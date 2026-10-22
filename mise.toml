@@ -1,0 +1,6 @@
+[tools]
+# Includes rustc, Cargo, the standard library, rustfmt, and Clippy.
+rust = { version = "1.99.1", profile = "default" }
+
+# Linux builds also require a system C linker and libc development headers.
+# Ubuntu/Debian: sudo apt install build-essential
