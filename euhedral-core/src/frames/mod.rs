@@ -47,12 +47,14 @@
 
 mod array;
 mod benchmark;
+mod callback;
 mod collection;
 mod dummy;
 mod runnable;
 
 pub use array::ArrayFrame;
 pub use benchmark::BenchmarkFrame;
+pub use callback::{Callback, CallbackFrame, CallbackReceiver};
 pub use collection::CollectionFrame;
 pub use dummy::DummyFrame;
 pub use runnable::{RunnableFrame, Task};

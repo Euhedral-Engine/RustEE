@@ -2,6 +2,7 @@
 //!
 //! - [`frames`]: the [`Frame`](frames::Frame) trait every unit of work implements, and the stock
 //!   frames.
+//! - [`generics`]: interfaces for what receives frames.
 //! - [`impls`]: pools that recycle finished frames (upstream package `impl`).
 //! - [`flow_control`]: how far a frame may travel from where it was made.
 //!
@@ -10,6 +11,7 @@
 
 pub mod flow_control;
 pub mod frames;
+pub mod generics;
 pub mod impls;
 
 mod internal;
