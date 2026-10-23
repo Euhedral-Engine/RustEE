@@ -3,14 +3,20 @@
 //! - [`RoutingPolicy`]: how far a frame may travel from where it was made.
 //! - [`LatticeHotSource`]: a source its owner pushes frames into by hand.
 //! - [`LatticeHotReceiver`]: a pusher that retries a frame until its [`PushHook`] takes it.
+//! - [`UpstreamRegistry`]: the [`UpstreamHandle`]s feeding a lattice and the workers servicing
+//!   them, each through its own [`UpstreamQueue`].
 
 mod hot_receiver;
 mod hot_source;
+mod registry;
 #[cfg(test)]
 pub(crate) mod testing;
+mod upstream_queue;
 
 pub use hot_receiver::{LatticeHotReceiver, PushHook, Response};
 pub use hot_source::LatticeHotSource;
+pub use registry::UpstreamRegistry;
+pub use upstream_queue::{PullBucketDivisionMode, UpstreamHandle, UpstreamQueue, decay_contention};
 
 /// How close to its [origin](crate::frames::FrameHeader::origin) a frame must stay.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
