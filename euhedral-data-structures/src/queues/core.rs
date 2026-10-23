@@ -8,6 +8,7 @@
 //! enforce: one single-producer (`sp_*`) caller at a time, one single-consumer (`sc_*`) caller at a time.
 
 use super::chunk::{Chunk, ChunkPool, FULL, LINK, Slot};
+use super::queue::Sink;
 use super::queue_utils::{INCREMENT, MAX_SIZE, RESIZING, SHIFT, round_chunk_size};
 use crate::atomics::CachePadded;
 use std::cell::UnsafeCell;
@@ -485,6 +486,43 @@ impl<T> Core<T> {
             commit.head += INCREMENT;
             total += 1;
             consume(item);
+        }
+        total
+    }
+
+    /// Moves up to `limit` elements into `sink`, stopping at the first one it rejects.
+    ///
+    /// # Safety
+    ///
+    /// As for [`sc_poll`](Self::sc_poll).
+    pub(crate) unsafe fn sc_transfer(
+        &self,
+        sink: &mut impl Sink<T>,
+        inspect: &mut impl FnMut(&T),
+        limit: u64,
+    ) -> u64 {
+        let mut commit = HeadCommit {
+            cell: &self.consumer.head,
+            head: self.consumer.head.load(Ordering::Relaxed),
+        };
+        let mut total = 0;
+        while total < limit {
+            let Some(slot) = (unsafe { self.sc_slot(commit.head) }) else {
+                break;
+            };
+            inspect(unsafe { slot.peek() });
+            let item = unsafe { slot.take() };
+            // Advance before pushing, so a sink that panics has consumed the element and nothing else.
+            commit.head += INCREMENT;
+            match sink.push(item) {
+                Ok(()) => total += 1,
+                Err(item) => {
+                    // Nothing else touches this slot while the head stays put: return the element to it.
+                    unsafe { slot.publish(item) };
+                    commit.head -= INCREMENT;
+                    break;
+                }
+            }
         }
         total
     }

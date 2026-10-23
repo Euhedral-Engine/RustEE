@@ -5,6 +5,7 @@
 //! role can be cloned freely. That keeps the whole API safe.
 
 use super::core::Core;
+use std::collections::VecDeque;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -30,6 +31,38 @@ impl Role for Single {
 }
 impl Role for Multi {
     const MULTI: bool = true;
+}
+
+/// Somewhere a [`Consumer`] can move elements to: a queue's producer, or a collection.
+pub trait Sink<T> {
+    /// Takes `item`, or hands it back if the sink is full.
+    fn push(&mut self, item: T) -> Result<(), T>;
+}
+
+impl<T> Sink<T> for Vec<T> {
+    fn push(&mut self, item: T) -> Result<(), T> {
+        Vec::push(self, item);
+        Ok(())
+    }
+}
+
+impl<T> Sink<T> for VecDeque<T> {
+    fn push(&mut self, item: T) -> Result<(), T> {
+        self.push_back(item);
+        Ok(())
+    }
+}
+
+impl<T> Sink<T> for Producer<T, Single> {
+    fn push(&mut self, item: T) -> Result<(), T> {
+        self.offer(item)
+    }
+}
+
+impl<T> Sink<T> for Producer<T, Multi> {
+    fn push(&mut self, item: T) -> Result<(), T> {
+        self.offer(item)
+    }
 }
 
 /// Single producer, single consumer.
@@ -307,6 +340,24 @@ impl<T> Consumer<T, Single> {
     /// Removes every published element.
     pub fn clear(&mut self) {
         while self.drain_all(drop) > 0 {}
+    }
+
+    /// Moves up to `limit` elements, oldest first, into `sink` and returns how many moved. Stops at the
+    /// first element the sink rejects, which stays at the front of this queue.
+    pub fn drain_to(&mut self, sink: &mut impl Sink<T>, limit: u64) -> u64 {
+        self.drain_to_inspect(sink, |_| {}, limit)
+    }
+
+    /// Like [`drain_to`](Self::drain_to), calling `inspect` on each element just before it is pushed.
+    /// An element the sink rejects has been inspected already and is inspected again on the next call.
+    pub fn drain_to_inspect(
+        &mut self,
+        sink: &mut impl Sink<T>,
+        mut inspect: impl FnMut(&T),
+        limit: u64,
+    ) -> u64 {
+        // SAFETY: as for `poll`.
+        unsafe { self.core.sc_transfer(sink, &mut inspect, limit) }
     }
 }
 
