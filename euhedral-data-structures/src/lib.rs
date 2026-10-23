@@ -5,3 +5,4 @@
 //! relaxed operations.
 
 pub mod atomics;
+pub mod queues;
