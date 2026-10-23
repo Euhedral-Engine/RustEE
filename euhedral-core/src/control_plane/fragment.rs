@@ -208,6 +208,16 @@ impl ControlPlaneFragment {
         self.adaptive_batch_cap.load(Ordering::Acquire)
     }
 
+    /// Waits up to `timeout` for the executors of both workers to finish their tasks.
+    #[cfg(test)]
+    pub(crate) fn await_executors(&self, timeout: Duration) -> bool {
+        self.executor.await_termination(timeout)
+            && self
+                .buddy
+                .as_ref()
+                .is_none_or(|buddy| buddy.await_executors(timeout))
+    }
+
     fn lock_lifecycle(&self) -> MutexGuard<'_, ()> {
         lock(&self.lifecycle)
     }

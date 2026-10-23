@@ -1,4 +1,5 @@
-use crate::generics::CloneableObject;
+use crate::generics::{AbstractExecutor, CloneableObject};
+use crate::impls::BaseCloneableObject;
 use euhedral_hardware_utils::topology::Topology;
 use euhedral_hardware_utils::util::CpuSet;
 use std::sync::Arc;
@@ -39,6 +40,20 @@ impl LatticeConfig {
             startup_timeout: Self::DEFAULT_STARTUP_TIMEOUT,
             cloneable,
         }
+    }
+
+    /// The defaults, with a [`BaseCloneableObject`] of default fragments running frames with
+    /// `executor`.
+    pub fn with_executor<E: AbstractExecutor>(executor: E) -> Self {
+        Self::new(Arc::new(BaseCloneableObject::with_executor(executor)))
+    }
+}
+
+impl Default for LatticeConfig {
+    /// The default names and timeouts, and the default [`BaseCloneableObject`] on every CPU of the
+    /// host.
+    fn default() -> Self {
+        Self::new(Arc::new(BaseCloneableObject::default()))
     }
 }
 

@@ -1,13 +1,59 @@
-//! A cloneable object that records what the control plane does to it.
+//! A cloneable object that records what the control plane does to it, and helpers for tests that
+//! run workers on the host's CPUs.
 
 use crate::config::CloneConfig;
 use crate::flow_control::LatticeEdge;
 use crate::flow_control::testing::TestReceiver;
 use crate::generics::CloneableObject;
+use euhedral_hardware_utils::affinity;
 use euhedral_hardware_utils::monitor::CoreSnapshot;
+use euhedral_hardware_utils::topology::Topology;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
+use std::thread;
+use std::time::{Duration, Instant};
+
+/// How long tests wait for workers.
+pub(crate) const PATIENCE: Duration = Duration::from_secs(10);
+
+/// Tests that start workers close the per-CPU executors they run on, so they take turns.
+pub(crate) fn pinned_turn() -> MutexGuard<'static, ()> {
+    static PINNED: Mutex<()> = Mutex::new(());
+    PINNED.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Waits for `condition`, failing the test after [`PATIENCE`].
+pub(crate) fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
+    let deadline = Instant::now() + PATIENCE;
+    while !condition() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// The host's last core with at least two CPUs this process may run on, and those CPUs.
+pub(crate) static SMT_CORE: LazyLock<Option<(usize, Vec<usize>)>> = LazyLock::new(|| {
+    let allowed = affinity::base_mask();
+    Topology::system()
+        .core_infos()
+        .iter()
+        .rev()
+        .map(|core| (core.core, core.cpus.iter().collect::<Vec<_>>()))
+        .find(|(_, cpus)| cpus.len() >= 2 && cpus.iter().all(|&cpu| allowed.contains(cpu)))
+});
+
+/// The host's last core this process may run on and its first CPU.
+pub(crate) static SINGLE_CORE: LazyLock<Option<(usize, usize)>> = LazyLock::new(|| {
+    let allowed = affinity::base_mask();
+    Topology::system()
+        .core_infos()
+        .iter()
+        .rev()
+        .find_map(|core| {
+            let cpu = core.cpus.iter().find(|&cpu| allowed.contains(cpu))?;
+            Some((core.core, cpu))
+        })
+});
 
 pub(crate) type Hook = Box<dyn FnOnce() + Send>;
 

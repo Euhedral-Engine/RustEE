@@ -1,5 +1,6 @@
 use super::*;
 use crate::config::CacheConfig;
+use crate::control_plane::testing::{PATIENCE, SINGLE_CORE, SMT_CORE, pinned_turn, wait_until};
 use crate::flow_control::testing::{TestReceiver, frame};
 use crate::flow_control::{LatticeNode, UpstreamHandle};
 use crate::frames::Failure;
@@ -9,46 +10,8 @@ use euhedral_hardware_utils::topology::Topology;
 use euhedral_hardware_utils::topology::source::{CoreKind, LogicalCpu, TopologyInput, normalize};
 use euhedral_hardware_utils::util::CpuSet;
 use std::collections::VecDeque;
+use std::sync::Condvar;
 use std::sync::mpsc;
-use std::sync::{Condvar, LazyLock};
-
-/// Fragments close the per-CPU executors they run on, so the tests that start them take turns.
-static SERIAL: Mutex<()> = Mutex::new(());
-
-const PATIENCE: Duration = Duration::from_secs(10);
-
-/// Waits for `condition`, failing the test after [`PATIENCE`].
-fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
-    let deadline = Instant::now() + PATIENCE;
-    while !condition() {
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
-        thread::sleep(Duration::from_millis(1));
-    }
-}
-
-/// The host's last core with at least two CPUs this process may run on, and those CPUs.
-static SMT_CORE: LazyLock<Option<(usize, Vec<usize>)>> = LazyLock::new(|| {
-    let allowed = affinity::base_mask();
-    Topology::system()
-        .core_infos()
-        .iter()
-        .rev()
-        .map(|core| (core.core, core.cpus.iter().collect::<Vec<_>>()))
-        .find(|(_, cpus)| cpus.len() >= 2 && cpus.iter().all(|&cpu| allowed.contains(cpu)))
-});
-
-/// The host's last core this process may run on and its first CPU.
-static SINGLE_CORE: LazyLock<Option<(usize, usize)>> = LazyLock::new(|| {
-    let allowed = affinity::base_mask();
-    Topology::system()
-        .core_infos()
-        .iter()
-        .rev()
-        .find_map(|core| {
-            let cpu = core.cpus.iter().find(|&cpu| allowed.contains(cpu))?;
-            Some((core.core, cpu))
-        })
-});
 
 fn directory() -> Arc<CacheDirectory> {
     CacheDirectory::new(UpstreamRegistry::new(), Topology::system().clone())
@@ -67,7 +30,7 @@ struct Fixture {
 impl Fixture {
     /// A fragment of `config` on `cpus` of `core`, below an edge, its outputs into gates.
     fn new(config: &FragmentConfig, core: usize, cpus: &[usize]) -> Self {
-        let serial = lock(&SERIAL);
+        let serial = pinned_turn();
         let directory = directory();
         let clone = CloneConfig::new("test", core, cpus.iter().copied().collect())
             .with_cache_directory(directory.clone());
@@ -146,11 +109,7 @@ impl Drop for Fixture {
         self.fragment.close();
         let deadline = Instant::now() + PATIENCE;
         let stopped = self.fragment.liveness.await_termination(deadline);
-        let mut executors = vec![&self.fragment.executor];
-        executors.extend(self.fragment.buddy.as_ref().map(|buddy| &buddy.executor));
-        let terminated = executors
-            .iter()
-            .all(|executor| executor.await_termination(PATIENCE));
+        let terminated = self.fragment.await_executors(PATIENCE);
         if !thread::panicking() {
             assert!(stopped && terminated, "the workers did not stop");
         }
@@ -700,7 +659,7 @@ fn the_config_clones_into_fragments() {
     let Some((core, cpu)) = *SINGLE_CORE else {
         return;
     };
-    let _serial = lock(&SERIAL);
+    let _serial = pinned_turn();
     let clone =
         CloneConfig::new("test", core, CpuSet::from_iter([cpu])).with_cache_directory(directory());
     let config = FragmentConfig::default().with_smt_enabled(false);
