@@ -8,9 +8,9 @@ use euhedral_data_structures::queues::queue::{Consumer, Multi, Single};
 use euhedral_hardware_utils::monitor::CoreSnapshot;
 use euhedral_hardware_utils::topology::{CpuCacheLayout, Topology};
 use euhedral_hardware_utils::util::CpuSet;
-use std::mem;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, TryLockError, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, RwLock, TryLockError, Weak};
+use std::{mem, ptr};
 
 type Partition = Consumer<Box<dyn Frame>, Single>;
 
@@ -91,6 +91,10 @@ impl CacheDirectory {
 /// unordered frames from the front with [`work_steal`](Self::work_steal); a partition is held by one
 /// consumer at a time, and the others pass it over.
 ///
+/// With SMT, the two hardware threads of a core each run a cache, and the first takes the core's
+/// frames for both: [`pair_with`](Self::pair_with) sends those with an odd routing hash to the
+/// second.
+///
 /// Build the cache on its owner's CPU and call [`first_touch`](Self::first_touch) there before it
 /// receives work, so its queue's memory lands on that CPU's NUMA node.
 ///
@@ -116,6 +120,7 @@ pub struct ControlPlaneCache {
     cap_factor: AtomicU64,
     retired: AtomicBool,
     primed: AtomicBool,
+    sibling: OnceLock<Arc<ControlPlaneCache>>,
     this: Weak<ControlPlaneCache>,
 }
 
@@ -176,6 +181,7 @@ impl ControlPlaneCache {
                 cap_factor: AtomicU64::new(1.0f64.to_bits()),
                 retired: AtomicBool::new(false),
                 primed: AtomicBool::new(false),
+                sibling: OnceLock::new(),
                 queue,
                 this: this.clone(),
                 name,
@@ -268,6 +274,30 @@ impl ControlPlaneCache {
         self.cap_factor.store(1.0f64.to_bits(), Ordering::Release);
     }
 
+    /// Sends the frames that reach this cache with an odd routing hash to `sibling`, the cache of
+    /// the core's other SMT thread, which takes no frames of its own. Call it before the cache is
+    /// attached.
+    ///
+    /// # Panics
+    ///
+    /// If the cache already has a sibling, or `sibling` is this cache.
+    pub fn pair_with(&self, sibling: Arc<ControlPlaneCache>) {
+        assert!(
+            !ptr::eq(&*sibling, self),
+            "a cache cannot be its own sibling"
+        );
+        assert!(
+            self.sibling.set(sibling).is_ok(),
+            "{} already has a sibling",
+            self.name
+        );
+    }
+
+    /// The cache of the core's other SMT thread, if this cache shares the core's frames with it.
+    pub fn sibling(&self) -> Option<&Arc<ControlPlaneCache>> {
+        self.sibling.get()
+    }
+
     /// Places the cache below `edge`, so the frames pushed into `edge` arrive here and pulls climb
     /// through it.
     pub fn attach(&self, edge: &LatticeEdge) {
@@ -281,17 +311,20 @@ impl ControlPlaneCache {
         if limit == 0 {
             return 0;
         }
-        let mut added = 0;
+        let (mut own, mut sibling) = (0, 0);
         let taken = self.edge.pull(
-            &mut |frame| {
-                if self.offer(frame) {
-                    added += 1;
-                }
+            &mut |frame| match self.offer(frame) {
+                Some(lane) if ptr::eq(lane, self) => own += 1,
+                Some(_) => sibling += 1,
+                None => {}
             },
             &mut |_| false,
             limit,
         );
-        self.count.fetch_add(added, Ordering::AcqRel);
+        self.count.fetch_add(own, Ordering::AcqRel);
+        if let Some(lane) = self.sibling.get() {
+            lane.count.fetch_add(sibling, Ordering::AcqRel);
+        }
         taken
     }
 
@@ -437,17 +470,22 @@ impl ControlPlaneCache {
         self.edge.close_edge();
     }
 
-    /// Queues `frame` in its partition, or fails it once the cache is retired.
-    fn offer(&self, frame: Box<dyn Frame>) -> bool {
-        if self.retired.load(Ordering::Acquire) {
+    /// Queues `frame` in its partition of this cache or, on the odd lane, of the sibling, and
+    /// returns the cache that took it. Fails the frame once either cache is retired.
+    fn offer(&self, frame: Box<dyn Frame>) -> Option<&ControlPlaneCache> {
+        let lane = match self.sibling.get() {
+            Some(sibling) if frame.header().routing_hash() & 1 == 1 => sibling,
+            _ => self,
+        };
+        if self.retired.load(Ordering::Acquire) || lane.retired.load(Ordering::Acquire) {
             frame.do_finally_with_error(FrameError::failed("the cache retired"));
-            return false;
+            return None;
         }
-        let partition = route_by_hash(&*frame, self.partitions.len());
-        if self.producer.offer_to(partition, frame).is_err() {
+        let partition = route_by_hash(&*frame, lane.partitions.len());
+        if lane.producer.offer_to(partition, frame).is_err() {
             unreachable!("an unbounded partition takes every frame");
         }
-        true
+        Some(lane)
     }
 }
 
@@ -458,8 +496,8 @@ impl LatticeNode for ControlPlaneCache {
 
     /// Queues `frame` and counts it toward the calling worker's request.
     fn push(&self, frame: Box<dyn Frame>) {
-        if self.offer(frame) {
-            self.count.fetch_add(1, Ordering::AcqRel);
+        if let Some(lane) = self.offer(frame) {
+            lane.count.fetch_add(1, Ordering::AcqRel);
             FlowContext::with(|context| {
                 if let Some(context) = context {
                     context.add_satisfied_request(1);

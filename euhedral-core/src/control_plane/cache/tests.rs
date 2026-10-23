@@ -423,6 +423,114 @@ fn a_closed_cache_fails_new_frames_and_keeps_its_queue() {
     assert_eq!(victim.drain(drop, 10), 1);
 }
 
+/// A cache on core 0's first CPU paired with one on its second.
+fn smt_pair(directory: &Arc<CacheDirectory>) -> (Arc<ControlPlaneCache>, Arc<ControlPlaneCache>) {
+    let config = config(2);
+    let first = ControlPlaneCache::new(&config, &clone_config(0), 0, true, directory);
+    let second = ControlPlaneCache::new(&config, &clone_config(0), 1, true, directory);
+    first.pair_with(second.clone());
+    (first, second)
+}
+
+fn drained_ids(cache: &ControlPlaneCache) -> Vec<u64> {
+    let mut drained = Vec::new();
+    cache.drain(|frame| drained.push(frame), 100);
+    let mut ids = ids(&drained);
+    ids.sort_unstable();
+    ids
+}
+
+#[test]
+fn a_paired_cache_sends_its_odd_lane_to_the_sibling() {
+    let directory = directory();
+    let (first, second) = smt_pair(&directory);
+    assert!(Arc::ptr_eq(first.sibling().unwrap(), &second));
+    assert!(second.sibling().is_none());
+    FlowContext::initialize();
+
+    for (id, hash) in [(1, 4), (2, 7), (3, u64::MAX), (4, 1 << 63)] {
+        first.push(unordered(id, hash));
+    }
+
+    assert_eq!(first.local_cache_count(), 2);
+    assert_eq!(second.local_cache_count(), 2);
+    assert_eq!(FlowContext::with(|c| c.unwrap().satisfied_request()), 4);
+    assert_eq!(drained_ids(&first), [1, 4]);
+    assert_eq!(drained_ids(&second), [2, 3]);
+    assert!(first.is_drained() && second.is_drained());
+    FlowContext::clear();
+}
+
+#[test]
+fn a_paired_cache_pulls_for_both_lanes() {
+    let directory = directory();
+    let (first, second) = smt_pair(&directory);
+    let edge = LatticeEdge::new(directory.registry(), Default::default());
+    first.attach(&edge);
+    let _source = source(
+        &directory,
+        (1..=6).map(|id| unordered(id, id + 100)).collect(),
+    );
+
+    assert_eq!(first.pull(10), 6);
+
+    assert_eq!(first.local_cache_count(), 3);
+    assert_eq!(second.local_cache_count(), 3);
+    assert_eq!(drained_ids(&first), [2, 4, 6]);
+    assert_eq!(drained_ids(&second), [1, 3, 5]);
+    directory.registry().remove_thread();
+}
+
+fn tracked(id: u64, hash: u64, fates: &Fates) -> Box<dyn Frame> {
+    let mut frame = Tracked::new(id, fates);
+    frame.header_mut().set_routing_hash(hash);
+    frame
+}
+
+#[test]
+fn a_retired_lane_fails_its_frames() {
+    let directory = directory();
+    let (first, second) = smt_pair(&directory);
+    second.close();
+    let fates = Fates::default();
+    first.push(tracked(1, 3, &fates));
+    first.push(tracked(2, 2, &fates));
+    assert!(matches!(fates.lock().unwrap()[..], [(1, Fate::Failed(_))]));
+    assert_eq!(first.local_cache_count(), 1);
+    assert_eq!(second.local_cache_count(), 0);
+
+    first.close();
+    first.push(tracked(3, 2, &fates));
+    assert!(matches!(fates.lock().unwrap()[1], (3, Fate::Failed(_))));
+    assert_eq!(first.local_cache_count(), 1);
+}
+
+#[test]
+fn a_retired_cache_fails_its_siblings_lane_too() {
+    let directory = directory();
+    let (first, second) = smt_pair(&directory);
+    first.close();
+    let fates = Fates::default();
+    first.push(tracked(1, 3, &fates));
+    assert!(matches!(fates.lock().unwrap()[..], [(1, Fate::Failed(_))]));
+    assert_eq!(second.local_cache_count(), 0);
+}
+
+#[test]
+#[should_panic(expected = "already has a sibling")]
+fn a_cache_pairs_once() {
+    let directory = directory();
+    let (first, second) = smt_pair(&directory);
+    first.pair_with(second);
+}
+
+#[test]
+#[should_panic(expected = "its own sibling")]
+fn a_cache_cannot_pair_with_itself() {
+    let cache = cache(1);
+    cache.pair_with(cache.clone());
+}
+
 #[test]
 fn closing_an_old_cache_leaves_its_replacement_in_place() {
     let directory = directory();
