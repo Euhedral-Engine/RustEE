@@ -1,3 +1,3 @@
 [workspace]
-members = ["euhedral-hashing"]
+members = ["euhedral-hashing", "euhedral-data-structures"]
 resolver = "3"

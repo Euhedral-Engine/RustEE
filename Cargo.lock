@@ -3,5 +3,9 @@
 version = 4
 
 [[package]]
+name = "euhedral-data-structures"
+version = "0.1.0"
+
+[[package]]
 name = "euhedral-hashing"
 version = "0.1.0"
