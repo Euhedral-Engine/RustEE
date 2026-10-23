@@ -2,9 +2,11 @@
 //! simpler hand-off points frames use themselves.
 
 mod cloneable;
+mod executor;
 mod lattice;
 
 pub use cloneable::CloneableObject;
+pub use executor::AbstractExecutor;
 pub use lattice::{LatticeInterceptor, LatticeReceiver, LatticeSource, LatticeTerminal};
 
 use crate::frames::Frame;

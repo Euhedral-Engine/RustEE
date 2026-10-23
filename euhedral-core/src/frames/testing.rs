@@ -1,18 +1,13 @@
-//! Frames and an executor stand-in shared by the frame tests.
+//! Frames and an executor shared by the frame tests.
 
 use super::{Frame, FrameError, FrameHeader};
+use crate::generics::AbstractExecutor;
+use crate::impls::DefaultExecutor;
 use std::sync::{Arc, Mutex};
 
-/// Drives `frame` the way an executor does: skip it when dead, otherwise execute it, then finalize.
-pub(crate) fn run(mut frame: Box<dyn Frame>) {
-    if !frame.is_alive() {
-        frame.do_finally();
-        return;
-    }
-    match frame.execute() {
-        Ok(()) | Err(FrameError::Cancelled) => frame.do_finally(),
-        Err(error) => frame.do_finally_with_error(error),
-    }
+/// Drives `frame` through its lifecycle on a [`DefaultExecutor`].
+pub(crate) fn run(frame: Box<dyn Frame>) {
+    DefaultExecutor::new().run(frame);
 }
 
 /// Appends its id hash to a shared log when executed, or fails with `error` if set.
