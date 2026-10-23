@@ -2,7 +2,7 @@
 //! against a `VecDeque`. Small chunks and pools force constant chunk rollover, reuse and ring wrap-around.
 
 use euhedral_data_structures::queues::{
-    Consumer, MpscQueue, Multi, Producer, Queue, Role, Single, SpscQueue,
+    Consumer, MpmcQueue, MpscQueue, Multi, Producer, Queue, Role, Single, SpmcQueue, SpscQueue,
 };
 use std::collections::VecDeque;
 
@@ -194,6 +194,32 @@ where
     assert!(queue.is_empty());
 }
 
+impl ModelConsumer for Consumer<u64, Multi> {
+    fn take(&mut self) -> Option<u64> {
+        self.poll()
+    }
+
+    fn look(&mut self) -> Option<u64> {
+        self.peek_with(|v| *v)
+    }
+
+    fn take_up_to(&mut self, limit: u64) -> (u64, Vec<u64>) {
+        let mut drained = Vec::new();
+        let count = self.drain(|v| drained.push(v), limit);
+        (count, drained)
+    }
+
+    fn take_until_multiple_of(&mut self, divisor: u64, limit: u64) -> Vec<u64> {
+        let mut drained = Vec::new();
+        self.drain_while(|v| drained.push(v), |v| v % divisor == 0, limit);
+        drained
+    }
+
+    fn wipe(&mut self) {
+        self.clear();
+    }
+}
+
 macro_rules! model_tests {
     ($module:ident, $queue:ident) => {
         mod $module {
@@ -224,3 +250,5 @@ macro_rules! model_tests {
 
 model_tests!(spsc, SpscQueue);
 model_tests!(mpsc, MpscQueue);
+model_tests!(spmc, SpmcQueue);
+model_tests!(mpmc, MpmcQueue);

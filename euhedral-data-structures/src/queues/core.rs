@@ -33,6 +33,8 @@ struct Config {
     window: u64,
     bounded: bool,
     capacity: u64,
+    /// The most a multi-consumer drain takes per hold of the consumer lock.
+    max_consume_batch: u64,
 }
 
 /// Written only occasionally: the pool at chunk boundaries, the role flags when a handle is made, and
@@ -53,6 +55,8 @@ pub(crate) struct Core<T> {
     producer: CachePadded<ProducerState<T>>,
     pub(crate) shared: CachePadded<Shared<T>>,
     config: CachePadded<Config>,
+    /// Zero, or the token of the thread currently acting as the consumer of a multi-consumer queue.
+    mc_lock: CachePadded<AtomicU64>,
 }
 
 unsafe impl<T: Send> Send for Core<T> {}
@@ -114,7 +118,9 @@ impl<T> Core<T> {
                 window,
                 bounded,
                 capacity,
+                max_consume_batch: u64::MAX,
             }),
+            mc_lock: CachePadded::new(AtomicU64::new(0)),
         }
     }
 
@@ -137,6 +143,47 @@ impl<T> Core<T> {
 
     pub(crate) fn chunks_allocated(&self) -> usize {
         self.shared.chunks_allocated.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn max_consume_batch(&self) -> u64 {
+        self.config.max_consume_batch
+    }
+
+    /// Sets the batch cap while the queue is still unshared.
+    pub(crate) fn set_max_consume_batch(&mut self, batch: u64) {
+        self.config.max_consume_batch = batch;
+    }
+
+    // ----- Consumer lock (multiple consumers) -----
+
+    /// Becomes the active consumer unless another one is, without waiting.
+    pub(crate) fn try_lock_consumers(&self) -> Option<ConsumerLock<'_>> {
+        let token = thread_token();
+        self.mc_lock
+            .compare_exchange(0, token, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+            // Lazily: building the guard eagerly would drop it, and so unlock, when the attempt failed.
+            .then(|| ConsumerLock {
+                cell: &self.mc_lock,
+            })
+    }
+
+    /// Becomes the active consumer, waiting for the current one to finish.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the calling thread is already the active consumer, since it would wait for itself.
+    pub(crate) fn lock_consumers(&self) -> ConsumerLock<'_> {
+        loop {
+            if let Some(lock) = self.try_lock_consumers() {
+                return lock;
+            }
+            assert!(
+                self.mc_lock.load(Ordering::Relaxed) != thread_token(),
+                "clear called from inside a consumer callback of the same queue"
+            );
+            std::hint::spin_loop();
+        }
     }
 
     /// Reserved positions, which can include slots a producer has claimed but not yet published.
@@ -463,6 +510,26 @@ impl<T> Core<T> {
             }
         }
     }
+}
+
+/// Held while a multi-consumer queue's consumer operation runs; released on drop, including by unwind.
+pub(crate) struct ConsumerLock<'a> {
+    cell: &'a AtomicU64,
+}
+
+impl Drop for ConsumerLock<'_> {
+    fn drop(&mut self) {
+        self.cell.store(0, Ordering::Release);
+    }
+}
+
+/// A non-zero number unique to the calling thread.
+fn thread_token() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    thread_local! {
+        static TOKEN: u64 = NEXT.fetch_add(1, Ordering::Relaxed);
+    }
+    TOKEN.with(|token| *token)
 }
 
 /// What a producer got from [`Core::mp_reserve`].

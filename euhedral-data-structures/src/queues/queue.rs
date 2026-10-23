@@ -147,6 +147,26 @@ impl<T, P: Role, C: Role> Queue<T, P, C> {
     }
 }
 
+impl<T, P: Role> Queue<T, P, Multi> {
+    /// Caps how many elements one consumer takes per lock hold. A `drain` above the cap releases the
+    /// lock between batches so other consumers can interleave.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `batch` is zero, or if a producer or consumer handle has already been created.
+    pub fn with_max_consume_batch(mut self, batch: u64) -> Self {
+        assert!(batch > 0, "max consume batch must be positive");
+        Arc::get_mut(&mut self.core)
+            .expect("configure the queue before creating its handles")
+            .set_max_consume_batch(batch);
+        self
+    }
+
+    pub fn max_consume_batch(&self) -> u64 {
+        self.core.max_consume_batch()
+    }
+}
+
 /// The producing side of a [`Queue`].
 pub struct Producer<T, P: Role> {
     core: Arc<Core<T>>,
@@ -287,5 +307,78 @@ impl<T> Consumer<T, Single> {
     /// Removes every published element.
     pub fn clear(&mut self) {
         while self.drain_all(drop) > 0 {}
+    }
+}
+
+impl<T> Clone for Consumer<T, Multi> {
+    fn clone(&self) -> Self {
+        Self {
+            core: Arc::clone(&self.core),
+            role: PhantomData,
+        }
+    }
+}
+
+impl<T> Consumer<T, Multi> {
+    /// Removes and returns the oldest published element, or `None` if there is none or another
+    /// consumer is active.
+    pub fn poll(&self) -> Option<T> {
+        let _lock = self.core.try_lock_consumers()?;
+        // SAFETY: the lock makes this thread the only consumer until `_lock` drops.
+        unsafe { self.core.sc_poll() }
+    }
+
+    /// Runs `look` on the oldest published element, leaving it queued. Returns `None` if there is none
+    /// or another consumer is active.
+    pub fn peek_with<R>(&self, look: impl FnOnce(&T) -> R) -> Option<R> {
+        let _lock = self.core.try_lock_consumers()?;
+        // SAFETY: as for `poll`; the borrow ends inside `look`, before the lock is released.
+        unsafe { self.core.sc_peek() }.map(look)
+    }
+
+    /// Hands up to `limit` elements to `consume`, oldest first, and returns how many. It stops early if
+    /// another consumer is active.
+    pub fn drain(&self, consume: impl FnMut(T), limit: u64) -> u64 {
+        self.drain_while(consume, |_| false, limit)
+    }
+
+    /// [`drain`](Self::drain) without a limit.
+    pub fn drain_all(&self, consume: impl FnMut(T)) -> u64 {
+        self.drain(consume, u64::MAX)
+    }
+
+    /// Like [`drain`](Self::drain), but stops before the first element for which `stop` returns true,
+    /// leaving it queued.
+    pub fn drain_while(
+        &self,
+        mut consume: impl FnMut(T),
+        mut stop: impl FnMut(&T) -> bool,
+        limit: u64,
+    ) -> u64 {
+        let mut total = 0;
+        while total < limit {
+            let Some(_lock) = self.core.try_lock_consumers() else {
+                break;
+            };
+            let batch = (limit - total).min(self.core.max_consume_batch());
+            // SAFETY: as for `poll`.
+            let drained = unsafe { self.core.sc_drain(&mut consume, &mut stop, batch) };
+            total += drained;
+            if drained < batch {
+                break;
+            }
+        }
+        total
+    }
+
+    /// Removes every published element, waiting for any active consumer to finish first.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called from inside a callback of this queue's own consumer, which would wait forever.
+    pub fn clear(&self) {
+        let _lock = self.core.lock_consumers();
+        // SAFETY: as for `poll`.
+        while unsafe { self.core.sc_drain(&mut drop, &mut |_| false, u64::MAX) } > 0 {}
     }
 }
