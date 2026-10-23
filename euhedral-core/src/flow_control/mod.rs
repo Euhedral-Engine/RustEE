@@ -1,4 +1,16 @@
-//! Routing constraints on where a frame may run.
+//! How frames and demand move through a lattice.
+//!
+//! - [`RoutingPolicy`]: how far a frame may travel from where it was made.
+//! - [`LatticeHotSource`]: a source its owner pushes frames into by hand.
+//! - [`LatticeHotReceiver`]: a pusher that retries a frame until its [`PushHook`] takes it.
+
+mod hot_receiver;
+mod hot_source;
+#[cfg(test)]
+pub(crate) mod testing;
+
+pub use hot_receiver::{LatticeHotReceiver, PushHook, Response};
+pub use hot_source::LatticeHotSource;
 
 /// How close to its [origin](crate::frames::FrameHeader::origin) a frame must stay.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
