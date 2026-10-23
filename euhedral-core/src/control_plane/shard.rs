@@ -1,3 +1,4 @@
+use super::countdown::{Countdown, Done};
 use crate::config::CloneConfig;
 use crate::flow_control::{
     LatticeEdge, LatticeNode, LatticeVertex, RoutingPolicy, RoutingState, UpstreamRegistry,
@@ -13,12 +14,10 @@ use euhedral_hardware_utils::util::CpuSet;
 use std::error::Error;
 use std::fmt;
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 type ObjectClone = Arc<dyn CloneableObject>;
-type Done = Box<dyn FnOnce() + Send>;
 
 /// Returned when a shard is still rebalancing at a reset's deadline.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -136,6 +135,11 @@ impl ControlPlaneShard {
         clones.iter().flatten().all(|clone| clone.ready())
     }
 
+    /// Whether the shard is running, ready or not.
+    pub(crate) fn is_running(&self) -> bool {
+        self.lock().started
+    }
+
     /// Whether the shard is rebalancing; it takes no frames meanwhile.
     pub fn is_rebalancing(&self) -> bool {
         self.lock().rebalancing
@@ -157,11 +161,11 @@ impl ControlPlaneShard {
         clones.iter().flatten().all(|clone| clone.is_drained())
     }
 
-    /// Starts the shard below `upstream` and places clones by `topology`. Does nothing while
-    /// running.
+    /// Starts the shard below `upstream` and places clones by `topology`, passing each its core's
+    /// share of `snapshot` if there is one. Does nothing while running.
     pub fn start(
         &self,
-        snapshot: &SocketSnapshot,
+        snapshot: Option<&SocketSnapshot>,
         topology: &EffectiveSocketTopology,
         upstream: Arc<LatticeEdge>,
     ) {
@@ -198,8 +202,8 @@ impl ControlPlaneShard {
         self.update(snapshot, topology);
     }
 
-    /// Passes each clone its core's utilization, or rebalances if the topology changed.
-    pub fn update(&self, snapshot: &SocketSnapshot, topology: &EffectiveSocketTopology) {
+    /// Passes each clone its core's share of `snapshot`, or rebalances if the topology changed.
+    pub fn update(&self, snapshot: Option<&SocketSnapshot>, topology: &EffectiveSocketTopology) {
         let (primed, version, clones) = {
             let state = self.lock();
             if !state.started {
@@ -240,7 +244,7 @@ impl ControlPlaneShard {
 
     fn handle_topology_change(
         &self,
-        snapshot: &SocketSnapshot,
+        snapshot: Option<&SocketSnapshot>,
         topology: &EffectiveSocketTopology,
     ) {
         let (distributor, old_clones, handles, first, generation, pool) = {
@@ -378,7 +382,7 @@ impl ControlPlaneShard {
     fn drain_and_prune(
         &self,
         old_clones: Vec<Option<ObjectClone>>,
-        snapshot: &SocketSnapshot,
+        snapshot: Option<&SocketSnapshot>,
         topology: &EffectiveSocketTopology,
         generation: u64,
     ) {
@@ -667,40 +671,6 @@ impl Drop for Reopen<'_> {
     }
 }
 
-/// Calls its action once `count` ticks have arrived; at once for a count of zero.
-struct Countdown {
-    remaining: AtomicUsize,
-    done: Mutex<Option<Done>>,
-}
-
-impl Countdown {
-    fn new(count: usize, done: Done) -> Arc<Self> {
-        if count == 0 {
-            done();
-            return Arc::new(Self {
-                remaining: AtomicUsize::new(0),
-                done: Mutex::new(None),
-            });
-        }
-        Arc::new(Self {
-            remaining: AtomicUsize::new(count),
-            done: Mutex::new(Some(done)),
-        })
-    }
-
-    fn tick(&self) {
-        if self.remaining.fetch_sub(1, Ordering::AcqRel) == 1
-            && let Some(done) = self
-                .done
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .take()
-        {
-            done();
-        }
-    }
-}
-
 /// Ticks its countdown when dropped, so a clone that panics while shutting down still counts.
 struct Tick(Arc<Countdown>);
 
@@ -724,15 +694,16 @@ fn route_to_core(frame: &dyn Frame, state: &RoutingState) -> usize {
     unsigned_multiply_high(rotated, state.len() as u64) as usize
 }
 
-fn nodes(handles: &[Option<Arc<LatticeEdge>>]) -> Vec<Option<Arc<dyn LatticeNode>>> {
+/// The handles as lattice nodes, for a vertex mapping.
+pub(super) fn nodes(handles: &[Option<Arc<LatticeEdge>>]) -> Vec<Option<Arc<dyn LatticeNode>>> {
     handles
         .iter()
         .map(|handle| handle.clone().map(|handle| handle as Arc<dyn LatticeNode>))
         .collect()
 }
 
-fn core_snapshot(snapshot: &SocketSnapshot, core: usize) -> Option<&CoreSnapshot> {
-    snapshot.core_snapshots.get(core)?.as_ref()
+fn core_snapshot(snapshot: Option<&SocketSnapshot>, core: usize) -> Option<&CoreSnapshot> {
+    snapshot?.core_snapshots.get(core)?.as_ref()
 }
 
 fn core_cpus(topology: &EffectiveSocketTopology, core: usize) -> CpuSet {

@@ -5,9 +5,9 @@
 //! - [`generics`]: the interfaces frames flow through, and executors.
 //! - [`impls`]: pools that recycle finished frames, and the default executor (upstream package
 //!   `impl`).
-//! - [`config`]: where each clone of a control-plane object runs.
-//! - [`control_plane`]: the shards that place a clone of an object on each effective core of a
-//!   socket and route frames among them.
+//! - [`config`]: how a lattice is set up, and where each clone of a control-plane object runs.
+//! - [`control_plane`]: the lattice where frames enter, and the shard per socket that places a
+//!   clone of an object on each effective core and routes frames among them.
 //! - [`flow_control`]: the lattice frames flow down through and demand flows up through: edges,
 //!   routing vertices, upstream handles and each worker's scheduler over them.
 //! - [`utils`]: math, spin waiting, timing, flow statistics and calibration for the control plane.

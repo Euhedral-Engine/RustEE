@@ -1,156 +1,12 @@
 use super::*;
-use crate::flow_control::testing::{Fate, Fates, TestReceiver, Tracked, frame};
+use crate::control_plane::testing::TestClone;
+use crate::flow_control::testing::{Fate, Fates, Tracked, frame};
 use euhedral_hardware_utils::monitor::{HardwareUtilization, HardwareUtilizationParts};
 use euhedral_hardware_utils::topology::CpuInfo;
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
 const SPAN: usize = 4;
-
-type Hook = Box<dyn FnOnce() + Send>;
-
-/// Records what the shard does to it. The template's clones share its `spawned` list and copy its
-/// knobs at the time they are cloned.
-struct TestClone {
-    config: Option<CloneConfig>,
-    spawned: Arc<Mutex<Vec<Arc<TestClone>>>>,
-    on_clone: Arc<Mutex<Option<Hook>>>,
-    receiver: Arc<TestReceiver>,
-    edge: Mutex<Option<Arc<LatticeEdge>>>,
-    starts: AtomicUsize,
-    started: AtomicBool,
-    closed: AtomicBool,
-    drain_modes: Mutex<Vec<bool>>,
-    updates: Mutex<Vec<usize>>,
-    drained: AtomicBool,
-    ready: AtomicBool,
-    buffered: AtomicU64,
-    panic_on_reset: AtomicBool,
-    panic_on_dump: AtomicBool,
-}
-
-impl TestClone {
-    fn template() -> Arc<Self> {
-        Arc::new(Self::new(None, Default::default(), Default::default()))
-    }
-
-    fn new(
-        config: Option<CloneConfig>,
-        spawned: Arc<Mutex<Vec<Arc<TestClone>>>>,
-        on_clone: Arc<Mutex<Option<Hook>>>,
-    ) -> Self {
-        Self {
-            config,
-            spawned,
-            on_clone,
-            receiver: TestReceiver::new(),
-            edge: Mutex::new(None),
-            starts: AtomicUsize::new(0),
-            started: AtomicBool::new(false),
-            closed: AtomicBool::new(false),
-            drain_modes: Mutex::new(Vec::new()),
-            updates: Mutex::new(Vec::new()),
-            drained: AtomicBool::new(true),
-            ready: AtomicBool::new(true),
-            buffered: AtomicU64::new(0),
-            panic_on_reset: AtomicBool::new(false),
-            panic_on_dump: AtomicBool::new(false),
-        }
-    }
-
-    fn config(&self) -> &CloneConfig {
-        self.config.as_ref().expect("a clone has a config")
-    }
-
-    fn drain_modes(&self) -> Vec<bool> {
-        self.drain_modes.lock().unwrap().clone()
-    }
-
-    fn in_drain_mode(&self) -> bool {
-        self.drain_modes().last().copied().unwrap_or(false)
-    }
-
-    fn updates(&self) -> Vec<usize> {
-        self.updates.lock().unwrap().clone()
-    }
-
-    fn is_closed(&self) -> bool {
-        self.closed.load(Ordering::SeqCst)
-    }
-
-    fn edge(&self) -> Arc<LatticeEdge> {
-        self.edge
-            .lock()
-            .unwrap()
-            .clone()
-            .expect("the clone has an input edge")
-    }
-}
-
-impl CloneableObject for TestClone {
-    fn clone_object(&self, config: &CloneConfig) -> Arc<dyn CloneableObject> {
-        if let Some(hook) = self.on_clone.lock().unwrap().take() {
-            hook();
-        }
-        let clone = Arc::new(Self::new(
-            Some(config.clone()),
-            self.spawned.clone(),
-            self.on_clone.clone(),
-        ));
-        clone
-            .drained
-            .store(self.drained.load(Ordering::SeqCst), Ordering::SeqCst);
-        self.spawned.lock().unwrap().push(clone.clone());
-        clone
-    }
-
-    fn start(&self) {
-        self.starts.fetch_add(1, Ordering::SeqCst);
-        self.started.store(true, Ordering::SeqCst);
-    }
-
-    fn is_started(&self) -> bool {
-        self.started.load(Ordering::SeqCst)
-    }
-
-    fn ready(&self) -> bool {
-        self.ready.load(Ordering::SeqCst)
-    }
-
-    fn update(&self, snapshot: &CoreSnapshot) {
-        self.updates.lock().unwrap().push(snapshot.core_id);
-    }
-
-    fn input_edge(self: Arc<Self>, edge: Arc<LatticeEdge>) {
-        edge.add_downstream(self.receiver.clone());
-        *self.edge.lock().unwrap() = Some(edge);
-    }
-
-    fn is_drained(&self) -> bool {
-        self.drained.load(Ordering::SeqCst)
-    }
-
-    fn set_drain_mode(&self, drain: bool) {
-        self.drain_modes.lock().unwrap().push(drain);
-    }
-
-    fn reset(&self, _deadline: Instant) -> u64 {
-        assert!(!self.panic_on_reset.load(Ordering::SeqCst), "reset failed");
-        self.buffered.swap(0, Ordering::SeqCst)
-    }
-
-    fn dump_locks(&self) {
-        assert!(!self.panic_on_dump.load(Ordering::SeqCst), "dump failed");
-    }
-
-    fn core(&self) -> Option<usize> {
-        self.config.as_ref().map(CloneConfig::core_id)
-    }
-
-    fn close(&self) {
-        self.closed.store(true, Ordering::SeqCst);
-    }
-}
 
 /// Core `c` of the test socket has CPUs `2c` and `2c + 1`.
 fn cpus_of(core: usize) -> CpuSet {
@@ -231,12 +87,16 @@ impl Fixture {
     }
 
     fn start(&self, cores: &[usize]) {
-        self.shard
-            .start(&snapshot(), &topology(1, cores), self.upstream.clone());
+        self.shard.start(
+            Some(&snapshot()),
+            &topology(1, cores),
+            self.upstream.clone(),
+        );
     }
 
     fn update(&self, version: u64, cores: &[usize]) {
-        self.shard.update(&snapshot(), &topology(version, cores));
+        self.shard
+            .update(Some(&snapshot()), &topology(version, cores));
     }
 
     fn rebalance(&self, version: u64, cores: &[usize]) {
@@ -249,7 +109,7 @@ impl Fixture {
     }
 
     fn spawned(&self) -> Vec<Arc<TestClone>> {
-        self.template.spawned.lock().unwrap().clone()
+        self.template.spawned()
     }
 
     /// The latest clone spawned on `core`.
@@ -731,7 +591,7 @@ fn a_closed_shard_starts_again_with_new_clones() {
     let upstream = LatticeEdge::new(&fixture.registry, Default::default());
     fixture
         .shard
-        .start(&snapshot(), &topology(1, &[0]), upstream.clone());
+        .start(Some(&snapshot()), &topology(1, &[0]), upstream.clone());
 
     assert_eq!(fixture.spawned().len(), 2);
     let clone = fixture.clone_on(0);
@@ -898,11 +758,28 @@ fn a_shut_down_overtaken_by_a_restart_leaves_the_new_run_alone() {
     let upstream = LatticeEdge::new(&fixture.registry, Default::default());
     fixture
         .shard
-        .start(&snapshot(), &topology(1, &[0]), upstream);
+        .start(Some(&snapshot()), &topology(1, &[0]), upstream);
     let restarted = fixture.clone_on(0);
 
     assert!(parent.set_downstream_mapping(&[], &[None]));
     eventually("the stale shutdown", || calls.load(Ordering::SeqCst) == 1);
     assert!(fixture.shard.is_started());
     assert!(!restarted.is_closed());
+}
+
+#[test]
+fn a_shard_without_a_snapshot_places_clones_by_its_topology() {
+    let fixture = Fixture::new(Duration::from_secs(10));
+    fixture
+        .shard
+        .start(None, &topology(1, &[0, 3]), fixture.upstream.clone());
+
+    for core in [0, 3] {
+        let clone = fixture.clone_on(core);
+        assert_eq!(clone.config().effective_cpus(), &cpus_of(core));
+        assert!(clone.is_started());
+        assert!(clone.updates().is_empty());
+    }
+    fixture.shard.update(None, &topology(1, &[0, 3]));
+    assert!(fixture.clone_on(0).updates().is_empty());
 }
