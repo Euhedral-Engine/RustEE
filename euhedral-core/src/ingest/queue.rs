@@ -70,6 +70,14 @@ impl QueueSource {
         })
     }
 
+    /// Hands completion and drain notifications to `owner`.
+    pub(super) fn set_owner(&self, owner: Weak<dyn Owner>) {
+        assert!(
+            self.owner.set(owner).is_ok(),
+            "the queue already has an owner"
+        );
+    }
+
     fn owner(&self) -> Option<Arc<dyn Owner>> {
         self.owner.get().and_then(Weak::upgrade)
     }
@@ -176,6 +184,21 @@ impl QueueSource {
             Ok(consumer) => Some(consumer),
             Err(TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
             Err(TryLockError::WouldBlock) => None,
+        }
+    }
+
+    /// Hands every queued frame to `consume`, unless a drain holds the queue: that drain hands the
+    /// frames queued behind it on when it lets go.
+    pub(super) fn discard_queued(&self, mut consume: impl FnMut(Box<dyn Frame>)) {
+        loop {
+            let Some(mut consumer) = self.try_hold() else {
+                return;
+            };
+            consumer.drain_all(&mut consume);
+            drop(consumer);
+            if self.queue.is_empty() {
+                return;
+            }
         }
     }
 

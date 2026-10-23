@@ -4,14 +4,18 @@
 //!
 //! - [`QueueIngestSink`]: a partitioned queue that any thread publishes to.
 //! - [`ArrayIngestSink`]: a fixed batch of frames, complete once every frame is taken.
+//! - [`PipelineRunner`]: runs typed [`PipelineFrame`](crate::frames::PipelineFrame) chains, with
+//!   admission that completes gracefully once every accepted chain has finished.
 //! - [`SingleUseSource`]: one frame.
 
 mod array;
 mod downstream;
+mod pipeline_runner;
 mod queue;
 mod single_use;
 
 pub use array::ArrayIngestSink;
+pub use pipeline_runner::{AdmissionClosed, PipelineControl, PipelineRunner};
 pub use queue::QueueIngestSink;
 pub use single_use::SingleUseSource;
 
