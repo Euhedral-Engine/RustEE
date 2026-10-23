@@ -193,6 +193,30 @@ impl<T> Producer<T, Single> {
     }
 }
 
+impl<T> Clone for Producer<T, Multi> {
+    fn clone(&self) -> Self {
+        Self {
+            core: Arc::clone(&self.core),
+            role: PhantomData,
+        }
+    }
+}
+
+impl<T> Producer<T, Multi> {
+    /// Appends `item`, or returns it if a bounded queue is full.
+    pub fn offer(&self, item: T) -> Result<(), T> {
+        // SAFETY: a queue with multiple producers never uses the single-producer methods.
+        unsafe { self.core.mp_offer(item) }
+    }
+
+    /// Moves items from the front of `items` into the queue and returns how many it took. Items it
+    /// could not take (a bounded queue filled up) stay in `items`, in order.
+    pub fn fill(&self, items: &mut Vec<T>) -> usize {
+        // SAFETY: as for `offer`.
+        unsafe { self.core.mp_fill(items) }
+    }
+}
+
 /// The consuming side of a [`Queue`].
 pub struct Consumer<T, C: Role> {
     core: Arc<Core<T>>,

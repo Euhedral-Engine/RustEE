@@ -8,7 +8,7 @@
 //! enforce: one single-producer (`sp_*`) caller at a time, one single-consumer (`sc_*`) caller at a time.
 
 use super::chunk::{Chunk, ChunkPool, FULL, LINK, Slot};
-use super::queue_utils::{INCREMENT, MAX_SIZE, SHIFT, round_chunk_size};
+use super::queue_utils::{INCREMENT, MAX_SIZE, RESIZING, SHIFT, round_chunk_size};
 use crate::atomics::CachePadded;
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
@@ -256,6 +256,129 @@ impl<T> Core<T> {
         true
     }
 
+    // ----- Multiple producers -----
+
+    /// Appends `item`, or hands it back if a bounded queue is full.
+    ///
+    /// # Safety
+    ///
+    /// The `mp_*` methods may run on any number of threads at once, but never on a queue that is also
+    /// used through the `sp_*` methods.
+    pub(crate) unsafe fn mp_offer(&self, item: T) -> Result<(), T> {
+        match unsafe { self.mp_reserve(INCREMENT) } {
+            Reservation::Reserved { chunk, tail, .. } => {
+                unsafe { (*chunk).slots[self.index(tail)].publish(item) };
+                Ok(())
+            }
+            Reservation::Full => Err(item),
+        }
+    }
+
+    /// Moves items from the front of `items` until the queue is full, returning how many.
+    ///
+    /// # Safety
+    ///
+    /// As for [`mp_offer`](Self::mp_offer).
+    pub(crate) unsafe fn mp_fill(&self, items: &mut Vec<T>) -> usize {
+        let mut total = 0;
+        while !items.is_empty() {
+            let wanted = (items.len() as u64) << SHIFT;
+            match unsafe { self.mp_reserve(wanted) } {
+                Reservation::Full => break,
+                Reservation::Reserved { chunk, tail, count } => {
+                    let count = (count >> SHIFT) as usize;
+                    // Write through the chunk the reservation came from, not whatever the tail chunk
+                    // is by now: another producer may already have moved on to a newer one.
+                    let chunk = unsafe { &*chunk };
+                    for (i, item) in items.drain(..count).enumerate() {
+                        let position = tail + (i as u64) * INCREMENT;
+                        unsafe { chunk.slots[self.index(position)].publish(item) };
+                    }
+                    total += count;
+                }
+            }
+        }
+        total
+    }
+
+    /// Claims between one slot and `wanted` counter units of room at the tail, never more than the
+    /// current epoch allows. Starts a new chunk when the ring is full and the queue is unbounded; that
+    /// producer claims the first slot of the new chunk.
+    unsafe fn mp_reserve(&self, wanted: u64) -> Reservation<T> {
+        loop {
+            let tail = self.tail.load(Ordering::Acquire);
+            if tail & RESIZING != 0 {
+                // Another producer is installing a chunk and will clear the flag in a moment.
+                std::hint::spin_loop();
+                continue;
+            }
+            let epoch = self.producer.epoch.load(Ordering::Acquire);
+            let chunk = self.producer.tail_chunk.load(Ordering::Acquire);
+
+            let mut limit = epoch;
+            if epoch <= tail {
+                // Out of room for this epoch: see whether the consumer has freed some.
+                let head = self.consumer.head.load(Ordering::Acquire);
+                let next_epoch = head + self.config.window;
+                if next_epoch <= tail {
+                    if self.config.bounded {
+                        return Reservation::Full;
+                    }
+                    if self
+                        .tail
+                        .compare_exchange(
+                            tail,
+                            tail | RESIZING,
+                            Ordering::AcqRel,
+                            Ordering::Relaxed,
+                        )
+                        .is_ok()
+                    {
+                        return unsafe { self.mp_resize(chunk, tail) };
+                    }
+                    continue;
+                }
+                if self
+                    .producer
+                    .epoch
+                    .compare_exchange(epoch, next_epoch, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_err()
+                {
+                    continue;
+                }
+                limit = next_epoch;
+            }
+
+            let count = wanted.min(limit - tail);
+            if self
+                .tail
+                .compare_exchange(tail, tail + count, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                return Reservation::Reserved { chunk, tail, count };
+            }
+        }
+    }
+
+    /// Installs a new tail chunk. The caller has set the resizing flag in the tail, which keeps every
+    /// other producer out, and `old` is the tail chunk: the tail has not moved since it was read.
+    unsafe fn mp_resize(&self, old: *mut Chunk<T>, tail: u64) -> Reservation<T> {
+        let next = self.allocate_chunk();
+        self.producer.tail_chunk.store(next, Ordering::Relaxed);
+        self.producer
+            .epoch
+            .store(tail + self.config.window, Ordering::Relaxed);
+        unsafe { self.link(old, next, tail) };
+        // Clears the flag and takes the first slot of `next` for this producer. The release makes the
+        // new chunk, epoch and link visible to the producers waiting on the flag.
+        self.tail.fetch_add(RESIZING, Ordering::Release);
+        Reservation::Reserved {
+            chunk: next,
+            tail,
+            count: INCREMENT,
+        }
+    }
+
     // ----- Single consumer -----
 
     /// Removes and returns the oldest published element.
@@ -340,6 +463,18 @@ impl<T> Core<T> {
             }
         }
     }
+}
+
+/// What a producer got from [`Core::mp_reserve`].
+enum Reservation<T> {
+    /// `count` counter units starting at `tail`, all in `chunk`.
+    Reserved {
+        chunk: *mut Chunk<T>,
+        tail: u64,
+        count: u64,
+    },
+    /// A bounded queue is full.
+    Full,
 }
 
 /// Publishes the consumer's head when a drain finishes or unwinds.
