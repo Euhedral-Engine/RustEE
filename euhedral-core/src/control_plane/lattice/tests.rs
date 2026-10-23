@@ -223,6 +223,21 @@ fn start_places_a_clone_on_every_effective_core() {
         );
         assert_eq!(clone.updates(), [core]);
     }
+    let directory = fixture
+        .clone_on(0)
+        .config()
+        .cache_directory()
+        .unwrap()
+        .clone();
+    for core in 0..4 {
+        let clone = fixture.clone_on(core);
+        assert!(Arc::ptr_eq(
+            clone.config().cache_directory().unwrap(),
+            &directory
+        ));
+        assert!(Arc::ptr_eq(clone.edge().registry(), directory.registry()));
+    }
+    assert_eq!(directory.topology().socket_count(), 2);
     assert_eq!(fixture.source.starts.load(Ordering::SeqCst), 1);
     assert!(!fixture.drained());
     assert!(lattice.is_drained());

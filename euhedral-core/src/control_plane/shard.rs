@@ -1,8 +1,7 @@
+use super::cache::CacheDirectory;
 use super::countdown::{Countdown, Done};
 use crate::config::CloneConfig;
-use crate::flow_control::{
-    LatticeEdge, LatticeNode, LatticeVertex, RoutingPolicy, RoutingState, UpstreamRegistry,
-};
+use crate::flow_control::{LatticeEdge, LatticeNode, LatticeVertex, RoutingPolicy, RoutingState};
 use crate::frames::Frame;
 use crate::generics::CloneableObject;
 use crate::internal::task_pool::TaskPool;
@@ -73,17 +72,17 @@ pub struct ControlPlaneShard {
     name: String,
     cloneable: ObjectClone,
     shutdown_timeout: Duration,
-    registry: Arc<UpstreamRegistry>,
+    directory: Arc<CacheDirectory>,
     core_span: usize,
     state: Mutex<State>,
     this: Weak<ControlPlaneShard>,
 }
 
 impl ControlPlaneShard {
-    /// A shard for `socket` that clones `cloneable` onto cores with ids below `core_span`. Clones get
-    /// `shutdown_timeout` to drain before they are closed.
+    /// A shard for `socket` of `directory`'s lattice that clones `cloneable` onto cores with ids
+    /// below `core_span`. Clones get `shutdown_timeout` to drain before they are closed.
     pub fn new(
-        registry: &Arc<UpstreamRegistry>,
+        directory: &Arc<CacheDirectory>,
         socket: usize,
         name: impl Into<String>,
         cloneable: ObjectClone,
@@ -95,7 +94,7 @@ impl ControlPlaneShard {
             name: name.into(),
             cloneable,
             shutdown_timeout,
-            registry: registry.clone(),
+            directory: directory.clone(),
             core_span,
             state: Mutex::new(State::default()),
             this: this.clone(),
@@ -176,7 +175,7 @@ impl ControlPlaneShard {
             }
             log::info!(target: &self.name, "starting");
             let distributor = LatticeVertex::with_routing(
-                &self.registry,
+                self.directory.registry(),
                 format!("{}-CoreDistributor", self.name),
                 self.core_span,
                 route_to_core,
@@ -349,7 +348,10 @@ impl ControlPlaneShard {
     }
 
     fn core_edge(&self, distributor: &LatticeVertex) -> Arc<LatticeEdge> {
-        LatticeEdge::new(&self.registry, distributor.edge().drain_flag().clone())
+        LatticeEdge::new(
+            self.directory.registry(),
+            distributor.edge().drain_flag().clone(),
+        )
     }
 
     /// Clones the object onto `core`, attaches it below `handle`, starts it and passes it the
@@ -363,9 +365,10 @@ impl ControlPlaneShard {
         drain: bool,
     ) -> ObjectClone {
         log::trace!(target: &self.name, "spawning a clone on core {core}");
-        let clone = self
-            .cloneable
-            .clone_object(&CloneConfig::new(self.name.clone(), core, cpus));
+        let clone = self.cloneable.clone_object(
+            &CloneConfig::new(self.name.clone(), core, cpus)
+                .with_cache_directory(self.directory.clone()),
+        );
         if let Some(handle) = handle {
             clone.clone().input_edge(handle);
         }

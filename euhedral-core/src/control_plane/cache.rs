@@ -10,7 +10,7 @@ use euhedral_hardware_utils::topology::{CpuCacheLayout, Topology};
 use euhedral_hardware_utils::util::CpuSet;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, RwLock, TryLockError, Weak};
-use std::{mem, ptr};
+use std::{fmt, mem, ptr};
 
 type Partition = Consumer<Box<dyn Frame>, Single>;
 
@@ -27,6 +27,14 @@ pub struct CacheDirectory {
     registry: Arc<UpstreamRegistry>,
     topology: Topology,
     slots: Vec<RwLock<Weak<ControlPlaneCache>>>,
+}
+
+impl fmt::Debug for CacheDirectory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CacheDirectory")
+            .field("cpu_span", &self.slots.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl CacheDirectory {

@@ -1,4 +1,5 @@
 use super::CloneLivenessRegistry;
+use crate::control_plane::CacheDirectory;
 use euhedral_hardware_utils::util::CpuSet;
 use std::error::Error;
 use std::fmt;
@@ -8,14 +9,15 @@ use std::sync::Arc;
 /// Where one clone of a [`CloneableObject`](crate::generics::CloneableObject) runs.
 ///
 /// The control plane builds these as it places clones on cores. Equality and hashing cover the
-/// clone's identity (shard, core and CPUs) and ignore the liveness registry, which is runtime
-/// wiring.
+/// clone's identity (shard, core and CPUs) and ignore the liveness registry and cache directory,
+/// which are runtime wiring.
 #[derive(Clone, Debug)]
 pub struct CloneConfig {
     shard_name: String,
     core_id: usize,
     effective_cpus: CpuSet,
     liveness_registry: Arc<CloneLivenessRegistry>,
+    cache_directory: Option<Arc<CacheDirectory>>,
 }
 
 impl CloneConfig {
@@ -27,6 +29,7 @@ impl CloneConfig {
             core_id,
             effective_cpus,
             liveness_registry,
+            cache_directory: None,
         }
     }
 
@@ -48,7 +51,16 @@ impl CloneConfig {
             core_id,
             effective_cpus,
             liveness_registry,
+            cache_directory: None,
         })
+    }
+
+    /// This config, placing the clone in `directory`'s lattice.
+    pub fn with_cache_directory(self, directory: Arc<CacheDirectory>) -> Self {
+        Self {
+            cache_directory: Some(directory),
+            ..self
+        }
     }
 
     /// The shard managing the clone.
@@ -74,6 +86,12 @@ impl CloneConfig {
     /// Where the clone's workers, and its SMT buddy's, publish their liveness.
     pub fn liveness_registry(&self) -> &Arc<CloneLivenessRegistry> {
         &self.liveness_registry
+    }
+
+    /// The caches, upstream registry and topology of the lattice the clone runs in. Every config a
+    /// lattice's shards build carries it.
+    pub fn cache_directory(&self) -> Option<&Arc<CacheDirectory>> {
+        self.cache_directory.as_ref()
     }
 }
 
@@ -170,6 +188,20 @@ mod tests {
         assert_ne!(base, CloneConfig::new("other", 1, cpus(&[2, 3])));
         assert_ne!(base, CloneConfig::new("shard", 2, cpus(&[2, 3])));
         assert_ne!(base, CloneConfig::new("shard", 1, cpus(&[2])));
+    }
+
+    #[test]
+    fn a_config_can_carry_a_cache_directory_without_changing_identity() {
+        use crate::flow_control::UpstreamRegistry;
+        use euhedral_hardware_utils::topology::Topology;
+
+        let plain = CloneConfig::new("shard", 1, cpus(&[2, 3]));
+        assert!(plain.cache_directory().is_none());
+        let directory = CacheDirectory::new(UpstreamRegistry::new(), Topology::system().clone());
+        let placed = plain.clone().with_cache_directory(directory.clone());
+        assert!(Arc::ptr_eq(placed.cache_directory().unwrap(), &directory));
+        assert_eq!(placed, plain);
+        assert_eq!(hash(&placed), hash(&plain));
     }
 
     #[test]

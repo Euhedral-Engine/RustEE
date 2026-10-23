@@ -1,8 +1,9 @@
 use super::*;
 use crate::control_plane::testing::TestClone;
+use crate::flow_control::UpstreamRegistry;
 use crate::flow_control::testing::{Fate, Fates, Tracked, frame};
 use euhedral_hardware_utils::monitor::{HardwareUtilization, HardwareUtilizationParts};
-use euhedral_hardware_utils::topology::CpuInfo;
+use euhedral_hardware_utils::topology::{CpuInfo, Topology};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
@@ -54,6 +55,7 @@ fn eventually(what: &str, condition: impl Fn() -> bool) {
 
 struct Fixture {
     registry: Arc<UpstreamRegistry>,
+    directory: Arc<CacheDirectory>,
     upstream: Arc<LatticeEdge>,
     template: Arc<TestClone>,
     shard: Arc<ControlPlaneShard>,
@@ -62,10 +64,11 @@ struct Fixture {
 impl Fixture {
     fn new(shutdown_timeout: Duration) -> Self {
         let registry = UpstreamRegistry::new();
+        let directory = CacheDirectory::new(registry.clone(), Topology::system().clone());
         let upstream = LatticeEdge::new(&registry, Default::default());
         let template = TestClone::template();
         let shard = ControlPlaneShard::new(
-            &registry,
+            &directory,
             0,
             "shard",
             template.clone(),
@@ -74,6 +77,7 @@ impl Fixture {
         );
         Self {
             registry,
+            directory,
             upstream,
             template,
             shard,
@@ -155,6 +159,10 @@ fn start_primes_a_started_clone_on_each_effective_core() {
         assert_eq!(clone.config().core_id(), core);
         assert_eq!(clone.config().shard_name(), "shard");
         assert_eq!(clone.config().effective_cpus(), &cpus_of(core));
+        assert!(Arc::ptr_eq(
+            clone.config().cache_directory().unwrap(),
+            &fixture.directory
+        ));
         assert_eq!(clone.starts.load(Ordering::SeqCst), 1);
         assert_eq!(clone.updates(), [core]);
         assert_eq!(clone.drain_modes(), [true, false]);

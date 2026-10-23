@@ -1,3 +1,4 @@
+use super::cache::CacheDirectory;
 use super::countdown::Countdown;
 use super::shard::{ControlPlaneShard, RebalanceTimedOut, nodes};
 use crate::config::LatticeConfig;
@@ -171,12 +172,13 @@ impl ControlPlaneLattice {
         };
         let registry = UpstreamRegistry::new();
         let topology = mapper.topology();
+        let directory = CacheDirectory::new(registry.clone(), topology.clone());
         let sockets = topology.socket_count();
         let shards = (0..sockets)
             .map(|socket| {
                 log::info!(target: &name, "creating the shard of socket {socket}");
                 ControlPlaneShard::new(
-                    &registry,
+                    &directory,
                     socket,
                     format!("{name}-{}-{socket}", config.shard_name),
                     config.cloneable.clone(),
