@@ -50,6 +50,7 @@ mod benchmark;
 mod callback;
 mod collection;
 mod dummy;
+mod pipeline;
 mod runnable;
 
 pub use array::ArrayFrame;
@@ -57,6 +58,7 @@ pub use benchmark::BenchmarkFrame;
 pub use callback::{Callback, CallbackFrame, CallbackReceiver};
 pub use collection::CollectionFrame;
 pub use dummy::DummyFrame;
+pub use pipeline::{Completion, Outcome, PipelineBuilder, PipelineFrame, Status};
 pub use runnable::{RunnableFrame, Task};
 
 use crate::flow_control::RoutingPolicy;
@@ -157,7 +159,11 @@ impl FrameHeader {
     /// Sets the routing hash to the id hash mixed with `seed`, making the frame unordered for every
     /// seed.
     pub fn randomize_hash(&mut self, seed: u64) {
-        self.routing_hash = self.id_hash ^ hasher_api::mix_with_zero_check(seed);
+        self.routing_hash = randomized_hash(self.id_hash, seed);
+    }
+
+    pub(crate) fn set_routing_hash(&mut self, routing_hash: u64) {
+        self.routing_hash = routing_hash;
     }
 
     /// Restores the routing hash to the id hash, making the frame ordered.
@@ -240,6 +246,11 @@ pub trait Frame: Any + Send {
 
     /// Returns the frame to its pool. The default, for frames without one, drops it.
     fn recycle(self: Box<Self>) {}
+}
+
+/// The routing hash [`FrameHeader::randomize_hash`] gives a frame with `id_hash` and `seed`.
+fn randomized_hash(id_hash: u64, seed: u64) -> u64 {
+    id_hash ^ hasher_api::mix_with_zero_check(seed)
 }
 
 /// Executes each live frame in turn, stopping at the first error.

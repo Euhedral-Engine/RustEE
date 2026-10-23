@@ -1,5 +1,14 @@
 //! Interfaces between frames and whatever receives them.
 
+use crate::frames::Frame;
+
+/// Accepts frames for scheduling, such as the next stage of a
+/// [`PipelineFrame`](crate::frames::PipelineFrame).
+pub trait FrameSink: Send + Sync {
+    /// Takes `frame`, or hands that same frame back when it cannot.
+    fn offer(&self, frame: Box<dyn Frame>) -> Result<(), Box<dyn Frame>>;
+}
+
 /// Takes ownership of frames handed back by the frames themselves, such as finished
 /// [`CallbackFrame`](crate::frames::CallbackFrame)s.
 ///

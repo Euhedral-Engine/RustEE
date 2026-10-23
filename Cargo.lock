@@ -9,6 +9,7 @@ dependencies = [
  "euhedral-data-structures",
  "euhedral-hardware-utils",
  "euhedral-hashing",
+ "log",
 ]
 
 [[package]]
