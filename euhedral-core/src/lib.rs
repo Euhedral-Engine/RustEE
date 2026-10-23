@@ -2,7 +2,7 @@
 //!
 //! - [`frames`]: the [`Frame`](frames::Frame) trait every unit of work implements, and the stock
 //!   frames.
-//! - [`generics`]: interfaces for what receives frames.
+//! - [`generics`]: the interfaces frames flow through, and executors.
 //! - [`impls`]: pools that recycle finished frames (upstream package `impl`).
 //! - [`config`]: where each clone of a control-plane object runs.
 //! - [`flow_control`]: how far a frame may travel from where it was made.

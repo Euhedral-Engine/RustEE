@@ -1,4 +1,9 @@
-//! Interfaces between frames and whatever receives them.
+//! The interfaces frames flow through: lattice sources, receivers and interceptors, and the
+//! simpler hand-off points frames use themselves.
+
+mod lattice;
+
+pub use lattice::{LatticeInterceptor, LatticeReceiver, LatticeSource, LatticeTerminal};
 
 use crate::frames::Frame;
 
