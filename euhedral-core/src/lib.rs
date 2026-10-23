@@ -3,9 +3,11 @@
 //! - [`frames`]: the [`Frame`](frames::Frame) trait every unit of work implements, and the stock
 //!   frames.
 //! - [`generics`]: the interfaces frames flow through, and executors.
-//! - [`impls`]: pools that recycle finished frames (upstream package `impl`).
+//! - [`impls`]: pools that recycle finished frames, and the default executor (upstream package
+//!   `impl`).
 //! - [`config`]: where each clone of a control-plane object runs.
 //! - [`flow_control`]: how far a frame may travel from where it was made.
+//! - [`utils`]: math, spin waiting, timing and flow statistics for the control plane.
 //!
 //! A frame is owned by whoever holds its `Box`: queues, executors and pools move it rather than
 //! share it, so a frame needs no locking and is never touched by two threads at once.
@@ -15,5 +17,6 @@ pub mod flow_control;
 pub mod frames;
 pub mod generics;
 pub mod impls;
+pub mod utils;
 
 mod internal;
