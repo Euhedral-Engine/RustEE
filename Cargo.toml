@@ -1,0 +1,3 @@
+[workspace]
+members = ["euhedral-hashing"]
+resolver = "3"
