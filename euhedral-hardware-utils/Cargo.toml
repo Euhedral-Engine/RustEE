@@ -1,0 +1,23 @@
+[package]
+name = "euhedral-hardware-utils"
+version = "0.1.0"
+edition = "2024"
+description = "CPU topology, thread affinity, pinned executors and resource-pressure monitoring for Euhedral"
+
+[dependencies]
+log = "0.4.29"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.174"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_System_JobObjects",
+    "Win32_System_Kernel",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Power",
+    "Win32_System_ProcessStatus",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
