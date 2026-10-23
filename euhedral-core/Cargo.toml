@@ -5,5 +5,6 @@ edition = "2024"
 description = "Frames, frame pools and pipelines executed by the Euhedral control plane"
 
 [dependencies]
+euhedral-data-structures = { path = "../euhedral-data-structures" }
 euhedral-hardware-utils = { path = "../euhedral-hardware-utils" }
 euhedral-hashing = { path = "../euhedral-hashing" }
