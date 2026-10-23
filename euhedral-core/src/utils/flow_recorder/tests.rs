@@ -17,8 +17,8 @@ fn at(base: Instant, millis: u64) -> Instant {
 #[test]
 fn defaults() {
     let recorder = FlowRecorder::new();
-    assert_eq!(recorder.window(), Some(DEFAULT_WINDOW));
-    assert_eq!(recorder.alpha(), DEFAULT_ALPHA);
+    assert_eq!(recorder.window(), Some(FlowRecorder::DEFAULT_WINDOW));
+    assert_eq!(recorder.alpha(), FlowRecorder::DEFAULT_ALPHA);
     assert!(!recorder.is_measured());
     assert_eq!(recorder.min_units(), None);
     assert_eq!(recorder.last_recording(), None);

@@ -7,7 +7,7 @@
 //!   `impl`).
 //! - [`config`]: where each clone of a control-plane object runs.
 //! - [`flow_control`]: how far a frame may travel from where it was made.
-//! - [`utils`]: math, spin waiting, timing and flow statistics for the control plane.
+//! - [`utils`]: math, spin waiting, timing, flow statistics and calibration for the control plane.
 //!
 //! A frame is owned by whoever holds its `Box`: queues, executors and pools move it rather than
 //! share it, so a frame needs no locking and is never touched by two threads at once.

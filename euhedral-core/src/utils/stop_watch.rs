@@ -1,9 +1,6 @@
 use std::num::NonZeroU64;
 use std::time::{Duration, Instant};
 
-/// The default number of [`StopWatch::start`] calls per measurement.
-pub const DEFAULT_INTERVAL: NonZeroU64 = NonZeroU64::new(256).unwrap();
-
 /// A sampling timer: of every `interval` start/stop pairs, only the first is timed, which keeps the
 /// clock reads off the hot path.
 #[derive(Clone, Debug)]
@@ -14,9 +11,12 @@ pub struct StopWatch {
 }
 
 impl StopWatch {
-    /// Times one in every [`DEFAULT_INTERVAL`] pairs.
+    /// The default number of start/stop pairs per measurement.
+    pub const DEFAULT_INTERVAL: NonZeroU64 = NonZeroU64::new(256).unwrap();
+
+    /// Times one in every [`DEFAULT_INTERVAL`](Self::DEFAULT_INTERVAL) pairs.
     pub fn new() -> Self {
-        Self::with_interval(DEFAULT_INTERVAL)
+        Self::with_interval(Self::DEFAULT_INTERVAL)
     }
 
     /// Times one in every `interval` pairs.
@@ -122,6 +122,6 @@ mod tests {
     #[test]
     fn the_default_interval_is_256() {
         assert_eq!(StopWatch::new().interval().get(), 256);
-        assert_eq!(StopWatch::default().interval(), DEFAULT_INTERVAL);
+        assert_eq!(StopWatch::default().interval(), StopWatch::DEFAULT_INTERVAL);
     }
 }

@@ -1,12 +1,6 @@
 use super::math::ewma;
 use std::time::{Duration, Instant};
 
-/// The default measurement window of a [`FlowRecorder`].
-pub const DEFAULT_WINDOW: Duration = Duration::from_millis(10);
-
-/// The default EWMA weight of a [`FlowRecorder`]'s newest sample.
-pub const DEFAULT_ALPHA: f64 = 0.05;
-
 /// Running statistics of a flow of measurements: how many units each recording carried, how long
 /// apart the recordings were, and the rate between them.
 ///
@@ -54,9 +48,16 @@ pub struct FlowRecorder {
 }
 
 impl FlowRecorder {
-    /// A recorder with a [`DEFAULT_WINDOW`] window and weight [`DEFAULT_ALPHA`].
+    /// The default measurement window.
+    pub const DEFAULT_WINDOW: Duration = Duration::from_millis(10);
+
+    /// The default EWMA weight of the newest sample.
+    pub const DEFAULT_ALPHA: f64 = 0.05;
+
+    /// A recorder with a [`DEFAULT_WINDOW`](Self::DEFAULT_WINDOW) window and weight
+    /// [`DEFAULT_ALPHA`](Self::DEFAULT_ALPHA).
     pub fn new() -> Self {
-        Self::with_window(Some(DEFAULT_WINDOW), DEFAULT_ALPHA)
+        Self::with_window(Some(Self::DEFAULT_WINDOW), Self::DEFAULT_ALPHA)
     }
 
     /// A recorder counting recordings per `window` (`None` for one unbounded window), weighting

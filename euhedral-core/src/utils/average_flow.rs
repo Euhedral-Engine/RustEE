@@ -4,9 +4,6 @@ use std::fmt;
 /// The fixed-point scale of an acquisition-contention sample: `SCALE` is full contention.
 pub const ACQUIRE_CONTENTION_SCALE: u64 = 1_000_000;
 
-/// Each sample moves the average by `1 / DIVISOR` of its distance from the sample.
-pub const DIVISOR: u64 = 16;
-
 /// A fixed-point EWMA of samples in `0..=`[`ACQUIRE_CONTENTION_SCALE`], with no clock reads or
 /// floating-point work.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -15,6 +12,9 @@ pub struct AverageFlow {
 }
 
 impl AverageFlow {
+    /// Each sample moves the average by `1 / DIVISOR` of its distance from the sample.
+    pub const DIVISOR: u64 = 16;
+
     pub const fn new() -> Self {
         Self { value: None }
     }
@@ -26,8 +26,8 @@ impl AverageFlow {
         }
         self.value = Some(match self.value {
             None => sample,
-            Some(value) if sample >= value => value + (sample - value) / DIVISOR,
-            Some(value) => value - (value - sample) / DIVISOR,
+            Some(value) if sample >= value => value + (sample - value) / Self::DIVISOR,
+            Some(value) => value - (value - sample) / Self::DIVISOR,
         });
         Ok(())
     }
@@ -111,7 +111,7 @@ mod tests {
             assert!(value >= previous && value <= ACQUIRE_CONTENTION_SCALE);
             previous = value;
         }
-        assert!(previous >= ACQUIRE_CONTENTION_SCALE - DIVISOR);
+        assert!(previous >= ACQUIRE_CONTENTION_SCALE - AverageFlow::DIVISOR);
 
         for _ in 0..256 {
             average.record(0).unwrap();
@@ -119,7 +119,7 @@ mod tests {
             assert!(value <= previous);
             previous = value;
         }
-        assert!(previous < DIVISOR);
+        assert!(previous < AverageFlow::DIVISOR);
     }
 
     #[test]
