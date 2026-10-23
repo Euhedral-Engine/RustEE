@@ -6,7 +6,8 @@
 //! - [`impls`]: pools that recycle finished frames, and the default executor (upstream package
 //!   `impl`).
 //! - [`config`]: where each clone of a control-plane object runs.
-//! - [`flow_control`]: how far a frame may travel from where it was made.
+//! - [`flow_control`]: the lattice frames flow down through and demand flows up through: edges,
+//!   routing vertices, upstream handles and each worker's scheduler over them.
 //! - [`utils`]: math, spin waiting, timing, flow statistics and calibration for the control plane.
 //!
 //! A frame is owned by whoever holds its `Box`: queues, executors and pools move it rather than
