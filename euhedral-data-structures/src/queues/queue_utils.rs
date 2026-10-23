@@ -4,7 +4,8 @@
 pub const MAX_SIZE: u64 = 1 << 30;
 
 /// Counters advance by two per element, so the low bit is free for the multi-producer resize flag.
-const SHIFT: u32 = 1;
+pub(crate) const SHIFT: u32 = 1;
+pub(crate) const INCREMENT: u64 = 1 << SHIFT;
 
 /// The high 64 bits of the unsigned 128-bit product, used to map a random seed onto `0..n`.
 pub fn unsigned_multiply_high(a: u64, b: u64) -> u64 {

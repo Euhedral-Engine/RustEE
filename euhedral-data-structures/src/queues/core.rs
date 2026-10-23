@@ -1,0 +1,405 @@
+//! The chunked ring-buffer queue behind every queue flavour (`BaseConcurrentQueue` upstream).
+//!
+//! Elements live in power-of-two ring chunks. Counters advance by [`INCREMENT`] per element and wrap
+//! onto a chunk through `chunk_mask`. A producer may write up to `epoch`; when the ring is full an
+//! unbounded queue links a fresh chunk by publishing a `LINK` slot, and the consumer follows it.
+//!
+//! Every method is `unsafe` because it relies on a role contract that the handles in `queue.rs`
+//! enforce: one single-producer (`sp_*`) caller at a time, one single-consumer (`sc_*`) caller at a time.
+
+use super::chunk::{Chunk, ChunkPool, FULL, LINK, Slot};
+use super::queue_utils::{INCREMENT, MAX_SIZE, SHIFT, round_chunk_size};
+use crate::atomics::CachePadded;
+use std::cell::UnsafeCell;
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+
+/// State only the consumer writes; producers read `head` to learn how much room there is.
+struct ConsumerState<T> {
+    head: AtomicU64,
+    head_chunk: UnsafeCell<*mut Chunk<T>>,
+}
+
+/// State only the producer (or, for multiple producers, the one resizing) writes.
+struct ProducerState<T> {
+    epoch: AtomicU64,
+    tail_chunk: AtomicPtr<Chunk<T>>,
+}
+
+/// Fixed at construction and read by every operation.
+struct Config {
+    chunk_len: usize,
+    chunk_mask: u64,
+    /// How far past `head` a producer may write, in counter units.
+    window: u64,
+    bounded: bool,
+    capacity: u64,
+}
+
+/// Written only occasionally: the pool at chunk boundaries, the role flags when a handle is made, and
+/// the statistics. Kept off the hot lines so that traffic never invalidates them.
+pub(crate) struct Shared<T> {
+    pool: ChunkPool<T>,
+    chunks_allocated: AtomicUsize,
+    pub(crate) producer_taken: AtomicBool,
+    pub(crate) consumer_taken: AtomicBool,
+}
+
+/// Each group of fields below is padded to its own 128-byte blocks, like upstream's `TailPad`,
+/// `MidPad1`, `MidPad2` and `StartPad`, so a producer, a consumer and a resizing thread never
+/// contend for a line they do not both need.
+pub(crate) struct Core<T> {
+    tail: CachePadded<AtomicU64>,
+    consumer: CachePadded<ConsumerState<T>>,
+    producer: CachePadded<ProducerState<T>>,
+    pub(crate) shared: CachePadded<Shared<T>>,
+    config: CachePadded<Config>,
+}
+
+unsafe impl<T: Send> Send for Core<T> {}
+unsafe impl<T: Send> Sync for Core<T> {}
+
+impl<T> Core<T> {
+    /// An unbounded queue whose chunks hold `round_chunk_size(chunk_size)` ring slots.
+    pub(crate) fn new(chunk_size: usize, max_pooled_chunks: usize) -> Self {
+        let chunk_len = round_chunk_size(chunk_size.max(2) as u64) as usize;
+        let window = ((chunk_len as u64) - 1) << SHIFT;
+        Self::build(chunk_len, window, false, u64::MAX, max_pooled_chunks)
+    }
+
+    /// A queue that holds exactly `capacity` elements and never allocates another chunk.
+    pub(crate) fn bounded(capacity: usize) -> Self {
+        assert!(capacity > 0, "capacity must be positive");
+        assert!(
+            (capacity as u64) < MAX_SIZE,
+            "capacity must be below {MAX_SIZE}"
+        );
+        // One spare slot lets a full ring be told apart from an empty one.
+        let chunk_len = round_chunk_size(capacity as u64 + 1) as usize;
+        Self::build(
+            chunk_len,
+            (capacity as u64) << SHIFT,
+            true,
+            capacity as u64,
+            0,
+        )
+    }
+
+    fn build(
+        chunk_len: usize,
+        window: u64,
+        bounded: bool,
+        capacity: u64,
+        max_pooled_chunks: usize,
+    ) -> Self {
+        let first = Box::into_raw(Chunk::new(chunk_len));
+        Self {
+            tail: CachePadded::new(AtomicU64::new(0)),
+            consumer: CachePadded::new(ConsumerState {
+                head: AtomicU64::new(0),
+                head_chunk: UnsafeCell::new(first),
+            }),
+            producer: CachePadded::new(ProducerState {
+                epoch: AtomicU64::new(window),
+                tail_chunk: AtomicPtr::new(first),
+            }),
+            shared: CachePadded::new(Shared {
+                pool: ChunkPool::new(max_pooled_chunks),
+                chunks_allocated: AtomicUsize::new(0),
+                producer_taken: AtomicBool::new(false),
+                consumer_taken: AtomicBool::new(false),
+            }),
+            config: CachePadded::new(Config {
+                chunk_len,
+                chunk_mask: ((chunk_len as u64) - 1) << SHIFT,
+                window,
+                bounded,
+                capacity,
+            }),
+        }
+    }
+
+    pub(crate) fn capacity(&self) -> u64 {
+        self.config.capacity
+    }
+
+    #[cfg(test)]
+    fn pool_address(&self) -> *const u8 {
+        &self.shared.pool as *const ChunkPool<T> as *const u8
+    }
+
+    pub(crate) fn max_pooled_chunks(&self) -> usize {
+        self.shared.pool.max()
+    }
+
+    pub(crate) fn pooled_chunks(&self) -> usize {
+        self.shared.pool.len()
+    }
+
+    pub(crate) fn chunks_allocated(&self) -> usize {
+        self.shared.chunks_allocated.load(Ordering::Relaxed)
+    }
+
+    /// Reserved positions, which can include slots a producer has claimed but not yet published.
+    pub(crate) fn size_long(&self) -> u64 {
+        // `head` first: it only grows, so a later `tail` is never behind it.
+        let head = self.consumer.head.load(Ordering::Acquire);
+        let tail = self.tail.load(Ordering::Acquire);
+        tail.saturating_sub(head) >> SHIFT
+    }
+
+    /// The ring slot a counter position maps to.
+    fn index(&self, position: u64) -> usize {
+        ((position & self.config.chunk_mask) >> SHIFT) as usize
+    }
+
+    fn allocate_chunk(&self) -> *mut Chunk<T> {
+        let chunk = self.shared.pool.pop().unwrap_or_else(|| {
+            self.shared.chunks_allocated.fetch_add(1, Ordering::Relaxed);
+            Chunk::new(self.config.chunk_len)
+        });
+        Box::into_raw(chunk)
+    }
+
+    /// Hands a fully consumed chunk to the pool, or frees it.
+    ///
+    /// # Safety
+    ///
+    /// `chunk` must be a chunk of this queue whose slots are all `EMPTY` and whose `next` is null, and
+    /// the caller must not touch it afterwards: a producer may reuse it at once.
+    unsafe fn release_chunk(&self, chunk: *mut Chunk<T>) {
+        self.shared.pool.push(unsafe { Box::from_raw(chunk) });
+    }
+
+    /// Ends `old` at the slot for `position` and continues in `next`.
+    ///
+    /// # Safety
+    ///
+    /// The caller must own that slot, which is free, and `next` must be a fresh chunk.
+    unsafe fn link(&self, old: *mut Chunk<T>, next: *mut Chunk<T>, position: u64) {
+        let old = unsafe { &*old };
+        // Published by the release store on the slot just below.
+        old.next.store(next, Ordering::Relaxed);
+        unsafe { old.slots[self.index(position)].link() };
+    }
+
+    // ----- Single producer -----
+
+    /// Appends `item`, or hands it back if a bounded queue is full.
+    ///
+    /// # Safety
+    ///
+    /// At most one thread may call the `sp_*` methods at a time, and none may call the `mp_*` ones.
+    pub(crate) unsafe fn sp_offer(&self, item: T) -> Result<(), T> {
+        let tail = self.tail.load(Ordering::Relaxed);
+        while self.producer.epoch.load(Ordering::Relaxed) <= tail {
+            if !unsafe { self.sp_make_room(tail) } {
+                return Err(item);
+            }
+        }
+        let chunk = unsafe { &*self.producer.tail_chunk.load(Ordering::Relaxed) };
+        unsafe { chunk.slots[self.index(tail)].publish(item) };
+        self.tail.store(tail + INCREMENT, Ordering::Release);
+        Ok(())
+    }
+
+    /// Moves items from the front of `items` until the queue is full, returning how many.
+    ///
+    /// # Safety
+    ///
+    /// As for [`sp_offer`](Self::sp_offer).
+    pub(crate) unsafe fn sp_fill(&self, items: &mut Vec<T>) -> usize {
+        let mut total = 0;
+        while !items.is_empty() {
+            let tail = self.tail.load(Ordering::Relaxed);
+            let epoch = self.producer.epoch.load(Ordering::Relaxed);
+            if epoch <= tail {
+                if !unsafe { self.sp_make_room(tail) } {
+                    break;
+                }
+                continue;
+            }
+
+            let count = (((epoch - tail) >> SHIFT) as usize).min(items.len());
+            let chunk = unsafe { &*self.producer.tail_chunk.load(Ordering::Relaxed) };
+            let mut position = tail;
+            for item in items.drain(..count) {
+                unsafe { chunk.slots[self.index(position)].publish(item) };
+                position += INCREMENT;
+            }
+            self.tail.store(position, Ordering::Release);
+            total += count;
+        }
+        total
+    }
+
+    /// The producer has caught up with `epoch`. Raises it if the consumer freed room, otherwise starts
+    /// a new chunk; returns false only for a full bounded queue.
+    unsafe fn sp_make_room(&self, tail: u64) -> bool {
+        let head = self.consumer.head.load(Ordering::Acquire);
+        if head + self.config.window > tail {
+            self.producer
+                .epoch
+                .store(head + self.config.window, Ordering::Relaxed);
+            return true;
+        }
+        if self.config.bounded {
+            return false;
+        }
+
+        let old = self.producer.tail_chunk.load(Ordering::Relaxed);
+        let next = self.allocate_chunk();
+        unsafe { self.link(old, next, tail) };
+        self.producer.tail_chunk.store(next, Ordering::Relaxed);
+        self.producer
+            .epoch
+            .store(tail + self.config.window, Ordering::Relaxed);
+        true
+    }
+
+    // ----- Single consumer -----
+
+    /// Removes and returns the oldest published element.
+    ///
+    /// # Safety
+    ///
+    /// At most one thread may call the `sc_*` methods at a time, and the references they return must
+    /// not be used after the next `sc_*` call.
+    pub(crate) unsafe fn sc_poll(&self) -> Option<T> {
+        let head = self.consumer.head.load(Ordering::Relaxed);
+        let slot = unsafe { self.sc_slot(head) }?;
+        let item = unsafe { slot.take() };
+        self.consumer
+            .head
+            .store(head + INCREMENT, Ordering::Release);
+        Some(item)
+    }
+
+    /// The oldest published element, left in place.
+    ///
+    /// # Safety
+    ///
+    /// As for [`sc_poll`](Self::sc_poll).
+    pub(crate) unsafe fn sc_peek(&self) -> Option<&T> {
+        let head = self.consumer.head.load(Ordering::Relaxed);
+        let slot = unsafe { self.sc_slot(head) }?;
+        Some(unsafe { slot.peek() })
+    }
+
+    /// Hands up to `limit` elements to `consume`, stopping before the first one `stop` accepts.
+    ///
+    /// The head is published when this returns or unwinds, so a panicking callback leaves the queue
+    /// consistent: the element it was given is gone, the rest are still queued.
+    ///
+    /// # Safety
+    ///
+    /// As for [`sc_poll`](Self::sc_poll).
+    pub(crate) unsafe fn sc_drain(
+        &self,
+        consume: &mut impl FnMut(T),
+        stop: &mut impl FnMut(&T) -> bool,
+        limit: u64,
+    ) -> u64 {
+        let mut commit = HeadCommit {
+            cell: &self.consumer.head,
+            head: self.consumer.head.load(Ordering::Relaxed),
+        };
+        let mut total = 0;
+        while total < limit {
+            let Some(slot) = (unsafe { self.sc_slot(commit.head) }) else {
+                break;
+            };
+            if stop(unsafe { slot.peek() }) {
+                break;
+            }
+            let item = unsafe { slot.take() };
+            commit.head += INCREMENT;
+            total += 1;
+            consume(item);
+        }
+        total
+    }
+
+    /// The slot at `head` if it holds a published element, retiring finished chunks on the way.
+    unsafe fn sc_slot(&self, head: u64) -> Option<&Slot<T>> {
+        loop {
+            let chunk_ptr = unsafe { *self.consumer.head_chunk.get() };
+            let chunk = unsafe { &*chunk_ptr };
+            let slot = &chunk.slots[self.index(head)];
+            match slot.state() {
+                FULL => return Some(slot),
+                LINK => {
+                    // `next` was stored before the slot was published as LINK.
+                    let next = chunk.next.load(Ordering::Acquire);
+                    unsafe { slot.clear_link() };
+                    chunk.next.store(std::ptr::null_mut(), Ordering::Relaxed);
+                    unsafe { *self.consumer.head_chunk.get() = next };
+                    unsafe { self.release_chunk(chunk_ptr) };
+                }
+                // EMPTY: nothing has been published here yet.
+                _ => return None,
+            }
+        }
+    }
+}
+
+/// Publishes the consumer's head when a drain finishes or unwinds.
+struct HeadCommit<'a> {
+    cell: &'a AtomicU64,
+    head: u64,
+}
+
+impl Drop for HeadCommit<'_> {
+    fn drop(&mut self) {
+        self.cell.store(self.head, Ordering::Release);
+    }
+}
+
+impl<T> Drop for Core<T> {
+    fn drop(&mut self) {
+        // Only the chain from the head chunk is live; the chunk drop drops any elements still in it.
+        let mut chunk = *self.consumer.head_chunk.get_mut();
+        while !chunk.is_null() {
+            let boxed = unsafe { Box::from_raw(chunk) };
+            chunk = boxed.next.load(Ordering::Relaxed);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::mem::{align_of, size_of};
+    use std::sync::Arc;
+
+    fn block(address: *const u8) -> usize {
+        address as usize / 128
+    }
+
+    #[test]
+    fn every_group_of_hot_fields_sits_alone_on_its_own_128_byte_block() {
+        let core = Core::<u64>::new(8, 2);
+        // One field from each group: the producer's tail, the consumer's head, the producer's epoch, the
+        // pool's lock and a configuration constant that every operation reads.
+        let blocks = [
+            block(&*core.tail as *const AtomicU64 as *const u8),
+            block(&core.consumer.head as *const AtomicU64 as *const u8),
+            block(&core.producer.epoch as *const AtomicU64 as *const u8),
+            block(core.pool_address()),
+            block(&core.config.chunk_mask as *const u64 as *const u8),
+        ];
+
+        for (i, a) in blocks.iter().enumerate() {
+            for b in &blocks[i + 1..] {
+                assert_ne!(a, b, "two groups share a cache line: {blocks:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_queue_is_aligned_and_sized_in_whole_128_byte_blocks() {
+        assert_eq!(align_of::<Core<u64>>(), 128);
+        assert_eq!(size_of::<Core<u64>>() % 128, 0);
+        let shared = Arc::new(Core::<u64>::new(8, 0));
+        assert_eq!(Arc::as_ptr(&shared) as usize % 128, 0);
+    }
+}
