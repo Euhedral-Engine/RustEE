@@ -1,5 +1,6 @@
 use super::LatticeSource;
 use crate::config::{CloneConfig, CloneLivenessRegistry};
+use crate::flow_control::LatticeEdge;
 use euhedral_hardware_utils::affinity::PinnedThreadExecutor;
 use euhedral_hardware_utils::monitor::CoreSnapshot;
 use std::sync::Arc;
@@ -7,10 +8,12 @@ use std::time::Instant;
 
 /// Anything the control plane clones onto each core it places work on.
 ///
-/// The control plane calls, in order: [`clone_object`](Self::clone_object) (or
-/// [`clone_object_on`](Self::clone_object_on)), [`first_touch`](Self::first_touch),
-/// [`start`](Self::start), then [`input`](Self::input) and [`output`](Self::output) to wire the clone
-/// into the lattice. Every other method has a default suited to an object without that concern.
+/// A [`ControlPlaneShard`](crate::control_plane::ControlPlaneShard) calls, in order:
+/// [`clone_object`](Self::clone_object), [`input_edge`](Self::input_edge) to attach the clone below
+/// its core's edge, [`set_drain_mode`](Self::set_drain_mode), [`start`](Self::start), then
+/// [`update`](Self::update) with each new utilization of the core. [`input`](Self::input) and
+/// [`output`](Self::output) wire clones to other sources. Every other method has a default suited
+/// to an object without that concern.
 pub trait CloneableObject: Send + Sync + 'static {
     /// A new instance placed by `config`.
     fn clone_object(&self, config: &CloneConfig) -> Arc<dyn CloneableObject>;
@@ -49,6 +52,13 @@ pub trait CloneableObject: Send + Sync + 'static {
     /// Attaches `stream` as a source of frames for this clone.
     fn input(self: Arc<Self>, stream: Arc<dyn LatticeSource>) {
         let _ = stream;
+    }
+
+    /// Attaches this clone below `edge`, the edge its core's frames arrive through: typically with
+    /// [`LatticeEdge::add_downstream`] or [`LatticeEdge::add_downstream_node`]. The default ignores
+    /// it.
+    fn input_edge(self: Arc<Self>, edge: Arc<LatticeEdge>) {
+        let _ = edge;
     }
 
     /// The source this clone emits frames through, if any.
