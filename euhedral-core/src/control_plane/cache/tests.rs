@@ -1,0 +1,721 @@
+use super::*;
+use crate::flow_control::UpstreamHandle;
+use crate::flow_control::testing::{Fate, Fates, Tracked, frame};
+use euhedral_hardware_utils::monitor::{HardwareUtilization, HardwareUtilizationParts};
+use euhedral_hardware_utils::topology::source::{
+    CacheDomain, CoreKind, LogicalCpu, TopologyInput, normalize,
+};
+use std::collections::VecDeque;
+use std::num::NonZeroUsize;
+use std::panic::{self, AssertUnwindSafe};
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
+
+const L1: u64 = 32 * 1024;
+const L2: u64 = 1024 * 1024;
+
+/// Socket 0 has eight cores, socket 1 two; core `c` has CPUs `2c` and `2c + 1`, which share a
+/// 32 KiB L1 and a 1 MiB L2.
+fn topology() -> Topology {
+    let socket_of = |core: usize| if core < 8 { 0 } else { 1 };
+    let cpus = (0..20)
+        .map(|cpu| LogicalCpu {
+            id: cpu,
+            socket_key: format!("linux:package:{:010}", socket_of(cpu / 2)),
+            die_key: "linux:die:0000000000".to_string(),
+            core_key: format!("linux:core:{:010}", cpu / 2),
+            kind: CoreKind::Unknown,
+        })
+        .collect();
+    let caches = (0..10)
+        .flat_map(|core| {
+            let sharers = CpuSet::range(2 * core, 2 * core + 2);
+            [(1, L1), (2, L2)].map(|(level, size_bytes)| CacheDomain {
+                level,
+                size_bytes,
+                line_size_bytes: 64,
+                sharers: sharers.clone(),
+            })
+        })
+        .collect();
+    normalize(TopologyInput {
+        provider: "linux".to_string(),
+        cpus,
+        caches,
+    })
+    .unwrap()
+}
+
+fn directory() -> Arc<CacheDirectory> {
+    CacheDirectory::new(UpstreamRegistry::new(), topology())
+}
+
+fn config(partitions: usize) -> CacheConfig {
+    CacheConfig::default().with_partitions(NonZeroUsize::new(partitions).unwrap())
+}
+
+fn clone_config(core: usize) -> CloneConfig {
+    CloneConfig::new("shard", core, CpuSet::range(2 * core, 2 * core + 2))
+}
+
+/// A cache on `core`, run from the core's first CPU.
+fn cache_on(
+    directory: &Arc<CacheDirectory>,
+    config: &CacheConfig,
+    core: usize,
+) -> Arc<ControlPlaneCache> {
+    ControlPlaneCache::new(config, &clone_config(core), 2 * core, false, directory)
+}
+
+fn cache(partitions: usize) -> Arc<ControlPlaneCache> {
+    cache_on(&directory(), &config(partitions), 0)
+}
+
+/// An ordered frame: it routes by its id hash.
+fn ordered(id: u64) -> Box<dyn Frame> {
+    frame(id)
+}
+
+/// An unordered frame with routing hash `hash`.
+fn unordered(id: u64, hash: u64) -> Box<dyn Frame> {
+    let mut frame = frame(id);
+    frame.header_mut().set_routing_hash(hash);
+    assert!(!frame.header().is_ordered());
+    frame
+}
+
+fn ids(frames: &[Box<dyn Frame>]) -> Vec<u64> {
+    frames
+        .iter()
+        .map(|frame| frame.header().id_hash())
+        .collect()
+}
+
+/// Hands out queued frames and records the demand requested of it.
+#[derive(Default)]
+struct Source {
+    frames: Mutex<VecDeque<Box<dyn Frame>>>,
+    requested: AtomicU64,
+}
+
+impl UpstreamHandle for Source {
+    fn sequence(&self) -> u64 {
+        0
+    }
+
+    fn pull(
+        &self,
+        consumer: &mut dyn FnMut(Box<dyn Frame>),
+        stop: &mut dyn FnMut(&dyn Frame) -> bool,
+        demand: u64,
+    ) -> Option<u64> {
+        let mut frames = self.frames.lock().unwrap();
+        let mut pulled = 0;
+        while pulled < demand {
+            match frames.front() {
+                Some(frame) if !stop(&**frame) => {
+                    consumer(frames.pop_front().unwrap());
+                    pulled += 1;
+                }
+                _ => break,
+            }
+        }
+        Some(pulled)
+    }
+
+    fn request(&self, demand: u64) {
+        self.requested.fetch_add(demand, Ordering::SeqCst);
+    }
+
+    fn is_complete(&self) -> bool {
+        false
+    }
+}
+
+/// Makes the calling thread a worker of `directory`'s registry, fed by a new source.
+fn source(directory: &CacheDirectory, frames: Vec<Box<dyn Frame>>) -> Arc<Source> {
+    let source = Arc::new(Source {
+        frames: Mutex::new(frames.into()),
+        ..Default::default()
+    });
+    directory.registry().register();
+    directory.registry().add_handle(source.clone());
+    source
+}
+
+#[test]
+fn a_cache_is_named_and_placed_by_its_clone() {
+    let directory = directory();
+    let cache = ControlPlaneCache::new(&config(2), &clone_config(3), 7, false, &directory);
+    assert_eq!(cache.name(), "shard-ControlPlaneCache-3");
+    assert_eq!(cache.core(), 3);
+    assert_eq!(cache.cpu(), 7);
+    assert!(Arc::ptr_eq(&directory.cache_at(7).unwrap(), &cache));
+    assert!(cache.is_drained());
+    assert_eq!(cache.local_cache_count(), 0);
+    assert_eq!(cache.cap_factor(), 1.0);
+}
+
+#[test]
+fn chunks_fill_the_budgeted_share_of_l1_and_l2() {
+    let directory = directory();
+    // (1 MiB + 32 KiB) / 8 partitions * 0.7 = 94,617 bytes: 64 KiB, 4,096 boxed frames.
+    let cache = cache_on(&directory, &config(8), 0);
+    assert_eq!(cache.chunk_size(), 4096);
+    assert_eq!(cache.frame_quota(), 8 * 4096);
+    assert_eq!(cache.max_local_cache_count(), 8 * 4096);
+
+    // SMT siblings split the core's caches: half of each, 32 KiB, 2,048 frames.
+    let sibling = ControlPlaneCache::new(&config(8), &clone_config(1), 2, true, &directory);
+    assert_eq!(sibling.chunk_size(), 2048);
+}
+
+#[test]
+fn chunks_never_shrink_below_the_minimum() {
+    let tiny = CacheConfig::default()
+        .with_memory_budget(0.001)
+        .unwrap()
+        .with_partitions(NonZeroUsize::new(64).unwrap());
+    let layout = topology().cache_layout(0).unwrap().clone();
+    assert_eq!(chunk_size(&tiny, Some(&layout), false), MIN_CHUNK);
+    assert_eq!(chunk_size(&config(8), None, false), MIN_CHUNK);
+    let unshared = CpuCacheLayout {
+        mask_l1: CpuSet::range(0, 1),
+        mask_l2: CpuSet::range(0, 1),
+        ..layout
+    };
+    assert_eq!(chunk_size(&config(8), Some(&unshared), true), 4096);
+}
+
+#[test]
+fn caches_on_crowded_l2s_split_them() {
+    let layout = topology().cache_layout(0).unwrap().clone();
+    let crowded = CpuCacheLayout {
+        mask_l2: CpuSet::range(0, 4),
+        ..layout
+    };
+    // (256 KiB + 32 KiB) / 8 * 0.7 = 25,804 bytes: 16 KiB, 1,024 frames.
+    assert_eq!(chunk_size(&config(8), Some(&crowded), false), 1024);
+}
+
+#[test]
+fn pushed_frames_are_counted_and_drained_in_partition_order() {
+    let cache = cache(2);
+    FlowContext::initialize();
+    // Hashes in the lower half go to the first partition, the upper half to the second.
+    for (id, hash) in [(1, 0), (2, 1), (3, 1 << 63), (4, u64::MAX)] {
+        cache.push(unordered(id, hash));
+    }
+    let satisfied = FlowContext::with(|context| context.unwrap().satisfied_request());
+    FlowContext::clear();
+    assert_eq!(satisfied, 4);
+    assert_eq!(cache.local_cache_count(), 4);
+    assert!(!cache.is_drained());
+
+    let mut drained = Vec::new();
+    assert_eq!(cache.drain(|frame| drained.push(frame), 3), 3);
+    assert_eq!(ids(&drained), [1, 2, 3]);
+    assert_eq!(cache.local_cache_count(), 1);
+
+    drained.clear();
+    assert_eq!(cache.drain(|frame| drained.push(frame), 3), 1);
+    assert_eq!(ids(&drained), [4]);
+    assert!(cache.is_drained());
+}
+
+#[test]
+fn a_zero_limit_drains_nothing() {
+    let cache = cache(2);
+    cache.push(ordered(1));
+    assert_eq!(cache.drain(|_| panic!("not consumed"), 0), 0);
+    assert_eq!(
+        cache.drain_while(|_| panic!("not consumed"), |_| panic!("not asked"), 0),
+        0
+    );
+    assert_eq!(cache.pull(0), 0);
+    assert_eq!(cache.upstream_pull(|_| panic!("not consumed"), 0), 0);
+    assert_eq!(cache.local_cache_count(), 1);
+}
+
+#[test]
+fn a_stopped_partition_keeps_its_head_while_others_progress() {
+    let cache = cache(2);
+    cache.push(unordered(1, 0));
+    cache.push(unordered(2, 1));
+    cache.push(unordered(3, u64::MAX));
+
+    let mut drained = Vec::new();
+    let taken = cache.drain_while(
+        |frame| drained.push(frame),
+        |frame| frame.header().id_hash() == 1,
+        3,
+    );
+    assert_eq!(taken, 1);
+    assert_eq!(ids(&drained), [3]);
+    assert_eq!(cache.local_cache_count(), 2);
+
+    drained.clear();
+    assert_eq!(cache.drain(|frame| drained.push(frame), 3), 2);
+    assert_eq!(ids(&drained), [1, 2]);
+}
+
+#[test]
+fn the_queue_grows_past_the_frame_quota() {
+    let cache = cache(1);
+    let frames = cache.frame_quota() + 17;
+    for id in 0..frames {
+        cache.push(ordered(id));
+    }
+    assert_eq!(cache.local_cache_count(), frames);
+    assert!(cache.local_cache_count() > cache.max_local_cache_count());
+    let mut drained = Vec::new();
+    assert_eq!(cache.drain(|frame| drained.push(frame), u64::MAX), frames);
+    assert_eq!(ids(&drained), (0..frames).collect::<Vec<_>>());
+}
+
+/// Drains two partitions where taking the second partition's frame queues one in the first,
+/// which only another walk over the partitions finds.
+fn drain_with_refill(threshold: u64) -> u64 {
+    let directory = directory();
+    let config = config(2).with_ring_walk_reset_threshold(threshold);
+    let cache = cache_on(&directory, &config, 0);
+    cache.push(unordered(1, u64::MAX));
+    let refill = cache.clone();
+    cache.drain(
+        |frame| {
+            if frame.header().id_hash() == 1 {
+                refill.push(unordered(2, 1));
+            }
+        },
+        10,
+    )
+}
+
+#[test]
+fn a_productive_walk_walks_the_partitions_again() {
+    assert_eq!(drain_with_refill(0), 2);
+}
+
+#[test]
+fn a_walk_at_the_threshold_ends_the_drain() {
+    assert_eq!(drain_with_refill(1), 1);
+}
+
+#[test]
+fn a_consumer_that_panics_leaves_the_count_and_partition_usable() {
+    let cache = cache(1);
+    for id in 0..3 {
+        cache.push(ordered(id));
+    }
+    let failed = panic::catch_unwind(AssertUnwindSafe(|| {
+        cache.drain(
+            |frame| {
+                if frame.header().id_hash() == 1 {
+                    panic!("consumer failed");
+                }
+            },
+            3,
+        )
+    }));
+    assert!(failed.is_err());
+    assert_eq!(cache.local_cache_count(), 1);
+
+    let mut drained = Vec::new();
+    assert_eq!(cache.drain(|frame| drained.push(frame), 3), 1);
+    assert_eq!(ids(&drained), [2]);
+}
+
+#[test]
+fn work_stealing_takes_unordered_frames_and_leaves_ordered_heads() {
+    let directory = directory();
+    let thief = cache_on(&directory, &config(1), 0);
+    let victim = cache_on(&directory, &config(1), 1);
+    victim.push(unordered(1, 5));
+    victim.push(ordered(2));
+    victim.push(unordered(3, 7));
+
+    let mut stolen = Vec::new();
+    assert_eq!(
+        thief.work_steal(|frame| stolen.push(frame), 10, victim.cpu()),
+        1
+    );
+    assert_eq!(ids(&stolen), [1]);
+    assert_eq!(victim.local_cache_count(), 2);
+
+    // The cursor wraps over the CPUs.
+    victim.push(unordered(4, 9));
+    let span = directory.topology().cpu_span();
+    let mut owner = Vec::new();
+    victim.drain_while(
+        |frame| owner.push(frame),
+        |frame| frame.header().id_hash() == 3,
+        10,
+    );
+    assert_eq!(ids(&owner), [2]);
+    stolen.clear();
+    assert_eq!(
+        thief.work_steal(|frame| stolen.push(frame), 10, victim.cpu() + span),
+        2
+    );
+    assert_eq!(ids(&stolen), [3, 4]);
+    assert!(victim.is_drained());
+}
+
+#[test]
+fn work_stealing_finds_nothing_at_an_empty_slot_or_when_off() {
+    let directory = directory();
+    let thief = cache_on(&directory, &config(1), 0);
+    let victim = cache_on(&directory, &config(1), 1);
+    victim.push(unordered(1, 5));
+    assert_eq!(thief.work_steal(|_| panic!("nothing to steal"), 10, 5), 0);
+
+    let honest = cache_on(&directory, &config(1).with_work_steal(false), 2);
+    assert_eq!(
+        honest.work_steal(|_| panic!("stealing is off"), 10, victim.cpu()),
+        0
+    );
+    assert_eq!(victim.local_cache_count(), 1);
+}
+
+#[test]
+fn a_held_partition_is_passed_over() {
+    let directory = directory();
+    let thief = cache_on(&directory, &config(1), 0);
+    let victim = cache_on(&directory, &config(1), 1);
+    victim.push(unordered(1, 5));
+
+    let held = victim.partitions[0].lock().unwrap();
+    assert_eq!(
+        thief.work_steal(|_| panic!("the partition is held"), 10, victim.cpu()),
+        0
+    );
+    assert_eq!(victim.drain(|_| panic!("the partition is held"), 10), 0);
+    drop(held);
+
+    assert_eq!(thief.work_steal(drop, 10, victim.cpu()), 1);
+}
+
+#[test]
+fn a_closed_cache_fails_new_frames_and_keeps_its_queue() {
+    let directory = directory();
+    let thief = cache_on(&directory, &config(1), 0);
+    let victim = cache_on(&directory, &config(1), 1);
+    victim.push(unordered(1, 5));
+
+    victim.close();
+    victim.close();
+
+    assert!(victim.is_closed());
+    assert!(victim.edge().is_edge_closed());
+    assert!(directory.cache_at(victim.cpu()).is_none());
+    assert_eq!(
+        thief.work_steal(|_| panic!("withdrawn"), 10, victim.cpu()),
+        0
+    );
+
+    let fates = Fates::default();
+    victim.push(Tracked::new(2, &fates));
+    let fates = fates.lock().unwrap().clone();
+    assert_eq!(fates.len(), 1);
+    assert!(matches!(fates[0].1, Fate::Failed(_)));
+    assert_eq!(victim.local_cache_count(), 1);
+    assert_eq!(victim.drain(drop, 10), 1);
+}
+
+#[test]
+fn closing_an_old_cache_leaves_its_replacement_in_place() {
+    let directory = directory();
+    let old = cache_on(&directory, &config(1), 1);
+    let replacement = cache_on(&directory, &config(1), 1);
+    old.close();
+    assert!(Arc::ptr_eq(&directory.cache_at(2).unwrap(), &replacement));
+}
+
+#[test]
+fn closing_does_not_wait_for_a_thief_mid_drain() {
+    let directory = directory();
+    let thief = cache_on(&directory, &config(1), 0);
+    let victim = cache_on(&directory, &config(1), 1);
+    victim.push(unordered(1, 5));
+    victim.push(unordered(2, 6));
+    let (entered, inside) = mpsc::channel();
+    let (release, released) = mpsc::channel::<()>();
+    let cpu = victim.cpu();
+    let stealing = thread::spawn(move || {
+        thief.work_steal(
+            |_| {
+                entered.send(()).unwrap();
+                released.recv().unwrap();
+            },
+            1,
+            cpu,
+        )
+    });
+    inside.recv().unwrap();
+
+    let closer = victim.clone();
+    let (closed, done) = mpsc::channel();
+    thread::spawn(move || {
+        closer.close();
+        closed.send(()).unwrap();
+    });
+    done.recv_timeout(Duration::from_secs(5)).unwrap();
+
+    release.send(()).unwrap();
+    assert_eq!(stealing.join().unwrap(), 1);
+    assert_eq!(victim.local_cache_count(), 1);
+}
+
+#[test]
+fn an_attached_cache_takes_the_frames_pushed_into_its_edge() {
+    let directory = directory();
+    let cache = cache_on(&directory, &config(1), 0);
+    let edge = LatticeEdge::new(directory.registry(), Default::default());
+    cache.attach(&edge);
+    edge.push_downstream(ordered(1));
+    assert_eq!(cache.local_cache_count(), 1);
+    assert!(cache.edge().parent().is_some());
+}
+
+#[test]
+fn pull_fills_the_cache_through_the_edges_above() {
+    let directory = directory();
+    let cache = cache_on(&directory, &config(1), 0);
+    let edge = LatticeEdge::new(directory.registry(), Default::default());
+    cache.attach(&edge);
+    let source = source(&directory, (0..5).map(ordered).collect());
+
+    cache.set_drain_mode(true);
+    assert_eq!(cache.pull(3), 0);
+    cache.set_drain_mode(false);
+
+    assert_eq!(cache.pull(3), 3);
+    assert_eq!(cache.local_cache_count(), 3);
+    let mut drained = Vec::new();
+    cache.drain(|frame| drained.push(frame), 10);
+    assert_eq!(ids(&drained), [0, 1, 2]);
+    assert_eq!(source.frames.lock().unwrap().len(), 2);
+    directory.registry().remove_thread();
+}
+
+#[test]
+fn upstream_pull_bypasses_the_cache_and_stops_at_ordered_frames() {
+    let directory = directory();
+    let cache = cache_on(&directory, &config(1), 0);
+    let _source = source(
+        &directory,
+        vec![unordered(1, 5), unordered(2, 6), ordered(3)],
+    );
+    let mut pulled = Vec::new();
+    assert_eq!(cache.upstream_pull(|frame| pulled.push(frame), 10), 2);
+    assert_eq!(ids(&pulled), [1, 2]);
+    assert!(cache.is_drained());
+    directory.registry().remove_thread();
+}
+
+#[test]
+fn request_scales_the_batch_by_the_socket_and_fans_it_out() {
+    let directory = directory();
+    // Core 0 sits on socket 0, with eight cores: the batch scales by 3.
+    let cache = cache_on(&directory, &config(1), 0);
+    let source = source(&directory, Vec::new());
+    FlowContext::initialize();
+    FlowContext::with(|context| {
+        let context = context.unwrap();
+        context.add_satisfied_request(11);
+        context.add_satisfied_pull(13);
+        context.set_original_pull(14);
+    });
+
+    cache.request(4);
+
+    let (satisfied, original, satisfied_pull, original_pull) = FlowContext::with(|context| {
+        let context = context.unwrap();
+        (
+            context.satisfied_request(),
+            context.original_request(),
+            context.satisfied_pull(),
+            context.original_pull(),
+        )
+    });
+    FlowContext::clear();
+    assert_eq!((satisfied, original), (0, 12));
+    assert_eq!((satisfied_pull, original_pull), (0, 0));
+    // Two sockets.
+    assert_eq!(source.requested.load(Ordering::SeqCst), 24);
+    directory.registry().remove_thread();
+}
+
+#[test]
+fn request_is_capped_by_the_cache_capacity() {
+    let directory = directory();
+    let cache = cache_on(&directory, &config(1), 9);
+    let source = source(&directory, Vec::new());
+    cache.request(u64::MAX);
+    assert_eq!(
+        source.requested.load(Ordering::SeqCst),
+        2 * cache.max_local_cache_count()
+    );
+    directory.registry().remove_thread();
+}
+
+#[test]
+fn a_small_socket_still_doubles_the_batch() {
+    let directory = directory();
+    // Core 9 sits on socket 1, with two cores: 37.5% rounds down to zero, raised to two.
+    let cache = cache_on(&directory, &config(1), 9);
+    let source = source(&directory, Vec::new());
+    cache.request(5);
+    assert_eq!(source.requested.load(Ordering::SeqCst), 20);
+    directory.registry().remove_thread();
+}
+
+/// A snapshot of `core` where each CPU has the pressure given for it.
+fn snapshot(core: usize, pressures: &[(usize, f64)]) -> CoreSnapshot {
+    let mut per_cpu = vec![0.0; 20];
+    for &(cpu, pressure) in pressures {
+        per_cpu[cpu] = pressure;
+    }
+    let utilization = HardwareUtilization::new(HardwareUtilizationParts {
+        quota_cpus: 20.0,
+        global_effective_cpus: CpuSet::range(0, 20),
+        per_quota_cpu_pressure: per_cpu,
+        ..Default::default()
+    });
+    utilization.core_snapshot(core, &CpuSet::range(2 * core, 2 * core + 2), 2.0)
+}
+
+#[test]
+fn pressure_lowers_the_cap_quickly_and_relief_raises_it_slowly() {
+    let cache = cache(1);
+    // The core's busiest CPU counts: the target is 1 - 0.85 * 0.8 = 0.32.
+    cache.update(&snapshot(0, &[(0, 0.2), (1, 0.8)]));
+    let lowered = 1.0 * 0.8 + 0.32 * 0.2;
+    assert!((cache.cap_factor() - lowered).abs() < 1e-12);
+    assert_eq!(
+        cache.max_local_cache_count(),
+        (cache.frame_quota() as f64 * lowered) as u64
+    );
+
+    cache.update(&snapshot(0, &[]));
+    let raised = lowered * 0.98 + 0.02;
+    assert!((cache.cap_factor() - raised).abs() < 1e-12);
+}
+
+#[test]
+fn pressure_on_other_cores_is_ignored() {
+    let cache = cache(1);
+    cache.update(&snapshot(0, &[(2, 1.0), (3, 1.0)]));
+    assert_eq!(cache.cap_factor(), 1.0);
+}
+
+#[test]
+fn the_cap_never_falls_below_its_floor() {
+    let cache = cache(1);
+    for _ in 0..200 {
+        cache.update(&snapshot(0, &[(0, 1.0)]));
+    }
+    assert!(cache.cap_factor() >= MIN_CAP_FACTOR);
+    assert!(cache.cap_factor() < MIN_CAP_FACTOR + 1e-9);
+}
+
+#[test]
+fn reset_drops_every_frame_and_restores_capacity() {
+    let cache = cache(2);
+    cache.update(&snapshot(0, &[(0, 1.0)]));
+    for id in 0..5 {
+        cache.push(ordered(id));
+    }
+    assert_eq!(cache.reset_for_next_trial(), 5);
+    assert!(cache.is_drained());
+    assert_eq!(cache.cap_factor(), 1.0);
+    assert_eq!(cache.drain(|_| panic!("cleared"), 10), 0);
+    assert_eq!(cache.reset_for_next_trial(), 0);
+}
+
+#[test]
+fn errors_from_upstream_stop_at_the_cache() {
+    let cache = cache(1);
+    LatticeNode::on_error(&*cache, "upstream failed".into());
+    LatticeNode::close(&*cache);
+    assert!(LatticeNode::is_closed(&*cache));
+}
+
+#[test]
+fn a_count_that_dips_below_zero_reads_as_empty() {
+    let cache = cache(1);
+    cache.count.store(-1, Ordering::SeqCst);
+    assert_eq!(cache.local_cache_count(), 0);
+    assert!(cache.is_drained());
+}
+
+#[test]
+fn pressure_is_rounded_to_four_places() {
+    let cache = cache(1);
+    cache.update(&snapshot(0, &[(0, 0.123_449)]));
+    let target = 1.0 - 0.85 * 0.1234;
+    assert!((cache.cap_factor() - (0.8 + 0.2 * target)).abs() < 1e-12);
+}
+
+#[test]
+fn frames_queued_after_a_reset_are_the_only_ones_left() {
+    let cache = cache(1);
+    for id in 0..3 {
+        cache.push(ordered(id));
+    }
+    cache.reset_for_next_trial();
+    cache.push(ordered(9));
+    let mut drained = Vec::new();
+    assert_eq!(cache.drain(|frame| drained.push(frame), 10), 1);
+    assert_eq!(ids(&drained), [9]);
+}
+
+#[test]
+fn chunks_count_the_l1_with_the_l2() {
+    let layout = CpuCacheLayout {
+        bytes_l1: 64 * 1024,
+        bytes_l2: 64 * 1024,
+        mask_l1: CpuSet::range(0, 1),
+        mask_l2: CpuSet::range(0, 1),
+        ..topology().cache_layout(0).unwrap().clone()
+    };
+    let whole = config(1).with_memory_budget(1.0).unwrap();
+    // 128 KiB in one partition: 8,192 boxed frames.
+    assert_eq!(chunk_size(&whole, Some(&layout), false), 8192);
+}
+
+#[test]
+fn first_touch_writes_the_chunks_then_resets_the_cache() {
+    let directory = directory();
+    let config = config(2).with_max_pooled_chunks(2);
+    let cache = cache_on(&directory, &config, 0);
+    cache.update(&snapshot(0, &[(0, 1.0)]));
+
+    cache.first_touch();
+
+    // Three chunks' worth of frames retires at least two chunks per partition; the pool keeps two.
+    assert_eq!(cache.pooled_chunks(), 4);
+    assert!(cache.is_drained());
+    assert_eq!(cache.cap_factor(), 1.0);
+    assert_eq!(
+        cache.drain(|_| panic!("the dummies are cleared"), u64::MAX),
+        0
+    );
+    cache.push(ordered(1));
+    let mut drained = Vec::new();
+    cache.drain(|frame| drained.push(frame), 10);
+    assert_eq!(ids(&drained), [1]);
+}
+
+#[test]
+fn first_touch_runs_once() {
+    let directory = directory();
+    let cache = cache_on(&directory, &config(1).with_max_pooled_chunks(4), 0);
+    cache.first_touch();
+    cache.update(&snapshot(0, &[(0, 1.0)]));
+    cache.first_touch();
+    // A chunk spends a slot on its link, so three chunks' worth of frames retired three chunks.
+    assert_eq!(cache.pooled_chunks(), 3);
+    assert!(cache.cap_factor() < 1.0);
+}

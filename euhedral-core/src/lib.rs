@@ -7,7 +7,8 @@
 //!   `impl`).
 //! - [`config`]: how a lattice is set up, and where each clone of a control-plane object runs.
 //! - [`control_plane`]: the lattice where frames enter, and the shard per socket that places a
-//!   clone of an object on each effective core and routes frames among them.
+//!   clone of an object on each effective core and routes frames among them, and the core-local
+//!   cache that holds a clone's frames.
 //! - [`flow_control`]: the lattice frames flow down through and demand flows up through: edges,
 //!   routing vertices, upstream handles and each worker's scheduler over them.
 //! - [`utils`]: math, spin waiting, timing, flow statistics and calibration for the control plane.

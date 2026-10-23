@@ -15,7 +15,8 @@ use std::time::Instant;
 /// [`output`](Self::output) wire clones to other sources. Every other method has a default suited
 /// to an object without that concern.
 pub trait CloneableObject: Send + Sync + 'static {
-    /// A new instance placed by `config`.
+    /// A new instance placed by `config`. How the clone is built is up to the implementation; the
+    /// shard does not call [`first_touch`](Self::first_touch).
     fn clone_object(&self, config: &CloneConfig) -> Arc<dyn CloneableObject>;
 
     /// Like [`clone_object`](Self::clone_object), for a clone that runs on `executor`. The default
@@ -31,9 +32,10 @@ pub trait CloneableObject: Send + Sync + 'static {
 
     fn start(&self) {}
 
-    /// Called once before [`start`](Self::start) on the clone's own CPU. Objects that allocate
-    /// should fill their queues and touch their state here, then reset it, so the memory lands on
-    /// the NUMA node of the CPU that uses it.
+    /// Called once before [`start`](Self::start), on the clone's own CPU, by whatever builds the
+    /// clone. Objects that allocate should fill their queues and touch their state here, then
+    /// reset it: on Linux, the first touch of a page places it on the NUMA node of the CPU that
+    /// uses it.
     fn first_touch(&self) {}
 
     fn is_started(&self) -> bool {
