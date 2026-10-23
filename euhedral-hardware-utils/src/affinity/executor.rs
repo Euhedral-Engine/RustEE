@@ -1,0 +1,817 @@
+//! An executor that runs each command on a fresh thread pinned to one logical CPU (upstream
+//! `PinnedThreadExecutor`).
+//!
+//! Executors live in a registry with at most one live executor per CPU. A handle is cheap to clone;
+//! dropping the last handle closes the executor, as upstream's `Cleaner` did when an executor became
+//! unreachable.
+//!
+//! Divergences from upstream:
+//! - No thread priority or daemon flag: std threads have neither, and a Rust process exits when
+//!   `main` returns regardless of other threads.
+//! - No JVM shutdown hook closing every executor at exit; process exit ends every thread.
+//! - Interruption is cooperative: [`shutdown_now`](PinnedThreadExecutor::shutdown_now) and closing
+//!   set a flag the task reads with [`is_interrupted`] and unpark the task's thread.
+//! - A CPU that is a hole in a sparse topology is rejected up front.
+
+use std::any::Any;
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::fmt;
+use std::io;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
+use std::thread::{self, JoinHandle, Thread};
+use std::time::{Duration, Instant};
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    // No user code runs under these locks.
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+thread_local! {
+    static INTERRUPTED: RefCell<Option<Arc<AtomicBool>>> = const { RefCell::new(None) };
+}
+
+/// Whether the calling pinned task has been asked to stop, by
+/// [`shutdown_now`](PinnedThreadExecutor::shutdown_now) or by closing its executor. Always `false`
+/// outside a pinned task.
+pub fn is_interrupted() -> bool {
+    INTERRUPTED.with(|flag| {
+        flag.borrow()
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+    })
+}
+
+/// Why a registry call failed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExecutorError {
+    /// The CPU is not an active logical CPU.
+    InvalidCpu(usize),
+    /// The thread name contains a NUL byte.
+    InvalidName,
+    /// A closed executor for this CPU still has running tasks, so it cannot be replaced yet.
+    ClosedWithActiveTasks(usize),
+    /// The executor is closed and cannot restart.
+    Closed,
+}
+
+impl fmt::Display for ExecutorError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ExecutorError::InvalidCpu(cpu) => write!(f, "cpu {cpu} is not an active logical CPU"),
+            ExecutorError::InvalidName => f.write_str("thread names may not contain NUL bytes"),
+            ExecutorError::ClosedWithActiveTasks(cpu) => {
+                write!(f, "a closed executor still owns active tasks for CPU {cpu}")
+            }
+            ExecutorError::Closed => f.write_str("a closed executor cannot restart"),
+        }
+    }
+}
+
+impl std::error::Error for ExecutorError {}
+
+/// Why a command was not accepted.
+#[derive(Debug)]
+pub enum Rejected {
+    /// The executor is shut down or closed.
+    NotRunning,
+    /// The task thread could not be spawned.
+    Spawn(io::Error),
+}
+
+impl fmt::Display for Rejected {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Rejected::NotRunning => f.write_str("the executor is not running"),
+            Rejected::Spawn(error) => write!(f, "failed to spawn a pinned thread: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for Rejected {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Rejected::Spawn(error) => Some(error),
+            Rejected::NotRunning => None,
+        }
+    }
+}
+
+/// The affinity steps around each task, injectable for tests.
+pub(crate) trait TaskBinding: Send + Sync {
+    /// Opens the managed-CPU scope on the task thread; the guard ends it.
+    fn bind(&self, cpu: usize) -> Option<Box<dyn Any>>;
+    fn set_affinity(&self, cpu: usize) -> bool;
+    fn release_affinity(&self);
+}
+
+struct ControllerBinding;
+
+impl TaskBinding for ControllerBinding {
+    fn bind(&self, cpu: usize) -> Option<Box<dyn Any>> {
+        super::controller()
+            .bind_managed_cpu(cpu)
+            .map(|binding| Box::new(binding) as Box<dyn Any>)
+    }
+
+    fn set_affinity(&self, cpu: usize) -> bool {
+        super::controller().set_affinity(cpu)
+    }
+
+    fn release_affinity(&self) {
+        super::controller().release_affinity();
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum State {
+    Running,
+    Shutdown,
+    Closed,
+}
+
+struct Task {
+    thread: Option<Thread>,
+    interrupted: Arc<AtomicBool>,
+}
+
+impl Task {
+    fn interrupt(&self) {
+        self.interrupted.store(true, Ordering::Release);
+        if let Some(thread) = &self.thread {
+            thread.unpark();
+        }
+    }
+}
+
+struct ControlState {
+    state: State,
+    name: String,
+    tasks: HashMap<u64, Task>,
+    next_task: u64,
+}
+
+/// One executor's lifecycle and its running tasks (upstream `LifecycleControl`).
+struct Control {
+    state: Mutex<ControlState>,
+    changed: Condvar,
+}
+
+impl Control {
+    fn lock(&self) -> MutexGuard<'_, ControlState> {
+        lock(&self.state)
+    }
+
+    fn state(&self) -> State {
+        self.lock().state
+    }
+
+    fn is_empty(&self) -> bool {
+        self.lock().tasks.is_empty()
+    }
+
+    /// Closes permanently and interrupts every task; returns whether no task is running.
+    fn close(&self) -> bool {
+        let mut control = self.lock();
+        control.state = State::Closed;
+        control.tasks.values().for_each(Task::interrupt);
+        self.changed.notify_all();
+        control.tasks.is_empty()
+    }
+
+    /// Removes a finished task; returns whether the executor is closed with no task left.
+    fn remove_task(&self, id: u64) -> bool {
+        let mut control = self.lock();
+        control.tasks.remove(&id);
+        self.changed.notify_all();
+        control.state == State::Closed && control.tasks.is_empty()
+    }
+}
+
+struct Entry {
+    id: u64,
+    executor: Weak<Inner>,
+    control: Arc<Control>,
+}
+
+struct RegistryShared {
+    entries: Mutex<HashMap<usize, Entry>>,
+    binding: Arc<dyn TaskBinding>,
+    validator: Box<dyn Fn(usize) -> bool + Send + Sync>,
+}
+
+impl RegistryShared {
+    /// Removes the entry for `cpu` if it is still entry `id` and has no running task.
+    fn remove_exact(&self, cpu: usize, id: u64) {
+        let mut entries = lock(&self.entries);
+        if entries
+            .get(&cpu)
+            .is_some_and(|entry| entry.id == id && entry.control.is_empty())
+        {
+            entries.remove(&cpu);
+        }
+    }
+}
+
+/// A set of executors, at most one live per CPU (upstream `Registry`). The process-wide one backs
+/// [`PinnedThreadExecutor::get_or_create`]; tests build isolated ones.
+pub(crate) struct Registry {
+    shared: Arc<RegistryShared>,
+}
+
+static NEXT_ENTRY: AtomicU64 = AtomicU64::new(0);
+
+impl Registry {
+    pub(crate) fn new(
+        binding: Arc<dyn TaskBinding>,
+        validator: impl Fn(usize) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            shared: Arc::new(RegistryShared {
+                entries: Mutex::new(HashMap::new()),
+                binding,
+                validator: Box::new(validator),
+            }),
+        }
+    }
+
+    fn global() -> &'static Registry {
+        static GLOBAL: OnceLock<Registry> = OnceLock::new();
+        GLOBAL.get_or_init(|| {
+            Registry::new(Arc::new(ControllerBinding), |cpu| {
+                crate::topology::Topology::system().is_active_cpu(cpu)
+            })
+        })
+    }
+
+    fn validate(&self, cpu: usize) -> Result<(), ExecutorError> {
+        if (self.shared.validator)(cpu) {
+            Ok(())
+        } else {
+            Err(ExecutorError::InvalidCpu(cpu))
+        }
+    }
+
+    /// The live executor for `cpu`: a running one as is, a shut-down one restarted under `name`, or a
+    /// new one.
+    pub(crate) fn acquire(
+        &self,
+        cpu: usize,
+        name: &str,
+    ) -> Result<PinnedThreadExecutor, ExecutorError> {
+        self.validate(cpu)?;
+        check_name(name)?;
+        // An upgraded handle may be the last one; drop it only after releasing the registry lock.
+        let mut stale = None;
+        let result = {
+            let mut entries = lock(&self.shared.entries);
+            let reuse = match entries.get(&cpu) {
+                Some(entry) => {
+                    let live = entry.executor.upgrade();
+                    let state = entry.control.state();
+                    match (live, state) {
+                        (Some(inner), State::Running) => Some(Ok(PinnedThreadExecutor { inner })),
+                        (Some(inner), State::Shutdown) => {
+                            let executor = PinnedThreadExecutor { inner };
+                            Some(executor.start(name).map(|()| executor))
+                        }
+                        (live, _) if !entry.control.is_empty() => {
+                            stale = live;
+                            Some(Err(ExecutorError::ClosedWithActiveTasks(cpu)))
+                        }
+                        (live, _) => {
+                            stale = live;
+                            entries.remove(&cpu);
+                            None
+                        }
+                    }
+                }
+                None => None,
+            };
+            reuse.unwrap_or_else(|| {
+                let id = NEXT_ENTRY.fetch_add(1, Ordering::Relaxed);
+                let control = Arc::new(Control {
+                    state: Mutex::new(ControlState {
+                        state: State::Running,
+                        name: name.to_owned(),
+                        tasks: HashMap::new(),
+                        next_task: 0,
+                    }),
+                    changed: Condvar::new(),
+                });
+                let inner = Arc::new(Inner {
+                    cpu,
+                    entry: id,
+                    control: Arc::clone(&control),
+                    registry: Arc::downgrade(&self.shared),
+                    binding: Arc::clone(&self.shared.binding),
+                });
+                entries.insert(
+                    cpu,
+                    Entry {
+                        id,
+                        executor: Arc::downgrade(&inner),
+                        control,
+                    },
+                );
+                Ok(PinnedThreadExecutor { inner })
+            })
+        };
+        drop(stale);
+        result
+    }
+
+    /// The running executor for `cpu`, if any; never restarts one.
+    pub(crate) fn get(&self, cpu: usize) -> Result<Option<PinnedThreadExecutor>, ExecutorError> {
+        self.validate(cpu)?;
+        let live;
+        let found = {
+            let mut entries = lock(&self.shared.entries);
+            let Some(entry) = entries.get(&cpu) else {
+                return Ok(None);
+            };
+            live = entry.executor.upgrade();
+            let state = entry.control.state();
+            match &live {
+                Some(inner) if state == State::Running => Some(PinnedThreadExecutor {
+                    inner: Arc::clone(inner),
+                }),
+                _ => {
+                    if (live.is_none() || state == State::Closed) && entry.control.is_empty() {
+                        entries.remove(&cpu);
+                    }
+                    None
+                }
+            }
+        };
+        drop(live);
+        Ok(found)
+    }
+
+    /// Closes every executor; later acquisitions create new ones.
+    pub(crate) fn close_all(&self) {
+        // An executor with running tasks keeps its entry until the last task exits.
+        lock(&self.shared.entries).retain(|_, entry| !entry.control.close());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn entry_count(&self) -> usize {
+        lock(&self.shared.entries).len()
+    }
+}
+
+fn check_name(name: &str) -> Result<(), ExecutorError> {
+    if name.contains('\0') {
+        Err(ExecutorError::InvalidName)
+    } else {
+        Ok(())
+    }
+}
+
+struct Inner {
+    cpu: usize,
+    entry: u64,
+    control: Arc<Control>,
+    registry: Weak<RegistryShared>,
+    binding: Arc<dyn TaskBinding>,
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        // The registry entry is removed by the last task or the next registry access: this may run
+        // under the registry lock.
+        self.control.close();
+    }
+}
+
+/// Runs each command on a fresh thread pinned to one logical CPU.
+#[derive(Clone)]
+pub struct PinnedThreadExecutor {
+    inner: Arc<Inner>,
+}
+
+impl fmt::Debug for PinnedThreadExecutor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let control = self.inner.control.lock();
+        f.debug_struct("PinnedThreadExecutor")
+            .field("cpu", &self.inner.cpu)
+            .field("state", &control.state)
+            .field("name", &control.name)
+            .field("active_tasks", &control.tasks.len())
+            .finish()
+    }
+}
+
+impl PinnedThreadExecutor {
+    /// The one live executor for `cpu`, creating it, or restarting a shut-down one, with thread
+    /// name `name` (upstream `getOrSetIfAbsent`).
+    pub fn get_or_create(cpu: usize, name: &str) -> Result<Self, ExecutorError> {
+        Registry::global().acquire(cpu, name)
+    }
+
+    /// The running executor for `cpu`, if one exists.
+    pub fn get(cpu: usize) -> Result<Option<Self>, ExecutorError> {
+        Registry::global().get(cpu)
+    }
+
+    /// Permanently closes every executor in the process-wide registry.
+    pub fn close_all() {
+        Registry::global().close_all();
+    }
+
+    pub fn cpu(&self) -> usize {
+        self.inner.cpu
+    }
+
+    /// Restarts a shut-down executor under a new thread name; a no-op while running.
+    pub fn start(&self, name: &str) -> Result<(), ExecutorError> {
+        check_name(name)?;
+        let mut control = self.inner.control.lock();
+        match control.state {
+            State::Running => Ok(()),
+            State::Closed => Err(ExecutorError::Closed),
+            State::Shutdown => {
+                control.state = State::Running;
+                control.name = name.to_owned();
+                self.inner.control.changed.notify_all();
+                Ok(())
+            }
+        }
+    }
+
+    /// Runs `command` on a new pinned thread.
+    pub fn execute(&self, command: impl FnOnce() + Send + 'static) -> Result<(), Rejected> {
+        self.submit(command).map(drop)
+    }
+
+    /// Runs `task` on a new pinned thread and returns its handle.
+    pub fn submit<T: Send + 'static>(
+        &self,
+        task: impl FnOnce() -> T + Send + 'static,
+    ) -> Result<JoinHandle<T>, Rejected> {
+        let control = &self.inner.control;
+        let mut state = control.lock();
+        if state.state != State::Running {
+            return Err(Rejected::NotRunning);
+        }
+        let id = state.next_task;
+        state.next_task += 1;
+        let interrupted = Arc::new(AtomicBool::new(false));
+        let finish = TaskFinish {
+            id,
+            cpu: self.inner.cpu,
+            entry: self.inner.entry,
+            control: Arc::clone(control),
+            registry: Weak::clone(&self.inner.registry),
+        };
+        let binding = Arc::clone(&self.inner.binding);
+        let (cpu, flag) = (self.inner.cpu, Arc::clone(&interrupted));
+        // The task removes itself under this lock, so it cannot finish before it is registered.
+        let spawned = thread::Builder::new()
+            .name(state.name.clone())
+            .spawn(move || {
+                let _finish = finish;
+                run_pinned(&*binding, cpu, Some(flag), task)
+            })
+            .map_err(Rejected::Spawn)?;
+        state.tasks.insert(
+            id,
+            Task {
+                thread: Some(spawned.thread().clone()),
+                interrupted,
+            },
+        );
+        Ok(spawned)
+    }
+
+    /// Spawns a pinned thread outside the lifecycle: it is not counted, not interrupted, and allowed in
+    /// any state (upstream's `pinnedFactory`).
+    pub fn spawn_untracked<T: Send + 'static>(
+        &self,
+        task: impl FnOnce() -> T + Send + 'static,
+    ) -> io::Result<JoinHandle<T>> {
+        let binding = Arc::clone(&self.inner.binding);
+        let cpu = self.inner.cpu;
+        let name = self.inner.control.lock().name.clone();
+        thread::Builder::new()
+            .name(name)
+            .spawn(move || run_pinned(&*binding, cpu, None, task))
+    }
+
+    /// Stops accepting commands; running tasks continue.
+    pub fn shutdown(&self) {
+        let mut control = self.inner.control.lock();
+        if control.state == State::Running {
+            control.state = State::Shutdown;
+            self.inner.control.changed.notify_all();
+        }
+    }
+
+    /// Stops accepting commands and interrupts every running task.
+    pub fn shutdown_now(&self) {
+        let mut control = self.inner.control.lock();
+        if control.state == State::Running {
+            control.state = State::Shutdown;
+        }
+        control.tasks.values().for_each(Task::interrupt);
+        self.inner.control.changed.notify_all();
+    }
+
+    /// Closes permanently and interrupts every running task. Other handles see it closed.
+    pub fn close(&self) {
+        if self.inner.control.close()
+            && let Some(registry) = self.inner.registry.upgrade()
+        {
+            registry.remove_exact(self.inner.cpu, self.inner.entry);
+        }
+    }
+
+    pub fn is_shutdown(&self) -> bool {
+        self.inner.control.state() != State::Running
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.inner.control.state() == State::Closed
+    }
+
+    /// Not running and no task left.
+    pub fn is_terminated(&self) -> bool {
+        let control = self.inner.control.lock();
+        control.state != State::Running && control.tasks.is_empty()
+    }
+
+    /// Waits until terminated; `false` on timeout, or at once while running.
+    pub fn await_termination(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now().checked_add(timeout);
+        let mut control = self.inner.control.lock();
+        loop {
+            if control.state == State::Running {
+                return false;
+            }
+            if control.tasks.is_empty() {
+                return true;
+            }
+            let remaining = match deadline {
+                Some(deadline) => deadline.saturating_duration_since(Instant::now()),
+                None => Duration::MAX,
+            };
+            if remaining.is_zero() {
+                return false;
+            }
+            control = self
+                .inner
+                .control
+                .changed
+                .wait_timeout(control, remaining)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+    }
+
+    #[cfg(test)]
+    fn active_tasks(&self) -> usize {
+        self.inner.control.lock().tasks.len()
+    }
+}
+
+/// Removes a task from its executor when the task thread ends, panicking or not.
+struct TaskFinish {
+    id: u64,
+    cpu: usize,
+    entry: u64,
+    control: Arc<Control>,
+    registry: Weak<RegistryShared>,
+}
+
+impl Drop for TaskFinish {
+    fn drop(&mut self) {
+        if self.control.remove_task(self.id)
+            && let Some(registry) = self.registry.upgrade()
+        {
+            registry.remove_exact(self.cpu, self.entry);
+        }
+    }
+}
+
+/// Runs `task` inside the managed binding and affinity, undoing both even if it panics.
+fn run_pinned<T>(
+    binding: &dyn TaskBinding,
+    cpu: usize,
+    interrupted: Option<Arc<AtomicBool>>,
+    task: impl FnOnce() -> T,
+) -> T {
+    struct Undo<'a> {
+        binding: &'a dyn TaskBinding,
+        managed: Option<Box<dyn Any>>,
+    }
+    impl Drop for Undo<'_> {
+        fn drop(&mut self) {
+            self.binding.release_affinity();
+            drop(self.managed.take());
+            INTERRUPTED.with(|flag| flag.borrow_mut().take());
+        }
+    }
+    INTERRUPTED.with(|flag| *flag.borrow_mut() = interrupted);
+    let managed = binding.bind(cpu);
+    if managed.is_none() {
+        log::debug!("no managed binding for logical CPU {cpu}");
+    }
+    let _undo = Undo { binding, managed };
+    if !binding.set_affinity(cpu) {
+        log::debug!("could not pin a task to logical CPU {cpu}");
+    }
+    task()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    #[derive(Default)]
+    struct Recording {
+        events: Mutex<Vec<String>>,
+    }
+
+    impl TaskBinding for Recording {
+        fn bind(&self, cpu: usize) -> Option<Box<dyn Any>> {
+            lock(&self.events).push(format!("bind {cpu}"));
+            Some(Box::new(()))
+        }
+
+        fn set_affinity(&self, cpu: usize) -> bool {
+            lock(&self.events).push(format!("pin {cpu}"));
+            true
+        }
+
+        fn release_affinity(&self) {
+            lock(&self.events).push("release".into());
+        }
+    }
+
+    fn registry() -> (Registry, Arc<Recording>) {
+        let binding = Arc::new(Recording::default());
+        // CPU 2 is a hole.
+        (
+            Registry::new(binding.clone(), |cpu| cpu < 4 && cpu != 2),
+            binding,
+        )
+    }
+
+    #[test]
+    fn runs_each_command_pinned_and_releases_after() {
+        let (registry, binding) = registry();
+        let executor = registry.acquire(1, "pinned-1").unwrap();
+        let handle = executor
+            .submit(|| thread::current().name().map(str::to_owned))
+            .unwrap();
+        assert_eq!(handle.join().unwrap().as_deref(), Some("pinned-1"));
+        executor.shutdown();
+        assert!(executor.await_termination(Duration::from_secs(5)));
+        assert_eq!(*lock(&binding.events), ["bind 1", "pin 1", "release"]);
+    }
+
+    #[test]
+    fn holes_and_bad_names_are_rejected() {
+        let (registry, _) = registry();
+        assert_eq!(
+            registry.acquire(2, "x").unwrap_err(),
+            ExecutorError::InvalidCpu(2)
+        );
+        assert_eq!(
+            registry.acquire(9, "x").unwrap_err(),
+            ExecutorError::InvalidCpu(9)
+        );
+        assert_eq!(registry.get(2).unwrap_err(), ExecutorError::InvalidCpu(2));
+        assert_eq!(
+            registry.acquire(0, "a\0b").unwrap_err(),
+            ExecutorError::InvalidName
+        );
+    }
+
+    #[test]
+    fn one_live_executor_per_cpu() {
+        let (registry, _) = registry();
+        let first = registry.acquire(0, "a").unwrap();
+        let second = registry.acquire(0, "b").unwrap();
+        assert!(Arc::ptr_eq(&first.inner, &second.inner));
+        assert!(registry.get(0).unwrap().is_some());
+        assert!(registry.get(1).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_shut_down_executor_restarts_on_acquire() {
+        let (registry, _) = registry();
+        let executor = registry.acquire(0, "before").unwrap();
+        executor.shutdown();
+        assert!(matches!(executor.execute(|| {}), Err(Rejected::NotRunning)));
+        assert!(registry.get(0).unwrap().is_none(), "get never restarts");
+        let restarted = registry.acquire(0, "after").unwrap();
+        assert!(Arc::ptr_eq(&executor.inner, &restarted.inner));
+        let name = restarted
+            .submit(|| thread::current().name().map(str::to_owned))
+            .unwrap();
+        assert_eq!(name.join().unwrap().as_deref(), Some("after"));
+    }
+
+    #[test]
+    fn dropping_the_last_handle_closes_and_frees_the_slot() {
+        let (registry, _) = registry();
+        let executor = registry.acquire(0, "a").unwrap();
+        let control = Arc::clone(&executor.inner.control);
+        drop(executor);
+        assert_eq!(control.state(), State::Closed);
+        assert!(registry.get(0).unwrap().is_none());
+        assert_eq!(registry.entry_count(), 0);
+        let replacement = registry.acquire(0, "b").unwrap();
+        assert!(!replacement.is_shutdown());
+    }
+
+    #[test]
+    fn a_closed_executor_with_running_tasks_blocks_replacement() {
+        let (registry, _) = registry();
+        let executor = registry.acquire(3, "a").unwrap();
+        let (started, started_rx) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel::<()>();
+        let handle = executor
+            .submit(move || {
+                started.send(()).unwrap();
+                release_rx.recv().unwrap();
+                is_interrupted()
+            })
+            .unwrap();
+        started_rx.recv().unwrap();
+        executor.close();
+        assert_eq!(
+            registry.acquire(3, "b").unwrap_err(),
+            ExecutorError::ClosedWithActiveTasks(3)
+        );
+        release.send(()).unwrap();
+        assert!(handle.join().unwrap(), "closing interrupts running tasks");
+        assert!(executor.await_termination(Duration::from_secs(5)));
+        assert_eq!(registry.entry_count(), 0);
+        assert!(registry.acquire(3, "b").is_ok());
+    }
+
+    #[test]
+    fn shutdown_now_interrupts_but_keeps_the_executor_restartable() {
+        let (registry, _) = registry();
+        let executor = registry.acquire(1, "a").unwrap();
+        let (started, started_rx) = mpsc::channel();
+        let handle = executor
+            .submit(move || {
+                started.send(()).unwrap();
+                while !is_interrupted() {
+                    thread::park_timeout(Duration::from_millis(10));
+                }
+            })
+            .unwrap();
+        started_rx.recv().unwrap();
+        assert!(!executor.await_termination(Duration::ZERO));
+        executor.shutdown_now();
+        handle.join().unwrap();
+        assert!(executor.await_termination(Duration::from_secs(5)));
+        assert!(executor.is_terminated());
+        executor.start("b").unwrap();
+        assert!(!executor.is_shutdown());
+        assert!(!is_interrupted());
+    }
+
+    #[test]
+    fn a_panicking_task_still_releases_and_unregisters() {
+        let (registry, binding) = registry();
+        let executor = registry.acquire(0, "a").unwrap();
+        let handle = executor.submit(|| panic!("task failure")).unwrap();
+        assert!(handle.join().is_err());
+        assert_eq!(executor.active_tasks(), 0);
+        assert_eq!(
+            lock(&binding.events).last().map(String::as_str),
+            Some("release")
+        );
+    }
+
+    #[test]
+    fn close_all_closes_every_executor_and_restart_is_refused() {
+        let (registry, _) = registry();
+        let zero = registry.acquire(0, "a").unwrap();
+        let one = registry.acquire(1, "b").unwrap();
+        registry.close_all();
+        assert!(zero.is_closed() && one.is_closed());
+        assert_eq!(zero.start("c").unwrap_err(), ExecutorError::Closed);
+        assert_eq!(registry.entry_count(), 0);
+        let fresh = registry.acquire(0, "d").unwrap();
+        assert!(!Arc::ptr_eq(&fresh.inner, &zero.inner));
+    }
+
+    #[test]
+    fn untracked_threads_are_pinned_but_not_counted() {
+        let (registry, binding) = registry();
+        let executor = registry.acquire(3, "a").unwrap();
+        executor.shutdown();
+        let handle = executor.spawn_untracked(|| 7).unwrap();
+        assert_eq!(handle.join().unwrap(), 7);
+        assert!(executor.is_terminated());
+        assert_eq!(*lock(&binding.events), ["bind 3", "pin 3", "release"]);
+    }
+}

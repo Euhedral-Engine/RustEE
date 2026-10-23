@@ -1,5 +1,6 @@
 //! Platform back ends, selected at compile time.
 
+use crate::affinity::AffinityProvider;
 use crate::monitor::sampling::{DetailedSnapshotProvider, SystemSnapshotProvider};
 use crate::topology::{Topology, source};
 
@@ -17,5 +18,9 @@ pub(crate) fn detailed_provider(topology: &Topology) -> Option<Box<dyn DetailedS
 }
 
 pub(crate) fn snapshot_provider() -> Option<Box<dyn SystemSnapshotProvider>> {
+    None
+}
+
+pub(crate) fn affinity_provider() -> Option<Box<dyn AffinityProvider>> {
     None
 }
