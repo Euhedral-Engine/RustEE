@@ -45,11 +45,17 @@
 //! The finalizer takes the frame by value: it is the frame's last owner on that executor, and
 //! decides where the frame goes next (a pool, a receiver, or another queue).
 
+mod array;
 mod benchmark;
+mod collection;
 mod dummy;
+mod runnable;
 
+pub use array::ArrayFrame;
 pub use benchmark::BenchmarkFrame;
+pub use collection::CollectionFrame;
 pub use dummy::DummyFrame;
+pub use runnable::{RunnableFrame, Task};
 
 use crate::flow_control::RoutingPolicy;
 use euhedral_hardware_utils::topology::CpuInfo;
@@ -234,5 +240,19 @@ pub trait Frame: Any + Send {
     fn recycle(self: Box<Self>) {}
 }
 
+/// Executes each live frame in turn, stopping at the first error.
+fn execute_all<'a>(
+    frames: impl IntoIterator<Item = &'a mut Box<dyn Frame>>,
+) -> Result<(), FrameError> {
+    for frame in frames {
+        if frame.is_alive() {
+            frame.execute()?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) mod testing;
 #[cfg(test)]
 mod tests;
