@@ -7,7 +7,7 @@ mod padded_double_adder;
 mod padded_long_adder;
 mod padded_slots;
 mod padding;
-mod thread_random;
+pub(crate) mod thread_random;
 
 pub use atomic_double::AtomicDouble;
 pub use padded_atomic_double::PaddedAtomicDouble;
