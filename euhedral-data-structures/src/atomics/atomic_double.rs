@@ -79,12 +79,21 @@ impl AtomicDouble {
     }
 
     pub fn get_and_add(&self, val: f64) -> f64 {
+        self.add_with(val, Ordering::SeqCst)
+    }
+
+    /// Add with release ordering on success. Only the padded arrays and adders use it.
+    pub(crate) fn get_and_add_release(&self, val: f64) -> f64 {
+        self.add_with(val, Ordering::Release)
+    }
+
+    fn add_with(&self, val: f64, success: Ordering) -> f64 {
         let mut prev = self.bits.load(Ordering::Relaxed);
         loop {
             let next = (f64::from_bits(prev) + val).to_bits();
             match self
                 .bits
-                .compare_exchange_weak(prev, next, Ordering::SeqCst, Ordering::Relaxed)
+                .compare_exchange_weak(prev, next, success, Ordering::Relaxed)
             {
                 Ok(_) => return f64::from_bits(prev),
                 Err(witness) => prev = witness,
