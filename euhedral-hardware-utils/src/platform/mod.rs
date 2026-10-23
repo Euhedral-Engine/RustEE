@@ -3,6 +3,9 @@
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) mod linux;
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) mod macos;
+
 use crate::affinity::AffinityProvider;
 use crate::monitor::SystemSnapshot;
 use crate::monitor::sampling::{
@@ -55,6 +58,8 @@ pub(crate) fn legacy_snapshot(
 pub(crate) fn discover_topology() -> Topology {
     #[cfg(target_os = "linux")]
     return linux::layout::discover(std::path::Path::new("/sys"));
+    #[cfg(target_os = "macos")]
+    return macos::layout::discover(&macos::system::SystemSysctl, processor_count());
     #[allow(unreachable_code)]
     source::fallback(processor_count())
 }
@@ -62,6 +67,8 @@ pub(crate) fn discover_topology() -> Topology {
 pub(crate) fn detailed_provider(topology: &Topology) -> Option<Box<dyn DetailedSnapshotProvider>> {
     #[cfg(target_os = "linux")]
     return Some(Box::new(linux::resources::LinuxResources::new(topology)));
+    #[cfg(target_os = "macos")]
+    return Some(Box::new(macos::resources::MacosResources::new(topology)));
     #[allow(unreachable_code)]
     {
         let _ = topology;
@@ -74,6 +81,10 @@ pub(crate) fn snapshot_provider() -> Option<Box<dyn SystemSnapshotProvider>> {
     return Some(Box::new(linux::resources::LinuxSnapshots::new(
         linux::resources::LinuxResources::new(Topology::system()),
     )));
+    #[cfg(target_os = "macos")]
+    return Some(Box::new(macos::resources::MacosResources::new(
+        Topology::system(),
+    )));
     #[allow(unreachable_code)]
     None
 }
@@ -83,6 +94,8 @@ pub(crate) fn affinity_provider() -> Option<Box<dyn AffinityProvider>> {
     return Some(Box::new(linux::affinity::LinuxAffinity::new(
         Topology::system().cpu_span(),
     )));
+    #[cfg(target_os = "macos")]
+    return Some(Box::new(macos::affinity::MacosAffinity));
     #[allow(unreachable_code)]
     None
 }
