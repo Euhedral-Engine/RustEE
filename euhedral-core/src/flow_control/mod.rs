@@ -3,9 +3,12 @@
 //! - [`RoutingPolicy`]: how far a frame may travel from where it was made.
 //! - [`LatticeHotSource`]: a source its owner pushes frames into by hand.
 //! - [`LatticeHotReceiver`]: a pusher that retries a frame until its [`PushHook`] takes it.
+//! - [`LatticeEdge`]: the link every [`LatticeNode`] is built on: frames flow down through it and
+//!   demand flows up.
 //! - [`UpstreamRegistry`]: the [`UpstreamHandle`]s feeding a lattice and the workers servicing
 //!   them, each through its own [`UpstreamQueue`].
 
+mod edge;
 mod hot_receiver;
 mod hot_source;
 mod registry;
@@ -13,6 +16,7 @@ mod registry;
 pub(crate) mod testing;
 mod upstream_queue;
 
+pub use edge::{LatticeEdge, LatticeNode, Retirement};
 pub use hot_receiver::{LatticeHotReceiver, PushHook, Response};
 pub use hot_source::LatticeHotSource;
 pub use registry::UpstreamRegistry;
