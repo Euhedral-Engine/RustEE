@@ -5,6 +5,8 @@
 //! - [`generics`]: the interfaces frames flow through, and executors.
 //! - [`impls`]: pools that recycle finished frames, the default executor, and the default object a
 //!   lattice clones onto each core: a fragment feeding an executor (upstream package `impl`).
+//! - [`ingest`]: sinks that feed frames into a lattice from outside it: a queue producers offer
+//!   to, a fixed batch, and a single frame.
 //! - [`config`]: how a lattice, its fragments, caches and idle workers are set up, and where each
 //!   clone of a control-plane object runs.
 //! - [`control_plane`]: the lattice where frames enter, and the shard per socket that places a
@@ -23,6 +25,7 @@ pub mod flow_control;
 pub mod frames;
 pub mod generics;
 pub mod impls;
+pub mod ingest;
 pub mod utils;
 
 mod internal;
