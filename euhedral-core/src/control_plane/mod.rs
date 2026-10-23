@@ -6,16 +6,16 @@
 
 mod cache;
 mod countdown;
-#[allow(dead_code)]
 mod decision_tree;
+mod fragment;
 mod lattice;
-#[allow(dead_code)]
 mod participation;
 mod shard;
 #[cfg(test)]
 pub(crate) mod testing;
 
 pub use cache::{CacheDirectory, ControlPlaneCache};
+pub use fragment::{ControlPlaneFragment, FragmentError};
 pub use lattice::{
     CacheReset, ControlPlaneLattice, LatticeError, UtilizationListener, UtilizationSource,
 };

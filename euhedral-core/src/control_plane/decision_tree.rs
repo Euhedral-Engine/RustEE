@@ -310,11 +310,13 @@ impl DecisionTree {
         self.body_cost.reset();
     }
 
+    #[cfg(test)]
     pub(super) fn batch_size(&self) -> u64 {
         self.batch_size
     }
 
     /// The service-time average in nanoseconds per frame; zero before the first sample.
+    #[cfg(test)]
     pub(super) fn service_time_ns(&self) -> f64 {
         self.service_time_ns
     }
