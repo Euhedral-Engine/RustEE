@@ -3,6 +3,14 @@
 version = 4
 
 [[package]]
+name = "euhedral-core"
+version = "0.1.0"
+dependencies = [
+ "euhedral-hardware-utils",
+ "euhedral-hashing",
+]
+
+[[package]]
 name = "euhedral-data-structures"
 version = "0.1.0"
 
