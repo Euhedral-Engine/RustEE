@@ -1,0 +1,936 @@
+use super::*;
+use crate::flow_control::LatticeHotSource;
+use crate::flow_control::testing::{Fate, Fates, TestReceiver, Tracked, frame};
+use crate::frames::BenchmarkFrame;
+use euhedral_hardware_utils::util::CpuSet;
+use std::sync::atomic::AtomicUsize;
+use std::sync::mpsc;
+use std::thread;
+
+fn registry() -> Arc<UpstreamRegistry> {
+    UpstreamRegistry::with_topology(4, CpuSet::new())
+}
+
+fn receiving_edge(registry: &Arc<UpstreamRegistry>) -> (Arc<LatticeEdge>, Arc<TestReceiver>) {
+    let edge = LatticeEdge::new(registry, Arc::new(AtomicBool::new(false)));
+    let receiver = TestReceiver::new();
+    edge.add_downstream(receiver.clone());
+    (edge, receiver)
+}
+
+fn node(edge: &Arc<LatticeEdge>) -> Option<Arc<dyn LatticeNode>> {
+    Some(edge.clone())
+}
+
+/// Maps `active` while draining, as the caller of a remap must.
+fn map(vertex: &LatticeVertex, active: &[usize], handles: &[Option<Arc<dyn LatticeNode>>]) -> bool {
+    vertex.set_drain(true);
+    let mapped = vertex.set_downstream_mapping(active, handles);
+    vertex.set_drain(false);
+    mapped
+}
+
+/// A frame with `id` whose routing hash is `hash`.
+fn routed(id: u64, hash: u64) -> Box<dyn Frame> {
+    let mut frame = BenchmarkFrame::new(id, None);
+    frame.header_mut().set_routing_hash(hash);
+    Box::new(frame)
+}
+
+fn same(a: &Arc<dyn LatticeNode>, b: &Arc<LatticeEdge>) -> bool {
+    std::ptr::eq(a.edge(), &**b)
+}
+
+/// A source that only pushes when the test tells it to.
+#[derive(Default)]
+struct DeferredSource {
+    downstream: Mutex<Option<Arc<dyn LatticeReceiver>>>,
+    requested: AtomicU64,
+    complete: AtomicBool,
+    panics: AtomicBool,
+}
+
+impl DeferredSource {
+    fn emit(&self, frame: Box<dyn Frame>) {
+        let downstream = self.downstream.lock().unwrap().clone().unwrap();
+        downstream.push(frame);
+    }
+}
+
+impl LatticeSource for DeferredSource {
+    fn add_downstream(self: Arc<Self>, downstream: Arc<dyn LatticeReceiver>) {
+        *self.downstream.lock().unwrap() = Some(downstream);
+    }
+
+    fn pull(
+        &self,
+        _consumer: &mut dyn FnMut(Box<dyn Frame>),
+        _stop: &mut dyn FnMut(&dyn Frame) -> bool,
+        _demand: u64,
+    ) -> u64 {
+        assert!(!self.panics.load(Ordering::Relaxed), "the source broke");
+        0
+    }
+
+    fn request(&self, demand: u64) {
+        assert!(!self.panics.load(Ordering::Relaxed), "the source broke");
+        self.requested.fetch_add(demand, Ordering::Relaxed);
+    }
+
+    fn complete(&self) {
+        self.complete.store(true, Ordering::Release);
+    }
+
+    fn is_complete(&self) -> bool {
+        self.complete.load(Ordering::Acquire)
+    }
+}
+
+#[test]
+fn a_new_vertex_routes_nowhere() {
+    let vertex = LatticeVertex::new(&registry(), "fresh", 4);
+    assert_eq!(vertex.downstream_count(), 4);
+    assert_eq!(vertex.name(), "fresh");
+    assert!(vertex.routing_state().is_empty());
+    assert!((0..4).all(|id| vertex.active_downstream_index(id).is_none()));
+}
+
+#[test]
+fn the_drain_flag_is_shared_with_the_edge() {
+    let vertex = LatticeVertex::new(&registry(), "drain", 1);
+    vertex.set_drain(true);
+    assert!(vertex.edge().drain_flag().load(Ordering::Acquire));
+    vertex.set_drain(false);
+    assert!(!vertex.edge().drain_flag().load(Ordering::Acquire));
+}
+
+#[test]
+fn a_mapping_activates_downstreams_and_adopts_them() {
+    let registry = registry();
+    let vertex = LatticeVertex::new(&registry, "map", 4);
+    let (first, _) = receiving_edge(&registry);
+    let (second, _) = receiving_edge(&registry);
+
+    assert!(map(
+        &vertex,
+        &[2, 0],
+        &[node(&first), None, node(&second), None]
+    ));
+
+    assert!(same(&vertex.downstream(0).unwrap(), &first));
+    assert!(same(&vertex.downstream(2).unwrap(), &second));
+    assert!(vertex.downstream(1).is_none());
+    assert_eq!(vertex.routing_state().mappings(), [0, 2]);
+    assert_eq!(vertex.active_downstream_index(0), Some(0));
+    assert_eq!(vertex.active_downstream_index(2), Some(1));
+    assert_eq!(vertex.active_downstream_index(9), None);
+    let parent = first.parent().unwrap();
+    assert!(std::ptr::eq(parent.edge(), vertex.edge()));
+    assert!(std::ptr::eq(second.parent().unwrap().edge(), vertex.edge()));
+}
+
+#[test]
+fn mapping_needs_a_drained_open_vertex_and_valid_handles() {
+    let registry = registry();
+    let vertex = LatticeVertex::new(&registry, "invalid", 2);
+    let (edge, _) = receiving_edge(&registry);
+
+    assert!(
+        !vertex.set_downstream_mapping(&[0], &[node(&edge)]),
+        "not draining"
+    );
+    vertex.set_drain(true);
+    assert!(
+        !vertex.set_downstream_mapping(&[2], &[node(&edge), None, node(&edge)]),
+        "past the slots"
+    );
+    assert!(
+        !vertex.set_downstream_mapping(&[1], &[node(&edge)]),
+        "no handle for the id"
+    );
+    assert!(
+        !vertex.set_downstream_mapping(&[1], &[node(&edge), None]),
+        "an empty handle"
+    );
+    assert!(vertex.routing_state().is_empty());
+    assert!(edge.parent().is_none(), "a refused mapping changes nothing");
+
+    vertex.close();
+    assert!(
+        !vertex.set_downstream_mapping(&[0], &[node(&edge)]),
+        "closed"
+    );
+}
+
+#[test]
+#[should_panic(expected = "share one upstream registry")]
+fn mapping_a_handle_of_another_registry_panics() {
+    let vertex = LatticeVertex::new(&registry(), "foreign", 1);
+    let (edge, _) = receiving_edge(&registry());
+    map(&vertex, &[0], &[node(&edge)]);
+}
+
+#[test]
+fn a_remap_closes_downstreams_it_drops() {
+    let registry = registry();
+    let vertex = LatticeVertex::new(&registry, "remap", 4);
+    let (kept, kept_receiver) = receiving_edge(&registry);
+    let (dropped, dropped_receiver) = receiving_edge(&registry);
+    assert!(map(&vertex, &[0, 1], &[node(&kept), node(&dropped)]));
+
+    assert!(map(&vertex, &[0], &[node(&kept)]));
+
+    assert!(dropped.is_closed());
+    assert!(dropped_receiver.is_completed());
+    assert!(!kept.is_closed());
+    assert!(!kept_receiver.is_completed());
+    assert!(vertex.downstream(1).is_none());
+
+    assert!(map(&vertex, &[], &[]));
+    assert!(kept.is_closed());
+}
+
+#[test]
+fn frames_route_by_hash() {
+    let registry = registry();
+    let vertex = LatticeVertex::new(&registry, "route", 4);
+    let (low, low_receiver) = receiving_edge(&registry);
+    let (high, high_receiver) = receiving_edge(&registry);
+    assert!(map(&vertex, &[0, 1], &[node(&low), node(&high)]));
+
+    vertex.push(routed(1, 0));
+    vertex.push(routed(2, u64::MAX));
+
+    assert_eq!(low_receiver.received(), [1]);
+    assert_eq!(high_receiver.received(), [2]);
+    assert_eq!(route_by_hash(&*frame(7), 1), 0);
+}
+
+#[test]
+fn a_custom_routing_function_sees_the_generation() {
+    let registry = registry();
+    let vertex = LatticeVertex::with_routing(&registry, "custom", 3, |frame, state| {
+        let wanted = frame.header().id_hash() as usize;
+        state.active_index(wanted).unwrap_or(0)
+    });
+    let (first, first_receiver) = receiving_edge(&registry);
+    let (second, second_receiver) = receiving_edge(&registry);
+    assert!(map(&vertex, &[0, 2], &[node(&first), None, node(&second)]));
+
+    vertex.push(frame(2));
+    vertex.push(frame(1));
+
+    assert_eq!(second_receiver.received(), [2]);
+    assert_eq!(first_receiver.received(), [1]);
+}
+
+#[test]
+#[should_panic(expected = "the routing function chose index 5")]
+fn an_out_of_range_route_panics() {
+    let registry = registry();
+    let vertex = LatticeVertex::with_routing(&registry, "broken", 1, |_, _| 5);
+    let (edge, _) = receiving_edge(&registry);
+    map(&vertex, &[0], &[node(&edge)]);
+    vertex.push(frame(1));
+}
+
+#[test]
+fn a_frame_without_an_active_downstream_is_refused() {
+    let vertex = LatticeVertex::new(&registry(), "empty", 1);
+    let fates = Fates::default();
+
+    let refused = vertex.try_push(Tracked::new(1, &fates)).unwrap_err();
+    assert_eq!(refused.header().id_hash(), 1);
+    vertex.push(refused);
+
+    assert_eq!(
+        *fates.lock().unwrap(),
+        [(
+            1,
+            Fate::Failed("frame failed: no active downstream to route the frame to".into())
+        )]
+    );
+}
+
+#[test]
+fn errors_reach_every_active_downstream_once() {
+    let registry = registry();
+    let vertex = LatticeVertex::new(&registry, "errors", 3);
+    let (first, first_receiver) = receiving_edge(&registry);
+    let (second, second_receiver) = receiving_edge(&registry);
+    assert!(map(
+        &vertex,
+        &[0, 1, 2],
+        &[node(&first), node(&second), node(&first)]
+    ));
+
+    vertex.on_error("boom".into());
+
+    assert_eq!(first_receiver.errors(), ["boom"]);
+    assert_eq!(second_receiver.errors(), ["boom"]);
+
+    assert!(map(&vertex, &[1], &[None, node(&second)]));
+    vertex.on_error("alone".into());
+    assert_eq!(second_receiver.errors(), ["boom", "alone"]);
+}
+
+#[test]
+fn closing_closes_every_downstream_and_unmaps_them() {
+    let registry = registry();
+    let vertex = LatticeVertex::new(&registry, "close", 2);
+    let (first, first_receiver) = receiving_edge(&registry);
+    let (second, _) = receiving_edge(&registry);
+    assert!(map(&vertex, &[0, 1], &[node(&first), node(&second)]));
+
+    vertex.close();
+
+    assert!(vertex.is_closed());
+    assert!(vertex.edge().is_edge_closed());
+    assert!(first.is_closed());
+    assert!(second.is_closed());
+    assert!(first_receiver.is_completed());
+    assert_eq!(vertex.active_downstream_index(0), None);
+    assert_eq!(vertex.active_downstream_index(1), None);
+    let fates = Fates::default();
+    vertex.push(Tracked::new(1, &fates));
+    assert!(matches!(fates.lock().unwrap()[0], (1, Fate::Failed(_))));
+    vertex.on_error("after close".into());
+    assert!(first_receiver.errors().is_empty());
+}
+
+#[test]
+fn a_shared_downstream_is_closed_once_no_generation_uses_it() {
+    let registry = registry();
+    let vertex = LatticeVertex::new(&registry, "shared", 2);
+    let (shared, receiver) = receiving_edge(&registry);
+    assert!(map(&vertex, &[0, 1], &[node(&shared), node(&shared)]));
+    assert!(map(&vertex, &[1], &[None, node(&shared)]));
+    assert!(!shared.is_closed());
+
+    assert!(map(&vertex, &[], &[]));
+
+    assert!(shared.is_closed());
+    assert!(receiver.is_completed());
+}
+
+#[test]
+fn a_vertex_goes_below_an_upstream_node() {
+    let registry = registry();
+    let upstream = LatticeEdge::new(&registry, Arc::new(AtomicBool::new(false)));
+    let vertex = LatticeVertex::new(&registry, "below", 1);
+    let (downstream, receiver) = receiving_edge(&registry);
+    assert!(map(&vertex, &[0], &[node(&downstream)]));
+
+    vertex.add_upstream_node(&*upstream).unwrap();
+
+    assert!(std::ptr::eq(
+        vertex.edge().parent().unwrap().edge(),
+        &*upstream
+    ));
+    assert!(
+        std::ptr::eq(downstream.parent().unwrap().edge(), vertex.edge()),
+        "the vertex keeps its own downstreams"
+    );
+    upstream.push(frame(4));
+    assert_eq!(receiver.received(), [4]);
+
+    vertex.close();
+    assert_eq!(vertex.add_upstream_node(&*upstream), Err(LatticeClosed));
+}
+
+#[test]
+fn demand_through_a_vertex_climbs_to_its_parent() {
+    let registry = registry();
+    registry.register();
+    let upstream = LatticeEdge::new(&registry, Arc::new(AtomicBool::new(false)));
+    let vertex = LatticeVertex::new(&registry, "climb", 1);
+    vertex.add_upstream_node(&*upstream).unwrap();
+    let source = Arc::new(DeferredSource::default());
+    vertex.ingest(source.clone()).unwrap();
+
+    vertex.edge().request(3);
+    assert_eq!(source.requested.load(Ordering::Relaxed), 3);
+
+    upstream.drain_flag().store(true, Ordering::Release);
+    vertex.edge().request(3);
+    assert_eq!(vertex.edge().pull(&mut |_| {}, &mut |_| false, 3), 0);
+    assert_eq!(
+        source.requested.load(Ordering::Relaxed),
+        3,
+        "a draining parent stops it"
+    );
+}
+
+#[test]
+fn ingesting_attaches_the_source_once() {
+    let registry = registry();
+    let vertex = LatticeVertex::new(&registry, "ingest", 1);
+    let source = Arc::new(LatticeHotSource::new());
+
+    let interceptor = vertex.ingest(source.clone()).unwrap();
+
+    let upstream: Arc<dyn LatticeSource> = source.clone();
+    assert!(Arc::ptr_eq(interceptor.upstream().unwrap(), &upstream));
+    assert_eq!(
+        registry.upstream_handle_count(),
+        1,
+        "the source attached itself too"
+    );
+    assert!(!interceptor.is_complete());
+
+    source.complete();
+    assert!(interceptor.is_complete());
+    assert_eq!(registry.upstream_handle_count(), 0);
+}
+
+#[test]
+fn ingested_sources_take_registration_order() {
+    let vertex = LatticeVertex::new(&registry(), "order", 1);
+    let first = vertex.ingest(Arc::new(DeferredSource::default())).unwrap();
+    let second = vertex.ingest(Arc::new(DeferredSource::default())).unwrap();
+    assert_eq!(first.sequence(), 0);
+    assert_eq!(second.sequence(), 1);
+}
+
+#[test]
+fn a_closed_vertex_completes_what_it_is_given() {
+    let registry = registry();
+    let vertex = LatticeVertex::new(&registry, "closed", 1);
+    vertex.close();
+    let source = Arc::new(DeferredSource::default());
+
+    assert_eq!(vertex.ingest(source.clone()).err(), Some(LatticeClosed));
+
+    assert!(source.is_complete());
+    assert_eq!(registry.upstream_handle_count(), 0);
+}
+
+#[test]
+fn an_interceptor_takes_one_source() {
+    let vertex = LatticeVertex::new(&registry(), "one", 1);
+    let first = Arc::new(DeferredSource::default());
+    let interceptor = vertex.ingest(first.clone()).unwrap();
+    let second = Arc::new(DeferredSource::default());
+
+    interceptor.add_upstream(second.clone());
+
+    assert!(second.is_complete());
+    assert!(!first.is_complete());
+    let upstream: Arc<dyn LatticeSource> = first;
+    assert!(Arc::ptr_eq(interceptor.upstream().unwrap(), &upstream));
+}
+
+#[test]
+fn an_interceptor_routes_what_its_source_pushes() {
+    let registry = registry();
+    let vertex = LatticeVertex::new(&registry, "push", 1);
+    let (edge, receiver) = receiving_edge(&registry);
+    assert!(map(&vertex, &[0], &[node(&edge)]));
+    let source = Arc::new(DeferredSource::default());
+    vertex.ingest(source.clone()).unwrap();
+
+    source.emit(frame(6));
+
+    assert_eq!(receiver.received(), [6]);
+}
+
+#[test]
+fn completing_an_interceptor_completes_its_source() {
+    let registry = registry();
+    let vertex = LatticeVertex::new(&registry, "cancel", 1);
+    let source = Arc::new(DeferredSource::default());
+    let interceptor = vertex.ingest(source.clone()).unwrap();
+
+    interceptor.complete();
+    interceptor.complete();
+
+    assert!(source.is_complete());
+    assert!(interceptor.is_complete());
+    assert_eq!(registry.upstream_handle_count(), 0);
+}
+
+#[test]
+fn completion_and_errors_from_the_source_complete_the_interceptor() {
+    let registry = registry();
+    let vertex = LatticeVertex::new(&registry, "complete", 1);
+    let completing = vertex.ingest(Arc::new(DeferredSource::default())).unwrap();
+    let failing = vertex.ingest(Arc::new(DeferredSource::default())).unwrap();
+    assert_eq!(registry.upstream_handle_count(), 2);
+
+    completing.on_complete();
+    failing.on_error("broken".into());
+    failing.on_complete();
+
+    assert!(completing.is_complete());
+    assert!(failing.is_complete());
+    assert_eq!(registry.upstream_handle_count(), 0);
+}
+
+#[test]
+fn an_interceptor_is_serviced_only_under_its_lock() {
+    let vertex = LatticeVertex::new(&registry(), "lock", 1);
+    let source = Arc::new(DeferredSource::default());
+    let interceptor = vertex.ingest(source.clone()).unwrap();
+    let pull = |interceptor: &UpstreamInterceptor, demand| {
+        interceptor.pull(&mut |_| {}, &mut |_| false, demand)
+    };
+
+    assert_eq!(pull(&interceptor, 1), None);
+    interceptor.request(1);
+    assert_eq!(source.requested.load(Ordering::Relaxed), 0);
+
+    assert!(interceptor.try_acquire());
+    assert!(!interceptor.try_acquire());
+    assert_eq!(pull(&interceptor, 1), Some(0));
+    assert_eq!(pull(&interceptor, 0), None);
+    interceptor.request(0);
+    interceptor.request(2);
+    assert_eq!(source.requested.load(Ordering::Relaxed), 2);
+
+    vertex.set_drain(true);
+    assert_eq!(pull(&interceptor, 1), None);
+    interceptor.request(2);
+    assert_eq!(source.requested.load(Ordering::Relaxed), 2);
+    vertex.set_drain(false);
+
+    interceptor.release();
+    assert!(interceptor.try_acquire());
+}
+
+#[test]
+fn a_panicking_source_completes_its_interceptor() {
+    let registry = registry();
+    let vertex = LatticeVertex::new(&registry, "panic", 1);
+    let pulled = Arc::new(DeferredSource::default());
+    let requested = Arc::new(DeferredSource::default());
+    let pulling = vertex.ingest(pulled.clone()).unwrap();
+    let requesting = vertex.ingest(requested.clone()).unwrap();
+    pulled.panics.store(true, Ordering::Relaxed);
+    requested.panics.store(true, Ordering::Relaxed);
+    assert!(pulling.try_acquire() && requesting.try_acquire());
+
+    assert_eq!(pulling.pull(&mut |_| {}, &mut |_| false, 1), None);
+    requesting.request(1);
+
+    assert!(pulling.is_complete() && pulled.is_complete());
+    assert!(requesting.is_complete() && requested.is_complete());
+    assert_eq!(registry.upstream_handle_count(), 0);
+}
+
+#[test]
+fn workers_service_ingested_sources() {
+    let registry = registry();
+    registry.register();
+    let vertex = LatticeVertex::new(&registry, "workers", 1);
+    let source = Arc::new(DeferredSource::default());
+    vertex.ingest(source.clone()).unwrap();
+
+    vertex.edge().request(5);
+
+    assert_eq!(source.requested.load(Ordering::Relaxed), 5);
+}
+
+#[test]
+fn a_held_generation_keeps_its_downstreams_open() {
+    let registry = registry();
+    let vertex = LatticeVertex::new(&registry, "snapshot", 5);
+    let edges: Vec<_> = (0..5).map(|_| receiving_edge(&registry).0).collect();
+    let handles: Vec<_> = edges.iter().map(node).collect();
+    assert!(map(&vertex, &[1, 4], &handles));
+    let previous = vertex.routing_state();
+    assert_eq!(previous.mappings(), [1, 4]);
+
+    assert!(map(&vertex, &[2, 4], &handles));
+    let current = vertex.routing_state();
+
+    assert!(!Arc::ptr_eq(&previous, &current));
+    assert_eq!(current.mappings(), [2, 4]);
+    assert_eq!(current.active_index(1), None);
+    assert_eq!(current.active_index(2), Some(0));
+    assert_eq!(current.active_index(4), Some(1));
+    assert_eq!(
+        previous.mappings(),
+        [1, 4],
+        "a published generation never changes"
+    );
+    assert_eq!(previous.active_index(1), Some(0));
+    assert!(
+        !edges[1].is_closed(),
+        "the held generation still routes to it"
+    );
+
+    drop(previous);
+    assert!(edges[1].is_closed());
+    assert!(!edges[4].is_closed());
+}
+
+#[test]
+fn a_quiesced_remap_routes_later_frames_to_the_new_generation() {
+    let registry = registry();
+    let vertex = LatticeVertex::new(&registry, "handoff", 3);
+    let (retired, retired_receiver) = receiving_edge(&registry);
+    let (replacement, replacement_receiver) = receiving_edge(&registry);
+    let handles = [None, node(&retired), node(&replacement)];
+    assert!(map(&vertex, &[1], &handles));
+
+    let (delivered, delivered_rx) = mpsc::channel();
+    let (remapped, remapped_rx) = mpsc::channel::<()>();
+    let producer = {
+        let vertex = vertex.clone();
+        thread::spawn(move || {
+            vertex.push(frame(1));
+            delivered.send(()).unwrap();
+            remapped_rx.recv().unwrap();
+            vertex.push(frame(2));
+        })
+    };
+    delivered_rx.recv().unwrap();
+    assert_eq!(retired_receiver.received(), [1]);
+
+    assert!(map(&vertex, &[2], &handles));
+    assert!(retired.is_closed());
+    assert!(retired_receiver.is_completed());
+    remapped.send(()).unwrap();
+    producer.join().unwrap();
+
+    assert_eq!(retired_receiver.received(), [1]);
+    assert_eq!(replacement_receiver.received(), [2]);
+}
+
+#[test]
+fn a_push_after_a_remap_uses_the_live_generation() {
+    let registry = registry();
+    let vertex = LatticeVertex::new(&registry, "asynchronous", 1);
+    let (retired, retired_receiver) = receiving_edge(&registry);
+    assert!(map(&vertex, &[0], &[node(&retired)]));
+    let source = Arc::new(DeferredSource::default());
+    vertex.ingest(source.clone()).unwrap();
+
+    let (replacement, replacement_receiver) = receiving_edge(&registry);
+    assert!(map(&vertex, &[0], &[node(&replacement)]));
+    let emitter = source.clone();
+    thread::spawn(move || emitter.emit(frame(3)))
+        .join()
+        .unwrap();
+
+    assert!(retired.is_closed());
+    assert!(retired_receiver.received().is_empty());
+    assert_eq!(replacement_receiver.received(), [3]);
+}
+
+#[test]
+fn a_push_after_an_empty_remap_fails_on_the_producer_thread() {
+    let registry = registry();
+    let vertex = LatticeVertex::new(&registry, "asynchronous-empty", 1);
+    let (edge, receiver) = receiving_edge(&registry);
+    assert!(map(&vertex, &[0], &[node(&edge)]));
+    let source = Arc::new(DeferredSource::default());
+    vertex.ingest(source.clone()).unwrap();
+    assert!(map(&vertex, &[], &[node(&edge)]));
+
+    let fates = Fates::default();
+    let (emitter, tracked) = (source.clone(), Tracked::new(5, &fates));
+    thread::spawn(move || emitter.emit(tracked)).join().unwrap();
+
+    assert!(edge.is_closed());
+    assert!(receiver.received().is_empty());
+    assert_eq!(
+        *fates.lock().unwrap(),
+        [(
+            5,
+            Fate::Failed("frame failed: no active downstream to route the frame to".into())
+        )]
+    );
+}
+
+#[test]
+fn pushes_racing_remaps_always_reach_an_open_downstream() {
+    let registry = registry();
+    let vertex = LatticeVertex::new(&registry, "race", 1);
+    let generations: Vec<_> = (0..2).map(|_| receiving_edge(&registry)).collect();
+    let fates = Fates::default();
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut current = 0;
+    assert!(map(&vertex, &[0], &[node(&generations[current].0)]));
+
+    let producers: Vec<_> = (0..2)
+        .map(|producer| {
+            let (vertex, fates, stop) = (vertex.clone(), fates.clone(), stop.clone());
+            thread::spawn(move || {
+                let mut sent = 0;
+                while !stop.load(Ordering::Acquire) {
+                    vertex.push(Tracked::new(producer * 1_000_000 + sent, &fates));
+                    sent += 1;
+                }
+                sent
+            })
+        })
+        .collect();
+
+    let mut remaps = Vec::new();
+    for _ in 0..200 {
+        let (edge, receiver) = receiving_edge(&registry);
+        vertex.set_drain(true);
+        assert!(vertex.set_downstream_mapping(&[0], &[node(&edge)]));
+        vertex.set_drain(false);
+        remaps.push((edge, receiver));
+        current += 1;
+    }
+    stop.store(true, Ordering::Release);
+    let sent: u64 = producers
+        .into_iter()
+        .map(|producer| producer.join().unwrap())
+        .sum();
+
+    let delivered: usize = generations
+        .iter()
+        .chain(&remaps)
+        .map(|(_, receiver)| receiver.received().len())
+        .sum();
+    assert!(fates.lock().unwrap().is_empty(), "no frame was refused");
+    assert_eq!(delivered as u64, sent);
+    assert!(
+        remaps[..remaps.len() - 1]
+            .iter()
+            .all(|(edge, _)| edge.is_closed())
+    );
+    assert!(current > 0);
+}
+
+#[test]
+fn closing_publishes_no_active_downstreams() {
+    let registry = registry();
+    let vertex = LatticeVertex::new(&registry, "closed-map", 2);
+    let (edge, _) = receiving_edge(&registry);
+    assert!(map(&vertex, &[1], &[None, node(&edge)]));
+
+    vertex.close();
+
+    assert_eq!(vertex.active_downstream_index(0), None);
+    assert_eq!(vertex.active_downstream_index(1), None);
+}
+
+fn counter() -> (Arc<AtomicUsize>, impl FnOnce() + Send + 'static) {
+    let count = Arc::new(AtomicUsize::new(0));
+    let increment = count.clone();
+    (count, move || {
+        increment.fetch_add(1, Ordering::AcqRel);
+    })
+}
+
+#[test]
+fn retirement_waits_until_no_generation_routes_to_the_child() {
+    let registry = registry();
+    let vertex = LatticeVertex::new(&registry, "retire", 2);
+    let (child, _) = receiving_edge(&registry);
+    let (other, _) = receiving_edge(&registry);
+    assert!(map(&vertex, &[0], &[node(&child)]));
+    let held = vertex.routing_state();
+
+    let (retired, action) = counter();
+    child.defer_retirement(Box::new(action));
+    assert_eq!(retired.load(Ordering::Acquire), 0);
+
+    assert!(map(&vertex, &[1], &[None, node(&other)]));
+    assert_eq!(
+        retired.load(Ordering::Acquire),
+        0,
+        "a held generation still routes to it"
+    );
+    assert!(!child.is_closed());
+
+    drop(held);
+    assert_eq!(retired.load(Ordering::Acquire), 1);
+    assert!(child.is_closed());
+
+    let (late, action) = counter();
+    child.defer_retirement(Box::new(action));
+    assert_eq!(
+        late.load(Ordering::Acquire),
+        1,
+        "an unrouted child retires at once"
+    );
+}
+
+#[test]
+fn a_panicking_retirement_does_not_stop_the_rest() {
+    let registry = registry();
+    let vertex = LatticeVertex::new(&registry, "retire-panic", 1);
+    let (child, _) = receiving_edge(&registry);
+    assert!(map(&vertex, &[0], &[node(&child)]));
+    child.defer_retirement(Box::new(|| panic!("retirement failed")));
+    let (retired, action) = counter();
+    child.defer_retirement(Box::new(action));
+
+    assert!(map(&vertex, &[], &[]));
+
+    assert_eq!(retired.load(Ordering::Acquire), 1);
+    assert!(child.is_closed());
+}
+
+#[test]
+fn close_retirements_wait_for_held_generations() {
+    let registry = registry();
+    let vertex = LatticeVertex::new(&registry, "close-retire", 1);
+    let (child, _) = receiving_edge(&registry);
+    assert!(map(&vertex, &[0], &[node(&child)]));
+    let held = vertex.routing_state();
+
+    let (first, action) = counter();
+    vertex.close_after_routes_retire(action);
+    let (second, action) = counter();
+    vertex.close_after_routes_retire(action);
+    assert!(vertex.is_closed());
+    assert_eq!(
+        first.load(Ordering::Acquire) + second.load(Ordering::Acquire),
+        0
+    );
+    assert!(!child.is_closed());
+
+    drop(held);
+    assert!(child.is_closed());
+    assert_eq!(first.load(Ordering::Acquire), 1);
+    assert_eq!(second.load(Ordering::Acquire), 1);
+
+    let (late, action) = counter();
+    vertex.close_after_routes_retire(action);
+    assert_eq!(late.load(Ordering::Acquire), 1, "routing is already closed");
+}
+
+#[test]
+fn closing_an_unmapped_vertex_retires_at_once() {
+    let vertex = LatticeVertex::new(&registry(), "close-empty", 1);
+    let (closed, action) = counter();
+    vertex.close_after_routes_retire(action);
+    assert_eq!(closed.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn a_dropped_vertex_leaves_its_downstreams_alone() {
+    let registry = registry();
+    let vertex = LatticeVertex::new(&registry, "dropped", 1);
+    let (child, receiver) = receiving_edge(&registry);
+    assert!(map(&vertex, &[0], &[node(&child)]));
+    let held = vertex.routing_state();
+
+    drop(vertex);
+    drop(held);
+
+    assert!(!child.is_closed());
+    assert!(!receiver.is_completed());
+    assert!(child.parent().is_none());
+}
+
+#[test]
+fn close_retirements_wait_for_every_generation() {
+    let registry = registry();
+    let vertex = LatticeVertex::new(&registry, "close-generations", 1);
+    let (first, _) = receiving_edge(&registry);
+    let (second, _) = receiving_edge(&registry);
+    assert!(map(&vertex, &[0], &[node(&first)]));
+    let older = vertex.routing_state();
+    assert!(map(&vertex, &[0], &[node(&second)]));
+    let newer = vertex.routing_state();
+
+    let (closed, action) = counter();
+    vertex.close_after_routes_retire(action);
+    drop(newer);
+    assert!(second.is_closed());
+    assert_eq!(
+        closed.load(Ordering::Acquire),
+        0,
+        "the older generation still routes"
+    );
+
+    drop(older);
+    assert!(first.is_closed());
+    assert_eq!(closed.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn a_push_during_a_request_counts_as_work_for_the_worker() {
+    /// Pushes one queued frame per unit of demand, on the requesting thread.
+    #[derive(Default)]
+    struct Synchronous {
+        downstream: Mutex<Option<Arc<dyn LatticeReceiver>>>,
+        frames: Mutex<Vec<Box<dyn Frame>>>,
+    }
+
+    impl LatticeSource for Synchronous {
+        fn add_downstream(self: Arc<Self>, downstream: Arc<dyn LatticeReceiver>) {
+            *self.downstream.lock().unwrap() = Some(downstream);
+        }
+        fn pull(
+            &self,
+            _consumer: &mut dyn FnMut(Box<dyn Frame>),
+            _stop: &mut dyn FnMut(&dyn Frame) -> bool,
+            _demand: u64,
+        ) -> u64 {
+            0
+        }
+        fn request(&self, demand: u64) {
+            let downstream = self.downstream.lock().unwrap().clone().unwrap();
+            for _ in 0..demand {
+                let Some(frame) = self.frames.lock().unwrap().pop() else {
+                    return;
+                };
+                downstream.push(frame);
+            }
+        }
+        fn complete(&self) {}
+        fn is_complete(&self) -> bool {
+            false
+        }
+    }
+
+    let registry = registry();
+    registry.register();
+    let vertex = LatticeVertex::new(&registry, "evidence", 1);
+    let (edge, receiver) = receiving_edge(&registry);
+    assert!(map(&vertex, &[0], &[node(&edge)]));
+    let source = Arc::new(Synchronous::default());
+    vertex.ingest(source.clone()).unwrap();
+    let productive = || registry.with_thread_queue(|queue| queue.productive_handle_count());
+
+    assert_eq!(vertex.edge().pull(&mut |_| {}, &mut |_| false, 1), 0);
+    assert_eq!(productive(), Some(0));
+
+    source.frames.lock().unwrap().push(frame(8));
+    vertex.edge().request(1);
+
+    assert_eq!(receiver.received(), [8]);
+    assert_eq!(productive(), Some(1));
+}
+
+#[test]
+fn attaching_to_a_vertex_that_closed_meanwhile_completes_the_source() {
+    let registry = registry();
+    let vertex = LatticeVertex::new(&registry, "closed-meanwhile", 1);
+    let interceptor = UpstreamInterceptor::new(&vertex);
+    vertex.close();
+    let source = Arc::new(DeferredSource::default());
+
+    interceptor.add_upstream(source.clone());
+
+    assert!(interceptor.is_complete());
+    assert!(source.is_complete());
+    assert_eq!(registry.upstream_handle_count(), 0);
+}
+
+#[test]
+fn attaching_after_the_vertex_is_gone_completes_the_source() {
+    let registry = registry();
+    let vertex = LatticeVertex::new(&registry, "gone", 1);
+    let interceptor = UpstreamInterceptor::new(&vertex);
+    drop(vertex);
+    let source = Arc::new(DeferredSource::default());
+
+    interceptor.add_upstream(source.clone());
+
+    assert!(interceptor.is_complete());
+    assert!(source.is_complete());
+    assert_eq!(registry.upstream_handle_count(), 0);
+    let fates = Fates::default();
+    interceptor.push(Tracked::new(1, &fates));
+    assert!(matches!(fates.lock().unwrap()[0], (1, Fate::Failed(_))));
+}

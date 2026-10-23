@@ -5,6 +5,8 @@
 //! - [`LatticeHotReceiver`]: a pusher that retries a frame until its [`PushHook`] takes it.
 //! - [`LatticeEdge`]: the link every [`LatticeNode`] is built on: frames flow down through it and
 //!   demand flows up.
+//! - [`LatticeVertex`]: a node routing each frame to one of its downstreams, fed by sources it
+//!   [ingests](LatticeVertex::ingest).
 //! - [`UpstreamRegistry`]: the [`UpstreamHandle`]s feeding a lattice and the workers servicing
 //!   them, each through its own [`UpstreamQueue`].
 
@@ -15,12 +17,16 @@ mod registry;
 #[cfg(test)]
 pub(crate) mod testing;
 mod upstream_queue;
+mod vertex;
 
 pub use edge::{LatticeEdge, LatticeNode, Retirement};
 pub use hot_receiver::{LatticeHotReceiver, PushHook, Response};
 pub use hot_source::LatticeHotSource;
 pub use registry::UpstreamRegistry;
 pub use upstream_queue::{PullBucketDivisionMode, UpstreamHandle, UpstreamQueue, decay_contention};
+pub use vertex::{
+    LatticeClosed, LatticeVertex, RoutingFunction, RoutingState, UpstreamInterceptor, route_by_hash,
+};
 
 /// How close to its [origin](crate::frames::FrameHeader::origin) a frame must stay.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]

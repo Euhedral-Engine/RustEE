@@ -16,13 +16,6 @@ thread_local! {
 
 /// Records that a frame was routed downstream on this thread, so a request serviced on this
 /// thread can tell that its source produced work synchronously.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the vertex's upstream interceptor reports its pushes"
-    )
-)]
 pub(crate) fn note_routed_push() {
     ROUTED_PUSHES.with(|pushes| pushes.set(pushes.get().wrapping_add(1)));
 }
