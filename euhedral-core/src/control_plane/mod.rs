@@ -6,7 +6,11 @@
 
 mod cache;
 mod countdown;
+#[allow(dead_code)]
+mod decision_tree;
 mod lattice;
+#[allow(dead_code)]
+mod participation;
 mod shard;
 #[cfg(test)]
 pub(crate) mod testing;
