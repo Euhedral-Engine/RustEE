@@ -1,8 +1,10 @@
 //! The interfaces frames flow through: lattice sources, receivers and interceptors, and the
 //! simpler hand-off points frames use themselves.
 
+mod cloneable;
 mod lattice;
 
+pub use cloneable::CloneableObject;
 pub use lattice::{LatticeInterceptor, LatticeReceiver, LatticeSource, LatticeTerminal};
 
 use crate::frames::Frame;
