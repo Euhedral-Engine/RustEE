@@ -75,6 +75,10 @@ pub type SpmcQueue<T> = Queue<T, Single, Multi>;
 pub type MpmcQueue<T> = Queue<T, Multi, Multi>;
 
 /// An unbounded or bounded FIFO queue, generic over its producer and consumer roles.
+///
+/// The queue's tail, head, epoch, configuration and consumer lock each live alone in a 128-byte block,
+/// in the order and with the isolation upstream gets from its `TailPad`/`MidPad` chain; see
+/// [`Core`](super::core::Core) for the layout.
 pub struct Queue<T, P: Role, C: Role> {
     core: Arc<Core<T>>,
     roles: PhantomData<(P, C)>,

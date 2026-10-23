@@ -47,15 +47,35 @@ pub(crate) struct Shared<T> {
     pub(crate) consumer_taken: AtomicBool,
 }
 
-/// Each group of fields below is padded to its own 128-byte blocks, like upstream's `TailPad`,
-/// `MidPad1`, `MidPad2` and `StartPad`, so a producer, a consumer and a resizing thread never
-/// contend for a line they do not both need.
+/// The queue's state, padded the way upstream pads it.
+///
+/// Upstream stacks base classes to put each hot group between 128-byte runs of dead `long`s:
+///
+/// ```text
+/// TailPad(128) | tail | MidPad1(128) | head, headQueue | MidPad2(120) | tailEpoch, tailQueue | StartPad(128)
+/// ```
+///
+/// followed by its read-only configuration and, for multiple consumers, the consumer flag with padding
+/// of its own. Here `CachePadded` gives each group a 128-byte aligned block to itself, and `repr(C)`
+/// keeps them in upstream's order, so a producer, a consumer and a resizing thread never contend for a
+/// line they do not both need:
+///
+/// | block | here                            | upstream                        |
+/// |-------|---------------------------------|---------------------------------|
+/// | before | the `Arc` header, alone in its block | `TailPad`                       |
+/// | 1     | `tail`                          | `tail` between `TailPad`/`MidPad1` |
+/// | 2     | `consumer`: `head`, head chunk  | `head`, `headQueue` + `MidPad2` |
+/// | 3     | `producer`: `epoch`, tail chunk | `tailEpoch`, `tailQueue` + `StartPad` |
+/// | 4     | `config`, read by every operation | `chunkMask`, `bounded`, ...     |
+/// | 5     | `shared`: pool, statistics, role flags | the allocator, which is its own padded queue upstream |
+/// | 6     | `mc_lock`                       | `mcFlag` + the `MultiConsumer` padding |
+#[repr(C)]
 pub(crate) struct Core<T> {
     tail: CachePadded<AtomicU64>,
     consumer: CachePadded<ConsumerState<T>>,
     producer: CachePadded<ProducerState<T>>,
-    pub(crate) shared: CachePadded<Shared<T>>,
     config: CachePadded<Config>,
+    pub(crate) shared: CachePadded<Shared<T>>,
     /// Zero, or the token of the thread currently acting as the consumer of a multi-consumer queue.
     mc_lock: CachePadded<AtomicU64>,
 }
@@ -127,11 +147,6 @@ impl<T> Core<T> {
 
     pub(crate) fn capacity(&self) -> u64 {
         self.config.capacity
-    }
-
-    #[cfg(test)]
-    fn pool_address(&self) -> *const u8 {
-        &self.shared.pool as *const ChunkPool<T> as *const u8
     }
 
     pub(crate) fn max_pooled_chunks(&self) -> usize {
@@ -608,38 +623,51 @@ impl<T> Drop for Core<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::mem::{align_of, size_of};
+    use std::mem::{align_of, offset_of, size_of};
     use std::sync::Arc;
 
-    fn block(address: *const u8) -> usize {
-        address as usize / 128
-    }
-
     #[test]
-    fn every_group_of_hot_fields_sits_alone_on_its_own_128_byte_block() {
-        let core = Core::<u64>::new(8, 2);
-        // One field from each group: the producer's tail, the consumer's head, the producer's epoch, the
-        // pool's lock and a configuration constant that every operation reads.
-        let blocks = [
-            block(&*core.tail as *const AtomicU64 as *const u8),
-            block(&core.consumer.head as *const AtomicU64 as *const u8),
-            block(&core.producer.epoch as *const AtomicU64 as *const u8),
-            block(core.pool_address()),
-            block(&core.config.chunk_mask as *const u64 as *const u8),
+    fn the_groups_follow_upstreams_order_each_alone_in_its_own_128_byte_block() {
+        // tail | head | epoch | config | shared | consumer lock, as upstream stacks them.
+        let offsets = [
+            offset_of!(Core<u64>, tail),
+            offset_of!(Core<u64>, consumer),
+            offset_of!(Core<u64>, producer),
+            offset_of!(Core<u64>, config),
+            offset_of!(Core<u64>, shared),
+            offset_of!(Core<u64>, mc_lock),
         ];
 
-        for (i, a) in blocks.iter().enumerate() {
-            for b in &blocks[i + 1..] {
-                assert_ne!(a, b, "two groups share a cache line: {blocks:?}");
-            }
-        }
+        assert_eq!(offsets, [0, 128, 256, 384, 512, 640]);
+        assert_eq!(size_of::<Core<u64>>(), 768);
     }
 
     #[test]
-    fn the_queue_is_aligned_and_sized_in_whole_128_byte_blocks() {
+    fn each_groups_data_fits_inside_its_block_so_dead_space_separates_it_from_the_next() {
+        // What follows each group's data, up to the next group, is padding.
+        assert!(size_of::<AtomicU64>() <= 128);
+        assert!(size_of::<ConsumerState<u64>>() <= 128);
+        assert!(size_of::<ProducerState<u64>>() <= 128);
+        assert!(size_of::<Config>() <= 128);
+        assert!(size_of::<Shared<u64>>() <= 128);
+    }
+
+    #[test]
+    fn the_queue_is_aligned_so_the_arc_header_sits_in_a_block_of_its_own() {
         assert_eq!(align_of::<Core<u64>>(), 128);
         assert_eq!(size_of::<Core<u64>>() % 128, 0);
+        // `ArcInner` puts its two counters in front of the value; the value's 128-byte alignment
+        // pushes it to the next block, so the counters share a line with nothing hot.
         let shared = Arc::new(Core::<u64>::new(8, 0));
         assert_eq!(Arc::as_ptr(&shared) as usize % 128, 0);
+    }
+
+    #[test]
+    fn partitions_do_not_share_a_core() {
+        let a = Arc::new(Core::<u64>::new(8, 0));
+        let b = Arc::new(Core::<u64>::new(8, 0));
+        let (a, b) = (Arc::as_ptr(&a) as usize, Arc::as_ptr(&b) as usize);
+
+        assert!(a.abs_diff(b) >= size_of::<Core<u64>>());
     }
 }
