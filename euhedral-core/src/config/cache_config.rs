@@ -76,8 +76,8 @@ impl CacheConfig {
         }
     }
 
-    /// The frames one walk over the partitions must collect for a drain to walk them again: higher
-    /// values end drains sooner, lower ones keep them going longer.
+    /// The frames one walk over the partitions must collect for a greedy take to walk them again:
+    /// higher values end greedy takes sooner, lower ones keep them going longer.
     pub fn ring_walk_reset_threshold(&self) -> u64 {
         self.ring_walk_reset_threshold
     }

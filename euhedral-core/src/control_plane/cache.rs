@@ -94,14 +94,15 @@ impl CacheDirectory {
 /// queues the frames pushed to it, and [`pull`](Self::pull) fills it through the edges above.
 /// [`request`](Self::request) asks the calling worker's upstreams for a batch sized to the cache's
 /// capacity, which shrinks under CPU pressure. The owner takes frames out with
-/// [`drain`](Self::drain), or one at a time with [`poll`](Self::poll).
+/// [`greedy`](Self::greedy), or one at a time with [`poll`](Self::poll).
 ///
 /// The queue is split into partitions by routing hash, so frames of one ordered stream stay in one
 /// partition, in order. With work stealing on, other caches of the lattice may take a partition's
 /// unordered frames from the front with [`work_steal`](Self::work_steal), as far as the frames'
 /// [routing policy](RoutingPolicy) lets them leave; a partition is held by one
-/// consumer at a time, and the others pass it over. A drain holds a partition while it runs the
-/// frames it takes, so it drains without touching the producer side; a poll holds it only while it
+/// consumer at a time, and the others pass it over. A greedy take holds a partition while it runs the
+/// frames it takes, so it consumes them as fast as it can without touching the producer side; a poll
+/// holds it only while it
 /// takes a frame out, so a frame that blocks leaves the unordered frames behind it to stealers.
 ///
 /// With SMT, the two hardware threads of a core each run a cache, and the first takes the core's
@@ -393,16 +394,17 @@ impl ControlPlaneCache {
             .with_thread_queue(|queue| queue.request(demand));
     }
 
-    /// Moves up to `limit` frames into `consume`, partition by partition, and returns how many.
-    pub fn drain(&self, consume: impl FnMut(Box<dyn Frame>), limit: u64) -> u64 {
-        self.drain_while(consume, |_| false, limit)
+    /// Moves up to `limit` frames into `consume`, partition by partition, and returns how many,
+    /// greedily: it holds each partition while it runs the frames it takes from it.
+    pub fn greedy(&self, consume: impl FnMut(Box<dyn Frame>), limit: u64) -> u64 {
+        self.greedy_while(consume, |_| false, limit)
     }
 
-    /// Like [`drain`](Self::drain), but leaves each partition at its first frame `stop` matches.
+    /// Like [`greedy`](Self::greedy), but leaves each partition at its first frame `stop` matches.
     ///
     /// The partitions are walked in turn, skipping any another consumer holds, and walked again
     /// while a walk collects more than the ring-walk reset threshold.
-    pub fn drain_while(
+    pub fn greedy_while(
         &self,
         mut consume: impl FnMut(Box<dyn Frame>),
         mut stop: impl FnMut(&dyn Frame) -> bool,
@@ -444,11 +446,11 @@ impl ControlPlaneCache {
     /// Moves up to `limit` frames into `consume` one at a time and returns how many, holding a
     /// partition only while it takes a frame out: while `consume` runs a frame, its partition is
     /// free, so another worker may steal the unordered frames queued behind it. For workers whose
-    /// frames may block ([`FragmentConfig::polls`](crate::config::FragmentConfig::polls)); a drain
-    /// is cheaper when frames are short.
+    /// frames may block ([`FragmentConfig::polls`](crate::config::FragmentConfig::polls)); a greedy
+    /// take is cheaper when frames are short.
     ///
     /// Ordered frames keep their order: only the cache's owner takes them (stealers stop at an
-    /// ordered head, and an SMT buddy drains its own cache), and it runs them one after another.
+    /// ordered head, and an SMT buddy takes from its own cache), and it runs them one after another.
     pub fn poll(&self, consume: impl FnMut(Box<dyn Frame>), limit: u64) -> u64 {
         self.poll_while(consume, |_| false, limit)
     }
@@ -505,7 +507,7 @@ impl ControlPlaneCache {
         match self.directory.cache_at(cursor) {
             Some(target) => {
                 let stop = self.steal_stop(&target);
-                target.drain_while(consume, stop, limit)
+                target.greedy_while(consume, stop, limit)
             }
             None => 0,
         }
@@ -628,7 +630,7 @@ impl LatticeNode for ControlPlaneCache {
     }
 }
 
-/// Subtracts the frames a drain took from the count when dropped, so a consumer that panics
+/// Subtracts the frames a greedy take removed from the count when dropped, so a consumer that panics
 /// still leaves the count right.
 struct Taken<'a> {
     count: &'a AtomicI64,
@@ -641,7 +643,7 @@ impl Drop for Taken<'_> {
     }
 }
 
-/// The partition, unless another consumer holds it. A consumer that panicked mid-drain leaves the
+/// The partition, unless another consumer holds it. A consumer that panicked mid-take leaves the
 /// partition intact, so its lock is taken over.
 fn try_hold(partition: &Mutex<Partition>) -> Option<MutexGuard<'_, Partition>> {
     match partition.try_lock() {

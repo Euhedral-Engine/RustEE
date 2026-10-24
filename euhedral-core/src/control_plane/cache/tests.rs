@@ -201,7 +201,7 @@ fn caches_on_crowded_l2s_split_them() {
 }
 
 #[test]
-fn pushed_frames_are_counted_and_drained_in_partition_order() {
+fn pushed_frames_are_counted_and_taken_in_partition_order() {
     let cache = cache(2);
     FlowContext::initialize();
     // Hashes in the lower half go to the first partition, the upper half to the second.
@@ -214,24 +214,24 @@ fn pushed_frames_are_counted_and_drained_in_partition_order() {
     assert_eq!(cache.local_cache_count(), 4);
     assert!(!cache.is_drained());
 
-    let mut drained = Vec::new();
-    assert_eq!(cache.drain(|frame| drained.push(frame), 3), 3);
-    assert_eq!(ids(&drained), [1, 2, 3]);
+    let mut taken_frames = Vec::new();
+    assert_eq!(cache.greedy(|frame| taken_frames.push(frame), 3), 3);
+    assert_eq!(ids(&taken_frames), [1, 2, 3]);
     assert_eq!(cache.local_cache_count(), 1);
 
-    drained.clear();
-    assert_eq!(cache.drain(|frame| drained.push(frame), 3), 1);
-    assert_eq!(ids(&drained), [4]);
+    taken_frames.clear();
+    assert_eq!(cache.greedy(|frame| taken_frames.push(frame), 3), 1);
+    assert_eq!(ids(&taken_frames), [4]);
     assert!(cache.is_drained());
 }
 
 #[test]
-fn a_zero_limit_drains_nothing() {
+fn a_zero_limit_takes_nothing() {
     let cache = cache(2);
     cache.push(ordered(1));
-    assert_eq!(cache.drain(|_| panic!("not consumed"), 0), 0);
+    assert_eq!(cache.greedy(|_| panic!("not consumed"), 0), 0);
     assert_eq!(
-        cache.drain_while(|_| panic!("not consumed"), |_| panic!("not asked"), 0),
+        cache.greedy_while(|_| panic!("not consumed"), |_| panic!("not asked"), 0),
         0
     );
     assert_eq!(cache.pull(0), 0);
@@ -246,19 +246,19 @@ fn a_stopped_partition_keeps_its_head_while_others_progress() {
     cache.push(unordered(2, 1));
     cache.push(unordered(3, u64::MAX));
 
-    let mut drained = Vec::new();
-    let taken = cache.drain_while(
-        |frame| drained.push(frame),
+    let mut taken_frames = Vec::new();
+    let taken = cache.greedy_while(
+        |frame| taken_frames.push(frame),
         |frame| frame.header().id_hash() == 1,
         3,
     );
     assert_eq!(taken, 1);
-    assert_eq!(ids(&drained), [3]);
+    assert_eq!(ids(&taken_frames), [3]);
     assert_eq!(cache.local_cache_count(), 2);
 
-    drained.clear();
-    assert_eq!(cache.drain(|frame| drained.push(frame), 3), 2);
-    assert_eq!(ids(&drained), [1, 2]);
+    taken_frames.clear();
+    assert_eq!(cache.greedy(|frame| taken_frames.push(frame), 3), 2);
+    assert_eq!(ids(&taken_frames), [1, 2]);
 }
 
 #[test]
@@ -270,20 +270,23 @@ fn the_queue_grows_past_the_frame_quota() {
     }
     assert_eq!(cache.local_cache_count(), frames);
     assert!(cache.local_cache_count() > cache.max_local_cache_count());
-    let mut drained = Vec::new();
-    assert_eq!(cache.drain(|frame| drained.push(frame), u64::MAX), frames);
-    assert_eq!(ids(&drained), (0..frames).collect::<Vec<_>>());
+    let mut taken_frames = Vec::new();
+    assert_eq!(
+        cache.greedy(|frame| taken_frames.push(frame), u64::MAX),
+        frames
+    );
+    assert_eq!(ids(&taken_frames), (0..frames).collect::<Vec<_>>());
 }
 
-/// Drains two partitions where taking the second partition's frame queues one in the first,
+/// Takes greedily from two partitions where taking the second partition's frame queues one in the first,
 /// which only another walk over the partitions finds.
-fn drain_with_refill(threshold: u64) -> u64 {
+fn greedy_with_refill(threshold: u64) -> u64 {
     let directory = directory();
     let config = config(2).with_ring_walk_reset_threshold(threshold);
     let cache = cache_on(&directory, &config, 0);
     cache.push(unordered(1, u64::MAX));
     let refill = cache.clone();
-    cache.drain(
+    cache.greedy(
         |frame| {
             if frame.header().id_hash() == 1 {
                 refill.push(unordered(2, 1));
@@ -295,12 +298,12 @@ fn drain_with_refill(threshold: u64) -> u64 {
 
 #[test]
 fn a_productive_walk_walks_the_partitions_again() {
-    assert_eq!(drain_with_refill(0), 2);
+    assert_eq!(greedy_with_refill(0), 2);
 }
 
 #[test]
-fn a_walk_at_the_threshold_ends_the_drain() {
-    assert_eq!(drain_with_refill(1), 1);
+fn a_walk_at_the_threshold_ends_the_greedy_take() {
+    assert_eq!(greedy_with_refill(1), 1);
 }
 
 #[test]
@@ -310,7 +313,7 @@ fn a_consumer_that_panics_leaves_the_count_and_partition_usable() {
         cache.push(ordered(id));
     }
     let failed = panic::catch_unwind(AssertUnwindSafe(|| {
-        cache.drain(
+        cache.greedy(
             |frame| {
                 if frame.header().id_hash() == 1 {
                     panic!("consumer failed");
@@ -322,9 +325,9 @@ fn a_consumer_that_panics_leaves_the_count_and_partition_usable() {
     assert!(failed.is_err());
     assert_eq!(cache.local_cache_count(), 1);
 
-    let mut drained = Vec::new();
-    assert_eq!(cache.drain(|frame| drained.push(frame), 3), 1);
-    assert_eq!(ids(&drained), [2]);
+    let mut taken_frames = Vec::new();
+    assert_eq!(cache.greedy(|frame| taken_frames.push(frame), 3), 1);
+    assert_eq!(ids(&taken_frames), [2]);
 }
 
 #[test]
@@ -348,7 +351,7 @@ fn work_stealing_takes_unordered_frames_and_leaves_ordered_heads() {
     victim.push(unordered(4, 9));
     let span = directory.topology().cpu_span();
     let mut owner = Vec::new();
-    victim.drain_while(
+    victim.greedy_while(
         |frame| owner.push(frame),
         |frame| frame.header().id_hash() == 3,
         10,
@@ -385,7 +388,7 @@ fn stolen_while_the_owner_runs_a_frame(owner_polls: bool) -> u64 {
             if owner_polls {
                 victim.poll(blocking, 1)
             } else {
-                victim.drain(blocking, 1)
+                victim.greedy(blocking, 1)
             }
         })
     };
@@ -403,7 +406,7 @@ fn a_poll_frees_the_partition_while_its_frame_runs() {
 }
 
 #[test]
-fn a_drain_holds_the_partition_while_its_frames_run() {
+fn a_greedy_take_holds_the_partition_while_its_frames_run() {
     assert_eq!(stolen_while_the_owner_runs_a_frame(false), 0);
 }
 
@@ -504,7 +507,7 @@ fn locality_allows_what_each_routing_policy_lets_leave() {
 }
 
 #[test]
-fn stealing_leaves_cache_local_frames_to_their_core_in_drain_and_poll_mode() {
+fn stealing_leaves_cache_local_frames_to_their_core_in_greedy_and_poll_mode() {
     let directory = directory();
     let victim = cache_on(&directory, &config(1), 1);
     let other_core = cache_on(&directory, &config(1), 2);
@@ -680,7 +683,7 @@ fn a_held_partition_is_passed_over() {
         thief.work_steal(|_| panic!("the partition is held"), 10, victim.cpu()),
         0
     );
-    assert_eq!(victim.drain(|_| panic!("the partition is held"), 10), 0);
+    assert_eq!(victim.greedy(|_| panic!("the partition is held"), 10), 0);
     drop(held);
 
     assert_eq!(thief.work_steal(drop, 10, victim.cpu()), 1);
@@ -710,7 +713,7 @@ fn a_closed_cache_fails_new_frames_and_keeps_its_queue() {
     assert_eq!(fates.len(), 1);
     assert!(matches!(fates[0].1, Fate::Failed(_)));
     assert_eq!(victim.local_cache_count(), 1);
-    assert_eq!(victim.drain(drop, 10), 1);
+    assert_eq!(victim.greedy(drop, 10), 1);
 }
 
 /// A cache on core 0's first CPU paired with one on its second.
@@ -722,10 +725,10 @@ fn smt_pair(directory: &Arc<CacheDirectory>) -> (Arc<ControlPlaneCache>, Arc<Con
     (first, second)
 }
 
-fn drained_ids(cache: &ControlPlaneCache) -> Vec<u64> {
-    let mut drained = Vec::new();
-    cache.drain(|frame| drained.push(frame), 100);
-    let mut ids = ids(&drained);
+fn taken_ids(cache: &ControlPlaneCache) -> Vec<u64> {
+    let mut taken_frames = Vec::new();
+    cache.greedy(|frame| taken_frames.push(frame), 100);
+    let mut ids = ids(&taken_frames);
     ids.sort_unstable();
     ids
 }
@@ -745,8 +748,8 @@ fn a_paired_cache_sends_its_odd_lane_to_the_sibling() {
     assert_eq!(first.local_cache_count(), 2);
     assert_eq!(second.local_cache_count(), 2);
     assert_eq!(FlowContext::with(|c| c.unwrap().satisfied_request()), 4);
-    assert_eq!(drained_ids(&first), [1, 4]);
-    assert_eq!(drained_ids(&second), [2, 3]);
+    assert_eq!(taken_ids(&first), [1, 4]);
+    assert_eq!(taken_ids(&second), [2, 3]);
     assert!(first.is_drained() && second.is_drained());
     FlowContext::clear();
 }
@@ -766,8 +769,8 @@ fn a_paired_cache_pulls_for_both_lanes() {
 
     assert_eq!(first.local_cache_count(), 3);
     assert_eq!(second.local_cache_count(), 3);
-    assert_eq!(drained_ids(&first), [2, 4, 6]);
-    assert_eq!(drained_ids(&second), [1, 3, 5]);
+    assert_eq!(taken_ids(&first), [2, 4, 6]);
+    assert_eq!(taken_ids(&second), [1, 3, 5]);
     directory.registry().remove_thread();
 }
 
@@ -831,7 +834,7 @@ fn closing_an_old_cache_leaves_its_replacement_in_place() {
 }
 
 #[test]
-fn closing_does_not_wait_for_a_thief_mid_drain() {
+fn closing_does_not_wait_for_a_thief_mid_take() {
     let directory = directory();
     let thief = cache_on(&directory, &config(1), 0);
     let victim = cache_on(&directory, &config(1), 1);
@@ -890,9 +893,9 @@ fn pull_fills_the_cache_through_the_edges_above() {
 
     assert_eq!(cache.pull(3), 3);
     assert_eq!(cache.local_cache_count(), 3);
-    let mut drained = Vec::new();
-    cache.drain(|frame| drained.push(frame), 10);
-    assert_eq!(ids(&drained), [0, 1, 2]);
+    let mut taken_frames = Vec::new();
+    cache.greedy(|frame| taken_frames.push(frame), 10);
+    assert_eq!(ids(&taken_frames), [0, 1, 2]);
     assert_eq!(source.frames.lock().unwrap().len(), 2);
     directory.registry().remove_thread();
 }
@@ -1028,7 +1031,7 @@ fn reset_drops_every_frame_and_restores_capacity() {
     assert_eq!(cache.reset_for_next_trial(), 5);
     assert!(cache.is_drained());
     assert_eq!(cache.cap_factor(), 1.0);
-    assert_eq!(cache.drain(|_| panic!("cleared"), 10), 0);
+    assert_eq!(cache.greedy(|_| panic!("cleared"), 10), 0);
     assert_eq!(cache.reset_for_next_trial(), 0);
 }
 
@@ -1064,9 +1067,9 @@ fn frames_queued_after_a_reset_are_the_only_ones_left() {
     }
     cache.reset_for_next_trial();
     cache.push(ordered(9));
-    let mut drained = Vec::new();
-    assert_eq!(cache.drain(|frame| drained.push(frame), 10), 1);
-    assert_eq!(ids(&drained), [9]);
+    let mut taken_frames = Vec::new();
+    assert_eq!(cache.greedy(|frame| taken_frames.push(frame), 10), 1);
+    assert_eq!(ids(&taken_frames), [9]);
 }
 
 #[test]
@@ -1097,13 +1100,13 @@ fn first_touch_writes_the_chunks_then_resets_the_cache() {
     assert!(cache.is_drained());
     assert_eq!(cache.cap_factor(), 1.0);
     assert_eq!(
-        cache.drain(|_| panic!("the dummies are cleared"), u64::MAX),
+        cache.greedy(|_| panic!("the dummies are cleared"), u64::MAX),
         0
     );
     cache.push(ordered(1));
-    let mut drained = Vec::new();
-    cache.drain(|frame| drained.push(frame), 10);
-    assert_eq!(ids(&drained), [1]);
+    let mut taken_frames = Vec::new();
+    cache.greedy(|frame| taken_frames.push(frame), 10);
+    assert_eq!(ids(&taken_frames), [1]);
 }
 
 #[test]

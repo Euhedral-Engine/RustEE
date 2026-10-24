@@ -56,7 +56,7 @@ impl Error for FragmentError {}
 /// straight from upstream, stage them in the cache by requesting a batch, or sit the cycle out.
 /// When that finds nothing it steals from the next cache of the lattice, and failing that it parks.
 /// With a max batch of [`FragmentConfig::POLL_MODE_MAX_BATCH`] or less the worker polls its cache
-/// and the caches it steals from instead of draining them, so a frame that blocks holds up nothing
+/// and the caches it steals from instead of taking from them greedily, so a frame that blocks holds up nothing
 /// another worker could run ([`ControlPlaneCache::poll`]).
 /// Batches grow and shrink with the frames' service time, within a cap that falls as the CPU's
 /// pressure rises.
@@ -328,7 +328,7 @@ impl ControlPlaneFragment {
                 if polls {
                     self.cache.poll(output, limit)
                 } else {
-                    self.cache.drain(output, limit)
+                    self.cache.greedy(output, limit)
                 }
             });
             limit -= count;

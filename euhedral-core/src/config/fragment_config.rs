@@ -41,7 +41,7 @@ impl FragmentConfig {
         }
     }
 
-    /// The max batch at or below which workers poll their caches instead of draining them
+    /// The max batch at or below which workers poll their caches instead of taking from them greedily
     /// ([`polls`](Self::polls)).
     pub const POLL_MODE_MAX_BATCH: u64 = 2;
 
