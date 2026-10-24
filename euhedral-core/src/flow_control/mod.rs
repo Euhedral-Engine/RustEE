@@ -29,14 +29,20 @@ pub use vertex::{
 };
 
 /// How close to its [origin](crate::frames::FrameHeader::origin) a frame must stay.
+///
+/// The policy is binding, like the ordered flag: routing places a frame by it, and work stealing
+/// and a worker's direct pull from its upstreams take a frame only where its policy lets it run.
+/// A frame without an origin goes anywhere.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum RoutingPolicy {
     /// Any CPU.
     #[default]
     Anywhere,
-    /// A CPU on the origin's socket.
+    /// A CPU on the origin's socket; if that socket is inactive, routing falls back to another
+    /// socket and the frame goes anywhere.
     SocketLocal,
-    /// A CPU sharing a cache with the origin.
+    /// A CPU of the origin's core (its SMT threads); if that core is inactive, routing falls back
+    /// to a hashed core and the frame keeps to the origin's socket.
     CacheLocal,
 }
 

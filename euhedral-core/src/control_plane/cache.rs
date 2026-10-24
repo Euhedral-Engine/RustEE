@@ -99,7 +99,7 @@ impl CacheDirectory {
 /// The queue is split into partitions by routing hash, so frames of one ordered stream stay in one
 /// partition, in order. With work stealing on, other caches of the lattice may take a partition's
 /// unordered frames from the front with [`work_steal`](Self::work_steal), as far as the frames'
-/// [routing policy](RoutingPolicy) lets them leave ([`locality_allows`]); a partition is held by one
+/// [routing policy](RoutingPolicy) lets them leave; a partition is held by one
 /// consumer at a time, and the others pass it over. A drain holds a partition while it runs the
 /// frames it takes, so it drains without touching the producer side; a poll holds it only while it
 /// takes a frame out, so a frame that blocks leaves the unordered frames behind it to stealers.
@@ -355,7 +355,7 @@ impl ControlPlaneCache {
 
     /// Takes up to `limit` frames from the calling worker's upstreams straight into `consume`,
     /// bypassing the cache, and stops before the first ordered frame and the first frame its
-    /// routing policy keeps off this core ([`locality_allows`]): those go through the lattice's
+    /// routing policy keeps off this core ([`RoutingPolicy`]): those go through the lattice's
     /// routing instead.
     pub fn upstream_pull(&self, mut consume: impl FnMut(Box<dyn Frame>), limit: u64) -> u64 {
         if limit == 0 {
@@ -492,7 +492,7 @@ impl ControlPlaneCache {
     /// Takes up to `limit` unordered frames from the front of the partitions of the cache at
     /// `cursor` in the lattice's work stealing, which wraps over the CPUs, stopping in each
     /// partition at the first frame that is ordered or that its routing policy keeps where it is
-    /// ([`locality_allows`]). Nothing without work stealing.
+    /// ([`RoutingPolicy`]). Nothing without work stealing.
     pub fn work_steal(
         &self,
         consume: impl FnMut(Box<dyn Frame>),
