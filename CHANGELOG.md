@@ -3,6 +3,82 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## Metrics restored (2026-10-24)
+
+**What.** `euhedral-core` gets a [`metrics`](euhedral-core/src/metrics/mod.rs) module, the port of upstream's
+`metrics` package (`ExecutionMetrics`, `CacheMetrics`, `MetricsAggregator`), which the port had dropped. Each fragment
+worker and each cache registers meters in a `MetricsRegistry`; `MetricsRegistry::snapshot` and
+`ControlPlaneLattice::metrics` read them all without stopping the workers. The fragment's cycle state has upstream's
+two `FlowRecorder`s back (service time per frame and frames per cycle), which feed the latency and throughput meters.
+
+**Why.** Upstream reports latency, throughput, in-progress, backlog and cap-factor meters through Micrometer; the
+port had the raw state (`in_progress`, `cap_factor`, the cache's count) but no way to read it as metrics.
+
+**How to use it.**
+```rust
+let registry = MetricsRegistry::new();
+let config = LatticeConfig::with_metrics("app", registry.clone()); // or:
+let fragment = FragmentConfig::default().with_metrics("app", registry.clone()); // fragments and their caches
+// ... run the lattice ...
+let snapshot = registry.snapshot(); // or lattice.metrics()
+let p99 = snapshot.get("app.execution.latency", cpu).and_then(|m| m.summary()).and_then(|s| s.percentile(0.99));
+```
+- `FragmentConfig` and `CacheConfig` have upstream's `metric_prefix()` and `registry()`, with `with_metric_prefix`
+  and `with_registry` (`None` turns metrics off). `FragmentConfig::with_metrics` sets both its own and its cache
+  config's, like `FragmentConfig.ofDefaults(metricPrefix, registry)`; `LatticeConfig::with_metrics` is
+  `LatticeConfig.ofDefaults(.., metricPrefix, registry)`.
+- `CloneableObject::metrics_registry` (default `None`) lets a lattice find its object's registry.
+
+**Semantics.**
+
+| Meter | Kind | Recorded | Upstream |
+|---|---|---|---|
+| `<prefix>.execution.latency` | summary, ns | at each batch end: the service-time recorder's average | `reportLatency` in `reportMetrics` |
+| `<prefix>.execution.throughput` | summary, frames/s | at each batch end: the frame recorder's rate × 10^9 | `reportThroughput` in `reportMetrics` |
+| `<prefix>.execution.inProgress` | gauge | 1 while the worker is inside a cache take, a direct pull or a steal (`timed`) | `executionStarted`/`executionFinished` around `drainLocalCache`, `pullAvailableUpstream`, `stealWork` |
+| `<prefix>.execution.frames` | counter | after each productive cycle | none |
+| `<prefix>.execution.serviceTime` | flow, ns | after each productive cycle: the service-time recorder's `FlowStats` | none |
+| `<prefix>.execution.rate` | flow, frames/s | after each productive cycle: the frame recorder's rate `FlowStats` | none |
+| `<prefix>.cache.backlog` | gauge, frames | read at snapshot: the cache's count | `CacheMetrics` gauge on `TOTAL_COUNT` |
+| `<prefix>.cache.capFactor` | summary | in `ControlPlaneCache::update`, the cap factor it set | `recordCapFactor` in `update` |
+
+- **The recorders** are recorded where upstream's `recordProgress` records them: after each productive cycle, the
+  service time per frame (`max(1, elapsed / frames)`) and the frames run, at the cycle's end time. A worker reset starts
+  them over, as `CycleState.reset()` does; the summaries stay cumulative.
+- **Prefix:** `euhedral` unless set; blank means the default, and a trailing `.` is dropped (`metricName`).
+- **Tags:** `core` (the clone's core id) and `cpu`. Upstream has only `core`, so a core's two SMT workers share one
+  Micrometer meter per name; here each worker and each cache has its own, and `HistogramSnapshot::merge` combines them.
+- **Summaries** are cumulative histograms of atomics: count, sum, max, and log2 buckets (each octave from `2^-16` to
+  `2^48` split in four), so percentiles are within a quarter-octave. Negative and `NaN` values are ignored, as
+  Micrometer ignores negative amounts.
+- **Flows** are published by the worker through a sequence lock: the worker never waits, readers retry a read a write
+  overlapped.
+- **Lifecycle:** a fragment or cache registers when built and leaves its registry when closed or dropped (upstream's
+  caches never removed their meters).
+- **Cost.** No lock and no allocation on a worker's path; each worker owns its meters on their own cache lines.
+  Without a registry a cycle pays one untaken branch. With one, a productive cycle pays about 33 ns (two `FlowRecorder`
+  updates, about 28 ns, dominate), plus a histogram record per summary at each batch end. Measured on an i9-14900K, in
+  release, one SMT core's two workers running empty frames: greedy mode 157.0 ns/frame off, 158.5 on (+1%); poll mode,
+  with a cycle per one or two frames, 251 off, 289 on (+38 ns, +15%).
+- `MetricsAggregator.getInProgressGauges(registry)` matched the latency suffix upstream; `in_progress_gauges` matches
+  the in-progress suffix.
+- No exporter: the `metrics` crate facade is push-based, so a bridge would either record through a global recorder on
+  the hot path or poll snapshots on a thread of its own; an application can write the latter in a few lines.
+
+**Tests:**
+- `metrics/histogram.rs`: buckets and their bounds, recording, percentiles, `since` and `merge`, concurrent writers.
+- `metrics/flow.rs`: publishing, no torn reads under a concurrent writer, `FlowStats` from a recorder.
+- `metrics/tests.rs`: upstream's names and prefix rules, nothing built without a registry, meters and tags, the
+  aggregator lookups, sources leaving the registry, snapshots while four writers record.
+- `config/*`: the prefix and registry settings and defaults.
+- `control_plane/cache/tests.rs`: no meters without a registry; backlog and cap factor tagged with the core; closing or
+  dropping a cache removes its meters.
+- `control_plane/fragment/tests.rs`: no meters without a registry; both SMT workers and caches register, tagged;
+  running workers record frames, latency, throughput and flows while a reader snapshots; a cycle counts frames and
+  reports at batch ends.
+- `impls/base_cloneable/tests.rs`: a metered lattice reports every worker's meters until closed. Ignored
+  measurements: `metrics_cost_per_cycle` (fragment tests) and `metrics_overhead_per_frame`.
+
 ## Greedy, not drain, for holding a partition while its frames run (2026-10-23)
 
 **What.** `ControlPlaneCache::drain` and `drain_while` are renamed `greedy` and `greedy_while`; the mode they make is

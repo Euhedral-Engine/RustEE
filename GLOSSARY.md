@@ -269,6 +269,46 @@ contention half-life. The default is adaptive: a fitted model (`cache_local_boun
 contention, productive handles per worker and body cost. `IdlePolicy::fixed` always uses the same
 park; prefer it for graphics loops, because the adaptive timing is not built for predictable timing.
 
+## Metrics
+
+**metrics, MetricsRegistry** ([`metrics`](euhedral-core/src/metrics/mod.rs),
+[`MetricsRegistry`](euhedral-core/src/metrics/registry.rs)): what workers and caches measure about
+themselves. A config with a registry (`FragmentConfig::with_metrics`,
+`LatticeConfig::with_metrics`) makes each worker and cache register its meters there; without one
+nothing is recorded. The registry holds them weakly; closing a fragment or cache takes its meters
+out.
+
+**meter, metric name, prefix, tags** ([`Meter`](euhedral-core/src/metrics/registry.rs),
+[`metric_name`](euhedral-core/src/metrics/mod.rs)): one measured value of one worker or cache. Its
+name is a prefix (`euhedral` by default, a trailing `.` dropped) and a suffix such as
+`.execution.latency`; its tags are `core` (the clone's physical core) and `cpu` (the worker's CPU,
+which tells a core's two SMT workers apart).
+
+**gauge, counter, summary, flow** ([`MeterValue`](euhedral-core/src/metrics/registry.rs)): a gauge
+reads a value now (`.execution.inProgress`, `.cache.backlog`); a counter counts since the meter
+was made (`.execution.frames`); a summary is a cumulative histogram of recorded values
+(`.execution.latency`, `.execution.throughput`, `.cache.capFactor`); a flow is a `FlowRecorder`'s
+current statistics (`.execution.serviceTime`, `.execution.rate`).
+
+**histogram, log2 buckets, percentile** ([`Histogram`](euhedral-core/src/metrics/histogram.rs)):
+atomics counting, summing and keeping the maximum of recorded values, and counting them in
+buckets: each octave `[2^e, 2^(e+1))` from `2^-16` to `2^48` split in four. A `HistogramSnapshot`
+gives the mean, percentiles within a bucket's width, and with `since` the values recorded between
+two snapshots.
+
+**latency, throughput** ([`ExecutionFlow`](euhedral-core/src/control_plane/fragment.rs), private):
+a worker's smoothed service time per frame (ns) and rate of frames run (frames/s), from two
+`FlowRecorder`s it updates after each productive cycle. The latency and throughput summaries
+sample their averages at the end of each batch.
+
+**FlowStats** ([`FlowStats`](euhedral-core/src/metrics/flow.rs)): a `FlowRecorder`'s average,
+standard deviation, trend and recent minimum and maximum, which a worker publishes through a
+sequence lock: it never waits, and readers never see a half-written set.
+
+**snapshot** ([`MetricsSnapshot`](euhedral-core/src/metrics/registry.rs)): every registered meter,
+read without stopping the workers (`MetricsRegistry::snapshot`, `ControlPlaneLattice::metrics`),
+with lookups by name, worker and suffix.
+
 ## Hardware
 
 **topology** ([`Topology`](euhedral-hardware-utils/src/topology/mod.rs)): the machine's logical

@@ -38,6 +38,7 @@ and routing policy, and lets idle workers steal unordered work.
 | [`config`](src/config/mod.rs) | `LatticeConfig`, `FragmentConfig`, `CacheConfig`, `IdlePolicy` with `FixedTiming` and `IdleTimingFunction` (`TimingProvider`, `TimingModel`), `CloneConfig`, `CloneLivenessRegistry`. |
 | [`flow_control`](src/flow_control/mod.rs) | `RoutingPolicy`; `LatticeEdge` and `LatticeNode`; `LatticeVertex` and its `RoutingState` generations; `UpstreamRegistry`, `UpstreamHandle`, `UpstreamQueue`; `LatticeHotSource`, `LatticeHotReceiver`. |
 | [`impls`](src/impls/mod.rs) | `BaseCloneableObject` (the stock per-core object: a fragment feeding an executor), `DefaultExecutor`, and frame pooling: `FrameManager`, `FrameFactory`, `Recycler`. |
+| [`metrics`](src/metrics/mod.rs) | `MetricsRegistry` and its `MetricsSnapshot` of `Meter`s (`MeterValue`: gauge, counter, summary, flow); `Histogram` and `HistogramSnapshot` (log2 buckets, percentiles); `FlowStats`; the metric names (`metric_name`, `DEFAULT_PREFIX`, the `*_SUFFIX` constants, `CORE_TAG`, `CPU_TAG`). |
 | [`utils`](src/utils/mod.rs) | `math`, `spin_wait`, `StopWatch`, `AverageFlow`, `FlowRecorder`, `FlowContext`, `calibration`. |
 
 ## Key concepts
@@ -357,6 +358,49 @@ config.allowed_cpus = [2, 3].into_iter().collect();
 `CacheConfig` sets each cache's memory budget (a share of the core's L1 and L2, 70% by default),
 partition count (8), chunk pooling, ring-walk reset threshold, and whether work stealing is on.
 
+### Metrics
+
+With a `MetricsRegistry` in the fragment config (or `LatticeConfig::with_metrics`), each worker
+and each cache registers its meters, tagged with its `core` and `cpu`, named after a prefix
+(`euhedral` by default), as upstream's Micrometer meters are:
+
+| Name | Kind | What |
+|---|---|---|
+| `.execution.latency` | summary, ns | each batch's smoothed service time per frame |
+| `.execution.throughput` | summary, frames/s | each batch's smoothed rate of frames run |
+| `.execution.inProgress` | gauge | 1 while the worker runs frames, else 0 |
+| `.execution.frames` | counter | frames the worker has run |
+| `.execution.serviceTime` | flow, ns | the current smoothed service time per frame |
+| `.execution.rate` | flow, frames/s | the current smoothed rate of frames run |
+| `.cache.backlog` | gauge, frames | frames queued in the cache |
+| `.cache.capFactor` | summary | the cache's cap factor at each utilization update |
+
+`frames`, `serviceTime` and `rate` are RustEE's own; the rest are upstream's names. Each worker
+keeps two `FlowRecorder`s (service time per frame, frames per cycle) and publishes their
+statistics after each productive cycle; the summaries sample their averages at each batch end.
+Summaries are cumulative histograms with log2 buckets, so a snapshot gives means and percentiles,
+and `HistogramSnapshot::since` a window's. Recording takes no lock and allocates nothing; without a
+registry nothing is recorded and a cycle pays one untaken branch.
+
+```rust,no_run
+use euhedral_core::config::LatticeConfig;
+use euhedral_core::control_plane::ControlPlaneLattice;
+use euhedral_core::metrics::MetricsRegistry;
+
+let registry = MetricsRegistry::new();
+let lattice = ControlPlaneLattice::new(LatticeConfig::with_metrics("app", registry.clone())).unwrap();
+// ... add upstreams and run frames ...
+let snapshot = lattice.metrics().unwrap(); // the same as registry.snapshot()
+for meter in snapshot.latency_summaries() {
+    let latency = meter.summary().unwrap();
+    println!("core {} cpu {}: mean {:.0} ns, p99 {:?} ns", meter.core, meter.cpu,
+        latency.mean(), latency.percentile(0.99));
+}
+let frames: u64 = snapshot.frames_counters().filter_map(|meter| meter.counter()).sum();
+println!("{frames} frames run");
+lattice.close();
+```
+
 ## Build and test
 
 ```sh
@@ -371,5 +415,15 @@ particular hardware and pass without checking anything when the host lacks it:
 - the `CacheLocal` lattice test needs two whole cores the process may run on.
 
 Run them on an SMT machine with no CPU restrictions to exercise everything. In this README, the
-three examples that start no lattice are compiled and run as doctests; the three that start one
+three examples that start no lattice are compiled and run as doctests; the four that start one
 are compiled only (`no_run`), because they start a worker on every allowed CPU.
+
+Two measurements are `#[ignore]`d tests; run them in release:
+
+```sh
+mise exec -- cargo test --release -p euhedral-core --lib -- --ignored --nocapture metrics_
+```
+
+`metrics_cost_per_cycle` times a worker cycle's bookkeeping with metrics off and on;
+`metrics_overhead_per_frame` runs empty frames on an SMT core's two workers with metrics off and
+on, in greedy and in poll mode.
