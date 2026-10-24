@@ -2,6 +2,7 @@ use super::*;
 use crate::flow_control::UpstreamHandle;
 use crate::flow_control::testing::{Fate, Fates, Tracked, frame};
 use euhedral_hardware_utils::monitor::{HardwareUtilization, HardwareUtilizationParts};
+use euhedral_hardware_utils::topology::CpuInfo;
 use euhedral_hardware_utils::topology::source::{
     CacheDomain, CoreKind, LogicalCpu, TopologyInput, normalize,
 };
@@ -445,6 +446,210 @@ fn polls_walk_every_partition() {
     ids.sort_unstable();
     assert_eq!(ids, (0..8).collect::<Vec<_>>());
     assert!(cache.is_drained());
+}
+
+/// An unordered frame that must stay as close to `origin_core` (of `origin_socket`) as `policy` says.
+fn local(
+    id: u64,
+    policy: RoutingPolicy,
+    origin_core: usize,
+    origin_socket: usize,
+) -> Box<dyn Frame> {
+    let mut frame = unordered(id, id + 100);
+    let header = frame.header_mut();
+    header.set_routing_policy(policy);
+    header.set_origin(Some(CpuInfo {
+        cpu: 2 * origin_core,
+        core: origin_core,
+        socket: origin_socket,
+    }));
+    frame
+}
+
+/// The cache of core `core`'s second CPU: the SMT buddy of `cache_on(.., core)`.
+fn buddy_on(directory: &Arc<CacheDirectory>, core: usize) -> Arc<ControlPlaneCache> {
+    ControlPlaneCache::new(
+        &config(1),
+        &clone_config(core),
+        2 * core + 1,
+        false,
+        directory,
+    )
+}
+
+#[test]
+fn locality_allows_what_each_routing_policy_lets_leave() {
+    let at = |policy, core, socket| local(1, policy, core, socket);
+    // Core 1 of socket 0; core 2 shares the socket, core 8 is on socket 1.
+    let cache_local = at(RoutingPolicy::CacheLocal, 1, 0);
+    assert!(locality_allows(&*cache_local, (1, 0), Some((1, 0))));
+    assert!(!locality_allows(&*cache_local, (2, 0), Some((1, 0))));
+    assert!(locality_allows(&*cache_local, (1, 0), None));
+    assert!(!locality_allows(&*cache_local, (2, 0), None));
+    // Fell back to core 3 (its core inactive): it keeps to its socket.
+    assert!(locality_allows(&*cache_local, (2, 0), Some((3, 0))));
+    assert!(!locality_allows(&*cache_local, (8, 1), Some((3, 0))));
+
+    let socket_local = at(RoutingPolicy::SocketLocal, 1, 0);
+    assert!(locality_allows(&*socket_local, (2, 0), Some((1, 0))));
+    assert!(!locality_allows(&*socket_local, (8, 1), Some((1, 0))));
+    assert!(!locality_allows(&*socket_local, (8, 1), None));
+    // Fell back to socket 1: anywhere.
+    assert!(locality_allows(&*socket_local, (2, 0), Some((8, 1))));
+
+    let anywhere = at(RoutingPolicy::Anywhere, 1, 0);
+    assert!(locality_allows(&*anywhere, (8, 1), Some((1, 0))));
+    assert!(locality_allows(&*anywhere, (8, 1), None));
+    assert!(locality_allows(&*unordered(2, 9), (8, 1), Some((1, 0))));
+}
+
+#[test]
+fn stealing_leaves_cache_local_frames_to_their_core_in_drain_and_poll_mode() {
+    let directory = directory();
+    let victim = cache_on(&directory, &config(1), 1);
+    let other_core = cache_on(&directory, &config(1), 2);
+    let buddy = buddy_on(&directory, 1);
+    for id in 1..=3 {
+        victim.push(local(id, RoutingPolicy::CacheLocal, 1, 0));
+    }
+
+    assert_eq!(
+        other_core.work_steal(|_| panic!("not its core"), 10, victim.cpu()),
+        0
+    );
+    assert_eq!(
+        other_core.work_steal_polled(|_| panic!("not its core"), 10, victim.cpu()),
+        0
+    );
+    let mut stolen = Vec::new();
+    assert_eq!(
+        buddy.work_steal_polled(|frame| stolen.push(frame), 2, victim.cpu()),
+        2
+    );
+    assert_eq!(
+        buddy.work_steal(|frame| stolen.push(frame), 10, victim.cpu()),
+        1
+    );
+    assert_eq!(ids(&stolen), [1, 2, 3]);
+    assert!(victim.is_drained());
+}
+
+#[test]
+fn a_cache_local_frame_behind_a_blocking_one_waits_for_its_own_core() {
+    let directory = directory();
+    let victim = cache_on(&directory, &config(1), 1);
+    let other_core = cache_on(&directory, &config(1), 2);
+    let buddy = buddy_on(&directory, 1);
+    victim.push(local(0, RoutingPolicy::CacheLocal, 1, 0));
+    for id in 1..=3 {
+        victim.push(local(id, RoutingPolicy::CacheLocal, 1, 0));
+    }
+    let (running_tx, running) = mpsc::channel();
+    let (release, released) = mpsc::channel::<()>();
+    let owner = {
+        let victim = victim.clone();
+        thread::spawn(move || {
+            victim.poll(
+                |_frame| {
+                    running_tx.send(()).unwrap();
+                    released.recv().unwrap();
+                },
+                1,
+            )
+        })
+    };
+    running.recv().unwrap();
+    assert_eq!(
+        other_core.work_steal_polled(|_| panic!("not its core"), 10, victim.cpu()),
+        0
+    );
+    let mut stolen = Vec::new();
+    assert_eq!(
+        buddy.work_steal_polled(|frame| stolen.push(frame), 10, victim.cpu()),
+        3
+    );
+    release.send(()).unwrap();
+    assert_eq!(owner.join().unwrap(), 1);
+    assert_eq!(ids(&stolen), [1, 2, 3]);
+}
+
+#[test]
+fn socket_local_frames_are_stolen_only_on_their_socket_and_anywhere_frames_by_all() {
+    let directory = directory();
+    let victim = cache_on(&directory, &config(1), 1);
+    let same_socket = cache_on(&directory, &config(1), 2);
+    let other_socket = cache_on(&directory, &config(1), 8);
+    victim.push(local(1, RoutingPolicy::SocketLocal, 1, 0));
+    assert_eq!(
+        other_socket.work_steal(|_| panic!("not its socket"), 10, victim.cpu()),
+        0
+    );
+    assert_eq!(
+        other_socket.work_steal_polled(|_| panic!("not its socket"), 10, victim.cpu()),
+        0
+    );
+    let mut stolen = Vec::new();
+    assert_eq!(
+        same_socket.work_steal(|frame| stolen.push(frame), 10, victim.cpu()),
+        1
+    );
+
+    victim.push(local(2, RoutingPolicy::Anywhere, 1, 0));
+    victim.push(unordered(3, 7));
+    assert_eq!(
+        other_socket.work_steal_polled(|frame| stolen.push(frame), 10, victim.cpu()),
+        2
+    );
+    assert_eq!(ids(&stolen), [1, 2, 3]);
+}
+
+#[test]
+fn a_cache_local_frame_that_fell_back_to_another_core_stays_stealable_on_its_socket() {
+    let directory = directory();
+    // Its core, 5, was inactive: routing put it on core 1.
+    let victim = cache_on(&directory, &config(1), 1);
+    let same_socket = cache_on(&directory, &config(1), 2);
+    let other_socket = cache_on(&directory, &config(1), 8);
+    victim.push(local(1, RoutingPolicy::CacheLocal, 5, 0));
+    assert_eq!(
+        other_socket.work_steal(|_| panic!("not its socket"), 10, victim.cpu()),
+        0
+    );
+    let mut stolen = Vec::new();
+    assert_eq!(
+        same_socket.work_steal(|frame| stolen.push(frame), 10, victim.cpu()),
+        1
+    );
+    assert_eq!(ids(&stolen), [1]);
+}
+
+/// What a worker on `core` pulls straight from an upstream holding an unordered frame, a frame bound
+/// to core 3 and another unordered frame.
+fn pulled_on(core: usize) -> Vec<u64> {
+    let directory = directory();
+    let cache = cache_on(&directory, &config(1), core);
+    let _source = source(
+        &directory,
+        vec![
+            unordered(1, 5),
+            local(2, RoutingPolicy::CacheLocal, 3, 0),
+            unordered(3, 6),
+        ],
+    );
+    let mut pulled = Vec::new();
+    cache.upstream_pull(|frame| pulled.push(frame), 10);
+    directory.registry().remove_thread();
+    ids(&pulled)
+}
+
+#[test]
+fn upstream_pull_leaves_a_frame_bound_to_another_core_to_routing() {
+    assert_eq!(pulled_on(0), [1]);
+}
+
+#[test]
+fn upstream_pull_runs_a_frame_bound_to_its_own_core() {
+    assert_eq!(pulled_on(3), [1, 2, 3]);
 }
 
 #[test]

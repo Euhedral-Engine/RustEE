@@ -601,3 +601,90 @@ fn a_polling_lattice_runs_ordered_frames_on_their_own_cpu_in_sequence_while_othe
         );
     }
 }
+
+/// The CPUs of the host's last two cores whose CPUs this process may all run on.
+fn two_cores() -> Option<[(usize, Vec<usize>); 2]> {
+    let allowed = affinity::base_mask();
+    let mut cores = Topology::system()
+        .core_infos()
+        .iter()
+        .rev()
+        .filter_map(|core| {
+            let cpus: Vec<usize> = core.cpus.iter().collect();
+            cpus.iter()
+                .all(|&cpu| allowed.contains(cpu))
+                .then_some((core.core, cpus))
+        });
+    Some([cores.next()?, cores.next()?])
+}
+
+/// Records the CPU it ran on.
+struct Located {
+    header: FrameHeader,
+    ran_on: Arc<Mutex<Vec<Option<usize>>>>,
+}
+
+impl Frame for Located {
+    fn header(&self) -> &FrameHeader {
+        &self.header
+    }
+
+    fn header_mut(&mut self) -> &mut FrameHeader {
+        &mut self.header
+    }
+
+    fn execute(&mut self) -> Result<(), FrameError> {
+        self.ran_on.lock().unwrap().push(affinity::current_cpu());
+        Ok(())
+    }
+}
+
+/// An unordered frame bound to `cpu`'s core.
+fn cache_local_header(id: u64, seed: u64, cpu: usize) -> FrameHeader {
+    let mut header = FrameHeader::new(id);
+    header.randomize_hash(seed);
+    header.set_origin(Topology::system().cpu_info(cpu).copied());
+    header.set_routing_policy(crate::flow_control::RoutingPolicy::CacheLocal);
+    header
+}
+
+#[test]
+fn cache_local_frames_behind_a_blocking_one_stay_on_their_core_in_both_modes() {
+    let Some([(_, home), (_, other)]) = two_cores() else {
+        return;
+    };
+    let cpus: Vec<usize> = home.iter().chain(&other).copied().collect();
+    for fragment in [FragmentConfig::default(), polling()] {
+        let _turn = pinned_turn();
+        let Some((lattice, source)) = running_lattice(fragment, &cpus) else {
+            return;
+        };
+        let started = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        source.accept(Box::new(Blocking {
+            header: cache_local_header(0x10, 1, home[0]),
+            started: started.clone(),
+            release: release.clone(),
+        }));
+        wait_until("the blocker to start", || started.load(Ordering::Acquire));
+        let ran_on = Arc::new(Mutex::new(Vec::new()));
+        for seq in 0..64 {
+            source.accept(Box::new(Located {
+                header: cache_local_header(0x20, seq + 2, home[0]),
+                ran_on: ran_on.clone(),
+            }));
+        }
+        // The other core idles and steals what it may; give it the time.
+        thread::sleep(Duration::from_millis(100));
+        release.store(true, Ordering::Release);
+        wait_until("every frame to run", || ran_on.lock().unwrap().len() == 64);
+        lattice.close();
+        let ran_on = ran_on.lock().unwrap().clone();
+        assert!(
+            ran_on
+                .iter()
+                .all(|cpu| cpu.is_some_and(|cpu| home.contains(&cpu))),
+            "ran off core {home:?}: {ran_on:?}"
+        );
+    }
+}

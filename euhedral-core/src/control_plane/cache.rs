@@ -1,5 +1,7 @@
 use crate::config::{CacheConfig, CloneConfig};
-use crate::flow_control::{LatticeEdge, LatticeNode, UpstreamRegistry, route_by_hash};
+use crate::flow_control::{
+    LatticeEdge, LatticeNode, RoutingPolicy, UpstreamRegistry, route_by_hash,
+};
 use crate::frames::{DummyFrame, Failure, Frame, FrameError};
 use crate::utils::FlowContext;
 use crate::utils::math::ewma;
@@ -96,7 +98,8 @@ impl CacheDirectory {
 ///
 /// The queue is split into partitions by routing hash, so frames of one ordered stream stay in one
 /// partition, in order. With work stealing on, other caches of the lattice may take a partition's
-/// unordered frames from the front with [`work_steal`](Self::work_steal); a partition is held by one
+/// unordered frames from the front with [`work_steal`](Self::work_steal), as far as the frames'
+/// [routing policy](RoutingPolicy) lets them leave ([`locality_allows`]); a partition is held by one
 /// consumer at a time, and the others pass it over. A drain holds a partition while it runs the
 /// frames it takes, so it drains without touching the producer side; a poll holds it only while it
 /// takes a frame out, so a frame that blocks leaves the unordered frames behind it to stealers.
@@ -113,6 +116,7 @@ impl CacheDirectory {
 pub struct ControlPlaneCache {
     name: String,
     core: usize,
+    socket: usize,
     cpu: usize,
     cpus: CpuSet,
     config: CacheConfig,
@@ -155,9 +159,11 @@ impl ControlPlaneCache {
             chunk_size,
             config.max_pooled_chunks(),
         );
-        let socket_cores = topology
+        let socket = topology
             .core_info(clone.core_id())
-            .and_then(|core| topology.socket_info(core.socket))
+            .map_or(0, |core| core.socket);
+        let socket_cores = topology
+            .socket_info(socket)
             .map_or(0, |socket| socket.cores.len() as u64);
         // 37.5% of the socket's cores.
         let pull_multiplier = ((socket_cores * 3) >> 3).max(2);
@@ -176,6 +182,7 @@ impl ControlPlaneCache {
             let node: Weak<dyn LatticeNode> = this.clone();
             Self {
                 core: clone.core_id(),
+                socket,
                 cpu,
                 cpus: clone.effective_cpus().clone(),
                 config: config.clone(),
@@ -210,6 +217,11 @@ impl ControlPlaneCache {
 
     pub fn core(&self) -> usize {
         self.core
+    }
+
+    /// The socket of the cache's core.
+    pub fn socket(&self) -> usize {
+        self.socket
     }
 
     /// The CPU the cache runs from, and its slot in the lattice's work stealing.
@@ -342,17 +354,20 @@ impl ControlPlaneCache {
     }
 
     /// Takes up to `limit` frames from the calling worker's upstreams straight into `consume`,
-    /// bypassing the cache, and stops before the first ordered frame.
+    /// bypassing the cache, and stops before the first ordered frame and the first frame its
+    /// routing policy keeps off this core ([`locality_allows`]): those go through the lattice's
+    /// routing instead.
     pub fn upstream_pull(&self, mut consume: impl FnMut(Box<dyn Frame>), limit: u64) -> u64 {
         if limit == 0 {
             return 0;
         }
+        let here = (self.core, self.socket);
         self.directory
             .registry()
             .with_thread_queue(|queue| {
                 queue.pull(
                     &mut consume,
-                    &mut |frame| frame.header().is_ordered(),
+                    &mut |frame| frame.header().is_ordered() || !locality_allows(frame, here, None),
                     limit,
                 )
             })
@@ -475,8 +490,9 @@ impl ControlPlaneCache {
     }
 
     /// Takes up to `limit` unordered frames from the front of the partitions of the cache at
-    /// `cursor` in the lattice's work stealing, which wraps over the CPUs. Nothing without work
-    /// stealing.
+    /// `cursor` in the lattice's work stealing, which wraps over the CPUs, stopping in each
+    /// partition at the first frame that is ordered or that its routing policy keeps where it is
+    /// ([`locality_allows`]). Nothing without work stealing.
     pub fn work_steal(
         &self,
         consume: impl FnMut(Box<dyn Frame>),
@@ -487,9 +503,20 @@ impl ControlPlaneCache {
             return 0;
         }
         match self.directory.cache_at(cursor) {
-            Some(target) => target.drain_while(consume, |frame| frame.header().is_ordered(), limit),
+            Some(target) => {
+                let stop = self.steal_stop(&target);
+                target.drain_while(consume, stop, limit)
+            }
             None => 0,
         }
+    }
+
+    /// What a steal from `victim` leaves: ordered frames, and frames whose routing policy keeps
+    /// them off this cache's core.
+    fn steal_stop(&self, victim: &ControlPlaneCache) -> impl FnMut(&dyn Frame) -> bool + use<> {
+        let here = (self.core, self.socket);
+        let queued = (victim.core, victim.socket);
+        move |frame| frame.header().is_ordered() || !locality_allows(frame, here, Some(queued))
     }
 
     /// Like [`work_steal`](Self::work_steal), but polls the victim ([`poll`](Self::poll)): a
@@ -504,7 +531,10 @@ impl ControlPlaneCache {
             return 0;
         }
         match self.directory.cache_at(cursor) {
-            Some(target) => target.poll_while(consume, |frame| frame.header().is_ordered(), limit),
+            Some(target) => {
+                let stop = self.steal_stop(&target);
+                target.poll_while(consume, stop, limit)
+            }
             None => 0,
         }
     }
@@ -619,6 +649,38 @@ fn try_hold(partition: &Mutex<Partition>) -> Option<MutexGuard<'_, Partition>> {
         Err(TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
         Err(TryLockError::WouldBlock) => None,
     }
+}
+
+/// Whether a worker on core `here.0` of socket `here.1` may run `frame`, which waits in the queue of
+/// a cache on core `queued.0` of socket `queued.1` (`None`: in an upstream, not yet routed), as far
+/// as the frame's [routing policy](RoutingPolicy) goes. The cache that holds a frame always may: this
+/// rules what other workers take, by stealing or straight from an upstream.
+///
+/// - [`Anywhere`](RoutingPolicy::Anywhere), or no origin: any worker.
+/// - [`CacheLocal`](RoutingPolicy::CacheLocal): a worker on the origin's core (where routing sends
+///   it: the core's SMT threads, not a wider cache). If its core was inactive, routing fell back to
+///   a hashed core; such a frame keeps to the origin's socket, so it is never left to one worker.
+/// - [`SocketLocal`](RoutingPolicy::SocketLocal): a worker on the origin's socket; one that fell
+///   back to another socket goes anywhere.
+pub(crate) fn locality_allows(
+    frame: &dyn Frame,
+    here: (usize, usize),
+    queued: Option<(usize, usize)>,
+) -> bool {
+    let header = frame.header();
+    let Some(origin) = header.origin() else {
+        return true;
+    };
+    let policy = header.routing_policy();
+    if policy >= RoutingPolicy::CacheLocal && queued.is_none_or(|(core, _)| core == origin.core) {
+        return here.0 == origin.core;
+    }
+    if policy >= RoutingPolicy::SocketLocal
+        && queued.is_none_or(|(_, socket)| socket == origin.socket)
+    {
+        return here.1 == origin.socket;
+    }
+    true
 }
 
 /// The partition's front frame, unless another consumer holds the partition or `stop` matches the
