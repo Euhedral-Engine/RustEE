@@ -3,5 +3,6 @@ name = "euhedral-data-structures"
 version = "0.1.0"
 edition = "2024"
 description = "Cache-line padded atomics and lock-free chunked queues for Euhedral"
+readme = "README.md"
 
 [dependencies]

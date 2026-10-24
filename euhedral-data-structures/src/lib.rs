@@ -10,3 +10,8 @@
 
 pub mod atomics;
 pub mod queues;
+
+/// Compiles and runs the examples in the crate README as doctests.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;

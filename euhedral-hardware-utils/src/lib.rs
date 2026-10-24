@@ -22,3 +22,8 @@ pub mod monitor;
 mod platform;
 pub mod topology;
 pub mod util;
+
+/// Compiles and runs the examples in the crate README as doctests.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;

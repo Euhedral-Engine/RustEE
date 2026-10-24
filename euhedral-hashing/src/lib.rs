@@ -9,3 +9,8 @@ pub mod hasher_api;
 pub mod string_hasher;
 
 mod primitives;
+
+/// Compiles and runs the examples in the crate README as doctests.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;

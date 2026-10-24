@@ -1,0 +1,332 @@
+# RustEE glossary
+
+The terms a user of RustEE meets, as the code names them, grouped by topic. Each links to the type
+or module that defines it. Paths are relative to the repository root.
+
+## Frames
+
+**Frame** ([`Frame`](euhedral-core/src/frames/mod.rs)): a unit of work, like a kernel. It carries a
+`FrameHeader`, does its work in `execute`, and is owned by whoever holds its `Box`, so it is never
+touched by two threads at once.
+
+**FrameHeader** ([`FrameHeader`](euhedral-core/src/frames/mod.rs)): the state every frame carries:
+its id hash, routing hash, origin, routing policy and optional kill switch.
+
+**id hash** ([`FrameHeader::id_hash`](euhedral-core/src/frames/mod.rs)): the frame's identity. A new
+header's routing hash equals it, which makes the frame ordered.
+
+**routing hash** ([`FrameHeader::routing_hash`](euhedral-core/src/frames/mod.rs)): the hash the
+lattice routes a frame by: it picks the socket, the core, the cache partition and the SMT lane.
+`randomize_hash(seed)` sets it to the id hash mixed with a seed; `reset_hash` sets it back.
+
+**ordered frame, ordered stream** ([`FrameHeader::is_ordered`](euhedral-core/src/frames/mod.rs)): a
+frame whose routing hash equals its id hash. Ordered frames with one routing hash land in one
+partition of one cache (the odd-hash SMT split included) and run in the order they were offered, on
+that cache's owning CPU. Stealers never take them.
+
+**unordered frame**: a frame whose routing hash was randomized. Unordered frames spread over the
+cores, and idle workers may steal them, as far as their routing policy allows.
+
+**origin** ([`FrameHeader::origin`](euhedral-core/src/frames/mod.rs)): the `CpuInfo` of the CPU a
+frame was made on, or should stay near. A frame without an origin goes anywhere, whatever its
+routing policy.
+
+**RoutingPolicy** ([`RoutingPolicy`](euhedral-core/src/flow_control/mod.rs)): how close to its
+origin a frame must run: `Anywhere` (the default), `SocketLocal` (a CPU of the origin's socket) or
+`CacheLocal` (a CPU of the origin's core, its SMT threads). It is binding, like the ordered flag:
+routing places a frame by it, and work stealing and direct pulls take a frame only where it may run.
+If the origin's core or socket is inactive, `CacheLocal` falls back to the origin's socket and
+`SocketLocal` to anywhere.
+
+**kill switch** ([`FrameHeader::with_kill_switch`](euhedral-core/src/frames/mod.rs)): an
+`Arc<AtomicBool>` shared by the frames of one piece of work. `kill()` sets it; a frame whose switch
+is set is no longer alive, and executors skip it and call `do_finally`.
+
+**lifecycle events** ([`Frame`](euhedral-core/src/frames/mod.rs),
+[`AbstractExecutor::run`](euhedral-core/src/generics/executor.rs)): what an executor calls on a
+frame: `execute` if the frame is alive, then exactly one finalizer, `do_finally` or
+`do_finally_with_error`. Frames chain into a graph through these events: a finalizer can hand a
+follow-up frame to a source.
+
+**`do_finally`** ([`Frame::do_finally`](euhedral-core/src/frames/mod.rs)): the finalizer after
+`execute` returned `Ok` or `FrameError::Cancelled`, or after a dead frame was skipped. It takes the
+frame by value and decides where it goes next; the default calls `recycle`.
+
+**`do_finally_with_error`** ([`Frame::do_finally_with_error`](euhedral-core/src/frames/mod.rs)): the
+finalizer after `execute` failed or panicked. The default calls `recycle`.
+
+**FrameError** ([`FrameError`](euhedral-core/src/frames/mod.rs)): why `execute` stopped early:
+`Cancelled` (finished with `do_finally`) or `Failed` (finished with `do_finally_with_error`).
+
+**recycle, FrameManager** ([`FrameManager`](euhedral-core/src/impls/frame_manager.rs),
+[`FrameFactory`](euhedral-core/src/impls/frame_factory.rs)): `recycle` returns a frame to its pool.
+A `FrameManager` keeps finished frames for reuse and refills them through its `FrameFactory`, so
+steady-state execution allocates nothing.
+
+**PipelineFrame, fan out, fan in** ([`PipelineFrame`](euhedral-core/src/frames/pipeline.rs)): one
+run of a typed, multi-stage pipeline, as a single frame that steps through its stages and offers
+itself to a sink after each one. A `fan_out` stage gets its own routing hash and may run in parallel
+across chains; a `fan_in` stage keeps the chain's id hash and stays ordered with the pipeline's
+other chains.
+
+## Sources and ingest
+
+**LatticeSource** ([`LatticeSource`](euhedral-core/src/generics/lattice.rs)): where frames come
+from: a programmable stream the lattice's workers pull from or request from. Only one thread at a
+time is inside a source's `pull` or `request`.
+
+**`request`** ([`LatticeSource::request`](euhedral-core/src/generics/lattice.rs)): signals demand for
+more frames, which the source pushes to its downstream receiver now or later. Demand accumulates;
+`u64::MAX` means unbounded and `0` asks for nothing.
+
+**`pull`** ([`LatticeSource::pull`](euhedral-core/src/generics/lattice.rs)): hands up to `demand`
+frames straight to a consumer, without pushing, and stops before the first frame a `stop`
+predicate matches. Its demand does not accumulate.
+
+**demand**: how many frames a receiver has asked a source for. It flows up through the lattice while
+frames flow down.
+
+**LatticeReceiver, LatticeTerminal, LatticeInterceptor**
+([`generics::lattice`](euhedral-core/src/generics/lattice.rs)): a receiver takes the frames a source
+pushes and hears `on_complete` and `on_error`; a terminal is the bottom of a chain that attaches to a
+source; an interceptor is a stage that is both a source and a receiver.
+
+**ingest sink** ([`IngestSink`](euhedral-core/src/ingest/mod.rs)): a ready-made `LatticeSource` that
+feeds a lattice from outside it. Hand its `delegate()` to `ControlPlaneLattice::add_upstream`;
+`complete()` finishes it at once.
+
+**QueueIngestSink** ([`QueueIngestSink`](euhedral-core/src/ingest/queue.rs)): an ingest sink over a
+partitioned queue that any thread offers frames to. Frames of one partition are delivered in order;
+`complete_gracefully` completes it once the lattice has drained the queue.
+
+**ArrayIngestSink** ([`ArrayIngestSink`](euhedral-core/src/ingest/array.rs)): a fixed batch of
+frames, delivered in order. It completes as soon as its last frame is taken.
+
+**SingleUseSource** ([`SingleUseSource`](euhedral-core/src/ingest/single_use.rs)): a source of one
+frame. It completes once the frame is taken; completed before that, it cancels the frame.
+
+**Downstream** ([`ingest::downstream`](euhedral-core/src/ingest/downstream.rs), private): the one
+receiver an ingest source pushes to, the demand it asked for, and the source's completion, which the
+receiver hears of exactly once.
+
+**PipelineRunner** ([`PipelineRunner`](euhedral-core/src/ingest/pipeline_runner.rs)): an ingest
+sink that runs typed `PipelineFrame` chains. `run` and `submit` admit an input; `complete_gracefully`
+stops admission and completes once every accepted chain has finished; `complete` kills the chains.
+
+**LatticeHotSource** ([`LatticeHotSource`](euhedral-core/src/flow_control/hot_source.rs)): a source
+its owner pushes frames into by hand with `accept`, without waiting for demand.
+
+## The lattice
+
+**lattice** ([`ControlPlaneLattice`](euhedral-core/src/control_plane/lattice.rs)): where frames
+enter the control plane. It routes each frame to the shard of one active socket and keeps the
+shards in line with the effective topology; it starts on its first `add_upstream`.
+
+**shard** ([`ControlPlaneShard`](euhedral-core/src/control_plane/shard.rs)): the control plane of one
+socket. It keeps a clone of the lattice's `CloneableObject` on each effective core of the socket and
+routes the socket's frames among them by hash (`CacheLocal` frames to their origin's core).
+
+**CloneableObject** ([`CloneableObject`](euhedral-core/src/generics/cloneable.rs)): what a lattice
+clones onto each core. The object in the `LatticeConfig` is a template; the stock one is
+[`BaseCloneableObject`](euhedral-core/src/impls/base_cloneable.rs), a fragment feeding an executor.
+
+**fragment** ([`ControlPlaneFragment`](euhedral-core/src/control_plane/fragment.rs)): the worker
+that runs one core's frames, on a thread pinned to the core's first CPU. It takes frames from its
+cache and its upstreams and pushes them to its executor.
+
+**worker**: a fragment's pinned thread (or its SMT buddy's). It registers with the lattice's
+`UpstreamRegistry` and runs cycles until stopped.
+
+**executor** ([`AbstractExecutor`](euhedral-core/src/generics/executor.rs),
+[`DefaultExecutor`](euhedral-core/src/impls/default_executor.rs)): the terminal that runs each frame
+through its lifecycle. Attached to a source with `input`, it requests unbounded demand.
+
+**ControlPlaneCache** ([`ControlPlaneCache`](euhedral-core/src/control_plane/cache.rs)): a worker's
+core-local queue of frames and the demand that keeps it filled. It is split into partitions by
+routing hash, sized to a share of the core's L1 and L2, and first touched on its owner's CPU so its
+memory lands on that CPU's NUMA node.
+
+**partition** ([`ControlPlaneCache`](euhedral-core/src/control_plane/cache.rs),
+[`CacheConfig::partitions`](euhedral-core/src/config/cache_config.rs)): one of a cache's independent
+queues (8 by default). Frames of one ordered stream stay in one partition, in order. Each logical
+CPU owns all the partitions of its cache; one consumer holds a partition at a time, and the others
+pass it over.
+
+**SMT buddy, sibling cache** ([`ControlPlaneFragment::smt_buddy`](euhedral-core/src/control_plane/fragment.rs),
+[`ControlPlaneCache::pair_with`](euhedral-core/src/control_plane/cache.rs)): with SMT enabled and two
+effective CPUs on a core, the fragment runs a second worker, its SMT buddy, on the second CPU, with
+its own cache (the sibling cache). The core's frames reach the first cache, which hands those with
+an odd routing hash to the sibling.
+
+**CacheDirectory** ([`CacheDirectory`](euhedral-core/src/control_plane/cache.rs)): a lattice's caches
+by CPU, which work stealing walks, with the upstream registry and topology they share.
+
+**first touch** ([`CloneableObject::first_touch`](euhedral-core/src/generics/cloneable.rs),
+[`ControlPlaneCache::first_touch`](euhedral-core/src/control_plane/cache.rs)): filling a clone's
+queues once from its own CPU before it receives work, then clearing them, so Linux places those
+pages on that CPU's NUMA node.
+
+**rebalance**: what the lattice and its shards do when the effective topology changes: stop ingest,
+start, drain or close clones, remap routing, then reopen ingest. A clone is closed only once no
+routing generation can still send it frames.
+
+**routing generation** ([`RoutingState`](euhedral-core/src/flow_control/vertex.rs)): one immutable
+version of a vertex's routing table. A push routes with the generation current when it began, and
+holding a generation keeps its downstreams open.
+
+**LatticeEdge, LatticeNode, LatticeVertex** ([`edge`](euhedral-core/src/flow_control/edge.rs),
+[`vertex`](euhedral-core/src/flow_control/vertex.rs)): the links of a lattice. Frames flow down an
+edge and demand climbs up it; a vertex is a node that routes each frame to one of its downstreams
+(by default by routing hash) and ingests sources.
+
+**upstream, UpstreamHandle, UpstreamInterceptor**
+([`UpstreamHandle`](euhedral-core/src/flow_control/upstream_queue.rs),
+[`UpstreamInterceptor`](euhedral-core/src/flow_control/vertex.rs)): a source fed into the lattice,
+as the workers see it. A worker services a handle only while it holds the handle's lock, so the
+source sees one worker at a time.
+
+**UpstreamRegistry, UpstreamQueue** ([`registry`](euhedral-core/src/flow_control/registry.rs),
+[`upstream_queue`](euhedral-core/src/flow_control/upstream_queue.rs)): the registry holds a lattice's
+upstream handles and its registered workers. Each worker has its own queue of handles and splits its
+demand across them round-robin, in a shuffled order.
+
+**productive handle**: an upstream handle that produced work the last time this worker serviced it.
+The decision tree and idle timing use the count of productive handles per worker.
+
+**contention** ([`UpstreamQueue`](euhedral-core/src/flow_control/upstream_queue.rs),
+[`ACQUIRE_CONTENTION_SCALE`](euhedral-core/src/utils/average_flow.rs)): the share of handles a worker
+found locked by another worker, as a decaying average scaled to `1_000_000`.
+
+## Execution
+
+**drain** ([`ControlPlaneCache::set_drain_mode`](euhedral-core/src/control_plane/cache.rs),
+[`CloneableObject::set_drain_mode`](euhedral-core/src/generics/cloneable.rs),
+[`LatticeVertex::set_drain`](euhedral-core/src/flow_control/vertex.rs),
+[`ControlPlaneLattice::is_drained`](euhedral-core/src/control_plane/lattice.rs)): stop accepting
+work and finish what is in flight. A draining edge or vertex ignores demand and makes new upstreams
+wait; `is_drained` says a cache, clone, shard or lattice has finished its work; a shard drains its
+clones in a rebalance. The queues' `drain*` methods in `euhedral-data-structures` are a different
+thing: taking items out of a container.
+
+**greedy** ([`ControlPlaneCache::greedy`](euhedral-core/src/control_plane/cache.rs)): consume as
+fast as possible by holding locks longer. A greedy take holds a cache partition while it runs the
+frames it takes from it.
+
+**greedy mode** ([`ControlPlaneCache::greedy`](euhedral-core/src/control_plane/cache.rs),
+[`FragmentConfig::polls`](euhedral-core/src/config/fragment_config.rs)): a fragment with a max batch
+above 2 takes from its cache greedily, so it consumes without touching the producer side: a bias to
+low latency, for short frames. A frame that blocks holds up the frames queued behind it in its
+partition, and stealers pass the held partition over.
+
+**poll mode** ([`ControlPlaneCache::poll`](euhedral-core/src/control_plane/cache.rs),
+[`FragmentConfig::POLL_MODE_MAX_BATCH`](euhedral-core/src/config/fragment_config.rs)): a fragment
+with a max batch of 2 or less polls its cache: it takes one frame at a time and holds the partition
+only while it takes the frame out. For slow or blocking work: idle workers steal the unordered
+frames behind a blocked one.
+
+**max batch size** ([`FragmentConfig::max_batch_size`](euhedral-core/src/config/fragment_config.rs)):
+the largest batch a worker grows to, 4096 by default. It also selects greedy or poll mode.
+
+**batch cap** ([`ControlPlaneFragment::batch_cap`](euhedral-core/src/control_plane/fragment.rs)): the
+largest batch a worker currently runs: the max batch size, capped by its cache's capacity, at least
+two, and lowered as its CPU's pressure rises.
+
+**cap factor** ([`ControlPlaneCache::cap_factor`](euhedral-core/src/control_plane/cache.rs)): the
+share of its frame quota a cache currently asks its upstreams for, in `[0.15, 1]`. It moves quickly
+down and slowly up as the core's CPU pressure rises and falls.
+
+**work stealing** ([`ControlPlaneCache::work_steal`](euhedral-core/src/control_plane/cache.rs),
+[`CacheConfig::work_steal`](euhedral-core/src/config/cache_config.rs)): a worker that ran nothing
+takes unordered frames from the front of another cache's partitions, visiting the lattice's caches in
+turn. In each partition it stops at the first frame that is ordered or that its routing policy keeps
+where it is. `work_steal_polled` is the poll-mode form. On by default.
+
+**direct pull** ([`ControlPlaneCache::upstream_pull`](euhedral-core/src/control_plane/cache.rs)): a
+worker taking frames straight from its upstreams, bypassing the caches. It stops before the first
+ordered frame and the first frame bound to another core, leaving those to the lattice's routing.
+
+**decision tree** ([`control_plane::decision_tree`](euhedral-core/src/control_plane/decision_tree.rs),
+private): each worker's policy for a cycle: whether to sit it out, which execution path to take, and
+how large the next batch is. It times a sample of frame bodies to estimate their cost.
+
+**execution paths: Direct, Staged, Idle**
+([`ExecutionPath`](euhedral-core/src/control_plane/decision_tree.rs), private): Direct runs frames
+straight from upstream; Staged requests a batch into the cache and runs it from there; Idle sits the
+cycle out and parks. Direct is taken for a lone worker, before the body cost is known, while
+there is a productive handle per worker, or for cheap bodies at moderate contention; Staged
+otherwise. Idle is never chosen for the first-ranked or only worker; for the others, when no handle is
+productive or when a fitted participation model says so.
+
+**park, idle park, unproductive park** ([`IdlePolicy`](euhedral-core/src/config/idle_policy.rs)): a
+worker with nothing to do parks its thread. The idle park is how long it parks on the Idle path; the
+unproductive park is how long it parks when none of its upstream handles produced work (zero
+disables it). Both default to 15 µs and are tunable.
+
+**idle timing, adaptive vs fixed** ([`IdlePolicy`](euhedral-core/src/config/idle_policy.rs),
+[`IdleTimingFunction`](euhedral-core/src/config/idle_timing.rs),
+[`FixedTiming`](euhedral-core/src/config/idle_timing.rs)): what picks the idle park and the
+contention half-life. The default is adaptive: a fitted model (`cache_local_bounded`) of the
+contention, productive handles per worker and body cost. `IdlePolicy::fixed` always uses the same
+park; prefer it for graphics loops, because the adaptive timing is not built for predictable timing.
+
+## Hardware
+
+**topology** ([`Topology`](euhedral-hardware-utils/src/topology/mod.rs)): the machine's logical
+CPUs, cores, sockets and caches. Logical CPU ids are the OS ids and may be sparse; `cpu_span()` is
+the highest id plus one.
+
+**effective topology** ([`TopologyMapper`](euhedral-hardware-utils/src/topology/mapper.rs),
+[`EffectiveSystemTopology`](euhedral-hardware-utils/src/topology/mapper.rs)): the part of the
+topology usable now: the CPUs the monitor reports as effective, the topology's CPUs and the allowed
+CPUs, intersected. A socket or core with no effective CPU is inactive, and nothing routes to it.
+
+**CPU set** ([`CpuSet`](euhedral-hardware-utils/src/util/cpu_set.rs)): an immutable set of logical
+CPU ids. `LatticeConfig::allowed_cpus` is one.
+
+**P-core, E-core** ([`CoreInfo::p_core`](euhedral-hardware-utils/src/topology/mod.rs)): performance
+and efficiency cores. A core is a P-core unless the platform classified it as an efficiency core.
+
+**affinity, pinning** ([`affinity`](euhedral-hardware-utils/src/affinity/mod.rs)): binding a thread
+to CPUs. `AffinityCapability` says what the platform can do: `Exact` masks (Linux, Windows), a
+`LocalityHint` (macOS), or `Unsupported`.
+
+**PinnedThreadExecutor** ([`PinnedThreadExecutor`](euhedral-hardware-utils/src/affinity/executor.rs)):
+runs each command on a fresh thread pinned to one CPU, with at most one live executor per CPU. Each
+fragment worker runs on one.
+
+**monitor** ([`ResourceMonitor`](euhedral-hardware-utils/src/monitor/mod.rs)): a background sampler
+that polls CPU, memory, I/O and power signals (every 200 ms by default), publishes a smoothed
+`HardwareUtilization`, and keeps a `TopologyMapper` in step. The lattice follows one.
+
+**pressure** ([`HardwareUtilization`](euhedral-hardware-utils/src/monitor/utilization.rs),
+[`monitor::pressure`](euhedral-hardware-utils/src/monitor/pressure.rs)): a per-CPU value in
+`[0, 1]` combining scheduler stall, throttling, contention, memory, I/O and thermal signals, each
+smoothed with a fast attack and a slow release. It lowers batch caps and cap factors.
+
+## Data structures
+
+**queue** ([`queues::queue`](euhedral-data-structures/src/queues/queue.rs)): the lock-free FIFO
+`Queue<T, P, C>` (`SpscQueue`, `MpscQueue`, `SpmcQueue`, `MpmcQueue`). It hands out role handles: a
+`Single` role has one live handle taking `&mut self`, a `Multi` role's handle is `Clone`.
+
+**chunk** ([`queues::chunk`](euhedral-data-structures/src/queues/chunk.rs)): a power-of-two ring of
+slots that a queue keeps its elements in. An unbounded queue links a fresh chunk when its ring is
+full, and can pool retired chunks for reuse.
+
+**partitioned queue** ([`queues::partitioned`](euhedral-data-structures/src/queues/partitioned.rs)):
+independent queues behind one handle pair, each on its own cache lines. Producers pick a partition
+(the same seed always picks the same one); there is no ordering between partitions.
+
+**plain queue** ([`PlainQueue`](euhedral-data-structures/src/queues/plain_queue.rs)): a FIFO for one
+thread with the same batch API as the concurrent queues and no synchronisation.
+
+**padded atomics** ([`atomics`](euhedral-data-structures/src/atomics/mod.rs)): atomics, arrays and
+striped adders with each value alone on a 128-byte block (`CachePadded`), so neighbours never share
+a cache line.
+
+## Hashing
+
+**hashing** ([`euhedral-hashing`](euhedral-hashing/src/lib.rs)): xxHash64 for routing keys,
+ordered-chain ids and vectors, identical to the Java hashers. Strings hash as UTF-16, `_pair`
+functions chain multi-part keys, and `mix_with_zero_check` never returns zero, which is what
+`randomize_hash` mixes a seed with.

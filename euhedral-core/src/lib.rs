@@ -29,3 +29,8 @@ pub mod ingest;
 pub mod utils;
 
 mod internal;
+
+/// Compiles and runs the examples in the crate README as doctests.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;

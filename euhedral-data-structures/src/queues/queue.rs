@@ -78,7 +78,7 @@ pub type MpmcQueue<T> = Queue<T, Multi, Multi>;
 ///
 /// The queue's tail, head, epoch, configuration and consumer lock each live alone in a 128-byte block,
 /// in the order and with the isolation upstream gets from its `TailPad`/`MidPad` chain; see
-/// [`Core`](super::core::Core) for the layout.
+/// the private `Core` in `queues/core.rs` for the layout.
 pub struct Queue<T, P: Role, C: Role> {
     core: Arc<Core<T>>,
     roles: PhantomData<(P, C)>,

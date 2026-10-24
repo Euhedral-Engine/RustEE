@@ -3,6 +3,7 @@ name = "euhedral-core"
 version = "0.1.0"
 edition = "2024"
 description = "Frames, frame pools and pipelines executed by the Euhedral control plane"
+readme = "README.md"
 
 [dependencies]
 euhedral-data-structures = { path = "../euhedral-data-structures" }
