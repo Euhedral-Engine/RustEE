@@ -102,7 +102,7 @@ pub enum MeterValue {
 }
 
 /// One meter of one worker: its full name (the prefix and a suffix, such as
-/// `euhedral.execution.latency`), its tags and what it reads.
+/// `euhedral.execution.serviceTime`), its tags and what it reads.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Meter {
     pub name: Arc<str>,
@@ -187,9 +187,9 @@ impl MetricsSnapshot {
             .filter(move |meter| meter.name.ends_with(suffix))
     }
 
-    /// Every fragment's latency summary.
-    pub fn latency_summaries(&self) -> impl Iterator<Item = &Meter> {
-        self.ending_with(super::LATENCY_SUMMARY_SUFFIX)
+    /// Every fragment's service-time summary: each frame's body time.
+    pub fn service_time_summaries(&self) -> impl Iterator<Item = &Meter> {
+        self.ending_with(super::SERVICE_TIME_SUFFIX)
     }
 
     /// Every fragment's throughput summary.
@@ -209,12 +209,12 @@ impl MetricsSnapshot {
 
     /// Every fragment's service-time flow.
     pub fn service_time_flows(&self) -> impl Iterator<Item = &Meter> {
-        self.ending_with(super::SERVICE_TIME_SUFFIX)
+        self.ending_with(super::SERVICE_TIME_FLOW_SUFFIX)
     }
 
-    /// Every fragment's rate flow.
-    pub fn rate_flows(&self) -> impl Iterator<Item = &Meter> {
-        self.ending_with(super::RATE_SUFFIX)
+    /// Every fragment's throughput flow.
+    pub fn throughput_flows(&self) -> impl Iterator<Item = &Meter> {
+        self.ending_with(super::THROUGHPUT_FLOW_SUFFIX)
     }
 
     /// Every cache's backlog gauge.

@@ -101,7 +101,7 @@ pub struct ControlPlaneFragment {
     in_progress: AtomicU64,
     adaptive_batch_cap: AtomicU64,
     /// The worker's meters, when the config has a registry.
-    metrics: Option<Box<CachePadded<ExecutionMetrics>>>,
+    metrics: Option<Arc<CachePadded<ExecutionMetrics>>>,
     this: Weak<ControlPlaneFragment>,
 }
 
@@ -151,7 +151,8 @@ impl ControlPlaneFragment {
             cache.pair_with(buddy.cache.clone());
         }
         let body_cost = Arc::new(BodyCost::new());
-        let output = Arc::new(timed_output(body_cost.clone()));
+        let metrics = ExecutionMetrics::new(config.metrics(), clone.core_id(), cpu);
+        let output = Arc::new(timed_output(body_cost.clone(), metrics.clone()));
         let initial_cap = initial_batch_cap(config, &cache);
         let fragment = Arc::new_cyclic(|this| Self {
             name,
@@ -178,7 +179,7 @@ impl ControlPlaneFragment {
             reset_cleared: AtomicU64::new(0),
             in_progress: AtomicU64::new(0),
             adaptive_batch_cap: AtomicU64::new(initial_cap),
-            metrics: ExecutionMetrics::new(config.metrics(), clone.core_id(), cpu),
+            metrics,
             this: this.clone(),
         });
         if let Some(metrics) = &fragment.metrics {
@@ -308,7 +309,7 @@ impl ControlPlaneFragment {
     fn run_owner_loop(&self) {
         let mut policy =
             DecisionTree::calibrated(self.config.idle_policy().clone(), self.body_cost.clone());
-        let mut cycle = Cycle::new(self.cpu.wrapping_add(1), self.metrics.is_some());
+        let mut cycle = Cycle::new(self.cpu.wrapping_add(1), self.execution_metrics());
         FlowContext::initialize();
         self.initialized.store(true, Ordering::Release);
         while self.running.load(Ordering::Acquire) && !affinity::is_interrupted() {
@@ -417,10 +418,13 @@ impl ControlPlaneFragment {
             return;
         }
 
-        let metrics = self.metrics.as_deref().map(|metrics| &**metrics);
-        cycle.complete(&run, policy, self.batch_cap(), metrics, || {
-            self.registry.thread_count()
-        });
+        cycle.complete(
+            &run,
+            policy,
+            self.batch_cap(),
+            self.execution_metrics(),
+            || self.registry.thread_count(),
+        );
         std::hint::spin_loop();
     }
 
@@ -444,6 +448,10 @@ impl ControlPlaneFragment {
         count
     }
 
+    fn execution_metrics(&self) -> Option<&ExecutionMetrics> {
+        self.metrics.as_deref().map(|metrics| &**metrics)
+    }
+
     fn with_queue<R>(&self, f: impl FnOnce(&mut UpstreamQueue) -> R) -> Option<R> {
         self.registry.with_thread_queue(f)
     }
@@ -454,7 +462,7 @@ impl ControlPlaneFragment {
             return;
         }
         let cleared = self.reset_shared_state();
-        *cycle = Cycle::new(cycle.neighbor_cursor, self.metrics.is_some());
+        *cycle = Cycle::new(cycle.neighbor_cursor, self.execution_metrics());
         self.with_queue(|queue| queue.reset_for_next_trial());
         policy.reset();
         FlowContext::with(|context| {
@@ -697,17 +705,61 @@ fn initial_batch_cap(config: &FragmentConfig, cache: &ControlPlaneCache) -> u64 
         .max(2)
 }
 
-/// An output that times a sample of the frame bodies it pushes into `body_cost`.
-fn timed_output(body_cost: Arc<BodyCost>) -> LatticeHotSource {
-    let watch = Arc::new(Mutex::new(StopWatch::new()));
-    let started = watch.clone();
+/// An output that times the bodies of the frames it pushes: the executor's run of each, from
+/// `execute` to its return and the frame's finalizer. Without `metrics` it times one body in
+/// [`StopWatch::DEFAULT_INTERVAL`] into `body_cost`; with them it times every body into the
+/// service-time summary and gives `body_cost` the same sample of those measurements.
+fn timed_output(
+    body_cost: Arc<BodyCost>,
+    metrics: Option<Arc<CachePadded<ExecutionMetrics>>>,
+) -> LatticeHotSource {
+    let Some(metrics) = metrics else {
+        let watch = Arc::new(Mutex::new(StopWatch::new()));
+        let started = watch.clone();
+        return LatticeHotSource::new()
+            .before_each(move |_| lock(&started).start())
+            .after_each(move || {
+                if let Some(elapsed) = lock(&watch).stop() {
+                    body_cost.record(elapsed);
+                }
+            });
+    };
+    let timer = Arc::new(Mutex::new(BodyTimer::default()));
+    let started = timer.clone();
     LatticeHotSource::new()
         .before_each(move |_| lock(&started).start())
         .after_each(move || {
-            if let Some(elapsed) = lock(&watch).stop() {
+            let Some((elapsed, sampled)) = lock(&timer).stop() else {
+                return;
+            };
+            metrics.record_service_time(elapsed);
+            if sampled {
                 body_cost.record(elapsed);
             }
         })
+}
+
+/// Times every body, and marks one in [`StopWatch::DEFAULT_INTERVAL`] as the body cost's sample.
+#[derive(Default)]
+struct BodyTimer {
+    started: Option<Instant>,
+    bodies: u64,
+}
+
+impl BodyTimer {
+    fn start(&mut self) {
+        if self.started.is_none() {
+            self.started = Some(Instant::now());
+        }
+    }
+
+    /// The time since the matching start, and whether it is the body cost's sample.
+    fn stop(&mut self) -> Option<(Duration, bool)> {
+        let started = self.started.take()?;
+        let sampled = self.bodies % StopWatch::DEFAULT_INTERVAL == 0;
+        self.bodies = self.bodies.wrapping_add(1);
+        Some((started.elapsed(), sampled))
+    }
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -726,14 +778,15 @@ struct Cycle {
 }
 
 impl Cycle {
-    fn new(neighbor_cursor: usize, metrics: bool) -> Self {
+    /// A cycle state; with `metrics`, keeping the flow the worker's meters report from.
+    fn new(neighbor_cursor: usize, metrics: Option<&ExecutionMetrics>) -> Self {
         Self {
             batch_size: 2,
             completed: 0,
             registered_workers: 0,
             now: Instant::now(),
             neighbor_cursor,
-            flow: metrics.then(ExecutionFlow::new),
+            flow: metrics.map(ExecutionFlow::new),
         }
     }
 
@@ -753,7 +806,7 @@ impl Cycle {
         let measured = match (metrics, self.flow.as_mut()) {
             (Some(metrics), Some(flow)) => {
                 metrics.record_frames(run.processed);
-                flow.record(self.now, run);
+                flow.record(self.now, run, metrics);
                 flow.publish(metrics);
                 Some((metrics, flow))
             }
@@ -772,28 +825,33 @@ impl Cycle {
 
 /// The service time and throughput of a worker's productive cycles (upstream `CycleState`'s
 /// `serviceTimeRecorder` and `throughputRecorder`). The worker publishes their statistics to its
-/// flow meters after each productive cycle, and its latency and throughput summaries sample their
-/// averages at the end of each batch. A reset of the worker starts them over.
+/// flow meters after each productive cycle, and its throughput summary samples the rate at the end
+/// of each batch. A reset of the worker starts them over.
 struct ExecutionFlow {
-    /// Nanoseconds per frame of each productive cycle.
+    /// The mean body time, in nanoseconds, of each productive cycle's frames.
     service_time: FlowRecorder,
     /// Frames of each productive cycle, whose rate is the throughput.
     throughput: FlowRecorder,
+    /// The service-time summary's count and sum at the last cycle.
+    timed: (u64, f64),
 }
 
 impl ExecutionFlow {
-    fn new() -> Self {
+    fn new(metrics: &ExecutionMetrics) -> Self {
         Self {
             service_time: FlowRecorder::new(),
             throughput: FlowRecorder::new(),
+            timed: metrics.service_time_totals(),
         }
     }
 
-    /// Records a productive cycle that ended at `now`.
-    fn record(&mut self, now: Instant, run: &Run) {
-        let elapsed = run.elapsed.as_nanos().min(i64::MAX as u128) as i64;
-        if elapsed > 0 && run.processed > 0 {
-            let per_frame = (elapsed / run.processed.min(i64::MAX as u64) as i64).max(1);
+    /// Records a productive cycle that ended at `now`, its frames' bodies timed in `metrics`.
+    fn record(&mut self, now: Instant, run: &Run, metrics: &ExecutionMetrics) {
+        let (count, sum) = metrics.service_time_totals();
+        let (bodies, nanos) = (count - self.timed.0, sum - self.timed.1);
+        self.timed = (count, sum);
+        if bodies > 0 {
+            let per_frame = (nanos / bodies as f64).round().max(1.0) as i64;
             self.service_time.record_units_at(now, per_frame);
         }
         self.throughput
@@ -806,19 +864,15 @@ impl ExecutionFlow {
             metrics.publish_service_time(&stats);
         }
         if let Some(stats) = FlowStats::of_rate(&self.throughput, NANOS_PER_SECOND) {
-            metrics.publish_rate(&stats);
+            metrics.publish_throughput(&stats);
         }
     }
 
-    /// Records the current averages in `metrics`' summaries, once each is measured and positive.
+    /// Records the current rate in `metrics`' throughput summary, once measured and positive.
     fn report(&self, metrics: &ExecutionMetrics) {
         let throughput = self.throughput.average_units_over_time();
         if throughput.is_finite() && throughput > 0.0 {
             metrics.report_throughput(throughput);
-        }
-        let latency = self.service_time.average_units();
-        if latency.is_finite() && latency > 0.0 {
-            metrics.report_latency(latency.round());
         }
     }
 }

@@ -729,9 +729,14 @@ fn a_metered_lattice_reports_every_workers_meters_until_closed() {
         .map(|meter| meter.counter().unwrap())
         .sum();
     assert_eq!(frames, 1000);
+    let timed: u64 = snapshot
+        .service_time_summaries()
+        .map(|meter| meter.summary().unwrap().count)
+        .sum();
+    assert_eq!(timed, 1000);
     // Both workers of the core, and both caches.
     for meters in [
-        snapshot.latency_summaries().collect::<Vec<_>>(),
+        snapshot.service_time_summaries().collect::<Vec<_>>(),
         snapshot.throughput_summaries().collect(),
         snapshot.in_progress_gauges().collect(),
         snapshot.cache_backlog_gauges().collect(),

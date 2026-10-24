@@ -59,6 +59,12 @@ impl Histogram {
         self.count.load(Ordering::Acquire)
     }
 
+    /// The values recorded so far and their sum, read together only if no other thread records.
+    #[inline]
+    pub(crate) fn totals(&self) -> (u64, f64) {
+        (self.count.load(Ordering::Relaxed), self.sum.get_opaque())
+    }
+
     /// The distribution so far. Each field is read once while writers may keep recording, so a
     /// record in flight may show in the buckets before it shows in the count; percentiles use the
     /// buckets.

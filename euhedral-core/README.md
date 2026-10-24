@@ -362,25 +362,32 @@ partition count (8), chunk pooling, ring-walk reset threshold, and whether work 
 
 With a `MetricsRegistry` in the fragment config (or `LatticeConfig::with_metrics`), each worker
 and each cache registers its meters, tagged with its `core` and `cpu`, named after a prefix
-(`euhedral` by default), as upstream's Micrometer meters are:
+(`euhedral` by default), as upstream's Micrometer meters are. The meters are per CPU: a core's
+two SMT workers and their caches each have their own (`HistogramSnapshot::merge` combines them).
 
 | Name | Kind | What |
 |---|---|---|
-| `.execution.latency` | summary, ns | each batch's smoothed service time per frame |
+| `.execution.serviceTime` | summary, ns | each frame's body: the executor's run of it, from `execute` to its return and finalizer |
+| `.execution.serviceTime.flow` | flow, ns | the current smoothed mean body time of the worker's cycles |
 | `.execution.throughput` | summary, frames/s | each batch's smoothed rate of frames run |
+| `.execution.throughput.flow` | flow, frames/s | the current smoothed rate of frames run |
 | `.execution.inProgress` | gauge | 1 while the worker runs frames, else 0 |
 | `.execution.frames` | counter | frames the worker has run |
-| `.execution.serviceTime` | flow, ns | the current smoothed service time per frame |
-| `.execution.rate` | flow, frames/s | the current smoothed rate of frames run |
 | `.cache.backlog` | gauge, frames | frames queued in the cache |
 | `.cache.capFactor` | summary | the cache's cap factor at each utilization update |
 
-`frames`, `serviceTime` and `rate` are RustEE's own; the rest are upstream's names. Each worker
-keeps two `FlowRecorder`s (service time per frame, frames per cycle) and publishes their
-statistics after each productive cycle; the summaries sample their averages at each batch end.
-Summaries are cumulative histograms with log2 buckets, so a snapshot gives means and percentiles,
-and `HistogramSnapshot::since` a window's. Recording takes no lock and allocates nothing; without a
-registry nothing is recorded and a cycle pays one untaken branch.
+**Service time, not latency.** At the user's direction RustEE departs from upstream here: upstream's
+`.execution.latency` sampled a smoothed per-cycle service time at each batch end; RustEE has no
+`latency` meter, and `.execution.serviceTime` records every frame's own body time, so its
+percentiles are the frames'. It is the body cost the decision tree already timed, read on every
+frame instead of one in 256 while metrics are on. It is not the time from ingest to a CPU.
+
+`frames` and the two `.flow` meters are RustEE's own too; the rest are upstream's names. Each
+worker keeps two `FlowRecorder`s (the mean body time and the frames of each productive cycle) and
+publishes their statistics after each productive cycle; the throughput summary samples the rate at
+each batch end. Summaries are cumulative histograms with log2 buckets, so a snapshot gives means
+and percentiles, and `HistogramSnapshot::since` a window's. Recording takes no lock and allocates
+nothing; without a registry nothing is recorded and a cycle pays one untaken branch.
 
 ```rust,no_run
 use euhedral_core::config::LatticeConfig;
@@ -391,10 +398,10 @@ let registry = MetricsRegistry::new();
 let lattice = ControlPlaneLattice::new(LatticeConfig::with_metrics("app", registry.clone())).unwrap();
 // ... add upstreams and run frames ...
 let snapshot = lattice.metrics().unwrap(); // the same as registry.snapshot()
-for meter in snapshot.latency_summaries() {
-    let latency = meter.summary().unwrap();
+for meter in snapshot.service_time_summaries() {
+    let service_time = meter.summary().unwrap();
     println!("core {} cpu {}: mean {:.0} ns, p99 {:?} ns", meter.core, meter.cpu,
-        latency.mean(), latency.percentile(0.99));
+        service_time.mean(), service_time.percentile(0.99));
 }
 let frames: u64 = snapshot.frames_counters().filter_map(|meter| meter.counter()).sum();
 println!("{frames} frames run");

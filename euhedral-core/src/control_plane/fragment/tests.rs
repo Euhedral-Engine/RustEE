@@ -641,7 +641,7 @@ fn drain_mode_and_first_touch_reach_both_workers() {
 #[test]
 fn the_output_times_a_sample_of_bodies() {
     let body_cost = Arc::new(BodyCost::new());
-    let output = Arc::new(timed_output(body_cost.clone()));
+    let output = Arc::new(timed_output(body_cost.clone(), None));
     let receiver = TestReceiver::new();
     output.clone().add_downstream(receiver.clone());
     // The first push of every interval is timed: the 32nd sample is push 31 · interval.
@@ -653,6 +653,44 @@ fn the_output_times_a_sample_of_bodies() {
     output.accept(frame(0));
     assert!(body_cost.has_history());
     assert_eq!(receiver.received().len() as u64, 31 * interval + 1);
+}
+
+#[test]
+fn with_metrics_the_output_times_every_body_and_samples_the_same_reads_for_the_body_cost() {
+    let config =
+        crate::metrics::MetricsConfig::default().with_registry(Some(MetricsRegistry::new()));
+    let metrics = ExecutionMetrics::new(&config, 0, 0).unwrap();
+    let body_cost = Arc::new(BodyCost::new());
+    let output = Arc::new(timed_output(body_cost.clone(), Some(metrics.clone())));
+    let receiver = TestReceiver::new();
+    output.clone().add_downstream(receiver.clone());
+    let interval = StopWatch::DEFAULT_INTERVAL.get();
+    for id in 0..31 * interval {
+        output.accept(frame(id));
+    }
+    // Every body is in the service-time summary; the body cost still has one in each interval.
+    assert_eq!(metrics.service_time_totals().0, 31 * interval);
+    assert!(!body_cost.has_history());
+    output.accept(frame(0));
+    assert!(body_cost.has_history());
+    assert_eq!(metrics.service_time_totals().0, 31 * interval + 1);
+    assert_eq!(receiver.received().len() as u64, 31 * interval + 1);
+}
+
+#[test]
+fn the_body_timer_samples_the_first_body_of_each_interval() {
+    let mut timer = BodyTimer::default();
+    assert_eq!(timer.stop(), None);
+    let interval = StopWatch::DEFAULT_INTERVAL.get();
+    let sampled: Vec<u64> = (0..3 * interval)
+        .filter(|_| {
+            timer.start();
+            // A nested start keeps the first.
+            timer.start();
+            timer.stop().unwrap().1
+        })
+        .collect();
+    assert_eq!(sampled, [0, interval, 2 * interval]);
 }
 
 #[test]
@@ -775,7 +813,7 @@ fn cycles_size_the_next_batch_at_the_end_of_each() {
         Duration::from_micros(1),
         Duration::from_micros(1),
     );
-    let mut cycle = Cycle::new(0, false);
+    let mut cycle = Cycle::new(0, None);
     let one = Run {
         processed: 1,
         elapsed: Duration::from_nanos(100),
@@ -820,7 +858,7 @@ fn a_fragment_without_a_registry_has_no_meters() {
 #[test]
 fn both_workers_and_their_caches_register_meters_tagged_with_core_and_cpu() {
     use crate::metrics::{
-        CACHE_BACKLOG_SUFFIX, FRAMES_SUFFIX, IN_PROGRESS_SUFFIX, LATENCY_SUMMARY_SUFFIX,
+        CACHE_BACKLOG_SUFFIX, FRAMES_SUFFIX, IN_PROGRESS_SUFFIX, SERVICE_TIME_SUFFIX,
         THROUGHPUT_SUMMARY_SUFFIX, metric_name,
     };
 
@@ -839,7 +877,7 @@ fn both_workers_and_their_caches_register_meters_tagged_with_core_and_cpu() {
 
     let snapshot = registry.snapshot();
     for suffix in [
-        LATENCY_SUMMARY_SUFFIX,
+        SERVICE_TIME_SUFFIX,
         THROUGHPUT_SUMMARY_SUFFIX,
         IN_PROGRESS_SUFFIX,
         FRAMES_SUFFIX,
@@ -892,7 +930,7 @@ fn both_workers_and_their_caches_register_meters_tagged_with_core_and_cpu() {
 }
 
 #[test]
-fn running_workers_record_frames_latency_and_throughput_while_snapshots_are_taken() {
+fn running_workers_record_frames_service_time_and_throughput_while_snapshots_are_taken() {
     let Some((core, cpu)) = *SINGLE_CORE else {
         return;
     };
@@ -911,10 +949,10 @@ fn running_workers_record_frames_latency_and_throughput_while_snapshots_are_take
                 let snapshot = registry.snapshot();
                 let read = |name| snapshot.get(name, cpu).unwrap();
                 let frames = read("test.execution.frames").counter().unwrap();
-                let latency = read("test.execution.latency").summary().unwrap().count;
+                let timed = read("test.execution.serviceTime").summary().unwrap().count;
                 let throughput = read("test.execution.throughput").summary().unwrap().count;
-                assert!(frames >= last.0 && latency >= last.1 && throughput >= last.2);
-                last = (frames, latency, throughput);
+                assert!(frames >= last.0 && timed >= last.1 && throughput >= last.2);
+                last = (frames, timed, throughput);
                 taken += 1;
                 thread::yield_now();
             }
@@ -929,16 +967,12 @@ fn running_workers_record_frames_latency_and_throughput_while_snapshots_are_take
         wait_until("every frame to run", || {
             fixture.received().len() as u64 == rounds * per_round
         });
-        wait_until("a latency and a throughput sample", || {
-            let snapshot = registry.snapshot();
-            snapshot
-                .get("test.execution.latency", cpu)
+        wait_until("a throughput sample", || {
+            registry
+                .snapshot()
+                .get("test.execution.throughput", cpu)
                 .and_then(|meter| meter.summary())
                 .is_some_and(|summary| summary.count > 0)
-                && snapshot
-                    .get("test.execution.throughput", cpu)
-                    .and_then(|meter| meter.summary())
-                    .is_some_and(|summary| summary.count > 0)
         });
         stop.store(true, Ordering::Release);
         reader.join().unwrap()
@@ -948,14 +982,18 @@ fn running_workers_record_frames_latency_and_throughput_while_snapshots_are_take
     let snapshot = registry.snapshot();
     let frames = snapshot.get("test.execution.frames", cpu).unwrap();
     assert_eq!(frames.counter(), Some(rounds * per_round));
-    let latency = snapshot
-        .get("test.execution.latency", cpu)
+    let service_time = snapshot
+        .get("test.execution.serviceTime", cpu)
         .unwrap()
         .summary()
         .unwrap();
-    // Nanoseconds per frame: positive and well under the 10 s the test may take.
-    assert!(latency.mean() > 0.0 && latency.max < 1e10, "{latency:?}");
-    assert!(latency.percentile(0.5).unwrap() <= latency.max);
+    // Every frame's body, in nanoseconds: positive and well under the 10 s the test may take.
+    assert_eq!(service_time.count, rounds * per_round);
+    assert!(
+        service_time.mean() > 0.0 && service_time.max < 1e10,
+        "{service_time:?}"
+    );
+    assert!(service_time.percentile(0.5).unwrap() <= service_time.max);
     let throughput = snapshot
         .get("test.execution.throughput", cpu)
         .unwrap()
@@ -963,13 +1001,13 @@ fn running_workers_record_frames_latency_and_throughput_while_snapshots_are_take
         .unwrap();
     // Frames per second.
     assert!(throughput.mean() > 1.0, "{throughput:?}");
-    let service_time = snapshot
-        .get("test.execution.serviceTime", cpu)
+    let flow = snapshot
+        .get("test.execution.serviceTime.flow", cpu)
         .and_then(|meter| meter.flow())
         .unwrap();
-    assert!(service_time.average > 0.0 && service_time.min <= service_time.max);
+    assert!(flow.average > 0.0 && flow.min <= flow.max);
     let rate = snapshot
-        .get("test.execution.rate", cpu)
+        .get("test.execution.throughput.flow", cpu)
         .and_then(|meter| meter.flow())
         .unwrap();
     assert!(rate.average > 0.0, "{rate:?}");
@@ -992,10 +1030,10 @@ fn cycles_count_frames_and_report_the_flow_at_the_end_of_each_batch() {
         Duration::from_micros(1),
         Duration::from_micros(1),
     );
-    let mut cycle = Cycle::new(0, true);
+    let mut cycle = Cycle::new(0, Some(&metrics));
     let run = Run {
         processed: 1,
-        elapsed: Duration::from_nanos(200),
+        elapsed: Duration::from_nanos(300),
     };
     let summaries = |metrics: &ExecutionMetrics| {
         let mut meters = Vec::new();
@@ -1009,24 +1047,29 @@ fn cycles_count_frames_and_report_the_flow_at_the_end_of_each_batch() {
         };
         (
             count(".execution.frames").counter().unwrap(),
-            count(".execution.latency").summary().unwrap().clone(),
+            count(".execution.serviceTime").summary().unwrap().clone(),
             count(".execution.throughput").summary().unwrap().clone(),
         )
     };
     let start = Instant::now();
     for step in 1..=12u32 {
+        // The output times each frame's body as the worker pushes it.
+        metrics.record_service_time(Duration::from_nanos(200));
         cycle.now = start + Duration::from_micros(u64::from(step) * 10);
         cycle.complete(&run, &mut policy, 4096, Some(&metrics), || 1);
     }
-    let (frames, latency, throughput) = summaries(&metrics);
+    let (frames, service_time, throughput) = summaries(&metrics);
     assert_eq!(frames, 12);
+    // Every body, not the cycle's elapsed time.
+    assert_eq!((service_time.count, service_time.sum), (12, 2400.0));
+    assert_eq!(service_time.max, 200.0);
     // Batches of 2, then as the policy sizes them: each batch end after the flow is measured
-    // records a sample, and none is recorded mid-batch.
-    assert!(latency.count > 0 && latency.count < 12, "{latency:?}");
-    assert_eq!(latency.max, 200.0);
-    assert_eq!(latency.sum, 200.0 * latency.count as f64);
+    // records a throughput sample, and none is recorded mid-batch.
+    assert!(
+        throughput.count > 0 && throughput.count < 12,
+        "{throughput:?}"
+    );
     // One frame each 10 µs: 100,000 frames per second.
-    assert!(throughput.count > 0);
     assert!((throughput.max - 100_000.0).abs() < 1.0, "{throughput:?}");
 
     // The flow meters carry the recorders' current statistics.
@@ -1040,17 +1083,19 @@ fn cycles_count_frames_and_report_the_flow_at_the_end_of_each_batch() {
             .flow()
             .unwrap()
     };
-    let service_time = flow(".execution.serviceTime");
+    // The service-time flow is the mean body time of each cycle's frames.
+    let service_time = flow(".execution.serviceTime.flow");
     assert_eq!((service_time.average, service_time.max), (200.0, 200.0));
     assert_eq!(service_time.standard_deviation, 0.0);
-    let rate = flow(".execution.rate");
+    let rate = flow(".execution.throughput.flow");
     assert!((rate.average - 100_000.0).abs() < 1.0, "{rate:?}");
 
     // Without metrics a cycle keeps no flow.
-    assert!(Cycle::new(0, false).flow.is_none());
+    assert!(Cycle::new(0, None).flow.is_none());
 }
 
-/// The cost of a cycle's bookkeeping with metrics off and on, on one thread: what the worker
+/// The cost of a cycle's bookkeeping with metrics off and on, on one thread, without the per-frame
+/// body timing (which `metrics_overhead_per_frame` includes): what the worker
 /// pays per productive cycle, whatever the frames.
 #[test]
 #[ignore = "a measurement: run with --ignored --nocapture"]
@@ -1068,12 +1113,12 @@ fn metrics_cost_per_cycle() {
                 Duration::from_micros(1),
                 Duration::from_micros(1),
             );
-            let mut cycle = Cycle::new(0, metered);
+            let meters = metered.then_some(&**metrics);
+            let mut cycle = Cycle::new(0, meters);
             let run = Run {
                 processed,
                 elapsed: Duration::from_nanos(100 * processed),
             };
-            let meters = metered.then_some(&**metrics);
             let start = Instant::now();
             for _ in 0..CYCLES {
                 cycle.now += Duration::from_micros(1);

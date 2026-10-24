@@ -2,18 +2,21 @@ use super::*;
 use std::sync::Weak;
 
 #[test]
-fn names_are_the_upstream_names() {
+fn names_are_upstreams_except_service_time() {
     assert_eq!(DEFAULT_PREFIX, "euhedral");
     assert_eq!(CORE_TAG, "core");
     let names = [
-        (LATENCY_SUMMARY_SUFFIX, "euhedral.execution.latency"),
         (THROUGHPUT_SUMMARY_SUFFIX, "euhedral.execution.throughput"),
         (IN_PROGRESS_SUFFIX, "euhedral.execution.inProgress"),
         (CACHE_BACKLOG_SUFFIX, "euhedral.cache.backlog"),
         (CAP_FACTOR_SUFFIX, "euhedral.cache.capFactor"),
         (FRAMES_SUFFIX, "euhedral.execution.frames"),
         (SERVICE_TIME_SUFFIX, "euhedral.execution.serviceTime"),
-        (RATE_SUFFIX, "euhedral.execution.rate"),
+        (
+            SERVICE_TIME_FLOW_SUFFIX,
+            "euhedral.execution.serviceTime.flow",
+        ),
+        (THROUGHPUT_FLOW_SUFFIX, "euhedral.execution.throughput.flow"),
     ];
     for (suffix, name) in names {
         assert_eq!(metric_name(DEFAULT_PREFIX, suffix), name);
@@ -23,20 +26,20 @@ fn names_are_the_upstream_names() {
 #[test]
 fn a_prefix_loses_its_trailing_dot_and_a_blank_one_is_the_default() {
     assert_eq!(
-        metric_name("app.", LATENCY_SUMMARY_SUFFIX),
-        "app.execution.latency"
+        metric_name("app.", SERVICE_TIME_SUFFIX),
+        "app.execution.serviceTime"
     );
     assert_eq!(
         metric_name("my.app", CAP_FACTOR_SUFFIX),
         "my.app.cache.capFactor"
     );
     assert_eq!(
-        metric_name("", LATENCY_SUMMARY_SUFFIX),
-        "euhedral.execution.latency"
+        metric_name("", SERVICE_TIME_SUFFIX),
+        "euhedral.execution.serviceTime"
     );
     assert_eq!(
-        metric_name("  ", LATENCY_SUMMARY_SUFFIX),
-        "euhedral.execution.latency"
+        metric_name("  ", SERVICE_TIME_SUFFIX),
+        "euhedral.execution.serviceTime"
     );
     assert_eq!(MetricsConfig::default().prefix(), "euhedral");
     assert_eq!(
@@ -54,7 +57,7 @@ fn without_a_registry_nothing_is_built() {
 }
 
 /// A source with a fixed set of meters.
-struct Fixed(Box<CachePadded<ExecutionMetrics>>);
+struct Fixed(Arc<CachePadded<ExecutionMetrics>>);
 
 impl MeterSource for Fixed {
     fn collect(&self, out: &mut Vec<Meter>) {
@@ -78,7 +81,10 @@ fn execution_meters_report_what_was_recorded() {
     let source = fixed(&registry, "app", 4, 9);
     source.0.record_frames(5);
     source.0.record_frames(2);
-    source.0.report_latency(250.0);
+    source
+        .0
+        .record_service_time(std::time::Duration::from_nanos(250));
+    assert_eq!(source.0.service_time_totals(), (1, 250.0));
     source.0.report_throughput(0.002);
 
     let snapshot = registry.snapshot();
@@ -86,19 +92,19 @@ fn execution_meters_report_what_was_recorded() {
     assert_eq!(get("app.execution.frames").counter(), Some(7));
     // The gauge says whether the worker runs frames: any count in progress is 1.
     assert_eq!(get("app.execution.inProgress").gauge(), Some(1.0));
-    let latency = get("app.execution.latency").summary().unwrap();
-    assert_eq!((latency.count, latency.sum), (1, 250.0));
+    let service_time = get("app.execution.serviceTime").summary().unwrap();
+    assert_eq!((service_time.count, service_time.sum), (1, 250.0));
     // 0.002 frames per nanosecond is 2,000,000 frames per second.
     let throughput = get("app.execution.throughput").summary().unwrap();
     assert_eq!(throughput.max, 2_000_000.0);
-    let meter = get("app.execution.latency");
+    let meter = get("app.execution.serviceTime");
     assert_eq!((meter.core, meter.cpu), (4, 9));
     assert_eq!(
         (meter.tag(CORE_TAG), meter.tag(CPU_TAG), meter.tag("x")),
         (Some(4), Some(9), None)
     );
     assert!(meter.gauge().is_none() && meter.counter().is_none() && meter.flow().is_none());
-    assert!(get("app.execution.serviceTime").flow().is_none());
+    assert!(get("app.execution.serviceTime.flow").flow().is_none());
     let stats = FlowStats {
         average: 4.0,
         standard_deviation: 1.0,
@@ -107,14 +113,20 @@ fn execution_meters_report_what_was_recorded() {
         max: 6.0,
     };
     source.0.publish_service_time(&stats);
-    source.0.publish_rate(&stats);
+    source.0.publish_throughput(&stats);
     let snapshot = registry.snapshot();
     assert_eq!(
-        snapshot.get("app.execution.serviceTime", 9).unwrap().flow(),
+        snapshot
+            .get("app.execution.serviceTime.flow", 9)
+            .unwrap()
+            .flow(),
         Some(&stats)
     );
     assert_eq!(
-        snapshot.get("app.execution.rate", 9).unwrap().flow(),
+        snapshot
+            .get("app.execution.throughput.flow", 9)
+            .unwrap()
+            .flow(),
         Some(&stats)
     );
 }
@@ -127,18 +139,18 @@ fn lookups_match_names_and_suffixes_like_the_aggregator() {
     let _other = fixed(&registry, "b", 1, 2);
     let snapshot = registry.snapshot();
     assert_eq!(snapshot.meters().len(), 18);
-    assert_eq!(snapshot.latency_summaries().count(), 3);
+    assert_eq!(snapshot.service_time_summaries().count(), 3);
     assert_eq!(snapshot.service_time_flows().count(), 3);
-    assert_eq!(snapshot.rate_flows().count(), 3);
+    assert_eq!(snapshot.throughput_flows().count(), 3);
     assert_eq!(snapshot.throughput_summaries().count(), 3);
     assert_eq!(snapshot.in_progress_gauges().count(), 3);
     assert_eq!(snapshot.frames_counters().count(), 3);
     assert_eq!(snapshot.cache_backlog_gauges().count(), 0);
     assert_eq!(snapshot.cap_factor_summaries().count(), 0);
-    let prefixed = metric_name("a", LATENCY_SUMMARY_SUFFIX);
+    let prefixed = metric_name("a", SERVICE_TIME_SUFFIX);
     assert_eq!(snapshot.named(&prefixed).count(), 2);
     assert!(snapshot.get(&prefixed, 2).is_none());
-    assert!(snapshot.get("b.execution.latency", 2).is_some());
+    assert!(snapshot.get("b.execution.serviceTime", 2).is_some());
 }
 
 #[test]
@@ -178,7 +190,9 @@ fn snapshots_read_while_writers_record() {
                 let mut value = 0u64;
                 while !stop.load(Ordering::Relaxed) || value < 1000 {
                     source.0.record_frames(1);
-                    source.0.report_latency((value % 1000) as f64);
+                    source
+                        .0
+                        .record_service_time(std::time::Duration::from_nanos(value % 1000));
                     value += 1;
                 }
             });
@@ -191,9 +205,9 @@ fn snapshots_read_while_writers_record() {
                 assert!(frames >= last[meter.cpu]);
                 last[meter.cpu] = frames;
             }
-            for meter in snapshot.latency_summaries() {
-                let latency = meter.summary().unwrap();
-                assert!(latency.buckets.iter().sum::<u64>() >= latency.count);
+            for meter in snapshot.service_time_summaries() {
+                let service_time = meter.summary().unwrap();
+                assert!(service_time.buckets.iter().sum::<u64>() >= service_time.count);
             }
         }
         stop.store(true, Ordering::Relaxed);
@@ -205,12 +219,12 @@ fn snapshots_read_while_writers_record() {
             .unwrap()
             .counter()
             .unwrap();
-        let latency = snapshot
-            .get("c.execution.latency", cpu)
+        let service_time = snapshot
+            .get("c.execution.serviceTime", cpu)
             .unwrap()
             .summary()
             .unwrap();
-        assert_eq!(latency.count, frames);
-        assert_eq!(latency.buckets.iter().sum::<u64>(), frames);
+        assert_eq!(service_time.count, frames);
+        assert_eq!(service_time.buckets.iter().sum::<u64>(), frames);
     }
 }

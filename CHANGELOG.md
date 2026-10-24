@@ -9,10 +9,16 @@ semantics and the tests that pin it.
 `metrics` package (`ExecutionMetrics`, `CacheMetrics`, `MetricsAggregator`), which the port had dropped. Each fragment
 worker and each cache registers meters in a `MetricsRegistry`; `MetricsRegistry::snapshot` and
 `ControlPlaneLattice::metrics` read them all without stopping the workers. The fragment's cycle state has upstream's
-two `FlowRecorder`s back (service time per frame and frames per cycle), which feed the latency and throughput meters.
+two `FlowRecorder`s back, which feed the throughput summary and the two flow meters.
 
 **Why.** Upstream reports latency, throughput, in-progress, backlog and cap-factor meters through Micrometer; the
 port had the raw state (`in_progress`, `cap_factor`, the cache's count) but no way to read it as metrics.
+
+**Departure from upstream: service time, not latency.** At the user's direction, RustEE has no `.execution.latency`.
+Upstream's was a batch-end sample of a smoothed per-cycle service time (cycle time over frames). RustEE's
+`.execution.serviceTime` summary records every frame's own body time: the executor's run of the frame, from `execute`
+to its return and the frame's finalizer. Its percentiles are the frames'. It is the work's body, not the time a frame
+takes to get from ingest to a CPU.
 
 **How to use it.**
 ```rust
@@ -21,7 +27,7 @@ let config = LatticeConfig::with_metrics("app", registry.clone()); // or:
 let fragment = FragmentConfig::default().with_metrics("app", registry.clone()); // fragments and their caches
 // ... run the lattice ...
 let snapshot = registry.snapshot(); // or lattice.metrics()
-let p99 = snapshot.get("app.execution.latency", cpu).and_then(|m| m.summary()).and_then(|s| s.percentile(0.99));
+let p99 = snapshot.get("app.execution.serviceTime", cpu).and_then(|m| m.summary()).and_then(|s| s.percentile(0.99));
 ```
 - `FragmentConfig` and `CacheConfig` have upstream's `metric_prefix()` and `registry()`, with `with_metric_prefix`
   and `with_registry` (`None` turns metrics off). `FragmentConfig::with_metrics` sets both its own and its cache
@@ -33,21 +39,26 @@ let p99 = snapshot.get("app.execution.latency", cpu).and_then(|m| m.summary()).a
 
 | Meter | Kind | Recorded | Upstream |
 |---|---|---|---|
-| `<prefix>.execution.latency` | summary, ns | at each batch end: the service-time recorder's average | `reportLatency` in `reportMetrics` |
+| `<prefix>.execution.serviceTime` | summary, ns | every frame, around the worker's push of it to its executor (`timed_output`) | replaces `.execution.latency` (`reportLatency` in `reportMetrics`) |
+| `<prefix>.execution.serviceTime.flow` | flow, ns | after each productive cycle: the `FlowStats` of a recorder of the cycle's mean body time | none |
 | `<prefix>.execution.throughput` | summary, frames/s | at each batch end: the frame recorder's rate × 10^9 | `reportThroughput` in `reportMetrics` |
+| `<prefix>.execution.throughput.flow` | flow, frames/s | after each productive cycle: the frame recorder's rate `FlowStats` | none |
 | `<prefix>.execution.inProgress` | gauge | 1 while the worker is inside a cache take, a direct pull or a steal (`timed`) | `executionStarted`/`executionFinished` around `drainLocalCache`, `pullAvailableUpstream`, `stealWork` |
 | `<prefix>.execution.frames` | counter | after each productive cycle | none |
-| `<prefix>.execution.serviceTime` | flow, ns | after each productive cycle: the service-time recorder's `FlowStats` | none |
-| `<prefix>.execution.rate` | flow, frames/s | after each productive cycle: the frame recorder's rate `FlowStats` | none |
 | `<prefix>.cache.backlog` | gauge, frames | read at snapshot: the cache's count | `CacheMetrics` gauge on `TOTAL_COUNT` |
 | `<prefix>.cache.capFactor` | summary | in `ControlPlaneCache::update`, the cap factor it set | `recordCapFactor` in `update` |
 
-- **The recorders** are recorded where upstream's `recordProgress` records them: after each productive cycle, the
-  service time per frame (`max(1, elapsed / frames)`) and the frames run, at the cycle's end time. A worker reset starts
-  them over, as `CycleState.reset()` does; the summaries stay cumulative.
+- **Body timing.** The worker's output already timed one push in 256 (`StopWatch`) for the decision tree's body cost.
+  With metrics on it times every push instead, with the same clock reads, into the service-time summary, and gives the
+  body cost the first of each 256 as before. Without metrics the output is unchanged.
+- **The recorders** are recorded where upstream's `recordProgress` records them, after each productive cycle and at
+  the cycle's end time: the mean body time of the cycle's frames (from the service-time summary's count and sum, so no
+  further clock read) and the frames run. A worker reset starts them over, as `CycleState.reset()` does; the summaries
+  stay cumulative.
 - **Prefix:** `euhedral` unless set; blank means the default, and a trailing `.` is dropped (`metricName`).
-- **Tags:** `core` (the clone's core id) and `cpu`. Upstream has only `core`, so a core's two SMT workers share one
-  Micrometer meter per name; here each worker and each cache has its own, and `HistogramSnapshot::merge` combines them.
+- **Tags, per CPU:** `core` (the clone's core id) and `cpu`. Upstream has only `core`, so a core's two SMT workers
+  share one Micrometer meter per name; here each worker and each cache has its own, which is what the user wants.
+  `HistogramSnapshot::merge` combines them if a reader needs a core's total.
 - **Summaries** are cumulative histograms of atomics: count, sum, max, and log2 buckets (each octave from `2^-16` to
   `2^48` split in four), so percentiles are within a quarter-octave. Negative and `NaN` values are ignored, as
   Micrometer ignores negative amounts.
@@ -56,10 +67,13 @@ let p99 = snapshot.get("app.execution.latency", cpu).and_then(|m| m.summary()).a
 - **Lifecycle:** a fragment or cache registers when built and leaves its registry when closed or dropped (upstream's
   caches never removed their meters).
 - **Cost.** No lock and no allocation on a worker's path; each worker owns its meters on their own cache lines.
-  Without a registry a cycle pays one untaken branch. With one, a productive cycle pays about 33 ns (two `FlowRecorder`
-  updates, about 28 ns, dominate), plus a histogram record per summary at each batch end. Measured on an i9-14900K, in
-  release, one SMT core's two workers running empty frames: greedy mode 157.0 ns/frame off, 158.5 on (+1%); poll mode,
-  with a cycle per one or two frames, 251 off, 289 on (+38 ns, +15%).
+  Without a registry a cycle pays one untaken branch and the output times one body in 256, as before. With one, each
+  frame pays two clock reads and a histogram record, and each productive cycle up to about 30 ns, mostly the two
+  `FlowRecorder` updates (`metrics_cost_per_cycle`, which records no bodies: 15 to 17 ns over 4 to 6 ns off).
+  Measured on an i9-14900K, in release, one SMT core's two workers running empty frames from an array sink
+  (`metrics_overhead_per_frame`, medians of two runs of seven rounds): greedy mode 152 to 154 ns/frame off, 171 to 172
+  on (+17 to +20 ns, +11 to +13%); poll mode, with a cycle per one or two frames, 242 to 245 off, 295 to 299 on (+53 to
+  +54 ns, +22%). The user's frames run for milliseconds, so this is noise for them.
 - `MetricsAggregator.getInProgressGauges(registry)` matched the latency suffix upstream; `in_progress_gauges` matches
   the in-progress suffix.
 - No exporter: the `metrics` crate facade is push-based, so a bridge would either record through a global recorder on
@@ -68,16 +82,17 @@ let p99 = snapshot.get("app.execution.latency", cpu).and_then(|m| m.summary()).a
 **Tests:**
 - `metrics/histogram.rs`: buckets and their bounds, recording, percentiles, `since` and `merge`, concurrent writers.
 - `metrics/flow.rs`: publishing, no torn reads under a concurrent writer, `FlowStats` from a recorder.
-- `metrics/tests.rs`: upstream's names and prefix rules, nothing built without a registry, meters and tags, the
-  aggregator lookups, sources leaving the registry, snapshots while four writers record.
+- `metrics/tests.rs`: the names (upstream's, and service time) and prefix rules, nothing built without a registry,
+  meters and tags, the aggregator lookups, sources leaving the registry, snapshots while four writers record.
 - `config/*`: the prefix and registry settings and defaults.
 - `control_plane/cache/tests.rs`: no meters without a registry; backlog and cap factor tagged with the core; closing or
   dropping a cache removes its meters.
-- `control_plane/fragment/tests.rs`: no meters without a registry; both SMT workers and caches register, tagged;
-  running workers record frames, latency, throughput and flows while a reader snapshots; a cycle counts frames and
-  reports at batch ends.
-- `impls/base_cloneable/tests.rs`: a metered lattice reports every worker's meters until closed. Ignored
-  measurements: `metrics_cost_per_cycle` (fragment tests) and `metrics_overhead_per_frame`.
+- `control_plane/fragment/tests.rs`: with metrics the output times every body and still samples one in 256 for the
+  body cost; no meters without a registry; both SMT workers and caches register, tagged; running workers time every
+  frame and record throughput and flows while a reader snapshots; a cycle counts frames, feeds the service-time flow
+  from the timed bodies and reports throughput at batch ends.
+- `impls/base_cloneable/tests.rs`: a metered lattice reports every worker's meters, every frame timed, until closed.
+  Ignored measurements: `metrics_cost_per_cycle` (fragment tests) and `metrics_overhead_per_frame`.
 
 ## Greedy, not drain, for holding a partition while its frames run (2026-10-23)
 

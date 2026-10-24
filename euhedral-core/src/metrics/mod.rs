@@ -13,21 +13,27 @@
 //!
 //! | Name | Kind | What |
 //! |---|---|---|
-//! | `.execution.latency` | summary, ns | each batch's smoothed service time per frame |
+//! | `.execution.serviceTime` | summary, ns | each frame's body: the executor's run of it, from `execute` to its return and finalizer |
+//! | `.execution.serviceTime.flow` | flow, ns | the current smoothed service time per frame of the worker's cycles |
 //! | `.execution.throughput` | summary, frames/s | each batch's smoothed rate of frames run |
+//! | `.execution.throughput.flow` | flow, frames/s | the current smoothed rate of frames run |
 //! | `.execution.inProgress` | gauge | 1 while the worker runs frames, else 0 |
 //! | `.execution.frames` | counter | frames the worker has run |
-//! | `.execution.serviceTime` | flow, ns | the current smoothed service time per frame |
-//! | `.execution.rate` | flow, frames/s | the current smoothed rate of frames run |
 //! | `.cache.backlog` | gauge, frames | frames queued in the cache |
 //! | `.cache.capFactor` | summary | the cache's cap factor at each utilization update, in `[0.15, 1]` |
 //!
+//! Upstream's `.execution.latency` was a batch-end sample of a smoothed per-cycle service time;
+//! RustEE replaces it with `.execution.serviceTime`, every frame's own body time, so its
+//! percentiles are those of the frames. The worker times each frame it pushes to its executor with
+//! the clock reads it already makes for its decision tree's body cost, on every frame instead of
+//! one in 256 while metrics are on.
+//!
 //! Each worker keeps two [`FlowRecorder`](crate::utils::FlowRecorder)s in its own cycle state (as
-//! upstream's `CycleState` does): one of the service time per frame of each productive cycle, one
+//! upstream's `CycleState` does): one of the mean body time of each productive cycle's frames, one
 //! of the frames each ran, whose rate is the throughput. At the end of each productive cycle the
-//! worker publishes their averages, deviations, trends and recent extremes as [`FlowStats`]
-//! (the flow meters), and at the end of each batch it records the averages in the latency and
-//! throughput summaries, as upstream does.
+//! worker publishes their averages, deviations, trends and recent extremes as [`FlowStats`] (the
+//! `.flow` meters), and at the end of each batch it records the rate in the throughput summary,
+//! as upstream does.
 //!
 //! Summaries are cumulative [`Histogram`]s: count, sum, max and log2 buckets, so readers get means
 //! and percentiles, and the difference of two snapshots ([`HistogramSnapshot::since`]) gives a
@@ -44,11 +50,11 @@
 //! assert_eq!(fragment.metric_prefix(), "app");
 //! // A lattice of these fragments registers each worker and cache; read them with:
 //! let snapshot = registry.snapshot();
-//! let name = metrics::metric_name("app", metrics::LATENCY_SUMMARY_SUFFIX);
-//! assert_eq!(name, "app.execution.latency");
+//! let name = metrics::metric_name("app", metrics::SERVICE_TIME_SUFFIX);
+//! assert_eq!(name, "app.execution.serviceTime");
 //! for meter in snapshot.named(&name) {
-//!     let latency = meter.summary().unwrap();
-//!     println!("core {} cpu {}: p99 {:?} ns", meter.core, meter.cpu, latency.percentile(0.99));
+//!     let service_time = meter.summary().unwrap();
+//!     println!("core {} cpu {}: p99 {:?} ns", meter.core, meter.cpu, service_time.percentile(0.99));
 //! }
 //! ```
 
@@ -69,6 +75,7 @@ pub(crate) use registry::MeterSource;
 use euhedral_data_structures::atomics::CachePadded;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 /// The prefix of every metric name when none is configured.
 pub const DEFAULT_PREFIX: &str = "euhedral";
@@ -83,18 +90,19 @@ pub const CACHE_BACKLOG_SUFFIX: &str = ".cache.backlog";
 pub const CAP_FACTOR_SUFFIX: &str = ".cache.capFactor";
 
 pub const IN_PROGRESS_SUFFIX: &str = ".execution.inProgress";
-pub const LATENCY_SUMMARY_SUFFIX: &str = ".execution.latency";
-pub const THROUGHPUT_SUMMARY_SUFFIX: &str = ".execution.throughput";
-/// The frames a worker has run. Upstream has no such counter.
-pub const FRAMES_SUFFIX: &str = ".execution.frames";
-/// A worker's current service time per frame, in nanoseconds: the [`FlowStats`] of the
-/// [`FlowRecorder`](crate::utils::FlowRecorder) the latency summary samples. Upstream has no such
-/// meter.
+/// Each frame's body time, in nanoseconds: a summary. RustEE's replacement for upstream's
+/// `.execution.latency`.
 pub const SERVICE_TIME_SUFFIX: &str = ".execution.serviceTime";
+/// A worker's current service time per frame, in nanoseconds: the [`FlowStats`] of its
+/// service-time [`FlowRecorder`](crate::utils::FlowRecorder). Upstream has no such meter.
+pub const SERVICE_TIME_FLOW_SUFFIX: &str = ".execution.serviceTime.flow";
+pub const THROUGHPUT_SUMMARY_SUFFIX: &str = ".execution.throughput";
 /// A worker's current rate, in frames per second: the [`FlowStats`] of the
 /// [`FlowRecorder`](crate::utils::FlowRecorder) the throughput summary samples. Upstream has no
 /// such meter.
-pub const RATE_SUFFIX: &str = ".execution.rate";
+pub const THROUGHPUT_FLOW_SUFFIX: &str = ".execution.throughput.flow";
+/// The frames a worker has run. Upstream has no such counter.
+pub const FRAMES_SUFFIX: &str = ".execution.frames";
 
 /// `prefix` and `suffix` joined, without a trailing `.` on the prefix; a blank prefix is
 /// [`DEFAULT_PREFIX`].
@@ -150,16 +158,16 @@ pub(crate) struct ExecutionMetrics {
     registry: Arc<MetricsRegistry>,
     core: usize,
     cpu: usize,
-    latency_name: Arc<str>,
+    service_time_name: Arc<str>,
+    service_time_flow_name: Arc<str>,
     throughput_name: Arc<str>,
+    throughput_flow_name: Arc<str>,
     in_progress_name: Arc<str>,
     frames_name: Arc<str>,
-    service_time_name: Arc<str>,
-    rate_name: Arc<str>,
     frames: CachePadded<AtomicU64>,
-    service_time: PublishedFlow,
-    rate: PublishedFlow,
-    latency: Histogram,
+    service_time_flow: PublishedFlow,
+    throughput_flow: PublishedFlow,
+    service_time: Histogram,
     throughput: Histogram,
 }
 
@@ -169,24 +177,24 @@ impl ExecutionMetrics {
         config: &MetricsConfig,
         core: usize,
         cpu: usize,
-    ) -> Option<Box<CachePadded<Self>>> {
+    ) -> Option<Arc<CachePadded<Self>>> {
         let registry = config.registry()?.clone();
         let prefix = config.prefix();
         let name = |suffix| Arc::<str>::from(metric_name(prefix, suffix));
-        Some(Box::new(CachePadded::new(Self {
+        Some(Arc::new(CachePadded::new(Self {
             registry,
             core,
             cpu,
-            latency_name: name(LATENCY_SUMMARY_SUFFIX),
+            service_time_name: name(SERVICE_TIME_SUFFIX),
+            service_time_flow_name: name(SERVICE_TIME_FLOW_SUFFIX),
             throughput_name: name(THROUGHPUT_SUMMARY_SUFFIX),
+            throughput_flow_name: name(THROUGHPUT_FLOW_SUFFIX),
             in_progress_name: name(IN_PROGRESS_SUFFIX),
             frames_name: name(FRAMES_SUFFIX),
-            service_time_name: name(SERVICE_TIME_SUFFIX),
-            rate_name: name(RATE_SUFFIX),
             frames: CachePadded::new(AtomicU64::new(0)),
-            service_time: PublishedFlow::new(),
-            rate: PublishedFlow::new(),
-            latency: Histogram::new(),
+            service_time_flow: PublishedFlow::new(),
+            throughput_flow: PublishedFlow::new(),
+            service_time: Histogram::new(),
             throughput: Histogram::new(),
         })))
     }
@@ -201,21 +209,28 @@ impl ExecutionMetrics {
         self.frames.fetch_add(frames, Ordering::Relaxed);
     }
 
+    /// Records one frame's body time.
+    #[inline]
+    pub(crate) fn record_service_time(&self, elapsed: Duration) {
+        self.service_time.record(elapsed.as_nanos() as f64);
+    }
+
+    /// The frames whose body time was recorded, and the sum of their times in nanoseconds.
+    #[inline]
+    pub(crate) fn service_time_totals(&self) -> (u64, f64) {
+        self.service_time.totals()
+    }
+
     /// Publishes the current service time per frame, in nanoseconds.
     #[inline]
     pub(crate) fn publish_service_time(&self, stats: &FlowStats) {
-        self.service_time.publish(stats);
+        self.service_time_flow.publish(stats);
     }
 
     /// Publishes the current rate, in frames per second.
     #[inline]
-    pub(crate) fn publish_rate(&self, stats: &FlowStats) {
-        self.rate.publish(stats);
-    }
-
-    /// Records a service time per frame, in nanoseconds.
-    pub(crate) fn report_latency(&self, nanos: f64) {
-        self.latency.record(nanos);
+    pub(crate) fn publish_throughput(&self, stats: &FlowStats) {
+        self.throughput_flow.publish(stats);
     }
 
     /// Records a rate in frames per nanosecond, as frames per second.
@@ -232,12 +247,20 @@ impl ExecutionMetrics {
             value,
         };
         out.push(meter(
-            &self.latency_name,
-            MeterValue::Summary(self.latency.snapshot()),
+            &self.service_time_name,
+            MeterValue::Summary(self.service_time.snapshot()),
+        ));
+        out.push(meter(
+            &self.service_time_flow_name,
+            MeterValue::Flow(self.service_time_flow.read()),
         ));
         out.push(meter(
             &self.throughput_name,
             MeterValue::Summary(self.throughput.snapshot()),
+        ));
+        out.push(meter(
+            &self.throughput_flow_name,
+            MeterValue::Flow(self.throughput_flow.read()),
         ));
         out.push(meter(
             &self.in_progress_name,
@@ -247,11 +270,6 @@ impl ExecutionMetrics {
             &self.frames_name,
             MeterValue::Counter(self.frames.load(Ordering::Relaxed)),
         ));
-        out.push(meter(
-            &self.service_time_name,
-            MeterValue::Flow(self.service_time.read()),
-        ));
-        out.push(meter(&self.rate_name, MeterValue::Flow(self.rate.read())));
     }
 }
 

@@ -281,14 +281,15 @@ out.
 **meter, metric name, prefix, tags** ([`Meter`](euhedral-core/src/metrics/registry.rs),
 [`metric_name`](euhedral-core/src/metrics/mod.rs)): one measured value of one worker or cache. Its
 name is a prefix (`euhedral` by default, a trailing `.` dropped) and a suffix such as
-`.execution.latency`; its tags are `core` (the clone's physical core) and `cpu` (the worker's CPU,
-which tells a core's two SMT workers apart).
+`.execution.serviceTime`; its tags are `core` (the clone's physical core) and `cpu` (the worker's
+CPU). Meters are per CPU: a core's two SMT workers each have their own.
 
 **gauge, counter, summary, flow** ([`MeterValue`](euhedral-core/src/metrics/registry.rs)): a gauge
 reads a value now (`.execution.inProgress`, `.cache.backlog`); a counter counts since the meter
 was made (`.execution.frames`); a summary is a cumulative histogram of recorded values
-(`.execution.latency`, `.execution.throughput`, `.cache.capFactor`); a flow is a `FlowRecorder`'s
-current statistics (`.execution.serviceTime`, `.execution.rate`).
+(`.execution.serviceTime`, `.execution.throughput`, `.cache.capFactor`); a flow is a
+`FlowRecorder`'s current statistics, named after the summary it sits beside
+(`.execution.serviceTime.flow`, `.execution.throughput.flow`).
 
 **histogram, log2 buckets, percentile** ([`Histogram`](euhedral-core/src/metrics/histogram.rs)):
 atomics counting, summing and keeping the maximum of recorded values, and counting them in
@@ -296,10 +297,17 @@ buckets: each octave `[2^e, 2^(e+1))` from `2^-16` to `2^48` split in four. A `H
 gives the mean, percentiles within a bucket's width, and with `since` the values recorded between
 two snapshots.
 
-**latency, throughput** ([`ExecutionFlow`](euhedral-core/src/control_plane/fragment.rs), private):
-a worker's smoothed service time per frame (ns) and rate of frames run (frames/s), from two
-`FlowRecorder`s it updates after each productive cycle. The latency and throughput summaries
-sample their averages at the end of each batch.
+**service time** ([`timed_output`](euhedral-core/src/control_plane/fragment.rs), private): how long
+a frame's body takes: the executor's run of it, from `execute` to its return and the frame's
+finalizer, timed by the worker as it pushes the frame. With metrics on every body is timed into the
+`.execution.serviceTime` summary; the decision tree's body cost takes one in 256 of the same
+measurements. Upstream named its smoothed per-cycle form `.execution.latency`; RustEE does not use
+that name, at the user's direction, because the meter is not the time from ingest to a CPU.
+
+**throughput** ([`ExecutionFlow`](euhedral-core/src/control_plane/fragment.rs), private): a worker's
+smoothed rate of frames run (frames/s), from a `FlowRecorder` of the frames of each productive
+cycle. The throughput summary samples it at the end of each batch; a second recorder of each
+cycle's mean body time gives the service-time flow.
 
 **FlowStats** ([`FlowStats`](euhedral-core/src/metrics/flow.rs)): a `FlowRecorder`'s average,
 standard deviation, trend and recent minimum and maximum, which a worker publishes through a
