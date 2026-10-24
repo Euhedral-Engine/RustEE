@@ -419,11 +419,12 @@ impl Frame for Blocking {
 }
 
 /// Counts itself when run; with `stream`, also checks that the frames of its id run one at a
-/// time and in sequence.
+/// time and in sequence, and records the CPUs they ran on. Without, it works `work` first.
 struct Counted {
     header: FrameHeader,
     seq: u64,
     stream: Option<Arc<Stream>>,
+    work: Duration,
     done: Arc<AtomicU64>,
 }
 
@@ -432,6 +433,7 @@ struct Stream {
     running: AtomicBool,
     next: AtomicU64,
     faults: AtomicU64,
+    cpus: Mutex<Vec<Option<usize>>>,
 }
 
 impl Frame for Counted {
@@ -456,6 +458,16 @@ impl Frame for Counted {
             }
             stream.next.store(self.seq + 1, Ordering::Release);
             stream.running.store(false, Ordering::Release);
+            let cpu = affinity::current_cpu();
+            let mut cpus = stream.cpus.lock().unwrap();
+            if !cpus.contains(&cpu) {
+                cpus.push(cpu);
+            }
+        } else {
+            let spin = Instant::now();
+            while spin.elapsed() < self.work {
+                std::hint::spin_loop();
+            }
         }
         self.done.fetch_add(1, Ordering::AcqRel);
         Ok(())
@@ -518,6 +530,7 @@ fn a_polling_lattice_runs_the_frames_queued_behind_one_that_blocks() {
             header,
             seq,
             stream: None,
+            work: Duration::ZERO,
             done: done.clone(),
         }));
     }
@@ -535,7 +548,7 @@ fn a_polling_lattice_runs_the_frames_queued_behind_one_that_blocks() {
 }
 
 #[test]
-fn a_polling_lattice_runs_ordered_streams_one_frame_at_a_time_in_order() {
+fn a_polling_lattice_runs_ordered_frames_on_their_own_cpu_in_sequence_while_others_steal() {
     let Some((_, cpus)) = SMT_CORE.as_ref() else {
         return;
     };
@@ -543,8 +556,8 @@ fn a_polling_lattice_runs_ordered_streams_one_frame_at_a_time_in_order() {
     let Some((lattice, source)) = running_lattice(polling(), cpus) else {
         return;
     };
-    // An even id for the core's first worker, an odd one for its SMT buddy, with unordered frames
-    // between them that either worker may steal.
+    // An even id belongs to the core's first CPU, an odd one to its SMT buddy. Between them come
+    // unordered frames of 20 us that keep both workers stealing from each other.
     let streams = [Arc::new(Stream::default()), Arc::new(Stream::default())];
     let done = Arc::new(AtomicU64::new(0));
     let per_stream = 2000;
@@ -554,24 +567,37 @@ fn a_polling_lattice_runs_ordered_streams_one_frame_at_a_time_in_order() {
                 header: FrameHeader::new(id),
                 seq,
                 stream: Some(stream.clone()),
+                work: Duration::ZERO,
                 done: done.clone(),
             }));
         }
-        let mut header = FrameHeader::new(0x50);
-        header.randomize_hash(seq + 1);
-        source.accept(Box::new(Counted {
-            header,
-            seq,
-            stream: None,
-            done: done.clone(),
-        }));
+        for k in 0..2 {
+            let mut header = FrameHeader::new(0x50);
+            header.randomize_hash(2 * seq + k + 1);
+            source.accept(Box::new(Counted {
+                header,
+                seq,
+                stream: None,
+                work: Duration::from_micros(20),
+                done: done.clone(),
+            }));
+        }
     }
     wait_until("every frame to run", || {
-        done.load(Ordering::Acquire) == 3 * per_stream
+        done.load(Ordering::Acquire) == 4 * per_stream
     });
     lattice.close();
-    for stream in &streams {
-        assert_eq!(stream.faults.load(Ordering::Acquire), 0);
+    for (stream, &owner) in streams.iter().zip(cpus) {
+        assert_eq!(
+            stream.faults.load(Ordering::Acquire),
+            0,
+            "out of turn or overlapping"
+        );
         assert_eq!(stream.next.load(Ordering::Acquire), per_stream);
+        assert_eq!(
+            *stream.cpus.lock().unwrap(),
+            [Some(owner)],
+            "ran off its owner's CPU"
+        );
     }
 }
