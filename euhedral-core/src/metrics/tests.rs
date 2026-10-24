@@ -228,3 +228,104 @@ fn snapshots_read_while_writers_record() {
         assert_eq!(service_time.buckets.iter().sum::<u64>(), frames);
     }
 }
+
+/// Spins for `execute` in its body and for `finally` in its finalizer.
+struct Spinning {
+    header: crate::frames::FrameHeader,
+    execute: std::time::Duration,
+    finally: std::time::Duration,
+}
+
+fn spin(duration: std::time::Duration) {
+    let start = std::time::Instant::now();
+    while start.elapsed() < duration {
+        std::hint::spin_loop();
+    }
+}
+
+impl crate::frames::Frame for Spinning {
+    fn header(&self) -> &crate::frames::FrameHeader {
+        &self.header
+    }
+
+    fn header_mut(&mut self) -> &mut crate::frames::FrameHeader {
+        &mut self.header
+    }
+
+    fn execute(&mut self) -> Result<(), crate::frames::FrameError> {
+        spin(self.execute);
+        Ok(())
+    }
+
+    fn do_finally(self: Box<Self>) {
+        spin(self.finally);
+    }
+}
+
+fn spinning() -> Box<Spinning> {
+    Box::new(Spinning {
+        header: crate::frames::FrameHeader::new(1),
+        execute: std::time::Duration::from_micros(100),
+        finally: std::time::Duration::from_millis(3),
+    })
+}
+
+#[test]
+fn run_times_execute_alone_on_a_thread_with_a_sink() {
+    use crate::generics::AbstractExecutor;
+    use crate::impls::DefaultExecutor;
+
+    let registry = MetricsRegistry::new();
+    let config = MetricsConfig::default().with_registry(Some(registry));
+    let metrics = ExecutionMetrics::new(&config, 0, 0).unwrap();
+    let executor = DefaultExecutor::new();
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                // Without a sink nothing is timed.
+                executor.run(spinning());
+                assert_eq!(metrics.service_time_totals().0, 0);
+                {
+                    let _sink = ServiceTimeSink::install(metrics.clone());
+                    executor.run(spinning());
+                    executor.run(spinning());
+                    // A frame that is not alive is not executed, so not timed.
+                    let kill = Arc::new(std::sync::atomic::AtomicBool::new(true));
+                    let mut dead = spinning();
+                    dead.header = crate::frames::FrameHeader::with_kill_switch(2, Some(kill));
+                    executor.run(dead);
+                }
+                executor.run(spinning());
+            })
+            .join()
+            .unwrap();
+    });
+    let snapshot = {
+        let mut meters = Vec::new();
+        metrics.collect(0, &mut meters);
+        meters
+            .into_iter()
+            .find(|meter| meter.name.ends_with(SERVICE_TIME_SUFFIX))
+            .unwrap()
+    };
+    let service_time = snapshot.summary().unwrap();
+    assert_eq!(service_time.count, 2);
+    // 100 µs of execute each; the 3 ms finalizers are not in it.
+    assert!(service_time.sum >= 200_000.0, "{service_time:?}");
+    assert!(service_time.max < 2_000_000.0, "{service_time:?}");
+}
+
+#[test]
+fn time_execute_returns_what_execute_returns() {
+    assert_eq!(time_execute(|| 7), 7);
+    let registry = MetricsRegistry::new();
+    let config = MetricsConfig::default().with_registry(Some(registry));
+    let metrics = ExecutionMetrics::new(&config, 0, 0).unwrap();
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let _sink = ServiceTimeSink::install(metrics.clone());
+            assert_eq!(time_execute(|| "body"), "body");
+        });
+    });
+    assert_eq!(metrics.service_time_totals().0, 1);
+}

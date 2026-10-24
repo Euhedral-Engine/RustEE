@@ -297,17 +297,17 @@ buckets: each octave `[2^e, 2^(e+1))` from `2^-16` to `2^48` split in four. A `H
 gives the mean, percentiles within a bucket's width, and with `since` the values recorded between
 two snapshots.
 
-**service time** ([`timed_output`](euhedral-core/src/control_plane/fragment.rs), private): how long
-a frame's body takes: the executor's run of it, from `execute` to its return and the frame's
-finalizer, timed by the worker as it pushes the frame. With metrics on every body is timed into the
-`.execution.serviceTime` summary; the decision tree's body cost takes one in 256 of the same
-measurements. Upstream named its smoothed per-cycle form `.execution.latency`; RustEE does not use
-that name, at the user's direction, because the meter is not the time from ingest to a CPU.
+**service time** ([`time_execute`](euhedral-core/src/metrics/mod.rs)): how long a frame's `execute`
+takes to return: the body of the work, not `do_finally` and not the time from ingest to a CPU.
+`AbstractExecutor::run` times every `execute` on a metered worker's thread into its
+`.execution.serviceTime` summary; an executor that overrides `run` wraps its `execute` call in
+`time_execute` to opt in. Upstream named a smoothed per-cycle form `.execution.latency`; RustEE does
+not use that name, at the user's direction.
 
 **throughput** ([`ExecutionFlow`](euhedral-core/src/control_plane/fragment.rs), private): a worker's
 smoothed rate of frames run (frames/s), from a `FlowRecorder` of the frames of each productive
 cycle. The throughput summary samples it at the end of each batch; a second recorder of each
-cycle's mean body time gives the service-time flow.
+cycle's mean `execute` time gives the service-time flow.
 
 **FlowStats** ([`FlowStats`](euhedral-core/src/metrics/flow.rs)): a `FlowRecorder`'s average,
 standard deviation, trend and recent minimum and maximum, which a worker publishes through a

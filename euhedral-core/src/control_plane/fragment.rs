@@ -4,7 +4,9 @@ use crate::config::{CloneConfig, CloneLivenessRegistry, FragmentConfig};
 use crate::flow_control::{LatticeEdge, LatticeHotSource, UpstreamQueue, UpstreamRegistry};
 use crate::frames::Frame;
 use crate::generics::{CloneableObject, LatticeSource};
-use crate::metrics::{ExecutionMetrics, FlowStats, Meter, MeterSource, MetricsRegistry};
+use crate::metrics::{
+    ExecutionMetrics, FlowStats, Meter, MeterSource, MetricsRegistry, ServiceTimeSink,
+};
 use crate::utils::{FlowContext, FlowRecorder, StopWatch};
 use euhedral_data_structures::atomics::CachePadded;
 use euhedral_hardware_utils::affinity::{self, ExecutorError, PinnedThreadExecutor};
@@ -152,7 +154,7 @@ impl ControlPlaneFragment {
         }
         let body_cost = Arc::new(BodyCost::new());
         let metrics = ExecutionMetrics::new(config.metrics(), clone.core_id(), cpu);
-        let output = Arc::new(timed_output(body_cost.clone(), metrics.clone()));
+        let output = Arc::new(timed_output(body_cost.clone()));
         let initial_cap = initial_batch_cap(config, &cache);
         let fragment = Arc::new_cyclic(|this| Self {
             name,
@@ -311,6 +313,8 @@ impl ControlPlaneFragment {
             DecisionTree::calibrated(self.config.idle_policy().clone(), self.body_cost.clone());
         let mut cycle = Cycle::new(self.cpu.wrapping_add(1), self.execution_metrics());
         FlowContext::initialize();
+        // The executors this worker pushes to time each frame's execute into its summary.
+        let _service_time = self.metrics.clone().map(ServiceTimeSink::install);
         self.initialized.store(true, Ordering::Release);
         while self.running.load(Ordering::Acquire) && !affinity::is_interrupted() {
             self.run_cycle(&mut policy, &mut cycle);
@@ -705,61 +709,17 @@ fn initial_batch_cap(config: &FragmentConfig, cache: &ControlPlaneCache) -> u64 
         .max(2)
 }
 
-/// An output that times the bodies of the frames it pushes: the executor's run of each, from
-/// `execute` to its return and the frame's finalizer. Without `metrics` it times one body in
-/// [`StopWatch::DEFAULT_INTERVAL`] into `body_cost`; with them it times every body into the
-/// service-time summary and gives `body_cost` the same sample of those measurements.
-fn timed_output(
-    body_cost: Arc<BodyCost>,
-    metrics: Option<Arc<CachePadded<ExecutionMetrics>>>,
-) -> LatticeHotSource {
-    let Some(metrics) = metrics else {
-        let watch = Arc::new(Mutex::new(StopWatch::new()));
-        let started = watch.clone();
-        return LatticeHotSource::new()
-            .before_each(move |_| lock(&started).start())
-            .after_each(move || {
-                if let Some(elapsed) = lock(&watch).stop() {
-                    body_cost.record(elapsed);
-                }
-            });
-    };
-    let timer = Arc::new(Mutex::new(BodyTimer::default()));
-    let started = timer.clone();
+/// An output that times a sample of the frame bodies it pushes into `body_cost`.
+fn timed_output(body_cost: Arc<BodyCost>) -> LatticeHotSource {
+    let watch = Arc::new(Mutex::new(StopWatch::new()));
+    let started = watch.clone();
     LatticeHotSource::new()
         .before_each(move |_| lock(&started).start())
         .after_each(move || {
-            let Some((elapsed, sampled)) = lock(&timer).stop() else {
-                return;
-            };
-            metrics.record_service_time(elapsed);
-            if sampled {
+            if let Some(elapsed) = lock(&watch).stop() {
                 body_cost.record(elapsed);
             }
         })
-}
-
-/// Times every body, and marks one in [`StopWatch::DEFAULT_INTERVAL`] as the body cost's sample.
-#[derive(Default)]
-struct BodyTimer {
-    started: Option<Instant>,
-    bodies: u64,
-}
-
-impl BodyTimer {
-    fn start(&mut self) {
-        if self.started.is_none() {
-            self.started = Some(Instant::now());
-        }
-    }
-
-    /// The time since the matching start, and whether it is the body cost's sample.
-    fn stop(&mut self) -> Option<(Duration, bool)> {
-        let started = self.started.take()?;
-        let sampled = self.bodies % StopWatch::DEFAULT_INTERVAL == 0;
-        self.bodies = self.bodies.wrapping_add(1);
-        Some((started.elapsed(), sampled))
-    }
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -828,7 +788,7 @@ impl Cycle {
 /// flow meters after each productive cycle, and its throughput summary samples the rate at the end
 /// of each batch. A reset of the worker starts them over.
 struct ExecutionFlow {
-    /// The mean body time, in nanoseconds, of each productive cycle's frames.
+    /// The mean time, in nanoseconds, each productive cycle's frames took in `execute`.
     service_time: FlowRecorder,
     /// Frames of each productive cycle, whose rate is the throughput.
     throughput: FlowRecorder,
@@ -845,7 +805,7 @@ impl ExecutionFlow {
         }
     }
 
-    /// Records a productive cycle that ended at `now`, its frames' bodies timed in `metrics`.
+    /// Records a productive cycle that ended at `now`, its frames' `execute` timed in `metrics`.
     fn record(&mut self, now: Instant, run: &Run, metrics: &ExecutionMetrics) {
         let (count, sum) = metrics.service_time_totals();
         let (bodies, nanos) = (count - self.timed.0, sum - self.timed.1);

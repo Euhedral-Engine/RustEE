@@ -1,6 +1,7 @@
 use super::{CloneableObject, LatticeReceiver, LatticeSource, LatticeTerminal};
 use crate::config::CloneConfig;
 use crate::frames::{Failure, Frame, FrameError};
+use crate::metrics::time_execute;
 use std::any::Any;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
@@ -34,12 +35,19 @@ pub trait AbstractExecutor: Sized + Send + Sync + 'static {
     ///   [`do_finally_with_error`](Frame::do_finally_with_error).
     ///
     /// A finalizer that panics is logged; the frame it held is gone.
+    ///
+    /// On a lattice worker with metrics, `execute` is timed into the worker's
+    /// `.execution.serviceTime` summary ([`time_execute`]); the finalizer is not. An executor that
+    /// overrides `run` opts in by wrapping its call to [`execute`](Self::execute) in
+    /// [`time_execute`].
     fn run(&self, mut frame: Box<dyn Frame>) {
         if !frame.is_alive() {
             finalize(|| frame.do_finally());
             return;
         }
-        match catch_unwind(AssertUnwindSafe(|| self.execute(&mut *frame))) {
+        match catch_unwind(AssertUnwindSafe(|| {
+            time_execute(|| self.execute(&mut *frame))
+        })) {
             Ok(Ok(())) | Ok(Err(FrameError::Cancelled)) => finalize(|| frame.do_finally()),
             Ok(Err(error)) => {
                 log::error!("Uncaught error while executing frame: {error}");

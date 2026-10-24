@@ -8,7 +8,7 @@ use crate::flow_control::{LatticeHotSource, LatticeNode, UpstreamRegistry};
 use crate::frames::{Frame, FrameError, FrameHeader};
 use crate::impls::DefaultExecutor;
 use crate::ingest::{ArrayIngestSink, IngestSink};
-use crate::metrics::MetricsRegistry;
+use crate::metrics::{HistogramSnapshot, MetricsRegistry};
 use euhedral_hardware_utils::affinity;
 use euhedral_hardware_utils::monitor::{HardwareUtilization, HardwareUtilizationParts};
 use euhedral_hardware_utils::topology::Topology;
@@ -755,6 +755,78 @@ fn a_metered_lattice_reports_every_workers_meters_until_closed() {
     lattice.close();
     assert!(registry.is_empty());
     assert!(lattice.metrics().unwrap().meters().is_empty());
+}
+
+/// Spins for `execute` in its body and for `finally` in its finalizer.
+struct SlowFinalizer {
+    header: FrameHeader,
+    execute: Duration,
+    finally: Duration,
+    done: Arc<AtomicU64>,
+}
+
+fn spin(duration: Duration) {
+    let start = Instant::now();
+    while start.elapsed() < duration {
+        std::hint::spin_loop();
+    }
+}
+
+impl Frame for SlowFinalizer {
+    fn header(&self) -> &FrameHeader {
+        &self.header
+    }
+
+    fn header_mut(&mut self) -> &mut FrameHeader {
+        &mut self.header
+    }
+
+    fn execute(&mut self) -> Result<(), FrameError> {
+        spin(self.execute);
+        Ok(())
+    }
+
+    fn do_finally(self: Box<Self>) {
+        spin(self.finally);
+        self.done.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+#[test]
+fn the_service_time_is_execute_alone_not_the_finalizer() {
+    let Some((_, cpus)) = SMT_CORE.as_ref() else {
+        return;
+    };
+    let _turn = pinned_turn();
+    let registry = MetricsRegistry::new();
+    let fragment = FragmentConfig::default().with_metrics("body", registry.clone());
+    let Some((lattice, source)) = running_lattice(fragment, &cpus[..2]) else {
+        return;
+    };
+    let done = Arc::new(AtomicU64::new(0));
+    for seq in 0..20 {
+        let mut header = FrameHeader::new(0x40);
+        header.randomize_hash(seq + 1);
+        source.accept(Box::new(SlowFinalizer {
+            header,
+            execute: Duration::from_micros(50),
+            finally: Duration::from_millis(2),
+            done: done.clone(),
+        }));
+    }
+    wait_until("every frame to finish", || {
+        done.load(Ordering::Acquire) == 20
+    });
+    let snapshot = lattice.metrics().unwrap();
+    let mut service_time = HistogramSnapshot::empty();
+    for meter in snapshot.service_time_summaries() {
+        service_time.merge(meter.summary().unwrap());
+    }
+    assert_eq!(service_time.count, 20);
+    // Each execute spun 50 µs; the 2 ms finalizers are not in it.
+    assert!(service_time.sum / 20.0 >= 50_000.0, "{service_time:?}");
+    assert!(service_time.max < 1_000_000.0, "{service_time:?}");
+    lattice.close();
 }
 
 /// The median of `samples`.

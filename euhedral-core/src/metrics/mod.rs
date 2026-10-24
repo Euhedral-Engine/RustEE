@@ -13,8 +13,8 @@
 //!
 //! | Name | Kind | What |
 //! |---|---|---|
-//! | `.execution.serviceTime` | summary, ns | each frame's body: the executor's run of it, from `execute` to its return and finalizer |
-//! | `.execution.serviceTime.flow` | flow, ns | the current smoothed service time per frame of the worker's cycles |
+//! | `.execution.serviceTime` | summary, ns | each frame's body: how long its `execute` took to return (not `do_finally`) |
+//! | `.execution.serviceTime.flow` | flow, ns | the current smoothed mean `execute` time of the worker's cycles |
 //! | `.execution.throughput` | summary, frames/s | each batch's smoothed rate of frames run |
 //! | `.execution.throughput.flow` | flow, frames/s | the current smoothed rate of frames run |
 //! | `.execution.inProgress` | gauge | 1 while the worker runs frames, else 0 |
@@ -23,13 +23,14 @@
 //! | `.cache.capFactor` | summary | the cache's cap factor at each utilization update, in `[0.15, 1]` |
 //!
 //! Upstream's `.execution.latency` was a batch-end sample of a smoothed per-cycle service time;
-//! RustEE replaces it with `.execution.serviceTime`, every frame's own body time, so its
-//! percentiles are those of the frames. The worker times each frame it pushes to its executor with
-//! the clock reads it already makes for its decision tree's body cost, on every frame instead of
-//! one in 256 while metrics are on.
+//! RustEE replaces it with `.execution.serviceTime`, how long every frame's `execute` took
+//! to return (not its `do_finally`), so its
+//! percentiles are those of the frames. [`AbstractExecutor::run`](crate::generics::AbstractExecutor::run)
+//! times each `execute` call ([`time_execute`]) when the worker running it has metrics; the
+//! finalizer is not timed, and nothing is timed without metrics.
 //!
 //! Each worker keeps two [`FlowRecorder`](crate::utils::FlowRecorder)s in its own cycle state (as
-//! upstream's `CycleState` does): one of the mean body time of each productive cycle's frames, one
+//! upstream's `CycleState` does): one of the mean `execute` time of each productive cycle's frames, one
 //! of the frames each ran, whose rate is the throughput. At the end of each productive cycle the
 //! worker publishes their averages, deviations, trends and recent extremes as [`FlowStats`] (the
 //! `.flow` meters), and at the end of each batch it records the rate in the throughput summary,
@@ -73,9 +74,10 @@ pub use registry::{Meter, MeterValue, MetricsRegistry, MetricsSnapshot};
 pub(crate) use registry::MeterSource;
 
 use euhedral_data_structures::atomics::CachePadded;
+use std::cell::RefCell;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 /// The prefix of every metric name when none is configured.
 pub const DEFAULT_PREFIX: &str = "euhedral";
@@ -90,7 +92,7 @@ pub const CACHE_BACKLOG_SUFFIX: &str = ".cache.backlog";
 pub const CAP_FACTOR_SUFFIX: &str = ".cache.capFactor";
 
 pub const IN_PROGRESS_SUFFIX: &str = ".execution.inProgress";
-/// Each frame's body time, in nanoseconds: a summary. RustEE's replacement for upstream's
+/// How long each frame's `execute` took, in nanoseconds: a summary. RustEE's replacement for upstream's
 /// `.execution.latency`.
 pub const SERVICE_TIME_SUFFIX: &str = ".execution.serviceTime";
 /// A worker's current service time per frame, in nanoseconds: the [`FlowStats`] of its
@@ -122,6 +124,66 @@ fn resolve_prefix(prefix: &str) -> &str {
 }
 
 const NANOS_PER_SECOND: f64 = 1_000_000_000.0;
+
+/// Whether any worker has installed a [`ServiceTimeSink`]: until one has, [`time_execute`] only
+/// calls `execute`.
+static SINKS_INSTALLED: AtomicBool = AtomicBool::new(false);
+
+thread_local! {
+    /// The meters of the lattice worker on this thread, while it runs with metrics.
+    static SINK: RefCell<Option<Arc<CachePadded<ExecutionMetrics>>>> = const { RefCell::new(None) };
+}
+
+/// Runs `execute`, a frame's [`execute`](crate::generics::AbstractExecutor::execute) call, and on a
+/// lattice worker with metrics records how long it took to return in the worker's
+/// `.execution.serviceTime` summary. Elsewhere, or without metrics, it just runs `execute`.
+///
+/// [`AbstractExecutor::run`](crate::generics::AbstractExecutor::run) calls it; an executor that
+/// overrides `run` calls it around its own call to `execute` to opt in, and around nothing else:
+/// the service time is the body of the work, not the frame's finalizer. An `execute` that panics
+/// is not recorded.
+///
+/// ```
+/// use euhedral_core::frames::{Frame, FrameError};
+/// use euhedral_core::metrics::time_execute;
+///
+/// fn run_body(frame: &mut dyn Frame) -> Result<(), FrameError> {
+///     time_execute(|| frame.execute())
+/// }
+/// ```
+#[inline]
+pub fn time_execute<R>(execute: impl FnOnce() -> R) -> R {
+    if !SINKS_INSTALLED.load(Ordering::Relaxed) {
+        return execute();
+    }
+    SINK.with_borrow(|sink| match sink {
+        None => execute(),
+        Some(metrics) => {
+            let start = Instant::now();
+            let result = execute();
+            metrics.record_service_time(start.elapsed());
+            result
+        }
+    })
+}
+
+/// While held, [`time_execute`] on this thread records into a worker's meters.
+pub(crate) struct ServiceTimeSink(());
+
+impl ServiceTimeSink {
+    /// Makes `metrics` this thread's sink until the guard drops.
+    pub(crate) fn install(metrics: Arc<CachePadded<ExecutionMetrics>>) -> Self {
+        SINKS_INSTALLED.store(true, Ordering::Relaxed);
+        SINK.set(Some(metrics));
+        Self(())
+    }
+}
+
+impl Drop for ServiceTimeSink {
+    fn drop(&mut self) {
+        SINK.set(None);
+    }
+}
 
 /// The metric prefix and registry of a fragment or cache config.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -209,13 +271,13 @@ impl ExecutionMetrics {
         self.frames.fetch_add(frames, Ordering::Relaxed);
     }
 
-    /// Records one frame's body time.
+    /// Records how long one frame's `execute` took.
     #[inline]
     pub(crate) fn record_service_time(&self, elapsed: Duration) {
         self.service_time.record(elapsed.as_nanos() as f64);
     }
 
-    /// The frames whose body time was recorded, and the sum of their times in nanoseconds.
+    /// The frames whose `execute` was timed, and the sum of their times in nanoseconds.
     #[inline]
     pub(crate) fn service_time_totals(&self) -> (u64, f64) {
         self.service_time.totals()

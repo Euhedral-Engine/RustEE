@@ -38,7 +38,7 @@ and routing policy, and lets idle workers steal unordered work.
 | [`config`](src/config/mod.rs) | `LatticeConfig`, `FragmentConfig`, `CacheConfig`, `IdlePolicy` with `FixedTiming` and `IdleTimingFunction` (`TimingProvider`, `TimingModel`), `CloneConfig`, `CloneLivenessRegistry`. |
 | [`flow_control`](src/flow_control/mod.rs) | `RoutingPolicy`; `LatticeEdge` and `LatticeNode`; `LatticeVertex` and its `RoutingState` generations; `UpstreamRegistry`, `UpstreamHandle`, `UpstreamQueue`; `LatticeHotSource`, `LatticeHotReceiver`. |
 | [`impls`](src/impls/mod.rs) | `BaseCloneableObject` (the stock per-core object: a fragment feeding an executor), `DefaultExecutor`, and frame pooling: `FrameManager`, `FrameFactory`, `Recycler`. |
-| [`metrics`](src/metrics/mod.rs) | `MetricsRegistry` and its `MetricsSnapshot` of `Meter`s (`MeterValue`: gauge, counter, summary, flow); `Histogram` and `HistogramSnapshot` (log2 buckets, percentiles); `FlowStats`; the metric names (`metric_name`, `DEFAULT_PREFIX`, the `*_SUFFIX` constants, `CORE_TAG`, `CPU_TAG`). |
+| [`metrics`](src/metrics/mod.rs) | `time_execute` (times an executor's `execute` call); `MetricsRegistry` and its `MetricsSnapshot` of `Meter`s (`MeterValue`: gauge, counter, summary, flow); `Histogram` and `HistogramSnapshot` (log2 buckets, percentiles); `FlowStats`; the metric names (`metric_name`, `DEFAULT_PREFIX`, the `*_SUFFIX` constants, `CORE_TAG`, `CPU_TAG`). |
 | [`utils`](src/utils/mod.rs) | `math`, `spin_wait`, `StopWatch`, `AverageFlow`, `FlowRecorder`, `FlowContext`, `calibration`. |
 
 ## Key concepts
@@ -367,8 +367,8 @@ two SMT workers and their caches each have their own (`HistogramSnapshot::merge`
 
 | Name | Kind | What |
 |---|---|---|
-| `.execution.serviceTime` | summary, ns | each frame's body: the executor's run of it, from `execute` to its return and finalizer |
-| `.execution.serviceTime.flow` | flow, ns | the current smoothed mean body time of the worker's cycles |
+| `.execution.serviceTime` | summary, ns | each frame's body: how long its `execute` took to return (not `do_finally`) |
+| `.execution.serviceTime.flow` | flow, ns | the current smoothed mean `execute` time of the worker's cycles |
 | `.execution.throughput` | summary, frames/s | each batch's smoothed rate of frames run |
 | `.execution.throughput.flow` | flow, frames/s | the current smoothed rate of frames run |
 | `.execution.inProgress` | gauge | 1 while the worker runs frames, else 0 |
@@ -378,12 +378,13 @@ two SMT workers and their caches each have their own (`HistogramSnapshot::merge`
 
 **Service time, not latency.** At the user's direction RustEE departs from upstream here: upstream's
 `.execution.latency` sampled a smoothed per-cycle service time at each batch end; RustEE has no
-`latency` meter, and `.execution.serviceTime` records every frame's own body time, so its
-percentiles are the frames'. It is the body cost the decision tree already timed, read on every
-frame instead of one in 256 while metrics are on. It is not the time from ingest to a CPU.
+`latency` meter, and `.execution.serviceTime` records how long every frame's `execute` took to
+return, so its percentiles are the frames'. It is `execute` only: not `do_finally`, and not the time
+from ingest to a CPU. `AbstractExecutor::run` times it on a metered worker's thread; an executor that
+overrides `run` wraps its `execute` call in `metrics::time_execute` to opt in.
 
 `frames` and the two `.flow` meters are RustEE's own too; the rest are upstream's names. Each
-worker keeps two `FlowRecorder`s (the mean body time and the frames of each productive cycle) and
+worker keeps two `FlowRecorder`s (the mean `execute` time and the frames of each productive cycle) and
 publishes their statistics after each productive cycle; the throughput summary samples the rate at
 each batch end. Summaries are cumulative histograms with log2 buckets, so a snapshot gives means
 and percentiles, and `HistogramSnapshot::since` a window's. Recording takes no lock and allocates

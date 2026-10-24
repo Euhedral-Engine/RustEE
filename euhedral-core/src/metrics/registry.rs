@@ -187,7 +187,7 @@ impl MetricsSnapshot {
             .filter(move |meter| meter.name.ends_with(suffix))
     }
 
-    /// Every fragment's service-time summary: each frame's body time.
+    /// Every fragment's service-time summary: how long each frame's `execute` took.
     pub fn service_time_summaries(&self) -> impl Iterator<Item = &Meter> {
         self.ending_with(super::SERVICE_TIME_SUFFIX)
     }

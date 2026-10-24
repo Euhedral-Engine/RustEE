@@ -16,9 +16,9 @@ port had the raw state (`in_progress`, `cap_factor`, the cache's count) but no w
 
 **Departure from upstream: service time, not latency.** At the user's direction, RustEE has no `.execution.latency`.
 Upstream's was a batch-end sample of a smoothed per-cycle service time (cycle time over frames). RustEE's
-`.execution.serviceTime` summary records every frame's own body time: the executor's run of the frame, from `execute`
-to its return and the frame's finalizer. Its percentiles are the frames'. It is the work's body, not the time a frame
-takes to get from ingest to a CPU.
+`.execution.serviceTime` summary records every frame's own body time: how long its `execute` takes to return. It is
+`execute` only, not `do_finally` or the rest of the frame's lifecycle, and not the time a frame takes to get from
+ingest to a CPU. Its percentiles are the frames'.
 
 **How to use it.**
 ```rust
@@ -39,8 +39,8 @@ let p99 = snapshot.get("app.execution.serviceTime", cpu).and_then(|m| m.summary(
 
 | Meter | Kind | Recorded | Upstream |
 |---|---|---|---|
-| `<prefix>.execution.serviceTime` | summary, ns | every frame, around the worker's push of it to its executor (`timed_output`) | replaces `.execution.latency` (`reportLatency` in `reportMetrics`) |
-| `<prefix>.execution.serviceTime.flow` | flow, ns | after each productive cycle: the `FlowStats` of a recorder of the cycle's mean body time | none |
+| `<prefix>.execution.serviceTime` | summary, ns | every frame, around its `execute` call in `AbstractExecutor::run` (`time_execute`) | replaces `.execution.latency` (`reportLatency` in `reportMetrics`) |
+| `<prefix>.execution.serviceTime.flow` | flow, ns | after each productive cycle: the `FlowStats` of a recorder of the cycle's mean `execute` time | none |
 | `<prefix>.execution.throughput` | summary, frames/s | at each batch end: the frame recorder's rate × 10^9 | `reportThroughput` in `reportMetrics` |
 | `<prefix>.execution.throughput.flow` | flow, frames/s | after each productive cycle: the frame recorder's rate `FlowStats` | none |
 | `<prefix>.execution.inProgress` | gauge | 1 while the worker is inside a cache take, a direct pull or a steal (`timed`) | `executionStarted`/`executionFinished` around `drainLocalCache`, `pullAvailableUpstream`, `stealWork` |
@@ -48,12 +48,15 @@ let p99 = snapshot.get("app.execution.serviceTime", cpu).and_then(|m| m.summary(
 | `<prefix>.cache.backlog` | gauge, frames | read at snapshot: the cache's count | `CacheMetrics` gauge on `TOTAL_COUNT` |
 | `<prefix>.cache.capFactor` | summary | in `ControlPlaneCache::update`, the cap factor it set | `recordCapFactor` in `update` |
 
-- **Body timing.** The worker's output already timed one push in 256 (`StopWatch`) for the decision tree's body cost.
-  With metrics on it times every push instead, with the same clock reads, into the service-time summary, and gives the
-  body cost the first of each 256 as before. Without metrics the output is unchanged.
+- **Execute timing.** `AbstractExecutor::run` wraps its `execute` call in `metrics::time_execute`. A metered worker
+  installs its meters in a thread-local for its loop, so on that thread `time_execute` reads the clock before and
+  after `execute` and records the difference; the finalizer is outside it. A frame that is not alive is not executed,
+  so not timed; an `execute` that panics is not recorded. An executor that overrides `run` opts in by wrapping its own
+  `execute` call in `time_execute`, and nothing else. An executor that runs frames on another thread is not timed.
+  The decision tree's body cost keeps its own sampled timing of the push (one in 256), unchanged.
 - **The recorders** are recorded where upstream's `recordProgress` records them, after each productive cycle and at
-  the cycle's end time: the mean body time of the cycle's frames (from the service-time summary's count and sum, so no
-  further clock read) and the frames run. A worker reset starts them over, as `CycleState.reset()` does; the summaries
+  the cycle's end time: the mean `execute` time of the cycle's frames (from the service-time summary's count and sum,
+  so no further clock read) and the frames run. A worker reset starts them over, as `CycleState.reset()` does; the summaries
   stay cumulative.
 - **Prefix:** `euhedral` unless set; blank means the default, and a trailing `.` is dropped (`metricName`).
 - **Tags, per CPU:** `core` (the clone's core id) and `cpu`. Upstream has only `core`, so a core's two SMT workers
@@ -67,13 +70,15 @@ let p99 = snapshot.get("app.execution.serviceTime", cpu).and_then(|m| m.summary(
 - **Lifecycle:** a fragment or cache registers when built and leaves its registry when closed or dropped (upstream's
   caches never removed their meters).
 - **Cost.** No lock and no allocation on a worker's path; each worker owns its meters on their own cache lines.
-  Without a registry a cycle pays one untaken branch and the output times one body in 256, as before. With one, each
-  frame pays two clock reads and a histogram record, and each productive cycle up to about 30 ns, mostly the two
-  `FlowRecorder` updates (`metrics_cost_per_cycle`, which records no bodies: 15 to 17 ns over 4 to 6 ns off).
+  Without a registry a cycle pays one untaken branch, and each frame's `run` one relaxed load of a process-wide flag
+  (and, once any metered worker has started in the process, a thread-local lookup) before calling `execute`. With
+  one, each frame pays two clock reads and a histogram record, and each productive cycle up to about 30 ns, mostly the
+  two `FlowRecorder` updates (`metrics_cost_per_cycle`, which records no `execute`: 21 to 22 ns over 4 to 8 ns off).
   Measured on an i9-14900K, in release, one SMT core's two workers running empty frames from an array sink
-  (`metrics_overhead_per_frame`, medians of two runs of seven rounds): greedy mode 152 to 154 ns/frame off, 171 to 172
-  on (+17 to +20 ns, +11 to +13%); poll mode, with a cycle per one or two frames, 242 to 245 off, 295 to 299 on (+53 to
-  +54 ns, +22%). The user's frames run for milliseconds, so this is noise for them.
+  (`metrics_overhead_per_frame`, medians of two runs of seven rounds, off and on alternating in one process): greedy
+  mode 156 ns/frame off, 175 to 176 on (+19 to +20 ns, +12 to +13%); poll mode, with a cycle per one or two frames,
+  244 to 246 off, 302 to 303 on (+55 to +59 ns, +22 to +24%). The user's frames run for milliseconds, so this is noise
+  for them.
 - `MetricsAggregator.getInProgressGauges(registry)` matched the latency suffix upstream; `in_progress_gauges` matches
   the in-progress suffix.
 - No exporter: the `metrics` crate facade is push-based, so a bridge would either record through a global recorder on
@@ -87,11 +92,14 @@ let p99 = snapshot.get("app.execution.serviceTime", cpu).and_then(|m| m.summary(
 - `config/*`: the prefix and registry settings and defaults.
 - `control_plane/cache/tests.rs`: no meters without a registry; backlog and cap factor tagged with the core; closing or
   dropping a cache removes its meters.
-- `control_plane/fragment/tests.rs`: with metrics the output times every body and still samples one in 256 for the
-  body cost; no meters without a registry; both SMT workers and caches register, tagged; running workers time every
-  frame and record throughput and flows while a reader snapshots; a cycle counts frames, feeds the service-time flow
-  from the timed bodies and reports throughput at batch ends.
-- `impls/base_cloneable/tests.rs`: a metered lattice reports every worker's meters, every frame timed, until closed.
+- `metrics/tests.rs` also: `run` times `execute` alone on a thread with a sink, not a 3 ms `do_finally` and not a dead
+  frame, and nothing without a sink; `time_execute` returns what `execute` returns.
+- `control_plane/fragment/tests.rs`: no meters without a registry; both SMT workers and caches register, tagged;
+  running workers record frames, throughput and flows while a reader snapshots; a cycle counts frames, feeds the
+  service-time flow from the timed `execute` calls and reports throughput at batch ends.
+- `impls/base_cloneable/tests.rs`: a metered lattice reports every worker's meters, every frame's `execute` timed,
+  until closed; `the_service_time_is_execute_alone_not_the_finalizer`: 50 µs `execute`s with 2 ms finalizers record
+  at least 50 µs each and under 1 ms.
   Ignored measurements: `metrics_cost_per_cycle` (fragment tests) and `metrics_overhead_per_frame`.
 
 ## Greedy, not drain, for holding a partition while its frames run (2026-10-23)
