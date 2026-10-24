@@ -55,6 +55,9 @@ impl Error for FragmentError {}
 /// Each cycle the worker runs cached frames first, then picks a path with its policy: run frames
 /// straight from upstream, stage them in the cache by requesting a batch, or sit the cycle out.
 /// When that finds nothing it steals from the next cache of the lattice, and failing that it parks.
+/// With a max batch of [`FragmentConfig::POLL_MODE_MAX_BATCH`] or less the worker polls its cache
+/// and the caches it steals from instead of draining them, so a frame that blocks holds up nothing
+/// another worker could run ([`ControlPlaneCache::poll`]).
 /// Batches grow and shrink with the frames' service time, within a cap that falls as the CPU's
 /// pressure rises.
 ///
@@ -319,8 +322,15 @@ impl ControlPlaneFragment {
 
         let mut limit = cycle.batch_size.saturating_sub(cycle.completed);
         let mut run = Run::default();
+        let polls = self.config.polls();
         if limit > 0 && !self.cache.is_drained() {
-            let count = self.timed(&mut run, cycle, |output| self.cache.drain(output, limit));
+            let count = self.timed(&mut run, cycle, |output| {
+                if polls {
+                    self.cache.poll(output, limit)
+                } else {
+                    self.cache.drain(output, limit)
+                }
+            });
             limit -= count;
         }
 
@@ -364,7 +374,11 @@ impl ControlPlaneFragment {
             let cursor = cycle.neighbor_cursor;
             cycle.neighbor_cursor = cursor.wrapping_add(1);
             self.timed(&mut run, cycle, |output| {
-                self.cache.work_steal(output, limit, cursor)
+                if polls {
+                    self.cache.work_steal_polled(output, limit, cursor)
+                } else {
+                    self.cache.work_steal(output, limit, cursor)
+                }
             });
         }
 

@@ -362,6 +362,91 @@ fn work_stealing_takes_unordered_frames_and_leaves_ordered_heads() {
     assert!(victim.is_drained());
 }
 
+/// The owner runs the front frame of a one-partition victim on another thread and blocks in it;
+/// returns how many of the frames behind it a polling thief steals meanwhile.
+fn stolen_while_the_owner_runs_a_frame(owner_polls: bool) -> u64 {
+    let directory = directory();
+    let thief = cache_on(&directory, &config(1), 0);
+    let victim = cache_on(&directory, &config(1), 1);
+    victim.push(unordered(0, 5));
+    for id in 1..=3 {
+        victim.push(unordered(id, 5));
+    }
+    let (running_tx, running) = mpsc::channel();
+    let (release, released) = mpsc::channel::<()>();
+    let owner = {
+        let victim = victim.clone();
+        thread::spawn(move || {
+            let blocking = |_frame: Box<dyn Frame>| {
+                running_tx.send(()).unwrap();
+                released.recv().unwrap();
+            };
+            if owner_polls {
+                victim.poll(blocking, 1)
+            } else {
+                victim.drain(blocking, 1)
+            }
+        })
+    };
+    running.recv().unwrap();
+    let mut stolen = Vec::new();
+    let count = thief.work_steal_polled(|frame| stolen.push(frame), 10, victim.cpu());
+    release.send(()).unwrap();
+    assert_eq!(owner.join().unwrap(), 1);
+    count
+}
+
+#[test]
+fn a_poll_frees_the_partition_while_its_frame_runs() {
+    assert_eq!(stolen_while_the_owner_runs_a_frame(true), 3);
+}
+
+#[test]
+fn a_drain_holds_the_partition_while_its_frames_run() {
+    assert_eq!(stolen_while_the_owner_runs_a_frame(false), 0);
+}
+
+#[test]
+fn polls_take_one_frame_at_a_time_in_order_and_leave_ordered_heads_to_the_owner() {
+    let directory = directory();
+    let thief = cache_on(&directory, &config(1), 0);
+    let victim = cache_on(&directory, &config(1), 1);
+    victim.push(unordered(1, 5));
+    victim.push(ordered(2));
+    victim.push(unordered(3, 7));
+
+    let mut stolen = Vec::new();
+    assert_eq!(
+        thief.work_steal_polled(|frame| stolen.push(frame), 10, victim.cpu()),
+        1
+    );
+    assert_eq!(ids(&stolen), [1]);
+
+    let mut owner = Vec::new();
+    assert_eq!(victim.poll(|frame| owner.push(frame), 1), 1);
+    assert_eq!(ids(&owner), [2]);
+    assert_eq!(victim.local_cache_count(), 1);
+    assert_eq!(victim.poll(|frame| owner.push(frame), 10), 1);
+    assert_eq!(ids(&owner), [2, 3]);
+    assert!(victim.is_drained());
+    assert_eq!(victim.poll(|_| panic!("nothing left"), 10), 0);
+}
+
+#[test]
+fn polls_walk_every_partition() {
+    let cache = cache(4);
+    for id in 0..8 {
+        cache.push(unordered(id, id + 100));
+    }
+    let mut taken = Vec::new();
+    assert_eq!(cache.poll(|frame| taken.push(frame), 2), 2);
+    assert_eq!(cache.poll(|frame| taken.push(frame), 10), 6);
+    let mut ids = ids(&taken);
+    ids.sort_unstable();
+    assert_eq!(ids, (0..8).collect::<Vec<_>>());
+    assert!(cache.is_drained());
+}
+
 #[test]
 fn work_stealing_finds_nothing_at_an_empty_slot_or_when_off() {
     let directory = directory();

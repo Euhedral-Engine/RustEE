@@ -92,12 +92,14 @@ impl CacheDirectory {
 /// queues the frames pushed to it, and [`pull`](Self::pull) fills it through the edges above.
 /// [`request`](Self::request) asks the calling worker's upstreams for a batch sized to the cache's
 /// capacity, which shrinks under CPU pressure. The owner takes frames out with
-/// [`drain`](Self::drain).
+/// [`drain`](Self::drain), or one at a time with [`poll`](Self::poll).
 ///
 /// The queue is split into partitions by routing hash, so frames of one ordered stream stay in one
 /// partition, in order. With work stealing on, other caches of the lattice may take a partition's
 /// unordered frames from the front with [`work_steal`](Self::work_steal); a partition is held by one
-/// consumer at a time, and the others pass it over.
+/// consumer at a time, and the others pass it over. A drain holds a partition while it runs the
+/// frames it takes, so it drains without touching the producer side; a poll holds it only while it
+/// takes a frame out, so a frame that blocks leaves the unordered frames behind it to stealers.
 ///
 /// With SMT, the two hardware threads of a core each run a cache, and the first takes the core's
 /// frames for both: [`pair_with`](Self::pair_with) sends those with an odd routing hash to the
@@ -125,6 +127,8 @@ pub struct ControlPlaneCache {
     socket_count: u64,
     /// Frames queued, give or take those in flight; may dip below zero for a moment.
     count: AtomicI64,
+    /// The partition the next poll starts its walk at.
+    poll_cursor: AtomicU64,
     cap_factor: AtomicU64,
     retired: AtomicBool,
     primed: AtomicBool,
@@ -186,6 +190,7 @@ impl ControlPlaneCache {
                 pull_multiplier,
                 socket_count: topology.socket_count().max(1) as u64,
                 count: AtomicI64::new(0),
+                poll_cursor: AtomicU64::new(0),
                 cap_factor: AtomicU64::new(1.0f64.to_bits()),
                 retired: AtomicBool::new(false),
                 primed: AtomicBool::new(false),
@@ -421,6 +426,54 @@ impl ControlPlaneCache {
         }
     }
 
+    /// Moves up to `limit` frames into `consume` one at a time and returns how many, holding a
+    /// partition only while it takes a frame out: while `consume` runs a frame, its partition is
+    /// free, so another worker may steal the unordered frames queued behind it. For workers whose
+    /// frames may block ([`FragmentConfig::polls`](crate::config::FragmentConfig::polls)); a drain
+    /// is cheaper when frames are short.
+    ///
+    /// Ordered frames keep their order: only the cache's owner takes them (stealers stop at an
+    /// ordered head, and an SMT buddy drains its own cache), and it runs them one after another.
+    pub fn poll(&self, consume: impl FnMut(Box<dyn Frame>), limit: u64) -> u64 {
+        self.poll_while(consume, |_| false, limit)
+    }
+
+    /// Like [`poll`](Self::poll), but leaves each partition at its first frame `stop` matches.
+    ///
+    /// The walk starts one partition further on each call, so a busy partition does not starve the
+    /// others.
+    pub fn poll_while(
+        &self,
+        mut consume: impl FnMut(Box<dyn Frame>),
+        mut stop: impl FnMut(&dyn Frame) -> bool,
+        limit: u64,
+    ) -> u64 {
+        if limit == 0 || self.count.load(Ordering::Acquire) <= 0 {
+            return 0;
+        }
+        let partitions = self.partitions.len();
+        let start = self.poll_cursor.fetch_add(1, Ordering::Relaxed) as usize;
+        let mut taken = 0;
+        loop {
+            let walk_start = taken;
+            for step in 0..partitions {
+                if taken >= limit {
+                    return taken;
+                }
+                let partition = &self.partitions[(start + step) % partitions];
+                let Some(frame) = take_one(partition, &mut stop) else {
+                    continue;
+                };
+                self.count.fetch_sub(1, Ordering::AcqRel);
+                taken += 1;
+                consume(frame);
+            }
+            if taken == walk_start {
+                return taken;
+            }
+        }
+    }
+
     /// Takes up to `limit` unordered frames from the front of the partitions of the cache at
     /// `cursor` in the lattice's work stealing, which wraps over the CPUs. Nothing without work
     /// stealing.
@@ -435,6 +488,23 @@ impl ControlPlaneCache {
         }
         match self.directory.cache_at(cursor) {
             Some(target) => target.drain_while(consume, |frame| frame.header().is_ordered(), limit),
+            None => 0,
+        }
+    }
+
+    /// Like [`work_steal`](Self::work_steal), but polls the victim ([`poll`](Self::poll)): a
+    /// stolen frame that blocks does not hold up the victim's partition.
+    pub fn work_steal_polled(
+        &self,
+        consume: impl FnMut(Box<dyn Frame>),
+        limit: u64,
+        cursor: usize,
+    ) -> u64 {
+        if !self.config.work_steal() {
+            return 0;
+        }
+        match self.directory.cache_at(cursor) {
+            Some(target) => target.poll_while(consume, |frame| frame.header().is_ordered(), limit),
             None => 0,
         }
     }
@@ -549,6 +619,19 @@ fn try_hold(partition: &Mutex<Partition>) -> Option<MutexGuard<'_, Partition>> {
         Err(TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
         Err(TryLockError::WouldBlock) => None,
     }
+}
+
+/// The partition's front frame, unless another consumer holds the partition or `stop` matches the
+/// frame; the hold ends before the frame is returned.
+fn take_one(
+    partition: &Mutex<Partition>,
+    stop: &mut impl FnMut(&dyn Frame) -> bool,
+) -> Option<Box<dyn Frame>> {
+    let mut partition = try_hold(partition)?;
+    if partition.peek().is_some_and(|frame| stop(&**frame)) {
+        return None;
+    }
+    partition.poll()
 }
 
 fn hold(partition: &Mutex<Partition>) -> MutexGuard<'_, Partition> {

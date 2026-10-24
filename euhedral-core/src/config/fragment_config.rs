@@ -41,6 +41,19 @@ impl FragmentConfig {
         }
     }
 
+    /// The max batch at or below which workers poll their caches instead of draining them
+    /// ([`polls`](Self::polls)).
+    pub const POLL_MODE_MAX_BATCH: u64 = 2;
+
+    /// Whether the workers poll their caches, taking frames one at a time and holding a partition
+    /// only while they take a frame out ([`ControlPlaneCache::poll`](crate::control_plane::ControlPlaneCache::poll)):
+    /// with a max batch of [`POLL_MODE_MAX_BATCH`](Self::POLL_MODE_MAX_BATCH) or less, for frames
+    /// that may block. A blocking frame then holds up no frame queued behind it that another worker
+    /// could run.
+    pub fn polls(&self) -> bool {
+        self.max_batch_size.get() <= Self::POLL_MODE_MAX_BATCH
+    }
+
     /// The largest batch a worker grows to; its cache's capacity and the CPU's pressure may cap it
     /// lower.
     pub fn max_batch_size(&self) -> NonZeroU64 {
@@ -95,6 +108,16 @@ mod tests {
             config.idle_policy().idle_park(),
             IdlePolicy::DEFAULT_IDLE_PARK
         );
+    }
+
+    #[test]
+    fn workers_poll_at_a_max_batch_of_two_or_less() {
+        let with =
+            |batch| FragmentConfig::default().with_max_batch_size(NonZeroU64::new(batch).unwrap());
+        assert!(!FragmentConfig::default().polls());
+        assert!(with(1).polls());
+        assert!(with(2).polls());
+        assert!(!with(3).polls());
     }
 
     #[test]

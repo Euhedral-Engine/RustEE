@@ -1,18 +1,22 @@
 use super::*;
+use crate::config::FragmentConfig;
 use crate::config::{CacheConfig, LatticeConfig};
 use crate::control_plane::testing::{PATIENCE, SINGLE_CORE, SMT_CORE, pinned_turn, wait_until};
 use crate::control_plane::{CacheDirectory, ControlPlaneLattice};
 use crate::flow_control::testing::{Fate, Fates, Tracked, frame};
 use crate::flow_control::{LatticeHotSource, LatticeNode, UpstreamRegistry};
-use crate::frames::{Frame, FrameError};
+use crate::frames::{Frame, FrameError, FrameHeader};
+use crate::impls::DefaultExecutor;
 use euhedral_hardware_utils::affinity;
 use euhedral_hardware_utils::monitor::{HardwareUtilization, HardwareUtilizationParts};
 use euhedral_hardware_utils::topology::Topology;
 use euhedral_hardware_utils::util::CpuSet;
+use std::num::NonZeroU64;
 use std::panic::AssertUnwindSafe;
 use std::sync::Mutex;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
+use std::time::{Duration, Instant};
 
 /// The executor's CPU, the CPU that ran the frame, and the frame.
 type Run = (Option<usize>, Option<usize>, u64);
@@ -386,4 +390,188 @@ fn a_default_lattice_runs_frames_end_to_end() {
             .all(|(executor, ran_on, _)| executor == ran_on && cpus.contains(&ran_on.unwrap()))
     );
     lattice.close();
+}
+
+/// Waits in `execute` until released (or 2 s pass), like a frame whose source stalls.
+struct Blocking {
+    header: FrameHeader,
+    started: Arc<AtomicBool>,
+    release: Arc<AtomicBool>,
+}
+
+impl Frame for Blocking {
+    fn header(&self) -> &FrameHeader {
+        &self.header
+    }
+
+    fn header_mut(&mut self) -> &mut FrameHeader {
+        &mut self.header
+    }
+
+    fn execute(&mut self) -> Result<(), FrameError> {
+        self.started.store(true, Ordering::Release);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !self.release.load(Ordering::Acquire) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        Ok(())
+    }
+}
+
+/// Counts itself when run; with `stream`, also checks that the frames of its id run one at a
+/// time and in sequence.
+struct Counted {
+    header: FrameHeader,
+    seq: u64,
+    stream: Option<Arc<Stream>>,
+    done: Arc<AtomicU64>,
+}
+
+#[derive(Default)]
+struct Stream {
+    running: AtomicBool,
+    next: AtomicU64,
+    faults: AtomicU64,
+}
+
+impl Frame for Counted {
+    fn header(&self) -> &FrameHeader {
+        &self.header
+    }
+
+    fn header_mut(&mut self) -> &mut FrameHeader {
+        &mut self.header
+    }
+
+    fn execute(&mut self) -> Result<(), FrameError> {
+        if let Some(stream) = &self.stream {
+            let overlapped = stream.running.swap(true, Ordering::AcqRel);
+            let in_turn = stream.next.load(Ordering::Acquire) == self.seq;
+            let spin = Instant::now();
+            while spin.elapsed() < Duration::from_micros(5) {
+                std::hint::spin_loop();
+            }
+            if overlapped || !in_turn {
+                stream.faults.fetch_add(1, Ordering::AcqRel);
+            }
+            stream.next.store(self.seq + 1, Ordering::Release);
+            stream.running.store(false, Ordering::Release);
+        }
+        self.done.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+}
+
+/// A started lattice of `fragment` workers on `cpus` and its source, or `None` if no worker started.
+fn running_lattice(
+    fragment: FragmentConfig,
+    cpus: &[usize],
+) -> Option<(Arc<ControlPlaneLattice>, Arc<LatticeHotSource>)> {
+    let mut config = LatticeConfig::new(Arc::new(BaseCloneableObject::new(
+        fragment,
+        DefaultExecutor::new(),
+    )));
+    config.name = "poll-mode".into();
+    config.allowed_cpus = cpus.iter().copied().collect();
+    config.startup_timeout = PATIENCE;
+    config.shutdown_timeout = PATIENCE;
+    let lattice = ControlPlaneLattice::new(config).unwrap();
+    let source = Arc::new(LatticeHotSource::new());
+    lattice.add_upstream(source.clone()).unwrap();
+    if lattice.active_workers() == 0 {
+        lattice.close();
+        return None;
+    }
+    Some((lattice, source))
+}
+
+fn polling() -> FragmentConfig {
+    FragmentConfig::default()
+        .with_max_batch_size(NonZeroU64::new(FragmentConfig::POLL_MODE_MAX_BATCH).unwrap())
+}
+
+#[test]
+fn a_polling_lattice_runs_the_frames_queued_behind_one_that_blocks() {
+    let Some((_, cpus)) = SMT_CORE.as_ref() else {
+        return;
+    };
+    let _turn = pinned_turn();
+    let Some((lattice, source)) = running_lattice(polling(), cpus) else {
+        return;
+    };
+    let started = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    // Ordered with an even hash: the core's first worker takes it and blocks.
+    source.accept(Box::new(Blocking {
+        header: FrameHeader::new(0x10),
+        started: started.clone(),
+        release: release.clone(),
+    }));
+    wait_until("the blocker to start", || started.load(Ordering::Acquire));
+
+    let done = Arc::new(AtomicU64::new(0));
+    let sent = Instant::now();
+    for seq in 0..512 {
+        let mut header = FrameHeader::new(0x20);
+        header.randomize_hash(seq + 1);
+        source.accept(Box::new(Counted {
+            header,
+            seq,
+            stream: None,
+            done: done.clone(),
+        }));
+    }
+    let deadline = sent + Duration::from_secs(1);
+    while done.load(Ordering::Acquire) < 512 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(1));
+    }
+    let (ran, took) = (done.load(Ordering::Acquire), sent.elapsed());
+    release.store(true, Ordering::Release);
+    lattice.close();
+    assert_eq!(
+        ran, 512,
+        "{ran} of 512 frames ran within {took:?} of a 2 s blocker"
+    );
+}
+
+#[test]
+fn a_polling_lattice_runs_ordered_streams_one_frame_at_a_time_in_order() {
+    let Some((_, cpus)) = SMT_CORE.as_ref() else {
+        return;
+    };
+    let _turn = pinned_turn();
+    let Some((lattice, source)) = running_lattice(polling(), cpus) else {
+        return;
+    };
+    // An even id for the core's first worker, an odd one for its SMT buddy, with unordered frames
+    // between them that either worker may steal.
+    let streams = [Arc::new(Stream::default()), Arc::new(Stream::default())];
+    let done = Arc::new(AtomicU64::new(0));
+    let per_stream = 2000;
+    for seq in 0..per_stream {
+        for (id, stream) in [0x40, 0x41].into_iter().zip(&streams) {
+            source.accept(Box::new(Counted {
+                header: FrameHeader::new(id),
+                seq,
+                stream: Some(stream.clone()),
+                done: done.clone(),
+            }));
+        }
+        let mut header = FrameHeader::new(0x50);
+        header.randomize_hash(seq + 1);
+        source.accept(Box::new(Counted {
+            header,
+            seq,
+            stream: None,
+            done: done.clone(),
+        }));
+    }
+    wait_until("every frame to run", || {
+        done.load(Ordering::Acquire) == 3 * per_stream
+    });
+    lattice.close();
+    for stream in &streams {
+        assert_eq!(stream.faults.load(Ordering::Acquire), 0);
+        assert_eq!(stream.next.load(Ordering::Acquire), per_stream);
+    }
 }
