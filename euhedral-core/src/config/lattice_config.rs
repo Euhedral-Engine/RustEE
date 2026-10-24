@@ -1,5 +1,7 @@
+use super::FragmentConfig;
 use crate::generics::{AbstractExecutor, CloneableObject};
-use crate::impls::BaseCloneableObject;
+use crate::impls::{BaseCloneableObject, DefaultExecutor};
+use crate::metrics::MetricsRegistry;
 use euhedral_hardware_utils::topology::Topology;
 use euhedral_hardware_utils::util::CpuSet;
 use std::sync::Arc;
@@ -47,6 +49,17 @@ impl LatticeConfig {
     pub fn with_executor<E: AbstractExecutor>(executor: E) -> Self {
         Self::new(Arc::new(BaseCloneableObject::with_executor(executor)))
     }
+
+    /// The defaults, with a [`BaseCloneableObject`] of default fragments whose workers and caches
+    /// register their meters, named after `prefix`, in `registry`
+    /// (`LatticeConfig.ofDefaults(name, shardName, metricPrefix, registry)` upstream).
+    pub fn with_metrics(prefix: impl Into<String>, registry: Arc<MetricsRegistry>) -> Self {
+        let fragment = FragmentConfig::default().with_metrics(prefix, registry);
+        Self::new(Arc::new(BaseCloneableObject::new(
+            fragment,
+            DefaultExecutor::new(),
+        )))
+    }
 }
 
 impl Default for LatticeConfig {
@@ -78,5 +91,22 @@ mod tests {
         assert_eq!(&config.allowed_cpus, Topology::system().cpu_set());
         assert_eq!(config.shutdown_timeout, Duration::from_secs(60));
         assert_eq!(config.startup_timeout, Duration::from_secs(60));
+        assert!(config.cloneable.metrics_registry().is_none());
+    }
+
+    #[test]
+    fn with_metrics_gives_the_default_object_a_registry() {
+        let registry = MetricsRegistry::new();
+        let config = LatticeConfig::with_metrics("app", registry.clone());
+        assert!(Arc::ptr_eq(
+            &config.cloneable.metrics_registry().unwrap(),
+            &registry
+        ));
+        assert!(
+            LatticeConfig::default()
+                .cloneable
+                .metrics_registry()
+                .is_none()
+        );
     }
 }

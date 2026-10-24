@@ -3,6 +3,7 @@ use crate::config::{CloneConfig, CloneLivenessRegistry, FragmentConfig};
 use crate::control_plane::ControlPlaneFragment;
 use crate::flow_control::LatticeEdge;
 use crate::generics::{AbstractExecutor, CloneableObject};
+use crate::metrics::MetricsRegistry;
 use euhedral_hardware_utils::affinity::PinnedThreadExecutor;
 use euhedral_hardware_utils::monitor::CoreSnapshot;
 use std::panic;
@@ -205,6 +206,11 @@ impl<E: AbstractExecutor> CloneableObject for BaseCloneableObject<E> {
 
     fn core(&self) -> Option<usize> {
         self.config.as_ref().map(CloneConfig::core_id)
+    }
+
+    /// The fragment config's registry, for the template and its clones alike.
+    fn metrics_registry(&self) -> Option<Arc<MetricsRegistry>> {
+        self.fragment_config.metrics_registry()
     }
 
     fn liveness_registry(&self) -> Option<Arc<CloneLivenessRegistry>> {

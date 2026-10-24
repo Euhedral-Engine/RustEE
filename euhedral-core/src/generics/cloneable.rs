@@ -1,6 +1,7 @@
 use super::LatticeSource;
 use crate::config::{CloneConfig, CloneLivenessRegistry};
 use crate::flow_control::LatticeEdge;
+use crate::metrics::MetricsRegistry;
 use euhedral_hardware_utils::affinity::PinnedThreadExecutor;
 use euhedral_hardware_utils::monitor::CoreSnapshot;
 use std::sync::Arc;
@@ -97,6 +98,12 @@ pub trait CloneableObject: Send + Sync + 'static {
         None
     }
 
+    /// Where this object's clones register their meters, if anywhere. A lattice snapshots it in
+    /// [`ControlPlaneLattice::metrics`](crate::control_plane::ControlPlaneLattice::metrics).
+    fn metrics_registry(&self) -> Option<Arc<MetricsRegistry>> {
+        None
+    }
+
     fn close(&self) {}
 }
 
@@ -136,6 +143,7 @@ mod tests {
         object.dump_locks();
         assert_eq!(object.core(), None);
         assert!(object.liveness_registry().is_none());
+        assert!(object.metrics_registry().is_none());
         object.close();
     }
 

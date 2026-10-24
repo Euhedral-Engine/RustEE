@@ -14,6 +14,8 @@
 //!   runs a core's frames on pinned workers, and the core-local cache that holds them.
 //! - [`flow_control`]: the lattice frames flow down through and demand flows up through: edges,
 //!   routing vertices, upstream handles and each worker's scheduler over them.
+//! - [`metrics`]: the latency, throughput, in-progress and backlog meters of each worker and
+//!   cache, recorded without locks when a registry is configured, and snapshots of them.
 //! - [`utils`]: math, spin waiting, timing, flow statistics and calibration for the control plane.
 //!
 //! A frame is owned by whoever holds its `Box`: queues, executors and pools move it rather than
@@ -26,6 +28,7 @@ pub mod frames;
 pub mod generics;
 pub mod impls;
 pub mod ingest;
+pub mod metrics;
 pub mod utils;
 
 mod internal;

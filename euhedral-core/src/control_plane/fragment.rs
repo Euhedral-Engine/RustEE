@@ -4,17 +4,22 @@ use crate::config::{CloneConfig, CloneLivenessRegistry, FragmentConfig};
 use crate::flow_control::{LatticeEdge, LatticeHotSource, UpstreamQueue, UpstreamRegistry};
 use crate::frames::Frame;
 use crate::generics::{CloneableObject, LatticeSource};
-use crate::utils::{FlowContext, StopWatch};
+use crate::metrics::{ExecutionMetrics, FlowStats, Meter, MeterSource, MetricsRegistry};
+use crate::utils::{FlowContext, FlowRecorder, StopWatch};
+use euhedral_data_structures::atomics::CachePadded;
 use euhedral_hardware_utils::affinity::{self, ExecutorError, PinnedThreadExecutor};
 use euhedral_hardware_utils::monitor::CoreSnapshot;
 use std::error::Error;
 use std::fmt;
 use std::panic::{self, AssertUnwindSafe};
+use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::thread::{self, Thread};
 use std::time::{Duration, Instant};
 
+/// Converts a rate per nanosecond to one per second.
+const NANOS_PER_SECOND: f64 = 1_000_000_000.0;
 /// How long a worker with neither upstreams nor cached frames parks.
 const EMPTY_PARK: Duration = Duration::from_micros(15);
 /// The last snapshot timestamp before any snapshot is followed: older than any real one.
@@ -95,6 +100,8 @@ pub struct ControlPlaneFragment {
     reset_cleared: AtomicU64,
     in_progress: AtomicU64,
     adaptive_batch_cap: AtomicU64,
+    /// The worker's meters, when the config has a registry.
+    metrics: Option<Box<CachePadded<ExecutionMetrics>>>,
     this: Weak<ControlPlaneFragment>,
 }
 
@@ -146,7 +153,7 @@ impl ControlPlaneFragment {
         let body_cost = Arc::new(BodyCost::new());
         let output = Arc::new(timed_output(body_cost.clone()));
         let initial_cap = initial_batch_cap(config, &cache);
-        Ok(Arc::new_cyclic(|this| Self {
+        let fragment = Arc::new_cyclic(|this| Self {
             name,
             core: clone.core_id(),
             cpu,
@@ -171,8 +178,14 @@ impl ControlPlaneFragment {
             reset_cleared: AtomicU64::new(0),
             in_progress: AtomicU64::new(0),
             adaptive_batch_cap: AtomicU64::new(initial_cap),
+            metrics: ExecutionMetrics::new(config.metrics(), clone.core_id(), cpu),
             this: this.clone(),
-        }))
+        });
+        if let Some(metrics) = &fragment.metrics {
+            let source: Weak<dyn MeterSource> = Arc::downgrade(&fragment) as Weak<dyn MeterSource>;
+            metrics.registry().register(source);
+        }
+        Ok(fragment)
     }
 
     pub fn name(&self) -> &str {
@@ -295,7 +308,7 @@ impl ControlPlaneFragment {
     fn run_owner_loop(&self) {
         let mut policy =
             DecisionTree::calibrated(self.config.idle_policy().clone(), self.body_cost.clone());
-        let mut cycle = Cycle::new(self.cpu.wrapping_add(1));
+        let mut cycle = Cycle::new(self.cpu.wrapping_add(1), self.metrics.is_some());
         FlowContext::initialize();
         self.initialized.store(true, Ordering::Release);
         while self.running.load(Ordering::Acquire) && !affinity::is_interrupted() {
@@ -404,7 +417,8 @@ impl ControlPlaneFragment {
             return;
         }
 
-        cycle.complete(&run, policy, self.batch_cap(), || {
+        let metrics = self.metrics.as_deref().map(|metrics| &**metrics);
+        cycle.complete(&run, policy, self.batch_cap(), metrics, || {
             self.registry.thread_count()
         });
         std::hint::spin_loop();
@@ -440,7 +454,7 @@ impl ControlPlaneFragment {
             return;
         }
         let cleared = self.reset_shared_state();
-        *cycle = Cycle::new(cycle.neighbor_cursor);
+        *cycle = Cycle::new(cycle.neighbor_cursor, self.metrics.is_some());
         self.with_queue(|queue| queue.reset_for_next_trial());
         policy.reset();
         FlowContext::with(|context| {
@@ -619,8 +633,13 @@ impl CloneableObject for ControlPlaneFragment {
         Some(self.liveness.clone())
     }
 
-    /// Stops both workers, then closes the buddy, the executor and the cache. The workers exit
-    /// after their current cycle; what the cache holds stays in it.
+    fn metrics_registry(&self) -> Option<Arc<MetricsRegistry>> {
+        self.config.metrics_registry()
+    }
+
+    /// Stops both workers, then closes the buddy, the executor and the cache, and takes their
+    /// meters out of their registries. The workers exit after their current cycle; what the
+    /// cache holds stays in it.
     fn close(&self) {
         let _lifecycle = self.lock_lifecycle();
         self.request_stop();
@@ -630,6 +649,9 @@ impl CloneableObject for ControlPlaneFragment {
         }
         self.executor.close();
         self.cache.close();
+        if let Some(metrics) = &self.metrics {
+            metrics.registry().remove(ptr::from_ref(self).cast());
+        }
         log::debug!(target: &self.name, "closed");
     }
 }
@@ -647,6 +669,21 @@ impl CloneableObject for FragmentConfig {
                 "cannot build the fragment of core {}: {error}",
                 config.core_id()
             ),
+        }
+    }
+
+    /// The fragments' registry, or else their caches'.
+    fn metrics_registry(&self) -> Option<Arc<MetricsRegistry>> {
+        self.registry()
+            .or_else(|| self.cache_config().registry())
+            .cloned()
+    }
+}
+
+impl MeterSource for ControlPlaneFragment {
+    fn collect(&self, out: &mut Vec<Meter>) {
+        if let Some(metrics) = &self.metrics {
+            metrics.collect(self.in_progress.load(Ordering::Acquire), out);
         }
     }
 }
@@ -684,34 +721,104 @@ struct Cycle {
     registered_workers: usize,
     now: Instant,
     neighbor_cursor: usize,
+    /// What the worker's meters report from, when metrics are on.
+    flow: Option<ExecutionFlow>,
 }
 
 impl Cycle {
-    fn new(neighbor_cursor: usize) -> Self {
+    fn new(neighbor_cursor: usize, metrics: bool) -> Self {
         Self {
             batch_size: 2,
             completed: 0,
             registered_workers: 0,
             now: Instant::now(),
             neighbor_cursor,
+            flow: metrics.then(ExecutionFlow::new),
         }
     }
 
-    /// Counts `run` toward the batch and its time toward `policy`. At the end of a batch, starts
-    /// the next, sized by `policy` within `cap`, and takes the current count of `workers`.
+    /// Counts `run` toward the batch and its time toward `policy`, and with `metrics` toward the
+    /// worker's frame count and flow. At the end of a batch, starts the next, sized by `policy`
+    /// within `cap`, takes the current count of `workers`, and reports the flow to `metrics`.
     fn complete(
         &mut self,
         run: &Run,
         policy: &mut DecisionTree,
         cap: u64,
+        metrics: Option<&ExecutionMetrics>,
         workers: impl FnOnce() -> usize,
     ) {
         self.completed += run.processed;
         policy.record_execution(run.elapsed, run.processed);
+        let measured = match (metrics, self.flow.as_mut()) {
+            (Some(metrics), Some(flow)) => {
+                metrics.record_frames(run.processed);
+                flow.record(self.now, run);
+                flow.publish(metrics);
+                Some((metrics, flow))
+            }
+            _ => None,
+        };
         if self.completed >= self.batch_size {
             self.completed = 0;
             self.batch_size = policy.complete_batch(cap);
             self.registered_workers = workers();
+            if let Some((metrics, flow)) = measured {
+                flow.report(metrics);
+            }
+        }
+    }
+}
+
+/// The service time and throughput of a worker's productive cycles (upstream `CycleState`'s
+/// `serviceTimeRecorder` and `throughputRecorder`). The worker publishes their statistics to its
+/// flow meters after each productive cycle, and its latency and throughput summaries sample their
+/// averages at the end of each batch. A reset of the worker starts them over.
+struct ExecutionFlow {
+    /// Nanoseconds per frame of each productive cycle.
+    service_time: FlowRecorder,
+    /// Frames of each productive cycle, whose rate is the throughput.
+    throughput: FlowRecorder,
+}
+
+impl ExecutionFlow {
+    fn new() -> Self {
+        Self {
+            service_time: FlowRecorder::new(),
+            throughput: FlowRecorder::new(),
+        }
+    }
+
+    /// Records a productive cycle that ended at `now`.
+    fn record(&mut self, now: Instant, run: &Run) {
+        let elapsed = run.elapsed.as_nanos().min(i64::MAX as u128) as i64;
+        if elapsed > 0 && run.processed > 0 {
+            let per_frame = (elapsed / run.processed.min(i64::MAX as u64) as i64).max(1);
+            self.service_time.record_units_at(now, per_frame);
+        }
+        self.throughput
+            .record_units_at(now, run.processed.min(i64::MAX as u64) as i64);
+    }
+
+    /// Publishes the recorders' current statistics to `metrics`' flow meters, once measured.
+    fn publish(&self, metrics: &ExecutionMetrics) {
+        if let Some(stats) = FlowStats::of_units(&self.service_time) {
+            metrics.publish_service_time(&stats);
+        }
+        if let Some(stats) = FlowStats::of_rate(&self.throughput, NANOS_PER_SECOND) {
+            metrics.publish_rate(&stats);
+        }
+    }
+
+    /// Records the current averages in `metrics`' summaries, once each is measured and positive.
+    fn report(&self, metrics: &ExecutionMetrics) {
+        let throughput = self.throughput.average_units_over_time();
+        if throughput.is_finite() && throughput > 0.0 {
+            metrics.report_throughput(throughput);
+        }
+        let latency = self.service_time.average_units();
+        if latency.is_finite() && latency > 0.0 {
+            metrics.report_latency(latency.round());
         }
     }
 }

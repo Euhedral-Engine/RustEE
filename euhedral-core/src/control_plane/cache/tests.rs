@@ -1120,3 +1120,85 @@ fn first_touch_runs_once() {
     assert_eq!(cache.pooled_chunks(), 3);
     assert!(cache.cap_factor() < 1.0);
 }
+
+fn metered(registry: &Arc<crate::metrics::MetricsRegistry>) -> CacheConfig {
+    config(2)
+        .with_metric_prefix("test")
+        .with_registry(registry.clone())
+}
+
+#[test]
+fn a_cache_without_a_registry_registers_and_records_nothing() {
+    let cache = cache(1);
+    assert!(cache.metrics.is_none());
+    cache.update(&snapshot(0, &[(0, 1.0)]));
+    let mut meters = Vec::new();
+    MeterSource::collect(&*cache, &mut meters);
+    assert!(meters.is_empty());
+}
+
+#[test]
+fn a_metered_cache_reports_its_backlog_and_cap_factor_tagged_with_its_core() {
+    use crate::metrics::{CAP_FACTOR_SUFFIX, MetricsRegistry, metric_name};
+
+    let registry = MetricsRegistry::new();
+    let directory = directory();
+    let cache = cache_on(&directory, &metered(&registry), 3);
+    assert_eq!(registry.len(), 1);
+
+    for id in 0..5 {
+        cache.push(unordered(id, id * 2 + 1));
+    }
+    cache.update(&snapshot(3, &[(6, 1.0)]));
+    cache.update(&snapshot(3, &[(6, 0.0)]));
+
+    let snapshot = registry.snapshot();
+    let backlog = snapshot.named("test.cache.backlog").collect::<Vec<_>>();
+    assert_eq!(backlog.len(), 1);
+    assert_eq!((backlog[0].core, backlog[0].cpu), (3, 6));
+    assert_eq!(backlog[0].tag(crate::metrics::CORE_TAG), Some(3));
+    assert_eq!(backlog[0].gauge(), Some(5.0));
+    let cap = snapshot
+        .get(&metric_name("test", CAP_FACTOR_SUFFIX), 6)
+        .unwrap()
+        .summary()
+        .unwrap();
+    assert_eq!(cap.count, 2);
+    // Each update records the cap factor it set.
+    let lowered = 0.8 + 0.15 * 0.2;
+    let raised = lowered * 0.98 + 0.02;
+    assert!((cap.sum - (lowered + raised)).abs() < 1e-12);
+    assert_eq!(cap.max, raised);
+    assert_eq!(snapshot.cap_factor_summaries().count(), 1);
+    assert_eq!(snapshot.cache_backlog_gauges().count(), 1);
+
+    let mut taken = 0;
+    cache.greedy(|_| taken += 1, u64::MAX);
+    assert_eq!(taken, 5);
+    let backlog = registry.snapshot();
+    assert_eq!(
+        backlog.named("test.cache.backlog").next().unwrap().gauge(),
+        Some(0.0)
+    );
+}
+
+#[test]
+fn closing_or_dropping_a_cache_takes_its_meters_out_of_the_registry() {
+    let registry = crate::metrics::MetricsRegistry::new();
+    let directory = directory();
+    let closed = cache_on(&directory, &metered(&registry), 0);
+    let dropped = cache_on(&directory, &metered(&registry), 1);
+    assert_eq!(registry.len(), 2);
+    closed.close();
+    assert_eq!(registry.len(), 1);
+    assert!(
+        registry
+            .snapshot()
+            .meters()
+            .iter()
+            .all(|meter| meter.core == 1)
+    );
+    drop(dropped);
+    assert!(registry.is_empty());
+    assert!(registry.snapshot().meters().is_empty());
+}

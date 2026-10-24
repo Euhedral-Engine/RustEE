@@ -9,6 +9,7 @@ use crate::flow_control::{
 use crate::frames::Frame;
 use crate::generics::LatticeSource;
 use crate::internal::task_pool::TaskPool;
+use crate::metrics::{MetricsRegistry, MetricsSnapshot};
 use crate::utils::spin_wait;
 use euhedral_hardware_utils::monitor::{
     HardwareUtilization, MonitorError, ResourceMonitor, SocketSnapshot,
@@ -533,6 +534,18 @@ impl ControlPlaneLattice {
     /// The number of cores with a clone, over every shard.
     pub fn active_workers(&self) -> usize {
         self.shards.iter().map(|shard| shard.active_cores()).sum()
+    }
+
+    /// Every worker's and cache's meters now, read without stopping the workers; `None` unless
+    /// the cloned object has a [`MetricsRegistry`]
+    /// ([`CloneableObject::metrics_registry`](crate::generics::CloneableObject::metrics_registry)).
+    pub fn metrics(&self) -> Option<MetricsSnapshot> {
+        self.metrics_registry().map(|registry| registry.snapshot())
+    }
+
+    /// Where the cloned object's workers and caches register their meters, if anywhere.
+    pub fn metrics_registry(&self) -> Option<Arc<MetricsRegistry>> {
+        self.config.cloneable.metrics_registry()
     }
 
     /// Whether every shard has finished its work.

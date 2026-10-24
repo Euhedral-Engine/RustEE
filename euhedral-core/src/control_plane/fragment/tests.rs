@@ -5,6 +5,7 @@ use crate::flow_control::testing::{TestReceiver, frame};
 use crate::flow_control::{LatticeNode, UpstreamHandle};
 use crate::frames::Failure;
 use crate::generics::{LatticeReceiver, LatticeTerminal};
+use crate::metrics::CAP_FACTOR_SUFFIX;
 use euhedral_hardware_utils::monitor::{HardwareUtilization, HardwareUtilizationParts};
 use euhedral_hardware_utils::topology::Topology;
 use euhedral_hardware_utils::topology::source::{CoreKind, LogicalCpu, TopologyInput, normalize};
@@ -774,14 +775,14 @@ fn cycles_size_the_next_batch_at_the_end_of_each() {
         Duration::from_micros(1),
         Duration::from_micros(1),
     );
-    let mut cycle = Cycle::new(0);
+    let mut cycle = Cycle::new(0, false);
     let one = Run {
         processed: 1,
         elapsed: Duration::from_nanos(100),
     };
-    cycle.complete(&one, &mut policy, 4096, || unreachable!("mid-batch"));
+    cycle.complete(&one, &mut policy, 4096, None, || unreachable!("mid-batch"));
     assert_eq!((cycle.completed, cycle.batch_size), (1, 2));
-    cycle.complete(&one, &mut policy, 4096, || 3);
+    cycle.complete(&one, &mut policy, 4096, None, || 3);
     assert_eq!((cycle.completed, cycle.batch_size), (0, 4));
     assert_eq!(cycle.registered_workers, 3);
     assert_eq!(policy.service_time_ns(), 100.0);
@@ -789,7 +790,309 @@ fn cycles_size_the_next_batch_at_the_end_of_each() {
         processed: 4,
         elapsed: Duration::from_nanos(400),
     };
-    cycle.complete(&many, &mut policy, 6, || 5);
+    cycle.complete(&many, &mut policy, 6, None, || 5);
     assert_eq!((cycle.completed, cycle.batch_size), (0, 6));
     assert_eq!(cycle.registered_workers, 5);
+}
+
+fn metered(registry: &Arc<MetricsRegistry>) -> FragmentConfig {
+    FragmentConfig::default().with_metrics("test", registry.clone())
+}
+
+#[test]
+fn a_fragment_without_a_registry_has_no_meters() {
+    let Some(fixture) = Fixture::single() else {
+        return;
+    };
+    let fixture = fixture.started();
+    assert!(fixture.fragment.metrics.is_none());
+    assert!(fixture.fragment.metrics_registry().is_none());
+    for id in 0..100 {
+        fixture.edge.push_downstream(unordered(id, id + 1));
+    }
+    wait_until("every frame to run", || fixture.received().len() == 100);
+    let mut meters = Vec::new();
+    MeterSource::collect(&*fixture.fragment, &mut meters);
+    MeterSource::collect(&**fixture.fragment.cache(), &mut meters);
+    assert!(meters.is_empty());
+}
+
+#[test]
+fn both_workers_and_their_caches_register_meters_tagged_with_core_and_cpu() {
+    use crate::metrics::{
+        CACHE_BACKLOG_SUFFIX, FRAMES_SUFFIX, IN_PROGRESS_SUFFIX, LATENCY_SUMMARY_SUFFIX,
+        THROUGHPUT_SUMMARY_SUFFIX, metric_name,
+    };
+
+    let Some((core, cpus)) = SMT_CORE.as_ref() else {
+        return;
+    };
+    let registry = MetricsRegistry::new();
+    let fixture = Fixture::new(&metered(&registry), *core, &cpus[..2]);
+    let fragment = &fixture.fragment;
+    assert!(Arc::ptr_eq(
+        &fragment.metrics_registry().unwrap(),
+        &registry
+    ));
+    // Two workers and two caches.
+    assert_eq!(registry.len(), 4);
+
+    let snapshot = registry.snapshot();
+    for suffix in [
+        LATENCY_SUMMARY_SUFFIX,
+        THROUGHPUT_SUMMARY_SUFFIX,
+        IN_PROGRESS_SUFFIX,
+        FRAMES_SUFFIX,
+        CACHE_BACKLOG_SUFFIX,
+        CAP_FACTOR_SUFFIX,
+    ] {
+        let name = metric_name("test", suffix);
+        let mut tagged: Vec<_> = snapshot
+            .named(&name)
+            .map(|meter| (meter.core, meter.cpu))
+            .collect();
+        tagged.sort_unstable();
+        assert_eq!(tagged, [(*core, cpus[0]), (*core, cpus[1])], "{name}");
+    }
+    // Six meters per worker and two per cache.
+    assert_eq!(snapshot.meters().len(), 16);
+    // Flows are unmeasured before the workers run.
+    assert!(
+        snapshot
+            .service_time_flows()
+            .all(|meter| meter.flow().is_none())
+    );
+    let frames = snapshot.get("test.execution.frames", cpus[0]).unwrap();
+    assert_eq!(frames.counter(), Some(0));
+    assert!(
+        snapshot
+            .in_progress_gauges()
+            .all(|meter| meter.gauge() == Some(0.0))
+    );
+
+    // Frames queued before the workers start show as the backlog of their lanes.
+    for id in 0..10 {
+        fixture.edge.push_downstream(unordered(id, id));
+    }
+    fragment.update(&fixture.snapshot(10, 0.5));
+    let snapshot = registry.snapshot();
+    let backlog: f64 = snapshot
+        .cache_backlog_gauges()
+        .map(|meter| meter.gauge().unwrap())
+        .sum();
+    assert_eq!(backlog, 10.0);
+    assert!(
+        snapshot
+            .cap_factor_summaries()
+            .all(|meter| meter.summary().unwrap().count == 1)
+    );
+
+    fragment.close();
+    assert!(registry.is_empty());
+}
+
+#[test]
+fn running_workers_record_frames_latency_and_throughput_while_snapshots_are_taken() {
+    let Some((core, cpu)) = *SINGLE_CORE else {
+        return;
+    };
+    let registry = MetricsRegistry::new();
+    let fixture = Fixture::new(&metered(&registry), core, &[cpu]).started();
+
+    let stop = AtomicBool::new(false);
+    let rounds = 40u64;
+    let per_round = 250u64;
+    let snapshots = thread::scope(|scope| {
+        let reader = scope.spawn(|| {
+            // Counts only grow, read while the worker records.
+            let mut last = (0u64, 0u64, 0u64);
+            let mut taken = 0u64;
+            while !stop.load(Ordering::Acquire) {
+                let snapshot = registry.snapshot();
+                let read = |name| snapshot.get(name, cpu).unwrap();
+                let frames = read("test.execution.frames").counter().unwrap();
+                let latency = read("test.execution.latency").summary().unwrap().count;
+                let throughput = read("test.execution.throughput").summary().unwrap().count;
+                assert!(frames >= last.0 && latency >= last.1 && throughput >= last.2);
+                last = (frames, latency, throughput);
+                taken += 1;
+                thread::yield_now();
+            }
+            taken
+        });
+        for round in 0..rounds {
+            for id in round * per_round..(round + 1) * per_round {
+                fixture.edge.push_downstream(unordered(id, id * 2 + 1));
+            }
+            thread::sleep(Duration::from_micros(500));
+        }
+        wait_until("every frame to run", || {
+            fixture.received().len() as u64 == rounds * per_round
+        });
+        wait_until("a latency and a throughput sample", || {
+            let snapshot = registry.snapshot();
+            snapshot
+                .get("test.execution.latency", cpu)
+                .and_then(|meter| meter.summary())
+                .is_some_and(|summary| summary.count > 0)
+                && snapshot
+                    .get("test.execution.throughput", cpu)
+                    .and_then(|meter| meter.summary())
+                    .is_some_and(|summary| summary.count > 0)
+        });
+        stop.store(true, Ordering::Release);
+        reader.join().unwrap()
+    });
+    assert!(snapshots > 0);
+
+    let snapshot = registry.snapshot();
+    let frames = snapshot.get("test.execution.frames", cpu).unwrap();
+    assert_eq!(frames.counter(), Some(rounds * per_round));
+    let latency = snapshot
+        .get("test.execution.latency", cpu)
+        .unwrap()
+        .summary()
+        .unwrap();
+    // Nanoseconds per frame: positive and well under the 10 s the test may take.
+    assert!(latency.mean() > 0.0 && latency.max < 1e10, "{latency:?}");
+    assert!(latency.percentile(0.5).unwrap() <= latency.max);
+    let throughput = snapshot
+        .get("test.execution.throughput", cpu)
+        .unwrap()
+        .summary()
+        .unwrap();
+    // Frames per second.
+    assert!(throughput.mean() > 1.0, "{throughput:?}");
+    let service_time = snapshot
+        .get("test.execution.serviceTime", cpu)
+        .and_then(|meter| meter.flow())
+        .unwrap();
+    assert!(service_time.average > 0.0 && service_time.min <= service_time.max);
+    let rate = snapshot
+        .get("test.execution.rate", cpu)
+        .and_then(|meter| meter.flow())
+        .unwrap();
+    assert!(rate.average > 0.0, "{rate:?}");
+    wait_until("the worker to drain", || fixture.fragment.is_drained());
+    let idle = registry.snapshot();
+    assert_eq!(
+        idle.get("test.execution.inProgress", cpu).unwrap().gauge(),
+        Some(0.0)
+    );
+}
+
+#[test]
+fn cycles_count_frames_and_report_the_flow_at_the_end_of_each_batch() {
+    let registry = MetricsRegistry::new();
+    let config = crate::metrics::MetricsConfig::default().with_registry(Some(registry));
+    let metrics = ExecutionMetrics::new(&config, 1, 2).unwrap();
+    let mut policy = DecisionTree::with_thresholds(
+        crate::config::IdlePolicy::default(),
+        Arc::new(BodyCost::new()),
+        Duration::from_micros(1),
+        Duration::from_micros(1),
+    );
+    let mut cycle = Cycle::new(0, true);
+    let run = Run {
+        processed: 1,
+        elapsed: Duration::from_nanos(200),
+    };
+    let summaries = |metrics: &ExecutionMetrics| {
+        let mut meters = Vec::new();
+        metrics.collect(0, &mut meters);
+        let count = |name: &str| {
+            meters
+                .iter()
+                .find(|meter| meter.name.ends_with(name))
+                .unwrap()
+                .clone()
+        };
+        (
+            count(".execution.frames").counter().unwrap(),
+            count(".execution.latency").summary().unwrap().clone(),
+            count(".execution.throughput").summary().unwrap().clone(),
+        )
+    };
+    let start = Instant::now();
+    for step in 1..=12u32 {
+        cycle.now = start + Duration::from_micros(u64::from(step) * 10);
+        cycle.complete(&run, &mut policy, 4096, Some(&metrics), || 1);
+    }
+    let (frames, latency, throughput) = summaries(&metrics);
+    assert_eq!(frames, 12);
+    // Batches of 2, then as the policy sizes them: each batch end after the flow is measured
+    // records a sample, and none is recorded mid-batch.
+    assert!(latency.count > 0 && latency.count < 12, "{latency:?}");
+    assert_eq!(latency.max, 200.0);
+    assert_eq!(latency.sum, 200.0 * latency.count as f64);
+    // One frame each 10 µs: 100,000 frames per second.
+    assert!(throughput.count > 0);
+    assert!((throughput.max - 100_000.0).abs() < 1.0, "{throughput:?}");
+
+    // The flow meters carry the recorders' current statistics.
+    let mut meters = Vec::new();
+    metrics.collect(0, &mut meters);
+    let flow = |suffix: &str| {
+        *meters
+            .iter()
+            .find(|meter| meter.name.ends_with(suffix))
+            .unwrap()
+            .flow()
+            .unwrap()
+    };
+    let service_time = flow(".execution.serviceTime");
+    assert_eq!((service_time.average, service_time.max), (200.0, 200.0));
+    assert_eq!(service_time.standard_deviation, 0.0);
+    let rate = flow(".execution.rate");
+    assert!((rate.average - 100_000.0).abs() < 1.0, "{rate:?}");
+
+    // Without metrics a cycle keeps no flow.
+    assert!(Cycle::new(0, false).flow.is_none());
+}
+
+/// The cost of a cycle's bookkeeping with metrics off and on, on one thread: what the worker
+/// pays per productive cycle, whatever the frames.
+#[test]
+#[ignore = "a measurement: run with --ignored --nocapture"]
+fn metrics_cost_per_cycle() {
+    const CYCLES: u32 = 2_000_000;
+    let registry = MetricsRegistry::new();
+    let config = crate::metrics::MetricsConfig::default().with_registry(Some(registry));
+    let metrics = ExecutionMetrics::new(&config, 0, 0).unwrap();
+    for processed in [1, 64] {
+        let mut costs = Vec::new();
+        for metered in [false, true, false, true] {
+            let mut policy = DecisionTree::with_thresholds(
+                crate::config::IdlePolicy::default(),
+                Arc::new(BodyCost::new()),
+                Duration::from_micros(1),
+                Duration::from_micros(1),
+            );
+            let mut cycle = Cycle::new(0, metered);
+            let run = Run {
+                processed,
+                elapsed: Duration::from_nanos(100 * processed),
+            };
+            let meters = metered.then_some(&**metrics);
+            let start = Instant::now();
+            for _ in 0..CYCLES {
+                cycle.now += Duration::from_micros(1);
+                cycle.complete(&run, &mut policy, 4096, std::hint::black_box(meters), || 1);
+            }
+            costs.push((
+                metered,
+                start.elapsed().as_nanos() as f64 / f64::from(CYCLES),
+            ));
+        }
+        let mean = |on: bool| {
+            let picked: Vec<f64> = costs.iter().filter(|c| c.0 == on).map(|c| c.1).collect();
+            picked.iter().sum::<f64>() / picked.len() as f64
+        };
+        let (off, on) = (mean(false), mean(true));
+        eprintln!(
+            "{processed} frames/cycle: {off:.1} ns/cycle off, {on:.1} ns/cycle on: {:+.1} ns/cycle, {:+.2} ns/frame",
+            on - off,
+            (on - off) / processed as f64
+        );
+    }
 }

@@ -3,8 +3,10 @@ use crate::flow_control::{
     LatticeEdge, LatticeNode, RoutingPolicy, UpstreamRegistry, route_by_hash,
 };
 use crate::frames::{DummyFrame, Failure, Frame, FrameError};
+use crate::metrics::{CacheMetrics, Meter, MeterSource};
 use crate::utils::FlowContext;
 use crate::utils::math::ewma;
+use euhedral_data_structures::atomics::CachePadded;
 use euhedral_data_structures::queues::partitioned::{PartitionedMpscQueue, PartitionedProducer};
 use euhedral_data_structures::queues::queue::{Consumer, Multi, Single};
 use euhedral_hardware_utils::monitor::CoreSnapshot;
@@ -138,6 +140,8 @@ pub struct ControlPlaneCache {
     retired: AtomicBool,
     primed: AtomicBool,
     sibling: OnceLock<Arc<ControlPlaneCache>>,
+    /// The backlog and cap-factor meters, when the config has a registry.
+    metrics: Option<Box<CachePadded<CacheMetrics>>>,
     this: Weak<ControlPlaneCache>,
 }
 
@@ -203,12 +207,17 @@ impl ControlPlaneCache {
                 retired: AtomicBool::new(false),
                 primed: AtomicBool::new(false),
                 sibling: OnceLock::new(),
+                metrics: CacheMetrics::new(config.metrics(), clone.core_id(), cpu),
                 queue,
                 this: this.clone(),
                 name,
             }
         });
         directory.claim(cpu, Arc::downgrade(&cache));
+        if let Some(metrics) = &cache.metrics {
+            let source: Weak<dyn MeterSource> = Arc::downgrade(&cache) as Weak<dyn MeterSource>;
+            metrics.registry().register(source);
+        }
         cache
     }
 
@@ -541,7 +550,8 @@ impl ControlPlaneCache {
         }
     }
 
-    /// Moves the cap factor toward what the core's CPU pressure allows: quickly down, slowly up.
+    /// Moves the cap factor toward what the core's CPU pressure allows: quickly down, slowly up,
+    /// and records it in the cap-factor summary when metrics are on.
     pub fn update(&self, snapshot: &CoreSnapshot) {
         let pressure = self
             .cpus
@@ -556,6 +566,9 @@ impl ControlPlaneCache {
         let alpha = if target < current { 0.2 } else { 0.02 };
         let next = ewma(current, target, alpha).clamp(MIN_CAP_FACTOR, 1.0);
         self.cap_factor.store(next.to_bits(), Ordering::Release);
+        if let Some(metrics) = &self.metrics {
+            metrics.record_cap_factor(next);
+        }
     }
 
     /// Drops every queued frame and restores full capacity, for a new trial once ingest is frozen.
@@ -570,14 +583,17 @@ impl ControlPlaneCache {
         cleared
     }
 
-    /// Retires the cache: new frames fail, other caches stop stealing from it, and its edge
-    /// closes. What it holds stays for its owner to drain.
+    /// Retires the cache: new frames fail, other caches stop stealing from it, its edge closes,
+    /// and its meters leave their registry. What it holds stays for its owner to drain.
     pub fn close(&self) {
         if self.retired.swap(true, Ordering::AcqRel) {
             return;
         }
         self.directory.withdraw(self.cpu, &self.this);
         self.edge.close_edge();
+        if let Some(metrics) = &self.metrics {
+            metrics.registry().remove(ptr::from_ref(self).cast());
+        }
     }
 
     /// Queues `frame` in its partition of this cache or, on the odd lane, of the sibling, and
@@ -596,6 +612,14 @@ impl ControlPlaneCache {
             unreachable!("an unbounded partition takes every frame");
         }
         Some(lane)
+    }
+}
+
+impl MeterSource for ControlPlaneCache {
+    fn collect(&self, out: &mut Vec<Meter>) {
+        if let Some(metrics) = &self.metrics {
+            metrics.collect(self.local_cache_count(), out);
+        }
     }
 }
 

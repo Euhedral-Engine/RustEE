@@ -1,6 +1,8 @@
+use crate::metrics::{MetricsConfig, MetricsRegistry};
 use std::error::Error;
 use std::fmt;
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 
 /// How a [`ControlPlaneCache`](crate::control_plane::ControlPlaneCache) sizes, splits and shares
 /// its local queue.
@@ -11,6 +13,7 @@ pub struct CacheConfig {
     max_pooled_chunks: usize,
     ring_walk_reset_threshold: u64,
     work_steal: bool,
+    metrics: MetricsConfig,
 }
 
 /// A memory budget outside `(0, 1]`.
@@ -27,7 +30,7 @@ impl Error for InvalidMemoryBudget {}
 
 impl Default for CacheConfig {
     /// A budget of 70% of the core's L1 and L2, eight partitions, no chunk pooling, a ring-walk
-    /// reset threshold of four frames, and work stealing.
+    /// reset threshold of four frames, work stealing, and no metrics.
     fn default() -> Self {
         Self {
             memory_budget: 0.7,
@@ -35,6 +38,7 @@ impl Default for CacheConfig {
             max_pooled_chunks: 0,
             ring_walk_reset_threshold: 4,
             work_steal: true,
+            metrics: MetricsConfig::default(),
         }
     }
 }
@@ -97,6 +101,37 @@ impl CacheConfig {
     pub fn with_work_steal(self, work_steal: bool) -> Self {
         Self { work_steal, ..self }
     }
+
+    /// The prefix of the caches' metric names: [`DEFAULT_PREFIX`](crate::metrics::DEFAULT_PREFIX)
+    /// unless another was set.
+    pub fn metric_prefix(&self) -> &str {
+        self.metrics.prefix()
+    }
+
+    /// Sets the metric prefix; a blank one means the default.
+    pub fn with_metric_prefix(self, prefix: impl Into<String>) -> Self {
+        Self {
+            metrics: self.metrics.with_prefix(prefix),
+            ..self
+        }
+    }
+
+    /// Where the caches register their meters; `None`, the default, records nothing.
+    pub fn registry(&self) -> Option<&Arc<MetricsRegistry>> {
+        self.metrics.registry()
+    }
+
+    /// Sets the registry, or with `None` turns the caches' metrics off.
+    pub fn with_registry(self, registry: impl Into<Option<Arc<MetricsRegistry>>>) -> Self {
+        Self {
+            metrics: self.metrics.with_registry(registry.into()),
+            ..self
+        }
+    }
+
+    pub(crate) fn metrics(&self) -> &MetricsConfig {
+        &self.metrics
+    }
 }
 
 #[cfg(test)]
@@ -111,6 +146,33 @@ mod tests {
         assert_eq!(config.max_pooled_chunks(), 0);
         assert_eq!(config.ring_walk_reset_threshold(), 4);
         assert!(config.work_steal());
+        assert_eq!(config.metric_prefix(), "euhedral");
+        assert!(config.registry().is_none());
+    }
+
+    #[test]
+    fn metrics_take_a_prefix_and_a_registry() {
+        let registry = MetricsRegistry::new();
+        let config = CacheConfig::default()
+            .with_metric_prefix("app")
+            .with_registry(registry.clone());
+        assert_eq!(config.metric_prefix(), "app");
+        assert!(Arc::ptr_eq(config.registry().unwrap(), &registry));
+        assert_ne!(config, CacheConfig::default().with_metric_prefix("app"));
+        assert_ne!(
+            config,
+            CacheConfig::default()
+                .with_metric_prefix("app")
+                .with_registry(MetricsRegistry::new())
+        );
+        assert_eq!(config.clone(), config);
+        assert_eq!(config.with_metric_prefix(" ").metric_prefix(), "euhedral");
+        assert!(
+            CacheConfig::default()
+                .with_registry(None)
+                .registry()
+                .is_none()
+        );
     }
 
     #[test]

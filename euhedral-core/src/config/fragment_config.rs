@@ -1,5 +1,7 @@
 use super::{CacheConfig, IdlePolicy};
+use crate::metrics::{MetricsConfig, MetricsRegistry};
 use std::num::NonZeroU64;
+use std::sync::Arc;
 
 /// How a [`ControlPlaneFragment`](crate::control_plane::ControlPlaneFragment) caches, batches and
 /// idles.
@@ -11,17 +13,19 @@ pub struct FragmentConfig {
     max_batch_size: NonZeroU64,
     smt_enabled: bool,
     idle_policy: IdlePolicy,
+    metrics: MetricsConfig,
 }
 
 impl Default for FragmentConfig {
     /// The default cache and idle policy, batches of up to 4096 frames, and a worker on each SMT
-    /// thread of a core.
+    /// thread of a core, and no metrics.
     fn default() -> Self {
         Self {
             cache_config: CacheConfig::default(),
             max_batch_size: Self::DEFAULT_MAX_BATCH_SIZE,
             smt_enabled: true,
             idle_policy: IdlePolicy::default(),
+            metrics: MetricsConfig::default(),
         }
     }
 }
@@ -91,6 +95,53 @@ impl FragmentConfig {
             ..self
         }
     }
+
+    /// Metrics for the fragments and their caches: sets this config's and its cache config's
+    /// prefix and registry (`FragmentConfig.ofDefaults(metricPrefix, registry)` upstream).
+    pub fn with_metrics(self, prefix: impl Into<String>, registry: Arc<MetricsRegistry>) -> Self {
+        let prefix = prefix.into();
+        let cache_config = self
+            .cache_config
+            .clone()
+            .with_metric_prefix(prefix.clone())
+            .with_registry(registry.clone());
+        Self {
+            cache_config,
+            ..self.with_metric_prefix(prefix).with_registry(registry)
+        }
+    }
+
+    /// The prefix of the workers' metric names: [`DEFAULT_PREFIX`](crate::metrics::DEFAULT_PREFIX)
+    /// unless another was set.
+    pub fn metric_prefix(&self) -> &str {
+        self.metrics.prefix()
+    }
+
+    /// Sets the workers' metric prefix, not the cache config's; a blank one means the default.
+    pub fn with_metric_prefix(self, prefix: impl Into<String>) -> Self {
+        Self {
+            metrics: self.metrics.with_prefix(prefix),
+            ..self
+        }
+    }
+
+    /// Where the workers register their meters; `None`, the default, records nothing.
+    pub fn registry(&self) -> Option<&Arc<MetricsRegistry>> {
+        self.metrics.registry()
+    }
+
+    /// Sets the workers' registry, not the cache config's, or with `None` turns the workers'
+    /// metrics off.
+    pub fn with_registry(self, registry: impl Into<Option<Arc<MetricsRegistry>>>) -> Self {
+        Self {
+            metrics: self.metrics.with_registry(registry.into()),
+            ..self
+        }
+    }
+
+    pub(crate) fn metrics(&self) -> &MetricsConfig {
+        &self.metrics
+    }
 }
 
 #[cfg(test)]
@@ -108,6 +159,26 @@ mod tests {
             config.idle_policy().idle_park(),
             IdlePolicy::DEFAULT_IDLE_PARK
         );
+        assert_eq!(config.metric_prefix(), "euhedral");
+        assert!(config.registry().is_none());
+    }
+
+    #[test]
+    fn with_metrics_sets_the_fragment_and_its_cache() {
+        let registry = MetricsRegistry::new();
+        let config = FragmentConfig::default().with_metrics("app.", registry.clone());
+        assert_eq!(config.metric_prefix(), "app.");
+        assert_eq!(config.cache_config().metric_prefix(), "app.");
+        assert!(Arc::ptr_eq(config.registry().unwrap(), &registry));
+        assert!(Arc::ptr_eq(
+            config.cache_config().registry().unwrap(),
+            &registry
+        ));
+
+        let fragment_only = FragmentConfig::default().with_registry(registry);
+        assert!(fragment_only.registry().is_some());
+        assert!(fragment_only.cache_config().registry().is_none());
+        assert!(fragment_only.with_registry(None).registry().is_none());
     }
 
     #[test]

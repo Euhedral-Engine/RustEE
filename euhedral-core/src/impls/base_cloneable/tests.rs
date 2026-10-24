@@ -7,6 +7,8 @@ use crate::flow_control::testing::{Fate, Fates, Tracked, frame};
 use crate::flow_control::{LatticeHotSource, LatticeNode, UpstreamRegistry};
 use crate::frames::{Frame, FrameError, FrameHeader};
 use crate::impls::DefaultExecutor;
+use crate::ingest::{ArrayIngestSink, IngestSink};
+use crate::metrics::MetricsRegistry;
 use euhedral_hardware_utils::affinity;
 use euhedral_hardware_utils::monitor::{HardwareUtilization, HardwareUtilizationParts};
 use euhedral_hardware_utils::topology::Topology;
@@ -685,6 +687,129 @@ fn cache_local_frames_behind_a_blocking_one_stay_on_their_core_in_both_modes() {
                 .iter()
                 .all(|cpu| cpu.is_some_and(|cpu| home.contains(&cpu))),
             "ran off core {home:?}: {ran_on:?}"
+        );
+    }
+}
+
+fn counted(seq: u64, done: &Arc<AtomicU64>) -> Box<dyn Frame> {
+    let mut header = FrameHeader::new(0x30);
+    header.randomize_hash(seq + 1);
+    Box::new(Counted {
+        header,
+        seq,
+        stream: None,
+        work: Duration::ZERO,
+        done: done.clone(),
+    })
+}
+
+#[test]
+fn a_metered_lattice_reports_every_workers_meters_until_closed() {
+    let Some((core, cpus)) = SMT_CORE.as_ref() else {
+        return;
+    };
+    let _turn = pinned_turn();
+    let registry = MetricsRegistry::new();
+    let fragment = FragmentConfig::default().with_metrics("lattice", registry.clone());
+    let Some((lattice, source)) = running_lattice(fragment, &cpus[..2]) else {
+        return;
+    };
+    assert!(Arc::ptr_eq(&lattice.metrics_registry().unwrap(), &registry));
+    let done = Arc::new(AtomicU64::new(0));
+    for seq in 0..1000 {
+        source.accept(counted(seq, &done));
+    }
+    wait_until("every frame to run", || {
+        done.load(Ordering::Acquire) == 1000
+    });
+
+    let snapshot = lattice.metrics().unwrap();
+    let frames: u64 = snapshot
+        .frames_counters()
+        .map(|meter| meter.counter().unwrap())
+        .sum();
+    assert_eq!(frames, 1000);
+    // Both workers of the core, and both caches.
+    for meters in [
+        snapshot.latency_summaries().collect::<Vec<_>>(),
+        snapshot.throughput_summaries().collect(),
+        snapshot.in_progress_gauges().collect(),
+        snapshot.cache_backlog_gauges().collect(),
+        snapshot.cap_factor_summaries().collect(),
+    ] {
+        let mut tagged: Vec<_> = meters.iter().map(|meter| (meter.core, meter.cpu)).collect();
+        tagged.sort_unstable();
+        assert_eq!(tagged, [(*core, cpus[0]), (*core, cpus[1])]);
+        assert!(
+            meters
+                .iter()
+                .all(|meter| meter.name.starts_with("lattice."))
+        );
+    }
+
+    lattice.close();
+    assert!(registry.is_empty());
+    assert!(lattice.metrics().unwrap().meters().is_empty());
+}
+
+/// The median of `samples`.
+fn median(mut samples: Vec<f64>) -> f64 {
+    samples.sort_by(f64::total_cmp);
+    samples[samples.len() / 2]
+}
+
+/// The wall time per frame of an SMT core's two workers running empty frames from an array
+/// sink, with metrics off and on, in greedy and in poll mode. Rounds alternate off and on.
+#[test]
+#[ignore = "a measurement: run with --ignored --nocapture"]
+fn metrics_overhead_per_frame() {
+    const FRAMES: u64 = 200_000;
+    const ROUNDS: usize = 7;
+    let Some((_, cpus)) = SMT_CORE.as_ref() else {
+        return;
+    };
+    let _turn = pinned_turn();
+    for (mode, base) in [("greedy", FragmentConfig::default()), ("poll", polling())] {
+        let (mut off, mut on) = (Vec::new(), Vec::new());
+        for round in 0..ROUNDS * 2 {
+            let metered = round % 2 == 1;
+            let fragment = if metered {
+                base.clone().with_metrics("bench", MetricsRegistry::new())
+            } else {
+                base.clone()
+            };
+            let Some((lattice, _source)) = running_lattice(fragment, &cpus[..2]) else {
+                return;
+            };
+            let done = Arc::new(AtomicU64::new(0));
+            let frames: Vec<_> = (0..FRAMES).map(|seq| counted(seq, &done)).collect();
+            let sink = ArrayIngestSink::new(frames);
+            let start = Instant::now();
+            lattice.add_upstream(sink.delegate()).unwrap();
+            let deadline = start + PATIENCE;
+            while done.load(Ordering::Acquire) < FRAMES && Instant::now() < deadline {
+                thread::sleep(Duration::from_micros(100));
+            }
+            let per_frame = start.elapsed().as_nanos() as f64 / FRAMES as f64;
+            assert_eq!(done.load(Ordering::Acquire), FRAMES, "timed out");
+            if metered {
+                let snapshot = lattice.metrics().unwrap();
+                let ran: u64 = snapshot
+                    .frames_counters()
+                    .map(|meter| meter.counter().unwrap())
+                    .sum();
+                assert_eq!(ran, FRAMES);
+                on.push(per_frame);
+            } else {
+                off.push(per_frame);
+            }
+            lattice.close();
+        }
+        let (off, on) = (median(off), median(on));
+        eprintln!(
+            "{mode}: {off:.1} ns/frame off, {on:.1} ns/frame on, {:+.1} ns ({:+.1}%)",
+            on - off,
+            (on - off) / off * 100.0
         );
     }
 }
