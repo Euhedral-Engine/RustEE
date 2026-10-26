@@ -250,6 +250,9 @@ type Platform = win::Engine;
 ///   this source's completion port when its first operation on the port is submitted, and a handle
 ///   can belong to one port only: **it can serve one `AsyncIo`, ever**, and a handle that already
 ///   belongs to another port is refused. File reads and writes through IoRing need no port.
+/// - **Sockets on Windows** must belong to a provider that fills `OVERLAPPED`'s `Internal` and
+///   `InternalHigh` on completion, as the system's own TCP and UDP do; a socket of a legacy,
+///   non-IFS layered provider may not, and is not supported.
 /// - **Writes that extend a file** are synchronous on NTFS (the call returns when the data is
 ///   written). On Windows every write goes in pieces of at most 256 KiB, so that one piece is a
 ///   bounded wait for the worker that submits it.

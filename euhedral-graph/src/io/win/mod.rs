@@ -608,8 +608,10 @@ impl Engine {
         });
     }
 
-    /// A ring entry that cannot be built ends its operation with `error`.
-    fn fail_token(&self, user_data: usize, error: io::Error) {
+    /// A ring entry ends its operation with `error`, if the operation is still in flight. With
+    /// `leak`, the entry may have been handed to the kernel (it cannot be known), so the buffer is
+    /// leaked rather than returned, as `break_ring` leaks the buffers of what it ends.
+    fn fail_token(&self, user_data: usize, error: io::Error, leak: bool) {
         let (slot, generation) = untoken(user_data);
         let held = {
             let mut table = lock(&self.table);
@@ -622,13 +624,29 @@ impl Engine {
                 return;
             }
             entry.state = State::Busy;
-            (slot, entry.generation)
+            (slot, entry.generation, entry.rec.0)
         };
+        if leak {
+            // SAFETY: the slot is `Busy` now: ours.
+            if let Some(op) = unsafe { (*held.2.as_ptr()).op.as_mut() } {
+                std::mem::forget(std::mem::take(&mut op.buf.bytes));
+            }
+        }
         lock(&self.ready).push_back(Failed {
             slot: held.0,
             generation: held.1,
             error,
         });
+    }
+
+    /// A ring that broke meanwhile has no one to hand its backlog over (`break_ring` may have
+    /// cleared it before the entry was pushed): the operation ends here, unless `break_ring`
+    /// already ended it. A concurrent flush may have built the entry before the ring broke, so
+    /// the kernel may own the buffer: it is leaked.
+    fn end_if_broken(&self, ring: &Ring, user_data: usize) {
+        if ring.broken.load(Ordering::Acquire) {
+            self.fail_token(user_data, ring_failed(), true);
+        }
     }
 
     // ---- rings
@@ -716,7 +734,8 @@ impl Engine {
                 Err(BuildError::Full) => break,
                 Err(BuildError::Other(error)) => {
                     lock(&ring.backlog).pop_front();
-                    self.fail_token(entry.user_data, error);
+                    // Not built: the kernel never had the buffer.
+                    self.fail_token(entry.user_data, error, false);
                 }
             }
         }
@@ -931,14 +950,10 @@ impl Engine {
                 // The record is not touched again: the entry may complete as soon as it is built.
                 self.set_state(held, State::InFlight);
                 lock(&ring.backlog).push_back(entry);
-                // A ring that broke meanwhile has no one to hand its backlog over (`break_ring`
-                // may have cleared it before this push): end the operation here, unless
-                // `break_ring` already did.
-                if ring.broken.load(Ordering::Acquire) {
-                    self.fail_token(entry.user_data, ring_failed());
-                    return;
+                self.end_if_broken(&ring, entry.user_data);
+                if !ring.broken.load(Ordering::Acquire) {
+                    self.flush_ring(&ring);
                 }
-                self.flush_ring(&ring);
                 return;
             }
         };

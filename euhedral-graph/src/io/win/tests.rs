@@ -1155,3 +1155,60 @@ fn a_receive_that_fails_with_a_warning_keeps_the_bytes_that_arrived() {
     assert_eq!(done.buf.filled, 10, "the datagram's first bytes arrived");
     assert_eq!(done.buf.bytes, [9; 10]);
 }
+
+#[test]
+fn an_operation_ended_by_the_issuers_recheck_of_a_broken_ring_leaks_its_buffer() {
+    let h = Harness::with(Some(full_probe()), true, MAX_PIECE);
+    let file = h.sim.file(&content(100));
+    h.read(file, 0, 10, 1).unwrap(); // makes this thread's ring
+    h.drain(1);
+    let ring = h.engine.ring().unwrap();
+    let op = Engine::op(
+        super::Kind::Read { file, offset: 0 },
+        super::Route::Ring(ring.clone()),
+        IoBuf {
+            bytes: vec![0u8; 10],
+            filled: 0,
+        },
+        io_then(2),
+    );
+    let held = h.engine.begin(op, super::State::Issuing).unwrap();
+    h.front.pending.fetch_add(1, Ordering::AcqRel);
+    // The issuer's half of `launch`: its slot goes in flight and its entry is pushed ...
+    h.engine.set_state(held, super::State::InFlight);
+    let entry = super::Entry {
+        write: false,
+        file,
+        // SAFETY: the slot is `InFlight` with nothing else touching the record in this test.
+        buf: unsafe {
+            (*held.rec.as_ptr())
+                .op
+                .as_mut()
+                .unwrap()
+                .buf
+                .bytes
+                .as_mut_ptr() as usize
+        },
+        len: 10,
+        offset: 0,
+        user_data: super::token(held.slot, held.generation),
+    };
+    lock(&ring.backlog).push_back(entry);
+    // ... and a concurrent flush (which saw the ring healthy) builds it: the kernel has it.
+    h.engine.flush_ring(&ring);
+    assert_eq!(
+        h.sim.submit_sizes().last(),
+        Some(&1),
+        "the entry reached the kernel"
+    );
+    // Then the ring breaks, and the issuer's recheck reaches the slot before `break_ring`'s scan.
+    ring.broken.store(true, Ordering::Release);
+    h.engine.end_if_broken(&ring, entry.user_data);
+    let done = ended(h.one());
+    assert!(done.result.is_err());
+    assert!(
+        done.buf.bytes.is_empty(),
+        "the buffer the kernel may still write was not handed back"
+    );
+    assert_eq!(h.pending(), 0);
+}

@@ -57,7 +57,7 @@ now `async-io` (it was `io-uring`).
   with an error). Writes go in pieces of at most 256 KiB, since a write that extends a file is synchronous on NTFS. Paths
   near the Win32 limit go as verbatim paths. A ring whose completions cannot be read ends its operations with the error.
 
-**Tests.** 44 tests run on every platform against a simulated `Sys` (every operation's success, error and short transfers,
+**Tests.** 45 tests run on every platform against a simulated `Sys` (every operation's success, error and short transfers,
 the ring and its fallbacks, a full submission queue, the order across ring and port, a pull's `stop`, late and warning packets,
 slot reuse, routes and generations, handle modes, pool failures). 16 run on Windows
 only (`io/win/live.rs`: files, loopback TCP and UDP, accept, connect, open and rename, threads each with a ring), each twice:
