@@ -9,8 +9,8 @@ The pieces are ports of Euhedral-Inference's `runtime.graph` package (`StageGrap
 `FrameSequencer` (and the Kafka `OffsetCollector`). `AsyncIo` goes beyond `AsyncReads`: writes,
 sends, receives, accepts and connects.
 
-**Where it sits.** It depends on [`euhedral-core`](../euhedral-core) and on `libc` and `io-uring`
-(Linux and Android only). Nothing in the workspace depends on it; applications do. It adds
+**Where it sits.** It depends on [`euhedral-core`](../euhedral-core), and, for `AsyncIo`, on
+`io-uring` and `libc` (Linux and Android) or `windows-sys` (Windows). Nothing in the workspace depends on it; applications do. It adds
 `LatticeSource`s that the lattice's own polls drive, and plain structures that frame callbacks run,
 so it needs no thread of its own. It does not re-export `euhedral-core`: import `Frame`,
 `LatticeSource` and the rest from there.
@@ -20,7 +20,7 @@ so it needs no thread of its own. It does not re-export `euhedral-core`: import 
 | Module | Main types |
 |---|---|
 | [`completions`](src/completions.rs) | `Completions`, a `LatticeSource` of continuation frames behind completions: markers, timers, `Ready` tokens and `Pending` operations. |
-| [`io`](src/io/mod.rs) | `AsyncIo`, a `LatticeSource` of continuations behind file and socket operations (io_uring), with `IoBuf`, `IoDone` and `IoThen`. Linux and Android, feature `io-uring` (default). |
+| [`io`](src/io/mod.rs) | `AsyncIo`, a `LatticeSource` of continuations behind file and socket operations, with `IoBuf`, `IoDone`, `IoThen`, `OpenSpec` (`Create`), `AsyncIoOptions` and the handle aliases `RawFile`, `RawSock`, `OwnedFile` and `OwnedSock`. io_uring on Linux and Android ([`uring`](src/io/uring.rs)); IoRing and completion ports on Windows ([`win`](src/io/win/mod.rs)); none on macOS yet. Feature `async-io` (default). |
 | [`sequencer`](src/sequencer.rs) | `Sequencer` and `Slot`: execute in any order, release in admission order. |
 | [`join`](src/join.rs) | `Join`: a continuation that runs when its last part arrives. |
 | [`lanes`](src/lanes.rs) | `LanePool`, `LaneId`, `Marker` and the trait `DeviceQueue`: device timelines that are queried, never waited on. |
@@ -120,15 +120,28 @@ assert_eq!(*released.lock().unwrap(), [0, 1, 2]); // released in admission order
 
 ### AsyncIo
 
-`AsyncIo` (io_uring, on Linux and Android) does file and socket I/O that holds no worker: `read`,
-`write`, `send`, `recv`, `accept`, `open_file`, `rename`, `send_to` and `connect` each return at
-once, and the operation's `IoDone` (its buffer back, and the bytes moved or the error) reaches the
-`IoThen` continuation, which builds the frame the source emits. Each submitting thread has its own
-submission ring, so a lattice worker never contends with another to submit; completions of every
-ring are reaped by the lattice's polls. A read is cut into pieces so that no single completion
-holds a worker for long. An operation belongs to the thread that submitted it, and lattice workers
-live as long as the lattice. Other platforms get no `AsyncIo` yet; `io` is where another backend
-slots in, behind its own `cfg`.
+`AsyncIo` does file and socket I/O that holds no worker: `read`, `write`, `send`, `recv`, `accept`,
+`open_path` (and `open_file` with raw flags on Linux), `rename`, `send_to` and `connect` each
+return at once, and the operation's `IoDone` (its buffer back, and the bytes moved or the error)
+reaches the `IoThen` continuation, which builds the frame the source emits. Handles are the
+platform's: descriptors on Linux and Android, `HANDLE`s and `SOCKET`s on Windows (the aliases
+`RawFile`, `RawSock`, `OwnedFile` and `OwnedSock`). A read is cut into pieces so that no single
+completion holds a worker for long. The `AsyncIo` type is the same everywhere; an engine under it
+starts operations and finds their ends, and `io/mod.rs` does the rest.
+
+- **Linux and Android:** io_uring, with one ring per submitting thread. An operation belongs to the
+  thread that submitted it, and lattice workers live as long as the lattice.
+- **Windows:** one I/O completion port per `AsyncIo`, polled with a zero timeout, for every
+  operation, and one IoRing per submitting thread for file reads and writes where the OS has a
+  kernel ring (Windows 11; writes from 22H2; not one emulated in user mode). The ring functions are
+  looked up at run time, so the library still loads where they are missing, and each operation
+  falls back to the port on its own. `AsyncIoOptions { windows_ioring: false }` forces the port.
+  Windows has no asynchronous open or rename, so those run on the OS thread pool and post their
+  result to the port: the one place the crate uses threads it did not create. Handles must be
+  opened for overlapped I/O (`open_path` does, and so do Rust's sockets), and must not belong to
+  another completion port; a file handle that would block is refused. Tested on a real Windows by
+  [CI](../.github/workflows/windows.yml) on every push to the `graph` branch.
+- **macOS:** no engine yet.
 
 ### Device lanes and markers
 
@@ -179,6 +192,12 @@ arrived or were abandoned. Neither is a queue, and neither blocks.
 mise exec -- cargo test -p euhedral-graph
 mise exec -- cargo test -p euhedral-graph --no-default-features   # without AsyncIo
 ```
+
+The Windows engine's state machines run on every platform against a simulated `Sys` (the seam over
+the Windows calls, in `io/win/sim.rs`). Its real calls (`io/win/real.rs`) compile on Windows only;
+the workflow `.github/workflows/windows.yml` runs `cargo test -p euhedral-graph` on a
+`windows-2025` runner, where `io/win/live.rs` exercises files, loopback sockets, open and rename,
+each twice: with IoRing and forced onto the completion port.
 
 The tests are unit tests in each module (the stage graph's and `AsyncIo`'s drive their sources by
 hand), the fake device's, and `tests/credit_graph.rs`: one lattice of 4 workers, with a per-item

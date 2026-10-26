@@ -62,10 +62,25 @@ fn unit_then(tag: u64) -> Continuation<std::io::Result<()>> {
     })
 }
 
+/// What the engine should use on this machine: file reads and writes through a ring.
+fn expected_ring_use(windows_ioring: bool) -> (bool, bool) {
+    let Some(probe) = RealSys::new()
+        .ring_probe()
+        .filter(|p| windows_ioring && !p.emulated)
+    else {
+        return (false, false);
+    };
+    (
+        probe.read,
+        probe.write && probe.version >= super::sys::IORING_VERSION_3,
+    )
+}
+
 /// Runs a test body with IoRing (where the OS has it) and then forced onto the port.
 fn both(body: impl Fn(&Arc<AsyncIo>)) {
     for windows_ioring in [true, false] {
         let io = AsyncIo::open_with_options(AsyncIoOptions { windows_ioring }).unwrap();
+        assert_eq!(io.engine.ring_use(), expected_ring_use(windows_ioring));
         body(&io);
         assert_eq!(io.pending(), 0, "windows_ioring = {windows_ioring}");
     }
@@ -491,6 +506,12 @@ fn threads_submit_to_their_own_rings_and_every_read_ends_once() {
         for handle in handles {
             handle.join().unwrap();
         }
+        let rings = io.engine.rings.lock().unwrap().len();
+        assert_eq!(
+            rings,
+            if io.engine.ring_use().0 { 8 } else { 0 },
+            "a ring per submitting thread"
+        );
         for (i, done) in poll(io, 8).into_iter().enumerate() {
             let done = done.done.unwrap();
             assert_eq!(done.result.unwrap(), 4096);

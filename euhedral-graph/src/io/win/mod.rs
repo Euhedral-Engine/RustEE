@@ -272,7 +272,7 @@ impl Engine {
 
     /// Whether file reads and writes go through a ring (for tests).
     #[cfg(test)]
-    fn ring_use(&self) -> (bool, bool) {
+    pub(super) fn ring_use(&self) -> (bool, bool) {
         (self.ring_reads, self.ring_writes)
     }
 

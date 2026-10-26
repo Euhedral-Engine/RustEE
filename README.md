@@ -17,7 +17,7 @@ arm64 (Linux, macOS and Windows back ends) and is untested on mobile.
 | [`euhedral-hardware-utils`](euhedral-hardware-utils/README.md) | CPU topology, thread affinity, pinned executors and resource-pressure monitoring. |
 | [`euhedral-data-structures`](euhedral-data-structures/README.md) | Cache-line padded atomics and lock-free chunked queues. |
 | [`euhedral-hashing`](euhedral-hashing/README.md) | xxHash64 for routing keys, ordered-chain ids and vectors. |
-| [`euhedral-graph`](euhedral-graph/README.md) | No-wait dataflow on the lattice: completions, async I/O (io_uring), a sequencer, joins, device lanes and stage graphs. |
+| [`euhedral-graph`](euhedral-graph/README.md) | No-wait dataflow on the lattice: completions, async I/O (io_uring; IoRing and completion ports on Windows), a sequencer, joins, device lanes and stage graphs. |
 
 `euhedral-core` depends on the other three; they depend on none of each other. `euhedral-graph` builds
 on `euhedral-core`; nothing depends on it.

@@ -294,11 +294,17 @@ a source of frames.
 
 **AsyncIo** ([`AsyncIo`](euhedral-graph/src/io/mod.rs)): a `LatticeSource` of continuations behind
 file and socket operations. A submission returns at once; the lattice's polls reap the completions.
-io_uring on Linux and Android.
+io_uring on Linux and Android; IoRing and completion ports on Windows.
 
-**ring** ([`AsyncIo`](euhedral-graph/src/io/uring.rs)): an io_uring submission and completion queue
-pair. Each submitting thread has its own, so submitting never contends; an operation belongs to the
-ring of the thread that submitted it.
+**ring** ([`uring`](euhedral-graph/src/io/uring.rs), [`win`](euhedral-graph/src/io/win/mod.rs)): an
+io_uring (or Windows IoRing) submission and completion queue pair. Each submitting thread has its
+own, so submitting never contends; an operation belongs to the ring of the thread that submitted it.
+
+**completion port, IoRing** ([`win`](euhedral-graph/src/io/win/mod.rs)): the two engines of
+`AsyncIo` on Windows. A completion port collects the packets of overlapped calls and is polled with
+a zero timeout; IoRing is Windows' kernel ring for file reads and writes (Windows 11), used where
+the OS has one that is not emulated in user mode. Open and rename run on the OS thread pool and
+post to the port.
 
 **device lane, DeviceQueue** ([`DeviceQueue`](euhedral-graph/src/lanes.rs)): a device timeline that
 runs its submissions in order and whose progress is one cheap read (`completed`). A Vulkan queue

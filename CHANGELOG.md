@@ -3,6 +3,43 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## `AsyncIo` on Windows (2026-10-26)
+
+**What.** `euhedral-graph`'s `AsyncIo` gets a Windows engine: IoRing for file reads and writes where the OS has a kernel
+ring, and I/O completion ports for everything else (sockets, accept, connect, and files without a ring). Linux and
+Android keep io_uring. The portable half of `io` (the public API, the `LatticeSource` behaviour, the frames a pull's
+`stop` holds back) moved to `io/mod.rs`; the Linux engine and its tests are otherwise unchanged. The default feature is
+now `async-io` (it was `io-uring`).
+
+**Why.** MySphere's players run on Windows too, and `AsyncIo` was Linux-only.
+
+**API additions, on every platform.**
+- `RawFile`, `RawSock`, `OwnedFile` and `OwnedSock`: the platform's handles (descriptors on Linux and Android, `HANDLE` and
+  `SOCKET` on Windows). Linux signatures are unchanged.
+- `AsyncIo::open_path(path, OpenSpec, then)` with `OpenSpec { read, write, create: Create, unix_mode }`. `AsyncIo::open()`
+  stays the constructor, so the plan's "`AsyncIo::open(path, ..)`" is `open_path`; `open_file(path, flags, mode, then)`
+  stays on Linux and Android.
+- `AsyncIoOptions { windows_ioring }` with `AsyncIo::open_with_options`; the option is ignored off Windows.
+
+**Semantics on Windows.**
+- Each operation ends through a poll: the "skip the port on success" mode is not set. An overlapped call that fails at
+  once (no packet will come) ends with that error at the next poll.
+- A file operation uses a ring only if the probe says the OS has a kernel ring (not `IORING_FEATURE_UM_EMULATION`), the
+  operation is supported, and, for writes, the ring version is at least `IORING_VERSION_3`. Each kind falls back to the
+  port on its own. The IoRing functions are resolved with `LoadLibraryExW` and `GetProcAddress`, never linked, so the
+  library loads on Windows without them.
+- Open and rename run on the OS thread pool (`TrySubmitThreadpoolCallback`) and post their result to the port, so they
+  come out of the same poll. This is the one place the crate uses threads it did not create.
+- A handle joins the engine's port when its first operation is submitted and must not belong to another port. A file handle
+  opened without `FILE_FLAG_OVERLAPPED` is refused with `InvalidInput`.
+- A full ring submission queue goes to the ring's backlog and is handed over by a later submission or poll, as on Linux.
+
+**Tests.** 27 tests run on every platform against a simulated `Sys` (every operation's success, error and short transfers,
+the ring and its fallbacks, a full submission queue, the order across ring and port, a pull's `stop`). 12 run on Windows
+only (`io/win/live.rs`: files, loopback TCP and UDP, accept, connect, open and rename, threads each with a ring), each twice:
+with IoRing and forced onto the port. `.github/workflows/windows.yml` runs the crate's tests on a `windows-2025` runner on
+pushes to `graph`.
+
 ## Dataflow sources: `euhedral-graph` (2026-10-26)
 
 **What.** A new crate, [`euhedral-graph`](euhedral-graph/README.md), adds two kinds of `LatticeSource` that the
@@ -47,7 +84,7 @@ completions.after_marker(marker, Box::new(next_frame)); // next_frame runs once 
 - `QuantumOutcome` is how a quantum ended; it is not `frames::Outcome` (how a pipeline chain ended).
 - `AsyncIo` has one submission ring per submitting thread; an operation belongs to the thread that submitted it.
 
-**Tests.** 75 unit tests (`Completions`, `AsyncIo`, `Sequencer`, `Join`, `LanePool`, `StageGraph`, `FakeDevice`), the
+**Tests.** 75 unit tests at that point (`Completions`, `AsyncIo`, `Sequencer`, `Join`, `LanePool`, `StageGraph`, `FakeDevice`), the
 README doctests, and `tests/credit_graph.rs`: a 4-worker lattice running a per-item stage graph with a `Sequencer`, a
 `Join`, credit-bounded admission, a seek and a pause, which fails if a frame callback runs over 200 µs without the OS
 preempting it.
