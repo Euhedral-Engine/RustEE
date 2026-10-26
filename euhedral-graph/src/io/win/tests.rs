@@ -17,7 +17,8 @@ use super::sys::{
 use super::{Engine, MAX_PIECE};
 use crate::io::lock;
 use crate::io::{
-    AsyncIoOptions, Create, Engine as EngineTrait, Front, IoBuf, IoDone, OpenSpec, Request, Then,
+    AsyncIoOptions, Buf, Create, Engine as EngineTrait, Front, IoBuf, IoDone, IoDoneOwned,
+    OpenSpec, Region, Request, Then,
 };
 
 /// A completion frame: carries what the operation ended with.
@@ -25,6 +26,7 @@ struct Done {
     header: FrameHeader,
     done: Option<IoDone>,
     raw: Option<io::Result<usize>>,
+    owned: Option<IoDoneOwned<Vec<u8>>>,
 }
 
 impl Frame for Done {
@@ -43,8 +45,26 @@ fn io_then(tag: u64) -> Then {
             header: FrameHeader::new(tag),
             done: Some(done),
             raw: None,
+            owned: None,
         })
     }))
+}
+
+/// A read into caller-owned memory: the region of `memory`, and the continuation that holds it.
+fn owned_read(mut memory: Vec<u8>, tag: u64) -> (Buf, Then) {
+    let region = Region::of(&mut memory);
+    let then = Then::Owned(Box::new(move |result| {
+        Box::new(Done {
+            header: FrameHeader::new(tag),
+            done: None,
+            raw: None,
+            owned: Some(IoDoneOwned {
+                buf: memory,
+                result,
+            }),
+        })
+    }));
+    (Buf::Region(region), then)
 }
 
 fn raw_then(tag: u64) -> Then {
@@ -53,6 +73,7 @@ fn raw_then(tag: u64) -> Then {
             header: FrameHeader::new(tag),
             done: None,
             raw: Some(result),
+            owned: None,
         })
     }))
 }
@@ -98,7 +119,7 @@ impl Harness {
 
     fn submit(&self, request: Request, buf: IoBuf, then: Then) -> io::Result<()> {
         self.front.pending.fetch_add(1, Ordering::AcqRel);
-        let started = self.engine.submit(request, buf, then);
+        let started = self.engine.submit(request, buf.into(), then);
         if started.is_err() {
             self.front.pending.fetch_sub(1, Ordering::AcqRel);
         }
@@ -111,6 +132,18 @@ impl Harness {
             filled: 0,
         };
         self.submit(Request::Read { file, offset }, buf, io_then(tag))
+    }
+
+    fn read_owned(&self, file: Handle, offset: u64, memory: Vec<u8>, tag: u64) -> io::Result<()> {
+        let (buf, then) = owned_read(memory, tag);
+        self.front.pending.fetch_add(1, Ordering::AcqRel);
+        let started = self
+            .engine
+            .submit(Request::Read { file, offset }, buf, then);
+        if started.is_err() {
+            self.front.pending.fetch_sub(1, Ordering::AcqRel);
+        }
+        started
     }
 
     fn write(&self, file: Handle, offset: u64, bytes: &[u8], tag: u64) -> io::Result<()> {
@@ -1059,7 +1092,7 @@ fn a_ring_that_breaks_while_an_issuer_is_mid_call_cannot_touch_its_record() {
     let op = Engine::op(
         super::Kind::Read { file, offset: 0 },
         super::Route::Ring(ring.clone()),
-        buf,
+        buf.into(),
         io_then(2),
     );
     let held = h.engine.begin(op, super::State::Issuing).unwrap();
@@ -1067,7 +1100,7 @@ fn a_ring_that_breaks_while_an_issuer_is_mid_call_cannot_touch_its_record() {
     // The ring breaks now: the issuer's operation and its buffer are none of its business.
     h.engine.break_ring(&ring, &io::Error::from_raw_os_error(5));
     // SAFETY: the slot is `Issuing`: this test thread has the record.
-    let len = unsafe { (*held.rec.as_ptr()).op.as_ref().unwrap().buf.bytes.len() };
+    let len = unsafe { (*held.rec.as_ptr()).op.as_ref().unwrap().buf.len() };
     assert_eq!(len, 10, "the buffer was left alone");
     assert!(
         h.pull_with(&mut |_| false).is_empty(),
@@ -1169,7 +1202,8 @@ fn an_operation_ended_by_the_issuers_recheck_of_a_broken_ring_leaks_its_buffer()
         IoBuf {
             bytes: vec![0u8; 10],
             filled: 0,
-        },
+        }
+        .into(),
         io_then(2),
     );
     let held = h.engine.begin(op, super::State::Issuing).unwrap();
@@ -1186,7 +1220,7 @@ fn an_operation_ended_by_the_issuers_recheck_of_a_broken_ring_leaks_its_buffer()
                 .as_mut()
                 .unwrap()
                 .buf
-                .bytes
+                .bytes_mut()
                 .as_mut_ptr() as usize
         },
         len: 10,
@@ -1209,6 +1243,135 @@ fn an_operation_ended_by_the_issuers_recheck_of_a_broken_ring_leaks_its_buffer()
     assert!(
         done.buf.bytes.is_empty(),
         "the buffer the kernel may still write was not handed back"
+    );
+    assert_eq!(h.pending(), 0);
+}
+
+// ---- reads into caller-owned memory
+
+fn owned(done: Done) -> IoDoneOwned<Vec<u8>> {
+    done.owned.expect("a read into owned memory")
+}
+
+#[test]
+fn an_owned_read_is_cut_into_pieces_that_land_at_their_offsets() {
+    for ioring in [false, true] {
+        let h = Harness::with(Some(full_probe()), ioring, 4096);
+        let data = content(3 * 4096 + 123);
+        let file = h.sim.file(&data);
+        h.read_owned(file, 0, vec![0; data.len()], 1).unwrap();
+        let done = owned(h.one());
+        assert_eq!(done.result.unwrap(), data.len());
+        assert_eq!(done.buf, data);
+        let reads = h.sim.log().iter().filter(|l| l.starts_with("read")).count();
+        assert!(reads >= 4, "pieces of at most 4096 bytes: {reads}");
+        assert_eq!(h.pending(), 0);
+    }
+}
+
+#[test]
+fn an_owned_read_that_ends_inside_the_file_reports_its_count_and_one_past_it_fails_with_the_memory_back()
+ {
+    let h = Harness::new();
+    let data = content(100);
+    let file = h.sim.file(&data);
+    h.read_owned(file, 40, vec![0; 4096], 1).unwrap();
+    let done = owned(h.one());
+    assert_eq!(done.result.unwrap(), 60);
+    assert_eq!(done.buf.len(), 4096, "the whole memory comes back");
+    assert_eq!(&done.buf[..60], &data[40..]);
+    h.read_owned(file, 8192, vec![7; 64], 2).unwrap();
+    let done = owned(h.one());
+    assert_eq!(
+        done.result.unwrap_err().kind(),
+        io::ErrorKind::UnexpectedEof
+    );
+    assert_eq!(done.buf, [7; 64], "and so does the memory of a failed read");
+}
+
+#[test]
+fn an_owned_read_whose_ring_broke_leaks_its_memory_and_still_ends_with_a_frame() {
+    use std::sync::atomic::AtomicBool;
+
+    /// Tells when it is dropped.
+    struct Watched(Vec<u8>, Arc<AtomicBool>);
+    impl Drop for Watched {
+        fn drop(&mut self) {
+            self.1.store(true, Ordering::Release);
+        }
+    }
+
+    let h = Harness::with(Some(full_probe()), true, MAX_PIECE);
+    let file = h.sim.file(&content(100));
+    h.read(file, 0, 10, 1).unwrap(); // makes this thread's ring
+    h.drain(1);
+    let ring = h.engine.ring().unwrap();
+    let dropped = Arc::new(AtomicBool::new(false));
+    let ran = Arc::new(AtomicBool::new(false));
+    let mut memory = Watched(vec![0u8; 10], dropped.clone());
+    let region = Region::of(&mut memory.0);
+    let continuation = ran.clone();
+    let then = Then::Owned(Box::new(move |_| {
+        continuation.store(true, Ordering::Release);
+        drop(memory);
+        Box::new(Done {
+            header: FrameHeader::new(2),
+            done: None,
+            raw: None,
+            owned: None,
+        })
+    }));
+    let op = Engine::op(
+        super::Kind::Read { file, offset: 0 },
+        super::Route::Ring(ring.clone()),
+        Buf::Region(region),
+        then,
+    );
+    let held = h.engine.begin(op, super::State::Issuing).unwrap();
+    h.front.pending.fetch_add(1, Ordering::AcqRel);
+    h.engine.set_state(held, super::State::InFlight);
+    let entry = super::Entry {
+        write: false,
+        file,
+        // SAFETY: the slot is `InFlight` with nothing else touching the record in this test.
+        buf: unsafe {
+            (*held.rec.as_ptr())
+                .op
+                .as_mut()
+                .unwrap()
+                .buf
+                .bytes_mut()
+                .as_mut_ptr() as usize
+        },
+        len: 10,
+        offset: 0,
+        user_data: super::token(held.slot, held.generation),
+    };
+    lock(&ring.backlog).push_back(entry);
+    h.engine.flush_ring(&ring);
+    ring.broken.store(true, Ordering::Release);
+    h.engine.end_if_broken(&ring, entry.user_data);
+    let mut frames = Vec::new();
+    h.front.reap(
+        &*h.engine,
+        &mut |frame| frames.push(frame),
+        &mut |_| false,
+        u64::MAX,
+    );
+    assert_eq!(frames.len(), 1, "an empty frame ended it");
+    assert!(
+        (frames.pop().unwrap() as Box<dyn std::any::Any>)
+            .downcast::<Done>()
+            .is_err(),
+        "and it is not the continuation's"
+    );
+    assert!(
+        !ran.load(Ordering::Acquire),
+        "the continuation holding the memory did not run"
+    );
+    assert!(
+        !dropped.load(Ordering::Acquire),
+        "the memory the kernel may still write was not dropped"
     );
     assert_eq!(h.pending(), 0);
 }

@@ -11,6 +11,11 @@
 //! | Windows | IoRing for file reads and writes where the OS has a kernel ring, I/O completion ports for everything else | `win` |
 //!
 //! The feature `async-io` (default) builds this module. macOS has no engine yet.
+//!
+//! Unsafe code lives here and in the engines, nowhere else in the crate: the handle conversions, and
+//! the [`IoMemory`] contract that lets an operation read into memory the caller owns (`// SAFETY:` on
+//! every block).
+#![allow(unsafe_code)]
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -19,7 +24,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use euhedral_core::frames::Frame;
+use euhedral_core::frames::{Frame, RunnableFrame};
 use euhedral_core::generics::{LatticeReceiver, LatticeSource};
 
 use crate::Continuation;
@@ -76,6 +81,66 @@ pub struct IoDone {
 
 /// What continues an operation once it ended.
 pub type IoThen = Continuation<IoDone>;
+
+/// Memory the caller owns, that [`AsyncIo::read_into`] reads into: a pinned host arena, a mapped
+/// region, or any block the kernel may fill. The operation owns the value until it ends, and its
+/// continuation gets it back in an [`IoDoneOwned`].
+///
+/// # Safety
+///
+/// The engine hands the region to the kernel, which writes it while the operation runs, at times
+/// the program cannot observe. So the implementor promises, for the whole time from the call of
+/// [`as_mut_ptr`](Self::as_mut_ptr) until the value is dropped or handed back in
+/// [`IoDoneOwned::buf`]:
+///
+/// - the pointer addresses [`len`](Self::len) bytes that are allocated, **initialized**, valid for
+///   reads and writes, and not freed, remapped or reused;
+/// - **moving the value does not move the region** (the pointer stays valid after the value moved
+///   into the operation): a value that owns its memory through a heap block or a mapping, such as
+///   `Vec<u8>`, does; a value that holds the bytes inline does not, and must not implement this
+///   trait;
+/// - the region is exclusively the operation's: nothing else, in this process or another, reads or
+///   writes it (so a region of a shared arena must be one no other value refers to), and the value
+///   itself touches it only through the pointer;
+/// - `len` does not change, and both methods are called once, when the read is submitted.
+///
+/// The engine promises that the value is dropped or returned only after the kernel can no longer
+/// touch the region. When it cannot tell (a ring that broke), it **leaks** the value instead: the
+/// continuation does not run, the value is never dropped, and the operation ends with a frame that
+/// does nothing, so that [`AsyncIo::pending`] still drains.
+pub unsafe trait IoMemory: Send + 'static {
+    /// The start of the region.
+    fn as_mut_ptr(&mut self) -> *mut u8;
+
+    /// The region's length in bytes.
+    fn len(&self) -> usize;
+
+    /// Whether the region has no bytes (a read into one is refused).
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+// SAFETY: a `Vec`'s elements live in one heap block that stays where it is when the `Vec` moves;
+// `len` initialized bytes are valid for reads and writes; the `Vec` owns the block exclusively.
+unsafe impl IoMemory for Vec<u8> {
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        Vec::as_mut_ptr(self)
+    }
+
+    fn len(&self) -> usize {
+        Vec::len(self)
+    }
+}
+
+/// A finished read into caller-owned memory: the memory back, and the bytes moved or the error.
+/// The memory is returned whether the read succeeded or failed, except when it had to be leaked
+/// (see [`IoMemory`]).
+#[derive(Debug)]
+pub struct IoDoneOwned<B> {
+    pub buf: B,
+    pub result: io::Result<usize>,
+}
 
 /// What [`AsyncIo::open_path`] does about a file that exists or is missing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -190,13 +255,151 @@ pub(crate) enum Then {
     /// Accept and open (the result is a new handle's raw value), rename and connect (the value is
     /// unused).
     Raw(Box<dyn FnOnce(io::Result<usize>) -> Box<dyn Frame> + Send>),
+    /// A read into caller-owned memory: the closure holds the [`IoMemory`] value that the
+    /// operation's [`Buf::Region`] points into.
+    Owned(Box<dyn FnOnce(io::Result<usize>) -> Box<dyn Frame> + Send>),
+}
+
+/// The memory of an operation, as an engine sees it.
+pub(crate) enum Buf {
+    /// The buffer of [`IoBuf`], owned here.
+    Vec(IoBuf),
+    /// Caller-owned memory, owned by the operation's [`Then::Owned`].
+    Region(Region),
+}
+
+impl From<IoBuf> for Buf {
+    fn from(buf: IoBuf) -> Self {
+        Self::Vec(buf)
+    }
+}
+
+/// A view of an [`IoMemory`] value's region. The value is held by the operation's continuation, so
+/// the region outlives every use the engine makes of it unless the operation is leaked (then the
+/// value is too, see [`Buf::leak`]).
+pub(crate) struct Region {
+    ptr: *mut u8,
+    len: usize,
+    filled: usize,
+    leaked: bool,
+}
+
+// SAFETY: the region is exclusively the operation's (the `IoMemory` contract), and an operation is
+// used by one thread at a time (or by the kernel).
+unsafe impl Send for Region {}
+
+impl Region {
+    /// The region of `memory`, which must stay alive (and in place) for as long as the view is
+    /// used.
+    pub(crate) fn of<B: IoMemory>(memory: &mut B) -> Self {
+        Self {
+            ptr: memory.as_mut_ptr(),
+            len: memory.len(),
+            filled: 0,
+            leaked: false,
+        }
+    }
+}
+
+impl Buf {
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::Vec(buf) => buf.bytes.len(),
+            Self::Region(region) => region.len,
+        }
+    }
+
+    pub(crate) fn filled(&self) -> usize {
+        match self {
+            Self::Vec(buf) => buf.filled,
+            Self::Region(region) => region.filled,
+        }
+    }
+
+    pub(crate) fn set_filled(&mut self, filled: usize) {
+        match self {
+            Self::Vec(buf) => buf.filled = filled,
+            Self::Region(region) => region.filled = filled,
+        }
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Vec(buf) => &buf.bytes,
+            // SAFETY: the `IoMemory` contract: `len` initialized bytes, exclusively the operation's,
+            // alive while the operation's continuation holds the value.
+            Self::Region(region) => unsafe { std::slice::from_raw_parts(region.ptr, region.len) },
+        }
+    }
+
+    pub(crate) fn bytes_mut(&mut self) -> &mut [u8] {
+        match self {
+            Self::Vec(buf) => &mut buf.bytes,
+            // SAFETY: as in `bytes`; `&mut self` makes the view unique.
+            Self::Region(region) => unsafe {
+                std::slice::from_raw_parts_mut(region.ptr, region.len)
+            },
+        }
+    }
+
+    /// The kernel may still write the memory, so it must never be freed or returned: a buffer is
+    /// leaked and the operation ends with an empty one; caller-owned memory is marked, and
+    /// [`conclude`] then leaks the value its continuation holds.
+    #[cfg_attr(
+        not(windows),
+        allow(
+            dead_code,
+            reason = "only the Windows engine ends operations that may still be in the kernel"
+        )
+    )]
+    pub(crate) fn leak(&mut self) {
+        match self {
+            Self::Vec(buf) => std::mem::forget(std::mem::take(&mut buf.bytes)),
+            Self::Region(region) => region.leaked = true,
+        }
+    }
+
+    /// Whether the continuation of this operation must be leaked rather than run.
+    fn is_leaked(&self) -> bool {
+        matches!(self, Self::Region(Region { leaked: true, .. }))
+    }
+}
+
+/// The continuation's frame for an ended operation, the part the engines share. `fills` says the
+/// operation was a read or receive, whose success `Ok(n)` is how many bytes arrived.
+pub(crate) fn conclude(
+    mut buf: Buf,
+    then: Then,
+    fills: bool,
+    result: io::Result<usize>,
+) -> Box<dyn Frame> {
+    match then {
+        Then::Io(then) => {
+            if fills && let Ok(n) = result {
+                buf.set_filled(n);
+            }
+            let Buf::Vec(buf) = buf else {
+                unreachable!("an IoThen is paired with an IoBuf")
+            };
+            then(IoDone { buf, result })
+        }
+        Then::Raw(then) => then(result),
+        Then::Owned(then) => {
+            if buf.is_leaked() {
+                // The kernel may still write the region: the value that owns it is never dropped.
+                std::mem::forget(then);
+                return Box::new(RunnableFrame::new(0, Arc::new(|| {})));
+            }
+            then(result)
+        }
+    }
 }
 
 /// The platform's half of [`AsyncIo`]: it starts operations and finds their ends.
 pub(crate) trait Engine: Send + Sync {
     /// Starts the operation and returns at once. On `Err`, nothing was started: `then` and the
     /// buffer are dropped without running.
-    fn submit(&self, request: Request, buf: IoBuf, then: Then) -> io::Result<()>;
+    fn submit(&self, request: Request, buf: Buf, then: Then) -> io::Result<()>;
 
     /// Finds ended operations. Each is given to `offer` as its continuation's frame while `room`
     /// says the caller can take more; once `offer` returns `false` (it kept the frame), the engine
@@ -407,7 +610,7 @@ impl AsyncIo {
         })
     }
 
-    fn submit(&self, request: Request, buf: IoBuf, then: Then) -> io::Result<()> {
+    fn submit(&self, request: Request, buf: Buf, then: Then) -> io::Result<()> {
         if self.front.complete.load(Ordering::Acquire) {
             return Err(io::Error::other("this AsyncIo is complete"));
         }
@@ -427,7 +630,36 @@ impl AsyncIo {
             return Err(invalid("a read into an empty buffer"));
         }
         let file = raw_file(file);
-        self.submit(Request::Read { file, offset }, buf, Then::Io(then))
+        self.submit(Request::Read { file, offset }, buf.into(), Then::Io(then))
+    }
+
+    /// Reads into memory the caller owns: up to `buf.len()` bytes at `offset` of `file`, straight
+    /// into the region `buf` addresses (a pinned arena, say), with no copy. `buf` belongs to the
+    /// operation until it ends and comes back in the [`IoDoneOwned`] that `then` receives, whether
+    /// the read succeeded or failed.
+    ///
+    /// The result is as [`read`](Self::read)'s: `Ok(n)` with `n` the region's length, or less if
+    /// the file ended after some bytes (the first `n` bytes of the region are the file's); a read
+    /// that finds no bytes at all fails with `UnexpectedEof`. The region is cut into pieces as a
+    /// `read`'s buffer is, and the pieces land at their own offsets. A submission that returns `Err`
+    /// started nothing: `buf` and `then` are dropped without running, and an empty region is
+    /// refused. If the engine can no longer tell whether the kernel still writes the region (a
+    /// ring that broke), `buf` is leaked and `then` does not run (see [`IoMemory`]).
+    pub fn read_into<B: IoMemory>(
+        &self,
+        file: RawFile,
+        offset: u64,
+        mut buf: B,
+        then: Continuation<IoDoneOwned<B>>,
+    ) -> io::Result<()> {
+        if buf.is_empty() {
+            return Err(invalid("a read into an empty region"));
+        }
+        let region = Region::of(&mut buf);
+        let file = raw_file(file);
+        // The closure keeps `buf` alive and in place until the operation ends.
+        let then = Then::Owned(Box::new(move |result| then(IoDoneOwned { buf, result })));
+        self.submit(Request::Read { file, offset }, Buf::Region(region), then)
     }
 
     /// Writes `buf.bytes[..buf.filled]` at `offset` of `file`.
@@ -436,7 +668,7 @@ impl AsyncIo {
             return Err(invalid("a write needs 1..=bytes.len() bytes to write"));
         }
         let file = raw_file(file);
-        self.submit(Request::Write { file, offset }, buf, Then::Io(then))
+        self.submit(Request::Write { file, offset }, buf.into(), Then::Io(then))
     }
 
     /// Sends `buf.bytes[..buf.filled]` on a connected socket.
@@ -445,13 +677,13 @@ impl AsyncIo {
             return Err(invalid("filled is beyond the buffer"));
         }
         let sock = raw_sock(socket);
-        self.submit(Request::Send { sock }, buf, Then::Io(then))
+        self.submit(Request::Send { sock }, buf.into(), Then::Io(then))
     }
 
     /// Receives into `buf.bytes` from a connected socket; `Ok(0)` is the peer's end of stream.
     pub fn recv(&self, socket: RawSock, buf: IoBuf, then: IoThen) -> io::Result<()> {
         let sock = raw_sock(socket);
-        self.submit(Request::Recv { sock }, buf, Then::Io(then))
+        self.submit(Request::Recv { sock }, buf.into(), Then::Io(then))
     }
 
     /// Accepts one connection on a listening socket.
@@ -462,7 +694,7 @@ impl AsyncIo {
     ) -> io::Result<()> {
         let listener = raw_sock(listener);
         let then = Then::Raw(Box::new(move |result| then(result.map(owned_sock))));
-        self.submit(Request::Accept { listener }, IoBuf::default(), then)
+        self.submit(Request::Accept { listener }, IoBuf::default().into(), then)
     }
 
     /// Opens `path` as `spec` says. The file is opened for overlapped I/O on Windows. The open
@@ -482,7 +714,7 @@ impl AsyncIo {
             spec,
         };
         let then = Then::Raw(Box::new(move |result| then(result.map(owned_file))));
-        self.submit(request, IoBuf::default(), then)
+        self.submit(request, IoBuf::default().into(), then)
     }
 
     /// Opens `path` with `open(2)` `flags` (`O_CLOEXEC` is always added) and `mode` for a created
@@ -502,7 +734,7 @@ impl AsyncIo {
             mode,
         };
         let then = Then::Raw(Box::new(move |result| then(result.map(owned_file))));
-        self.submit(request, IoBuf::default(), then)
+        self.submit(request, IoBuf::default().into(), then)
     }
 
     /// Renames `from` to `to`, replacing `to` atomically if it exists (`renameat(2)`; on Windows
@@ -518,7 +750,7 @@ impl AsyncIo {
             to: to.to_owned(),
         };
         let then = Then::Raw(Box::new(move |result| then(result.map(|_| ()))));
-        self.submit(request, IoBuf::default(), then)
+        self.submit(request, IoBuf::default().into(), then)
     }
 
     /// Sends one datagram to `to`.
@@ -533,7 +765,7 @@ impl AsyncIo {
             return Err(invalid("filled is beyond the buffer"));
         }
         let sock = raw_sock(socket);
-        self.submit(Request::SendTo { sock, to }, buf, Then::Io(then))
+        self.submit(Request::SendTo { sock, to }, buf.into(), Then::Io(then))
     }
 
     /// Connects a stream socket (made by the caller, blocking or not: the engine waits for the
@@ -547,7 +779,7 @@ impl AsyncIo {
     ) -> io::Result<()> {
         let sock = raw_sock(socket);
         let then = Then::Raw(Box::new(move |result| then(result.map(|_| ()))));
-        self.submit(Request::Connect { sock, to }, IoBuf::default(), then)
+        self.submit(Request::Connect { sock, to }, IoBuf::default().into(), then)
     }
 
     /// Operations in flight.

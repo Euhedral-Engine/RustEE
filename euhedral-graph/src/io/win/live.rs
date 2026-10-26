@@ -20,7 +20,8 @@ use super::real::RealSys;
 use super::sys::Sys;
 use crate::Continuation;
 use crate::io::{
-    AsyncIo, AsyncIoOptions, Create, IoBuf, IoDone, IoThen, OpenSpec, OwnedFile, OwnedSock,
+    AsyncIo, AsyncIoOptions, Create, IoBuf, IoDone, IoDoneOwned, IoThen, OpenSpec, OwnedFile,
+    OwnedSock,
 };
 
 const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
@@ -183,6 +184,54 @@ fn a_file_read_in_several_pieces_and_a_tail_that_ends_inside() {
         let b = done[1].done.as_ref().unwrap();
         assert_eq!(b.result.as_ref().unwrap(), &(data.len() - 100));
         assert_eq!(&b.buf.bytes[..b.buf.filled], &data[100..]);
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+    });
+}
+
+/// Reads into memory the caller owns: cut into pieces, short at the end of the file, and
+/// returned on failure.
+#[test]
+fn a_read_into_owned_memory_lands_in_place_and_returns_the_memory() {
+    both(|io| {
+        let data = content(3 * 256 * 1024 + 4321, 4);
+        let (path, file) = overlapped_file("owned", &data);
+        let landed = Arc::new(Mutex::new(Vec::<(u64, IoDoneOwned<Vec<u8>>)>::new()));
+        let read = |offset: u64, len: usize, tag: u64| {
+            let landed = landed.clone();
+            io.read_into(
+                file.as_raw_handle(),
+                offset,
+                vec![0xAA; len],
+                Box::new(move |done| {
+                    landed.lock().unwrap().push((tag, done));
+                    Box::new(Done {
+                        header: FrameHeader::new(tag),
+                        done: None,
+                        raw: None,
+                    })
+                }),
+            )
+            .unwrap();
+        };
+        read(0, data.len(), 1);
+        read(100, data.len(), 2);
+        read(1 << 30, 64, 3);
+        poll(io, 3);
+        let mut landed = std::mem::take(&mut *landed.lock().unwrap());
+        landed.sort_by_key(|(tag, _)| *tag);
+        let [(_, whole), (_, tail), (_, past)] = &mut landed[..] else {
+            panic!("three reads ended");
+        };
+        assert_eq!(whole.result.as_ref().unwrap(), &data.len());
+        assert_eq!(whole.buf, data);
+        assert_eq!(tail.result.as_ref().unwrap(), &(data.len() - 100));
+        assert_eq!(&tail.buf[..data.len() - 100], &data[100..]);
+        assert_eq!(
+            past.result.as_ref().unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+        assert_eq!(past.buf, [0xAA; 64]);
         drop(file);
         std::fs::remove_file(path).unwrap();
     });

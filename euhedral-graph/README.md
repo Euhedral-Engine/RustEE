@@ -20,7 +20,7 @@ so it needs no thread of its own. It does not re-export `euhedral-core`: import 
 | Module | Main types |
 |---|---|
 | [`completions`](src/completions.rs) | `Completions`, a `LatticeSource` of continuation frames behind completions: markers, timers, `Ready` tokens and `Pending` operations. |
-| [`io`](src/io/mod.rs) | `AsyncIo`, a `LatticeSource` of continuations behind file and socket operations, with `IoBuf`, `IoDone`, `IoThen`, `OpenSpec` (`Create`), `AsyncIoOptions` and the handle aliases `RawFile`, `RawSock`, `OwnedFile` and `OwnedSock`. io_uring on Linux and Android ([`uring`](src/io/uring.rs)); IoRing and completion ports on Windows ([`win`](src/io/win/mod.rs)); none on macOS yet. Feature `async-io` (default). |
+| [`io`](src/io/mod.rs) | `AsyncIo`, a `LatticeSource` of continuations behind file and socket operations, with `IoBuf`, `IoDone`, `IoThen`, `IoMemory`, `IoDoneOwned`, `OpenSpec` (`Create`), `AsyncIoOptions` and the handle aliases `RawFile`, `RawSock`, `OwnedFile` and `OwnedSock`. io_uring on Linux and Android ([`uring`](src/io/uring.rs)); IoRing and completion ports on Windows ([`win`](src/io/win/mod.rs)); none on macOS yet. Feature `async-io` (default). |
 | [`sequencer`](src/sequencer.rs) | `Sequencer` and `Slot`: execute in any order, release in admission order. |
 | [`join`](src/join.rs) | `Join`: a continuation that runs when its last part arrives. |
 | [`lanes`](src/lanes.rs) | `LanePool`, `LaneId`, `Marker` and the trait `DeviceQueue`: device timelines that are queried, never waited on. |
@@ -128,6 +128,18 @@ platform's: descriptors on Linux and Android, `HANDLE`s and `SOCKET`s on Windows
 `RawFile`, `RawSock`, `OwnedFile` and `OwnedSock`). A read is cut into pieces so that no single
 completion holds a worker for long. The `AsyncIo` type is the same everywhere; an engine under it
 starts operations and finds their ends, and `io/mod.rs` does the rest.
+
+**Reads into memory you own.** `read_into(file, offset, buf, then)` reads straight into a region the
+caller owns, such as a pinned host arena, so the bytes land in place with no copy. `buf` is any
+`IoMemory`: an `unsafe` trait whose implementor promises that the region is initialized, stays put
+when the value moves, and is exclusively the operation's from submission until `then` gets the value
+back in an `IoDoneOwned { buf, result }` (`Vec<u8>` implements it). The result is a `read`'s: `Ok(n)`
+with `n` the region's length or less where the file ended, `UnexpectedEof` for a read that finds no
+bytes, and the memory comes back whether the read succeeded or failed. The region is cut into
+pieces internally, each landing at its own offset. The one case where the memory does not come back
+is a ring that broke while the kernel may still have been writing it: the value is leaked, `then`
+does not run, and an empty frame ends the operation so that `pending()` drains. `read` stays as it
+was, for a `Vec`-backed `IoBuf`.
 
 - **Linux and Android:** io_uring, with one ring per submitting thread. An operation belongs to the
   thread that submitted it, and lattice workers live as long as the lattice.
