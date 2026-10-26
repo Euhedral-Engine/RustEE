@@ -269,6 +269,94 @@ contention half-life. The default is adaptive: a fitted model (`cache_local_boun
 contention, productive handles per worker and body cost. `IdlePolicy::fixed` always uses the same
 park; prefer it for graphics loops, because the adaptive timing is not built for predictable timing.
 
+## Dataflow
+
+The terms of [`euhedral-graph`](euhedral-graph/README.md): work that is submitted, never waited
+for, and continues on a completion.
+
+**completion token, Ready, Pending** ([`Ready`](euhedral-graph/src/completions.rs),
+[`Pending`](euhedral-graph/src/completions.rs)): what says an operation has completed. A `Ready` is
+one cheap query (`is_ready`) that never blocks; a `Pending` is polled until it yields the
+continuation frame, for a completion that carries a result. A device lane's marker and a timer's
+deadline are completion tokens too.
+
+**continuation** ([`Continuation`](euhedral-graph/src/lib.rs),
+[`IoThen`](euhedral-graph/src/io/mod.rs)): the frame (or the closure that builds it) that carries
+on the work once an operation completed. The source emits it, and the lattice runs it like any
+other frame.
+
+**Completions** ([`Completions`](euhedral-graph/src/completions.rs)): a `LatticeSource` of
+continuation frames behind completion tokens. The lattice's polls query each pending token once and
+emit the continuations of those that completed, in registration order; nothing waits and there is
+no timer thread. Not `Completion` of a pipeline chain (the owner notification in
+[`frames::pipeline`](euhedral-core/src/frames/pipeline.rs)): that is an event on one chain, this is
+a source of frames.
+
+**AsyncIo** ([`AsyncIo`](euhedral-graph/src/io/mod.rs)): a `LatticeSource` of continuations behind
+file and socket operations. A submission returns at once; the lattice's polls reap the completions.
+io_uring on Linux and Android.
+
+**ring** ([`AsyncIo`](euhedral-graph/src/io/uring.rs)): an io_uring submission and completion queue
+pair. Each submitting thread has its own, so submitting never contends; an operation belongs to the
+ring of the thread that submitted it.
+
+**device lane, DeviceQueue** ([`DeviceQueue`](euhedral-graph/src/lanes.rs)): a device timeline that
+runs its submissions in order and whose progress is one cheap read (`completed`). A Vulkan queue
+with a timeline semaphore, a CUDA stream with events, a hardware codec engine, or a fake
+([`FakeDevice`](euhedral-graph/src/testing.rs)).
+
+**marker** ([`Marker`](euhedral-graph/src/lanes.rs)): a lane and a value on its timeline: the lane's
+work up to that value. Copyable; querying it never blocks. A successor on another lane orders itself
+behind a marker on the device.
+
+**LanePool** ([`LanePool`](euhedral-graph/src/lanes.rs), [`LaneId`](euhedral-graph/src/lanes.rs)):
+the device lanes shared by every graph of a process. `reached` says whether a marker's work has
+completed; `choose` picks a stage's lane, continuing its predecessor's when allowed.
+
+**submission edge, completion edge, external edge**
+([`EdgeKind`](euhedral-graph/src/graph.rs), [`ExternalEdge`](euhedral-graph/src/graph.rs)): when a
+stage's successor may run. A submission edge is satisfied when the predecessor submitted (the
+successor waits on the device); a completion edge when the predecessor's work completed, found by a
+`Completions` poll. An external edge makes a stage of a new quantum depend on a stage of an earlier
+quantum.
+
+**stage** ([`Stage`](euhedral-graph/src/graph.rs), [`StageSpec`](euhedral-graph/src/graph.rs)): one
+step of a stage graph, run once per quantum. It computes or submits and returns a
+[`Submitted`](euhedral-graph/src/graph.rs); it never waits. It may be ordered (its frames run in
+the order they are published) and may name the lanes able to run its work.
+
+**quantum** ([`StageGraph`](euhedral-graph/src/graph.rs)): the unit of work a stage graph is started
+for, carrying whatever the caller's stages need. It has a kill switch of its own and ends with a
+[`QuantumOutcome`](euhedral-graph/src/graph.rs): `Completed`, `Failed` or `Killed`.
+
+**live count** ([`StageGraph::live`](euhedral-graph/src/graph.rs)): the quanta started and not yet
+retired. Each quantum also counts its own published frames and armed completion edges; at zero no
+stage can run again.
+
+**retirement boundary, retirement** ([`StageGraph`](euhedral-graph/src/graph.rs)): the latest marker
+per lane of everything a quantum submitted, and every host completion no completion edge consumed.
+A quantum retires, handing itself and its outcome to the graph's `retire` callback, once none of its
+frames can run again and the boundary is reached. The boundary is armed as a `Completions` edge.
+
+**QuantumRef pin** ([`QuantumRef`](euhedral-graph/src/graph.rs)): a handle from `start` that keeps a
+quantum from retiring while any clone lives, so a later quantum's external edge can still use its
+results. Drop it when nothing will depend on the quantum.
+
+**retry backstop** ([`GraphRuntime::retry_backstop`](euhedral-graph/src/graph.rs),
+[`DEFAULT_RETRY_BACKSTOP`](euhedral-graph/src/graph.rs)): a stage that answers `StageError::Retry`
+runs again when any lane of the pool made progress, or after this deadline (20 ms by default) for a
+resource outside the pool. Set it longer than any one pass on your devices.
+
+**Sequencer, slot, releaser** ([`Sequencer`](euhedral-graph/src/sequencer.rs),
+[`Slot`](euhedral-graph/src/sequencer.rs)): execute in any order, release in admission order.
+`register` takes a slot in admission order; a slot is completed with a value or abandoned (dropping
+it abandons it). The **releaser** is the one thread at a time (a work-in-progress counter) that
+passes the prefix of finished slots to `emit`, in order, on its own thread.
+
+**Join, join part** ([`Join`](euhedral-graph/src/join.rs)): a fan-in that waits for no one. Each
+part arrives with a value or is abandoned, from any thread, and the last arrival runs the
+continuation once with every part's value (`None` for an abandoned part).
+
 ## Metrics
 
 **metrics, MetricsRegistry** ([`metrics`](euhedral-core/src/metrics/mod.rs),

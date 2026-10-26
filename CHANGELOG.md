@@ -3,6 +3,55 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## Dataflow sources: `euhedral-graph` (2026-10-26)
+
+**What.** A new crate, [`euhedral-graph`](euhedral-graph/README.md), adds two kinds of `LatticeSource` that the
+lattice's own polls drive, and the structures built on them: `Completions` (continuation frames behind markers,
+timers and completion tokens), `AsyncIo` (io_uring file and socket operations whose completions are frames; Linux and
+Android), `Sequencer`, `Join`, `LanePool` with `DeviceQueue` and `Marker`, and `StageGraph`. They are ports of
+Euhedral-Inference's `runtime.graph` package (`StageGraph`, `LanePool`, `Join`, `AsyncReads`) and
+`quantization.lattice` (`GpuCompletions`), and of Euhedral-Execution's `FrameSequencer`. `euhedral-core` is unchanged.
+
+**Why.** A frame must not wait: a worker is a core. Work that finishes elsewhere (a device queue, a file, a socket, a
+deadline) was left to the application to poll by hand. These sources make the completion itself a frame: the lattice
+polls the source like any other, and the continuation runs on whichever worker it is routed to.
+
+**How to use it.**
+```rust
+let (lanes, devices) = FakeDevice::pool(&["compute"]); // or your own DeviceQueue lanes
+let completions = Completions::new(lanes.clone());
+lattice.add_upstream(completions.clone())?;
+let marker = devices[0].submit(cost, &[]);            // submit; this returns at once
+completions.after_marker(marker, Box::new(next_frame)); // next_frame runs once the marker is reached
+```
+- A `StageGraph<Q>` runs a static DAG of stages per quantum `Q`, with submission, completion and external edges, a
+  kill switch per quantum and a `retire` callback that receives the `QuantumOutcome`. Its stage frames go to a
+  `QueueIngestSink`; ordered stages use the id hash (`StageSpec::ordered`), unordered ones `randomize_hash`. Frames keep
+  the default routing policy.
+- `GraphRuntime::retry_backstop` (default `DEFAULT_RETRY_BACKSTOP`, 20 ms) bounds how long a retried stage waits for
+  a lane's progress.
+- Features: `io-uring` (default; `AsyncIo`, Linux and Android only) and `testing` (`testing::FakeDevice`). Windows and
+  macOS get everything but `AsyncIo` for now.
+
+**Semantics.**
+- `Completions` queries each pending token once per poll, emits continuations in registration order and honours the
+  pull's `stop` (ordered frames go out through `request`'s pushes and the lattice's routing, so ordered lanes keep
+  registration order). A frame whose kill switch is set is emitted anyway: the executor skips it and runs its
+  `do_finally`, so `pending()` drains to zero. A registration after `complete` finishes its frame through `do_finally`
+  and fails a debug assertion.
+- `Completions::lateness_us` reports `(p50, p99, max)` in µs, each rounded up, from a `metrics::Histogram`: the maximum
+  is exact, the percentiles are interpolated within a bucket (a quarter of the value wide).
+- A `StageGraph` never scans for ready work: the last arrival at a stage publishes it. A quantum retires once none of
+  its frames can run again and every lane it used reached its last marker, and not before every `QuantumRef` clone was
+  dropped.
+- `QuantumOutcome` is how a quantum ended; it is not `frames::Outcome` (how a pipeline chain ended).
+- `AsyncIo` has one submission ring per submitting thread; an operation belongs to the thread that submitted it.
+
+**Tests.** 75 unit tests (`Completions`, `AsyncIo`, `Sequencer`, `Join`, `LanePool`, `StageGraph`, `FakeDevice`), the
+README doctests, and `tests/credit_graph.rs`: a 4-worker lattice running a per-item stage graph with a `Sequencer`, a
+`Join`, credit-bounded admission, a seek and a pause, which fails if a frame callback runs over 200 µs without the OS
+preempting it.
+
 ## Metrics restored (2026-10-24)
 
 **What.** `euhedral-core` gets a [`metrics`](euhedral-core/src/metrics/mod.rs) module, the port of upstream's
