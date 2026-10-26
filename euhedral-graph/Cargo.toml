@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "No-wait dataflow on the Euhedral control plane: completions, async I/O, sequencing, joins, device lanes and stage graphs"
 readme = "README.md"
+license = "Apache-2.0"
 
 [features]
 default = ["async-io"]

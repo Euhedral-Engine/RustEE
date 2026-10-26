@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "CPU topology, thread affinity, pinned executors and resource-pressure monitoring for Euhedral"
 readme = "README.md"
+license = "Apache-2.0"
 
 [dependencies]
 log = "0.4.29"
