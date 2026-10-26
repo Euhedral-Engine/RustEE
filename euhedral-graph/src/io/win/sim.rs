@@ -67,7 +67,9 @@ struct State {
     fs: HashMap<PathBuf, Vec<u8>>,
     port: VecDeque<Packet>,
     hold: bool,
-    held_packets: Vec<Packet>,
+    held_packets: Vec<(Packet, i32)>,
+    /// Bytes a warning completion of a receive delivered.
+    partial: usize,
     held_cqes: Vec<(Handle, Cqe)>,
     cap: usize,
     fail_issue: VecDeque<(Op, io::Error)>,
@@ -262,11 +264,11 @@ impl Sim {
         let mut s = self.s();
         s.hold = false;
         let packets = std::mem::take(&mut s.held_packets);
-        for packet in &packets {
+        for (packet, status) in &packets {
             // SAFETY: the held operation's `OVERLAPPED` is valid until its packet is handled.
-            unsafe { Self::complete_overlapped(packet) };
+            unsafe { Self::complete_overlapped(packet, *status) };
         }
-        s.port.extend(packets);
+        s.port.extend(packets.into_iter().map(|(packet, _)| packet));
         for (ring, cqe) in std::mem::take(&mut s.held_cqes) {
             s.rings.get_mut(&ring).unwrap().cq.push_back(cqe);
         }
@@ -356,11 +358,26 @@ impl Sim {
     }
 
     fn sock_op(s: &mut State, op: Op, sock: Handle, buf: usize, len: u32) -> io::Result<usize> {
-        if let Some(at) = s.fail_result.iter().position(|(o, _)| *o == op) {
-            return Err(s.fail_result.remove(at).unwrap().1);
-        }
         let cap = if s.cap == 0 { usize::MAX } else { s.cap };
         let len = (len as usize).min(cap);
+        if let Some(at) = s.fail_result.iter().position(|(o, _)| *o == op) {
+            let error = s.fail_result.remove(at).unwrap().1;
+            // A warning completion of a receive delivers what fit before it fails.
+            if op == Op::Recv
+                && error
+                    .raw_os_error()
+                    .is_some_and(|c| s.warnings.contains(&c))
+            {
+                let sock_state = s.socks.get_mut(&sock).expect("a simulated socket");
+                let n = len.min(sock_state.incoming.len());
+                for i in 0..n {
+                    // SAFETY: `buf` is writable for `len >= n` bytes.
+                    unsafe { *(buf as *mut u8).add(i) = sock_state.incoming.pop_front().unwrap() };
+                }
+                s.partial = n;
+            }
+            return Err(error);
+        }
         let sock_state = s.socks.get_mut(&sock).expect("a simulated socket");
         let n = match op {
             Op::Send | Op::SendTo => {
@@ -386,13 +403,10 @@ impl Sim {
     ///
     /// # Safety
     /// `packet.overlapped` is a valid `OVERLAPPED` whose call is being completed.
-    unsafe fn complete_overlapped(packet: &Packet) {
+    unsafe fn complete_overlapped(packet: &Packet, status: i32) {
         let ov = packet.overlapped as *mut Overlapped;
         // SAFETY: by this function's contract.
-        unsafe {
-            (*ov).internal = packet.status as u32 as usize;
-            (*ov).internal_high = packet.bytes as usize;
-        }
+        unsafe { Overlapped::store_result(ov, status as u32 as usize, packet.bytes as usize) };
     }
 
     /// The `NTSTATUS` and byte count a result becomes.
@@ -401,7 +415,9 @@ impl Sim {
             Ok(n) => (0, *n as u32),
             Err(error) => match error.raw_os_error() {
                 Some(38) => (STATUS_END_OF_FILE, 0),
-                Some(code) if s.warnings.contains(&code) => (0x8100_0000_u32 as i32 | code, 0),
+                Some(code) if s.warnings.contains(&code) => {
+                    (0x8100_0000_u32 as i32 | code, s.partial as u32)
+                }
                 Some(code) => (0xC100_0000_u32 as i32 | code, 0),
                 None => (0xC000_0001_u32 as i32, 0),
             },
@@ -412,18 +428,18 @@ impl Sim {
     /// held, with the call still pending).
     fn finish(s: &mut State, ov: *mut Overlapped, result: io::Result<usize>) {
         let (status, bytes) = Self::status_of(s, &result);
+        s.partial = 0;
         let packet = Packet {
             overlapped: ov as usize,
-            status,
             bytes,
         };
         if s.hold {
             // SAFETY: `ov` is valid by the trait's contract.
-            unsafe { (*ov).internal = STATUS_PENDING as usize };
-            s.held_packets.push(packet);
+            unsafe { Overlapped::store_result(ov, STATUS_PENDING as usize, 0) };
+            s.held_packets.push((packet, status));
         } else {
             // SAFETY: as above.
-            unsafe { Self::complete_overlapped(&packet) };
+            unsafe { Self::complete_overlapped(&packet, status) };
             s.port.push_back(packet);
         }
     }
@@ -484,7 +500,6 @@ impl Sys for Sim {
     fn post(&self, _port: Handle, overlapped: usize) -> io::Result<()> {
         self.s().port.push_back(Packet {
             overlapped,
-            status: 0,
             bytes: 0,
         });
         Ok(())

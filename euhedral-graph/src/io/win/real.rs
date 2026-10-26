@@ -87,7 +87,7 @@ fn started(ok: bool, ov: *const Overlapped) -> io::Result<()> {
     }
     // SAFETY: `ov` is the caller's valid `OVERLAPPED`; the kernel wrote its status during the call
     // that just returned, and nothing else writes it until the engine completes the operation.
-    let internal = unsafe { std::ptr::read_volatile(&raw const (*ov).internal) };
+    let internal = unsafe { Overlapped::load_internal(ov) };
     if is_nt_warning(internal as u32 as i32) {
         Ok(())
     } else {
@@ -400,7 +400,6 @@ impl Sys for RealSys {
         }
         out.extend(entries[..removed as usize].iter().map(|entry| Packet {
             overlapped: entry.lpOverlapped as usize,
-            status: entry.Internal as u32 as i32,
             bytes: entry.dwNumberOfBytesTransferred,
         }));
         Ok(())

@@ -47,11 +47,17 @@ now `async-io` (it was `io-uring`).
 - A handle that skips the port on success, or a socket opened without overlapped I/O, is refused. A handle already on
   another port is refused too (`ERROR_INVALID_PARAMETER` for a handle this engine did not join): a handle serves one
   `AsyncIo`, ever.
+- A slot stays `Issuing` until its call is made (or its ring entry or pool job is handed over): nothing that ends or fails
+  operations touches a record being filled. A ring that cannot be read ends its operations and the entries behind it, and an
+  operation sent to a broken ring ends with an error instead of waiting. A poll whose inbox holds only packets of returning
+  calls also looks at the port. A packet is taken only if its count agrees with the `OVERLAPPED`'s `InternalHigh`; status and
+  bytes are read from the `OVERLAPPED` as atomics. A read or receive that fails with a warning status keeps the bytes that
+  arrived: the result is the error (`ERROR_MORE_DATA`, `WSAEMSGSIZE`) and `IoBuf::filled` is their count.
 - Open and rename leave their result in a queue the poll drains (a job that panics or is dropped still ends the operation
   with an error). Writes go in pieces of at most 256 KiB, since a write that extends a file is synchronous on NTFS. Paths
   near the Win32 limit go as verbatim paths. A ring whose completions cannot be read ends its operations with the error.
 
-**Tests.** 40 tests run on every platform against a simulated `Sys` (every operation's success, error and short transfers,
+**Tests.** 44 tests run on every platform against a simulated `Sys` (every operation's success, error and short transfers,
 the ring and its fallbacks, a full submission queue, the order across ring and port, a pull's `stop`, late and warning packets,
 slot reuse, routes and generations, handle modes, pool failures). 16 run on Windows
 only (`io/win/live.rs`: files, loopback TCP and UDP, accept, connect, open and rename, threads each with a ring), each twice:

@@ -8,6 +8,7 @@
 use std::io;
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::super::OpenSpec;
 
@@ -30,6 +31,43 @@ pub(crate) struct Overlapped {
 }
 
 impl Overlapped {
+    /// `Internal` (the call's `NTSTATUS`, `STATUS_PENDING` until it completes), loaded as an
+    /// atomic: the kernel writes it.
+    ///
+    /// # Safety
+    /// `ov` points at a valid `OVERLAPPED`.
+    pub(crate) unsafe fn load_internal(ov: *const Self) -> usize {
+        // SAFETY: by this function's contract; `usize` and `AtomicUsize` have the same layout.
+        unsafe {
+            AtomicUsize::from_ptr((&raw const (*ov).internal).cast_mut()).load(Ordering::Acquire)
+        }
+    }
+
+    /// `InternalHigh` (the bytes the call moved), loaded as an atomic.
+    ///
+    /// # Safety
+    /// As [`load_internal`](Self::load_internal).
+    pub(crate) unsafe fn load_internal_high(ov: *const Self) -> usize {
+        // SAFETY: by this function's contract.
+        unsafe {
+            AtomicUsize::from_ptr((&raw const (*ov).internal_high).cast_mut())
+                .load(Ordering::Acquire)
+        }
+    }
+
+    /// The kernel's writes of a completed call (for the simulated `Sys`).
+    ///
+    /// # Safety
+    /// As [`load_internal`](Self::load_internal), and no other thread reads it at once.
+    #[cfg(test)]
+    pub(crate) unsafe fn store_result(ov: *mut Self, status: usize, bytes: usize) {
+        // SAFETY: by this function's contract.
+        unsafe {
+            AtomicUsize::from_ptr(&raw mut (*ov).internal_high).store(bytes, Ordering::Release);
+            AtomicUsize::from_ptr(&raw mut (*ov).internal).store(status, Ordering::Release);
+        }
+    }
+
     /// Cleared for a new operation at `offset` (for handles that have a file position).
     pub(crate) fn reset(&mut self, offset: u64) {
         *self = Self {
@@ -105,13 +143,13 @@ pub(crate) fn is_nt_warning(status: i32) -> bool {
     (status as u32) >> 30 == 2
 }
 
-/// A packet dequeued from a completion port: the `OVERLAPPED` it carries, and that call's final
-/// `NTSTATUS` and byte count (`Internal` and `InternalHigh`, as the port reports them).
+/// A packet dequeued from a completion port: the `OVERLAPPED` it carries and the byte count it
+/// reports. The call's status and bytes are read from the `OVERLAPPED` (`Internal` and
+/// `InternalHigh`, which are documented), and the packet's count is only checked against them.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Packet {
     /// The address of the `OVERLAPPED` the packet carries.
     pub overlapped: usize,
-    pub status: i32,
     pub bytes: u32,
 }
 

@@ -48,7 +48,7 @@ use euhedral_core::frames::Frame;
 
 use self::sys::{
     ACCEPT_BUF, BuildError, Cqe, Handle, IORING_VERSION_3, Overlapped, Packet, STATUS_END_OF_FILE,
-    STATUS_PENDING, SockAddr, Sys, hresult_error, is_end_of_file,
+    STATUS_PENDING, SockAddr, Sys, hresult_error, is_end_of_file, is_nt_warning,
 };
 use super::{
     AsyncIo, AsyncIoOptions, Engine as EngineTrait, IoBuf, IoDone, MAX_PIECE, OpenSpec, READ_PIECE,
@@ -78,7 +78,9 @@ const FLUSH_ENTRIES: usize = 16;
 const SLOT_BITS: u32 = 20;
 /// Operations in flight at once.
 const MAX_OPS: usize = (1 << SLOT_BITS) - 1;
-/// What the generation of a token keeps (a token is a `usize`).
+/// What the generation of a token keeps (a token is a `usize`): 44 bits on 64-bit targets, but
+/// only 12 on 32-bit ones, where a slot's generation wraps after 4096 issues. That is enough: a
+/// stale ring completion would need its slot reissued exactly a multiple of 4096 times meanwhile.
 const GENERATION_MASK: usize = usize::MAX >> SLOT_BITS;
 
 static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
@@ -382,8 +384,8 @@ pub(super) struct Engine {
 
 /// What a dequeued packet leads to.
 enum Taken {
-    /// The operation, now `Busy`.
-    Op(Held),
+    /// The operation, now `Busy`, with the status and byte count of its call.
+    Op(Held, i32, u32),
     /// Its call is still returning: look again at the next poll.
     Later,
     /// A packet of no operation in flight on the port.
@@ -508,11 +510,12 @@ impl Engine {
         table.free.push(held.slot);
     }
 
-    /// The operation whose `OVERLAPPED` is at `addr`, if it is in flight on the port and its call
-    /// finished: its slot becomes `Busy`.
-    fn take_packet(&self, addr: usize) -> Taken {
+    /// The operation whose `OVERLAPPED` is at the packet's address, if it is in flight on the port
+    /// and its call finished: its slot becomes `Busy`. The call's status and byte count are read
+    /// from the `OVERLAPPED`, and the packet's count must agree with it.
+    fn take_packet(&self, packet: &Packet) -> Taken {
         let mut table = lock(&self.table);
-        let Some(&slot) = table.by_addr.get(&addr) else {
+        let Some(&slot) = table.by_addr.get(&packet.overlapped) else {
             return Taken::Stray;
         };
         let entry = &mut table.slots[slot as usize];
@@ -523,26 +526,32 @@ impl Engine {
             State::InFlight => {}
         }
         let rec = entry.rec.0.as_ptr();
-        // SAFETY: a slab record, valid while the engine lives. `ov.Internal` is written by the
-        // kernel at completion, so it is read volatile; `op` is read while the slot is
-        // `InFlight`, when nothing writes it.
-        let (internal, on_port) = unsafe {
+        // SAFETY: a slab record, valid while the engine lives. The kernel writes `Internal` and
+        // `InternalHigh` at completion, so they are loaded as atomics; `op` is read while the
+        // slot is `InFlight`, when nothing writes it.
+        let (internal, high, on_port) = unsafe {
             (
-                std::ptr::read_volatile(&raw const (*rec).ov.internal),
+                Overlapped::load_internal(&raw const (*rec).ov),
+                Overlapped::load_internal_high(&raw const (*rec).ov),
                 matches!((*rec).op.as_ref().map(|op| &op.route), Some(Route::Port)),
             )
         };
-        // A packet of an earlier use of the slot, while the new call is pending, or a packet of
-        // an operation that is not on the port.
-        if !on_port || internal as u32 as i32 == STATUS_PENDING {
+        let status = internal as u32 as i32;
+        // A packet of an earlier use of the slot, while the new call is pending (or whose count
+        // is not this call's), or a packet of an operation that is not on the port.
+        if !on_port || status == STATUS_PENDING || high != packet.bytes as usize {
             return Taken::Stray;
         }
         entry.state = State::Busy;
-        Taken::Op(Held {
-            slot,
-            generation: entry.generation,
-            rec: entry.rec.0,
-        })
+        Taken::Op(
+            Held {
+                slot,
+                generation: entry.generation,
+                rec: entry.rec.0,
+            },
+            status,
+            packet.bytes,
+        )
     }
 
     /// The operation a ring completion (`ring`) or a pool result (`None`) names, if its slot is
@@ -664,6 +673,11 @@ impl Engine {
         let Ok(mut inner) = ring.inner.try_lock() else {
             return;
         };
+        if ring.broken.load(Ordering::Acquire) {
+            // Nothing is handed to a ring that cannot be read; its entries were ended.
+            lock(&ring.backlog).clear();
+            return;
+        }
         let sys = &*self.sys;
         let mut built = 0;
         while built < FLUSH_ENTRIES && ring.in_kernel.load(Ordering::Acquire) < ring.capacity {
@@ -767,9 +781,12 @@ impl Engine {
             lock(&self.ready).push_back(Failed {
                 slot,
                 generation,
-                error: io::Error::new(error.kind(), format!("the IoRing failed: {error}")),
+                error: ring_failed_with(error),
             });
         }
+        // The backlog is cleared under the submit lock, so a flush never pops an entry another
+        // thread has just taken out from under it.
+        let _inner = lock(&ring.inner);
         lock(&ring.backlog).clear();
     }
 
@@ -844,13 +861,11 @@ impl Engine {
         }
     }
 
-    /// Starts the operation: its slot, then its call.
+    /// Starts the operation: its slot, then its call. The slot stays `Issuing` until the call is
+    /// made (or, on a ring or the pool, until the entry or the job is handed over), so nothing
+    /// that completes or fails operations touches the record while it is being filled.
     fn start(&self, op: Op) -> io::Result<()> {
-        let state = match op.route {
-            Route::Port => State::Issuing,
-            Route::Ring(_) | Route::Pool => State::InFlight,
-        };
-        let held = self.begin(op, state)?;
+        let held = self.begin(op, State::Issuing)?;
         self.launch(held);
         Ok(())
     }
@@ -905,13 +920,24 @@ impl Engine {
                 unsafe { sys.connect(sock, to, ov) }
             }
             Call::Pool(job) => {
+                // The record is not touched again: the job's result may come at once.
+                self.set_state(held, State::InFlight);
                 // A job the pool refuses is dropped, and its delivery ends the operation with an
                 // error.
                 let _ = sys.run_on_pool(job);
                 return;
             }
             Call::Ring(ring, entry) => {
+                // The record is not touched again: the entry may complete as soon as it is built.
+                self.set_state(held, State::InFlight);
                 lock(&ring.backlog).push_back(entry);
+                // A ring that broke meanwhile has no one to hand its backlog over (`break_ring`
+                // may have cleared it before this push): end the operation here, unless
+                // `break_ring` already did.
+                if ring.broken.load(Ordering::Acquire) {
+                    self.fail_token(entry.user_data, ring_failed());
+                    return;
+                }
                 self.flush_ring(&ring);
                 return;
             }
@@ -1063,7 +1089,12 @@ impl Engine {
 
     /// What a finished piece means for its operation: the rest goes in again, or it ended and its
     /// continuation's frame comes out. The slot is `Busy`.
-    fn advance(&self, held: Held, result: io::Result<usize>) -> Option<Box<dyn Frame>> {
+    fn advance(
+        &self,
+        held: Held,
+        result: io::Result<usize>,
+        partial: usize,
+    ) -> Option<Box<dyn Frame>> {
         // SAFETY: the slot is `Busy`: this thread has the record.
         let rec = unsafe { &mut *held.rec.as_ptr() };
         let op = rec.op.as_mut().expect("an operation in flight");
@@ -1084,11 +1115,7 @@ impl Engine {
             (_, Ok(n)) if piecewise && n > 0 => {
                 op.moved += n;
                 if op.moved < total {
-                    let state = match op.route {
-                        Route::Port => State::Issuing,
-                        _ => State::InFlight,
-                    };
-                    let held = self.rebegin(held, state);
+                    let held = self.rebegin(held, State::Issuing);
                     self.launch(held);
                     return None;
                 }
@@ -1131,21 +1158,82 @@ impl Engine {
             }),
             _ => ended,
         };
-        let op = rec.op.take().expect("an operation in flight");
+        let mut op = rec.op.take().expect("an operation in flight");
+        // A receive or read that failed with a warning (`ERROR_MORE_DATA`, `WSAEMSGSIZE`) still
+        // moved bytes: they are in the buffer, and `filled` says how many.
+        if ended.is_err() && partial > 0 && matches!(op.kind, Kind::Read { .. } | Kind::Recv { .. })
+        {
+            op.buf.filled = (op.moved + partial).min(op.buf.bytes.len());
+        }
         self.release(held);
         Some(conclude(op, ended))
     }
 
-    /// The result of a dequeued packet.
-    fn packet_result(&self, kind: &Kind, packet: &Packet) -> io::Result<usize> {
-        if packet.status >= 0 {
-            return Ok(packet.bytes as usize);
+    /// The result of a finished call, from its `NTSTATUS` and byte count, and the bytes a warning
+    /// status delivered anyway.
+    fn packet_result(&self, kind: &Kind, status: i32, bytes: u32) -> (io::Result<usize>, usize) {
+        if status >= 0 {
+            return (Ok(bytes as usize), 0);
         }
-        if packet.status == STATUS_END_OF_FILE && matches!(kind, Kind::Read { .. }) {
-            return Ok(0);
+        if status == STATUS_END_OF_FILE && matches!(kind, Kind::Read { .. }) {
+            return (Ok(0), 0);
         }
         let socket = !matches!(kind, Kind::Read { .. } | Kind::Write { .. });
-        Err(self.sys.status_error(packet.status, socket))
+        // A warning (`ERROR_MORE_DATA`, `WSAEMSGSIZE`) is a failure that moved bytes.
+        let partial = if is_nt_warning(status) {
+            bytes as usize
+        } else {
+            0
+        };
+        (Err(self.sys.status_error(status, socket)), partial)
+    }
+
+    /// Ends the operations of `batch`, handing frames to `offer`. Packets of slots whose call is
+    /// still returning go to `later`. `Some(progress)`: whether any packet was not `Later`;
+    /// `None` once `offer` kept a frame back.
+    fn process_packets(
+        &self,
+        batch: &mut VecDeque<Packet>,
+        later: &mut VecDeque<Packet>,
+        room: &mut dyn FnMut() -> bool,
+        offer: &mut dyn FnMut(Box<dyn Frame>) -> bool,
+    ) -> Option<bool> {
+        let mut progress = false;
+        while let Some(packet) = batch.pop_front() {
+            if !room() {
+                batch.push_front(packet);
+                break;
+            }
+            match self.take_packet(&packet) {
+                Taken::Stray => {
+                    progress = true;
+                    self.stray();
+                }
+                Taken::Later => later.push_back(packet),
+                Taken::Op(held, status, bytes) => {
+                    progress = true;
+                    let (result, partial) = {
+                        // SAFETY: the slot is `Busy`: this thread has the record.
+                        let rec = unsafe { &*held.rec.as_ptr() };
+                        let kind = &rec.op.as_ref().expect("an operation in flight").kind;
+                        self.packet_result(kind, status, bytes)
+                    };
+                    if let Some(frame) = self.advance(held, result, partial)
+                        && !offer(frame)
+                    {
+                        return None;
+                    }
+                }
+            }
+        }
+        Some(progress)
+    }
+
+    fn dequeue(&self) -> VecDeque<Packet> {
+        let mut taken = Vec::new();
+        // An error leaves nothing taken: the next poll asks again.
+        let _ = self.sys.dequeue(self.port.handle, &mut taken, BATCH);
+        taken.into()
     }
 
     /// Packets of the port: ends operations, hands frames to `offer`. `false` once `offer` kept a
@@ -1156,42 +1244,28 @@ impl Engine {
         offer: &mut dyn FnMut(Box<dyn Frame>) -> bool,
     ) -> bool {
         let mut batch: VecDeque<Packet> = std::mem::take(&mut *lock(&self.inbox));
-        if batch.is_empty() {
-            let mut taken = Vec::new();
-            if self
-                .sys
-                .dequeue(self.port.handle, &mut taken, BATCH)
-                .is_ok()
-            {
-                batch.extend(taken);
-            }
+        let from_inbox = !batch.is_empty();
+        if !from_inbox {
+            batch = self.dequeue();
         }
         // Packets of slots whose call is still returning wait for the next poll.
         let mut later = VecDeque::new();
         let mut go_on = true;
-        while let Some(packet) = batch.pop_front() {
-            if !room() {
-                batch.push_front(packet);
-                break;
-            }
-            match self.take_packet(packet.overlapped) {
-                Taken::Stray => self.stray(),
-                Taken::Later => later.push_back(packet),
-                Taken::Op(held) => {
-                    let result = {
-                        // SAFETY: the slot is `Busy`: this thread has the record.
-                        let rec = unsafe { &*held.rec.as_ptr() };
-                        let kind = &rec.op.as_ref().expect("an operation in flight").kind;
-                        self.packet_result(kind, &packet)
-                    };
-                    if let Some(frame) = self.advance(held, result)
-                        && !offer(frame)
-                    {
-                        go_on = false;
-                        break;
-                    }
+        match self.process_packets(&mut batch, &mut later, room, offer) {
+            None => go_on = false,
+            // The inbox held only packets of calls still returning: a preempted issuer must not
+            // stall the completions behind them, so look at the port as well.
+            Some(false) if from_inbox && batch.is_empty() && room() => {
+                let mut fresh = self.dequeue();
+                if self
+                    .process_packets(&mut fresh, &mut later, room, offer)
+                    .is_none()
+                {
+                    go_on = false;
                 }
+                batch.extend(fresh);
             }
+            Some(_) => {}
         }
         later.extend(batch);
         *lock(&self.inbox) = later;
@@ -1212,7 +1286,7 @@ impl Engine {
                 self.stray();
                 continue;
             };
-            if let Some(frame) = self.advance(held, Err(failed.error))
+            if let Some(frame) = self.advance(held, Err(failed.error), 0)
                 && !offer(frame)
             {
                 return false;
@@ -1220,6 +1294,15 @@ impl Engine {
         }
         true
     }
+}
+
+/// The error of an operation on a ring that cannot be read.
+fn ring_failed() -> io::Error {
+    io::Error::other("the IoRing failed")
+}
+
+fn ring_failed_with(error: &io::Error) -> io::Error {
+    io::Error::new(error.kind(), format!("the IoRing failed: {error}"))
 }
 
 /// Clears the `OVERLAPPED` for a new call at `offset`.
@@ -1333,7 +1416,7 @@ impl EngineTrait for Engine {
                 self.stray();
                 continue;
             };
-            if let Some(frame) = self.advance(held, done.result)
+            if let Some(frame) = self.advance(held, done.result, 0)
                 && !offer(frame)
             {
                 return;
@@ -1359,7 +1442,7 @@ impl EngineTrait for Engine {
                 } else {
                     Err(hresult_error(cqe.result))
                 };
-                if let Some(frame) = self.advance(held, result)
+                if let Some(frame) = self.advance(held, result, 0)
                     && !offer(frame)
                 {
                     self.flush_ring(ring);

@@ -61,7 +61,9 @@ pub type OwnedSock = std::os::windows::io::OwnedSocket;
 pub struct IoBuf {
     pub bytes: Vec<u8>,
     /// For reads and receives: how many bytes arrived (`bytes[..filled]`). For writes and sends:
-    /// how many to send from the start.
+    /// how many to send from the start. On Windows a read or receive that fails with a warning
+    /// status (`ERROR_MORE_DATA` of a message-mode pipe, `WSAEMSGSIZE` of a datagram that did not
+    /// fit) still moved bytes: the result is that error, and `filled` says how many arrived.
     pub filled: usize,
 }
 

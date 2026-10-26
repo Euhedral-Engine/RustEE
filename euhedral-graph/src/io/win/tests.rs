@@ -1043,3 +1043,115 @@ fn long_paths_become_verbatim_paths_and_others_are_left_alone() {
     assert_eq!(verbatim_path(r"\\?\C:\a"), None);
     assert_eq!(verbatim_path(r"relative\path"), None);
 }
+
+// ---- the second review's cases
+
+#[test]
+fn a_ring_that_breaks_while_an_issuer_is_mid_call_cannot_touch_its_record() {
+    let h = Harness::with(Some(full_probe()), true, MAX_PIECE);
+    let file = h.sim.file(&content(100));
+    h.read(file, 0, 10, 1).unwrap(); // makes this thread's ring
+    h.drain(1);
+    let ring = h.engine.ring().unwrap();
+    // An issuer that has begun (its slot is `Issuing`) and has not yet pushed its entry.
+    let bytes = vec![0u8; 10];
+    let buf = IoBuf { bytes, filled: 0 };
+    let op = Engine::op(
+        super::Kind::Read { file, offset: 0 },
+        super::Route::Ring(ring.clone()),
+        buf,
+        io_then(2),
+    );
+    let held = h.engine.begin(op, super::State::Issuing).unwrap();
+    h.front.pending.fetch_add(1, Ordering::AcqRel);
+    // The ring breaks now: the issuer's operation and its buffer are none of its business.
+    h.engine.break_ring(&ring, &io::Error::from_raw_os_error(5));
+    // SAFETY: the slot is `Issuing`: this test thread has the record.
+    let len = unsafe { (*held.rec.as_ptr()).op.as_ref().unwrap().buf.bytes.len() };
+    assert_eq!(len, 10, "the buffer was left alone");
+    assert!(
+        h.pull_with(&mut |_| false).is_empty(),
+        "and the operation was not ended"
+    );
+    // The issuer goes on and hands its entry to the broken ring: the operation ends with an
+    // error instead of hanging.
+    h.engine.launch(held);
+    let error = ended(h.one()).result.unwrap_err();
+    assert!(error.to_string().contains("IoRing failed"), "{error}");
+    assert_eq!(h.pending(), 0);
+}
+
+#[test]
+fn an_inbox_of_packets_for_returning_calls_does_not_stall_the_other_completions() {
+    let h = Harness::new();
+    let file = h.sim.file(&content(100));
+    // B is pending until released.
+    h.sim.hold(true);
+    h.read(file, 50, 10, 2).unwrap();
+    h.sim.hold(false);
+    let seen: Arc<Mutex<Vec<usize>>> = Arc::default();
+    let (engine, front, sim, log) = (
+        h.engine.clone(),
+        h.front.clone(),
+        h.sim.clone(),
+        seen.clone(),
+    );
+    // While A's call returns: a poll sees A's packet (and sets it aside), B completes, and a
+    // second poll must still end B.
+    h.sim.on_read(Arc::new(move || {
+        let count = |front: &Front| {
+            let mut got = 0;
+            front.reap(&*engine, &mut |_| got += 1, &mut |_| false, u64::MAX);
+            got
+        };
+        let first = count(&front);
+        sim.release();
+        let second = count(&front);
+        log.lock().unwrap().extend([first, second]);
+    }));
+    h.read(file, 0, 10, 1).unwrap();
+    assert_eq!(
+        *seen.lock().unwrap(),
+        [0, 1],
+        "B ended while A's packet waited"
+    );
+    h.sim.on_read(Arc::new(|| {}));
+    let last = h.one();
+    assert_eq!(last.header.id_hash(), 1);
+    assert_eq!(ended(last).result.unwrap(), 10);
+}
+
+#[test]
+fn a_packet_whose_count_disagrees_with_the_call_is_ignored() {
+    let h = Harness::new();
+    let file = h.sim.file(&content(100));
+    h.read(file, 0, 10, 1).unwrap();
+    h.one();
+    let slot0 = first_overlapped(&h);
+    // A packet naming the slot with a count that is not the next call's.
+    h.engine.sys.post(h.engine.port.handle, slot0).unwrap();
+    h.read(file, 10, 10, 2).unwrap();
+    let done = ended(h.one());
+    assert_eq!(done.result.unwrap(), 10);
+    assert_eq!(done.buf.bytes, content(100)[10..20]);
+    assert_eq!(h.engine.strays.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn a_receive_that_fails_with_a_warning_keeps_the_bytes_that_arrived() {
+    let h = Harness::new();
+    let sock = h.sim.sock();
+    h.sim.mark_warning(10040);
+    h.sim.feed(sock, &[9; 100]);
+    h.sim
+        .fail_next_completion(Op::Recv, io::Error::from_raw_os_error(10040));
+    let buf = IoBuf {
+        bytes: vec![0; 10],
+        filled: 0,
+    };
+    h.submit(Request::Recv { sock }, buf, io_then(1)).unwrap();
+    let done = ended(h.one());
+    assert_eq!(done.result.unwrap_err().raw_os_error(), Some(10040));
+    assert_eq!(done.buf.filled, 10, "the datagram's first bytes arrived");
+    assert_eq!(done.buf.bytes, [9; 10]);
+}
