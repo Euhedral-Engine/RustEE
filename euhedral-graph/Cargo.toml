@@ -1,0 +1,35 @@
+[package]
+name = "euhedral-graph"
+version = "0.1.0"
+edition = "2024"
+description = "No-wait dataflow on the Euhedral control plane: completions, async I/O, sequencing, joins, device lanes and stage graphs"
+readme = "README.md"
+
+[features]
+default = ["io-uring"]
+# `AsyncIo`, on Linux and Android (io_uring). Without it, or on another platform, the crate has no `io` module.
+io-uring = ["dep:io-uring"]
+# `testing::FakeDevice`: an in-order fake device queue, for tests of code built on this crate.
+testing = []
+
+[dependencies]
+euhedral-core = { path = "../euhedral-core" }
+
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+libc = "0.2.174"
+io-uring = { version = "=0.7.15", optional = true }
+
+[dev-dependencies]
+# The crate's own integration tests and unit tests use the fake device.
+euhedral-graph = { path = ".", default-features = false, features = ["testing"] }
+# The credit-graph test checks the CPUs this process may run on.
+euhedral-hardware-utils = { path = "../euhedral-hardware-utils" }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"
+dbg_macro = "warn"
+todo = "warn"
