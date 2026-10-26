@@ -6,9 +6,10 @@ description = "No-wait dataflow on the Euhedral control plane: completions, asyn
 readme = "README.md"
 
 [features]
-default = ["io-uring"]
-# `AsyncIo`, on Linux and Android (io_uring). Without it, or on another platform, the crate has no `io` module.
-io-uring = ["dep:io-uring"]
+default = ["async-io"]
+# `AsyncIo`: io_uring on Linux and Android; IoRing and I/O completion ports on Windows. Without it, or
+# on another platform, the crate has no `io` module.
+async-io = ["dep:io-uring", "dep:windows-sys"]
 # `testing::FakeDevice`: an in-order fake device queue, for tests of code built on this crate.
 testing = []
 
@@ -18,6 +19,18 @@ euhedral-core = { path = "../euhedral-core" }
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 libc = "0.2.174"
 io-uring = { version = "=0.7.15", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", optional = true, features = [
+    "Wdk_Storage_FileSystem",
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 # The crate's own integration tests and unit tests use the fake device.

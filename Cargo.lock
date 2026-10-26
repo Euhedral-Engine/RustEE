@@ -37,6 +37,7 @@ dependencies = [
  "euhedral-hardware-utils",
  "io-uring",
  "libc",
+ "windows-sys",
 ]
 
 [[package]]

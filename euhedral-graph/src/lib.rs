@@ -22,7 +22,7 @@
 //! Every public type is also re-exported at the crate root. Types of `euhedral-core` (`Frame`,
 //! `LatticeSource`, ...) are not: import them from `euhedral_core`.
 //!
-//! Features: `io-uring` (default) builds `AsyncIo` on Linux and Android; `testing` adds
+//! Features: `async-io` (default) builds `AsyncIo` on Linux, Android and Windows; `testing` adds
 //! `testing::FakeDevice`.
 
 // io_uring needs unsafe in `io`, and `ThreadUsage` makes two system calls, each with a `// SAFETY:`
@@ -30,7 +30,10 @@
 #![deny(unsafe_code)]
 
 pub mod completions;
-#[cfg(all(feature = "io-uring", any(target_os = "linux", target_os = "android")))]
+#[cfg(all(
+    feature = "async-io",
+    any(target_os = "linux", target_os = "android", windows)
+))]
 pub mod io;
 pub mod join;
 pub mod lanes;
@@ -40,8 +43,14 @@ pub mod stage_graph;
 pub mod testing;
 
 pub use completions::{Completions, Pending, Ready};
-#[cfg(all(feature = "io-uring", any(target_os = "linux", target_os = "android")))]
-pub use io::{AsyncIo, IoBuf, IoDone, IoThen};
+#[cfg(all(
+    feature = "async-io",
+    any(target_os = "linux", target_os = "android", windows)
+))]
+pub use io::{
+    AsyncIo, AsyncIoOptions, Create, IoBuf, IoDone, IoThen, OpenSpec, OwnedFile, OwnedSock,
+    RawFile, RawSock,
+};
 pub use join::Join;
 pub use lanes::{DeviceQueue, LaneId, LanePool, Marker};
 pub use sequencer::{Sequencer, Slot};

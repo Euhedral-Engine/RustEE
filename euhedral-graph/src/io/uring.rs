@@ -7,104 +7,37 @@
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::ffi::CString;
-use std::fmt;
 use std::io;
-use std::os::fd::{FromRawFd, OwnedFd, RawFd};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
+use std::os::fd::RawFd;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 
 use euhedral_core::frames::Frame;
-use euhedral_core::generics::{LatticeReceiver, LatticeSource};
 use io_uring::{IoUring, Submitter, opcode, squeue, types};
 
-use super::{IoBuf, IoDone, IoThen};
-use crate::Continuation;
+use super::{
+    AsyncIo, AsyncIoOptions, Create, Engine, IoBuf, IoDone, MAX_PIECE, OpenSpec, READ_PIECE,
+    Request, Then, lock,
+};
 
 /// Entries of each ring's submission queue (its completion queue has twice as many).
 const RING_ENTRIES: u32 = 256;
-/// The most bytes one read or send piece moves (see `Op::entry`).
-const READ_PIECE: usize = 256 * 1024;
 /// Submitting threads (rings) one `AsyncIo` serves.
 const MAX_RINGS: usize = 256;
-/// The longest piece of a read or write handed to the kernel at once; the rest follows as a short
-/// one's would.
-const MAX_PIECE: usize = (i32::MAX as usize) & !4095;
 
 /// Replaces `io_uring_enter` (the submission of a ring's queued entries): the native call, or a
 /// test's stand-in. It returns how many entries the kernel took, or why it refused; refused entries
 /// stay queued and the next enter on the ring (a later submission or poll) hands them over.
 type Enter = dyn Fn(&Submitter<'_>) -> io::Result<usize> + Send + Sync;
 
-/// File and socket I/O that holds no worker: a submission returns at once, and the operation's
-/// completion is the frame its continuation builds, emitted when the lattice's workers poll this
-/// source.
-///
-/// The backend is io_uring (Linux and Android). Every submitting worker has its own submission
-/// queue (it is the queue's only submitter); completions of every queue are reaped by the lattice's
-/// polls, one poll at a time. A read or write is complete when all its bytes moved (a short one is
-/// resubmitted for the rest by the poll that reaped it) or it failed. One send per connection is in
-/// flight at a time (the caller's ordered lane ensures it), so bytes keep their order.
-///
-/// - **A read** completes with `Ok(n)`: `n` is the buffer's length, or less if the file ended after
-///   some bytes (`filled` = `n`); a read that finds no bytes at all (at or past the end) fails with
-///   `UnexpectedEof`.
-/// - **A write** completes with `Ok(filled)`, or fails (`WriteZero` if the kernel wrote nothing).
-/// - **A send** behaves like a write: a short send is resubmitted for the rest, and it completes
-///   with `Ok(filled)` once every byte is in the kernel, or with the error that stopped it (bytes
-///   sent before the error are not reported). It never raises `SIGPIPE` (`MSG_NOSIGNAL`): a closed
-///   peer is an `EPIPE` or `ECONNRESET` error.
-/// - **A receive** completes with what one operation moved: `Ok(n)`, `filled` = `n`; `Ok(0)` is the
-///   peer's end of stream.
-/// - **A datagram** (`send_to`) is one operation.
-/// - **A submission** returns `Err` only when nothing was submitted (an empty read or write, a
-///   completed source, too many submitting threads); `then` and the buffer are then dropped without
-///   running. When the kernel's queue is full or the kernel refuses an enter for a while, the
-///   operation stays queued and is handed over by a later submission or poll: it still completes,
-///   once.
-/// - **An operation belongs to the thread that submitted it:** io_uring cancels it (`ECANCELED`, or
-///   `EINTR`) if that thread exits first. Lattice workers live as long as the lattice.
-/// - **Dropping** an `AsyncIo` with operations in flight leaks their buffers (the kernel may still
-///   write them).
-///
-/// **Driving it by hand** (tests, or any caller outside a lattice): `pull(consumer, &mut |_| false,
-/// u64::MAX)` reaps on its own; no `request` is needed before it (a `request` only pushes to an
-/// attached downstream). During the pull, each ended operation's continuation is called and its
-/// frame handed to `consumer`; `AsyncIo` never runs a frame. The consumer decides when the frame
-/// runs: a lattice queues it for a worker (so it runs after the pull returns), and a test may run
-/// it inside the consumer or after `pull` returns. A pull finds only what completed by then: poll
-/// again until the completions you expect came out.
-///
-/// A pull stops before the first continuation its `stop` matches; that one (and what is reaped
-/// after it) goes out on a later poll, in order. The lattice's direct pulls stop before ordered
-/// frames, which so reach their ordered lane through `request`'s pushes and the lattice's routing,
-/// in the order they were reaped.
-pub struct AsyncIo {
+/// The io_uring engine: a ring per submitting thread.
+pub(super) struct Uring {
     id: usize,
     rings: Mutex<Vec<Arc<Ring>>>,
     enter: Box<Enter>,
-    /// Continuations reaped while a pull's `stop` matched them, the oldest first; only the polling
-    /// thread touches it.
-    held: Mutex<VecDeque<Box<dyn Frame>>>,
     /// The most bytes one read, write or send hands the kernel; a test's stand-in lowers it to
     /// force short ones.
     max_piece: usize,
-    pending: AtomicUsize,
-    demand: AtomicU64,
-    downstream: Mutex<Option<Arc<dyn LatticeReceiver>>>,
-    complete: AtomicBool,
-}
-
-impl fmt::Debug for AsyncIo {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("AsyncIo")
-            .field("rings", &lock(&self.rings).len())
-            .field("pending", &self.pending())
-            .finish_non_exhaustive()
-    }
-}
-
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
@@ -219,13 +152,6 @@ enum Kind {
         addr: Box<libc::sockaddr_storage>,
         len: libc::socklen_t,
     },
-}
-
-enum Then {
-    Io(IoThen),
-    /// Accept and open: the result is a new descriptor.
-    Fd(Continuation<io::Result<OwnedFd>>),
-    Unit(Continuation<io::Result<()>>),
 }
 
 /// An operation in flight. Its buffer stays put (the `Vec`'s heap block) until the operation is
@@ -473,13 +399,7 @@ fn conclude(op: Op, result: io::Result<usize>) -> Box<dyn Frame> {
             }
             then(IoDone { buf, result })
         }
-        Then::Fd(then) => then(result.map(|fd| {
-            let fd = RawFd::try_from(fd).expect("a file descriptor");
-            // SAFETY: an accept's or open's result is a new descriptor the kernel opened for this
-            // operation: no one else owns it.
-            unsafe { OwnedFd::from_raw_fd(fd) }
-        })),
-        Then::Unit(then) => then(result.map(|_| ())),
+        Then::Raw(then) => then(result),
     }
 }
 
@@ -535,31 +455,18 @@ fn socket_address(to: std::net::SocketAddr) -> (Box<libc::sockaddr_storage>, lib
     )
 }
 
-impl AsyncIo {
-    /// Asynchronous I/O on this machine, or why there is none (no io_uring).
-    pub fn open() -> io::Result<Arc<Self>> {
-        Self::open_with(
-            Box::new(|submitter: &Submitter<'_>| submitter.submit()),
-            MAX_PIECE,
-        )
-    }
-
-    /// As [`open`](Self::open), with `enter` in place of `io_uring_enter` and pieces of at most
-    /// `max_piece` bytes (tests: the stand-in backend).
-    fn open_with(enter: Box<Enter>, max_piece: usize) -> io::Result<Arc<Self>> {
+impl Uring {
+    /// An engine with `enter` in place of `io_uring_enter` and pieces of at most `max_piece` bytes
+    /// (tests: the stand-in backend).
+    fn with(enter: Box<Enter>, max_piece: usize) -> io::Result<Self> {
         // A ring proves the kernel allows io_uring before anything relies on it.
         drop(Ring::new()?);
-        Ok(Arc::new(Self {
+        Ok(Self {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             rings: Mutex::new(Vec::new()),
             enter,
-            held: Mutex::new(VecDeque::new()),
             max_piece: max_piece.clamp(1, MAX_PIECE),
-            pending: AtomicUsize::new(0),
-            demand: AtomicU64::new(0),
-            downstream: Mutex::new(None),
-            complete: AtomicBool::new(false),
-        }))
+        })
     }
 
     /// The calling thread's ring, made on first use.
@@ -584,10 +491,74 @@ impl AsyncIo {
         })
     }
 
-    fn submit(&self, kind: Kind, buf: IoBuf, then: Then) -> io::Result<()> {
-        if self.complete.load(Ordering::Acquire) {
-            return Err(io::Error::other("this AsyncIo is complete"));
-        }
+    fn kind(request: Request) -> io::Result<Kind> {
+        Ok(match request {
+            Request::Read { file, offset } => Kind::Read {
+                fd: file as RawFd,
+                offset,
+            },
+            Request::Write { file, offset } => Kind::Write {
+                fd: file as RawFd,
+                offset,
+            },
+            Request::Send { sock } => Kind::Send { fd: sock as RawFd },
+            Request::Recv { sock } => Kind::Recv { fd: sock as RawFd },
+            Request::Accept { listener } => Kind::Accept {
+                fd: listener as RawFd,
+            },
+            Request::OpenAt { path, flags, mode } => Kind::OpenAt {
+                path: c_path(&path)?,
+                flags,
+                mode: mode as libc::mode_t,
+            },
+            Request::Open { path, spec } => Kind::OpenAt {
+                path: c_path(&path)?,
+                flags: open_flags(spec),
+                mode: spec.unix_mode as libc::mode_t,
+            },
+            Request::Rename { from, to } => Kind::RenameAt {
+                from: c_path(&from)?,
+                to: c_path(&to)?,
+            },
+            Request::SendTo { sock, to } => {
+                let (addr, len) = socket_address(to);
+                Kind::SendTo {
+                    fd: sock as RawFd,
+                    addr,
+                    len,
+                }
+            }
+            Request::Connect { sock, to } => {
+                let (addr, len) = socket_address(to);
+                Kind::Connect {
+                    fd: sock as RawFd,
+                    addr,
+                    len,
+                }
+            }
+        })
+    }
+}
+
+/// `open(2)` flags for an [`OpenSpec`].
+fn open_flags(spec: OpenSpec) -> i32 {
+    let access = match (spec.read, spec.write) {
+        (_, false) => libc::O_RDONLY,
+        (false, true) => libc::O_WRONLY,
+        (true, true) => libc::O_RDWR,
+    };
+    let create = match spec.create {
+        Create::Never => 0,
+        Create::IfMissing => libc::O_CREAT,
+        Create::New => libc::O_CREAT | libc::O_EXCL,
+        Create::Truncate => libc::O_CREAT | libc::O_TRUNC,
+    };
+    access | create
+}
+
+impl Engine for Uring {
+    fn submit(&self, request: Request, buf: IoBuf, then: Then) -> io::Result<()> {
+        let kind = Self::kind(request)?;
         let ring = self.ring()?;
         let entry = {
             let mut ops = lock(&ring.ops);
@@ -601,184 +572,19 @@ impl AsyncIo {
                 .expect("just inserted")
                 .entry(user_data, self.max_piece)
         };
-        self.pending.fetch_add(1, Ordering::AcqRel);
         ring.queue(entry, &*self.enter);
         Ok(())
     }
 
-    /// Reads up to `buf.bytes.len()` bytes at `offset` of `file`.
-    pub fn read(&self, file: RawFd, offset: u64, buf: IoBuf, then: IoThen) -> io::Result<()> {
-        if buf.bytes.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "a read into an empty buffer",
-            ));
-        }
-        self.submit(Kind::Read { fd: file, offset }, buf, Then::Io(then))
-    }
-
-    /// Writes `buf.bytes[..buf.filled]` at `offset` of `file`.
-    pub fn write(&self, file: RawFd, offset: u64, buf: IoBuf, then: IoThen) -> io::Result<()> {
-        if buf.filled == 0 || buf.filled > buf.bytes.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "a write needs 1..=bytes.len() bytes to write",
-            ));
-        }
-        self.submit(Kind::Write { fd: file, offset }, buf, Then::Io(then))
-    }
-
-    /// Sends `buf.bytes[..buf.filled]` on a connected socket.
-    pub fn send(&self, socket: RawFd, buf: IoBuf, then: IoThen) -> io::Result<()> {
-        if buf.filled > buf.bytes.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "filled is beyond the buffer",
-            ));
-        }
-        self.submit(Kind::Send { fd: socket }, buf, Then::Io(then))
-    }
-
-    /// Receives into `buf.bytes` from a connected socket; `Ok(0)` is the peer's end of stream.
-    pub fn recv(&self, socket: RawFd, buf: IoBuf, then: IoThen) -> io::Result<()> {
-        self.submit(Kind::Recv { fd: socket }, buf, Then::Io(then))
-    }
-
-    /// Accepts one connection on a listening socket.
-    pub fn accept(
-        &self,
-        listener: RawFd,
-        then: Continuation<io::Result<OwnedFd>>,
-    ) -> io::Result<()> {
-        self.submit(
-            Kind::Accept { fd: listener },
-            IoBuf::default(),
-            Then::Fd(then),
-        )
-    }
-
-    /// Opens `path` with `open(2)` `flags` (`O_CLOEXEC` is always added) and `mode` for a created
-    /// file: for example `O_WRONLY | O_CREAT | O_TRUNC` and `0o644` for the temporary file of an
-    /// atomic save.
-    pub fn open_file(
-        &self,
-        path: &std::path::Path,
-        flags: i32,
-        mode: u32,
-        then: Continuation<io::Result<OwnedFd>>,
-    ) -> io::Result<()> {
-        let path = c_path(path)?;
-        self.submit(
-            Kind::OpenAt {
-                path,
-                flags,
-                mode: mode as libc::mode_t,
-            },
-            IoBuf::default(),
-            Then::Fd(then),
-        )
-    }
-
-    /// Renames `from` to `to` (`renameat(2)`), replacing `to` atomically if it exists: the last
-    /// step of an atomic save.
-    pub fn rename(
-        &self,
-        from: &std::path::Path,
-        to: &std::path::Path,
-        then: Continuation<io::Result<()>>,
-    ) -> io::Result<()> {
-        let (from, to) = (c_path(from)?, c_path(to)?);
-        self.submit(
-            Kind::RenameAt { from, to },
-            IoBuf::default(),
-            Then::Unit(then),
-        )
-    }
-
-    /// Sends one datagram to `to`.
-    pub fn send_to(
-        &self,
-        socket: RawFd,
-        to: std::net::SocketAddr,
-        buf: IoBuf,
-        then: IoThen,
-    ) -> io::Result<()> {
-        if buf.filled > buf.bytes.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "filled is beyond the buffer",
-            ));
-        }
-        let (addr, len) = socket_address(to);
-        self.submit(
-            Kind::SendTo {
-                fd: socket,
-                addr,
-                len,
-            },
-            buf,
-            Then::Io(then),
-        )
-    }
-
-    /// Connects a stream socket (made by the caller, blocking or not: io_uring waits for the
-    /// handshake either way) to `to`; `Ok(())` once connected. A client's connection, for instance
-    /// to a service on the same host.
-    pub fn connect(
-        &self,
-        socket: RawFd,
-        to: std::net::SocketAddr,
-        then: Continuation<io::Result<()>>,
-    ) -> io::Result<()> {
-        let (addr, len) = socket_address(to);
-        self.submit(
-            Kind::Connect {
-                fd: socket,
-                addr,
-                len,
-            },
-            IoBuf::default(),
-            Then::Unit(then),
-        )
-    }
-
-    /// Operations in flight.
-    pub fn pending(&self) -> usize {
-        self.pending.load(Ordering::Acquire)
-    }
-
-    /// One poll: reaps the completions of every ring and hands up to `demand` continuations' frames
-    /// to `consumer`.
-    fn reap(
-        &self,
-        consumer: &mut dyn FnMut(Box<dyn Frame>),
-        stop: &mut dyn FnMut(&dyn Frame) -> bool,
-        demand: u64,
-    ) -> u64 {
-        if demand == 0 || self.pending() == 0 {
-            return 0;
-        }
-        let mut emitted = 0u64;
-        // Continuations an earlier pull's `stop` held back go first, in the order they were reaped.
-        let mut held = lock(&self.held);
-        while emitted < demand {
-            let Some(frame) = held.front() else { break };
-            if stop(&**frame) {
-                return emitted;
-            }
-            let frame = held.pop_front().expect("the front");
-            self.pending.fetch_sub(1, Ordering::AcqRel);
-            consumer(frame);
-            emitted += 1;
-        }
+    fn poll(&self, room: &mut dyn FnMut() -> bool, offer: &mut dyn FnMut(Box<dyn Frame>) -> bool) {
         let rings: Vec<Arc<Ring>> = lock(&self.rings).clone();
-        'rings: for ring in &rings {
+        for ring in &rings {
             ring.flush_waiting(&*self.enter);
             let Ok(_reaping) = ring.cq.try_lock() else {
                 continue;
             };
             loop {
-                if emitted >= demand {
+                if !room() {
                     break;
                 }
                 let next = {
@@ -793,18 +599,10 @@ impl AsyncIo {
                 ring.in_kernel.fetch_sub(1, Ordering::AcqRel);
                 match ring.reap_one(user_data, result, self.max_piece) {
                     Reaped::Ended(op, result) => {
-                        let frame = conclude(op, result);
-                        if stop(&*frame) {
-                            // The lattice's direct pulls stop before ordered frames: this one goes
-                            // out through a later poll (the lattice's routing), and nothing reaped
-                            // after it passes it.
-                            held.push_back(frame);
+                        if !offer(conclude(op, result)) {
                             ring.flush_waiting(&*self.enter);
-                            break 'rings;
+                            return;
                         }
-                        self.pending.fetch_sub(1, Ordering::AcqRel);
-                        consumer(frame);
-                        emitted += 1;
                     }
                     Reaped::Again(entry) => ring.queue(entry, &*self.enter),
                     Reaped::Stray => {
@@ -815,62 +613,27 @@ impl AsyncIo {
             // Room freed in the completion queue may let the backlog in.
             ring.flush_waiting(&*self.enter);
         }
-        emitted
     }
 }
 
-impl LatticeSource for AsyncIo {
-    fn add_downstream(self: Arc<Self>, downstream: Arc<dyn LatticeReceiver>) {
-        if self.complete.load(Ordering::Acquire) {
-            downstream.on_complete();
-            return;
-        }
-        *lock(&self.downstream) = Some(downstream.clone());
-        downstream.add_upstream(self);
+impl AsyncIo {
+    /// Asynchronous I/O on this machine, or why there is none (no io_uring).
+    pub fn open() -> io::Result<Arc<Self>> {
+        Self::open_with_options(AsyncIoOptions::default())
     }
 
-    fn pull(
-        &self,
-        consumer: &mut dyn FnMut(Box<dyn Frame>),
-        stop: &mut dyn FnMut(&dyn Frame) -> bool,
-        demand: u64,
-    ) -> u64 {
-        self.reap(consumer, stop, demand)
+    /// As [`open`](Self::open), with options (none of them applies to io_uring).
+    pub fn open_with_options(_options: AsyncIoOptions) -> io::Result<Arc<Self>> {
+        Self::open_with(
+            Box::new(|submitter: &Submitter<'_>| submitter.submit()),
+            MAX_PIECE,
+        )
     }
 
-    fn request(&self, demand: u64) {
-        if demand == 0 || self.complete.load(Ordering::Acquire) {
-            return;
-        }
-        let total = self
-            .demand
-            .fetch_add(demand, Ordering::AcqRel)
-            .saturating_add(demand);
-        let Some(downstream) = lock(&self.downstream).clone() else {
-            return;
-        };
-        let emitted = self.reap(&mut |frame| downstream.push(frame), &mut |_| false, total);
-        if emitted > 0 {
-            let _ = self
-                .demand
-                .try_update(Ordering::AcqRel, Ordering::Acquire, |d| {
-                    Some(d.saturating_sub(emitted))
-                });
-        }
-    }
-
-    /// Stops new submissions (they fail) and tells the downstream. Complete it once
-    /// [`AsyncIo::pending`] is zero.
-    fn complete(&self) {
-        if !self.complete.swap(true, Ordering::AcqRel)
-            && let Some(downstream) = lock(&self.downstream).take()
-        {
-            downstream.on_complete();
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        self.complete.load(Ordering::Acquire)
+    /// As [`open`](Self::open), with `enter` in place of `io_uring_enter` and pieces of at most
+    /// `max_piece` bytes (tests: the stand-in backend).
+    fn open_with(enter: Box<Enter>, max_piece: usize) -> io::Result<Arc<Self>> {
+        Ok(Self::from_engine(Uring::with(enter, max_piece)?))
     }
 }
 
@@ -880,12 +643,14 @@ impl LatticeSource for AsyncIo {
 #[allow(clippy::disallowed_methods)] // Test fixtures write files and open sockets synchronously, outside any lattice.
 mod tests {
     use std::io::{Read, Write};
-    use std::os::fd::AsRawFd;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
     use euhedral_core::frames::FrameHeader;
+    use euhedral_core::generics::{LatticeReceiver, LatticeSource};
 
+    use super::super::{Continuation, IoThen};
     use super::*;
 
     /// A completion frame: carries what the operation ended with.
@@ -1064,7 +829,11 @@ mod tests {
                 data[4096 * i as usize..4096 * (i as usize + 1)]
             );
         }
-        assert_eq!(lock(&io.rings).len(), 8, "a ring per submitting thread");
+        assert_eq!(
+            lock(&io.engine.rings).len(),
+            8,
+            "a ring per submitting thread"
+        );
         assert_eq!(io.pending(), 0);
     }
 
@@ -1300,7 +1069,7 @@ mod tests {
         let io = AsyncIo::open().unwrap();
         io.read(file.as_raw_fd(), 0, buf(8), then(1)).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
-        while lock(&io.held).is_empty() {
+        while lock(&io.front.held).is_empty() {
             assert!(Instant::now() < deadline, "the read did not complete");
             let pulled = io.pull(&mut |_| panic!("held back"), &mut |_| true, u64::MAX);
             assert_eq!(pulled, 0);
