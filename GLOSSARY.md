@@ -434,7 +434,9 @@ to CPUs. `AffinityCapability` says what the platform can do: `Exact` masks (Linu
 
 **PinnedThreadExecutor** ([`PinnedThreadExecutor`](euhedral-hardware-utils/src/affinity/executor.rs)):
 runs each command on a fresh thread pinned to one CPU, with at most one live executor per CPU. Each
-fragment worker runs on one.
+fragment worker runs on one. Every handle is one use of the CPU's shared executor: it closes when
+its last use ends (the last handle is dropped or `release`d), so fragments of different lattices can
+share a CPU and each closes only its own worker task (`TaskInterrupt`).
 
 **monitor** ([`ResourceMonitor`](euhedral-hardware-utils/src/monitor/mod.rs)): a background sampler
 that polls CPU, memory, I/O and power signals (every 200 ms by default), publishes a smoothed

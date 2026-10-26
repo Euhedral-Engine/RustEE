@@ -81,9 +81,13 @@ can do depends on `capability()`: `Exact` applies the whole mask, `LocalityHint`
 preference, and `Unsupported` changes nothing and returns `false`.
 
 A `PinnedThreadExecutor` runs each command on a fresh thread pinned to one CPU. There is at most
-one live executor per CPU in the process; handles are cheap to clone, and dropping the last one
-closes it. Interruption is cooperative: `shutdown_now` and `close` set a flag the task reads with
-`is_interrupted()`.
+one live executor per CPU in the process, shared by everyone who asks for that CPU. Every handle is
+one *use* of it: cloning a handle adds a use, and `release` (or dropping the handle) ends it. The
+executor closes when its last use ends, so a user that is done leaves the others running.
+Interruption is cooperative: `shutdown_now` and `close` set a flag on every task, and
+`submit_interruptible` returns a `TaskInterrupt` that sets it on one task alone; a task reads it with
+`is_interrupted()`. `close` closes the executor for every user; a user that only wants to stop its own
+work interrupts its task and releases its handle.
 
 ```rust
 use euhedral_hardware_utils::affinity::{self, AffinityCapability, PinnedThreadExecutor};
@@ -94,7 +98,7 @@ let ran_on = executor.submit(affinity::current_cpu).unwrap().join().unwrap();
 if affinity::capability() == AffinityCapability::Exact && ran_on.is_some() {
     assert_eq!(ran_on, Some(cpu));
 }
-executor.close();
+executor.release();
 ```
 
 ### Monitor and pressure

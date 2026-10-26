@@ -9,7 +9,7 @@ mod executor;
 pub mod masks;
 
 pub use controller::{AffinityController, ControllerError, ManagedCpuBinding};
-pub use executor::{ExecutorError, PinnedThreadExecutor, Rejected, is_interrupted};
+pub use executor::{ExecutorError, PinnedThreadExecutor, Rejected, TaskInterrupt, is_interrupted};
 
 use crate::topology::{CpuInfo, Topology};
 use crate::util::CpuSet;
