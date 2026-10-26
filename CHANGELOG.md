@@ -59,6 +59,37 @@ the lattice to hand it a result.
 together made a rebalance panic with "cannot restart the executor"). `tests/credit_graph.rs` publishes its stage frames through
 a lake of two sinks. The stage graph's unit tests publish through a queue sink behind a small `FrameSink` adapter.
 
+## `AsyncIo::read_into`: reads into caller-owned memory (2026-10-26)
+
+**What.** `AsyncIo::read_into(file, offset, buf, then)` reads into memory the caller owns, such as a pinned host
+arena, instead of an `IoBuf`'s `Vec`. `buf` is any `IoMemory`; `then` receives an `IoDoneOwned { buf, result }`. The
+engines (io_uring, IoRing and the completion port) work on a view of the region, so nothing is copied.
+
+**Why.** The inference engine reads weights from disk straight into host memory it allocates and pins itself.
+
+**API.** `pub unsafe trait IoMemory: Send + 'static { as_mut_ptr, len, is_empty }`, implemented for `Vec<u8>`;
+`IoDoneOwned<B> { buf: Option<B>, result, filled }`. `read` is unchanged.
+
+**Semantics.**
+- The result is a `read`'s: `Ok(n)` with `n` the region's length, or less if the file ended after some bytes (the first
+  `n` bytes are the file's, the rest untouched); `UnexpectedEof` when no byte was read. An empty region is refused at
+  submission, with nothing started.
+- The region is cut into pieces of at most 256 KiB, as a `read`'s buffer is; each piece lands at its own offset and
+  the engines' short-transfer and slot-identity rules apply unchanged.
+- `then` always runs. The value comes back in `IoDoneOwned::buf` after a success and after an error alike. `buf` is
+  `None` only for an operation the engine cannot prove finished with the kernel, which already leaked its buffer on
+  Windows (a ring that broke, a ring entry that may have reached the kernel): the value is leaked (never dropped) and
+  `result` is the ring's failure. A submission that returns `Err` started nothing and drops the value.
+- `filled` is the count of bytes at the start of the region that arrived: `n` for `Ok(n)`; after an error, the bytes of a
+  Windows read that failed with a warning status (`ERROR_MORE_DATA`) and moved bytes anyway, as `IoBuf::filled` reports.
+- `IoMemory` is the only new `unsafe` surface; its contract (initialized, stable when moved
+  without claiming unique ownership, exclusive until returned) is on the trait.
+
+**Tests.** `tests/io_owned.rs` (`read_into_fills_owned_region`, `read_into_split_pieces_preserve_offsets`,
+`read_into_short_read_reports_count`, `owned_buffer_returned_on_error`); in `io/uring.rs`,
+`reads_into_parts_of_one_arena_land_in_place`; in `io/win/tests.rs`, the owned reads through the simulated ring and port
+and the leak of a broken ring's region (the continuation runs with `buf` `None`); in `io/win/live.rs`, a read into owned memory on a real Windows.
+
 ## `AsyncIo` on Windows (2026-10-26)
 
 **What.** `euhedral-graph`'s `AsyncIo` gets a Windows engine: IoRing for file reads and writes where the OS has a kernel

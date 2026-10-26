@@ -16,8 +16,8 @@ use euhedral_core::frames::Frame;
 use io_uring::{IoUring, Submitter, opcode, squeue, types};
 
 use super::{
-    AsyncIo, AsyncIoOptions, Create, Engine, IoBuf, IoDone, MAX_PIECE, OpenSpec, READ_PIECE,
-    Request, Then, lock,
+    AsyncIo, AsyncIoOptions, Buf, Create, Engine, MAX_PIECE, OpenSpec, READ_PIECE, Request, Then,
+    conclude as conclude_io, lock,
 };
 
 /// Entries of each ring's submission queue (its completion queue has twice as many).
@@ -158,7 +158,7 @@ enum Kind {
 /// reaped.
 struct Op {
     kind: Kind,
-    buf: IoBuf,
+    buf: Buf,
     /// Bytes moved so far (reads and writes resubmit the rest).
     moved: usize,
     then: Then,
@@ -170,7 +170,7 @@ impl Op {
         let piece = |n: usize| u32::try_from(n.min(max_piece)).unwrap_or(u32::MAX);
         let entry = match &self.kind {
             Kind::Read { fd, offset } => {
-                let rest = &mut self.buf.bytes[self.moved..];
+                let rest = &mut self.buf.bytes_mut()[self.moved..];
                 // A read the page cache can serve is copied inside `io_uring_enter`, on the
                 // submitting worker: about 0.2 ms per MB (a read of several MB copied in one
                 // completion held a worker for a millisecond). So a read goes in pieces of at most
@@ -182,7 +182,7 @@ impl Op {
                     .build()
             }
             Kind::Write { fd, offset } => {
-                let rest = &self.buf.bytes[self.moved..self.buf.filled];
+                let rest = &self.buf.bytes()[self.moved..self.buf.filled()];
                 opcode::Write::new(types::Fd(*fd), rest.as_ptr(), piece(rest.len()))
                     .offset(offset + self.moved as u64)
                     .build()
@@ -190,7 +190,7 @@ impl Op {
             Kind::Send { fd } => {
                 // Copied into the socket inside `io_uring_enter` too: pieces of at most READ_PIECE,
                 // as reads.
-                let bytes = &self.buf.bytes[self.moved..self.buf.filled];
+                let bytes = &self.buf.bytes()[self.moved..self.buf.filled()];
                 opcode::Send::new(
                     types::Fd(*fd),
                     bytes.as_ptr(),
@@ -200,7 +200,7 @@ impl Op {
                 .build()
             }
             Kind::Recv { fd } => {
-                let bytes = &mut self.buf.bytes[..];
+                let bytes = self.buf.bytes_mut();
                 opcode::Recv::new(types::Fd(*fd), bytes.as_mut_ptr(), piece(bytes.len())).build()
             }
             Kind::Accept { fd } => {
@@ -222,7 +222,7 @@ impl Op {
             )
             .build(),
             Kind::SendTo { fd, addr, len } => {
-                let bytes = &self.buf.bytes[..self.buf.filled];
+                let bytes = &self.buf.bytes()[..self.buf.filled()];
                 opcode::Send::new(types::Fd(*fd), bytes.as_ptr(), piece(bytes.len()))
                     .flags(libc::MSG_NOSIGNAL)
                     .dest_addr(std::ptr::from_ref(&**addr).cast())
@@ -340,9 +340,9 @@ impl Ring {
             Kind::Read { .. } | Kind::Write { .. } | Kind::Send { .. } if result > 0 => {
                 op.moved += result as usize;
                 let total = if matches!(op.kind, Kind::Read { .. }) {
-                    op.buf.bytes.len()
+                    op.buf.len()
                 } else {
-                    op.buf.filled
+                    op.buf.filled()
                 };
                 if op.moved < total {
                     return Reaped::Again(op.entry(user_data, max_piece));
@@ -360,7 +360,7 @@ impl Ring {
                 }
             }
             Kind::Write { .. } if result == 0 => Err(io::Error::from(io::ErrorKind::WriteZero)),
-            Kind::Send { .. } if result == 0 && op.buf.filled > 0 => {
+            Kind::Send { .. } if result == 0 && op.buf.filled() > 0 => {
                 Err(io::Error::from(io::ErrorKind::WriteZero))
             }
             _ if result < 0 => Err(io::Error::from_raw_os_error(-result)),
@@ -385,22 +385,10 @@ impl Drop for Ring {
 /// The continuation's frame for an ended operation.
 fn conclude(op: Op, result: io::Result<usize>) -> Box<dyn Frame> {
     let Op {
-        kind,
-        mut buf,
-        then,
-        ..
+        kind, buf, then, ..
     } = op;
-    match then {
-        Then::Io(then) => {
-            if matches!(kind, Kind::Read { .. } | Kind::Recv { .. })
-                && let Ok(n) = result
-            {
-                buf.filled = n;
-            }
-            then(IoDone { buf, result })
-        }
-        Then::Raw(then) => then(result),
-    }
+    let fills = matches!(kind, Kind::Read { .. } | Kind::Recv { .. });
+    conclude_io(buf, then, fills, result)
 }
 
 fn c_path(path: &std::path::Path) -> io::Result<CString> {
@@ -557,7 +545,7 @@ fn open_flags(spec: OpenSpec) -> i32 {
 }
 
 impl Engine for Uring {
-    fn submit(&self, request: Request, buf: IoBuf, then: Then) -> io::Result<()> {
+    fn submit(&self, request: Request, buf: Buf, then: Then) -> io::Result<()> {
         let kind = Self::kind(request)?;
         let ring = self.ring()?;
         let entry = {
@@ -647,10 +635,10 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
-    use euhedral_core::frames::FrameHeader;
+    use euhedral_core::frames::{FrameHeader, RunnableFrame};
     use euhedral_core::generics::{LatticeReceiver, LatticeSource};
 
-    use super::super::{Continuation, IoThen};
+    use super::super::{Continuation, IoBuf, IoDone, IoDoneOwned, IoMemory, IoThen};
     use super::*;
 
     /// A completion frame: carries what the operation ended with.
@@ -771,6 +759,109 @@ mod tests {
         assert_eq!(a.buf.bytes, data[..4096]);
         assert_eq!(&b.buf.bytes[..b.buf.filled], &data[4096..]);
         assert_eq!(io.pending(), 0);
+    }
+
+    /// One shared allocation, as a pinned host arena is: parts of it go to readers, each reaching its
+    /// bytes through the raw base pointer (never through a reference to the whole).
+    struct Arena {
+        base: *mut u8,
+        len: usize,
+        capacity: usize,
+    }
+
+    // SAFETY: the base pointer is only read; the bytes are reached through parts that are disjoint
+    // while their reads run, and through `bytes` after all parts came back.
+    unsafe impl Send for Arena {}
+    // SAFETY: as for `Send`.
+    unsafe impl Sync for Arena {}
+
+    impl Arena {
+        fn new(bytes: Vec<u8>) -> Self {
+            let mut bytes = std::mem::ManuallyDrop::new(bytes);
+            Self {
+                base: bytes.as_mut_ptr(),
+                len: bytes.len(),
+                capacity: bytes.capacity(),
+            }
+        }
+
+        /// All of it; only when no part is out.
+        fn bytes(&self) -> &[u8] {
+            // SAFETY: `len` initialized bytes of the block; the caller has every part back.
+            unsafe { std::slice::from_raw_parts(self.base, self.len) }
+        }
+    }
+
+    impl Drop for Arena {
+        fn drop(&mut self) {
+            // SAFETY: the parts of `new`'s vector, not used since.
+            drop(unsafe { Vec::from_raw_parts(self.base, self.len, self.capacity) });
+        }
+    }
+
+    struct ArenaPart {
+        arena: Arc<Arena>,
+        offset: usize,
+        len: usize,
+    }
+
+    // SAFETY: the part addresses `len` initialized bytes of the arena's block, which does not move
+    // or go away while an `Arc` of it exists; it holds no reference to them, only a pointer derived
+    // from the arena's base; the parts of this test are disjoint, and nothing else touches the arena
+    // until they all came back.
+    unsafe impl IoMemory for ArenaPart {
+        fn as_mut_ptr(&mut self) -> *mut u8 {
+            // SAFETY: `offset` is inside the block.
+            unsafe { self.arena.base.add(self.offset) }
+        }
+
+        fn len(&self) -> usize {
+            self.len
+        }
+    }
+
+    /// Two reads into disjoint parts of one arena, each cut into short pieces, land at their own
+    /// offsets of the arena, without a copy.
+    #[test]
+    fn reads_into_parts_of_one_arena_land_in_place() {
+        let data = content(3 * 4096, 11);
+        let (_guard, file) = temp_file("arena", &data);
+        let io = AsyncIo::open_with(Box::new(|s: &Submitter<'_>| s.submit()), 1000).unwrap();
+        let arena = Arc::new(Arena::new(vec![0xEE; 2 * 4096 + 100]));
+        let returned = Arc::new(Mutex::new(Vec::new()));
+        // The first part reads the file's last page and the second its first, in the arena's
+        // reverse order; the part in between stays untouched.
+        for (offset, len, from) in [(0, 4096, 2 * 4096), (4096 + 100, 4096, 0)] {
+            let part = ArenaPart {
+                arena: arena.clone(),
+                offset,
+                len,
+            };
+            let returned = returned.clone();
+            io.read_into(
+                file.as_raw_fd(),
+                from,
+                part,
+                Box::new(move |done: IoDoneOwned<ArenaPart>| {
+                    lock(&returned).push((done.buf.expect("memory back"), done.result.unwrap()));
+                    Box::new(RunnableFrame::new(1, Arc::new(|| {})))
+                }),
+            )
+            .unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while io.pending() > 0 {
+            assert!(Instant::now() < deadline, "the reads did not complete");
+            io.pull(&mut |frame| drop(frame), &mut |_| false, u64::MAX);
+        }
+        let returned = std::mem::take(&mut *lock(&returned));
+        assert_eq!(returned.len(), 2);
+        assert!(returned.iter().all(|(_, n)| *n == 4096));
+        drop(returned);
+        let arena = arena.bytes();
+        assert_eq!(arena[..4096], data[2 * 4096..]);
+        assert!(arena[4096..4096 + 100].iter().all(|&b| b == 0xEE));
+        assert_eq!(arena[4096 + 100..], data[..4096]);
     }
 
     /// AsyncReadsTest.readsFromManyThreadsEachCompleteOnce: 8 threads submit on rings of their own;

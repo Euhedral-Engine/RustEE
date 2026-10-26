@@ -27,8 +27,8 @@
 //! Features: `async-io` (default) builds `AsyncIo` on Linux, Android and Windows; `testing` adds
 //! `testing::FakeDevice`.
 
-// io_uring needs unsafe in `io`, and `ThreadUsage` makes two system calls, each with a `// SAFETY:`
-// comment; nowhere else.
+// The engines of `io` and its `IoMemory` contract need unsafe, and `ThreadUsage` makes two system
+// calls, each with a `// SAFETY:` comment; nowhere else.
 #![deny(unsafe_code)]
 
 pub mod completions;
@@ -52,8 +52,8 @@ pub use completions::{Completions, Pending, Ready};
     any(target_os = "linux", target_os = "android", windows)
 ))]
 pub use io::{
-    AsyncIo, AsyncIoOptions, Create, IoBuf, IoDone, IoThen, OpenSpec, OwnedFile, OwnedSock,
-    RawFile, RawSock,
+    AsyncIo, AsyncIoOptions, Create, IoBuf, IoDone, IoDoneOwned, IoMemory, IoThen, OpenSpec,
+    OwnedFile, OwnedSock, RawFile, RawSock,
 };
 pub use join::Join;
 pub use lake::{Lake, LakeClosed, UnitGuard};
