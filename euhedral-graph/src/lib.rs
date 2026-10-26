@@ -17,7 +17,7 @@
 //! | [`Sequencer`] | [`sequencer`] | Euhedral-Execution `FrameSequencer` / Kafka `OffsetCollector` |
 //! | [`Join`] | [`join`] | Euhedral-Inference `Join` |
 //! | [`LanePool`], [`Marker`], [`DeviceQueue`] | [`lanes`] | Euhedral-Inference `LanePool` |
-//! | [`StageGraph`] | [`graph`] | Euhedral-Inference `StageGraph` |
+//! | [`StageGraph`] | [`stage_graph`] | Euhedral-Inference `StageGraph` |
 //!
 //! Every public type is also re-exported at the crate root. Types of `euhedral-core` (`Frame`,
 //! `LatticeSource`, ...) are not: import them from `euhedral_core`.
@@ -30,26 +30,26 @@
 #![deny(unsafe_code)]
 
 pub mod completions;
-pub mod graph;
 #[cfg(all(feature = "io-uring", any(target_os = "linux", target_os = "android")))]
 pub mod io;
 pub mod join;
 pub mod lanes;
 pub mod sequencer;
+pub mod stage_graph;
 #[cfg(feature = "testing")]
 pub mod testing;
 
 pub use completions::{Completions, Pending, Ready};
-pub use graph::{
-    DEFAULT_RETRY_BACKSTOP, EdgeKind, ExternalEdge, GraphError, GraphRuntime, QuantumOutcome,
-    QuantumRef, RetryCounts, Stage, StageCx, StageError, StageGraph, StageGraphSpec, StageId,
-    StageSpec, Submitted,
-};
 #[cfg(all(feature = "io-uring", any(target_os = "linux", target_os = "android")))]
 pub use io::{AsyncIo, IoBuf, IoDone, IoThen};
 pub use join::Join;
 pub use lanes::{DeviceQueue, LaneId, LanePool, Marker};
 pub use sequencer::{Sequencer, Slot};
+pub use stage_graph::{
+    DEFAULT_RETRY_BACKSTOP, EdgeKind, ExternalEdge, GraphError, GraphRuntime, QuantumOutcome,
+    QuantumRef, RetryCounts, Stage, StageCx, StageError, StageGraph, StageGraphSpec, StageId,
+    StageSpec, Submitted,
+};
 
 use euhedral_core::frames::Frame;
 

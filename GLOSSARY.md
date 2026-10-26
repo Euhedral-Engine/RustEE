@@ -314,36 +314,36 @@ the device lanes shared by every graph of a process. `reached` says whether a ma
 completed; `choose` picks a stage's lane, continuing its predecessor's when allowed.
 
 **submission edge, completion edge, external edge**
-([`EdgeKind`](euhedral-graph/src/graph.rs), [`ExternalEdge`](euhedral-graph/src/graph.rs)): when a
+([`EdgeKind`](euhedral-graph/src/stage_graph.rs), [`ExternalEdge`](euhedral-graph/src/stage_graph.rs)): when a
 stage's successor may run. A submission edge is satisfied when the predecessor submitted (the
 successor waits on the device); a completion edge when the predecessor's work completed, found by a
 `Completions` poll. An external edge makes a stage of a new quantum depend on a stage of an earlier
 quantum.
 
-**stage** ([`Stage`](euhedral-graph/src/graph.rs), [`StageSpec`](euhedral-graph/src/graph.rs)): one
+**stage** ([`Stage`](euhedral-graph/src/stage_graph.rs), [`StageSpec`](euhedral-graph/src/stage_graph.rs)): one
 step of a stage graph, run once per quantum. It computes or submits and returns a
-[`Submitted`](euhedral-graph/src/graph.rs); it never waits. It may be ordered (its frames run in
+[`Submitted`](euhedral-graph/src/stage_graph.rs); it never waits. It may be ordered (its frames run in
 the order they are published) and may name the lanes able to run its work.
 
-**quantum** ([`StageGraph`](euhedral-graph/src/graph.rs)): the unit of work a stage graph is started
+**quantum** ([`StageGraph`](euhedral-graph/src/stage_graph.rs)): the unit of work a stage graph is started
 for, carrying whatever the caller's stages need. It has a kill switch of its own and ends with a
-[`QuantumOutcome`](euhedral-graph/src/graph.rs): `Completed`, `Failed` or `Killed`.
+[`QuantumOutcome`](euhedral-graph/src/stage_graph.rs): `Completed`, `Failed` or `Killed`.
 
-**live count** ([`StageGraph::live`](euhedral-graph/src/graph.rs)): the quanta started and not yet
+**live count** ([`StageGraph::live`](euhedral-graph/src/stage_graph.rs)): the quanta started and not yet
 retired. Each quantum also counts its own published frames and armed completion edges; at zero no
 stage can run again.
 
-**retirement boundary, retirement** ([`StageGraph`](euhedral-graph/src/graph.rs)): the latest marker
+**retirement boundary, retirement** ([`StageGraph`](euhedral-graph/src/stage_graph.rs)): the latest marker
 per lane of everything a quantum submitted, and every host completion no completion edge consumed.
 A quantum retires, handing itself and its outcome to the graph's `retire` callback, once none of its
 frames can run again and the boundary is reached. The boundary is armed as a `Completions` edge.
 
-**QuantumRef pin** ([`QuantumRef`](euhedral-graph/src/graph.rs)): a handle from `start` that keeps a
+**QuantumRef pin** ([`QuantumRef`](euhedral-graph/src/stage_graph.rs)): a handle from `start` that keeps a
 quantum from retiring while any clone lives, so a later quantum's external edge can still use its
 results. Drop it when nothing will depend on the quantum.
 
-**retry backstop** ([`GraphRuntime::retry_backstop`](euhedral-graph/src/graph.rs),
-[`DEFAULT_RETRY_BACKSTOP`](euhedral-graph/src/graph.rs)): a stage that answers `StageError::Retry`
+**retry backstop** ([`GraphRuntime::retry_backstop`](euhedral-graph/src/stage_graph.rs),
+[`DEFAULT_RETRY_BACKSTOP`](euhedral-graph/src/stage_graph.rs)): a stage that answers `StageError::Retry`
 runs again when any lane of the pool made progress, or after this deadline (20 ms by default) for a
 resource outside the pool. Set it longer than any one pass on your devices.
 
