@@ -140,9 +140,10 @@ fn read_into_fills_owned_region() {
     let region = memory.as_ptr();
     let done = read_into(&io, &file, 0, memory);
     assert_eq!(done.result.unwrap(), data.len());
-    assert_eq!(done.buf, data);
+    let buf = done.buf.unwrap();
+    assert_eq!(buf, data);
     assert_eq!(
-        done.buf.as_ptr(),
+        buf.as_ptr(),
         region,
         "the bytes landed in the caller's own region"
     );
@@ -157,12 +158,15 @@ fn read_into_split_pieces_preserve_offsets() {
     // Larger than a piece, from the start and from an offset that is not aligned to one.
     let done = read_into(&io, &file, 0, vec![SENTINEL; data.len()]);
     assert_eq!(done.result.unwrap(), data.len());
-    assert!(done.buf == data, "every piece landed at its own offset");
+    assert!(
+        done.buf.unwrap() == data,
+        "every piece landed at its own offset"
+    );
     let from = 5_000;
     let done = read_into(&io, &file, from as u64, vec![SENTINEL; 2 * PIECE + 13]);
     assert_eq!(done.result.unwrap(), 2 * PIECE + 13);
     assert!(
-        done.buf == data[from..from + 2 * PIECE + 13],
+        done.buf.unwrap() == data[from..from + 2 * PIECE + 13],
         "and so did the pieces of a read from an offset"
     );
 }
@@ -174,10 +178,12 @@ fn read_into_short_read_reports_count() {
     let (_scratch, file) = open_file(&io, "short", &data);
     let done = read_into(&io, &file, 400, vec![SENTINEL; 4096]);
     assert_eq!(done.result.unwrap(), 600, "the file ended after 600 bytes");
-    assert_eq!(done.buf.len(), 4096, "the whole region comes back");
-    assert_eq!(&done.buf[..600], &data[400..]);
+    assert_eq!(done.filled, 600);
+    let buf = done.buf.unwrap();
+    assert_eq!(buf.len(), 4096, "the whole region comes back");
+    assert_eq!(&buf[..600], &data[400..]);
     assert!(
-        done.buf[600..].iter().all(|&b| b == SENTINEL),
+        buf[600..].iter().all(|&b| b == SENTINEL),
         "past the end of the file the region is untouched"
     );
 }
@@ -193,7 +199,7 @@ fn owned_buffer_returned_on_error() {
         done.result.unwrap_err().kind(),
         io::ErrorKind::UnexpectedEof
     );
-    assert_eq!(done.buf, vec![SENTINEL; 512]);
+    assert_eq!(done.buf.unwrap(), vec![SENTINEL; 512]);
     assert_eq!(io.pending(), 0);
     // An empty region is refused at submission: nothing started, nothing pending.
     let refused = io.read_into(

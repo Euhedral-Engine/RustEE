@@ -53,14 +53,21 @@ fn io_then(tag: u64) -> Then {
 /// A read into caller-owned memory: the region of `memory`, and the continuation that holds it.
 fn owned_read(mut memory: Vec<u8>, tag: u64) -> (Buf, Then) {
     let region = Region::of(&mut memory);
-    let then = Then::Owned(Box::new(move |result| {
+    let then = Then::Owned(Box::new(move |result, filled, leaked| {
+        let buf = if leaked {
+            std::mem::forget(memory);
+            None
+        } else {
+            Some(memory)
+        };
         Box::new(Done {
             header: FrameHeader::new(tag),
             done: None,
             raw: None,
             owned: Some(IoDoneOwned {
-                buf: memory,
+                buf,
                 result,
+                filled,
             }),
         })
     }));
@@ -1262,7 +1269,7 @@ fn an_owned_read_is_cut_into_pieces_that_land_at_their_offsets() {
         h.read_owned(file, 0, vec![0; data.len()], 1).unwrap();
         let done = owned(h.one());
         assert_eq!(done.result.unwrap(), data.len());
-        assert_eq!(done.buf, data);
+        assert_eq!(done.buf.unwrap(), data);
         let reads = h.sim.log().iter().filter(|l| l.starts_with("read")).count();
         assert!(reads >= 4, "pieces of at most 4096 bytes: {reads}");
         assert_eq!(h.pending(), 0);
@@ -1278,19 +1285,25 @@ fn an_owned_read_that_ends_inside_the_file_reports_its_count_and_one_past_it_fai
     h.read_owned(file, 40, vec![0; 4096], 1).unwrap();
     let done = owned(h.one());
     assert_eq!(done.result.unwrap(), 60);
-    assert_eq!(done.buf.len(), 4096, "the whole memory comes back");
-    assert_eq!(&done.buf[..60], &data[40..]);
+    assert_eq!(done.filled, 60);
+    let buf = done.buf.unwrap();
+    assert_eq!(buf.len(), 4096, "the whole memory comes back");
+    assert_eq!(&buf[..60], &data[40..]);
     h.read_owned(file, 8192, vec![7; 64], 2).unwrap();
     let done = owned(h.one());
     assert_eq!(
         done.result.unwrap_err().kind(),
         io::ErrorKind::UnexpectedEof
     );
-    assert_eq!(done.buf, [7; 64], "and so does the memory of a failed read");
+    assert_eq!(
+        done.buf.unwrap(),
+        [7; 64],
+        "and so does the memory of a failed read"
+    );
 }
 
 #[test]
-fn an_owned_read_whose_ring_broke_leaks_its_memory_and_still_ends_with_a_frame() {
+fn an_owned_read_whose_ring_broke_leaks_its_memory_and_its_continuation_says_so() {
     use std::sync::atomic::AtomicBool;
 
     /// Tells when it is dropped.
@@ -1307,13 +1320,18 @@ fn an_owned_read_whose_ring_broke_leaks_its_memory_and_still_ends_with_a_frame()
     h.drain(1);
     let ring = h.engine.ring().unwrap();
     let dropped = Arc::new(AtomicBool::new(false));
-    let ran = Arc::new(AtomicBool::new(false));
+    let ran: Arc<Mutex<Option<(bool, bool)>>> = Arc::default();
     let mut memory = Watched(vec![0u8; 10], dropped.clone());
     let region = Region::of(&mut memory.0);
-    let continuation = ran.clone();
-    let then = Then::Owned(Box::new(move |_| {
-        continuation.store(true, Ordering::Release);
-        drop(memory);
+    let ran_with = ran.clone();
+    let then = Then::Owned(Box::new(move |result, _, leaked| {
+        let kept = if leaked {
+            std::mem::forget(memory);
+            None
+        } else {
+            Some(memory)
+        };
+        *ran_with.lock().unwrap() = Some((result.is_err(), kept.is_none()));
         Box::new(Done {
             header: FrameHeader::new(2),
             done: None,
@@ -1351,23 +1369,11 @@ fn an_owned_read_whose_ring_broke_leaks_its_memory_and_still_ends_with_a_frame()
     h.engine.flush_ring(&ring);
     ring.broken.store(true, Ordering::Release);
     h.engine.end_if_broken(&ring, entry.user_data);
-    let mut frames = Vec::new();
-    h.front.reap(
-        &*h.engine,
-        &mut |frame| frames.push(frame),
-        &mut |_| false,
-        u64::MAX,
-    );
-    assert_eq!(frames.len(), 1, "an empty frame ended it");
-    assert!(
-        (frames.pop().unwrap() as Box<dyn std::any::Any>)
-            .downcast::<Done>()
-            .is_err(),
-        "and it is not the continuation's"
-    );
-    assert!(
-        !ran.load(Ordering::Acquire),
-        "the continuation holding the memory did not run"
+    h.drain(1);
+    assert_eq!(
+        *ran.lock().unwrap(),
+        Some((true, true)),
+        "the continuation ran with the ring's failure and no memory"
     );
     assert!(
         !dropped.load(Ordering::Acquire),

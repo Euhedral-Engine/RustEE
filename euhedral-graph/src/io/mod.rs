@@ -24,7 +24,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use euhedral_core::frames::{Frame, RunnableFrame};
+use euhedral_core::frames::Frame;
 use euhedral_core::generics::{LatticeReceiver, LatticeSource};
 
 use crate::Continuation;
@@ -95,19 +95,21 @@ pub type IoThen = Continuation<IoDone>;
 ///
 /// - the pointer addresses [`len`](Self::len) bytes that are allocated, **initialized**, valid for
 ///   reads and writes, and not freed, remapped or reused;
-/// - **moving the value does not move the region** (the pointer stays valid after the value moved
-///   into the operation): a value that owns its memory through a heap block or a mapping, such as
-///   `Vec<u8>`, does; a value that holds the bytes inline does not, and must not implement this
-///   trait;
+/// - **moving the value does not move the region, and does not assert unique ownership of it**
+///   (the pointer stays valid after the value moved into the operation): a value that owns its
+///   memory through a heap block or a mapping behind a raw pointer, such as `Vec<u8>`, qualifies;
+///   a value that holds the bytes inline does not, and neither does one whose move is a unique
+///   retag of the region, such as `Box<[u8]>` (under Stacked Borrows a move of a `Box` invalidates
+///   the raw pointers derived from it), unless the region is reached through a raw-pointer wrapper;
 /// - the region is exclusively the operation's: nothing else, in this process or another, reads or
 ///   writes it (so a region of a shared arena must be one no other value refers to), and the value
 ///   itself touches it only through the pointer;
-/// - `len` does not change, and both methods are called once, when the read is submitted.
+/// - `len` returns the same value on every call.
 ///
-/// The engine promises that the value is dropped or returned only after the kernel can no longer
-/// touch the region. When it cannot tell (a ring that broke), it **leaks** the value instead: the
-/// continuation does not run, the value is never dropped, and the operation ends with a frame that
-/// does nothing, so that [`AsyncIo::pending`] still drains.
+/// The engine calls `as_mut_ptr` and `len` once, when the read is submitted, and promises that the
+/// value is dropped or returned only after the kernel can no longer touch the region. When it
+/// cannot tell (a ring that broke), it **leaks** the value instead: the value is never dropped, the
+/// continuation still runs, and its [`IoDoneOwned::buf`] is `None`.
 pub unsafe trait IoMemory: Send + 'static {
     /// The start of the region.
     fn as_mut_ptr(&mut self) -> *mut u8;
@@ -134,12 +136,17 @@ unsafe impl IoMemory for Vec<u8> {
 }
 
 /// A finished read into caller-owned memory: the memory back, and the bytes moved or the error.
-/// The memory is returned whether the read succeeded or failed, except when it had to be leaked
-/// (see [`IoMemory`]).
 #[derive(Debug)]
 pub struct IoDoneOwned<B> {
-    pub buf: B,
+    /// The memory, whether the read succeeded or failed. `None` only when the engine could not tell
+    /// that the kernel was done with it (a ring that broke) and leaked it instead: it is never
+    /// dropped, and `result` is then the ring's failure.
+    pub buf: Option<B>,
     pub result: io::Result<usize>,
+    /// How many bytes at the start of the region arrived: `n` for `Ok(n)`. After an error it is
+    /// the bytes that arrived before it, which is non-zero only for a Windows read that failed with
+    /// a warning status (`ERROR_MORE_DATA` of a message-mode pipe) and moved bytes anyway.
+    pub filled: usize,
 }
 
 /// What [`AsyncIo::open_path`] does about a file that exists or is missing.
@@ -256,9 +263,15 @@ pub(crate) enum Then {
     /// unused).
     Raw(Box<dyn FnOnce(io::Result<usize>) -> Box<dyn Frame> + Send>),
     /// A read into caller-owned memory: the closure holds the [`IoMemory`] value that the
-    /// operation's [`Buf::Region`] points into.
-    Owned(Box<dyn FnOnce(io::Result<usize>) -> Box<dyn Frame> + Send>),
+    /// operation's [`Buf::Region`] points into. It is called with the result, how many bytes
+    /// arrived, and whether the region was leaked (the closure then forgets the value).
+    Owned(OwnedThen),
 }
+
+/// What ends a read into caller-owned memory: the result, how many bytes arrived, and whether the
+/// region was leaked.
+pub(crate) type OwnedThen =
+    Box<dyn FnOnce(io::Result<usize>, usize, bool) -> Box<dyn Frame> + Send>;
 
 /// The memory of an operation, as an engine sees it.
 pub(crate) enum Buf {
@@ -275,8 +288,8 @@ impl From<IoBuf> for Buf {
 }
 
 /// A view of an [`IoMemory`] value's region. The value is held by the operation's continuation, so
-/// the region outlives every use the engine makes of it unless the operation is leaked (then the
-/// value is too, see [`Buf::leak`]).
+/// the region outlives every use the engine makes of it unless the operation is leaked (the
+/// continuation is then told, and forgets the value, see [`Buf::leak`]).
 pub(crate) struct Region {
     ptr: *mut u8,
     len: usize,
@@ -343,8 +356,8 @@ impl Buf {
     }
 
     /// The kernel may still write the memory, so it must never be freed or returned: a buffer is
-    /// leaked and the operation ends with an empty one; caller-owned memory is marked, and
-    /// [`conclude`] then leaks the value its continuation holds.
+    /// leaked and the operation ends with an empty one; caller-owned memory is marked, and its
+    /// continuation is told to leak the value it holds.
     #[cfg_attr(
         not(windows),
         allow(
@@ -385,12 +398,11 @@ pub(crate) fn conclude(
         }
         Then::Raw(then) => then(result),
         Then::Owned(then) => {
-            if buf.is_leaked() {
-                // The kernel may still write the region: the value that owns it is never dropped.
-                std::mem::forget(then);
-                return Box::new(RunnableFrame::new(0, Arc::new(|| {})));
+            if fills && let Ok(n) = result {
+                buf.set_filled(n);
             }
-            then(result)
+            let leaked = buf.is_leaked();
+            then(result, buf.filled(), leaked)
         }
     }
 }
@@ -643,8 +655,9 @@ impl AsyncIo {
     /// that finds no bytes at all fails with `UnexpectedEof`. The region is cut into pieces as a
     /// `read`'s buffer is, and the pieces land at their own offsets. A submission that returns `Err`
     /// started nothing: `buf` and `then` are dropped without running, and an empty region is
-    /// refused. If the engine can no longer tell whether the kernel still writes the region (a
-    /// ring that broke), `buf` is leaked and `then` does not run (see [`IoMemory`]).
+    /// refused. `then` always runs once the read was submitted. If the engine can no longer tell
+    /// whether the kernel still writes the region (a ring that broke), it leaks `buf`: `then` runs
+    /// with `buf` `None` and the ring's failure as the result (see [`IoMemory`]).
     pub fn read_into<B: IoMemory>(
         &self,
         file: RawFile,
@@ -658,7 +671,20 @@ impl AsyncIo {
         let region = Region::of(&mut buf);
         let file = raw_file(file);
         // The closure keeps `buf` alive and in place until the operation ends.
-        let then = Then::Owned(Box::new(move |result| then(IoDoneOwned { buf, result })));
+        let then = Then::Owned(Box::new(move |result, filled, leaked| {
+            let buf = if leaked {
+                // The kernel may still write the region: the value that owns it is never dropped.
+                std::mem::forget(buf);
+                None
+            } else {
+                Some(buf)
+            };
+            then(IoDoneOwned {
+                buf,
+                result,
+                filled,
+            })
+        }));
         self.submit(Request::Read { file, offset }, Buf::Region(region), then)
     }
 

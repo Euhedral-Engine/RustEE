@@ -132,14 +132,15 @@ starts operations and finds their ends, and `io/mod.rs` does the rest.
 **Reads into memory you own.** `read_into(file, offset, buf, then)` reads straight into a region the
 caller owns, such as a pinned host arena, so the bytes land in place with no copy. `buf` is any
 `IoMemory`: an `unsafe` trait whose implementor promises that the region is initialized, stays put
-when the value moves, and is exclusively the operation's from submission until `then` gets the value
-back in an `IoDoneOwned { buf, result }` (`Vec<u8>` implements it). The result is a `read`'s: `Ok(n)`
-with `n` the region's length or less where the file ended, `UnexpectedEof` for a read that finds no
-bytes, and the memory comes back whether the read succeeded or failed. The region is cut into
-pieces internally, each landing at its own offset. The one case where the memory does not come back
-is a ring that broke while the kernel may still have been writing it: the value is leaked, `then`
-does not run, and an empty frame ends the operation so that `pending()` drains. `read` stays as it
-was, for a `Vec`-backed `IoBuf`.
+when the value moves (and the move claims no unique ownership of it, which excludes `Box<[u8]>`), and
+is exclusively the operation's from submission until `then` gets the value back in an
+`IoDoneOwned { buf, result, filled }` (`Vec<u8>` implements it). The result is a `read`'s: `Ok(n)` with
+`n` the region's length or less where the file ended, `UnexpectedEof` for a read that finds no bytes,
+and `filled` is the bytes that arrived (`n`; after a Windows warning status, the bytes moved anyway).
+The memory comes back whether the read succeeded or failed, and `then` always runs. The one case where
+`buf` is `None` is a ring that broke while the kernel may still have been writing the region: the value
+is leaked (never dropped) and `result` is the ring's failure. The region is cut into pieces
+internally, each landing at its own offset. `read` stays as it was, for a `Vec`-backed `IoBuf`.
 
 - **Linux and Android:** io_uring, with one ring per submitting thread. An operation belongs to the
   thread that submitted it, and lattice workers live as long as the lattice.

@@ -761,12 +761,43 @@ mod tests {
         assert_eq!(io.pending(), 0);
     }
 
-    /// A part of one shared allocation, as a pinned host arena hands out parts to its readers.
-    struct Arena(std::cell::UnsafeCell<Vec<u8>>);
+    /// One shared allocation, as a pinned host arena is: parts of it go to readers, each reaching its
+    /// bytes through the raw base pointer (never through a reference to the whole).
+    struct Arena {
+        base: *mut u8,
+        len: usize,
+        capacity: usize,
+    }
 
-    // SAFETY: the test gives every part to one reader at a time and reads the arena after all
-    // parts came back.
+    // SAFETY: the base pointer is only read; the bytes are reached through parts that are disjoint
+    // while their reads run, and through `bytes` after all parts came back.
+    unsafe impl Send for Arena {}
+    // SAFETY: as for `Send`.
     unsafe impl Sync for Arena {}
+
+    impl Arena {
+        fn new(bytes: Vec<u8>) -> Self {
+            let mut bytes = std::mem::ManuallyDrop::new(bytes);
+            Self {
+                base: bytes.as_mut_ptr(),
+                len: bytes.len(),
+                capacity: bytes.capacity(),
+            }
+        }
+
+        /// All of it; only when no part is out.
+        fn bytes(&self) -> &[u8] {
+            // SAFETY: `len` initialized bytes of the block; the caller has every part back.
+            unsafe { std::slice::from_raw_parts(self.base, self.len) }
+        }
+    }
+
+    impl Drop for Arena {
+        fn drop(&mut self) {
+            // SAFETY: the parts of `new`'s vector, not used since.
+            drop(unsafe { Vec::from_raw_parts(self.base, self.len, self.capacity) });
+        }
+    }
 
     struct ArenaPart {
         arena: Arc<Arena>,
@@ -775,12 +806,13 @@ mod tests {
     }
 
     // SAFETY: the part addresses `len` initialized bytes of the arena's block, which does not move
-    // or go away while an `Arc` of it exists; the parts of this test are disjoint, and nothing else
-    // touches the arena until they all came back.
+    // or go away while an `Arc` of it exists; it holds no reference to them, only a pointer derived
+    // from the arena's base; the parts of this test are disjoint, and nothing else touches the arena
+    // until they all came back.
     unsafe impl IoMemory for ArenaPart {
         fn as_mut_ptr(&mut self) -> *mut u8 {
             // SAFETY: `offset` is inside the block.
-            unsafe { (*self.arena.0.get()).as_mut_ptr().add(self.offset) }
+            unsafe { self.arena.base.add(self.offset) }
         }
 
         fn len(&self) -> usize {
@@ -795,10 +827,7 @@ mod tests {
         let data = content(3 * 4096, 11);
         let (_guard, file) = temp_file("arena", &data);
         let io = AsyncIo::open_with(Box::new(|s: &Submitter<'_>| s.submit()), 1000).unwrap();
-        let arena = Arc::new(Arena(std::cell::UnsafeCell::new(vec![
-            0xEE;
-            2 * 4096 + 100
-        ])));
+        let arena = Arc::new(Arena::new(vec![0xEE; 2 * 4096 + 100]));
         let returned = Arc::new(Mutex::new(Vec::new()));
         // The first part reads the file's last page and the second its first, in the arena's
         // reverse order; the part in between stays untouched.
@@ -814,7 +843,7 @@ mod tests {
                 from,
                 part,
                 Box::new(move |done: IoDoneOwned<ArenaPart>| {
-                    lock(&returned).push((done.buf, done.result.unwrap()));
+                    lock(&returned).push((done.buf.expect("memory back"), done.result.unwrap()));
                     Box::new(RunnableFrame::new(1, Arc::new(|| {})))
                 }),
             )
@@ -829,11 +858,7 @@ mod tests {
         assert_eq!(returned.len(), 2);
         assert!(returned.iter().all(|(_, n)| *n == 4096));
         drop(returned);
-        let arena = Arc::try_unwrap(arena)
-            .ok()
-            .expect("every part came back")
-            .0
-            .into_inner();
+        let arena = arena.bytes();
         assert_eq!(arena[..4096], data[2 * 4096..]);
         assert!(arena[4096..4096 + 100].iter().all(|&b| b == 0xEE));
         assert_eq!(arena[4096 + 100..], data[..4096]);

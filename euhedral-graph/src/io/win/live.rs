@@ -224,14 +224,17 @@ fn a_read_into_owned_memory_lands_in_place_and_returns_the_memory() {
             panic!("three reads ended");
         };
         assert_eq!(whole.result.as_ref().unwrap(), &data.len());
-        assert_eq!(whole.buf, data);
+        assert_eq!(whole.buf.as_deref(), Some(&data[..]));
         assert_eq!(tail.result.as_ref().unwrap(), &(data.len() - 100));
-        assert_eq!(&tail.buf[..data.len() - 100], &data[100..]);
+        assert_eq!(
+            &tail.buf.as_ref().unwrap()[..data.len() - 100],
+            &data[100..]
+        );
         assert_eq!(
             past.result.as_ref().unwrap_err().kind(),
             std::io::ErrorKind::UnexpectedEof
         );
-        assert_eq!(past.buf, [0xAA; 64]);
+        assert_eq!(past.buf.as_deref(), Some(&[0xAA; 64][..]));
         drop(file);
         std::fs::remove_file(path).unwrap();
     });
