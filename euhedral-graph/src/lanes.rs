@@ -33,10 +33,11 @@ pub trait DeviceQueue: Send + Sync + fmt::Debug {
 
 /// The device lanes shared by every stage graph of a process.
 ///
-/// A stage chooses its lane each time it runs: it continues the lane of its critical-path
-/// predecessor, or takes a lane in turn (a root, or another branch of a fan-out). A dependency
-/// between stages on different lanes is a device-side wait on the predecessor's marker; stages on
-/// one lane rely on the lane's order.
+/// A stage chooses its lane each time it runs: it continues the lane of the predecessor whose
+/// critical successor it is (each stage's lane is continued by one successor only), or takes a lane
+/// in turn (a root, or any other branch of a fan-out). A dependency between stages on different
+/// lanes is a device-side wait on the predecessor's marker; stages on one lane rely on the lane's
+/// order.
 pub struct LanePool {
     lanes: Vec<Arc<dyn DeviceQueue>>,
     /// The turn for stages that continue no lane.
@@ -81,8 +82,8 @@ impl LanePool {
         self.lane(marker.lane).completed() >= marker.value
     }
 
-    /// The lane for a stage: `continued` (its critical-path predecessor's lane) when given and
-    /// among `allowed`, otherwise one of `allowed` in turn. `allowed` lists the lanes able to run
+    /// The lane for a stage: `continued` (the lane of the predecessor it is the critical successor
+    /// of) when given and among `allowed`, otherwise one of `allowed` in turn. `allowed` lists the lanes able to run
     /// the stage's kind of work (compute, copy, a codec engine). Panics if `allowed` is empty (a
     /// CPU-only stage chooses no lane).
     pub fn choose(&self, allowed: &[LaneId], continued: Option<LaneId>) -> LaneId {

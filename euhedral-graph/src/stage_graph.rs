@@ -1,6 +1,7 @@
 //! Static stage DAGs run per quantum, with submission, completion and external edges
 //! (Euhedral-Inference `StageGraph`).
 
+use std::collections::VecDeque;
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -299,9 +300,12 @@ impl std::error::Error for GraphError {}
 ///   by the boundary.
 ///
 /// More precisely:
-/// - **Lanes:** a stage with device lanes continues the lane its critical-path predecessor (the
-///   predecessor on its longest path from a root) ran on, when allowed, and otherwise takes its
-///   lanes in turn ([`LanePool::choose`]).
+/// - **Lanes:** each stage's lane is continued by exactly one successor, its critical successor
+///   (the one on the longest submission path through it; the first listed on ties). A stage with
+///   device lanes continues the lane of the predecessor it is the critical successor of, when
+///   allowed; a root, and every other branch of a fan-out, takes its lanes in turn
+///   ([`LanePool::choose`]). A join continues a predecessor's lane only if it is that
+///   predecessor's critical successor, and waits on the markers of its other predecessors.
 /// - **Waits:** a stage's [`StageCx::waits`] hold, per lane, the latest marker of its submission
 ///   predecessors and external edges, minus its own lane's. A stage that submitted no marker
 ///   (CPU-only) passes its inputs on, so device order is kept through it.
@@ -361,7 +365,8 @@ struct Topology {
     successors: Vec<Vec<(StageId, EdgeKind)>>,
     incoming: Vec<usize>,
     has_completion_successor: Vec<bool>,
-    /// The predecessor on each stage's longest path from a root (the first listed on ties).
+    /// The predecessor whose lane each stage continues: the one for which the stage is the critical
+    /// successor (see [`Topology::path_predecessors`]).
     path_predecessor: Vec<Option<StageId>>,
     roots: Vec<StageId>,
 }
@@ -384,7 +389,7 @@ impl Topology {
             incoming[usize::from(to.0)] += 1;
             has_completion_successor[usize::from(from.0)] |= kind == EdgeKind::Completion;
         }
-        // Kahn's order, with each stage's depth (longest path from a root).
+        // Kahn's order, to reject cycles.
         let mut pending = incoming.clone();
         let mut ready: Vec<usize> = (0..n).filter(|&s| pending[s] == 0).collect();
         let roots = ready.iter().map(|&s| StageId(s as u16)).collect();
@@ -402,17 +407,7 @@ impl Topology {
         if order.len() < n {
             return Err(GraphError::Cycle(Self::a_cycle(&predecessors, &pending)));
         }
-        let mut depth = vec![0usize; n];
-        let mut path_predecessor = vec![None; n];
-        for &stage in &order {
-            for &pred in &predecessors[stage] {
-                let d = depth[usize::from(pred.0)] + 1;
-                if path_predecessor[stage].is_none() || d > depth[stage] {
-                    depth[stage] = d;
-                    path_predecessor[stage] = Some(pred);
-                }
-            }
-        }
+        let path_predecessor = Self::path_predecessors(&successors);
         Ok(Self {
             successors,
             incoming,
@@ -420,6 +415,63 @@ impl Topology {
             path_predecessor,
             roots,
         })
+    }
+
+    /// Links each stage to the successor that continues its longest submission path to a sink, so
+    /// lane placement keeps a graph's critical chain on one lane and every other branch of a
+    /// fan-out takes a lane in turn. Entry `s` of the result is the stage whose lane `s` continues.
+    ///
+    /// Port of Euhedral-Inference's `StageGraph.markPaths`, with its tie-breaks:
+    /// - only submission edges count (the Java `submittedSuccessors`); a completion edge never
+    ///   carries a lane;
+    /// - a stage's critical successor is the one with the greatest height (the number of stages on
+    ///   its longest path to a sink); of equal heights, the first listed (in edge order) wins;
+    /// - stages are visited sinks first, in a first-in first-out Kahn order over the reversed edges
+    ///   (sinks by stage index; a stage joins the queue when its last successor was visited, its
+    ///   predecessors being taken in the order of their stage indexes);
+    /// - a stage that is the critical successor of several predecessors continues the one visited
+    ///   last.
+    fn path_predecessors(successors: &[Vec<(StageId, EdgeKind)>]) -> Vec<Option<StageId>> {
+        let n = successors.len();
+        let submitted: Vec<Vec<usize>> = successors
+            .iter()
+            .map(|edges| {
+                edges
+                    .iter()
+                    .filter(|&&(_, kind)| kind == EdgeKind::Submission)
+                    .map(|&(to, _)| usize::from(to.0))
+                    .collect()
+            })
+            .collect();
+        let mut predecessors: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for (from, tos) in submitted.iter().enumerate() {
+            for &to in tos {
+                predecessors[to].push(from);
+            }
+        }
+        let mut pending: Vec<usize> = submitted.iter().map(Vec::len).collect();
+        let mut ready: VecDeque<usize> = (0..n).filter(|&s| pending[s] == 0).collect();
+        let mut height = vec![0usize; n];
+        let mut path_predecessor = vec![None; n];
+        while let Some(stage) = ready.pop_front() {
+            let mut critical: Option<usize> = None;
+            for &successor in &submitted[stage] {
+                if critical.is_none_or(|c| height[successor] > height[c]) {
+                    critical = Some(successor);
+                }
+            }
+            height[stage] = critical.map_or(1, |c| height[c] + 1);
+            if let Some(critical) = critical {
+                path_predecessor[critical] = Some(StageId(stage as u16));
+            }
+            for &predecessor in &predecessors[stage] {
+                pending[predecessor] -= 1;
+                if pending[predecessor] == 0 {
+                    ready.push_back(predecessor);
+                }
+            }
+        }
+        path_predecessor
     }
 
     /// A cycle among the stages Kahn's order could not place, in edge order. Each of them waits for
@@ -1627,7 +1679,7 @@ mod tests {
     fn fan_out_runs_both_branches_and_fan_in_runs_the_join_once_behind_the_other_lane() {
         let h = Harness::new(2);
         let both: &[u16] = &[0, 1];
-        // 0 -> 1 -> 2 -> 4 (the long chain) and 0 -> 3 -> 4.
+        // 0 -> 1 -> 3 -> 4 is the longest path; 0 -> 2 -> 4 is the side branch.
         let graph = h.graph(
             &[
                 (None, both, Act::Submit),
@@ -1638,10 +1690,10 @@ mod tests {
             ],
             &[
                 (0, 1, Submission),
-                (1, 2, Submission),
-                (2, 4, Submission),
-                (0, 3, Submission),
+                (1, 3, Submission),
                 (3, 4, Submission),
+                (0, 2, Submission),
+                (2, 4, Submission),
             ],
         );
         let _ = graph.start(1, alive(), Vec::new());
@@ -1651,19 +1703,227 @@ mod tests {
         assert_eq!(ran, [0, 1, 2, 3, 4], "each stage ran once");
         let lane = |s| h.ran_with(1, s).unwrap().0.unwrap();
         assert_eq!(lane(1), lane(0), "the long chain keeps its root's lane");
-        assert_eq!(lane(2), lane(0));
-        assert_eq!(lane(4), lane(2), "the join continues the long chain");
+        assert_eq!(lane(3), lane(0));
+        assert_ne!(lane(2), lane(0), "the side branch takes the other lane");
+        assert_eq!(lane(4), lane(3), "the join continues the chain's lane");
         let (_, waits) = h.ran_with(1, 4).unwrap();
-        if lane(3) != lane(4) {
-            assert_eq!(
-                waits.len(),
-                1,
-                "the join waits for the other branch's lane only"
-            );
-            assert_eq!(waits[0].0, lane(3));
-        } else {
-            assert!(waits.is_empty());
+        assert_eq!(waits.len(), 1, "the join waits for the side branch only");
+        assert_eq!(waits[0].0, lane(2));
+    }
+
+    /// The lane each stage of a graph ran on, after one quantum ran to its end.
+    fn lanes_of(h: &Harness, stages: usize) -> Vec<u16> {
+        (0..stages)
+            .map(|s| h.ran_with(1, s as u16).unwrap().0.unwrap())
+            .collect()
+    }
+
+    /// A graph of `stages` stages that may run on any of the harness's `lanes`.
+    fn open_graph(
+        h: &Harness,
+        lanes: u16,
+        stages: usize,
+        edges: &[(u16, u16, EdgeKind)],
+    ) -> Arc<StageGraph<u64>> {
+        let allowed: Vec<u16> = (0..lanes).collect();
+        let stages: Vec<(Option<u64>, &[u16], Act)> = (0..stages)
+            .map(|_| (None, allowed.as_slice(), Act::Submit))
+            .collect();
+        h.graph(&stages, edges)
+    }
+
+    #[test]
+    fn a_fan_out_spreads_its_branches_over_the_lanes_and_the_join_waits_for_the_other_branch() {
+        let h = Harness::new(2);
+        // 0 -> {1, 2} -> 3. The branches tie; the first listed, 1, continues the root's lane.
+        let graph = open_graph(
+            &h,
+            2,
+            4,
+            &[
+                (0, 1, Submission),
+                (0, 2, Submission),
+                (1, 3, Submission),
+                (2, 3, Submission),
+            ],
+        );
+        let _ = graph.start(1, alive(), Vec::new());
+        h.pump();
+        let lane = lanes_of(&h, 4);
+        assert_eq!(
+            lane[1], lane[0],
+            "the critical branch continues the root's lane"
+        );
+        assert_ne!(lane[2], lane[1], "the other branch takes the other lane");
+        // Both branches are critical successors of the join; the one visited last (2) is continued.
+        assert_eq!(lane[3], lane[2], "the join continues a branch's lane");
+        let (_, waits) = h.ran_with(1, 3).unwrap();
+        assert_eq!(
+            waits,
+            [(lane[1], 2)],
+            "the join waits on the marker of the branch it did not continue"
+        );
+    }
+
+    #[test]
+    fn a_chain_keeps_one_lane() {
+        let h = Harness::new(3);
+        let graph = open_graph(
+            &h,
+            3,
+            4,
+            &[(0, 1, Submission), (1, 2, Submission), (2, 3, Submission)],
+        );
+        let _ = graph.start(1, alive(), Vec::new());
+        h.pump();
+        let lane = lanes_of(&h, 4);
+        assert!(lane.iter().all(|&l| l == lane[0]), "{lane:?}");
+        let (_, waits) = h.ran_with(1, 3).unwrap();
+        assert!(waits.is_empty(), "one lane: no waits");
+    }
+
+    #[test]
+    fn a_wider_fan_out_uses_every_lane() {
+        let h = Harness::new(3);
+        let graph = open_graph(
+            &h,
+            3,
+            4,
+            &[(0, 1, Submission), (0, 2, Submission), (0, 3, Submission)],
+        );
+        let _ = graph.start(1, alive(), Vec::new());
+        h.pump();
+        let lane = lanes_of(&h, 4);
+        assert_eq!(
+            lane[1], lane[0],
+            "the first listed branch continues the root"
+        );
+        let mut branches = lane[1..].to_vec();
+        branches.sort_unstable();
+        assert_eq!(
+            branches,
+            [0, 1, 2],
+            "three branches on three lanes: {lane:?}"
+        );
+    }
+
+    #[test]
+    fn a_longer_branch_continues_the_lane_whatever_its_place_in_the_edge_order() {
+        let h = Harness::new(2);
+        // 0 -> 1 (a sink) and 0 -> 2 -> 3: 2 has the greater height although 1 is listed first.
+        let graph = open_graph(
+            &h,
+            2,
+            4,
+            &[(0, 1, Submission), (0, 2, Submission), (2, 3, Submission)],
+        );
+        let _ = graph.start(1, alive(), Vec::new());
+        h.pump();
+        let lane = lanes_of(&h, 4);
+        assert_eq!(lane[2], lane[0]);
+        assert_eq!(lane[3], lane[0]);
+        assert_ne!(lane[1], lane[0]);
+    }
+
+    /// The stage each stage continues, by `markPaths`' rule, for `edges` over `stages` stages.
+    fn continues(stages: u16, edges: &[(u16, u16, EdgeKind)]) -> Vec<Option<u16>> {
+        let mut spec = StageGraphSpec::new();
+        for _ in 0..stages {
+            spec.stage(StageSpec {
+                name: "s",
+                ordered: None,
+                lanes: vec![LaneId(0)],
+            });
         }
+        for &(from, to, kind) in edges {
+            spec.edge(StageId(from), StageId(to), kind);
+        }
+        Topology::of(&spec)
+            .unwrap()
+            .path_predecessor
+            .iter()
+            .map(|p| p.map(|p| p.0))
+            .collect()
+    }
+
+    #[test]
+    fn of_equal_heights_the_first_listed_successor_continues() {
+        assert_eq!(
+            continues(3, &[(0, 1, Submission), (0, 2, Submission)]),
+            [None, Some(0), None]
+        );
+        assert_eq!(
+            continues(3, &[(0, 2, Submission), (0, 1, Submission)]),
+            [None, None, Some(0)]
+        );
+    }
+
+    #[test]
+    fn a_strictly_greater_height_beats_an_earlier_successor() {
+        // 1 is a sink listed first; 2 leads on to 3.
+        assert_eq!(
+            continues(
+                4,
+                &[(0, 1, Submission), (0, 2, Submission), (2, 3, Submission)]
+            ),
+            [None, None, Some(0), Some(2)]
+        );
+    }
+
+    #[test]
+    fn a_join_continues_the_last_visited_of_the_predecessors_it_is_critical_for() {
+        // 0 -> 1 -> 3 -> 4 and 0 -> 2 -> 4: sinks first, 4's predecessors are visited in stage
+        // order (2, then 3), so 3 continues into 4 and the side branch 2 continues nothing.
+        let edges = [
+            (0, 1, Submission),
+            (1, 3, Submission),
+            (3, 4, Submission),
+            (0, 2, Submission),
+            (2, 4, Submission),
+        ];
+        assert_eq!(
+            continues(5, &edges),
+            [None, Some(0), None, Some(1), Some(3)]
+        );
+        // The same graph with the branches' stage indexes swapped visits the chain first.
+        let swapped = [
+            (0, 1, Submission),
+            (1, 2, Submission),
+            (2, 4, Submission),
+            (0, 3, Submission),
+            (3, 4, Submission),
+        ];
+        assert_eq!(
+            continues(5, &swapped),
+            [None, Some(0), Some(1), None, Some(3)]
+        );
+    }
+
+    #[test]
+    fn a_join_continues_only_the_predecessor_it_is_the_critical_successor_of() {
+        // 0 -> {2, 3}, 1 -> 2; 3 -> 4 -> 5. 0's critical successor is 3 (taller), and 1's is 2,
+        // so 2 continues 1; it is not the critical successor of 0.
+        assert_eq!(
+            continues(
+                6,
+                &[
+                    (0, 2, Submission),
+                    (0, 3, Submission),
+                    (1, 2, Submission),
+                    (3, 4, Submission),
+                    (4, 5, Submission),
+                ]
+            ),
+            [None, None, Some(1), Some(0), Some(3), Some(4)]
+        );
+    }
+
+    #[test]
+    fn a_completion_edge_never_carries_a_lane() {
+        assert_eq!(
+            continues(3, &[(0, 1, Completion), (1, 2, Submission)]),
+            [None, None, Some(1)]
+        );
     }
 
     /// StageGraphTest.crossLaneDependenciesAreOrderedByMarkersAndUsedLanesJoinTheHomeLaneBeforeRetirement
