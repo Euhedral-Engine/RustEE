@@ -165,6 +165,8 @@ pub struct Lake {
     generation: RwLock<Option<Arc<Generation>>>,
     /// Generations made so far.
     attachments: AtomicU64,
+    /// Generations taken out of `generation` whose sinks have not all completed yet: draining.
+    retiring: Mutex<Vec<Arc<Generation>>>,
     finished: AtomicBool,
     this: Weak<Lake>,
 }
@@ -195,6 +197,7 @@ impl Lake {
             admission: Arc::new(Admission::new()),
             generation: RwLock::new(None),
             attachments: AtomicU64::new(0),
+            retiring: Mutex::new(Vec::new()),
             finished: AtomicBool::new(false),
             this: this.clone(),
         })
@@ -217,7 +220,7 @@ impl Lake {
                 .upgrade()
                 .expect("a lake that is being used is alive"),
         };
-        self.attach()?;
+        self.attach(false)?;
         Ok(guard)
     }
 
@@ -265,13 +268,32 @@ impl Lake {
         self.finished.load(Ordering::Acquire)
     }
 
-    /// Whether sinks are attached now (a busy period is under way).
+    /// Whether any sink of the lake is still attached to the lattice: the sinks of a busy period
+    /// that is under way, and those of a set that was detached or completed and is still draining
+    /// what it holds. False once every sink has delivered its frames and completed.
     pub fn is_attached(&self) -> bool {
-        self.generation
+        let live =
+            |generation: &Generation| generation.sinks.iter().any(|sink| !sink.is_complete());
+        if self
+            .generation
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .as_ref()
-            .is_some_and(|generation| generation.sinks.iter().any(|sink| !sink.is_complete()))
+            .is_some_and(|generation| live(generation))
+        {
+            return true;
+        }
+        let mut retiring = self.retiring.lock().unwrap_or_else(PoisonError::into_inner);
+        retiring.retain(|generation| live(generation));
+        !retiring.is_empty()
+    }
+
+    /// Finishes a generation taken out of the lake, and keeps track of it until its sinks complete.
+    fn retire(&self, generation: Arc<Generation>) {
+        generation.finish();
+        let mut retiring = self.retiring.lock().unwrap_or_else(PoisonError::into_inner);
+        retiring.retain(|generation| generation.sinks.iter().any(|sink| !sink.is_complete()));
+        retiring.push(generation);
     }
 
     /// How many times a set of sinks has been attached: one per busy period.
@@ -285,7 +307,11 @@ impl Lake {
     }
 
     /// The sinks attached now; attaches a fresh set (and the watch) when there are none.
-    fn attach(&self) -> Result<Arc<Generation>, LakeClosed> {
+    ///
+    /// `for_offer`: the attach is for a frame, so no generation is made unless a unit is admitted
+    /// when the lock is held (a unit that ended since the caller looked must not leave sinks
+    /// attached for nothing).
+    fn attach(&self, for_offer: bool) -> Result<Arc<Generation>, LakeClosed> {
         if let Some(current) = self
             .generation
             .read()
@@ -300,6 +326,9 @@ impl Lake {
                 .write()
                 .unwrap_or_else(PoisonError::into_inner);
             if self.finished.load(Ordering::Acquire) {
+                return Err(LakeClosed::Completed);
+            }
+            if for_offer && slot.is_none() && self.admission.units() == 0 {
                 return Err(LakeClosed::Completed);
             }
             match slot.as_ref() {
@@ -324,7 +353,7 @@ impl Lake {
         if self.admission.units() == 0 || self.is_complete() {
             return Err(LakeClosed::Completed);
         }
-        self.attach()
+        self.attach(true)
     }
 
     fn generation_of_sinks(&self) -> Generation {
@@ -398,7 +427,7 @@ impl Lake {
             }
         };
         if let Some(generation) = detached {
-            generation.finish();
+            self.retire(generation);
         }
     }
 
@@ -413,7 +442,7 @@ impl Lake {
             .unwrap_or_else(PoisonError::into_inner)
             .take();
         if let Some(generation) = attached {
-            generation.finish();
+            self.retire(generation);
         }
     }
 }

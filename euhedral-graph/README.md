@@ -198,8 +198,7 @@ once the last unit ends.
 
 ```rust,no_run
 use std::num::NonZeroUsize;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use euhedral_core::config::LatticeConfig;
@@ -213,7 +212,7 @@ let lake = Lake::new(lattice.clone(), NonZeroUsize::new(2).unwrap(), Duration::f
 // The main thread starts the work and waits for it; nothing else blocks.
 let (done, finished) = Latch::new();
 let unit = lake.admit().unwrap(); // attaches the sinks
-let done = std::sync::Mutex::new(Some(done));
+let done = Mutex::new(Some(done));
 let frame = RunnableFrame::new(7, Arc::new(move || {
     if let Some(done) = done.lock().unwrap().take() {
         done.set("ran");

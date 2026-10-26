@@ -42,7 +42,9 @@ the lattice to hand it a result.
   the generation out of the lake, completes its sinks gracefully and completes itself, which detaches all of them. The next
   `admit` makes a new generation (`Lake::attachments` counts them). `admit` counts the unit before it asks for a generation,
   and the watch checks the count again under the lock that takes the generation, so a unit never loses its sinks.
-- A frame that races a detach (its sink completed first) goes to the generation attached since, as long as a unit is admitted.
+- A frame that races a detach (its sink completed first) goes to the generation attached since, as long as a unit is admitted;
+  an offer re-checks the unit count under the lock before it makes a generation, so a unit that ended meanwhile leaves no sinks
+  attached. `Lake::is_attached` is true until every sink, including those of a detached set that is still draining, has completed.
 - Attaching registers the new sources with the lattice outside the lake's lock (registration asks the source for demand, which
   polls the watch). A lattice that refuses (closed) fails `admit` with `LakeClosed::Lattice` and the half-attached generation
   cancels what it holds.

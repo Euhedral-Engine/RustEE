@@ -22,9 +22,11 @@ use euhedral_graph::{Lake, Latch, LatchSetter};
 use euhedral_hardware_utils::affinity;
 use euhedral_hardware_utils::util::CpuSet;
 
-/// Lattices of one CPU that run at the same time rebalance each other (a rebalance panicked with
-/// "cannot restart the executor" when the tests ran in parallel), so the tests that start one take
-/// turns.
+/// Lattices on one CPU that run at the same time share that CPU's pinned executor
+/// (`PinnedThreadExecutor::get_or_create` returns one per CPU for the whole process), and closing
+/// one lattice's fragment closes it for the others: a rebalance then panicked with "cannot restart
+/// the executor". The tests that start a lattice therefore take turns, until `euhedral-core` gives
+/// each fragment its own executor handle (or counts the references to the shared one).
 static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
 
 fn take_turn() -> MutexGuard<'static, ()> {
@@ -234,11 +236,13 @@ fn complete_gracefully_drains_then_completes() {
     drop(forked);
     assert!(lake.is_complete(), "the last unit ended");
 
-    // The sinks drain what they hold, then complete and detach.
-    eventually("the sinks to drain", || {
-        ran.load(Ordering::Acquire) == FRAMES + 2
-    });
+    // The sinks drain what they hold, then complete and detach: they are attached until then.
     eventually("the sinks to complete", || !lake.is_attached());
+    assert_eq!(
+        ran.load(Ordering::Acquire),
+        FRAMES + 2,
+        "the sinks completed only after the drain"
+    );
     assert!(
         lake.offer(counting(1002, &ran)).is_err(),
         "a completed lake takes nothing"
