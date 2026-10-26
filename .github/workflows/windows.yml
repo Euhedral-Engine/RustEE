@@ -1,0 +1,43 @@
+# Runs euhedral-graph's tests on a real Windows: its AsyncIo engine (IoRing and I/O completion
+# ports) can only be built, not run, on the Linux development machines. windows-2025 is Windows
+# Server 2025 (build 26100), which has IoRing; each test also runs forced onto the completion port.
+name: windows
+
+on:
+  push:
+    branches: [graph]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  euhedral-graph:
+    runs-on: windows-2025
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the toolchain pinned in mise.toml
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path mise.toml -Pattern 'version = "([^"]+)"').Matches[0].Groups[1].Value
+          rustup toolchain install $version --profile minimal --component rustfmt --component clippy
+          rustup default $version
+          rustc --version
+          cargo --version
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy -p euhedral-graph --all-targets
+
+      - name: Test (default features)
+        run: cargo test -p euhedral-graph
+
+      - name: Which ring did the runner offer
+        run: cargo test -p euhedral-graph --lib the_machines_ring_is_reported -- --nocapture
