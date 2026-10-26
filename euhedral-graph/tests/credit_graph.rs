@@ -32,6 +32,7 @@
 #![allow(clippy::disallowed_methods)]
 
 use std::collections::{BTreeMap, VecDeque};
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 use std::time::{Duration, Instant};
@@ -45,9 +46,9 @@ use euhedral_core::impls::BaseCloneableObject;
 use euhedral_core::ingest::{IngestSink, QueueIngestSink};
 use euhedral_graph::testing::FakeDevice;
 use euhedral_graph::{
-    Completions, DEFAULT_RETRY_BACKSTOP, EdgeKind, GraphRuntime, Join, LaneId, LanePool, Marker,
-    QuantumOutcome, Sequencer, Slot, Stage, StageCx, StageError, StageGraph, StageGraphSpec,
-    StageSpec, Submitted,
+    Completions, DEFAULT_RETRY_BACKSTOP, EdgeKind, GraphRuntime, Join, Lake, LaneId, LanePool,
+    Marker, QuantumOutcome, Sequencer, Slot, Stage, StageCx, StageError, StageGraph,
+    StageGraphSpec, StageSpec, Submitted,
 };
 use euhedral_hardware_utils::affinity;
 
@@ -61,6 +62,8 @@ const SEEK_TO: u64 = 4 * FPS;
 const PAUSE_AT_PTS: u64 = SEEK_TO + FPS / 2;
 const PAUSE_FOR: Duration = Duration::from_millis(400);
 const POOL: u64 = 16;
+/// The sinks of the stage lake.
+const STAGE_SINKS: NonZeroUsize = NonZeroUsize::new(2).unwrap();
 
 const FETCH: Duration = Duration::from_micros(200);
 const PARSE: Duration = Duration::from_micros(1500);
@@ -329,7 +332,8 @@ struct Admission {
 }
 
 struct Ctx {
-    stages: Arc<QueueIngestSink>,
+    /// The lake the stage graph publishes into; the scenario admits one unit for its whole run.
+    stages: Arc<Lake>,
     control: QueueIngestSink,
     completions: Arc<Completions>,
     device: Arc<Device>,
@@ -345,10 +349,15 @@ struct Ctx {
 }
 
 impl Ctx {
-    fn new(pack_cost: Duration, lanes: Arc<LanePool>, devices: Vec<Arc<FakeDevice>>) -> Arc<Self> {
+    fn new(
+        lattice: Arc<ControlPlaneLattice>,
+        pack_cost: Duration,
+        lanes: Arc<LanePool>,
+        devices: Vec<Arc<FakeDevice>>,
+    ) -> Arc<Self> {
         let pool = lanes.clone();
         let ctx = Arc::new_cyclic(|me| Ctx {
-            stages: Arc::new(QueueIngestSink::new()),
+            stages: Lake::new(lattice, STAGE_SINKS, Duration::ZERO),
             control: QueueIngestSink::new(),
             completions: Completions::new(lanes),
             device: Arc::new(Device { lanes: devices }),
@@ -850,9 +859,9 @@ fn scenario(pack_cost: Duration) {
     let lattice = lattice(&cpus);
     let (lanes, devices) =
         FakeDevice::pool(&["disk", "parse", "compute-a", "compute-b", "pack", "nic"]);
-    let ctx = Ctx::new(pack_cost, lanes, devices);
+    let ctx = Ctx::new(lattice.clone(), pack_cost, lanes, devices);
     lattice.add_upstream(ctx.completions.clone()).unwrap();
-    lattice.add_upstream(ctx.stages.delegate()).unwrap();
+    let unit = ctx.stages.admit().unwrap(); // attaches the lake's sinks
     lattice.add_upstream(ctx.control.delegate()).unwrap();
     let s = stats();
     for counter in [&s.count, &s.max_ns, &s.slow, &s.preempted, &s.voluntary] {
@@ -875,6 +884,7 @@ fn scenario(pack_cost: Duration) {
     let drained_in = closing.elapsed();
     let closing = Instant::now();
     ctx.control.complete_gracefully();
+    drop(unit);
     ctx.stages.complete_gracefully();
     LatticeSource::complete(&*ctx.completions);
     lattice.close();

@@ -152,6 +152,10 @@ mod tests {
                     value += 1.0;
                 }
             });
+            // The publisher may not be scheduled yet on a small runner; count reads only once it has published.
+            while flow.read().is_none() {
+                std::thread::yield_now();
+            }
             let mut seen = 0;
             for _ in 0..20_000 {
                 if let Some(read) = flow.read() {

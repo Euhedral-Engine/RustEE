@@ -18,6 +18,8 @@
 //! | [`Join`] | [`join`] | Euhedral-Inference `Join` |
 //! | [`LanePool`], [`Marker`], [`DeviceQueue`] | [`lanes`] | Euhedral-Inference `LanePool` |
 //! | [`StageGraph`] | [`stage_graph`] | Euhedral-Inference `StageGraph` |
+//! | [`Lake`], [`UnitGuard`] | [`lake`] | Euhedral-Inference `InferenceLake` |
+//! | [`Latch`] | [`latch`] | a one-shot hand-off from a frame to the main thread |
 //!
 //! Every public type is also re-exported at the crate root. Types of `euhedral-core` (`Frame`,
 //! `LatticeSource`, ...) are not: import them from `euhedral_core`.
@@ -36,7 +38,9 @@ pub mod completions;
 ))]
 pub mod io;
 pub mod join;
+pub mod lake;
 pub mod lanes;
+pub mod latch;
 pub mod sequencer;
 pub mod stage_graph;
 #[cfg(feature = "testing")]
@@ -52,7 +56,9 @@ pub use io::{
     OwnedFile, OwnedSock, RawFile, RawSock,
 };
 pub use join::Join;
+pub use lake::{Lake, LakeClosed, UnitGuard};
 pub use lanes::{DeviceQueue, LaneId, LanePool, Marker};
+pub use latch::{Latch, LatchSetter, LatchWaiter};
 pub use sequencer::{Sequencer, Slot};
 pub use stage_graph::{
     DEFAULT_RETRY_BACKSTOP, EdgeKind, ExternalEdge, GraphError, GraphRuntime, QuantumOutcome,
