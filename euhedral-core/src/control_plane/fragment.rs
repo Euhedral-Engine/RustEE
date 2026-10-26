@@ -9,7 +9,7 @@ use crate::metrics::{
 };
 use crate::utils::{FlowContext, FlowRecorder, StopWatch};
 use euhedral_data_structures::atomics::CachePadded;
-use euhedral_hardware_utils::affinity::{self, ExecutorError, PinnedThreadExecutor};
+use euhedral_hardware_utils::affinity::{self, ExecutorError, PinnedThreadExecutor, TaskInterrupt};
 use euhedral_hardware_utils::monitor::CoreSnapshot;
 use std::error::Error;
 use std::fmt;
@@ -86,7 +86,11 @@ pub struct ControlPlaneFragment {
     cache: Arc<ControlPlaneCache>,
     output: Arc<LatticeHotSource>,
     body_cost: Arc<BodyCost>,
+    /// This fragment's use of its CPU's executor, which other fragments on the CPU share. Closing
+    /// the fragment releases the use; the executor closes with its last one.
     executor: PinnedThreadExecutor,
+    /// Interrupts this fragment's worker task alone; set while a worker has been submitted.
+    task: Mutex<Option<TaskInterrupt>>,
     buddy: Option<Arc<ControlPlaneFragment>>,
     /// Serializes start, reset and close.
     lifecycle: Mutex<()>,
@@ -169,6 +173,7 @@ impl ControlPlaneFragment {
             output,
             body_cost,
             executor,
+            task: Mutex::new(None),
             buddy,
             lifecycle: Mutex::new(()),
             last_snapshot: AtomicI64::new(NO_SNAPSHOT),
@@ -227,14 +232,24 @@ impl ControlPlaneFragment {
         self.adaptive_batch_cap.load(Ordering::Acquire)
     }
 
-    /// Waits up to `timeout` for the executors of both workers to finish their tasks.
+    /// Waits up to `timeout` for the worker tasks of this fragment and its buddy to end, and to leave
+    /// their executors.
     #[cfg(test)]
     pub(crate) fn await_executors(&self, timeout: Duration) -> bool {
-        self.executor.await_termination(timeout)
-            && self
-                .buddy
+        let deadline = Instant::now() + timeout;
+        let ended = loop {
+            let ended = lock(&self.task)
                 .as_ref()
-                .is_none_or(|buddy| buddy.await_executors(timeout))
+                .is_none_or(TaskInterrupt::is_finished);
+            if ended || Instant::now() >= deadline {
+                break ended;
+            }
+            thread::sleep(Duration::from_millis(1));
+        };
+        ended
+            && self.buddy.as_ref().is_none_or(|buddy| {
+                buddy.await_executors(deadline.saturating_duration_since(Instant::now()))
+            })
     }
 
     fn lock_lifecycle(&self) -> MutexGuard<'_, ()> {
@@ -250,6 +265,13 @@ impl ControlPlaneFragment {
         self.close_requested.store(true, Ordering::Release);
         self.running.store(false, Ordering::Release);
         self.unpark_worker();
+    }
+
+    /// Interrupts this fragment's worker task; no other task on the executor is touched.
+    fn interrupt_task(&self) {
+        if let Some(task) = &*lock(&self.task) {
+            task.interrupt();
+        }
     }
 
     fn unpark_worker(&self) {
@@ -516,12 +538,18 @@ impl CloneableObject for ControlPlaneFragment {
             buddy.start();
         }
         let this = self.this.upgrade().expect("a live fragment is shared");
-        if let Err(rejected) = self.executor.execute(move || this.run_worker()) {
-            self.running.store(false, Ordering::Release);
-            panic!(
-                "{}: the executor rejected the worker: {rejected}",
-                self.name
-            );
+        match self
+            .executor
+            .submit_interruptible(move || this.run_worker())
+        {
+            Ok((_, interrupt)) => *lock(&self.task) = Some(interrupt),
+            Err(rejected) => {
+                self.running.store(false, Ordering::Release);
+                panic!(
+                    "{}: the executor rejected the worker: {rejected}",
+                    self.name
+                );
+            }
         }
     }
 
@@ -629,9 +657,12 @@ impl CloneableObject for ControlPlaneFragment {
         cleared + self.buddy.as_ref().map_or(0, |buddy| buddy.reset(deadline))
     }
 
-    /// Closes the executor, and the buddy's.
+    /// Interrupts this fragment's worker task, and the buddy's, and releases their uses of the
+    /// executors. An executor another fragment still uses is left running, with that fragment's
+    /// worker untouched.
     fn dump_locks(&self) {
-        self.executor.close();
+        self.interrupt_task();
+        self.executor.release();
         if let Some(buddy) = &self.buddy {
             buddy.dump_locks();
         }
@@ -649,9 +680,11 @@ impl CloneableObject for ControlPlaneFragment {
         self.config.metrics_registry()
     }
 
-    /// Stops both workers, then closes the buddy, the executor and the cache, and takes their
-    /// meters out of their registries. The workers exit after their current cycle; what the
-    /// cache holds stays in it.
+    /// Stops both workers, then closes the buddy and the cache, releases this fragment's use of the
+    /// executor, and takes their meters out of their registries. The workers exit after their
+    /// current cycle; what the cache holds stays in it. Only this fragment's own tasks are
+    /// interrupted: the executor closes when its last user releases it, so a fragment of another
+    /// lattice on the same CPU keeps running.
     fn close(&self) {
         let _lifecycle = self.lock_lifecycle();
         self.request_stop();
@@ -659,7 +692,8 @@ impl CloneableObject for ControlPlaneFragment {
             buddy.request_stop();
             buddy.close();
         }
-        self.executor.close();
+        self.interrupt_task();
+        self.executor.release();
         self.cache.close();
         if let Some(metrics) = &self.metrics {
             metrics.registry().remove(ptr::from_ref(self).cast());

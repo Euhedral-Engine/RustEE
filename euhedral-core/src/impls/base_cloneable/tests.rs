@@ -189,10 +189,15 @@ fn a_clone_is_built_and_first_touched_on_its_core() {
     assert!(fragment.cache().pooled_chunks() > 0);
     assert!(buddy.cache().pooled_chunks() > 0);
     assert!(clone.output().is_none());
-    // The executor made for the build is shut down until the fragment starts.
-    assert!(PinnedThreadExecutor::get(cpus[0]).unwrap().is_none());
+    // The build leaves the executor to the fragment, which holds it without a task until it starts.
+    assert!(PinnedThreadExecutor::get(cpus[0]).unwrap().is_some());
     assert!(!clone.is_started());
     assert!(!clone.ready());
+    // Closing the clone ends the last use of the CPU's executor, so no use leaked from the build.
+    close(clone);
+    wait_until("the CPU's executor to close", || {
+        PinnedThreadExecutor::get(cpus[0]).unwrap().is_none()
+    });
 }
 
 #[test]
@@ -303,7 +308,7 @@ fn a_clone_without_a_cpu_cannot_be_built() {
 }
 
 #[test]
-fn a_failed_build_panics_and_shuts_its_executor_down() {
+fn a_failed_build_panics_and_releases_its_executor() {
     let Some((core, cpu)) = *SINGLE_CORE else {
         return;
     };
@@ -497,6 +502,62 @@ fn running_lattice(
         return None;
     }
     Some((lattice, source))
+}
+
+/// Sends `count` unordered frames through `source` and waits until they have all run.
+fn run_counted(source: &LatticeHotSource, count: u64) {
+    let done = Arc::new(AtomicU64::new(0));
+    for seq in 0..count {
+        let mut header = FrameHeader::new(0x70);
+        header.randomize_hash(seq + 1);
+        source.accept(Box::new(Counted {
+            header,
+            seq,
+            stream: None,
+            work: Duration::ZERO,
+            done: done.clone(),
+        }));
+    }
+    wait_until("the frames to run", || {
+        done.load(Ordering::Acquire) == count
+    });
+}
+
+#[test]
+fn two_lattices_on_one_cpu_close_independently() {
+    let Some((_, cpu)) = *SINGLE_CORE else {
+        return;
+    };
+    let _turn = pinned_turn();
+    let Some((first, first_source)) = running_lattice(FragmentConfig::default(), &[cpu]) else {
+        return;
+    };
+    let Some((second, second_source)) = running_lattice(FragmentConfig::default(), &[cpu]) else {
+        first.close();
+        return;
+    };
+    run_counted(&first_source, 50);
+    run_counted(&second_source, 50);
+
+    // Closing one lattice leaves the other's worker on the shared executor running.
+    first.close();
+    assert_eq!(second.active_workers(), 1);
+    run_counted(&second_source, 50);
+
+    // A lattice that starts while the other runs gets a working executor too.
+    let third = running_lattice(FragmentConfig::default(), &[cpu]);
+    if let Some((third, third_source)) = &third {
+        run_counted(third_source, 50);
+        run_counted(&second_source, 50);
+        third.close();
+    }
+    run_counted(&second_source, 50);
+    second.close();
+
+    // The last lattice to close took the executor with it.
+    wait_until("the CPU's executor to close", || {
+        PinnedThreadExecutor::get(cpu).unwrap().is_none()
+    });
 }
 
 fn polling() -> FragmentConfig {

@@ -75,18 +75,11 @@ impl<E: AbstractExecutor> BaseCloneableObject<E> {
             .effective_cpus()
             .first()
             .unwrap_or_else(|| panic!("core {} has no effective CPU", config.core_id()));
-        let existing = PinnedThreadExecutor::get(cpu).unwrap_or_else(|error| {
-            panic!("no pinned executor for CPU {cpu}: {error}");
-        });
-        let created = existing.is_none();
-        let pinned = match existing {
-            Some(pinned) => pinned,
-            None => PinnedThreadExecutor::get_or_create(
-                cpu,
-                &format!("{}-BaseCloneableObject", config.shard_name()),
-            )
-            .unwrap_or_else(|error| panic!("no pinned executor for CPU {cpu}: {error}")),
-        };
+        let pinned = PinnedThreadExecutor::get_or_create(
+            cpu,
+            &format!("{}-Worker-{}", config.shard_name(), config.core_id()),
+        )
+        .unwrap_or_else(|error| panic!("no pinned executor for CPU {cpu}: {error}"));
         let fragment_config = self.fragment_config.clone();
         let executor = self.executors[0].clone();
         let placement = config.clone();
@@ -96,9 +89,6 @@ impl<E: AbstractExecutor> BaseCloneableObject<E> {
                 panic!("CPU {cpu}'s pinned executor rejected the build: {rejected}")
             })
             .join();
-        if created {
-            pinned.shutdown_now();
-        }
         match built {
             Ok(clone) => Arc::new(clone),
             Err(panic) => panic::resume_unwind(panic),
@@ -137,8 +127,9 @@ impl<E: AbstractExecutor> BaseCloneableObject<E> {
 }
 
 impl<E: AbstractExecutor> CloneableObject for BaseCloneableObject<E> {
-    /// A clone placed by `config`, built on its first effective CPU's pinned executor. An executor
-    /// created for that is shut down again afterwards; the fragment restarts it when started.
+    /// A clone placed by `config`, built on its first effective CPU's pinned executor. The executor
+    /// is shared with every other user of that CPU and is left as it was found: the build is one task
+    /// on it, and releasing the executor ends only this call's use of it.
     ///
     /// # Panics
     ///

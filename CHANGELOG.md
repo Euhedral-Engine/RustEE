@@ -3,6 +3,56 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## A fragment closes only its own use of its CPU's executor (2026-10-26)
+
+**What.** `PinnedThreadExecutor` handles are now counted uses of the CPU's one shared executor, and
+`ControlPlaneFragment::close` and `dump_locks` end only their own fragment's use: they interrupt the
+fragment's worker task and `release` the handle. The executor closes when its last use ends. Fragments
+of different lattices on one CPU, and a shard's replacement clone on a core whose old clone is
+closing, no longer interrupt each other's workers.
+
+**Why.** `close` and `dump_locks` called `PinnedThreadExecutor::close`, which closes the executor for
+every user for good and interrupts every task on it. A second lattice on the same CPU lost its worker
+to the first one's close, and its next `start` panicked ("a closed executor cannot restart"). In a
+shard, a clone that failed to drain in time was replaced on the same core; the replacement shared the
+running executor, and the deferred retirement of the old clone then closed it. The replacement's worker
+left on `is_interrupted()` while its fragment still counted as running, so the core stopped without a
+sound and its frames hung.
+
+**API.**
+- `PinnedThreadExecutor::release(&self)`: ends this handle's use. Idempotent; dropping the handle
+  does it too.
+- `PinnedThreadExecutor::submit_interruptible(task)`: `submit`, plus a `TaskInterrupt` whose
+  `interrupt()` sets the `is_interrupted()` flag of that task alone and whose `is_finished()` says
+  the task has ended and left the executor.
+- `PinnedThreadExecutor::close` keeps its meaning: closed for every user. A user that only wants to
+  stop its own work does not call it.
+
+**Semantics.**
+- A use is a handle. `get_or_create` and `get` each return a new use of the live executor; `Clone`
+  adds one. A shut-down executor is restarted by a `get_or_create` as before. A handle joins an
+  executor in one step with the check that it is not closed, so a use never lands on an executor that
+  has just closed.
+- When the last use ends the executor closes as `close` does (interrupting any task still on it) and
+  its registry slot is freed once no task is left.
+- A fragment's worker task has its own `TaskInterrupt`, set on `close` and on `dump_locks`. The
+  fragment's other users of the CPU keep running, and `start` on a fragment sharing the executor finds
+  it running.
+- When the last use ends while its worker is still finishing, the executor is closed with a task left, and
+  its slot stays taken until that task ends. A re-placement on that CPU in the meantime gets
+  `ClosedWithActiveTasks`, and `BaseCloneableObject::place` panics on it. This limit of the registry is
+  unchanged; closing a lattice waits for its workers (which leave the registry just before the task
+  ends), so only a quick re-placement from another thread can meet it.
+- `BaseCloneableObject::place` no longer shuts the executor down after the build: that interrupted
+  every task on a shared executor, and a build racing another lattice's start could stop its worker.
+  The executor is created under the fragment's worker name and left as found.
+
+**Tests.** `executor_closes_after_last_user`, `releasing_a_user_leaves_the_other_users_tasks_running`
+and `a_task_interrupt_reaches_its_own_task_only` (`euhedral-hardware-utils`);
+`replacement_clone_on_same_core_keeps_running` and `dumping_locks_interrupts_only_the_fragments_own_worker`
+(`fragment`); `two_lattices_on_one_cpu_close_independently` (`base_cloneable`, three lattices on one CPU
+closing in turn).
+
 ## Lakes, latches and stage graphs over any frame sink (2026-10-26)
 
 **What.** `euhedral-graph` gets `Lake` (with `UnitGuard` and `LakeClosed`) and `Latch` (with `LatchSetter` and `LatchWaiter`).

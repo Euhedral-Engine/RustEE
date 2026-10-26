@@ -473,6 +473,85 @@ fn dumping_locks_interrupts_the_workers() {
     assert!(fragment.smt_buddy().unwrap().executor.is_closed());
 }
 
+/// A started fragment of its own on `core`'s `cpu`, below its own edge, its output into a gate.
+fn started_on(core: usize, cpu: usize) -> (Arc<ControlPlaneFragment>, Arc<LatticeEdge>, Arc<Gate>) {
+    let directory = directory();
+    let clone = CloneConfig::new("test", core, CpuSet::from_iter([cpu]))
+        .with_cache_directory(directory.clone());
+    let fragment = ControlPlaneFragment::new(&FragmentConfig::default(), &clone).unwrap();
+    let edge = LatticeEdge::new(directory.registry(), Default::default());
+    fragment.clone().input_edge(edge.clone());
+    let gate = Gate::new();
+    fragment.output().unwrap().add_downstream(gate.clone());
+    fragment.start();
+    wait_until("the worker to get ready", || fragment.ready());
+    (fragment, edge, gate)
+}
+
+/// Pushes `count` frames from `first` into `edge` and waits for `gate` to receive them all.
+fn run_frames(edge: &LatticeEdge, gate: &Gate, first: u64, count: u64) {
+    for id in first..first + count {
+        edge.push_downstream(unordered(id, id + 1));
+    }
+    wait_until("the frames to run", || {
+        let received = gate.received();
+        (first..first + count).all(|id| received.contains(&id))
+    });
+}
+
+#[test]
+fn replacement_clone_on_same_core_keeps_running() {
+    let Some((core, cpu)) = *SINGLE_CORE else {
+        return;
+    };
+    let _serial = pinned_turn();
+    // A shard that cannot drain a clone in time starts a replacement on the same core while the old
+    // clone's worker is still on the CPU's executor, then closes the old clone.
+    let (old, old_edge, old_gate) = started_on(core, cpu);
+    run_frames(&old_edge, &old_gate, 0, 10);
+    let (replacement, edge, gate) = started_on(core, cpu);
+
+    old.close();
+    old.dump_locks();
+    assert!(old.liveness.await_termination(Instant::now() + PATIENCE));
+    assert!(!old.is_started());
+
+    assert!(replacement.is_started() && replacement.ready());
+    assert!(!replacement.executor.is_closed());
+    run_frames(&edge, &gate, 100, 50);
+    assert!(replacement.is_started(), "the replacement's worker stays");
+
+    replacement.close();
+    assert!(
+        replacement
+            .liveness
+            .await_termination(Instant::now() + PATIENCE)
+    );
+    // The replacement was the executor's last user.
+    assert!(replacement.await_executors(PATIENCE));
+    assert!(replacement.executor.is_closed());
+}
+
+#[test]
+fn dumping_locks_interrupts_only_the_fragments_own_worker() {
+    let Some((core, cpu)) = *SINGLE_CORE else {
+        return;
+    };
+    let _serial = pinned_turn();
+    let (first, _, _) = started_on(core, cpu);
+    let (second, edge, gate) = started_on(core, cpu);
+
+    first.dump_locks();
+    assert!(first.liveness.await_termination(Instant::now() + PATIENCE));
+    assert!(second.is_started() && !second.executor.is_closed());
+    run_frames(&edge, &gate, 0, 20);
+
+    first.close();
+    second.close();
+    assert!(second.liveness.await_termination(Instant::now() + PATIENCE));
+    assert!(second.await_executors(PATIENCE));
+}
+
 #[test]
 fn a_reset_before_start_clears_the_caches_and_the_cap() {
     let Some(fixture) = Fixture::smt() else {

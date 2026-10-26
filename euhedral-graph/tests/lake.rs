@@ -10,7 +10,7 @@
 
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use euhedral_core::config::LatticeConfig;
@@ -21,17 +21,6 @@ use euhedral_core::impls::DefaultExecutor;
 use euhedral_graph::{Lake, Latch, LatchSetter};
 use euhedral_hardware_utils::affinity;
 use euhedral_hardware_utils::util::CpuSet;
-
-/// Lattices on one CPU that run at the same time share that CPU's pinned executor
-/// (`PinnedThreadExecutor::get_or_create` returns one per CPU for the whole process), and closing
-/// one lattice's fragment closes it for the others: a rebalance then panicked with "cannot restart
-/// the executor". The tests that start a lattice therefore take turns, until `euhedral-core` gives
-/// each fragment its own executor handle (or counts the references to the shared one).
-static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
-
-fn take_turn() -> MutexGuard<'static, ()> {
-    ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner)
-}
 
 /// A lattice of the first CPU this process may run on.
 fn one_cpu_lattice() -> Arc<ControlPlaneLattice> {
@@ -91,7 +80,6 @@ fn counting(hash: u64, ran: &Arc<AtomicU64>) -> Box<dyn Frame> {
 
 #[test]
 fn frames_of_one_hash_keep_order() {
-    let _turn = take_turn();
     const LANE: u64 = 0x1a4e;
     const FRAMES: u64 = 500;
     let lattice = one_cpu_lattice();
@@ -122,7 +110,6 @@ fn frames_of_one_hash_keep_order() {
 
 #[test]
 fn sinks_detach_after_idle_and_reattach_on_admit() {
-    let _turn = take_turn();
     const IDLE: Duration = Duration::from_millis(30);
     let lattice = one_cpu_lattice();
     let lake = Lake::new(lattice.clone(), sinks(2), IDLE);
@@ -168,7 +155,6 @@ fn sinks_detach_after_idle_and_reattach_on_admit() {
 
 #[test]
 fn a_lake_with_no_idle_time_never_detaches() {
-    let _turn = take_turn();
     let lattice = one_cpu_lattice();
     let lake = Lake::new(lattice.clone(), sinks(1), Duration::ZERO);
     drop(lake.admit().expect("a unit"));
@@ -181,7 +167,6 @@ fn a_lake_with_no_idle_time_never_detaches() {
 
 #[test]
 fn offer_without_admitted_unit_is_refused() {
-    let _turn = take_turn();
     let lattice = one_cpu_lattice();
     let lake = Lake::new(lattice.clone(), sinks(2), Duration::ZERO);
     let ran = Arc::new(AtomicU64::new(0));
@@ -209,7 +194,6 @@ fn offer_without_admitted_unit_is_refused() {
 
 #[test]
 fn complete_gracefully_drains_then_completes() {
-    let _turn = take_turn();
     const FRAMES: u64 = 200;
     let lattice = one_cpu_lattice();
     let lake = Lake::new(lattice.clone(), sinks(2), Duration::ZERO);
@@ -292,7 +276,6 @@ fn a_latch_whose_setter_was_dropped_does_not_park_forever() {
 
 #[test]
 fn latch_set_from_frame_wakes_waiter() {
-    let _turn = take_turn();
     let lattice = one_cpu_lattice();
     let lake = Lake::new(lattice.clone(), sinks(1), Duration::ZERO);
     let unit = lake.admit().expect("a unit");

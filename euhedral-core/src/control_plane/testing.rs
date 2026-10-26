@@ -16,7 +16,8 @@ use std::time::{Duration, Instant};
 /// How long tests wait for workers.
 pub(crate) const PATIENCE: Duration = Duration::from_secs(10);
 
-/// Tests that start workers close the per-CPU executors they run on, so they take turns.
+/// Tests that start workers pin them to the same few host CPUs and assert on those CPUs' executors
+/// (that they are open, closed or gone), so they take turns.
 pub(crate) fn pinned_turn() -> MutexGuard<'static, ()> {
     static PINNED: Mutex<()> = Mutex::new(());
     PINNED.lock().unwrap_or_else(PoisonError::into_inner)
