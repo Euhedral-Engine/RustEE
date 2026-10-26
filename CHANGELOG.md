@@ -3,6 +3,46 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## The branches of a fan-out run on different device lanes (2026-10-26)
+
+**What.** A stage graph now places stages on lanes by Euhedral-Inference's PATH placement
+(`StageGraph.markPaths`): each stage's lane is continued by exactly one successor, its critical
+successor, and every other successor of a fan-out takes a lane in turn. `Topology` computes this once,
+when the graph is built, as `path_predecessor`.
+
+**Why.** `path_predecessor` was the predecessor on a stage's longest path from a root, so in a fan-out
+A -> {B, C} both B and C continued A's lane. The branches never spread over lanes and ran one after the
+other on the device, although the docs say a fan-out's other branches take a lane in turn.
+
+**How to use.** Nothing changes in the graph's API. Give the branches of a fan-out several allowed
+lanes in `StageSpec::lanes`; with a pool of two or more lanes they now run on different ones, and a join
+waits (device side, in `StageCx::waits`) for the markers of the predecessors whose lane it does not
+continue.
+
+**Semantics.**
+- Only submission edges place lanes; a completion edge never carries one.
+- A stage's critical successor is its successor of greatest height (the stages on its longest
+  submission path to a sink). Of equal heights, the first listed (in edge order) wins.
+- A stage continues the lane of the predecessor it is the critical successor of. Stages are visited
+  sinks first in a first-in first-out order (sinks by stage index; a stage is queued when its last
+  successor was visited, and its predecessors are taken in stage index order), so a join that is the
+  critical successor of several predecessors continues the one visited last. A join that is the
+  critical successor of none continues no lane.
+- The Java `transfers()` rule (a transfer stage never continues a compute chain) has no counterpart: a
+  stage's allowed lanes already say which lanes it may use, and a continued lane outside them is
+  ignored.
+- Frame routing, id hashes and sinks are unchanged; this concerns the device lane a stage submits to.
+
+**Tests.** In `stage_graph`: `fan_out_runs_both_branches_and_fan_in_runs_the_join_once_behind_the_other_lane`,
+`a_fan_out_spreads_its_branches_over_the_lanes_and_the_join_waits_for_the_other_branch`,
+`a_chain_keeps_one_lane`, `a_wider_fan_out_uses_every_lane`,
+`a_longer_branch_continues_the_lane_whatever_its_place_in_the_edge_order`,
+`of_equal_heights_the_first_listed_successor_continues`,
+`a_strictly_greater_height_beats_an_earlier_successor`,
+`a_join_continues_the_last_visited_of_the_predecessors_it_is_critical_for`,
+`a_join_continues_only_the_predecessor_it_is_the_critical_successor_of` and
+`a_completion_edge_never_carries_a_lane`.
+
 ## A fragment closes only its own use of its CPU's executor (2026-10-26)
 
 **What.** `PinnedThreadExecutor` handles are now counted uses of the CPU's one shared executor, and
