@@ -18,18 +18,18 @@ use std::sync::atomic::{AtomicI32, Ordering};
 
 use windows_sys::Wdk::Storage::FileSystem::{
     FILE_MODE_INFORMATION, FILE_SYNCHRONOUS_IO_ALERT, FILE_SYNCHRONOUS_IO_NONALERT,
-    FileModeInformation, NtQueryInformationFile,
+    FileIoCompletionNotificationInformation, FileModeInformation, NtQueryInformationFile,
 };
 use windows_sys::Win32::Foundation::{
     CloseHandle, FARPROC, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
-    IORING_E_SUBMISSION_QUEUE_FULL, WAIT_TIMEOUT,
+    IORING_E_SUBMISSION_QUEUE_FULL, RtlNtStatusToDosError, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Networking::WinSock::{
     AF_INET, AF_INET6, INVALID_SOCKET, IPPROTO_TCP, LPFN_ACCEPTEX, LPFN_CONNECTEX,
     SIO_GET_EXTENSION_FUNCTION_POINTER, SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT,
     SOCK_STREAM, SOCKADDR, SOCKADDR_STORAGE, SOCKET, SOL_SOCKET, WSA_FLAG_NO_HANDLE_INHERIT,
-    WSA_FLAG_OVERLAPPED, WSABUF, WSAGetOverlappedResult, WSAID_ACCEPTEX, WSAID_CONNECTEX, WSAIoctl,
-    WSARecv, WSASend, WSASendTo, WSASocketW, bind, closesocket, getsockname, setsockopt,
+    WSA_FLAG_OVERLAPPED, WSABUF, WSAID_ACCEPTEX, WSAID_CONNECTEX, WSAIoctl, WSARecv, WSASend,
+    WSASendTo, WSASocketW, bind, closesocket, getsockname, setsockopt,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CREATE_ALWAYS, CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OVERLAPPED,
@@ -43,8 +43,8 @@ use windows_sys::Win32::Storage::FileSystem::{
     ReadFile, WriteFile,
 };
 use windows_sys::Win32::System::IO::{
-    CreateIoCompletionPort, GetOverlappedResult, GetQueuedCompletionStatusEx, IO_STATUS_BLOCK,
-    OVERLAPPED, OVERLAPPED_ENTRY, PostQueuedCompletionStatus,
+    CreateIoCompletionPort, GetQueuedCompletionStatusEx, IO_STATUS_BLOCK, OVERLAPPED,
+    OVERLAPPED_ENTRY, PostQueuedCompletionStatus,
 };
 use windows_sys::Win32::System::LibraryLoader::{
     GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
@@ -53,14 +53,13 @@ use windows_sys::Win32::System::Threading::{PTP_CALLBACK_INSTANCE, TrySubmitThre
 
 use super::super::{Create, OpenSpec};
 use super::sys::{
-    ACCEPT_BUF, BuildError, Cqe, Handle, Overlapped, Packet, RingProbe, SockAddr, Sys,
-    hresult_error,
+    ACCEPT_BUF, BuildError, Cqe, Handle, HandleMode, Overlapped, Packet, RingProbe, SockAddr, Sys,
+    hresult_error, is_nt_warning, socket_status_error, verbatim_path,
 };
 
 const _: () = assert!(size_of::<Overlapped>() == size_of::<OVERLAPPED>());
 const _: () = assert!(align_of::<Overlapped>() == align_of::<OVERLAPPED>());
 
-const ERROR_INVALID_PARAMETER: i32 = 87;
 const ERROR_IO_PENDING: i32 = 997;
 const WSAEINVAL: i32 = 10022;
 
@@ -69,13 +68,27 @@ fn last_error() -> io::Error {
     io::Error::last_os_error()
 }
 
-/// The result of starting an overlapped call that returned `ok`: pending is success.
-fn started(ok: bool) -> io::Result<()> {
+/// The result of starting an overlapped call that returned `ok`: `Ok` if a packet will follow.
+///
+/// Pending is success. A call that reports failure still queues a packet when its status is a
+/// warning (`ERROR_MORE_DATA` of a message-mode pipe, `WSAEMSGSIZE` of a datagram): the I/O
+/// manager posts for `!NT_ERROR(status) || pending returned`. Only the `OVERLAPPED`'s own status
+/// tells which; `kernel32` pre-sets `STATUS_PENDING` even when a call fails without an IRP, so a
+/// bare "not an error" test would be wrong, and only a warning counts.
+///
+/// The engine does not complete the operation until this returns, so reading `ov` is safe.
+fn started(ok: bool, ov: *const Overlapped) -> io::Result<()> {
     if ok {
         return Ok(());
     }
     let error = last_error();
     if error.raw_os_error() == Some(ERROR_IO_PENDING) {
+        return Ok(());
+    }
+    // SAFETY: `ov` is the caller's valid `OVERLAPPED`; the kernel wrote its status during the call
+    // that just returned, and nothing else writes it until the engine completes the operation.
+    let internal = unsafe { std::ptr::read_volatile(&raw const (*ov).internal) };
+    if is_nt_warning(internal as u32 as i32) {
         Ok(())
     } else {
         Err(error)
@@ -89,6 +102,14 @@ fn wide(path: &Path) -> io::Result<Vec<u16>> {
             io::ErrorKind::InvalidInput,
             "a path with a NUL character",
         ));
+    }
+    // A path near the ordinary limit goes as a verbatim path (`\\?\`), which Win32 takes at its
+    // full length; it must be absolute and normalized first.
+    if wide.len() >= 240
+        && let Ok(absolute) = std::path::absolute(path)
+        && let Some(verbatim) = absolute.to_str().and_then(verbatim_path)
+    {
+        wide = verbatim.encode_utf16().collect();
     }
     wide.push(0);
     Ok(wide)
@@ -249,28 +270,26 @@ struct Extensions {
     ) -> i32,
 }
 
-pub(in crate::io) struct RealSys {
-    ring: OnceLock<Option<RingApi>>,
-    /// The ring version the probe created, for the rings the engine creates.
-    ring_version: AtomicI32,
-    extensions: OnceLock<Extensions>,
-}
+/// The IoRing entry points, found once for the process.
+static RING: OnceLock<Option<RingApi>> = OnceLock::new();
+/// The ring version the probe created, for the rings the engine creates.
+static RING_VERSION: AtomicI32 = AtomicI32::new(IORING_VERSION_1);
+/// The Winsock extension functions, found once for the process.
+static EXTENSIONS: OnceLock<Extensions> = OnceLock::new();
+
+pub(in crate::io) struct RealSys;
 
 impl RealSys {
     pub(in crate::io) fn new() -> Self {
-        Self {
-            ring: OnceLock::new(),
-            ring_version: AtomicI32::new(IORING_VERSION_1),
-            extensions: OnceLock::new(),
-        }
+        Self
     }
 
-    fn ring_api(&self) -> Option<&RingApi> {
-        self.ring.get_or_init(RingApi::load).as_ref()
+    fn ring_api(&self) -> Option<&'static RingApi> {
+        RING.get_or_init(RingApi::load).as_ref()
     }
 
-    fn extensions(&self, sock: Handle) -> io::Result<&Extensions> {
-        if let Some(extensions) = self.extensions.get() {
+    fn extensions(&self, sock: Handle) -> io::Result<&'static Extensions> {
+        if let Some(extensions) = EXTENSIONS.get() {
             return Ok(extensions);
         }
         let accept = extension_pointer(sock, &WSAID_ACCEPTEX)?;
@@ -286,9 +305,7 @@ impl RealSys {
         let (Some(accept), Some(connect)) = (accept, connect) else {
             return Err(io::Error::other("Winsock has no AcceptEx or ConnectEx"));
         };
-        Ok(self
-            .extensions
-            .get_or_init(|| Extensions { accept, connect }))
+        Ok(EXTENSIONS.get_or_init(|| Extensions { accept, connect }))
     }
 }
 
@@ -311,8 +328,13 @@ fn extension_pointer(sock: Handle, guid: &windows_sys::core::GUID) -> io::Result
             None,
         )
     };
-    if status != 0 || address == 0 {
+    if status != 0 {
         return Err(last_error());
+    }
+    if address == 0 {
+        return Err(io::Error::other(
+            "Winsock returned no address for an extension function",
+        ));
     }
     Ok(address)
 }
@@ -344,16 +366,12 @@ impl Sys for RealSys {
     fn associate(&self, port: Handle, handle: Handle) -> io::Result<()> {
         // SAFETY: joins an open handle to an open port; both stay open for the call.
         let joined = unsafe { CreateIoCompletionPort(handle as HANDLE, port as HANDLE, 0, 0) };
-        if !joined.is_null() {
-            return Ok(());
-        }
-        let error = last_error();
-        // A handle already on a port is refused with this code: it is the one this engine
-        // joined it to (the contract says no other port).
-        if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER) {
-            Ok(())
+        if joined.is_null() {
+            // A handle that is already on a port is refused with `ERROR_INVALID_PARAMETER`; the
+            // engine decides whether that port is its own.
+            Err(last_error())
         } else {
-            Err(error)
+            Ok(())
         }
     }
 
@@ -382,6 +400,8 @@ impl Sys for RealSys {
         }
         out.extend(entries[..removed as usize].iter().map(|entry| Packet {
             overlapped: entry.lpOverlapped as usize,
+            status: entry.Internal as u32 as i32,
+            bytes: entry.dwNumberOfBytesTransferred,
         }));
         Ok(())
     }
@@ -394,13 +414,13 @@ impl Sys for RealSys {
         if ok == 0 { Err(last_error()) } else { Ok(()) }
     }
 
-    fn is_synchronous(&self, file: Handle) -> io::Result<bool> {
+    fn handle_mode(&self, handle: Handle, socket: bool) -> io::Result<HandleMode> {
         let mut status = IO_STATUS_BLOCK::default();
         let mut mode = FILE_MODE_INFORMATION { Mode: 0 };
         // SAFETY: an out structure of the size given, for the information class that fills it.
         let nt = unsafe {
             NtQueryInformationFile(
-                file as HANDLE,
+                handle as HANDLE,
                 &mut status,
                 std::ptr::from_mut(&mut mode).cast(),
                 size_of::<FILE_MODE_INFORMATION>() as u32,
@@ -408,11 +428,41 @@ impl Sys for RealSys {
             )
         };
         if nt < 0 {
+            // A socket is a file object too, but not every kind answers: read it as the default.
+            if socket {
+                return Ok(HandleMode::default());
+            }
             return Err(io::Error::other(format!(
                 "NtQueryInformationFile failed (NTSTATUS {nt:#010x})"
             )));
         }
-        Ok(mode.Mode & (FILE_SYNCHRONOUS_IO_ALERT | FILE_SYNCHRONOUS_IO_NONALERT) != 0)
+        // The completion-notification flags (`FILE_SKIP_COMPLETION_PORT_ON_SUCCESS` is bit 0). A
+        // failed query reads as "not set".
+        let mut flags = 0u32;
+        // SAFETY: an out `u32`, the size of `FILE_IO_COMPLETION_NOTIFICATION_INFORMATION`.
+        let nt = unsafe {
+            NtQueryInformationFile(
+                handle as HANDLE,
+                &mut status,
+                std::ptr::from_mut(&mut flags).cast(),
+                size_of::<u32>() as u32,
+                FileIoCompletionNotificationInformation,
+            )
+        };
+        Ok(HandleMode {
+            synchronous: mode.Mode & (FILE_SYNCHRONOUS_IO_ALERT | FILE_SYNCHRONOUS_IO_NONALERT)
+                != 0,
+            skips_port_on_success: nt >= 0 && flags & 1 != 0,
+        })
+    }
+
+    fn status_error(&self, status: i32, socket: bool) -> io::Error {
+        if socket && let Some(code) = socket_status_error(status) {
+            return io::Error::from_raw_os_error(code);
+        }
+        // SAFETY: a pure translation of a status code.
+        let code = unsafe { RtlNtStatusToDosError(status) };
+        io::Error::from_raw_os_error(code as i32)
     }
 
     unsafe fn read_file(
@@ -424,7 +474,7 @@ impl Sys for RealSys {
     ) -> io::Result<()> {
         // SAFETY: by this method's contract.
         let ok = unsafe { ReadFile(file as HANDLE, buf, len, null_mut(), ov.cast()) };
-        started(ok != 0)
+        started(ok != 0, ov)
     }
 
     unsafe fn write_file(
@@ -436,7 +486,7 @@ impl Sys for RealSys {
     ) -> io::Result<()> {
         // SAFETY: by this method's contract.
         let ok = unsafe { WriteFile(file as HANDLE, buf, len, null_mut(), ov.cast()) };
-        started(ok != 0)
+        started(ok != 0, ov)
     }
 
     unsafe fn send(
@@ -452,7 +502,7 @@ impl Sys for RealSys {
         };
         // SAFETY: by this method's contract; the call copies `wsabuf`.
         let status = unsafe { WSASend(sock as SOCKET, &wsabuf, 1, null_mut(), 0, ov.cast(), None) };
-        started(status == 0)
+        started(status == 0, ov)
     }
 
     unsafe fn recv(
@@ -476,7 +526,7 @@ impl Sys for RealSys {
                 None,
             )
         };
-        started(status == 0)
+        started(status == 0, ov)
     }
 
     unsafe fn send_to(
@@ -507,7 +557,7 @@ impl Sys for RealSys {
                 None,
             )
         };
-        started(status == 0)
+        started(status == 0, ov)
     }
 
     unsafe fn accept(
@@ -534,7 +584,7 @@ impl Sys for RealSys {
                 ov.cast(),
             )
         };
-        started(ok != 0)
+        started(ok != 0, ov)
     }
 
     unsafe fn connect(
@@ -558,31 +608,7 @@ impl Sys for RealSys {
                 ov.cast(),
             )
         };
-        started(ok != 0)
-    }
-
-    unsafe fn result(
-        &self,
-        handle: Handle,
-        ov: *const Overlapped,
-        socket: bool,
-    ) -> io::Result<usize> {
-        let mut moved = 0u32;
-        let ok = if socket {
-            let mut flags = 0u32;
-            // SAFETY: by this method's contract; not waiting, since the call finished.
-            unsafe {
-                WSAGetOverlappedResult(handle as SOCKET, ov.cast(), &mut moved, 0, &mut flags)
-            }
-        } else {
-            // SAFETY: as above.
-            unsafe { GetOverlappedResult(handle as HANDLE, ov.cast(), &mut moved, 0) }
-        };
-        if ok == 0 {
-            Err(last_error())
-        } else {
-            Ok(moved as usize)
-        }
+        started(ok != 0, ov)
     }
 
     fn accept_socket(&self, listener: Handle) -> io::Result<Handle> {
@@ -754,7 +780,7 @@ impl Sys for RealSys {
             && unsafe { (api.supported)(ring, IORING_OP_WRITE) } != 0;
         // SAFETY: closing the probe ring, once.
         unsafe { (api.close)(ring) };
-        self.ring_version.store(version, Ordering::Release);
+        RING_VERSION.store(version, Ordering::Release);
         Some(RingProbe {
             version: version as u32,
             emulated,
@@ -775,7 +801,7 @@ impl Sys for RealSys {
         // SAFETY: an out handle.
         let hr = unsafe {
             (api.create)(
-                self.ring_version.load(Ordering::Acquire),
+                RING_VERSION.load(Ordering::Acquire),
                 flags,
                 entries,
                 entries * 2,

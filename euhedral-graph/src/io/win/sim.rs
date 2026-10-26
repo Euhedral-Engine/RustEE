@@ -13,7 +13,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use super::super::{Create, OpenSpec};
-use super::sys::{BuildError, Cqe, Handle, Overlapped, Packet, RingProbe, SockAddr, Sys};
+use super::sys::{
+    BuildError, Cqe, Handle, HandleMode, Overlapped, Packet, RingProbe, STATUS_END_OF_FILE,
+    STATUS_PENDING, SockAddr, Sys,
+};
 
 /// The calls a script can make fail.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,12 +33,14 @@ pub(super) enum Op {
 struct SimFile {
     data: Vec<u8>,
     synchronous: bool,
+    skips_port: bool,
 }
 
 #[derive(Default)]
 struct SimSock {
     sent: Vec<u8>,
     incoming: VecDeque<u8>,
+    synchronous: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -61,7 +66,6 @@ struct State {
     socks: HashMap<Handle, SimSock>,
     fs: HashMap<PathBuf, Vec<u8>>,
     port: VecDeque<Packet>,
-    results: HashMap<usize, io::Result<usize>>,
     hold: bool,
     held_packets: Vec<Packet>,
     held_cqes: Vec<(Handle, Cqe)>,
@@ -77,10 +81,24 @@ struct State {
     closed_sockets: Vec<Handle>,
     fail_update: bool,
     fail_submits: u32,
+    /// OS error codes whose status is a warning (a packet still follows a failed call).
+    warnings: HashSet<i32>,
+    /// Calls that report failure and also queue a packet (what a warning status does).
+    fail_with_packet: VecDeque<(Op, i32)>,
+    elsewhere: HashSet<Handle>,
+    pop_error: Option<i32>,
+    /// How many entries each ring submit handed over.
+    submit_sizes: Vec<usize>,
+    panic_next_open: bool,
 }
+
+type Hook = std::sync::Arc<dyn Fn() + Send + Sync>;
 
 pub(super) struct Sim {
     state: Mutex<State>,
+    /// Runs in the middle of an asynchronous call, after the kernel finished it and before the
+    /// call returns (the moment a poll on another thread could see its packet).
+    hook: Mutex<Option<Hook>>,
 }
 
 fn hresult_for(error: &io::Error) -> i32 {
@@ -98,6 +116,7 @@ impl Sim {
                 sq_limit: usize::MAX,
                 ..State::default()
             }),
+            hook: Mutex::new(None),
         }
     }
 
@@ -126,9 +145,65 @@ impl Sim {
             SimFile {
                 data: data.to_vec(),
                 synchronous,
+                skips_port: false,
             },
         );
         handle
+    }
+
+    /// A file whose handle skips the port on success.
+    pub(super) fn skipping_file(&self, data: &[u8]) -> Handle {
+        let handle = self.add_file(data, false);
+        self.s().files.get_mut(&handle).unwrap().skips_port = true;
+        handle
+    }
+
+    /// A socket opened without overlapped I/O.
+    pub(super) fn synchronous_sock(&self) -> Handle {
+        let handle = self.sock();
+        self.s().socks.get_mut(&handle).unwrap().synchronous = true;
+        handle
+    }
+
+    /// `handle` already belongs to another completion port.
+    pub(super) fn joined_elsewhere(&self, handle: Handle) {
+        self.s().elsewhere.insert(handle);
+    }
+
+    /// An OS error code whose status is a warning.
+    pub(super) fn mark_warning(&self, code: i32) {
+        self.s().warnings.insert(code);
+    }
+
+    /// The next call of `op` reports `code` as a failure and still queues a packet for it (as a
+    /// call that fails with a warning status does).
+    pub(super) fn fail_with_packet(&self, op: Op, code: i32) {
+        self.s().fail_with_packet.push_back((op, code));
+    }
+
+    /// Ring completions cannot be popped: they fail with `code` (0 clears it).
+    pub(super) fn fail_pops(&self, code: i32) {
+        self.s().pop_error = (code != 0).then_some(code);
+    }
+
+    pub(super) fn submit_sizes(&self) -> Vec<usize> {
+        self.s().submit_sizes.clone()
+    }
+
+    /// The next open panics (on the pool's thread).
+    pub(super) fn panic_next_open(&self) {
+        self.s().panic_next_open = true;
+    }
+
+    /// `hook` runs inside every read call, after its completion was queued.
+    pub(super) fn on_read(&self, hook: Hook) {
+        *self.hook.lock().unwrap() = Some(hook);
+    }
+
+    /// Packets queued and not yet dequeued, plus held ones.
+    pub(super) fn packets_waiting(&self) -> usize {
+        let s = self.s();
+        s.port.len() + s.held_packets.len()
     }
 
     pub(super) fn file_data(&self, file: Handle) -> Vec<u8> {
@@ -187,6 +262,10 @@ impl Sim {
         let mut s = self.s();
         s.hold = false;
         let packets = std::mem::take(&mut s.held_packets);
+        for packet in &packets {
+            // SAFETY: the held operation's `OVERLAPPED` is valid until its packet is handled.
+            unsafe { Self::complete_overlapped(packet) };
+        }
         s.port.extend(packets);
         for (ring, cqe) in std::mem::take(&mut s.held_cqes) {
             s.rings.get_mut(&ring).unwrap().cq.push_back(cqe);
@@ -303,20 +382,60 @@ impl Sim {
         Ok(n)
     }
 
+    /// The kernel's final write into an `OVERLAPPED`.
+    ///
+    /// # Safety
+    /// `packet.overlapped` is a valid `OVERLAPPED` whose call is being completed.
+    unsafe fn complete_overlapped(packet: &Packet) {
+        let ov = packet.overlapped as *mut Overlapped;
+        // SAFETY: by this function's contract.
+        unsafe {
+            (*ov).internal = packet.status as u32 as usize;
+            (*ov).internal_high = packet.bytes as usize;
+        }
+    }
+
+    /// The `NTSTATUS` and byte count a result becomes.
+    fn status_of(s: &State, result: &io::Result<usize>) -> (i32, u32) {
+        match result {
+            Ok(n) => (0, *n as u32),
+            Err(error) => match error.raw_os_error() {
+                Some(38) => (STATUS_END_OF_FILE, 0),
+                Some(code) if s.warnings.contains(&code) => (0x8100_0000_u32 as i32 | code, 0),
+                Some(code) => (0xC100_0000_u32 as i32 | code, 0),
+                None => (0xC000_0001_u32 as i32, 0),
+            },
+        }
+    }
+
+    /// Completes the call: the `OVERLAPPED` gets its final status and the packet is queued (or
+    /// held, with the call still pending).
     fn finish(s: &mut State, ov: *mut Overlapped, result: io::Result<usize>) {
+        let (status, bytes) = Self::status_of(s, &result);
         let packet = Packet {
             overlapped: ov as usize,
+            status,
+            bytes,
         };
-        s.results.insert(ov as usize, result);
         if s.hold {
+            // SAFETY: `ov` is valid by the trait's contract.
+            unsafe { (*ov).internal = STATUS_PENDING as usize };
             s.held_packets.push(packet);
         } else {
+            // SAFETY: as above.
+            unsafe { Self::complete_overlapped(&packet) };
             s.port.push_back(packet);
         }
     }
 
     /// The failure a script asks of the next call of `op`.
-    fn scripted(s: &mut State, op: Op) -> io::Result<()> {
+    fn scripted(s: &mut State, op: Op, ov: *mut Overlapped) -> io::Result<()> {
+        if let Some(at) = s.fail_with_packet.iter().position(|(o, _)| *o == op) {
+            let code = s.fail_with_packet.remove(at).unwrap().1;
+            s.warnings.insert(code);
+            Self::finish(s, ov, Err(io::Error::from_raw_os_error(code)));
+            return Err(io::Error::from_raw_os_error(code));
+        }
         match s.fail_issue.iter().position(|(o, _)| *o == op) {
             Some(at) => Err(s.fail_issue.remove(at).unwrap().1),
             None => Ok(()),
@@ -343,9 +462,11 @@ impl Sys for Sim {
 
     fn associate(&self, _port: Handle, handle: Handle) -> io::Result<()> {
         let mut s = self.s();
-        if s.associated.insert(handle) {
-            s.log.push(format!("associate {handle:#x}"));
+        // As the OS: a handle that is already on a port (this one or another) is refused.
+        if s.elsewhere.contains(&handle) || !s.associated.insert(handle) {
+            return Err(io::Error::from_raw_os_error(87));
         }
+        s.log.push(format!("associate {handle:#x}"));
         Ok(())
     }
 
@@ -361,15 +482,33 @@ impl Sys for Sim {
     }
 
     fn post(&self, _port: Handle, overlapped: usize) -> io::Result<()> {
-        self.s().port.push_back(Packet { overlapped });
+        self.s().port.push_back(Packet {
+            overlapped,
+            status: 0,
+            bytes: 0,
+        });
         Ok(())
     }
 
-    fn is_synchronous(&self, file: Handle) -> io::Result<bool> {
-        match self.s().files.get(&file) {
-            Some(f) => Ok(f.synchronous),
+    fn handle_mode(&self, handle: Handle, socket: bool) -> io::Result<HandleMode> {
+        let s = self.s();
+        if socket {
+            return Ok(HandleMode {
+                synchronous: s.socks.get(&handle).is_some_and(|sock| sock.synchronous),
+                skips_port_on_success: false,
+            });
+        }
+        match s.files.get(&handle) {
+            Some(f) => Ok(HandleMode {
+                synchronous: f.synchronous,
+                skips_port_on_success: f.skips_port,
+            }),
             None => Err(io::Error::from_raw_os_error(6)),
         }
+    }
+
+    fn status_error(&self, status: i32, _socket: bool) -> io::Error {
+        io::Error::from_raw_os_error(status & 0xFFFF)
     }
 
     unsafe fn read_file(
@@ -380,11 +519,16 @@ impl Sys for Sim {
         ov: *mut Overlapped,
     ) -> io::Result<()> {
         let mut s = self.s();
-        Self::scripted(&mut s, Op::Read)?;
+        Self::scripted(&mut s, Op::Read, ov)?;
         // SAFETY: `ov` is valid by the trait's contract.
         let offset = unsafe { u64::from((*ov).offset) | (u64::from((*ov).offset_high) << 32) };
         let result = Self::file_op(&mut s, false, file, buf as usize, len, offset);
         Self::finish(&mut s, ov, result);
+        drop(s);
+        let hook = self.hook.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            hook();
+        }
         Ok(())
     }
 
@@ -396,7 +540,7 @@ impl Sys for Sim {
         ov: *mut Overlapped,
     ) -> io::Result<()> {
         let mut s = self.s();
-        Self::scripted(&mut s, Op::Write)?;
+        Self::scripted(&mut s, Op::Write, ov)?;
         // SAFETY: `ov` is valid by the trait's contract.
         let offset = unsafe { u64::from((*ov).offset) | (u64::from((*ov).offset_high) << 32) };
         let result = Self::file_op(&mut s, true, file, buf as usize, len, offset);
@@ -412,7 +556,7 @@ impl Sys for Sim {
         ov: *mut Overlapped,
     ) -> io::Result<()> {
         let mut s = self.s();
-        Self::scripted(&mut s, Op::Send)?;
+        Self::scripted(&mut s, Op::Send, ov)?;
         let result = Self::sock_op(&mut s, Op::Send, sock, buf as usize, len);
         Self::finish(&mut s, ov, result);
         Ok(())
@@ -426,7 +570,7 @@ impl Sys for Sim {
         ov: *mut Overlapped,
     ) -> io::Result<()> {
         let mut s = self.s();
-        Self::scripted(&mut s, Op::Recv)?;
+        Self::scripted(&mut s, Op::Recv, ov)?;
         let result = Self::sock_op(&mut s, Op::Recv, sock, buf as usize, len);
         Self::finish(&mut s, ov, result);
         Ok(())
@@ -441,7 +585,7 @@ impl Sys for Sim {
         ov: *mut Overlapped,
     ) -> io::Result<()> {
         let mut s = self.s();
-        Self::scripted(&mut s, Op::SendTo)?;
+        Self::scripted(&mut s, Op::SendTo, ov)?;
         // SAFETY: `to` is valid by the trait's contract.
         let family = unsafe { (*to).family() };
         s.log.push(format!("send_to family {family}"));
@@ -458,7 +602,7 @@ impl Sys for Sim {
         ov: *mut Overlapped,
     ) -> io::Result<()> {
         let mut s = self.s();
-        Self::scripted(&mut s, Op::Accept)?;
+        Self::scripted(&mut s, Op::Accept, ov)?;
         s.log
             .push(format!("accept on {listener:#x} into {accepted:#x}"));
         let result = match s.fail_result.iter().position(|(o, _)| *o == Op::Accept) {
@@ -476,7 +620,7 @@ impl Sys for Sim {
         ov: *mut Overlapped,
     ) -> io::Result<()> {
         let mut s = self.s();
-        Self::scripted(&mut s, Op::Connect)?;
+        Self::scripted(&mut s, Op::Connect, ov)?;
         s.log.push(format!("connect {sock:#x}"));
         let result = match s.fail_result.iter().position(|(o, _)| *o == Op::Connect) {
             Some(at) => Err(s.fail_result.remove(at).unwrap().1),
@@ -484,18 +628,6 @@ impl Sys for Sim {
         };
         Self::finish(&mut s, ov, result);
         Ok(())
-    }
-
-    unsafe fn result(
-        &self,
-        _handle: Handle,
-        ov: *const Overlapped,
-        _socket: bool,
-    ) -> io::Result<usize> {
-        self.s()
-            .results
-            .remove(&(ov as usize))
-            .expect("a result for the finished call")
     }
 
     fn accept_socket(&self, listener: Handle) -> io::Result<Handle> {
@@ -541,6 +673,10 @@ impl Sys for Sim {
 
     fn open_file(&self, path: &Path, spec: OpenSpec) -> io::Result<Handle> {
         let mut s = self.s();
+        if std::mem::take(&mut s.panic_next_open) {
+            drop(s);
+            panic!("the simulated open panicked");
+        }
         s.log.push(format!("open {}", path.display()));
         let exists = s.fs.contains_key(path);
         match (spec.create, exists) {
@@ -558,6 +694,7 @@ impl Sys for Sim {
             SimFile {
                 data,
                 synchronous: false,
+                skips_port: false,
             },
         );
         Ok(handle)
@@ -580,8 +717,9 @@ impl Sys for Sim {
         if self.s().pool_fail {
             return Err(io::Error::from_raw_os_error(8));
         }
-        // The pool's thread, here and now (the lock is not held while the job calls back).
-        job();
+        // The pool's thread, here and now (the lock is not held while the job calls back). A
+        // panic is the pool's to swallow, as the real one does.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
         Ok(())
     }
 
@@ -632,6 +770,7 @@ impl Sys for Sim {
             return Err(io::Error::from_raw_os_error(5));
         }
         let built = std::mem::take(&mut s.rings.get_mut(&ring).unwrap().sq);
+        s.submit_sizes.push(built.len());
         for entry in built {
             let result = Self::file_op(
                 &mut s,
@@ -663,7 +802,11 @@ impl Sys for Sim {
     }
 
     fn ring_pop(&self, ring: Handle) -> io::Result<Option<Cqe>> {
-        Ok(self.s().rings.get_mut(&ring).unwrap().cq.pop_front())
+        let mut s = self.s();
+        if let Some(code) = s.pop_error {
+            return Err(io::Error::from_raw_os_error(code));
+        }
+        Ok(s.rings.get_mut(&ring).unwrap().cq.pop_front())
     }
 }
 

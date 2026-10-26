@@ -521,3 +521,128 @@ fn threads_submit_to_their_own_rings_and_every_read_ends_once() {
         std::fs::remove_file(path).unwrap();
     });
 }
+
+#[test]
+fn a_datagram_larger_than_the_buffer_ends_once_with_wsaemsgsize() {
+    // The call reports failure and the I/O manager queues a packet for it anyway (a warning
+    // status): the operation must still end once, and its slot must stay sound.
+    both(|io| {
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let to = receiver.local_addr().unwrap();
+        for round in 0..20u64 {
+            sender.send_to(&[7u8; 100], to).unwrap();
+            std::thread::sleep(Duration::from_millis(5));
+            io.recv(receiver.as_raw_socket(), buf(10), then(round))
+                .unwrap();
+            let error = one(io).done.unwrap().result.unwrap_err();
+            assert_eq!(
+                error.raw_os_error(),
+                Some(10040),
+                "WSAEMSGSIZE, round {round}"
+            );
+            // Nothing else ends, however long the port is polled.
+            let mut extra = Vec::new();
+            io.pull(&mut |frame| extra.push(frame), &mut |_| false, u64::MAX);
+            assert!(extra.is_empty());
+        }
+        // The slots still work: a datagram that fits.
+        sender.send_to(b"fits", to).unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        io.recv(receiver.as_raw_socket(), buf(10), then(99))
+            .unwrap();
+        let done = one(io).done.unwrap();
+        assert_eq!(&done.buf.bytes[..done.buf.filled], b"fits");
+        assert_eq!(
+            io.engine.strays.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+    });
+}
+
+#[test]
+fn ring_reads_end_through_the_ring_even_on_a_file_joined_to_the_port() {
+    let io = AsyncIo::open().unwrap();
+    if !io.engine.ring_use().0 {
+        return;
+    }
+    let data = content(8 * 4096, 21);
+    let (path, file) = overlapped_file("ring-vs-port", &data);
+    let raw = file.as_raw_handle() as usize;
+    io.engine.sys.associate(io.engine.port.handle, raw).unwrap();
+    for i in 0..4u64 {
+        io.read(file.as_raw_handle(), i * 4096, buf(4096), then(i))
+            .unwrap();
+    }
+    for (i, done) in poll(&io, 4).into_iter().enumerate() {
+        let done = done.done.unwrap();
+        assert_eq!(done.buf.bytes, data[i * 4096..(i + 1) * 4096]);
+    }
+    // No packet ended them: the port has nothing, and nothing was ignored.
+    let mut packets = Vec::new();
+    io.engine
+        .sys
+        .dequeue(io.engine.port.handle, &mut packets, 64)
+        .unwrap();
+    assert!(packets.is_empty());
+    assert_eq!(
+        io.engine.strays.load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+    drop(file);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn a_handle_that_skips_the_port_on_success_is_refused() {
+    both(|io| {
+        let (path, file) = overlapped_file("skip", &[0; 100]);
+        // SAFETY: a file handle this test owns.
+        let set = unsafe {
+            windows_sys::Win32::Storage::FileSystem::SetFileCompletionNotificationModes(
+                file.as_raw_handle(),
+                1,
+            )
+        };
+        assert_ne!(set, 0);
+        let error = io
+            .read(file.as_raw_handle(), 0, buf(10), then(1))
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{error}");
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+    });
+}
+
+#[test]
+fn a_path_past_the_ordinary_limit_opens_as_a_verbatim_path() {
+    both(|io| {
+        let mut dir = scratch("long");
+        for _ in 0..5 {
+            dir.push("d".repeat(60));
+        }
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("file.bin");
+        assert!(path.as_os_str().len() > 260);
+        std::fs::write(&path, b"long path").unwrap();
+        let opened: Arc<Mutex<Option<std::io::Result<OwnedFile>>>> = Arc::default();
+        let slot = opened.clone();
+        io.open_path(
+            &path,
+            OpenSpec::default(),
+            Box::new(move |result| {
+                *slot.lock().unwrap() = Some(result);
+                Box::new(Done {
+                    header: FrameHeader::new(1),
+                    done: None,
+                    raw: Some(Ok(())),
+                })
+            }),
+        )
+        .unwrap();
+        assert!(one(io).raw.unwrap().is_ok());
+        let file = opened.lock().unwrap().take().unwrap().unwrap();
+        io.read(file.as_raw_handle(), 0, buf(9), then(2)).unwrap();
+        assert_eq!(one(io).done.unwrap().buf.bytes, b"long path");
+    });
+}

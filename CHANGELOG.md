@@ -33,9 +33,26 @@ now `async-io` (it was `io-uring`).
 - A handle joins the engine's port when its first operation is submitted and must not belong to another port. A file handle
   opened without `FILE_FLAG_OVERLAPPED` is refused with `InvalidInput`.
 - A full ring submission queue goes to the ring's backlog and is handed over by a later submission or poll, as on Linux.
+  A flush builds at most 16 entries before it submits, and a submission never waits behind a submit.
+- **Operation identity.** An operation's record lives in a slab and is never freed while the engine lives, so a late
+  packet naming its `OVERLAPPED` can be read safely. A slot is idle, issuing, in flight or busy; its generation changes at
+  every issue, and a ring entry carries slot and generation. A port packet carries only an address, so it is accepted for a
+  slot that is in flight on the port with an `Internal` status that is not `STATUS_PENDING`. A poll leaves the packet of a
+  slot whose call is still returning for the next poll.
+- **Warning statuses.** A call that reports failure with a warning status (`ERROR_MORE_DATA`, `WSAEMSGSIZE`) still queues a
+  packet; the real layer reads the `OVERLAPPED`'s status after such a call and treats a warning as "a packet follows".
+- Results are decoded from the packet's `NTSTATUS` and byte count, not through the handle (which the caller may close). Socket
+  statuses map to Winsock errors for the common cases (refused, reset, aborted, unreachable, timed out, message too long).
+- A handle that skips the port on success, or a socket opened without overlapped I/O, is refused. A handle already on
+  another port is refused too (`ERROR_INVALID_PARAMETER` for a handle this engine did not join): a handle serves one
+  `AsyncIo`, ever.
+- Open and rename leave their result in a queue the poll drains (a job that panics or is dropped still ends the operation
+  with an error). Writes go in pieces of at most 256 KiB, since a write that extends a file is synchronous on NTFS. Paths
+  near the Win32 limit go as verbatim paths. A ring whose completions cannot be read ends its operations with the error.
 
-**Tests.** 27 tests run on every platform against a simulated `Sys` (every operation's success, error and short transfers,
-the ring and its fallbacks, a full submission queue, the order across ring and port, a pull's `stop`). 12 run on Windows
+**Tests.** 40 tests run on every platform against a simulated `Sys` (every operation's success, error and short transfers,
+the ring and its fallbacks, a full submission queue, the order across ring and port, a pull's `stop`, late and warning packets,
+slot reuse, routes and generations, handle modes, pool failures). 16 run on Windows
 only (`io/win/live.rs`: files, loopback TCP and UDP, accept, connect, open and rename, threads each with a ring), each twice:
 with IoRing and forced onto the port. `.github/workflows/windows.yml` runs the crate's tests on a `windows-2025` runner on
 pushes to `graph`.

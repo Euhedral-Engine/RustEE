@@ -4,14 +4,18 @@
 use std::io;
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 
 use euhedral_core::frames::{Frame, FrameHeader};
 
 use super::sim::{Op, Sim};
-use super::sys::{Handle, IORING_VERSION_3, RingProbe, SockAddr, hresult_error};
+use super::sys::{
+    Handle, IORING_VERSION_3, RingProbe, SockAddr, hresult_error, socket_status_error,
+    verbatim_path,
+};
 use super::{Engine, MAX_PIECE};
+use crate::io::lock;
 use crate::io::{
     AsyncIoOptions, Create, Engine as EngineTrait, Front, IoBuf, IoDone, OpenSpec, Request, Then,
 };
@@ -65,8 +69,8 @@ fn full_probe() -> RingProbe {
 /// An engine over a simulated `Sys`, driven as `AsyncIo` drives its engine.
 struct Harness {
     sim: Arc<Sim>,
-    engine: Engine,
-    front: Front,
+    engine: Arc<Engine>,
+    front: Arc<Front>,
 }
 
 impl Harness {
@@ -87,8 +91,8 @@ impl Harness {
         .unwrap();
         Self {
             sim,
-            engine,
-            front: Front::new(),
+            engine: Arc::new(engine),
+            front: Arc::new(Front::new()),
         }
     }
 
@@ -121,7 +125,7 @@ impl Harness {
     fn pull_with(&self, stop: &mut dyn FnMut(&dyn Frame) -> bool) -> Vec<Done> {
         let mut out = Vec::new();
         self.front.reap(
-            &self.engine,
+            &*self.engine,
             &mut |frame| {
                 out.push(
                     *(frame as Box<dyn std::any::Any>)
@@ -131,6 +135,24 @@ impl Harness {
             },
             stop,
             u64::MAX,
+        );
+        out
+    }
+
+    /// One poll that takes at most `demand` completions.
+    fn pull_n(&self, demand: u64) -> Vec<Done> {
+        let mut out = Vec::new();
+        self.front.reap(
+            &*self.engine,
+            &mut |frame| {
+                out.push(
+                    *(frame as Box<dyn std::any::Any>)
+                        .downcast::<Done>()
+                        .expect("a Done frame"),
+                )
+            },
+            &mut |_| false,
+            demand,
         );
         out
     }
@@ -707,4 +729,301 @@ fn an_ioring_hresult_keeps_a_win32_code_and_otherwise_says_what_it_was() {
     let other = hresult_error(0x8000_4005u32 as i32);
     assert_eq!(other.raw_os_error(), None);
     assert!(other.to_string().contains("0x80004005"));
+}
+
+// ---- identity, late packets and the review's cases
+
+/// The address of the `OVERLAPPED` of slot 0.
+fn first_overlapped(h: &Harness) -> usize {
+    lock(&h.engine.table).slots[0].rec.0.as_ptr() as usize
+}
+
+#[test]
+fn a_call_that_fails_with_a_warning_status_and_queues_a_packet_ends_exactly_once() {
+    let h = Harness::new();
+    let file = h.sim.file(&content(100));
+    // The call reports failure (ERROR_MORE_DATA) and a packet follows anyway: the case the real
+    // layer reads as "a packet follows"; here the sim misbehaves to check that, even then, the
+    // operation ends once and the late packet is ignored.
+    h.sim.fail_with_packet(Op::Read, 234);
+    h.read(file, 0, 10, 1).unwrap();
+    assert_eq!(h.sim.packets_waiting(), 1);
+    let done = h.drain(1);
+    assert_eq!(ended_clone_error(&done[0]), Some(234));
+    for _ in 0..5 {
+        assert!(h.pull_with(&mut |_| false).is_empty(), "nothing ends twice");
+    }
+    assert_eq!(h.pending(), 0);
+    assert_eq!(
+        h.engine.strays.load(Ordering::Relaxed),
+        1,
+        "the late packet was ignored"
+    );
+    // The slot is usable again.
+    h.read(file, 0, 10, 2).unwrap();
+    assert_eq!(ended(h.one()).result.unwrap(), 10);
+}
+
+fn ended_clone_error(done: &Done) -> Option<i32> {
+    done.done
+        .as_ref()
+        .unwrap()
+        .result
+        .as_ref()
+        .err()
+        .and_then(io::Error::raw_os_error)
+}
+
+#[test]
+fn a_late_packet_never_ends_the_operation_that_reused_its_slot() {
+    let h = Harness::new();
+    let file = h.sim.file(&content(100));
+    h.sim.fail_with_packet(Op::Read, 234);
+    h.read(file, 0, 10, 1).unwrap();
+    // End the first operation, but leave its packet undelivered (the poll has no room for it).
+    let first = h.pull_n(1);
+    assert_eq!(ended_clone_error(&first[0]), Some(234));
+    assert_eq!(
+        h.sim.packets_waiting() + lock(&h.engine.inbox).len(),
+        1,
+        "the late packet waits"
+    );
+    // The second operation takes the same slot; its call is pending (its completion is held).
+    h.sim.hold(true);
+    h.read(file, 20, 10, 2).unwrap();
+    assert!(
+        h.pull_with(&mut |_| false).is_empty(),
+        "the late packet met a pending call"
+    );
+    assert_eq!(h.engine.strays.load(Ordering::Relaxed), 1);
+    h.sim.release();
+    let done = ended(h.one());
+    assert_eq!(done.result.unwrap(), 10);
+    assert_eq!(done.buf.bytes, content(100)[20..30]);
+    assert!(h.pull_with(&mut |_| false).is_empty());
+    assert_eq!(h.pending(), 0);
+}
+
+#[test]
+fn a_packet_that_arrives_while_its_call_is_returning_waits_for_the_next_poll() {
+    let h = Harness::new();
+    let file = h.sim.file(&content(100));
+    let seen: Arc<Mutex<Vec<usize>>> = Arc::default();
+    let (engine, front, log) = (h.engine.clone(), h.front.clone(), seen.clone());
+    // A poll on another thread, in the middle of the read call.
+    h.sim.on_read(Arc::new(move || {
+        let mut got = 0;
+        front.reap(&*engine, &mut |_| got += 1, &mut |_| false, u64::MAX);
+        log.lock().unwrap().push(got);
+    }));
+    h.read(file, 0, 10, 1).unwrap();
+    assert_eq!(
+        *seen.lock().unwrap(),
+        [0],
+        "the operation was not ended under its call"
+    );
+    h.sim.on_read(Arc::new(|| {}));
+    assert_eq!(ended(h.one()).result.unwrap(), 10);
+    assert_eq!(h.pending(), 0);
+}
+
+#[test]
+fn a_pool_job_that_panics_or_is_dropped_still_ends_its_operation() {
+    let h = Harness::new();
+    h.sim.panic_next_open();
+    h.submit(
+        Request::Open {
+            path: "x".into(),
+            spec: OpenSpec::default(),
+        },
+        IoBuf::default(),
+        raw_then(1),
+    )
+    .unwrap();
+    let error = h.one().raw.unwrap().unwrap_err();
+    assert!(error.to_string().contains("did not finish"), "{error}");
+    assert_eq!(h.pending(), 0);
+}
+
+#[test]
+fn a_handle_that_belongs_to_another_port_is_refused() {
+    let h = Harness::new();
+    let file = h.sim.file(&content(100));
+    h.sim.joined_elsewhere(file);
+    let error = h.read(file, 0, 10, 1).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert!(error.to_string().contains("another completion port"));
+    assert_eq!(h.pending(), 0);
+}
+
+#[test]
+fn handles_that_would_block_or_skip_the_port_are_refused() {
+    let h = Harness::new();
+    let skipping = h.sim.skipping_file(&content(10));
+    assert_eq!(
+        h.read(skipping, 0, 10, 1).unwrap_err().kind(),
+        io::ErrorKind::InvalidInput
+    );
+    let sock = h.sim.synchronous_sock();
+    let buf = IoBuf {
+        bytes: vec![0; 4],
+        filled: 0,
+    };
+    let error = h
+        .submit(Request::Recv { sock }, buf, io_then(2))
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(h.pending(), 0);
+}
+
+#[test]
+fn a_ring_completion_or_a_packet_ends_only_a_record_on_its_own_route() {
+    let h = Harness::with(Some(full_probe()), true, MAX_PIECE);
+    let file = h.sim.file(&content(100));
+    h.sim.hold(true);
+    h.read(file, 0, 10, 1).unwrap();
+    // A packet naming the ring-routed record's OVERLAPPED does not end it.
+    h.engine
+        .sys
+        .post(h.engine.port.handle, first_overlapped(&h))
+        .unwrap();
+    assert!(h.pull_with(&mut |_| false).is_empty());
+    assert_eq!(h.engine.strays.load(Ordering::Relaxed), 1);
+    // A ring completion with the wrong generation, or on a record not routed through the ring,
+    // ends nothing either.
+    let ring = lock(&h.engine.rings)[0].clone();
+    assert!(
+        h.engine.take_token(0, 1 + 7, Some(&ring)).is_none(),
+        "wrong generation"
+    );
+    assert!(
+        h.engine.take_token(0, 1, None).is_none(),
+        "a pool result for a ring record"
+    );
+    h.sim.release();
+    assert_eq!(ended(h.one()).result.unwrap(), 10);
+    assert_eq!(h.pending(), 0);
+
+    // And a port record is not ended by a ring completion naming it.
+    let sock = h.sim.sock();
+    h.sim.hold(true);
+    h.submit(
+        Request::Send { sock },
+        IoBuf {
+            bytes: vec![1; 4],
+            filled: 4,
+        },
+        io_then(2),
+    )
+    .unwrap();
+    assert!(
+        h.engine.take_token(0, 2, Some(&ring)).is_none(),
+        "a port record"
+    );
+    h.sim.release();
+    assert_eq!(ended(h.one()).result.unwrap(), 4);
+}
+
+#[test]
+fn a_write_goes_in_pieces_of_at_most_a_read_piece() {
+    let h = Harness::new();
+    let file = h.sim.file(&[]);
+    let data = content(600 * 1024);
+    h.write(file, 0, &data, 1).unwrap();
+    assert_eq!(ended(h.one()).result.unwrap(), data.len());
+    let writes: Vec<_> = h
+        .sim
+        .log()
+        .into_iter()
+        .filter(|l| l.starts_with("write"))
+        .collect();
+    assert_eq!(writes.len(), 3, "{writes:?}");
+    assert_eq!(h.sim.file_data(file), data);
+}
+
+#[test]
+fn a_flush_builds_a_bounded_number_of_entries_and_a_submission_never_waits_for_one() {
+    let h = Harness::with(Some(full_probe()), true, MAX_PIECE);
+    let data = content(4096);
+    let file = h.sim.file(&data);
+    h.read(file, 0, 10, 99).unwrap(); // makes this thread's ring
+    h.drain(1);
+    let ring = lock(&h.engine.rings)[0].clone();
+    let busy = lock(&ring.inner);
+    // Another thread is submitting: this one only queues its entries (it must not wait).
+    for tag in 0..40u64 {
+        h.read(file, tag * 10, 10, tag).unwrap();
+    }
+    drop(busy);
+    let done = h.drain(40);
+    for (i, done) in done.into_iter().enumerate() {
+        let done = ended(done);
+        assert_eq!(done.buf.bytes, data[i * 10..(i + 1) * 10]);
+    }
+    let sizes = h.sim.submit_sizes();
+    assert!(sizes.iter().all(|n| *n <= 16), "{sizes:?}");
+    assert_eq!(sizes.iter().sum::<usize>(), 41);
+}
+
+#[test]
+fn a_ring_that_cannot_be_read_ends_its_operations_with_the_error() {
+    let h = Harness::with(Some(full_probe()), true, MAX_PIECE);
+    let file = h.sim.file(&content(100));
+    h.sim.hold(true);
+    h.read(file, 0, 10, 1).unwrap();
+    h.read(file, 10, 10, 2).unwrap();
+    h.sim.fail_pops(5);
+    let done = h.drain(2);
+    for done in done {
+        let error = ended(done).result.unwrap_err();
+        assert!(error.to_string().contains("IoRing failed"), "{error}");
+    }
+    assert_eq!(h.pending(), 0);
+    // The thread gets a new ring for what follows.
+    h.sim.fail_pops(0);
+    h.sim.hold(false);
+    h.sim.release();
+    h.read(file, 0, 10, 3).unwrap();
+    assert_eq!(ended(h.one()).result.unwrap(), 10);
+    assert_eq!(h.sim.rings_made(), 2);
+}
+
+#[test]
+fn a_truncated_datagram_ends_once_with_its_winsock_error() {
+    let h = Harness::new();
+    let sock = h.sim.sock();
+    h.sim.mark_warning(10040);
+    h.sim
+        .fail_next_completion(Op::Recv, io::Error::from_raw_os_error(10040));
+    let buf = IoBuf {
+        bytes: vec![0; 4],
+        filled: 0,
+    };
+    h.submit(Request::Recv { sock }, buf, io_then(1)).unwrap();
+    let error = ended(h.one()).result.unwrap_err();
+    assert_eq!(error.raw_os_error(), Some(10040));
+    assert!(h.pull_with(&mut |_| false).is_empty());
+}
+
+#[test]
+fn socket_statuses_map_to_their_winsock_errors_and_other_statuses_are_left_alone() {
+    assert_eq!(socket_status_error(0xC000_0236_u32 as i32), Some(10061));
+    assert_eq!(socket_status_error(0xC000_020D_u32 as i32), Some(10054));
+    assert_eq!(socket_status_error(0x8000_0005_u32 as i32), Some(10040));
+    assert_eq!(
+        socket_status_error(0xC000_0120_u32 as i32),
+        None,
+        "cancelled is the Win32 995"
+    );
+}
+
+#[test]
+fn long_paths_become_verbatim_paths_and_others_are_left_alone() {
+    assert_eq!(verbatim_path(r"C:\a\b").as_deref(), Some(r"\\?\C:\a\b"));
+    assert_eq!(
+        verbatim_path(r"\\server\share\f").as_deref(),
+        Some(r"\\?\UNC\server\share\f")
+    );
+    assert_eq!(verbatim_path(r"\\?\C:\a"), None);
+    assert_eq!(verbatim_path(r"relative\path"), None);
 }

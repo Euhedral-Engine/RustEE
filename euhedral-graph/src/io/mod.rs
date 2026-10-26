@@ -238,12 +238,19 @@ type Platform = win::Engine;
 ///   the kernel refuses an enter for a while, the operation stays queued and is handed over by a
 ///   later submission or poll: it still completes, once.
 /// - **An operation belongs to the thread that submitted it:** io_uring cancels it (`ECANCELED`, or
-///   `EINTR`) if that thread exits first. Lattice workers live as long as the lattice. (Windows
-///   keeps operations of an exited thread, but the contract is the stricter one.)
+///   `EINTR`) if that thread exits first. Lattice workers live as long as the lattice. On
+///   Windows an operation is not cancelled when its thread exits (a ring is not tied to a thread,
+///   and a handle joined to a completion port keeps its I/O), but rely only on the contract above.
 /// - **Handles on Windows** must be opened for overlapped I/O (`FILE_FLAG_OVERLAPPED`: [`open_path`]
-///   does, and Rust's sockets are), and must not belong to another completion port: a handle joins
-///   this source's port for good. A file handle opened without overlapped I/O is refused with
-///   `InvalidInput`, since an operation on it would block the worker.
+///   does, and Rust's sockets are) and must not skip the port on success
+///   (`FILE_SKIP_COMPLETION_PORT_ON_SUCCESS`): a handle of either kind is refused with
+///   `InvalidInput`, since its operations would block the worker or never complete. A handle joins
+///   this source's completion port when its first operation on the port is submitted, and a handle
+///   can belong to one port only: **it can serve one `AsyncIo`, ever**, and a handle that already
+///   belongs to another port is refused. File reads and writes through IoRing need no port.
+/// - **Writes that extend a file** are synchronous on NTFS (the call returns when the data is
+///   written). On Windows every write goes in pieces of at most 256 KiB, so that one piece is a
+///   bounded wait for the worker that submits it.
 /// - **Dropping** an `AsyncIo` with operations in flight leaks their buffers (the kernel may still
 ///   write them).
 ///

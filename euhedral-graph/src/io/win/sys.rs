@@ -94,11 +94,34 @@ impl SockAddr {
     }
 }
 
-/// A packet dequeued from a completion port.
+/// `STATUS_PENDING`: the value an `OVERLAPPED`'s `Internal` holds until its call completes.
+pub(crate) const STATUS_PENDING: i32 = 0x103;
+/// `STATUS_END_OF_FILE`.
+pub(crate) const STATUS_END_OF_FILE: i32 = 0xC000_0011_u32 as i32;
+
+/// Whether an `NTSTATUS` is a warning (severity 2): the I/O manager still queues a completion
+/// packet for a call that returns one, although the call reports failure.
+pub(crate) fn is_nt_warning(status: i32) -> bool {
+    (status as u32) >> 30 == 2
+}
+
+/// A packet dequeued from a completion port: the `OVERLAPPED` it carries, and that call's final
+/// `NTSTATUS` and byte count (`Internal` and `InternalHigh`, as the port reports them).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Packet {
     /// The address of the `OVERLAPPED` the packet carries.
     pub overlapped: usize,
+    pub status: i32,
+    pub bytes: u32,
+}
+
+/// How a handle makes calls behave.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct HandleMode {
+    /// Opened without overlapped I/O: its calls block the caller.
+    pub synchronous: bool,
+    /// "Skip the port on success" is set: a call that completes at once queues no packet.
+    pub skips_port_on_success: bool,
 }
 
 /// What the OS says about its kernel ring (IoRing).
@@ -136,7 +159,10 @@ pub(crate) enum BuildError {
 /// guarantees what its safety comment says.
 ///
 /// An asynchronous call returns `Ok(())` when a completion packet (or ring completion) will
-/// follow, and `Err` when the call failed at once and none will.
+/// follow, and `Err` when the call failed at once and none will. A call that reports failure with
+/// a warning status (`ERROR_MORE_DATA`, `WSAEMSGSIZE`) still queues a packet, so it returns `Ok`.
+/// The engine does not complete an operation until its call has returned, so the implementation
+/// may read the `OVERLAPPED` after the call to tell the two apart.
 pub(crate) trait Sys: Send + Sync + 'static {
     // ---- the completion port
     fn create_port(&self) -> io::Result<Handle>;
@@ -145,10 +171,14 @@ pub(crate) trait Sys: Send + Sync + 'static {
     fn associate(&self, port: Handle, handle: Handle) -> io::Result<()>;
     /// Appends up to `max` packets to `out`, taking none and never waiting if there are none.
     fn dequeue(&self, port: Handle, out: &mut Vec<Packet>, max: usize) -> io::Result<()>;
-    /// Queues a packet that carries `overlapped`.
+    /// Queues a packet that carries `overlapped` (tests).
+    #[cfg_attr(not(test), allow(dead_code))]
     fn post(&self, port: Handle, overlapped: usize) -> io::Result<()>;
-    /// Whether the file handle makes calls block (opened without overlapped I/O).
-    fn is_synchronous(&self, file: Handle) -> io::Result<bool>;
+    /// How the handle (a file, or with `socket` a socket) makes calls behave. A failed query of a
+    /// socket is not an error: it reads as the default mode.
+    fn handle_mode(&self, handle: Handle, socket: bool) -> io::Result<HandleMode>;
+    /// An `NTSTATUS` of a finished call as an error (Win32 codes; Winsock codes for `socket`).
+    fn status_error(&self, status: i32, socket: bool) -> io::Error;
 
     // ---- overlapped calls
     /// # Safety
@@ -220,17 +250,6 @@ pub(crate) trait Sys: Send + Sync + 'static {
         to: *const SockAddr,
         ov: *mut Overlapped,
     ) -> io::Result<()>;
-    /// What a finished overlapped call moved, or why it failed.
-    ///
-    /// # Safety
-    /// `ov` is the `OVERLAPPED` of a call on `handle` whose packet was dequeued.
-    unsafe fn result(
-        &self,
-        handle: Handle,
-        ov: *const Overlapped,
-        socket: bool,
-    ) -> io::Result<usize>;
-
     // ---- sockets
     /// A new overlapped, non-inheritable stream socket of `listener`'s family.
     fn accept_socket(&self, listener: Handle) -> io::Result<Handle>;
@@ -300,6 +319,37 @@ pub(crate) fn hresult_error(hr: i32) -> io::Error {
     } else {
         io::Error::other(format!("an IoRing operation failed (HRESULT {bits:#010x})"))
     }
+}
+
+/// A path as a verbatim path (`\\?\`), for a path too long for the ordinary Win32 limit. `path`
+/// is absolute and normalized (no `.` or `..`, backslashes only); anything else is `None`.
+pub(crate) fn verbatim_path(path: &str) -> Option<String> {
+    if path.starts_with(r"\\?\") || path.starts_with(r"\\.\") {
+        return None;
+    }
+    if let Some(unc) = path.strip_prefix(r"\\") {
+        return Some(format!(r"\\?\UNC\{unc}"));
+    }
+    let bytes = path.as_bytes();
+    if bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\' {
+        return Some(format!(r"\\?\{path}"));
+    }
+    None
+}
+
+/// The Winsock error of a socket call's `NTSTATUS`, for the statuses whose Win32 translation
+/// differs from it (the table `libuv` keeps for the same reason). `None`: use the Win32 error.
+pub(crate) fn socket_status_error(status: i32) -> Option<i32> {
+    Some(match status as u32 {
+        0xC000_0236 => 10061, // STATUS_CONNECTION_REFUSED: WSAECONNREFUSED
+        0xC000_020D | 0xC000_013C | 0xC000_023F => 10054, // reset, remote disconnect, port unreachable: WSAECONNRESET
+        0xC000_0241 => 10053, // STATUS_CONNECTION_ABORTED: WSAECONNABORTED
+        0xC000_023D => 10065, // STATUS_HOST_UNREACHABLE: WSAEHOSTUNREACH
+        0xC000_023C => 10051, // STATUS_NETWORK_UNREACHABLE: WSAENETUNREACH
+        0xC000_00B5 => 10060, // STATUS_IO_TIMEOUT: WSAETIMEDOUT
+        0x8000_0005 => 10040, // STATUS_BUFFER_OVERFLOW: WSAEMSGSIZE
+        _ => return None,
+    })
 }
 
 /// `ERROR_HANDLE_EOF` and `ERROR_BROKEN_PIPE`: a read at the end of the data.

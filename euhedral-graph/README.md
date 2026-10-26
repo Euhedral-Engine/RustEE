@@ -138,8 +138,10 @@ starts operations and finds their ends, and `io/mod.rs` does the rest.
   falls back to the port on its own. `AsyncIoOptions { windows_ioring: false }` forces the port.
   Windows has no asynchronous open or rename, so those run on the OS thread pool and post their
   result to the port: the one place the crate uses threads it did not create. Handles must be
-  opened for overlapped I/O (`open_path` does, and so do Rust's sockets), and must not belong to
-  another completion port; a file handle that would block is refused. Tested on a real Windows by
+  opened for overlapped I/O (`open_path` does, and so do Rust's sockets) and must not skip the port
+  on success; a handle that would block or never complete is refused. A handle joins the engine's
+  port and can serve one `AsyncIo`, ever. Writes go in pieces of at most 256 KiB, since a write
+  that extends a file is synchronous on NTFS. Tested on a real Windows by
   [CI](../.github/workflows/windows.yml) on every push to the `graph` branch.
 - **macOS:** no engine yet.
 
