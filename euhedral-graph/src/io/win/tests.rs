@@ -575,7 +575,7 @@ fn a_read_at_the_end_through_the_ring_is_the_same_eof() {
 }
 
 #[test]
-fn the_ring_is_used_only_where_the_os_has_one_for_the_operation() {
+fn the_ring_is_used_only_where_the_os_has_one_for_reads_and_writes() {
     let probe = |version, emulated, read, write| {
         Some(RingProbe {
             version,
@@ -584,34 +584,21 @@ fn the_ring_is_used_only_where_the_os_has_one_for_the_operation() {
             write,
         })
     };
-    let uses = |probe, ioring| Harness::with(probe, ioring, MAX_PIECE).engine.ring_use();
-    assert_eq!(uses(None, true), (false, false), "no IoRing");
-    assert_eq!(
-        uses(probe(300, true, true, true), true),
-        (false, false),
-        "emulated"
+    let uses = |probe, ioring| Harness::with(probe, ioring, MAX_PIECE).engine.ring_use().0;
+    assert!(!uses(None, true), "no IoRing");
+    assert!(!uses(probe(300, true, true, true), true), "emulated");
+    assert!(!uses(probe(300, false, true, true), false), "forced off");
+    assert!(uses(probe(300, false, true, true), true));
+    assert!(
+        !uses(probe(2, false, true, true), true),
+        "no writes before v3"
     );
-    assert_eq!(
-        uses(probe(300, false, true, true), false),
-        (false, false),
-        "forced off"
-    );
-    assert_eq!(uses(probe(300, false, true, true), true), (true, true));
-    assert_eq!(
-        uses(probe(2, false, true, true), true),
-        (true, false),
-        "reads only before v3"
-    );
-    assert_eq!(
-        uses(probe(300, false, true, false), true),
-        (true, false),
-        "no write op"
-    );
-    assert_eq!(uses(probe(300, false, false, true), true), (false, true));
+    assert!(!uses(probe(300, false, true, false), true), "no write op");
+    assert!(!uses(probe(300, false, false, true), true), "no read op");
 }
 
 #[test]
-fn a_write_without_ring_support_goes_through_the_port_while_reads_use_the_ring() {
+fn without_ring_writes_files_go_through_the_port_for_reads_and_writes_alike() {
     let probe = RingProbe {
         version: 2,
         ..full_probe()
@@ -622,11 +609,40 @@ fn a_write_without_ring_support_goes_through_the_port_while_reads_use_the_ring()
     h.write(file, 50, b"zz", 2).unwrap();
     let done = h.drain(2);
     assert!(done.iter().all(|d| d.done.as_ref().unwrap().result.is_ok()));
+    assert_eq!(h.sim.rings_made(), 0);
     let log = h.sim.log();
     assert_eq!(
         log.iter().filter(|l| l.starts_with("associate")).count(),
         1,
-        "the write's"
+        "joined once"
+    );
+}
+
+#[test]
+fn a_file_keeps_its_route() {
+    let h = Harness::with(Some(full_probe()), true, MAX_PIECE);
+    // A file that joined the port stays on it, ring or not.
+    let joined = h.sim.file(&content(100));
+    h.engine
+        .sys
+        .associate(h.engine.port.handle, joined)
+        .unwrap();
+    h.engine.associated.lock().unwrap().insert(joined);
+    h.read(joined, 0, 10, 1).unwrap();
+    assert_eq!(ended(h.one()).result.unwrap(), 10);
+    assert_eq!(h.sim.rings_made(), 0, "no ring for a file on the port");
+    // A file a ring serves is never joined to the port.
+    let ringed = h.sim.file(&content(100));
+    h.read(ringed, 0, 10, 2).unwrap();
+    h.write(ringed, 0, b"x", 3).unwrap();
+    h.drain(2);
+    assert_eq!(h.sim.rings_made(), 1);
+    assert!(
+        !h.sim
+            .log()
+            .iter()
+            .any(|l| l == &format!("associate {ringed:#x}")),
+        "a ring-served file never joins the port"
     );
 }
 

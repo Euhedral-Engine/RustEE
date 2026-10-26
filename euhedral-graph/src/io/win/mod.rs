@@ -6,9 +6,10 @@
 //!   operation ends through a poll: the "skip the port on success" mode is not set, and a handle
 //!   that has it set is refused.
 //! - **One IoRing per submitting thread**, for file reads and writes, when the OS offers a kernel
-//!   ring ([`Sys::ring_probe`]: not emulated in user mode, with the operation supported). A full
+//!   ring for both ([`Sys::ring_probe`]: not emulated in user mode, with reads and writes
+//!   supported: Windows 11 22H2 and later). A full
 //!   submission queue goes to the ring's backlog and is handed over by a later submission or poll.
-//!   Each operation falls back to the port on its own.
+//!   A file keeps its route: IoRing refuses a handle that belongs to a completion port.
 //! - **Open and rename** have no asynchronous call. They run on the OS thread pool and leave their
 //!   result in a queue the poll drains, so a job that panics or is dropped still ends its
 //!   operation, with an error. It is the one place the crate uses threads it did not create.
@@ -368,8 +369,11 @@ pub(super) struct Engine {
     inbox: Mutex<VecDeque<Packet>>,
     /// The handles this engine joined to its port.
     associated: Mutex<HashSet<Handle>>,
-    ring_reads: bool,
-    ring_writes: bool,
+    /// File reads and writes go through rings (only where the OS has both: a handle that a ring
+    /// serves must not belong to a port, and a write has to follow its reads there).
+    ring_files: bool,
+    /// The file handles a ring serves.
+    ringed: Mutex<HashSet<Handle>>,
     rings: Mutex<Vec<Arc<Ring>>>,
     max_piece: usize,
     /// Packets and completions of no operation (ignored), for tests.
@@ -413,9 +417,10 @@ impl Engine {
             pool_done: Arc::default(),
             inbox: Mutex::new(VecDeque::new()),
             associated: Mutex::new(HashSet::new()),
-            ring_reads: probe.is_some_and(|probe| probe.read),
-            ring_writes: probe
-                .is_some_and(|probe| probe.write && probe.version >= IORING_VERSION_3),
+            ring_files: probe.is_some_and(|probe| {
+                probe.read && probe.write && probe.version >= IORING_VERSION_3
+            }),
+            ringed: Mutex::new(HashSet::new()),
             rings: Mutex::new(Vec::new()),
             max_piece: max_piece.clamp(1, MAX_PIECE),
             strays: AtomicUsize::new(0),
@@ -425,7 +430,7 @@ impl Engine {
     /// Whether file reads and writes go through a ring (for tests).
     #[cfg(test)]
     pub(super) fn ring_use(&self) -> (bool, bool) {
-        (self.ring_reads, self.ring_writes)
+        (self.ring_files, self.ring_files)
     }
 
     /// The number of bytes of the next piece of `n` left: at most `max_piece`, and a `u32`.
@@ -807,11 +812,21 @@ impl Engine {
         }
     }
 
-    /// The route of a file operation: a ring if one serves this kind of operation and can be had,
-    /// otherwise the port, which the handle then joins.
-    fn file_route(&self, handle: Handle, ring_ok: bool) -> io::Result<Route> {
-        if ring_ok && let Some(ring) = self.ring() {
-            return Ok(Route::Ring(ring));
+    /// The route of a file operation: a ring if the OS has them for files and one can be had,
+    /// otherwise the port, which the handle then joins. A file keeps its route: IoRing refuses a
+    /// handle that belongs to a port (`ERROR_INVALID_PARAMETER`), so a handle that joined the
+    /// port stays on it, and one a ring serves is never joined.
+    fn file_route(&self, handle: Handle) -> io::Result<Route> {
+        if self.ring_files && !lock(&self.associated).contains(&handle) {
+            if let Some(ring) = self.ring() {
+                lock(&self.ringed).insert(handle);
+                return Ok(Route::Ring(ring));
+            }
+            if lock(&self.ringed).contains(&handle) {
+                return Err(io::Error::other(
+                    "this file handle is served by IoRing, and no ring is available to this thread",
+                ));
+            }
         }
         self.join_port(handle)?;
         Ok(Route::Port)
@@ -1240,12 +1255,12 @@ impl EngineTrait for Engine {
         let op = match request {
             Request::Read { file, offset } => {
                 self.check_handle(file, false)?;
-                let route = self.file_route(file, self.ring_reads)?;
+                let route = self.file_route(file)?;
                 Self::op(Kind::Read { file, offset }, route, buf, then)
             }
             Request::Write { file, offset } => {
                 self.check_handle(file, false)?;
-                let route = self.file_route(file, self.ring_writes)?;
+                let route = self.file_route(file)?;
                 Self::op(Kind::Write { file, offset }, route, buf, then)
             }
             Request::Send { sock } => {

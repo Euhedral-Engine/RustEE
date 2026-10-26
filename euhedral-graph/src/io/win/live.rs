@@ -561,15 +561,15 @@ fn a_datagram_larger_than_the_buffer_ends_once_with_wsaemsgsize() {
 }
 
 #[test]
-fn ring_reads_end_through_the_ring_even_on_a_file_joined_to_the_port() {
+fn a_file_joined_to_a_port_is_served_by_the_port_not_a_ring() {
+    // IoRing refuses a handle that belongs to a completion port (ERROR_INVALID_PARAMETER), so the
+    // engine keeps such a handle on the port.
     let io = AsyncIo::open().unwrap();
-    if !io.engine.ring_use().0 {
-        return;
-    }
     let data = content(8 * 4096, 21);
     let (path, file) = overlapped_file("ring-vs-port", &data);
     let raw = file.as_raw_handle() as usize;
     io.engine.sys.associate(io.engine.port.handle, raw).unwrap();
+    io.engine.associated.lock().unwrap().insert(raw);
     for i in 0..4u64 {
         io.read(file.as_raw_handle(), i * 4096, buf(4096), then(i))
             .unwrap();
@@ -579,16 +579,10 @@ fn ring_reads_end_through_the_ring_even_on_a_file_joined_to_the_port() {
         assert!(done.result.is_ok(), "read {i}: {:?}", done.result);
         assert_eq!(done.buf.bytes, data[i * 4096..(i + 1) * 4096]);
     }
-    // No packet ended them: the port has nothing, and nothing was ignored.
-    let mut packets = Vec::new();
-    io.engine
-        .sys
-        .dequeue(io.engine.port.handle, &mut packets, 64)
-        .unwrap();
-    assert!(packets.is_empty());
     assert_eq!(
-        io.engine.strays.load(std::sync::atomic::Ordering::Relaxed),
-        0
+        io.engine.rings.lock().unwrap().len(),
+        0,
+        "no ring was made for it"
     );
     drop(file);
     std::fs::remove_file(path).unwrap();

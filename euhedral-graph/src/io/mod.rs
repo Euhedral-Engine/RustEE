@@ -117,8 +117,8 @@ impl Default for OpenSpec {
 /// How [`AsyncIo::open_with_options`] chooses its engine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AsyncIoOptions {
-    /// On Windows, use IoRing for file reads and writes where the OS has a kernel ring (Windows 11;
-    /// writes from 22H2); `false` forces completion ports everywhere. Ignored on other platforms.
+    /// On Windows, use IoRing for file reads and writes where the OS has a kernel ring (Windows 11 22H2 and
+    /// later, which has file reads and writes); `false` forces completion ports everywhere. Ignored on other platforms.
     pub windows_ioring: bool,
 }
 

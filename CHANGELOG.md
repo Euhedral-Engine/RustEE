@@ -24,9 +24,10 @@ now `async-io` (it was `io-uring`).
 **Semantics on Windows.**
 - Each operation ends through a poll: the "skip the port on success" mode is not set. An overlapped call that fails at
   once (no packet will come) ends with that error at the next poll.
-- A file operation uses a ring only if the probe says the OS has a kernel ring (not `IORING_FEATURE_UM_EMULATION`), the
-  operation is supported, and, for writes, the ring version is at least `IORING_VERSION_3`. Each kind falls back to the
-  port on its own. The IoRing functions are resolved with `LoadLibraryExW` and `GetProcAddress`, never linked, so the
+- File reads and writes use rings only if the probe says the OS has a kernel ring (not `IORING_FEATURE_UM_EMULATION`) with
+  both operations supported (`IORING_VERSION_3`, Windows 11 22H2 and later); otherwise both go through the port. A file keeps
+  its route: IoRing refuses a handle that belongs to a completion port (`ERROR_INVALID_PARAMETER`, found by a live test), so
+  a handle that joined the port stays on it and a handle a ring serves is never joined. The IoRing functions are resolved with `LoadLibraryExW` and `GetProcAddress`, never linked, so the
   library loads on Windows without them.
 - Open and rename run on the OS thread pool (`TrySubmitThreadpoolCallback`) and post their result to the port, so they
   come out of the same poll. This is the one place the crate uses threads it did not create.

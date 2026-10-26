@@ -133,9 +133,9 @@ starts operations and finds their ends, and `io/mod.rs` does the rest.
   thread that submitted it, and lattice workers live as long as the lattice.
 - **Windows:** one I/O completion port per `AsyncIo`, polled with a zero timeout, for every
   operation, and one IoRing per submitting thread for file reads and writes where the OS has a
-  kernel ring (Windows 11; writes from 22H2; not one emulated in user mode). The ring functions are
-  looked up at run time, so the library still loads where they are missing, and each operation
-  falls back to the port on its own. `AsyncIoOptions { windows_ioring: false }` forces the port.
+  kernel ring for both (Windows 11 22H2 and later; not one emulated in user mode). The ring
+  functions are looked up at run time, so the library still loads where they are missing. A file
+  keeps its route: IoRing refuses a handle that belongs to a completion port. `AsyncIoOptions { windows_ioring: false }` forces the port.
   Windows has no asynchronous open or rename, so those run on the OS thread pool and post their
   result to the port: the one place the crate uses threads it did not create. Handles must be
   opened for overlapped I/O (`open_path` does, and so do Rust's sockets) and must not skip the port
