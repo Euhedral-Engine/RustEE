@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 use euhedral_core::frames::{Frame, FrameError, FrameHeader};
-use euhedral_core::ingest::QueueIngestSink;
+use euhedral_core::generics::FrameSink;
 
 use crate::completions::{Completions, Ready};
 use crate::lanes::{LaneId, LanePool, Marker};
@@ -198,8 +198,10 @@ pub trait Stage<Q>: Send + Sync {
 /// The RustEE side a graph publishes through.
 #[derive(Clone)]
 pub struct GraphRuntime {
-    /// Where stage frames are offered (attached to the lattice).
-    pub stages: Arc<QueueIngestSink>,
+    /// Where stage frames are offered: any sink of the lattice's frames, usually a
+    /// [`Lake`](crate::Lake) (whose units are the graph's quanta, so the caller admits one before
+    /// it starts a quantum and drops its guard when the quantum retires).
+    pub stages: Arc<dyn FrameSink>,
     pub completions: Arc<Completions>,
     pub lanes: Arc<LanePool>,
     /// Shared by the runtime's graphs.
@@ -1226,7 +1228,7 @@ mod tests {
     use std::sync::atomic::AtomicU64;
 
     use euhedral_core::generics::LatticeSource;
-    use euhedral_core::ingest::IngestSink;
+    use euhedral_core::ingest::{IngestSink, QueueIngestSink};
 
     use super::*;
     use crate::DeviceQueue;
@@ -1376,8 +1378,19 @@ mod tests {
         fn on_error(&self, _: euhedral_core::frames::Failure) {}
     }
 
+    /// The stage sink of the harness: a queue its tests pull from.
+    struct QueueStages(Arc<QueueIngestSink>);
+
+    impl FrameSink for QueueStages {
+        fn offer(&self, frame: Box<dyn Frame>) -> Result<(), Box<dyn Frame>> {
+            self.0.offer(frame)
+        }
+    }
+
     struct Harness {
         runtime: GraphRuntime,
+        /// Where the runtime's stage frames queue.
+        sink: Arc<QueueIngestSink>,
         hands: Vec<Arc<HandLane>>,
         log: Log,
         /// The id hashes and orderedness of the stage frames run, in order.
@@ -1404,12 +1417,13 @@ mod tests {
             stages.delegate().add_downstream(Arc::new(Unattended));
             Self {
                 runtime: GraphRuntime {
-                    stages,
+                    stages: Arc::new(QueueStages(stages.clone())),
                     completions: Completions::new(pool.clone()),
                     lanes: pool,
                     retries: Arc::default(),
                     retry_backstop,
                 },
+                sink: stages,
                 hands,
                 log: Arc::default(),
                 headers: Mutex::default(),
@@ -1450,8 +1464,7 @@ mod tests {
         /// Runs one frame, as an executor does, from the stage sink or else the completions.
         fn pump_once(&self) -> bool {
             let mut frame = None;
-            self.runtime
-                .stages
+            self.sink
                 .delegate()
                 .pull(&mut |f| frame = Some(f), &mut |_| false, 1);
             if frame.is_none() {
@@ -1594,7 +1607,7 @@ mod tests {
             &[(0, 1, Submission), (1, 2, Submission)],
         );
         let _ = graph.start(7, alive(), Vec::new());
-        assert_eq!(h.runtime.stages.size(), 1, "only the root is published");
+        assert_eq!(h.sink.size(), 1, "only the root is published");
         for expected in [vec![0], vec![0, 1], vec![0, 1, 2]] {
             assert!(h.pump_once());
             assert_eq!(h.ran(7), expected);
@@ -2033,7 +2046,7 @@ mod tests {
     fn a_refused_stage_frame_fails_the_quantum_and_it_still_retires_once() {
         let h = Harness::new(1);
         let graph = h.graph(&[(None, &[], Act::Cpu)], &[]);
-        h.runtime.stages.complete();
+        h.sink.complete();
         let _ = graph.start(1, alive(), Vec::new());
         let retired = h.retired(1);
         assert!(
@@ -2113,11 +2126,9 @@ mod tests {
                             let mut frame = None;
                             {
                                 let _one = lock(&pull);
-                                h.runtime.stages.delegate().pull(
-                                    &mut |f| frame = Some(f),
-                                    &mut |_| false,
-                                    1,
-                                );
+                                h.sink
+                                    .delegate()
+                                    .pull(&mut |f| frame = Some(f), &mut |_| false, 1);
                             }
                             let Some(frame) = frame else { return };
                             run_frame(frame);
@@ -2168,7 +2179,7 @@ mod tests {
         };
         let _ = graph.start(2, alive(), vec![edge]);
         assert_eq!(
-            h.runtime.stages.size(),
+            h.sink.size(),
             1,
             "only the earlier quantum's root is published"
         );
