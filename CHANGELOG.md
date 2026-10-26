@@ -38,6 +38,11 @@ sound and its frames hung.
 - A fragment's worker task has its own `TaskInterrupt`, set on `close` and on `dump_locks`. The
   fragment's other users of the CPU keep running, and `start` on a fragment sharing the executor finds
   it running.
+- When the last use ends while its worker is still finishing, the executor is closed with a task left, and
+  its slot stays taken until that task ends. A re-placement on that CPU in the meantime gets
+  `ClosedWithActiveTasks`, and `BaseCloneableObject::place` panics on it. This limit of the registry is
+  unchanged; closing a lattice waits for its workers (which leave the registry just before the task
+  ends), so only a quick re-placement from another thread can meet it.
 - `BaseCloneableObject::place` no longer shuts the executor down after the build: that interrupted
   every task on a shared executor, and a build racing another lattice's start could stop its worker.
   The executor is created under the fragment's worker name and left as found.

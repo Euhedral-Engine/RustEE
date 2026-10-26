@@ -206,6 +206,7 @@ impl Control {
     /// with no task running.
     fn leave(&self) -> bool {
         let mut control = self.lock();
+        debug_assert!(control.users > 0, "a use ended twice");
         control.users = control.users.saturating_sub(1);
         if control.users > 0 {
             return false;

@@ -193,6 +193,11 @@ fn a_clone_is_built_and_first_touched_on_its_core() {
     assert!(PinnedThreadExecutor::get(cpus[0]).unwrap().is_some());
     assert!(!clone.is_started());
     assert!(!clone.ready());
+    // Closing the clone ends the last use of the CPU's executor, so no use leaked from the build.
+    close(clone);
+    wait_until("the CPU's executor to close", || {
+        PinnedThreadExecutor::get(cpus[0]).unwrap().is_none()
+    });
 }
 
 #[test]
