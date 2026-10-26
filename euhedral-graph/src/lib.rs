@@ -18,6 +18,8 @@
 //! | [`Join`] | [`join`] | Euhedral-Inference `Join` |
 //! | [`LanePool`], [`Marker`], [`DeviceQueue`] | [`lanes`] | Euhedral-Inference `LanePool` |
 //! | [`StageGraph`] | [`stage_graph`] | Euhedral-Inference `StageGraph` |
+//! | [`Lake`], [`UnitGuard`] | [`lake`] | Euhedral-Inference `InferenceLake` |
+//! | [`Latch`] | [`latch`] | a one-shot hand-off from a frame to the main thread |
 //!
 //! Every public type is also re-exported at the crate root. Types of `euhedral-core` (`Frame`,
 //! `LatticeSource`, ...) are not: import them from `euhedral_core`.
@@ -25,8 +27,8 @@
 //! Features: `async-io` (default) builds `AsyncIo` on Linux, Android and Windows; `testing` adds
 //! `testing::FakeDevice`.
 
-// io_uring needs unsafe in `io`, and `ThreadUsage` makes two system calls, each with a `// SAFETY:`
-// comment; nowhere else.
+// The engines of `io` and its `IoMemory` contract need unsafe, and `ThreadUsage` makes two system
+// calls, each with a `// SAFETY:` comment; nowhere else.
 #![deny(unsafe_code)]
 
 pub mod completions;
@@ -36,7 +38,9 @@ pub mod completions;
 ))]
 pub mod io;
 pub mod join;
+pub mod lake;
 pub mod lanes;
+pub mod latch;
 pub mod sequencer;
 pub mod stage_graph;
 #[cfg(feature = "testing")]
@@ -48,11 +52,13 @@ pub use completions::{Completions, Pending, Ready};
     any(target_os = "linux", target_os = "android", windows)
 ))]
 pub use io::{
-    AsyncIo, AsyncIoOptions, Create, IoBuf, IoDone, IoThen, OpenSpec, OwnedFile, OwnedSock,
-    RawFile, RawSock,
+    AsyncIo, AsyncIoOptions, Create, IoBuf, IoDone, IoDoneOwned, IoMemory, IoThen, OpenSpec,
+    OwnedFile, OwnedSock, RawFile, RawSock,
 };
 pub use join::Join;
+pub use lake::{Lake, LakeClosed, UnitGuard};
 pub use lanes::{DeviceQueue, LaneId, LanePool, Marker};
+pub use latch::{Latch, LatchSetter, LatchWaiter};
 pub use sequencer::{Sequencer, Slot};
 pub use stage_graph::{
     DEFAULT_RETRY_BACKSTOP, EdgeKind, ExternalEdge, GraphError, GraphRuntime, QuantumOutcome,

@@ -1,0 +1,47 @@
+# Builds and tests the whole workspace on Linux and Windows: formatting, Clippy with warnings as
+# errors, and every crate's tests and doctests. The toolchain is the one pinned in mise.toml.
+# windows-2025 is Windows Server 2025 (build 26100), which has IoRing, so euhedral-graph's
+# Windows engine runs on its kernel ring there (each of its tests also runs forced onto the
+# completion port).
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  workspace:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the toolchain pinned in mise.toml
+        shell: bash
+        run: |
+          version=$(sed -n 's/^rust = .*version = "\([^"]*\)".*/\1/p' mise.toml)
+          rustup toolchain install "$version" --profile minimal --component rustfmt --component clippy
+          rustup default "$version"
+          rustc --version
+          cargo --version
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace

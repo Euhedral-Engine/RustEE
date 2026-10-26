@@ -51,8 +51,8 @@ use self::sys::{
     STATUS_PENDING, SockAddr, Sys, hresult_error, is_end_of_file, is_nt_warning,
 };
 use super::{
-    AsyncIo, AsyncIoOptions, Engine as EngineTrait, IoBuf, IoDone, MAX_PIECE, OpenSpec, READ_PIECE,
-    Request, Then, invalid, lock,
+    AsyncIo, AsyncIoOptions, Buf, Engine as EngineTrait, MAX_PIECE, OpenSpec, READ_PIECE, Request,
+    Then, conclude as conclude_io, invalid, lock,
 };
 
 #[cfg(all(windows, test))]
@@ -137,7 +137,7 @@ struct Accepting {
 struct Op {
     kind: Kind,
     route: Route,
-    buf: IoBuf,
+    buf: Buf,
     /// Bytes moved so far (reads, writes and sends resubmit the rest).
     moved: usize,
     then: Then,
@@ -629,7 +629,7 @@ impl Engine {
         if leak {
             // SAFETY: the slot is `Busy` now: ours.
             if let Some(op) = unsafe { (*held.2.as_ptr()).op.as_mut() } {
-                std::mem::forget(std::mem::take(&mut op.buf.bytes));
+                op.buf.leak();
             }
         }
         lock(&self.ready).push_back(Failed {
@@ -795,7 +795,7 @@ impl Engine {
             // SAFETY: the slot is `Busy` now: ours.
             let op = unsafe { (*rec.as_ptr()).op.as_mut() };
             if let Some(op) = op {
-                std::mem::forget(std::mem::take(&mut op.buf.bytes));
+                op.buf.leak();
             }
             lock(&self.ready).push_back(Failed {
                 slot,
@@ -868,7 +868,7 @@ impl Engine {
         Ok(Route::Port)
     }
 
-    fn op(kind: Kind, route: Route, buf: IoBuf, then: Then) -> Op {
+    fn op(kind: Kind, route: Route, buf: Buf, then: Then) -> Op {
         Op {
             kind,
             route,
@@ -982,7 +982,7 @@ impl Engine {
                 // A read the page cache can serve is copied inside the call, on the submitting
                 // worker: pieces of at most READ_PIECE, each piece's completion submitting the
                 // next.
-                let rest = &mut op.buf.bytes[moved..];
+                let rest = &mut op.buf.bytes_mut()[moved..];
                 let len = self.piece(rest.len().min(READ_PIECE));
                 let buf = rest.as_mut_ptr();
                 if let Route::Ring(ring) = &op.route {
@@ -1005,7 +1005,7 @@ impl Engine {
                 // Pieces of at most READ_PIECE too: a write that extends a file is synchronous on
                 // NTFS (the call returns when the data is written), so its size is the worker's
                 // wait.
-                let rest = &op.buf.bytes[moved..op.buf.filled];
+                let rest = &op.buf.bytes()[moved..op.buf.filled()];
                 let len = self.piece(rest.len().min(READ_PIECE));
                 let buf = rest.as_ptr();
                 if let Route::Ring(ring) = &op.route {
@@ -1024,7 +1024,7 @@ impl Engine {
             }
             Kind::Send { sock } => {
                 let sock = *sock;
-                let bytes = &op.buf.bytes[moved..op.buf.filled];
+                let bytes = &op.buf.bytes()[moved..op.buf.filled()];
                 let len = self.piece(bytes.len().min(READ_PIECE));
                 let buf = bytes.as_ptr();
                 reset(ov, 0);
@@ -1032,7 +1032,7 @@ impl Engine {
             }
             Kind::Recv { sock } => {
                 let sock = *sock;
-                let bytes = &mut op.buf.bytes[..];
+                let bytes = op.buf.bytes_mut();
                 let len = self.piece(bytes.len());
                 let buf = bytes.as_mut_ptr();
                 reset(ov, 0);
@@ -1040,7 +1040,7 @@ impl Engine {
             }
             Kind::SendTo { sock } => {
                 let sock = *sock;
-                let bytes = &op.buf.bytes[..op.buf.filled];
+                let bytes = &op.buf.bytes()[..op.buf.filled()];
                 let len = self.piece(bytes.len());
                 let buf = bytes.as_ptr();
                 let to: *const SockAddr = op.addr.as_deref().expect("a datagram's address");
@@ -1118,8 +1118,8 @@ impl Engine {
             Kind::Read { .. } | Kind::Write { .. } | Kind::Send { .. }
         );
         let total = match op.kind {
-            Kind::Read { .. } => op.buf.bytes.len(),
-            _ => op.buf.filled,
+            Kind::Read { .. } => op.buf.len(),
+            _ => op.buf.filled(),
         };
         // A read at the end of the data is a read of no bytes.
         let result = match (&op.kind, result) {
@@ -1147,7 +1147,7 @@ impl Engine {
                 }
             }
             (Kind::Write { .. }, Ok(0)) => Err(io::Error::from(io::ErrorKind::WriteZero)),
-            (Kind::Send { .. }, Ok(0)) if op.buf.filled > 0 => {
+            (Kind::Send { .. }, Ok(0)) if op.buf.filled() > 0 => {
                 Err(io::Error::from(io::ErrorKind::WriteZero))
             }
             (_, other) => other,
@@ -1178,7 +1178,8 @@ impl Engine {
         // moved bytes: they are in the buffer, and `filled` says how many.
         if ended.is_err() && partial > 0 && matches!(op.kind, Kind::Read { .. } | Kind::Recv { .. })
         {
-            op.buf.filled = (op.moved + partial).min(op.buf.bytes.len());
+            let filled = (op.moved + partial).min(op.buf.len());
+            op.buf.set_filled(filled);
         }
         self.release(held);
         Some(conclude(op, ended))
@@ -1330,26 +1331,14 @@ fn reset(ov: *mut Overlapped, offset: u64) {
 /// The continuation's frame for an ended operation.
 fn conclude(op: Op, result: io::Result<usize>) -> Box<dyn Frame> {
     let Op {
-        kind,
-        mut buf,
-        then,
-        ..
+        kind, buf, then, ..
     } = op;
-    match then {
-        Then::Io(then) => {
-            if matches!(kind, Kind::Read { .. } | Kind::Recv { .. })
-                && let Ok(n) = result
-            {
-                buf.filled = n;
-            }
-            then(IoDone { buf, result })
-        }
-        Then::Raw(then) => then(result),
-    }
+    let fills = matches!(kind, Kind::Read { .. } | Kind::Recv { .. });
+    conclude_io(buf, then, fills, result)
 }
 
 impl EngineTrait for Engine {
-    fn submit(&self, request: Request, buf: IoBuf, then: Then) -> io::Result<()> {
+    fn submit(&self, request: Request, buf: Buf, then: Then) -> io::Result<()> {
         let op = match request {
             Request::Read { file, offset } => {
                 self.check_handle(file, false)?;

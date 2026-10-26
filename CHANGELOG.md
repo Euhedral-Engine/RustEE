@@ -48,6 +48,93 @@ and `a_task_interrupt_reaches_its_own_task_only` (`euhedral-hardware-utils`);
 (`fragment`); `two_lattices_on_one_cpu_close_independently` (`base_cloneable`, three lattices on one CPU
 closing in turn).
 
+## Lakes, latches and stage graphs over any frame sink (2026-10-26)
+
+**What.** `euhedral-graph` gets `Lake` (with `UnitGuard` and `LakeClosed`) and `Latch` (with `LatchSetter` and `LatchWaiter`).
+`GraphRuntime::stages` is now an `Arc<dyn FrameSink>` instead of an `Arc<QueueIngestSink>`, so a stage graph publishes into
+a lake (or any other sink) through `offer`. The workspace gets one CI workflow, `.github/workflows/ci.yml`.
+
+**Why.** A program has several kinds of ready work (stage frames, host work, control), each of which wants its own pool, spread
+over several sources so producers and workers stay off one cache line, and attached to the lattice only while there is work,
+because a worker polls every attached source for as long as it is attached. And the main thread needs one place to wait for
+the lattice to hand it a result.
+
+**Usage.**
+- `Lake::new(lattice, sinks, idle_release)` makes a lake of `sinks` queue ingest sinks of one partition each.
+  `Duration::ZERO` as `idle_release` never detaches them.
+- `lake.admit()` counts a unit in (a quantum, a host task), attaches the sinks if they are detached, and returns a `UnitGuard`;
+  dropping the guard terminates the unit. `UnitGuard::fork()` admits another unit even while the lake drains.
+- `lake.offer(frame)` (also `FrameSink::offer`) queues the frame in the sink `routing_hash % sinks` picks, or hands it back.
+- `lake.complete_gracefully()` closes admission.
+- `Latch::new()` returns a `LatchSetter` to move into a frame and a `LatchWaiter` for the main thread; `wait` parks until
+  `set`.
+- `GraphRuntime { stages: lake.clone(), .. }`. The lake's units are the graph's quanta: admit before `StageGraph::start` and
+  drop the guard in `retire`, or hold one for as long as the graph runs.
+
+**Semantics.**
+- A frame goes into one sink, by `routing_hash` taken as unsigned modulo the sink count. Frames of one hash therefore keep their
+  offer order, and a sink has one partition, so a sink delivers in offer order; an ordered frame still runs in its own chain's
+  order, and two chains in one sink may run at the same time.
+- A frame is accepted only while a unit is admitted: with none, `offer` hands the frame back and attaches nothing. A refused
+  frame is the caller's to end (the stage graph ends it in place).
+- Admission counts units in one word with a closed bit. `complete_gracefully` sets the bit; admission then fails with
+  `LakeClosed`, units already admitted may still offer frames and fork units, and when the last one terminates every sink
+  completes gracefully (it delivers what it holds, then completes and detaches) and the idle watch ends. A lake with no unit
+  when it is closed completes at once. After that `offer` hands every frame back.
+- The sinks attach to the lattice at the first `admit`, not at `Lake::new`. The attachment is a *generation*: the sinks and
+  their idle watch. The watch is a `LatticeSource` that holds no frames and checks the lake whenever a worker pulls from it or
+  requests from it (two atomic loads while a unit is admitted). When no unit has been admitted for `idle_release`, it takes
+  the generation out of the lake, completes its sinks gracefully and completes itself, which detaches all of them. The next
+  `admit` makes a new generation (`Lake::attachments` counts them). `admit` counts the unit before it asks for a generation,
+  and the watch checks the count again under the lock that takes the generation, so a unit never loses its sinks.
+- A frame that races a detach (its sink completed first) goes to the generation attached since, as long as a unit is admitted;
+  an offer re-checks the unit count under the lock before it makes a generation, so a unit that ended meanwhile leaves no sinks
+  attached. `Lake::is_attached` is true until every sink, including those of a detached set that is still draining, has completed.
+- Attaching registers the new sources with the lattice outside the lake's lock (registration asks the source for demand, which
+  polls the watch). A lattice that refuses (closed) fails `admit` with `LakeClosed::Lattice` and the half-attached generation
+  cancels what it holds.
+- A lake dropped before it completed lets its sinks drain and complete.
+- `Latch::wait` is the one blocking call: it parks the thread until the value is set, returning at once if it was set before.
+  A `LatchSetter` dropped without setting makes `wait` panic instead of hanging.
+
+**Tests.** `tests/lake.rs`, on a lattice of one CPU (the first the process may run on, so the tests assume no second core):
+`frames_of_one_hash_keep_order`, `sinks_detach_after_idle_and_reattach_on_admit`, `a_lake_with_no_idle_time_never_detaches`,
+`offer_without_admitted_unit_is_refused`, `complete_gracefully_drains_then_completes` (with a fork), `latch_set_before_wait_returns`,
+`latch_set_from_frame_wakes_waiter`, and a latch whose setter was dropped. They take turns (two lattices of one CPU running
+together made a rebalance panic with "cannot restart the executor"). `tests/credit_graph.rs` publishes its stage frames through
+a lake of two sinks. The stage graph's unit tests publish through a queue sink behind a small `FrameSink` adapter.
+
+## `AsyncIo::read_into`: reads into caller-owned memory (2026-10-26)
+
+**What.** `AsyncIo::read_into(file, offset, buf, then)` reads into memory the caller owns, such as a pinned host
+arena, instead of an `IoBuf`'s `Vec`. `buf` is any `IoMemory`; `then` receives an `IoDoneOwned { buf, result }`. The
+engines (io_uring, IoRing and the completion port) work on a view of the region, so nothing is copied.
+
+**Why.** The inference engine reads weights from disk straight into host memory it allocates and pins itself.
+
+**API.** `pub unsafe trait IoMemory: Send + 'static { as_mut_ptr, len, is_empty }`, implemented for `Vec<u8>`;
+`IoDoneOwned<B> { buf: Option<B>, result, filled }`. `read` is unchanged.
+
+**Semantics.**
+- The result is a `read`'s: `Ok(n)` with `n` the region's length, or less if the file ended after some bytes (the first
+  `n` bytes are the file's, the rest untouched); `UnexpectedEof` when no byte was read. An empty region is refused at
+  submission, with nothing started.
+- The region is cut into pieces of at most 256 KiB, as a `read`'s buffer is; each piece lands at its own offset and
+  the engines' short-transfer and slot-identity rules apply unchanged.
+- `then` always runs. The value comes back in `IoDoneOwned::buf` after a success and after an error alike. `buf` is
+  `None` only for an operation the engine cannot prove finished with the kernel, which already leaked its buffer on
+  Windows (a ring that broke, a ring entry that may have reached the kernel): the value is leaked (never dropped) and
+  `result` is the ring's failure. A submission that returns `Err` started nothing and drops the value.
+- `filled` is the count of bytes at the start of the region that arrived: `n` for `Ok(n)`; after an error, the bytes of a
+  Windows read that failed with a warning status (`ERROR_MORE_DATA`) and moved bytes anyway, as `IoBuf::filled` reports.
+- `IoMemory` is the only new `unsafe` surface; its contract (initialized, stable when moved
+  without claiming unique ownership, exclusive until returned) is on the trait.
+
+**Tests.** `tests/io_owned.rs` (`read_into_fills_owned_region`, `read_into_split_pieces_preserve_offsets`,
+`read_into_short_read_reports_count`, `owned_buffer_returned_on_error`); in `io/uring.rs`,
+`reads_into_parts_of_one_arena_land_in_place`; in `io/win/tests.rs`, the owned reads through the simulated ring and port
+and the leak of a broken ring's region (the continuation runs with `buf` `None`); in `io/win/live.rs`, a read into owned memory on a real Windows.
+
 ## `AsyncIo` on Windows (2026-10-26)
 
 **What.** `euhedral-graph`'s `AsyncIo` gets a Windows engine: IoRing for file reads and writes where the OS has a kernel

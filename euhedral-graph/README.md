@@ -20,9 +20,11 @@ so it needs no thread of its own. It does not re-export `euhedral-core`: import 
 | Module | Main types |
 |---|---|
 | [`completions`](src/completions.rs) | `Completions`, a `LatticeSource` of continuation frames behind completions: markers, timers, `Ready` tokens and `Pending` operations. |
-| [`io`](src/io/mod.rs) | `AsyncIo`, a `LatticeSource` of continuations behind file and socket operations, with `IoBuf`, `IoDone`, `IoThen`, `OpenSpec` (`Create`), `AsyncIoOptions` and the handle aliases `RawFile`, `RawSock`, `OwnedFile` and `OwnedSock`. io_uring on Linux and Android ([`uring`](src/io/uring.rs)); IoRing and completion ports on Windows ([`win`](src/io/win/mod.rs)); none on macOS yet. Feature `async-io` (default). |
+| [`io`](src/io/mod.rs) | `AsyncIo`, a `LatticeSource` of continuations behind file and socket operations, with `IoBuf`, `IoDone`, `IoThen`, `IoMemory`, `IoDoneOwned`, `OpenSpec` (`Create`), `AsyncIoOptions` and the handle aliases `RawFile`, `RawSock`, `OwnedFile` and `OwnedSock`. io_uring on Linux and Android ([`uring`](src/io/uring.rs)); IoRing and completion ports on Windows ([`win`](src/io/win/mod.rs)); none on macOS yet. Feature `async-io` (default). |
 | [`sequencer`](src/sequencer.rs) | `Sequencer` and `Slot`: execute in any order, release in admission order. |
 | [`join`](src/join.rs) | `Join`: a continuation that runs when its last part arrives. |
+| [`lake`](src/lake.rs) | `Lake`, `UnitGuard` and `LakeClosed`: the pool of ready work of one kind, as several ingest sinks that attach to the lattice for a busy period. A `FrameSink`. |
+| [`latch`](src/latch.rs) | `Latch`, `LatchSetter` and `LatchWaiter`: a frame hands one value to the main thread, which parks until it arrives. |
 | [`lanes`](src/lanes.rs) | `LanePool`, `LaneId`, `Marker` and the trait `DeviceQueue`: device timelines that are queried, never waited on. |
 | [`stage_graph`](src/stage_graph.rs) | `StageGraph` and its spec (`StageGraphSpec`, `StageSpec`, `StageId`, `EdgeKind`), the `Stage` trait with `StageCx`, `Submitted` and `StageError`, `QuantumOutcome`, `ExternalEdge`, `QuantumRef`, `GraphRuntime`, `RetryCounts`, `GraphError` and `DEFAULT_RETRY_BACKSTOP`. |
 | [`testing`](src/testing.rs) | `FakeDevice`, an in-order fake `DeviceQueue`. Feature `testing`. |
@@ -129,6 +131,19 @@ platform's: descriptors on Linux and Android, `HANDLE`s and `SOCKET`s on Windows
 completion holds a worker for long. The `AsyncIo` type is the same everywhere; an engine under it
 starts operations and finds their ends, and `io/mod.rs` does the rest.
 
+**Reads into memory you own.** `read_into(file, offset, buf, then)` reads straight into a region the
+caller owns, such as a pinned host arena, so the bytes land in place with no copy. `buf` is any
+`IoMemory`: an `unsafe` trait whose implementor promises that the region is initialized, stays put
+when the value moves (and the move claims no unique ownership of it, which excludes `Box<[u8]>`), and
+is exclusively the operation's from submission until `then` gets the value back in an
+`IoDoneOwned { buf, result, filled }` (`Vec<u8>` implements it). The result is a `read`'s: `Ok(n)` with
+`n` the region's length or less where the file ended, `UnexpectedEof` for a read that finds no bytes,
+and `filled` is the bytes that arrived (`n`; after a Windows warning status, the bytes moved anyway).
+The memory comes back whether the read succeeded or failed, and `then` always runs. The one case where
+`buf` is `None` is a ring that broke while the kernel may still have been writing the region: the value
+is leaked (never dropped) and `result` is the ring's failure. The region is cut into pieces
+internally, each landing at its own offset. `read` stays as it was, for a `Vec`-backed `IoBuf`.
+
 - **Linux and Android:** io_uring, with one ring per submitting thread. An operation belongs to the
   thread that submitted it, and lattice workers live as long as the lattice.
 - **Windows:** one I/O completion port per `AsyncIo`, polled with a zero timeout, for every
@@ -178,6 +193,57 @@ last marker (its retirement boundary, armed as a `Completions` edge). `retire` t
 quantum and its `QuantumOutcome`: `Completed`, `Failed` or `Killed`. `live()` counts quanta not
 retired yet.
 
+### Lakes and latches
+
+A `Lake` is where ready work waits for the lattice: `sinks` queue ingest sinks of one partition
+each, every one a source the workers poll. `offer` takes a frame and puts it in the sink its
+routing hash picks, so the frames of one lane stay in order in one sink and the rest spread over
+all of them. A lake is a `FrameSink`, and it is what a `GraphRuntime` publishes stage frames
+through (`GraphRuntime::stages` is any `Arc<dyn FrameSink>`). Use one lake per kind of work.
+
+A lake takes frames only while a **unit** is admitted. `admit()` counts a unit in and returns a
+`UnitGuard`; the unit ends when the guard drops. For a stage graph the unit is the quantum: admit
+before `start`, drop the guard in `retire`. The first unit attaches the sinks to the lattice, and
+once no unit has been admitted for the idle release time, an idle watch (a source of no frames
+that the workers poll) detaches them, so an idle lake costs the lattice nothing to poll; the next
+unit attaches a fresh set. `complete_gracefully` closes admission, and the sinks drain and complete
+once the last unit ends.
+
+```rust,no_run
+use std::num::NonZeroUsize;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use euhedral_core::config::LatticeConfig;
+use euhedral_core::control_plane::ControlPlaneLattice;
+use euhedral_core::frames::RunnableFrame;
+use euhedral_graph::{Lake, Latch};
+
+let lattice = ControlPlaneLattice::new(LatticeConfig::default()).unwrap();
+let lake = Lake::new(lattice.clone(), NonZeroUsize::new(2).unwrap(), Duration::from_secs(1));
+
+// The main thread starts the work and waits for it; nothing else blocks.
+let (done, finished) = Latch::new();
+let unit = lake.admit().unwrap(); // attaches the sinks
+let done = Mutex::new(Some(done));
+let frame = RunnableFrame::new(7, Arc::new(move || {
+    if let Some(done) = done.lock().unwrap().take() {
+        done.set("ran");
+    }
+}));
+assert!(lake.offer(Box::new(frame)).is_ok());
+assert_eq!(finished.wait(), "ran");
+
+drop(unit);
+lake.complete_gracefully();
+lattice.close();
+```
+
+A `Latch` is the hand-off back to the main thread: `Latch::new()` returns a `LatchSetter` to move
+into a frame and a `LatchWaiter` for `main`. `LatchWaiter::wait` parks the thread until the value
+is set (at once if it already was) and is the one call in the crate that blocks; nothing on the
+lattice may call it. A setter dropped without setting makes `wait` panic.
+
 ### Sequencer and Join
 
 A `Sequencer<T>` hands values out in admission order. `register()` takes a slot, in the order the
@@ -197,7 +263,7 @@ mise exec -- cargo test -p euhedral-graph --no-default-features   # without Asyn
 
 The Windows engine's state machines run on every platform against a simulated `Sys` (the seam over
 the Windows calls, in `io/win/sim.rs`). Its real calls (`io/win/real.rs`) compile on Windows only;
-the workflow `.github/workflows/windows.yml` runs `cargo test -p euhedral-graph` on a
+`.github/workflows/ci.yml` runs formatting, Clippy and the tests of the whole workspace on Ubuntu and Windows, and the workflow `.github/workflows/windows.yml` runs `cargo test -p euhedral-graph` on a
 `windows-2025` runner, where `io/win/live.rs` exercises files, loopback sockets, open and rename,
 each twice: with IoRing and forced onto the completion port.
 

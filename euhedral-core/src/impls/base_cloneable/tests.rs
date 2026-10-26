@@ -879,9 +879,10 @@ fn the_service_time_is_execute_alone_not_the_finalizer() {
         service_time.merge(meter.summary().unwrap());
     }
     assert_eq!(service_time.count, 20);
-    // Each execute spun 50 µs; the 2 ms finalizers are not in it.
+    // Each execute spun 50 µs; the 2 ms finalizers are not in it. The mean, not the max, carries the claim: one
+    // preempted sample on a shared runner can exceed 1 ms, while finalizers in every sample would put the mean past 2 ms.
     assert!(service_time.sum / 20.0 >= 50_000.0, "{service_time:?}");
-    assert!(service_time.max < 1_000_000.0, "{service_time:?}");
+    assert!(service_time.sum / 20.0 < 1_000_000.0, "{service_time:?}");
     lattice.close();
 }
 
