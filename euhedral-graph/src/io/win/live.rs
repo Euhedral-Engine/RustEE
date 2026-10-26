@@ -576,6 +576,7 @@ fn ring_reads_end_through_the_ring_even_on_a_file_joined_to_the_port() {
     }
     for (i, done) in poll(&io, 4).into_iter().enumerate() {
         let done = done.done.unwrap();
+        assert!(done.result.is_ok(), "read {i}: {:?}", done.result);
         assert_eq!(done.buf.bytes, data[i * 4096..(i + 1) * 4096]);
     }
     // No packet ended them: the port has nothing, and nothing was ignored.
