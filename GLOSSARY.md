@@ -363,6 +363,29 @@ passes the prefix of finished slots to `emit`, in order, on its own thread.
 part arrives with a value or is abandoned, from any thread, and the last arrival runs the
 continuation once with every part's value (`None` for an abandoned part).
 
+**lake, sink, unit, UnitGuard** ([`Lake`](euhedral-graph/src/lake.rs),
+[`UnitGuard`](euhedral-graph/src/lake.rs)): the pool of ready work of one kind (stage frames, host
+work, control), as several `QueueIngestSink`s of one partition each, every one an upstream source
+of the lattice. `offer` puts a frame in the sink its routing hash picks, so frames of one hash keep
+their order and different hashes spread over the sinks; a `Lake` is a `FrameSink`, which is what a
+`GraphRuntime` publishes through. A lake accepts frames only while a **unit** (a quantum, a host
+task) is admitted: `admit` counts one in and returns its `UnitGuard`, and dropping the guard
+terminates the unit. `complete_gracefully` closes admission; once every unit terminated, the sinks
+drain what they hold, complete and detach. A running unit may `fork` another unit while the lake
+drains.
+
+**busy period, idle watch** ([`Lake`](euhedral-graph/src/lake.rs)): the sinks of a lake are
+attached to the lattice only while it has units. Beside the sinks a lake attaches an idle watch, a
+source the workers poll that holds no frames; when no unit has been admitted for the lake's idle
+release time, the watch detaches the sinks and itself, so the lattice has nothing left to poll.
+The next `admit` attaches a fresh set. An idle release of `Duration::ZERO` keeps the sinks attached.
+
+**latch** ([`Latch`](euhedral-graph/src/latch.rs), [`LatchSetter`](euhedral-graph/src/latch.rs),
+[`LatchWaiter`](euhedral-graph/src/latch.rs)): a one-shot hand-off from a frame to the main thread.
+`Latch::new()` makes the two ends; a frame sets the `LatchSetter`, and the main thread parks in
+`LatchWaiter::wait` until it does. `wait` is the one blocking call in the crate, for `main` (or a
+test) only; a setter dropped without setting makes the wait panic instead of hang.
+
 ## Metrics
 
 **metrics, MetricsRegistry** ([`metrics`](euhedral-core/src/metrics/mod.rs),
