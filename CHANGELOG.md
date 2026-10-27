@@ -3,6 +3,36 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## `Completions` and the io_uring ring take registrations through `MpscQueue` (2026-10-26)
+
+**What.** In `euhedral-graph`, `Completions`' registrations (`after`, `after_marker`, `at`, `register`) go into a
+`euhedral_data_structures::queues::MpscQueue` instead of a `Mutex<Vec>`, and an `AsyncIo` io_uring ring's entries that were
+queued while another thread held its `sq` lock go into one instead of a `Mutex<VecDeque>`. The crate now depends on
+`euhedral-data-structures`. `held`, `Completions`' waiting list, `Sequencer`, `Join`, the retry counts and the Windows
+engine's backlog are unchanged.
+
+**Why.** A thread registering a completion or a ring entry no longer takes a lock the polling thread also takes; the
+poll no longer waits behind a registrant, and the registrant never waits behind a poll.
+
+**Semantics that changed.** A registration that races `complete`. Before, `complete` set its flag under the registration
+lock, so a registration either landed or was refused on the spot. Now `complete` sets the flag and appends one marker to the
+queue. A registration that sees the flag is refused on the spot, as before (`do_finally`, a panic in debug builds). One that
+does not is queued, and its position against the marker decides: ahead of it, it is a registration like any other and is
+emitted; behind it, the next poll (`pull` or `request`, also of a completed source) cancels it through `do_finally` without
+running it, and so does the last drop of the source if no poll comes. It ends exactly one way, never both and never neither;
+that cancellation does not panic. The argument is on `Completions::complete`.
+
+**The ring.** The `sq` holder drains the queue before it lets go, and looks again after it does; `flush_waiting` has the
+argument that an entry pushed just after the holder's last drain is submitted by its pusher taking `sq` or by that re-check.
+The flag that says "something was queued" stays, set after the entry is published: a queue's size counts reserved slots,
+so it cannot tell a producer between reservation and publish from a hidden entry, and the crate does not spin.
+
+**Tests.** `Completions`: a registration ahead of the marker is emitted and one behind it is cancelled; a `request` of a
+completed source and the last drop cancel what is behind the marker; a registration racing `complete` (1500 rounds) ends
+exactly once; 8 threads x 10 000 registrations against a hand-driven poller are emitted once each, in per-thread order.
+Ring: entries queued while another thread holds `sq` are never stranded (1000 rounds of 4 threads against a slow enter,
+the last pushes together so no later push can rescue one). The existing backlog and refused-enter tests pass unchanged.
+
 ## The branches of a fan-out run on different device lanes (2026-10-26)
 
 **What.** A stage graph now places stages on lanes by Euhedral-Inference's PATH placement

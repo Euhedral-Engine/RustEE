@@ -8,6 +8,7 @@ use std::time::Instant;
 
 use euhedral_core::frames::Frame;
 use euhedral_core::generics::{LatticeReceiver, LatticeSource};
+use euhedral_data_structures::queues::{Consumer, MpscQueue, Multi, Producer, Single};
 
 use euhedral_core::metrics::Histogram;
 
@@ -48,22 +49,48 @@ pub trait Pending: Send {
 /// `do_finally` without running (as a frame refused by a completed RustEE ingest queue is
 /// cancelled), so whatever it holds still ends, and debug builds then panic. A [`Pending`]
 /// registered after completion has no frame to finish: it is dropped.
+///
+/// A registration that races `complete` (the flag was not yet visible to it) lands in the queue
+/// and ends exactly one way: ahead of `complete`'s marker in the queue it is a registration like
+/// any other and is emitted; behind it, the next poll (`pull` or `request`) cancels it through
+/// `do_finally` without running it, and so does the last drop of the source if no poll comes. That
+/// cancellation does not panic: only the polling thread sees it, and it cannot tell a misuse from a
+/// poll that was late.
 pub struct Completions {
     /// The lanes polled for markers; released at [`LatticeSource::complete`] (the lattice that
     /// holds this source may outlive the run, and the lanes must not outlive it: they keep the
     /// device alive).
     lanes: Mutex<Option<Arc<LanePool>>>,
-    /// Registered since the last poll; any thread appends.
-    incoming: Mutex<Vec<Waiting>>,
-    /// Only the polling thread touches it (`pull` and `request` are called by one thread at a
-    /// time); the lock is never contended.
-    waiting: Mutex<VecDeque<Waiting>>,
+    /// Registered since the last poll; any thread appends, lock-free. [`LatticeSource::complete`]
+    /// appends one [`Slot::Closed`] marker: what is behind it was registered too late.
+    incoming: Producer<Slot, Multi>,
+    /// The polling thread's side: the queue's consumer and what it drained and has not emitted.
+    /// Only the polling thread locks it (`pull` and `request` are called by one thread at a time);
+    /// the lock is never contended, except by a late registration's `sweep`, which only tries it.
+    poll: Mutex<Poll>,
     pending: AtomicUsize,
     demand: AtomicU64,
     downstream: Mutex<Option<Arc<dyn LatticeReceiver>>>,
     complete: AtomicBool,
     /// How late each emission was, in µs, since the start (lock-free: polls record, readers copy).
     lateness: Histogram,
+}
+
+/// What travels through the registration queue.
+enum Slot {
+    Waiting(Waiting),
+    /// Appended once, by `complete`, after it set the flag: everything behind it was registered
+    /// after the source completed.
+    Closed,
+}
+
+/// What only the polling thread touches.
+struct Poll {
+    consumer: Consumer<Slot, Single>,
+    /// Drained from the queue, oldest first; entries are marked done in place.
+    waiting: VecDeque<Waiting>,
+    /// The `Closed` marker was drained: whatever is drained from now on is late.
+    closed: bool,
 }
 
 /// A registered operation and when it was last seen in flight (an upper bound on when it completed
@@ -85,6 +112,18 @@ enum Waits {
     Moving,
 }
 
+impl Drop for Completions {
+    /// The last owner lets go: no thread can register any more, and none will poll. What is still
+    /// in the queue behind the marker is cancelled, so no registration is left without an end.
+    fn drop(&mut self) {
+        let poll = self.poll.get_mut().unwrap_or_else(PoisonError::into_inner);
+        let late = Self::absorb(poll);
+        for what in late {
+            Self::cancel(what);
+        }
+    }
+}
+
 impl fmt::Debug for Completions {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Completions")
@@ -97,13 +136,21 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Slots per chunk of the registration queue (rounded to a power of two by the queue).
+const INCOMING_CHUNK: usize = 256;
+
 impl Completions {
     /// Polls of `marker`s use `lanes`.
     pub fn new(lanes: Arc<LanePool>) -> Arc<Self> {
+        let queue: MpscQueue<Slot> = MpscQueue::with_pool(INCOMING_CHUNK, 2);
         Arc::new(Self {
             lanes: Mutex::new(Some(lanes)),
-            incoming: Mutex::new(Vec::new()),
-            waiting: Mutex::new(VecDeque::new()),
+            incoming: queue.producer(),
+            poll: Mutex::new(Poll {
+                consumer: queue.consumer(),
+                waiting: VecDeque::new(),
+                closed: false,
+            }),
             pending: AtomicUsize::new(0),
             demand: AtomicU64::new(0),
             downstream: Mutex::new(None),
@@ -112,20 +159,45 @@ impl Completions {
         })
     }
 
+    /// Registers `what`. Exactly one end for its frame, whatever races `complete` (the argument is
+    /// on [`LatticeSource::complete`]'s implementation below).
     fn add(&self, what: Waits) {
-        {
-            // `complete` sets the flag under this lock, so a registration either lands before it or
-            // is refused.
-            let mut incoming = lock(&self.incoming);
-            if !self.complete.load(Ordering::Acquire) {
-                self.pending.fetch_add(1, Ordering::AcqRel);
-                incoming.push(Waiting {
-                    what,
-                    last_seen: Instant::now(),
-                });
-                return;
-            }
+        // The fast path of the sequential case: the flag is set and visible (`complete` returned
+        // before this call, by any synchronisation), so nothing is queued and the frame ends here.
+        // Only a speed-up and the visible failure: a registration that misses the flag takes the
+        // queue and is told apart by its position behind `Slot::Closed`.
+        if self.complete.load(Ordering::Acquire) {
+            Self::cancel(what);
+            debug_assert!(
+                false,
+                "a completion registered after Completions::complete (its frame was cancelled)"
+            );
+            return;
         }
+        // Counted before it can be seen, so `pending` never reads zero while a registration is
+        // between here and the queue.
+        self.pending.fetch_add(1, Ordering::AcqRel);
+        let slot = Slot::Waiting(Waiting {
+            what,
+            last_seen: Instant::now(),
+        });
+        if let Err(Slot::Waiting(Waiting { what, .. })) = self.incoming.offer(slot) {
+            // Unreachable for the unbounded queue; ends the frame rather than losing it.
+            self.pending.fetch_sub(1, Ordering::AcqRel);
+            Self::cancel(what);
+            return;
+        }
+        // Racing `complete`: the flag may be set by now, and this one may be behind the marker.
+        // Do not wait for the next poll to find it (best effort; the poll, or the last drop, is
+        // what guarantees it).
+        if self.complete.load(Ordering::Acquire) {
+            self.sweep();
+        }
+    }
+
+    /// Ends what a refused registration holds: its frame is finished without running; a
+    /// [`Pending`] has no frame, so it is dropped.
+    fn cancel(what: Waits) {
         match what {
             Waits::Ready(_, frame)
             | Waits::Marker(_, frame)
@@ -134,10 +206,51 @@ impl Completions {
             Waits::Pending(pending) => drop(pending),
             Waits::Moving => {}
         }
-        debug_assert!(
-            false,
-            "a completion registered after Completions::complete (its frame was cancelled)"
-        );
+    }
+
+    /// Moves what landed in the queue into `poll.waiting`, and takes out what landed behind the
+    /// `Closed` marker. Returns the late ones to cancel (the caller does it after letting go of the
+    /// lock: `do_finally` is the application's).
+    fn absorb(poll: &mut Poll) -> Vec<Waits> {
+        let Poll {
+            consumer,
+            waiting,
+            closed,
+        } = poll;
+        let mut late = Vec::new();
+        consumer.drain_all(|slot| match slot {
+            Slot::Closed => *closed = true,
+            Slot::Waiting(entry) if *closed => late.push(entry.what),
+            Slot::Waiting(entry) => waiting.push_back(entry),
+        });
+        late
+    }
+
+    /// Cancels the late ones `absorb` found.
+    fn cancel_late(&self, late: Vec<Waits>) {
+        if late.is_empty() {
+            return;
+        }
+        let count = late.len();
+        for what in late {
+            Self::cancel(what);
+        }
+        self.pending.fetch_sub(count, Ordering::AcqRel);
+    }
+
+    /// Cancels what landed too late now, unless a poll is inside the lock (it absorbs the queue
+    /// itself, or leaves the rest to the next poll). For a late registration, and for a `request`
+    /// of a completed source (which emits nothing, but is a poll; it must not wait for a lock the
+    /// `pull` it may be called from holds).
+    fn sweep(&self) {
+        let late = match self.poll.try_lock() {
+            Ok(mut poll) => Self::absorb(&mut poll),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                Self::absorb(&mut poisoned.into_inner())
+            }
+            Err(std::sync::TryLockError::WouldBlock) => return,
+        };
+        self.cancel_late(late);
     }
 
     /// Emits `frame` once `ready` reports completion.
@@ -194,14 +307,17 @@ impl Completions {
         if demand == 0 {
             return 0;
         }
-        let mut waiting = lock(&self.waiting);
-        {
-            let mut incoming = lock(&self.incoming);
-            if incoming.is_empty() && waiting.is_empty() {
-                return 0;
-            }
-            waiting.extend(incoming.drain(..));
+        let mut guard = lock(&self.poll);
+        let late = Self::absorb(&mut guard);
+        if !late.is_empty() {
+            drop(guard);
+            self.cancel_late(late);
+            guard = lock(&self.poll);
         }
+        if guard.waiting.is_empty() {
+            return 0;
+        }
+        let waiting = &mut guard.waiting;
         let now = Instant::now();
         let lanes = lock(&self.lanes).clone();
         let mut emitted = 0;
@@ -259,7 +375,7 @@ impl Completions {
             consumer(frame);
             emitted += 1;
         }
-        drop(waiting);
+        drop(guard);
         if emitted > 0 {
             self.pending.fetch_sub(emitted as usize, Ordering::AcqRel);
             for sample in late {
@@ -290,7 +406,13 @@ impl LatticeSource for Completions {
     }
 
     fn request(&self, demand: u64) {
-        if demand == 0 || self.complete.load(Ordering::Acquire) {
+        if self.complete.load(Ordering::Acquire) {
+            // Nothing is requested of a completed source, but this is a poll: it cancels what
+            // was registered too late.
+            self.sweep();
+            return;
+        }
+        if demand == 0 {
             return;
         }
         let total = self
@@ -310,12 +432,43 @@ impl LatticeSource for Completions {
         }
     }
 
+    /// # Why every registration ends exactly one way, whatever races this
+    ///
+    /// A registration is a frame (or a [`Pending`], which has none) and has three possible lives:
+    /// refused by `add` on the spot (`cancel`), emitted by a poll, or cancelled behind the marker.
+    ///
+    /// 1. `add` reads the flag once, before it queues anything. If it reads `true`, the frame is
+    ///    cancelled there and never reaches the queue. If `false`, it is queued, exactly once
+    ///    (`offer` on the unbounded queue cannot fail; if it did, the frame is cancelled there and
+    ///    was not queued). So no frame is both refused and queued.
+    /// 2. The first `complete` (the `swap` that reads `false`) sets the flag and *then* appends one
+    ///    `Slot::Closed`. Registrations queued by threads that read `false` are ordered against that
+    ///    marker by the queue itself: its multi-producer `offer` claims its slot with an `AcqRel`
+    ///    compare-exchange on one tail counter, so slots have one total order, and the single consumer
+    ///    drains in that order. No memory-ordering argument is needed for the split: a queued frame is
+    ///    either ahead of the marker or behind it, by position.
+    /// 3. The one consumer (under the `poll` lock) takes each slot exactly once. A frame drained
+    ///    ahead of the marker goes to `waiting` and leaves it only by emission, once. A frame drained
+    ///    behind the marker (`closed` is set) goes to `late`, and its `cancel` runs once, outside
+    ///    the lock. A frame is in exactly one of those lists, so it ends exactly once: emitted
+    ///    (the executor then runs or skips it and calls its `do_finally`) or cancelled.
+    ///
+    /// The flag's orderings matter only for promptness. `Acquire` on the load and `AcqRel` on the swap
+    /// make a `complete` that happened before an `add` (by any synchronisation) visible to it, so the
+    /// sequential misuse is refused on the spot and fails visibly in debug builds. A load that misses
+    /// the flag costs nothing in correctness: the frame is queued and handled by position, never
+    /// stranded in a state with no owner.
+    ///
+    /// What the queue cannot give is a poll. A frame behind the marker is cancelled by the next `pull`
+    /// or `request` (a late `add` also tries to, through `sweep`), and if no poll ever comes, when
+    /// the last `Arc` drops (`Drop`): no frame is left without an end. Slots a producer has
+    /// claimed but not yet published are invisible to a drain; they are drained by a later poll,
+    /// and (`Drop` has `&mut self`) a producer cannot still be inside `offer` then.
     fn complete(&self) {
-        let first = {
-            let _incoming = lock(&self.incoming);
-            !self.complete.swap(true, Ordering::AcqRel)
-        };
-        if first {
+        if !self.complete.swap(true, Ordering::AcqRel) {
+            // Exactly one marker. A registration that did not see the flag is queued behind it
+            // or ahead of it, and the queue's order says which (see `add`).
+            let _ = self.incoming.offer(Slot::Closed);
             lock(&self.lanes).take();
             if let Some(downstream) = lock(&self.downstream).take() {
                 downstream.on_complete();
@@ -329,6 +482,8 @@ impl LatticeSource for Completions {
 }
 
 #[cfg(test)]
+// The tests' own threads register, complete and poll, as lattice workers would.
+#[allow(clippy::disallowed_methods, clippy::disallowed_types)]
 mod tests {
     use std::sync::atomic::AtomicU64;
     use std::time::Duration;
@@ -679,5 +834,254 @@ mod tests {
             1,
             "a completed source holds no lane"
         );
+    }
+
+    /// A frame whose lifecycle ends are counted (`do_finally`), and who got it: a test's `ends`
+    /// must come to exactly one per frame, whichever of emitted or cancelled it was.
+    struct Counted {
+        header: FrameHeader,
+        ends: Arc<AtomicUsize>,
+    }
+
+    impl Frame for Counted {
+        fn header(&self) -> &FrameHeader {
+            &self.header
+        }
+
+        fn header_mut(&mut self) -> &mut FrameHeader {
+            &mut self.header
+        }
+
+        fn do_finally(self: Box<Self>) {
+            self.ends.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    fn counted(id: u64) -> (Box<dyn Frame>, Arc<AtomicUsize>) {
+        let ends = Arc::new(AtomicUsize::new(0));
+        let frame = Box::new(Counted {
+            header: FrameHeader::new(id),
+            ends: ends.clone(),
+        });
+        (frame, ends)
+    }
+
+    /// Runs `body` on its own thread and fails if it does not finish in `limit`: a hung test must
+    /// not hang the suite.
+    fn within<R: Send + 'static>(limit: Duration, body: impl FnOnce() -> R + Send + 'static) -> R {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(body());
+        });
+        rx.recv_timeout(limit)
+            .expect("the test did not finish in time")
+    }
+
+    /// A pull as the executor would see it: the continuations are run to their end.
+    fn pull_and_end(completions: &Completions) -> usize {
+        let mut emitted = 0;
+        completions.pull(
+            &mut |frame| {
+                emitted += 1;
+                frame.do_finally();
+            },
+            &mut |_| false,
+            u64::MAX,
+        );
+        emitted
+    }
+
+    /// Behind the marker, by position: queued as a registration that missed the flag would be.
+    fn queue_behind_the_marker(completions: &Completions, frame: Box<dyn Frame>) {
+        completions.pending.fetch_add(1, Ordering::AcqRel);
+        let queued = completions.incoming.offer(Slot::Waiting(Waiting {
+            what: Waits::At(Instant::now(), frame),
+            last_seen: Instant::now(),
+        }));
+        assert!(queued.is_ok());
+    }
+
+    #[test]
+    fn a_registration_ahead_of_the_marker_is_emitted_and_one_behind_it_is_cancelled() {
+        let (completions, _) = setup();
+        let (ahead, ahead_ends) = counted(1);
+        completions.at(Instant::now(), ahead);
+        completions.complete();
+        let (behind, behind_ends) = counted(2);
+        queue_behind_the_marker(&completions, behind);
+        assert_eq!(completions.pending(), 2);
+        let mut seen = Vec::new();
+        completions.pull(
+            &mut |frame| {
+                seen.push(frame.header().id_hash());
+                frame.do_finally();
+            },
+            &mut |_| false,
+            u64::MAX,
+        );
+        assert_eq!(
+            seen,
+            [1],
+            "only the one registered before complete is emitted"
+        );
+        assert_eq!(
+            (
+                ahead_ends.load(Ordering::Acquire),
+                behind_ends.load(Ordering::Acquire)
+            ),
+            (1, 1),
+            "each ended once: the first by its emission, the second by its cancellation"
+        );
+        assert_eq!(completions.pending(), 0);
+    }
+
+    #[test]
+    fn a_request_of_a_completed_source_cancels_what_landed_behind_the_marker() {
+        let (completions, _) = setup();
+        completions.complete();
+        let (behind, ends) = counted(3);
+        queue_behind_the_marker(&completions, behind);
+        completions.request(1);
+        assert_eq!(ends.load(Ordering::Acquire), 1);
+        assert_eq!(completions.pending(), 0);
+    }
+
+    #[test]
+    fn with_no_poll_the_last_drop_cancels_what_landed_behind_the_marker() {
+        let (completions, _) = setup();
+        completions.complete();
+        let (behind, ends) = counted(4);
+        queue_behind_the_marker(&completions, behind);
+        assert_eq!(ends.load(Ordering::Acquire), 0, "nobody polled yet");
+        drop(completions);
+        assert_eq!(
+            ends.load(Ordering::Acquire),
+            1,
+            "no registration is left without an end"
+        );
+    }
+
+    /// A registration racing `complete` ends exactly once: emitted or cancelled, never both and
+    /// never neither. One thread registers while another completes at an arbitrary point and the
+    /// test thread polls; the frames that end up behind the marker are cancelled by a poll, and any
+    /// left at the end by the drop.
+    #[test]
+    fn a_registration_racing_complete_runs_exactly_one_lifecycle_end() {
+        const ROUNDS: usize = 1500;
+        const PER_ROUND: usize = 64;
+        within(Duration::from_secs(120), || {
+            let mut refused_or_late = 0usize;
+            for round in 0..ROUNDS {
+                let (completions, _) = setup();
+                let ends: Vec<Arc<AtomicUsize>> = (0..PER_ROUND).map(|_| Arc::default()).collect();
+                let go = Arc::new(std::sync::Barrier::new(3));
+                let registrar = {
+                    let (completions, go) = (completions.clone(), go.clone());
+                    let frames: Vec<Box<dyn Frame>> = ends
+                        .iter()
+                        .enumerate()
+                        .map(|(i, ends)| {
+                            Box::new(Counted {
+                                header: FrameHeader::new(i as u64),
+                                ends: ends.clone(),
+                            }) as Box<dyn Frame>
+                        })
+                        .collect();
+                    std::thread::spawn(move || {
+                        go.wait();
+                        for frame in frames {
+                            // Debug builds panic on a registration that sees the flag: that is
+                            // the visible failure, and the frame is cancelled all the same.
+                            let completions = &completions;
+                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                completions.at(Instant::now(), frame)
+                            }));
+                        }
+                    })
+                };
+                let completer = {
+                    let (completions, go) = (completions.clone(), go.clone());
+                    // Different offsets across rounds put the marker at different places.
+                    let spin = (round * 37) % 400;
+                    std::thread::spawn(move || {
+                        go.wait();
+                        for _ in 0..spin {
+                            std::hint::spin_loop();
+                        }
+                        completions.complete();
+                    })
+                };
+                go.wait();
+                let mut emitted = 0;
+                while !registrar.is_finished() || !completer.is_finished() {
+                    emitted += pull_and_end(&completions);
+                }
+                registrar.join().unwrap();
+                completer.join().unwrap();
+                emitted += pull_and_end(&completions);
+                // A last poll cancels what the registrar queued behind the marker.
+                drop(completions);
+                for (i, ends) in ends.iter().enumerate() {
+                    assert_eq!(
+                        ends.load(Ordering::Acquire),
+                        1,
+                        "round {round}: frame {i} must end exactly once"
+                    );
+                }
+                refused_or_late += PER_ROUND - emitted;
+            }
+            // The marker falls inside the registrations in some rounds (a cancelled frame exists).
+            assert!(
+                refused_or_late > 0,
+                "no round had a registration after complete"
+            );
+        });
+    }
+
+    /// 8 threads register 10 000 continuations each while the test thread polls by hand: every
+    /// continuation is emitted exactly once, and each thread's keep the order it registered them.
+    #[test]
+    fn eight_threads_register_ten_thousand_each_and_each_is_emitted_once_in_thread_order() {
+        const THREADS: u64 = 8;
+        const EACH: u64 = 10_000;
+        within(Duration::from_secs(120), || {
+            let (completions, _) = setup();
+            let registrars: Vec<_> = (0..THREADS)
+                .map(|t| {
+                    let completions = completions.clone();
+                    std::thread::spawn(move || {
+                        for i in 0..EACH {
+                            completions.at(Instant::now(), tagged(t << 32 | i));
+                        }
+                    })
+                })
+                .collect();
+            let mut next = [0u64; THREADS as usize];
+            let mut total = 0u64;
+            let deadline = Instant::now() + Duration::from_secs(100);
+            while total < THREADS * EACH {
+                assert!(
+                    Instant::now() < deadline,
+                    "the continuations did not all arrive"
+                );
+                completions.pull(
+                    &mut |frame| {
+                        let id = frame.header().id_hash();
+                        let (t, i) = ((id >> 32) as usize, id & u64::from(u32::MAX));
+                        assert_eq!(i, next[t], "thread {t}'s continuations keep their order");
+                        next[t] += 1;
+                        total += 1;
+                    },
+                    &mut |_| false,
+                    u64::MAX,
+                );
+            }
+            for registrar in registrars {
+                registrar.join().unwrap();
+            }
+            assert_eq!(next, [EACH; THREADS as usize]);
+            assert!(poll(&completions).is_empty(), "nothing is emitted twice");
+            assert_eq!(completions.pending(), 0);
+        });
     }
 }

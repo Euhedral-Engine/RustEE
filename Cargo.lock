@@ -33,6 +33,7 @@ name = "euhedral-graph"
 version = "0.1.0"
 dependencies = [
  "euhedral-core",
+ "euhedral-data-structures",
  "euhedral-graph",
  "euhedral-hardware-utils",
  "io-uring",

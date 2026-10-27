@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use euhedral_core::frames::Frame;
+use euhedral_data_structures::queues::{Consumer, MpscQueue, Multi, Producer, Single};
 use io_uring::{IoUring, Submitter, opcode, squeue, types};
 
 use super::{
@@ -22,6 +23,8 @@ use super::{
 
 /// Entries of each ring's submission queue (its completion queue has twice as many).
 const RING_ENTRIES: u32 = 256;
+/// Slots per chunk of a ring's queue of entries that wait for `sq`.
+const INCOMING_CHUNK: usize = 256;
 /// Submitting threads (rings) one `AsyncIo` serves.
 const MAX_RINGS: usize = 256;
 
@@ -54,11 +57,12 @@ struct Ring {
     /// rest of a short read or hands over entries the kernel refused or had no room for.
     sq: Mutex<Queue>,
     /// Entries queued while another thread held `sq` (a poll chaining a read's pieces, each copied
-    /// inside its enter: a lane's small read waited 1.4 ms for the lock). The holder takes them
-    /// before it lets go; held only to push or take, never across a system call.
-    incoming: Mutex<VecDeque<squeue::Entry>>,
-    /// Set after a push to `incoming`; the `sq` holder clears it as it takes them, and looks again
-    /// after it lets go.
+    /// inside its enter: a lane's small read waited 1.4 ms for the lock). Lock-free: any thread
+    /// appends; the `sq` holder drains it (the consumer lives in [`Queue`]) before it lets go, and
+    /// looks again after it does (see [`Ring::flush_waiting`]).
+    incoming: Producer<squeue::Entry, Multi>,
+    /// Set after a push to `incoming`, once the entry is published; the `sq` holder clears it
+    /// before it drains, and looks again after it lets go.
     waiting: AtomicBool,
     /// Reaping: one poll at a time (the lattice's guarantee; the lock makes it a fact).
     cq: Mutex<()>,
@@ -70,6 +74,8 @@ struct Ring {
 }
 
 struct Queue {
+    /// The drain side of [`Ring::incoming`]: only the `sq` holder has it.
+    incoming: Consumer<squeue::Entry, Single>,
     /// Entries waiting for room in the kernel's queues, the oldest first.
     backlog: VecDeque<squeue::Entry>,
     /// Entries are in the submission queue that the kernel has not taken (an enter was refused).
@@ -252,13 +258,15 @@ impl Ring {
     fn new() -> io::Result<Self> {
         let uring = IoUring::builder().setup_clamp().build(RING_ENTRIES)?;
         let capacity = uring.params().cq_entries() as usize;
+        let incoming: MpscQueue<squeue::Entry> = MpscQueue::with_pool(INCOMING_CHUNK, 2);
         Ok(Self {
             uring,
             sq: Mutex::new(Queue {
+                incoming: incoming.consumer(),
                 backlog: VecDeque::new(),
                 unsubmitted: false,
             }),
-            incoming: Mutex::new(VecDeque::new()),
+            incoming: incoming.producer(),
             waiting: AtomicBool::new(false),
             cq: Mutex::new(()),
             ops: Mutex::new(Ops::default()),
@@ -270,7 +278,14 @@ impl Ring {
     /// Queues `entry` and hands what fits to the kernel: here, or, when another thread is
     /// submitting on the ring right now, by that thread before it lets go (never waiting for it).
     fn queue(&self, entry: squeue::Entry, enter: &Enter) {
-        lock(&self.incoming).push_back(entry);
+        // Cannot fail: the queue is unbounded. Were it ever to, the entry would be lost with its
+        // operation still in `ops`: say so loudly.
+        let queued = self.incoming.offer(entry);
+        assert!(
+            queued.is_ok(),
+            "the unbounded incoming queue refused an entry"
+        );
+        // After the publish: a holder that reads this `true` finds the entry.
         self.waiting.store(true, Ordering::SeqCst);
         self.flush_waiting(enter);
     }
@@ -306,25 +321,52 @@ impl Ring {
 
     /// Hands over what waits (queued entries, a backlog, or entries an enter refused), unless
     /// another thread is submitting right now: it then hands them over itself.
+    ///
+    /// # Why no queued entry is stranded
+    ///
+    /// A pusher P appends to `incoming` (the queue publishes the entry with a `Release` store when
+    /// `offer` returns), then sets `waiting` (`SeqCst`), then runs a `SeqCst` fence and
+    /// `try_lock`s `sq`. If it gets `sq`, it drains `incoming`, which holds its own entry, and is
+    /// done. If it fails, the holder H it read as locked unlocks later in the lock word's order,
+    /// then runs a `SeqCst` fence and reads `waiting`. The two fences are ordered one way or the
+    /// other in the single `SeqCst` order:
+    /// - H's fence first: H's unlock precedes it, so P's `try_lock` after its own fence would
+    ///   have seen the lock free (or taken by a later holder). P read it locked at H's time, so
+    ///   this case cannot happen for H, nor for any later holder (each unlocks after P's read).
+    /// - P's fence first: P's store to `waiting` precedes it, so H's read after its fence sees
+    ///   `true` (or the `false` of a later holder's swap, which took the entry: below). H then
+    ///   loops: it takes `sq` and drains, or fails to, and then another holder is in the same
+    ///   position, with the same two cases.
+    ///
+    /// A holder clears `waiting` (a `SeqCst` swap) before it drains. The swap that reads P's
+    /// `true` synchronises with P's store, which follows P's publish, so the drain after the swap
+    /// sees P's entry. A `true` stored after the swap is left for the holder's re-check.
+    ///
+    /// `waiting` is set after the entry is published, not when its slot is reserved. A queue's
+    /// size counts reserved slots, so a re-check by size alone could not tell a producer between
+    /// its reservation and its publish from an entry the holder's drain missed, and would have to
+    /// wait for the producer (nothing here spins). That producer sets `waiting` itself once it has
+    /// published.
     fn flush_waiting(&self, enter: &Enter) {
         loop {
-            // Pairs with the fence after a holder lets go: either this thread gets `sq`, or the
-            // holder sees `waiting`.
+            // Pairs with the fence after a holder lets go (see above): either this thread gets
+            // `sq`, or the holder sees what this thread queued.
             std::sync::atomic::fence(Ordering::SeqCst);
             let Ok(mut queue) = self.sq.try_lock() else {
                 return;
             };
-            // The swap reads the pusher's `true`, so its entry is in `incoming` for the take below.
-            if self.waiting.swap(false, Ordering::SeqCst) {
-                let incoming = std::mem::take(&mut *lock(&self.incoming));
-                queue.backlog.extend(incoming);
-            }
+            // The swap reads the pusher's `true`, so its entry is published for the drain below.
+            self.waiting.swap(false, Ordering::SeqCst);
+            let Queue {
+                incoming, backlog, ..
+            } = &mut *queue;
+            incoming.drain_all(|entry| backlog.push_back(entry));
             if queue.unsubmitted || !queue.backlog.is_empty() {
                 self.flush(&mut queue, enter);
             }
             drop(queue);
             std::sync::atomic::fence(Ordering::SeqCst);
-            // Pushed while this thread held `sq` (its pusher's try_lock failed): take it now.
+            // Queued while this thread held `sq` (its pusher's try_lock failed): take it now.
             if !self.waiting.load(Ordering::SeqCst) {
                 return;
             }
@@ -1549,5 +1591,64 @@ mod tests {
         assert_eq!(*lock(&recorder.0), [5]);
         io.complete();
         assert!(recorder.1.load(Ordering::Acquire));
+    }
+
+    /// Entries queued while another thread holds `sq` are submitted by that thread or by a re-check,
+    /// never stranded: no entry is left in `incoming` or the backlog once every pusher returned,
+    /// with no later flush to rescue it. Each round, 4 threads queue 2 entries each on one ring
+    /// whose enter is slow, so the holder is inside it when the others push, and the last pushes
+    /// come together (a rescue by a later push would hide a stranded entry).
+    #[test]
+    #[allow(clippy::disallowed_types)] // The pushers start together.
+    fn entries_queued_while_another_thread_holds_sq_are_never_stranded() {
+        const ROUNDS: usize = 1000;
+        const THREADS: usize = 4;
+        const EACH: usize = 2;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for round in 0..ROUNDS {
+                let ring = Arc::new(Ring::new().unwrap());
+                let slow: Arc<Enter> = Arc::new(|submitter: &Submitter<'_>| {
+                    // Long enough for the other threads to push meanwhile.
+                    let until = Instant::now() + Duration::from_micros(30);
+                    while Instant::now() < until {
+                        std::hint::spin_loop();
+                    }
+                    submitter.submit()
+                });
+                let go = Arc::new(std::sync::Barrier::new(THREADS));
+                let threads: Vec<_> = (0..THREADS)
+                    .map(|t| {
+                        let (ring, slow, go) = (ring.clone(), slow.clone(), go.clone());
+                        std::thread::spawn(move || {
+                            go.wait();
+                            for i in 0..EACH {
+                                let entry =
+                                    opcode::Nop::new().build().user_data((t * EACH + i) as u64);
+                                ring.queue(entry, &*slow);
+                            }
+                        })
+                    })
+                    .collect();
+                for thread in threads {
+                    thread.join().unwrap();
+                }
+                let queue = ring.sq.try_lock().expect("every pusher has returned");
+                assert!(
+                    ring.incoming.is_empty()
+                        && queue.backlog.is_empty()
+                        && !queue.unsubmitted
+                        && ring.in_kernel.load(Ordering::Acquire) == THREADS * EACH,
+                    "round {round}: {} in the kernel of {}, {} backlogged, {} still queued",
+                    ring.in_kernel.load(Ordering::Acquire),
+                    THREADS * EACH,
+                    queue.backlog.len(),
+                    ring.incoming.size_long()
+                );
+            }
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(Duration::from_secs(120))
+            .expect("the rounds did not finish in time");
     }
 }

@@ -16,6 +16,8 @@ testing = []
 
 [dependencies]
 euhedral-core = { path = "../euhedral-core" }
+# `MpscQueue`: any thread registers, the polling thread drains.
+euhedral-data-structures = { path = "../euhedral-data-structures" }
 
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 libc = "0.2.174"
