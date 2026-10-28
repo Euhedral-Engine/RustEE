@@ -219,7 +219,17 @@ impl Stream for FakeStream {
 
     fn poll_retired(&mut self) -> Option<RetireTicket> {
         let poisoned = self.gpu.poison.get().is_some();
-        self.retire.poll(poisoned)
+        let ticket = self.retire.poll(poisoned);
+        if self.retire.take_desync() {
+            self.gpu.poison.set(GpuError::Invalid(
+                "a retirement outcome arrived that no one had armed".into(),
+            ));
+        }
+        ticket
+    }
+
+    fn outstanding_tickets(&self) -> usize {
+        self.retire.outstanding_tickets()
     }
 
     fn confirm_retired(&mut self, ticket: RetireTicket) -> Option<GpuError> {

@@ -454,3 +454,39 @@ fn a_poisoned_device_reports_the_retirements_still_outstanding() {
     );
     assert_eq!(seen.iter().map(|t| t.seq()).collect::<Vec<_>>(), [0, 1]);
 }
+
+#[test]
+fn retire_into_refuses_a_stream_with_a_ticket_outstanding() {
+    use euhedral_core::frames::RunnableFrame;
+    let gpu = gpu_with_kernels();
+    let (pool, mut s) = lanes(&gpu, &["a"]);
+    let completions = euhedral_graph::Completions::new(pool);
+    let mut stream = s.remove(0);
+    // An earlier listener-free retirement is outstanding: its ticket would reach the continuation in place of the
+    // one armed for it, possibly before the work that follows.
+    stream.arm_retirement().unwrap();
+    assert_eq!(stream.outstanding_tickets(), 1);
+    let refused = euhedral_gpu::retire_into(stream, &completions, |_, _| {
+        Box::new(RunnableFrame::new(1, Arc::new(|| {})))
+    });
+    let Err(error) = refused else {
+        panic!("a stream with a ticket outstanding was accepted")
+    };
+    assert!(
+        matches!(error.error, GpuError::Invalid(_)),
+        "{:?}",
+        error.error
+    );
+    assert_eq!(completions.pending(), 0, "nothing was armed or registered");
+    // Once the earlier ticket is taken, the stream is accepted.
+    let mut stream = error.stream;
+    gpu.run_until_idle();
+    assert!(stream.poll_retired().is_some());
+    assert_eq!(stream.outstanding_tickets(), 0);
+    assert!(
+        euhedral_gpu::retire_into(stream, &completions, |_, _| {
+            Box::new(RunnableFrame::new(1, Arc::new(|| {})))
+        })
+        .is_ok()
+    );
+}

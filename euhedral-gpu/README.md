@@ -49,21 +49,38 @@ Asynchronous, backend-neutral GPU access for the RustEE control plane. A lattice
   refuses a marker of a queue that is not in the stream's pool with `Err(Invalid)`, whatever its lane and value, and a
   `LanePool` never reaches one. Each CUDA stream has a ring of `StreamOptions::markers`
   events (default 256). `mark()` returns `Err(Busy)` rather than reuse a slot whose marker has not completed; an
-  await on a marker that already completed adds no device wait.
+  await on a marker that already completed adds no device wait. An await that races the owner re-recording the marker's
+  slot is made safe without a lock: the awaiter raises a per-slot pin before it enqueues its wait, and the owner's
+  `mark` returns `Busy` (it never waits) if the slot it would reuse is pinned.
 - **Retirement.**
   - A retirement is a completion point after the work submitted so far. **The driver's callback only queues its
     outcome**: each stream owns one unbounded, lock-free MPSC queue (`Queue<_, Multi, Single>` of
     `euhedral-data-structures`, chunk-growing, with pooled chunks so steady state recycles them), and the callback,
     whose user data is a pointer to the stream's end of that queue, pushes the status of the work before it. It makes
-    no driver call, takes no lock, frees nothing, and allocates nothing in steady state (`tests/cuda_alloc.rs` counts
-    every allocation of the process over 1600 retirements: zero). A listener is never touched by the callback.
+    no driver call, takes no lock, frees nothing, and allocates nothing while fewer than `UNPOLLED_RETIREMENTS` (252)
+    statuses wait unpolled: the queue's chunk pool is seeded when the stream is made, and the owner's polling returns
+    chunks to it (`tests/cuda_alloc.rs` counts every allocation of the process over 5600 retirements, in batches of 8
+    and of 100: zero). Past the bound the queue grows by allocating a chunk, which is what "unbounded" accepts. The pool
+    guards its stack with a try-lock inside `euhedral-data-structures`, which the separate lock audit tracks. A listener
+    is never touched by the callback.
   - The retirement's number is not sent: a stream's callbacks run in the order they were enqueued, and each armed
     retirement enqueues one, so the n-th status that arrives belongs to the n-th retirement armed. The owner keeps what
     to do with each (a `PlainQueue` by number), and `poll_retired()` drains the queue and dispatches: `notify_retired(
     listener)` listeners are told, on the owner's thread, in order; the first retirement armed with
     `arm_retirement()` returns its ticket. Listeners are made and dropped on the owner's thread only.
   - If the device is poisoned, `poll_retired` reports the retirements still outstanding with `POISONED_STATUS` and
-    drops what arrives afterwards (it could no longer say whose it is).
+    drops what arrives afterwards (it could no longer say whose it is). A status that arrives with no retirement armed
+    is never dropped quietly: it poisons the device with `Invalid`. With the `cuLaunchHostFunc` fallback (a driver
+    without `cuStreamAddCallback`; the driver skips host functions after a fault), a poll that finds nothing arrived
+    while retirements are outstanding asks the stream (`cuStreamQuery`, which does not wait) and lets a failure
+    poison the device, so nothing is stranded.
+  - `retire_into` refuses (the stream comes back in the error) a stream that has a listener-free retirement
+    outstanding (`outstanding_tickets()`): its ticket would reach the continuation in place of its own.
+    `retire_into_with` carries extra state with the stream and returns it on failure.
+  - Dropping a submitter is a shutdown call (it waits for the device and its callbacks): a thread that must not block
+    hands the stream back instead of dropping it. If the wait cannot complete (a lost context or a sticky fault) while
+    retirements are outstanding, the drop leaks one reference to the stream's shared side, so a callback still to come
+    never pushes into freed memory.
   - `confirm_retired(ticket)` is a method of the submitter and returns the device failure behind the ticket, or `None`.
     The submitter owns its kept values (a `PlainQueue`), so releasing them needs no lock and no queue. It releases the values kept with `Enqueue::keep`, so the host buffers a copy reads live until the retirement is
     confirmed. A ticket carries the identity of the stream that armed it (its fields are private, made only by a
@@ -120,11 +137,10 @@ Asynchronous, backend-neutral GPU access for the RustEE control plane. A lattice
 ```rust
 use std::sync::{Arc, Mutex};
 
-use euhedral_core::frames::RunnableFrame;
 use euhedral_core::generics::LatticeSource;
 use euhedral_gpu::fake::{FakeGpu, FakeModule};
 use euhedral_gpu::{
-    Args, CompileOptions, Enqueue, Gpu, Launch, Module, Stream, StreamOptions, retire_into,
+    Args, CompileOptions, Enqueue, Gpu, Launch, Module, OnceFrame, Stream, StreamOptions, retire_into,
 };
 use euhedral_graph::Completions;
 
@@ -158,18 +174,19 @@ streams[1]
     })
     .unwrap();
 
-// The copy's retirement continues as a frame, emitted by the lattice's own poll. The submitter travels with it.
+// The copy's retirement continues as a frame, emitted by the lattice's own poll. The submitter travels with it,
+// and the frame hands it back: dropping a submitter waits for the device, so a thread that must not block (the
+// lattice's) never drops one.
 let completions = Completions::new(lanes);
-let confirmed = Arc::new(Mutex::new(None));
+let returned = Arc::new(Mutex::new(None));
 let copy_lane = streams.remove(1);
 retire_into(copy_lane, &completions, {
-    let confirmed = confirmed.clone();
+    let returned = returned.clone();
     move |mut stream, ticket| {
         let failure = stream.confirm_retired(ticket);
-        Box::new(RunnableFrame::new(
-            1,
-            Arc::new(move || *confirmed.lock().unwrap() = Some(failure.clone())),
-        ))
+        Box::new(OnceFrame::new(1, move || {
+            *returned.lock().unwrap() = Some((failure, stream));
+        }))
     }
 })
 .unwrap_or_else(|e| panic!("{}", e.error));
@@ -186,8 +203,10 @@ while completions.pending() > 0 {
         u64::MAX,
     );
 }
-assert_eq!(*confirmed.lock().unwrap(), Some(None)); // retired, no failure
+let (failure, copy_lane) = returned.lock().unwrap().take().expect("the continuation ran");
+assert_eq!(failure, None); // retired, no failure
 assert_eq!(u32::from_le_bytes(out), 1);
+drop(copy_lane); // a shutdown call, made here, where blocking is allowed
 ```
 
 ## Features

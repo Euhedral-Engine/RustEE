@@ -26,7 +26,7 @@ done, looked like one of this pool and could be treated as done.
   backend (feature `fake`) and a CUDA backend (feature `cuda`).
   - A stream is a shared, `Sync` queue (`DeviceQueue`, held by the `LanePool`) and a single-owner submitter (`Stream`:
     `Send`, not `Sync`). `submit`, `mark`, `await_marker`, `notify_retired`, `confirm_retired` and `Graph::replay`
-    take `&mut`, so ownership replaces locking and the hot path takes no lock. `submit` enqueues launches, copies and
+    take `&mut`, so ownership replaces locking: `euhedral-gpu`'s own submission, marker, retirement and replay paths take no lock (the lock-free chunk pool's try-lock and `Completions`' internal locks are tracked by the separate lock audit). `submit` enqueues launches, copies and
     memsets; `mark` and `await_marker` order work across streams on the device.
   - `notify_retired` arms a completion point. The driver's callback only pushes the outcome onto the stream's
     unbounded, lock-free MPSC queue (pooled chunks, no allocation or free in steady state); the owner drains it with

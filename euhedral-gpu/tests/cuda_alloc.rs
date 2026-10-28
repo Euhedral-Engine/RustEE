@@ -8,11 +8,13 @@
 )]
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use euhedral_gpu::cuda::CudaGpu;
-use euhedral_gpu::{Gpu, Stream, StreamOptions};
+use euhedral_gpu::cuda::{CudaGpu, CudaStream};
+use euhedral_gpu::{Gpu, Stream, StreamOptions, UNPOLLED_RETIREMENTS};
+use euhedral_graph::DeviceQueue;
 
 static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
 
@@ -41,20 +43,24 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static COUNTING: Counting = Counting;
 
-/// Arms `batch` retirements on the stream and drains their tickets as the driver's callbacks queue them.
-fn round(stream: &mut impl Stream, batch: usize) {
+/// Arms `batch` retirements, waits (from the device, with a marker after them) until the driver has run every
+/// callback, then drains the tickets. Draining only after the callbacks finished keeps the owner's side of the queue
+/// from running beside the callbacks' side.
+fn round(stream: &mut CudaStream, queue: &Arc<dyn DeviceQueue>, batch: usize) {
     for _ in 0..batch {
         stream.arm_retirement().unwrap();
     }
+    let marker = stream.mark().unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
-    let mut arrived = 0;
-    while arrived < batch {
-        assert!(Instant::now() < deadline, "the callbacks arrive");
-        while let Some(ticket) = stream.poll_retired() {
-            assert!(ticket.ok());
-            arrived += 1;
-        }
+    while queue.completed() < marker.value {
+        assert!(Instant::now() < deadline, "the callbacks run");
     }
+    let mut arrived = 0;
+    while let Some(ticket) = stream.poll_retired() {
+        assert!(ticket.ok());
+        arrived += 1;
+    }
+    assert_eq!(arrived, batch);
 }
 
 #[test]
@@ -72,18 +78,25 @@ fn the_retirement_path_allocates_nothing_in_steady_state() {
     );
     let (_pool, mut streams) = gpu.open_lanes(&["a"], StreamOptions::default()).unwrap();
     let stream = &mut streams[0];
-    // Warm up past several chunks of the queue, so retired chunks are pooled and the owner's list has its room.
-    for _ in 0..40 {
-        round(stream, 8);
-    }
+    let queue = stream.queue();
+    // The queue's chunk pool is seeded when the stream is made, so the callbacks need no warm-up. Batches of 8
+    // cross a 63-status chunk now and then; a batch of 100 leaves more than a chunk unpolled at once. Both stay under
+    // the bound the callback is documented to allocate nothing below.
+    const { assert!(100 > 64 && 100 < UNPOLLED_RETIREMENTS) };
+    // The owner's own list of armed retirements grows once, to the largest batch (that is the owner's side, and not
+    // the callback's).
+    round(stream, &queue, 100);
     let before = ALLOCATIONS.load(Ordering::Relaxed);
     for _ in 0..200 {
-        round(stream, 8);
+        round(stream, &queue, 8);
+    }
+    for _ in 0..40 {
+        round(stream, &queue, 100);
     }
     let after = ALLOCATIONS.load(Ordering::Relaxed);
     assert_eq!(
         after - before,
         0,
-        "1600 retirements armed, queued by the driver's callbacks and drained: no allocation"
+        "5600 retirements armed, queued by the driver's callbacks and drained: no allocation"
     );
 }

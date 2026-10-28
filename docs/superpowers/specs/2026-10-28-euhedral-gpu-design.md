@@ -35,12 +35,12 @@ It does all of this without a line of RustEE changed, and with one driver contex
 2. **Streams as ordered device queues.**
    - `submit(f)` runs launches, copies and memsets on the calling thread with the stream selected for every operation.
    - Stream order carries ordinary dependencies.
-   - Each stream implements `DeviceQueue`, so `LanePool`, `Marker` and `Completions::after_marker` work unchanged.
+   - A stream is split in two (user rule, 2026-10-28: the hot path is lock-free; locks only for lifecycle: start, stop, rebalance). Its **queue** implements `DeviceQueue` and is shared (`Sync`): `LanePool`, `Marker` and `Completions::after_marker` work unchanged. Its **submitter** has one owner (`Send`, not `Sync`), and every call that enqueues takes `&mut`, so ownership replaces a lock.
 3. **Markers across streams on the device.** `mark` records a marker after the work submitted so far. `await_marker` orders later work behind a marker, on the device; the host does not wait. Markers are reusable and closed when unused.
 4. **Retirement without blocking.**
    - `notify_retired(listener)` arms a completion point after the work submitted so far.
-   - The listener runs exactly once. On the driver's callback thread it may only enqueue work: no driver calls, no blocking, no frames, no frees.
-   - `confirm_retired(ticket)` runs on an ordinary thread and returns the device failure, or none. It never throws.
+   - The driver's callback only queues the outcome (user rule, 2026-10-28: retirement goes through an unbounded queue). Each stream owns one unbounded lock-free MPSC queue; the callback pushes the status of the work before it, with no driver call, lock, free, listener or (in steady state) allocation. The stream's owner drains the queue (`poll_retired`) and tells the listener, exactly once, on its own thread.
+   - `confirm_retired(ticket)` is a method of the submitter and returns the device failure, or none. It never throws.
    - A stage finishing its submission never counts as completion. Host buffers that a copy reads stay alive until retirement is confirmed.
 5. **Kernels from outside RustEE.**
    - A `Module` loads from either:

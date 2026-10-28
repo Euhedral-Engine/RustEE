@@ -38,7 +38,7 @@ pub use args::{Args, Dim3, KernelArg, Launch};
 pub use error::GpuError;
 pub use module_cache::{CacheKey, KeyMaterial, ModuleCache, cache_key};
 pub use poison::Poison;
-pub use retire::{OnceFrame, RetireError, retire_into};
+pub use retire::{OnceFrame, RetireError, UNPOLLED_RETIREMENTS, retire_into, retire_into_with};
 pub use shape::{CopyKind, Fingerprint, ShapeHasher};
 
 /// Compiles and runs the examples in the crate README as doctests.

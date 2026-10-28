@@ -27,7 +27,7 @@ use euhedral_core::impls::DefaultExecutor;
 use euhedral_gpu::cuda::{CudaGpu, CudaGraph, CudaKernel, CudaModule, CudaStream};
 use euhedral_gpu::{
     Args, CompileOptions, Enqueue, Gpu, GpuError, Graph, Launch, Module, OnceFrame, Sequence,
-    Stream, StreamOptions, retire_into,
+    Stream, StreamOptions, retire_into, retire_into_with,
 };
 use euhedral_graph::{Completions, Latch, LatchSetter};
 use euhedral_hardware_utils::affinity;
@@ -154,7 +154,8 @@ impl Shared {
 }
 
 /// Arms the retirement of iteration `i`. The chain travels with its continuation: the frame the lattice's own poll
-/// emits owns the stream and the graph, so no lock is taken anywhere on the path.
+/// emits owns the stream and the graph, so no lock is taken anywhere on the path. Dropping a stream waits for the
+/// device, so the lattice never drops one: a finished or failed chain hands its pieces to the main thread.
 fn arm(chain: Chain, i: u32) {
     let Chain {
         shared,
@@ -163,19 +164,30 @@ fn arm(chain: Chain, i: u32) {
         finish,
     } = chain;
     let completions = shared.completions.clone();
-    let armed = retire_into(stream, &completions, move |stream, ticket| {
-        let chain = Chain {
-            shared,
-            stream,
-            graph,
-            finish,
-        };
-        let frame: Box<dyn Frame> = Box::new(OnceFrame::new(LANE, move || step(chain, i, ticket)));
-        frame
-    });
+    let armed = retire_into_with(
+        stream,
+        (shared, graph, finish),
+        &completions,
+        move |stream, (shared, graph, finish), ticket| {
+            let chain = Chain {
+                shared,
+                stream,
+                graph,
+                finish,
+            };
+            let frame: Box<dyn Frame> =
+                Box::new(OnceFrame::new(LANE, move || step(chain, i, ticket)));
+            frame
+        },
+    );
     if let Err(e) = armed {
-        // The closure (and the guard it owns) was dropped: the guard ends the wait. The stream comes back here.
-        eprintln!("graph_replay: arming a retirement failed: {}", e.error);
+        // Arming failed: the stream and everything that travelled with it come back, and go home to the main thread.
+        let (_shared, graph, finish) = e.state;
+        let result = Err(format!("arming a retirement failed: {}", e.error));
+        finish.with(Outcome {
+            result,
+            parts: Some((e.stream, graph)),
+        });
     }
 }
 

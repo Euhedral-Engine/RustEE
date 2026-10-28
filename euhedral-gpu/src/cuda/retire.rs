@@ -43,7 +43,10 @@ impl CudaStream {
         let fns = &self.gpu.fns;
         // SAFETY: a stream of this device and the sink the callback reads; the context is current.
         unsafe {
-            match fns.stream_add_callback {
+            match fns
+                .stream_add_callback
+                .filter(|_| !self.gpu.uses_host_func())
+            {
                 Some(add) => self
                     .gpu
                     .check("cuStreamAddCallback", add(self.raw, trampoline, user, 0)),

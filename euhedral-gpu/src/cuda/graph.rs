@@ -240,7 +240,7 @@ impl CudaSequence<'_> {
         self.gpu.poison.check()?;
         let event = self.event()?;
         let fns = &self.gpu.device().driver.fns;
-        // SAFETY: an event of this sequence and a stream of a locked stream (or its shadow); the context is current.
+        // SAFETY: an event of this sequence and a stream borrowed by this recording (or its shadow); the context is current.
         self.gpu.check("cuEventRecord", unsafe {
             (fns.event_record)(event, earlier)
         })?;

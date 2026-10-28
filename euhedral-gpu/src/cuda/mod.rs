@@ -18,6 +18,7 @@ pub use nvrtc::{Nvrtc, Target};
 pub use stream::{CudaQueue, CudaStream};
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use euhedral_memory::cuda::{CudaError, Device, Driver};
 
@@ -76,6 +77,8 @@ pub struct CudaGpu {
     device: Arc<Device>,
     pub(crate) fns: GpuFns,
     pub(crate) poison: Poison,
+    /// Test switch: retirements use `cuLaunchHostFunc` even when `cuStreamAddCallback` exists.
+    force_host_func: AtomicBool,
     arch: (i32, i32),
     driver_version: i32,
 }
@@ -113,6 +116,7 @@ impl CudaGpu {
             device,
             fns,
             poison: Poison::new(),
+            force_host_func: AtomicBool::new(false),
             arch,
             driver_version,
         }))
@@ -146,6 +150,23 @@ impl CudaGpu {
 
     /// As [`check`](Self::check), for a call whose failure leaves the device unusable whatever the code: the device
     /// is poisoned with it.
+    /// Poisons the device with a misuse that desynchronizes its bookkeeping, which must never pass silently.
+    pub(crate) fn fail_invalid(&self, what: &str) {
+        note_unrecoverable(&self.poison, &GpuError::Invalid(what.into()));
+    }
+
+    /// A test hook: makes retirements use the `cuLaunchHostFunc` fallback (a driver without `cuStreamAddCallback`),
+    /// which the driver skips after a fault.
+    #[doc(hidden)]
+    pub fn force_host_func_fallback(&self, on: bool) {
+        self.force_host_func.store(on, Ordering::Relaxed);
+    }
+
+    /// Whether retirements are armed with `cuLaunchHostFunc`.
+    pub(crate) fn uses_host_func(&self) -> bool {
+        self.fns.stream_add_callback.is_none() || self.force_host_func.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn fail(&self, call: &'static str, code: i32) -> GpuError {
         let err = match self.device.driver.check(call, code) {
             Ok(()) => classify(call, code, "unknown".into()),

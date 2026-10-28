@@ -71,10 +71,12 @@ impl Frame for OnceFrame {
     }
 }
 
-/// A stream handed back with the error that stopped [`retire_into`] from arming its retirement.
+/// A stream (and the state that travelled with it) handed back with the error that stopped [`retire_into`] or
+/// [`retire_into_with`] from arming the retirement.
 #[derive(Debug)]
-pub struct RetireError<S> {
+pub struct RetireError<S, T = ()> {
     pub stream: S,
+    pub state: T,
     pub error: GpuError,
 }
 
@@ -88,39 +90,72 @@ pub struct RetireError<S> {
 /// fails the stream comes back in the error.
 ///
 /// `completions` polls the stream's retirement queue ([`Stream::poll_retired`]); there is no per-retirement cell. The
-/// stream must have no other retirement armed with [`Stream::arm_retirement`] while this one is pending.
+/// stream must have no other listener-free retirement outstanding ([`Stream::outstanding_tickets`]): its ticket would
+/// reach this continuation in place of the one armed here, possibly before the work this retirement follows. In that
+/// case nothing is armed and the stream comes back in the error.
 ///
 /// If the device is poisoned before the callback runs, the continuation is emitted at once with
-/// [`POISONED_STATUS`], so nothing is stranded. If `completions` is dropped or completed with the continuation still
-/// pending, the stream is dropped there (a shutdown call: it waits for the device).
+/// [`POISONED_STATUS`], so nothing is stranded. **Dropping a submitter is a shutdown call** (it waits for the device):
+/// a continuation that is done with a stream hands it back to a thread where blocking is allowed instead of dropping
+/// it on the lattice, and a [`Completions`] dropped or completed with a continuation still pending drops the stream
+/// there.
 pub fn retire_into<S: Stream>(
-    mut stream: S,
+    stream: S,
     completions: &Completions,
     then: impl FnOnce(S, RetireTicket) -> Box<dyn Frame> + Send + 'static,
 ) -> Result<(), RetireError<S>> {
+    retire_into_with(stream, (), completions, move |stream, (), ticket| {
+        then(stream, ticket)
+    })
+}
+
+/// [`retire_into`] with state that travels with the stream: `state` is handed to `then` with the stream and the
+/// ticket, and comes back with the stream if arming fails, so nothing the chain owns is lost or dropped on the
+/// lattice by an error.
+pub fn retire_into_with<S: Stream, T: Send + 'static>(
+    mut stream: S,
+    state: T,
+    completions: &Completions,
+    then: impl FnOnce(S, T, RetireTicket) -> Box<dyn Frame> + Send + 'static,
+) -> Result<(), RetireError<S, T>> {
+    if stream.outstanding_tickets() > 0 {
+        return Err(RetireError {
+            stream,
+            state,
+            error: GpuError::Invalid(
+                "a listener-free retirement is already outstanding on this stream".into(),
+            ),
+        });
+    }
     if let Err(error) = stream.arm_retirement() {
-        return Err(RetireError { stream, error });
+        return Err(RetireError {
+            stream,
+            state,
+            error,
+        });
     }
     completions.register(Box::new(StreamPending {
         stream: Some(stream),
+        state: Some(state),
         then: Some(Box::new(then)),
     }));
     Ok(())
 }
 
-type Then<S> = Box<dyn FnOnce(S, RetireTicket) -> Box<dyn Frame> + Send>;
+type Then<S, T> = Box<dyn FnOnce(S, T, RetireTicket) -> Box<dyn Frame> + Send>;
 
 /// A pending retirement: it owns the stream, and each poll drains the stream's retirement queue.
-struct StreamPending<S: Stream> {
+struct StreamPending<S: Stream, T> {
     stream: Option<S>,
-    then: Option<Then<S>>,
+    state: Option<T>,
+    then: Option<Then<S, T>>,
 }
 
-impl<S: Stream> Pending for StreamPending<S> {
+impl<S: Stream, T: Send> Pending for StreamPending<S, T> {
     fn poll(&mut self) -> Option<Box<dyn Frame>> {
         let ticket = self.stream.as_mut()?.poll_retired()?;
-        let (stream, then) = (self.stream.take()?, self.then.take()?);
-        Some(then(stream, ticket))
+        let (stream, state, then) = (self.stream.take()?, self.state.take()?, self.then.take()?);
+        Some(then(stream, state, ticket))
     }
 }
 
@@ -137,8 +172,11 @@ impl std::fmt::Debug for RetireSink {
 }
 
 impl RetireSink {
-    /// Hands one retirement's status to the owner. Lock-free; makes no driver call and frees nothing. It allocates only
-    /// when the queue grows past its pooled chunks, which a polling owner prevents.
+    /// Hands one retirement's status to the owner. Lock-free; makes no driver call and frees nothing. It allocates
+    /// nothing while fewer than [`UNPOLLED_RETIREMENTS`] statuses wait unpolled: the queue starts with [`POOLED_CHUNKS`]
+    /// spare chunks, one is linked in per [`CHUNK`]` - 1` statuses, and the owner's polling returns them. (A chunk pool
+    /// that is contended at that instant is skipped for a fresh allocation: `euhedral-data-structures`' `ChunkPool`
+    /// guards its stack with a try-lock, which the separate lock audit tracks.)
     pub(crate) fn push(&self, status: i32) {
         // The queue is unbounded: an offer is never refused.
         let _ = self.producer.offer(status);
@@ -163,6 +201,10 @@ pub(crate) struct Retirements {
     /// The device was poisoned and the outstanding retirements were reported as such: anything that arrives later no
     /// longer says which retirement it belongs to, and is dropped.
     abandoned: bool,
+    /// Retirements armed without a listener whose tickets `poll` has not returned.
+    tickets: usize,
+    /// A status arrived with no armed retirement to belong to: the order the design relies on broke.
+    desync: bool,
 }
 
 impl std::fmt::Debug for Retirements {
@@ -174,14 +216,31 @@ impl std::fmt::Debug for Retirements {
     }
 }
 
-/// Chunk size, and how many retired chunks the queue keeps for reuse.
+/// Slots of a queue chunk (one of them links to the next chunk, so a chunk holds `CHUNK - 1` statuses), and how many
+/// retired chunks the queue keeps for reuse.
 const CHUNK: usize = 64;
 const POOLED_CHUNKS: usize = 4;
+/// A stream's driver callback allocates nothing while fewer retirement statuses than this wait unpolled: the room left in the active chunk is
+/// at least one slot, and each pooled chunk adds `CHUNK - 1`.
+pub const UNPOLLED_RETIREMENTS: usize = POOLED_CHUNKS * (CHUNK - 1);
+
+/// The queue, with its chunk pool seeded: filling and draining `POOLED_CHUNKS + 1` chunks retires `POOLED_CHUNKS` of
+/// them into the pool, so the callback finds spare chunks from the first retirement on.
+fn seeded_queue() -> Queue<i32, Multi, Single> {
+    let queue = Queue::<i32, Multi, Single>::with_pool(CHUNK, POOLED_CHUNKS);
+    let producer = queue.producer();
+    for _ in 0..(POOLED_CHUNKS + 1) * (CHUNK - 1) {
+        // An unbounded queue never refuses.
+        let _ = producer.offer(0);
+    }
+    queue.consumer().clear();
+    queue
+}
 
 impl Retirements {
     /// A retirement channel for the stream `id` on `lane`: the owner's end, and the callback's.
     pub(crate) fn new(id: QueueId, lane: LaneId) -> (Self, RetireSink) {
-        let queue = Queue::<i32, Multi, Single>::with_pool(CHUNK, POOLED_CHUNKS);
+        let queue = seeded_queue();
         let sink = RetireSink {
             producer: queue.producer(),
         };
@@ -192,8 +251,29 @@ impl Retirements {
             id,
             lane,
             abandoned: false,
+            tickets: 0,
+            desync: false,
         };
         (retirements, sink)
+    }
+
+    /// Retirements armed and not yet reported, listeners and tickets together.
+    #[cfg_attr(
+        not(feature = "cuda"),
+        allow(dead_code, reason = "used by the CUDA stream")
+    )]
+    pub(crate) fn outstanding(&self) -> usize {
+        usize::try_from(self.armed.size_long()).unwrap_or(usize::MAX)
+    }
+
+    /// Retirements armed without a listener whose tickets have not been returned.
+    pub(crate) fn outstanding_tickets(&self) -> usize {
+        self.tickets
+    }
+
+    /// Whether a status arrived with no retirement to belong to (once; the flag is cleared).
+    pub(crate) fn take_desync(&mut self) -> bool {
+        std::mem::take(&mut self.desync)
     }
 
     /// The number the next retirement armed gets.
@@ -204,6 +284,7 @@ impl Retirements {
     /// Records that a retirement was armed (its callback is enqueued), with the listener to tell, if any. Called after
     /// the backend accepted the callback: whatever it pushes is read only by a later poll.
     pub(crate) fn register(&mut self, listener: Option<Box<dyn RetireListener>>) {
+        self.tickets += usize::from(listener.is_none());
         let armed = listener.map_or(Armed::Pull, Armed::Listener);
         // An unbounded queue never refuses.
         let _ = self.armed.offer((self.next, armed));
@@ -220,6 +301,8 @@ impl Retirements {
             while let Some(status) = self.consumer.poll() {
                 // Callbacks run in the order they were enqueued, so this status belongs to the oldest armed one.
                 let Some((seq, armed)) = self.armed.poll() else {
+                    // A status nobody armed: never drop it quietly. The stream poisons its device with this.
+                    self.desync = true;
                     continue;
                 };
                 if let Some(ticket) = self.dispatch(seq, armed, status) {
@@ -239,14 +322,17 @@ impl Retirements {
         None
     }
 
-    fn dispatch(&self, seq: u64, armed: Armed, status: i32) -> Option<RetireTicket> {
+    fn dispatch(&mut self, seq: u64, armed: Armed, status: i32) -> Option<RetireTicket> {
         let ticket = RetireTicket::new(self.id, self.lane, seq, status);
         match armed {
             Armed::Listener(listener) => {
                 listener.retired(ticket);
                 None
             }
-            Armed::Pull => Some(ticket),
+            Armed::Pull => {
+                self.tickets -= 1;
+                Some(ticket)
+            }
         }
     }
 }
@@ -356,5 +442,30 @@ mod tests {
         sink.push(0);
         assert!(r.poll(true).is_none());
         assert!(r.poll(false).is_none());
+    }
+
+    #[test]
+    fn the_chunk_pool_is_seeded_at_creation() {
+        assert_eq!(seeded_queue().pooled_chunks(), POOLED_CHUNKS);
+    }
+
+    #[test]
+    fn a_status_nobody_armed_is_flagged() {
+        let (mut r, sink, _) = channel();
+        sink.push(0);
+        assert!(r.poll(false).is_none());
+        assert!(r.take_desync(), "a desync must never be silent");
+        assert!(!r.take_desync(), "reported once");
+    }
+
+    #[test]
+    fn listener_free_retirements_are_counted_until_their_tickets_return() {
+        let (mut r, sink, _) = channel();
+        r.register(None);
+        r.register(None);
+        assert_eq!((r.outstanding(), r.outstanding_tickets()), (2, 2));
+        sink.push(0);
+        assert!(r.poll(false).is_some());
+        assert_eq!((r.outstanding(), r.outstanding_tickets()), (1, 1));
     }
 }

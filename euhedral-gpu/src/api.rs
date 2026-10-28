@@ -148,6 +148,15 @@ pub trait Stream: Send + Sized + 'static {
     /// outstanding are reported with [`POISONED_STATUS`], so nothing is stranded.
     fn poll_retired(&mut self) -> Option<RetireTicket>;
 
+    /// How many retirements armed with [`arm_retirement`](Self::arm_retirement) have not returned their ticket from
+    /// [`poll_retired`](Self::poll_retired) yet. [`retire_into`](crate::retire_into) refuses a stream with any
+    /// outstanding: their tickets would reach its continuation in place of its own.
+    fn outstanding_tickets(&self) -> usize;
+
+    /// Dropping a submitter is a **shutdown call**: it waits for the stream's work (and every callback it armed) to end.
+    /// A thread that must not block does not drop one: it hands the stream back to a thread that may, as the
+    /// continuations of [`retire_into`](crate::retire_into) do.
+    ///
     /// Settles a retirement: the device failure behind it, or `None`. Never panics. Values kept for the retirement are
     /// released. A ticket armed on another stream is refused with `Some(Invalid)` and releases nothing.
     ///
