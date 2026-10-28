@@ -11,7 +11,7 @@ use euhedral_memory::cuda::{CuEvent, CuStream, Device, STREAM_NON_BLOCKING};
 use crate::kept::Kept;
 use crate::stream_lock::{StreamGuard, StreamLock};
 use crate::{
-    Args, Enqueue, GpuError, Launch, POISONED_STATUS, RetireListener, RetireTicket, Stream,
+    Args, Enqueue, GpuError, Kernel, Launch, POISONED_STATUS, RetireListener, RetireTicket, Stream,
     StreamOptions,
 };
 
@@ -380,11 +380,41 @@ impl Enqueue for CudaEnqueue<'_> {
 
     unsafe fn launch(
         &mut self,
-        _kernel: &CudaKernel,
-        _launch: Launch,
-        _args: &Args,
+        kernel: &CudaKernel,
+        launch: Launch,
+        args: &Args,
     ) -> Result<(), GpuError> {
-        Err(GpuError::Invalid("not yet".into()))
+        if let Some(expected) = kernel.parameter_sizes() {
+            let got: Vec<usize> = args.sizes().collect();
+            if expected.len() != got.len()
+                || expected.iter().zip(&got).any(|(e, g)| *e as usize != *g)
+            {
+                return Err(GpuError::Args(format!(
+                    "{}: expected sizes {expected:?}, got {got:?}",
+                    kernel.name()
+                )));
+            }
+        }
+        let gpu = &self.stream.gpu;
+        let mut pointers = args.pointers();
+        // SAFETY: the caller's contract (arguments match the kernel; addresses valid until retired); the pointers
+        // address `args`, which outlives the call; the context is current.
+        let code = unsafe {
+            (gpu.fns.launch_kernel)(
+                kernel.raw(),
+                launch.grid.x,
+                launch.grid.y,
+                launch.grid.z,
+                launch.block.x,
+                launch.block.y,
+                launch.block.z,
+                launch.shared_bytes,
+                self.stream.raw,
+                pointers.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        };
+        gpu.check("cuLaunchKernel", code)
     }
 
     unsafe fn copy_to_device(

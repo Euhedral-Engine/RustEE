@@ -439,3 +439,118 @@ mod modules {
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
     }
 }
+
+mod launches {
+    use super::streams::{device_memory, reached_within};
+    use super::*;
+    use std::time::Duration;
+
+    use euhedral_gpu::cuda::{CudaModule, Nvrtc};
+    use euhedral_gpu::{
+        Args, CompileOptions, Enqueue, Gpu, GpuError, Launch, Module, Stream, StreamOptions,
+    };
+    use euhedral_memory::cuda::PinnedHost;
+    use euhedral_memory::{Backend, LocationId};
+
+    const OPS: &str = include_str!("kernels/ops.cu");
+    const OPS_PTX: &[u8] = include_bytes!("kernels/ops.ptx");
+
+    #[test]
+    fn axpb_from_source_and_from_ptx_match_the_cpu_bit_for_bit() {
+        let Some(gpu) = gpu() else { return };
+        let mut modules = Vec::new();
+        if Nvrtc::shared(None).is_ok() {
+            modules.push(CudaModule::from_source(&gpu, OPS, &CompileOptions::default()).unwrap());
+        }
+        if gpu.driver_version() >= 13010 {
+            modules.push(CudaModule::from_image(&gpu, OPS_PTX).unwrap());
+        }
+        if modules.is_empty() {
+            eprintln!("neither NVRTC nor a 13.1 driver: skipped");
+            return;
+        }
+        let (pool, s) = gpu
+            .open_lanes(&["compute"], StreamOptions::default())
+            .unwrap();
+        let mem = device_memory(&gpu);
+        let pinned = PinnedHost::new(gpu.device().clone(), LocationId(1), 0);
+        let n = 1usize << 20;
+        let bytes = n * 4;
+        let (a, b) = (1.5f32, -2.0f32);
+        let x_host = pinned.alloc(bytes as u64).unwrap();
+        // SAFETY: a pinned block of `bytes` bytes owned by this test.
+        let x_slice = unsafe { std::slice::from_raw_parts_mut(x_host.addr as *mut f32, n) };
+        for (i, v) in x_slice.iter_mut().enumerate() {
+            *v = i as f32 * 0.25;
+        }
+        let x_dev = mem.alloc(bytes as u64).unwrap();
+        s[0].submit(|q| {
+            // SAFETY: valid blocks; the host block is untouched until the marker below is reached.
+            unsafe { q.copy_to_device(x_dev.addr, x_host.addr as *const u8, bytes) }
+        })
+        .unwrap();
+        let mut outs = Vec::new();
+        for module in &modules {
+            let axpb = module.kernel("axpb").unwrap();
+            let y_dev = mem.alloc(bytes as u64).unwrap();
+            let y_host = pinned.alloc(bytes as u64).unwrap();
+            let args = Args::new()
+                .device(y_dev.addr)
+                .device(x_dev.addr)
+                .arg(a)
+                .arg(b)
+                .arg(n as u32);
+            s[0].submit(|q| {
+                // SAFETY: the arguments match `axpb`'s parameters; the buffers are live until the marker.
+                unsafe {
+                    q.launch(&axpb, Launch::linear(n as u32, 256), &args)?;
+                    q.copy_to_host(y_host.addr as *mut u8, y_dev.addr, bytes)
+                }
+            })
+            .unwrap();
+            outs.push((y_dev, y_host));
+        }
+        let m = s[0].mark().unwrap();
+        assert!(reached_within(&pool, m, Duration::from_secs(10)));
+        let reference: Vec<u32> = x_slice.iter().map(|&x| a.mul_add(x, b).to_bits()).collect();
+        for (_, y_host) in &outs {
+            // SAFETY: the pinned block was written by the copy that retired.
+            let y = unsafe { std::slice::from_raw_parts(y_host.addr as *const u32, n) };
+            assert!(y == reference.as_slice(), "bit-for-bit with the CPU");
+        }
+        drop((pool, s));
+        // SAFETY: the stream ended its work; nothing uses the blocks.
+        unsafe {
+            for (d, h) in outs {
+                mem.free(d);
+                pinned.free(h);
+            }
+            mem.free(x_dev);
+            pinned.free(x_host);
+        }
+    }
+
+    #[test]
+    fn arguments_that_do_not_fit_are_refused_before_launch() {
+        let Some(gpu) = gpu() else { return };
+        if gpu.driver_version() < 13010 {
+            return;
+        }
+        let module = CudaModule::from_image(&gpu, OPS_PTX).unwrap();
+        let axpb = module.kernel("axpb").unwrap();
+        let (_pool, s) = gpu
+            .open_lanes(&["compute"], StreamOptions::default())
+            .unwrap();
+        let args = Args::new()
+            .device(0x1000)
+            .device(0x2000)
+            .arg(1.0f32)
+            .arg(2.0f32);
+        let r = s[0].submit(|q| {
+            // SAFETY: refused before the driver sees it.
+            unsafe { q.launch(&axpb, Launch::linear(1, 1), &args) }
+        });
+        assert!(matches!(r, Err(GpuError::Args(_))), "{r:?}");
+        assert_eq!(gpu.poisoned(), None);
+    }
+}

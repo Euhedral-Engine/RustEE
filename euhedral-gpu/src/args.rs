@@ -125,7 +125,6 @@ impl Args {
     /// One pointer per argument, into this value's storage: valid while it is neither moved nor changed. The driver
     /// reads through them and never writes.
     #[cfg(feature = "cuda")]
-    #[allow(dead_code, reason = "used by the CUDA launch, which comes next")]
     pub(crate) fn pointers(&self) -> Vec<*mut c_void> {
         let base = self.storage.as_ptr().cast::<u8>();
         self.slots

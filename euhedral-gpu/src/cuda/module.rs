@@ -59,7 +59,6 @@ pub struct CudaModule {
 }
 
 #[derive(Clone, Copy, Debug)]
-#[allow(dead_code, reason = "read by the launch, which comes next")]
 struct Func(CuFunction);
 
 // SAFETY: a function of a loaded module, usable from any thread with the context current.
@@ -70,7 +69,6 @@ unsafe impl Sync for Func {}
 /// A kernel of a module. It keeps its module loaded.
 #[derive(Clone, Debug)]
 pub struct CudaKernel {
-    #[allow(dead_code, reason = "read by the launch, which comes next")]
     func: Func,
     #[allow(dead_code, reason = "keeps the module loaded while the kernel lives")]
     module: Arc<ModuleInner>,
@@ -80,7 +78,6 @@ pub struct CudaKernel {
 }
 
 impl CudaKernel {
-    #[allow(dead_code, reason = "used by the launch, which comes next")]
     pub(crate) fn raw(&self) -> CuFunction {
         self.func.0
     }
