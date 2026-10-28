@@ -13,6 +13,7 @@ mod error;
 pub mod fake;
 #[cfg(any(feature = "fake", feature = "cuda"))]
 mod kept;
+mod module_cache;
 mod poison;
 mod retire;
 mod shape;
@@ -24,6 +25,7 @@ pub use api::{
 };
 pub use args::{Args, Dim3, KernelArg, Launch};
 pub use error::GpuError;
+pub use module_cache::{CacheKey, KeyMaterial, ModuleCache, cache_key};
 pub use poison::Poison;
 pub use retire::retire_into;
 pub use shape::{CopyKind, Fingerprint, ShapeHasher};
