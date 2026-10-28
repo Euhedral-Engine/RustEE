@@ -1,5 +1,6 @@
 //! Typed kernel arguments and launch geometry.
 
+#[cfg(feature = "cuda")]
 use std::ffi::c_void;
 
 use euhedral_hashing::hasher_api::hash_bytes;
@@ -123,10 +124,8 @@ impl Args {
 
     /// One pointer per argument, into this value's storage: valid while it is neither moved nor changed. The driver
     /// reads through them and never writes.
-    #[cfg_attr(
-        all(),
-        allow(dead_code, reason = "used by the backends, which come next")
-    )]
+    #[cfg(feature = "cuda")]
+    #[allow(dead_code, reason = "used by the CUDA launch, which comes next")]
     pub(crate) fn pointers(&self) -> Vec<*mut c_void> {
         let base = self.storage.as_ptr().cast::<u8>();
         self.slots
@@ -195,6 +194,7 @@ mod tests {
         assert_eq!(a.sizes().collect::<Vec<_>>(), [4, 4, 8, 6]);
     }
 
+    #[cfg(feature = "cuda")]
     #[test]
     fn pointers_are_aligned_to_each_argument() {
         let a = Args::new().arg(1u8).arg(2u64).arg(3u16).arg(u128_like());
@@ -204,6 +204,7 @@ mod tests {
         assert_eq!(p[2] as usize % 2, 0);
     }
 
+    #[cfg(feature = "cuda")]
     fn u128_like() -> [u64; 2] {
         [7, 9]
     }

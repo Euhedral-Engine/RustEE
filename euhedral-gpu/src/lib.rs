@@ -7,6 +7,10 @@
 mod api;
 mod args;
 mod error;
+#[cfg(feature = "fake")]
+pub mod fake;
+#[cfg(any(feature = "fake", feature = "cuda"))]
+mod kept;
 mod poison;
 mod retire;
 mod shape;
