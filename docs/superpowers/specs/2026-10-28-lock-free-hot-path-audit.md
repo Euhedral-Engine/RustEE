@@ -7,59 +7,102 @@ complete, close) and rebalance (attach and detach of sources and receivers, latt
 reachable after start, a spin-wait or back-off loop that waits on another thread, and a blocking system call or park,
 on a path that runs per frame, per pull, per offer, per completion or per request.
 
+**Execution model (from RustEE's author; this revision applies it).**
+
+1. The lattice serialises access to every `LatticeSource` attached to it: only one worker is ever inside a source's
+   `request` or `pull`, so whatever those two touch is single-consumer state. `request` is where a source assembles
+   work and pushes it; `pull` hands over work that is ready now. The workers drive the system themselves, through the
+   events of a frame or of a source; one lattice is enough.
+2. A spin inside a queue is fine when it is a CAS loop (as in the upstream Java queues).
+3. The hot path is lock-free; locks only for start, stop and rebalance.
+
 **Scope.** `main` at `b33258c`: `euhedral-core`, `euhedral-data-structures`, `euhedral-hashing`,
 `euhedral-hardware-utils`, `euhedral-graph`, `euhedral-io`, `euhedral-memory`. `euhedral-gpu` is out of scope (it is
 being reworked separately). Test code (`tests.rs`, `testing.rs`, `#[cfg(test)]` modules, `tests/`, `examples/`) is
 not counted. Paths are relative to the repository root; line numbers are those of `b33258c`.
 
-**Classes.**
+**Classes** (where the lock is taken today):
 
 - **HOT**: runs per frame, pull, offer, completion or request in steady state.
 - **LIFECYCLE**: start, stop or rebalance only.
 - **MIXED**: both; each row says which paths are which. Rows tagged **tick** are taken in steady state by the
   periodic control loop (resource monitor poller, its dispatcher, the lattice's and shards' utilization updates).
   Those never run on a lattice worker and never contend with one, but they are not lifecycle work either, so they are
-  counted as MIXED and fixed last (see question 1).
+  counted as MIXED and fixed last (question 1).
+
+**Routes** (how each HOT or MIXED lock goes away; §2.1 gives every finding's route and reason):
+
+- **SOURCE**: the state is only touched inside one source's `pull`/`request`, so it becomes plain single-consumer
+  state in a `SourceCell` (§2.0); lifecycle calls reach it through the source's serialiser, never concurrently.
+- **SPLIT**: producers on any thread feed it, and only the source's `pull`/`request` drains it: a lock-free queue
+  (or atomics) on the producer side, the queue's `Single` consumer role (or a `SourceCell`) on the consumer side.
+- **OWNER**: one thread owns it by construction (the worker that owns its output); it moves onto that thread.
+- **SNAPSHOT**: read on hot paths by many threads, written only at rebalance or close: a published snapshot read
+  without a lock or a reference count, retired by the writer after a grace period.
+- **FAN-IN**: written by many producers (completions and arrivals from any worker): atomics, or ownership proved by
+  the counters that already order the phases.
+- **QUEUE-MC**: multi-consumer by design (work stealing): the existing queue's `Multi` consumer role.
+- **TICK**: the periodic control loop; question 1.
+- **OPEN**: needs an answer first (question 4).
 
 ## 1. Summary
 
 | Crate | HOT | MIXED | of which tick | LIFECYCLE |
 |---|---:|---:|---:|---:|
 | `euhedral-core` | 4 | 16 | 5 | 14 |
-| `euhedral-data-structures` | 1 | 0 | 0 | 1 |
+| `euhedral-data-structures` | 0 | 0 | 0 | 1 |
 | `euhedral-hashing` | 0 | 0 | 0 | 0 |
 | `euhedral-hardware-utils` | 0 | 7 | 7 | 4 |
 | `euhedral-graph` | 10 | 3 | 0 | 2 |
 | `euhedral-io` | 10 | 5 | 0 | 1 |
 | `euhedral-memory` | 0 | 1 | 0 | 2 |
-| **Total** | **25** | **32** | **12** | **24** |
+| **Total** | **24** | **32** | **12** | **24** |
+
+| Route | Findings | Count |
+|---|---|---:|
+| SOURCE | C11, C12, C13, G1, G2, G3, I1, I2, I4, I5, I10, I14 | 12 |
+| SPLIT | C15, I3, I6, I7, I8, I9, I13, I15 | 8 |
+| OWNER | C1, C2, C3, C10 | 4 |
+| SNAPSHOT | C5, C6, C7, C8, C9, G7, I11, I12 | 8 |
+| FAN-IN | C14, G4, G5, G6, G10, G11, G12, G13, G14, G15 | 10 |
+| QUEUE-MC | C4 | 1 |
+| TICK | C16-C20, H1-H7 | 12 |
+| OPEN | M1 | 1 |
 
 One finding is one lock (a field or a static) or one blocking call site, with all its acquisitions.
+
+**Changes from the first revision.** D1 (multi-producer queue offers spinning on the tail's `RESIZING` flag while
+another producer links a chunk, `queues/core.rs:371-378`) is a CAS loop inside the queue and is fine by point 2; it
+moves to the "not locks" list, and the chunk that redesigned it is dropped. Twelve findings now take the SOURCE route,
+which needs no new concurrent structure at all, and the `Claim<T>` primitive of the first revision is gone: every
+claim it stood for was either a source's single consumer or the queue's own `Multi` consumer.
 
 **Where the hot locks are, by path:**
 
 - **Every frame a worker runs** passes `LatticeHotSource::accept`: one `RwLock` read, two hook `Mutex`es and the
   `StopWatch` `Mutex` twice (C1, C2, C10), plus the body-cost `Mutex` on sampled frames (C3).
-- **Every frame pushed through the lattice** (the request path: source push, global distributor, socket edge, core
-  distributor, core edge, cache) takes two vertex routing `RwLock`s and two edge downstream `RwLock`s, each with an
-  `Arc` clone on a line every worker shares (C6, C8).
+- **Every frame pushed through the lattice** (a source's `request` pushing through the global distributor, socket edge,
+  core distributor, core edge, cache) takes two vertex routing `RwLock`s and two edge downstream `RwLock`s, each with
+  an `Arc` clone on a line every worker shares (C6, C8).
 - **Every cache take and steal** takes a partition `Mutex` (`try_lock`), and every steal attempt a directory
   `RwLock` (C4, C5).
 - **Every pull and request of a stock source** takes the ingest `Downstream` `RwLock` and the queue consumer `Mutex`
-  (C11, C12, C13); `Completions` and `AsyncIo` take two or three `Mutex`es per poll (G1-G3, I1-I6).
+  (C11, C12, C13); `Completions` and `AsyncIo` take two or three `Mutex`es per poll (G1-G3, I1-I6). All of these sit
+  inside the lattice's serialisation already.
 - **Every completion** in `euhedral-graph` takes a `Mutex` (`Join`, `Sequencer`, `Latch`) and a stage graph takes
   five `Mutex`es and an `RwLock` per stage (G4-G6, G10-G15).
 - **Every Windows I/O operation** takes the slab `Mutex` two to four times and one or two `HashSet` `Mutex`es (I7-I15).
-- **Multi-producer queue offers** spin while another producer installs a new chunk (D1).
 
 **Not locks, and left as they are** (listed so the next audit does not re-raise them):
 
+- Multi-producer queue offers spinning on `RESIZING` while another producer links a chunk
+  (`euhedral-data-structures/src/queues/core.rs:371-378`, formerly D1): a CAS loop inside the queue (point 2).
 - The worker's idle parks: `control_plane/fragment.rs:359` (no upstreams and an empty cache), `:430`/`:432` (Idle
-  path), `:439`/`:442` (unproductive park or yield), and the `spin_loop` hint at `:454`. They run only when the
-  worker found no work, and they wait on no other thread (question 3).
-- Non-blocking claims, which fail instead of waiting: `UpstreamInterceptor::try_acquire`
-  (`flow_control/vertex.rs:594`), `ChunkPool::try_lock` (`queues/chunk.rs:133`), the multi-consumer queue's
-  `try_lock_consumers` (`queues/core.rs:176`). Several fixes below reuse this pattern (question 2).
+  path), `:439`/`:442` (unproductive park or yield), and the `spin_loop` hint at `:454`: the `IdlePolicy` at work,
+  only when the worker found no work, waiting on no other thread.
+- The lattice's own source claim, `UpstreamInterceptor::try_acquire` (`flow_control/vertex.rs:594`), which is what
+  serialises sources (§2.0); `ChunkPool::try_lock` (`queues/chunk.rs:133`) and the multi-consumer queue's
+  `try_lock_consumers` (`queues/core.rs:176`): CAS claims inside the queues that fail instead of waiting.
 - The seqlock read of the flow meters (`metrics/flow.rs:88-115`): bounded retries, and the writer never waits.
 - CAS retry loops that wait on nobody: the atomics in `euhedral-data-structures/src/atomics`, the planner, arena and
   tier moves in `euhedral-memory` (`planner.rs:293,391,756,1163`, `arena.rs:207`, `tiers.rs:610,928,966`).
@@ -70,7 +113,144 @@ One finding is one lock (a field or a static) or one blocking call site, with al
 
 ## 2. Findings
 
-### 2.1 HOT
+### 2.0 The source invariant
+
+**What the lattice guarantees.** A source joins a lattice through `LatticeVertex::ingest`
+(`flow_control/vertex.rs:369`), which wraps it in one `UpstreamInterceptor` and adds that interceptor to the
+`UpstreamRegistry` as an `UpstreamHandle`. A worker's `UpstreamQueue` services a handle only between
+`handle.try_acquire()` (`upstream_queue.rs:405`; for the interceptor a `swap(true, Acquire)` on its `lock`) and
+`handle.release()` (`:642`, a `store(false, Release)`), and the interceptor reaches the source's `pull` and `request`
+only from there (`serviceable` checks the lock, `vertex.rs:547`). A source accepts one downstream, so it has one live
+interceptor. Hence:
+
+> **Invariant.** For a source attached to a lattice, at most one thread at a time executes its `pull` or `request`,
+> and each executor of them happens-after the previous one (release on `release`, acquire on `try_acquire`).
+
+The glossary already states the contract for every source: "Only one thread at a time is inside a source's `pull` or
+`request`". A source driven without a lattice (a test, or `AsyncIo` driven by hand) relies on its caller for the same
+guarantee, as today.
+
+**Under the invariant:** `LatticeSource::pull`, `LatticeSource::request`, and everything they run synchronously on the
+same source: `QueueSource::drain_requests`, `Completions::emit`, `Front::reap` and the engines' `poll`, the
+`IdleWatch` poll, and the source's own push to its receiver. Also the interceptor's own `serviceable` state.
+
+**Not under it:**
+
+- `add_downstream` (attach). It runs before the interceptor is registered, so it happens-before every `pull` and
+  `request`; a slot it writes once is safe to read under the invariant without a lock.
+- `complete`, `clear`, kill: lifecycle calls from any thread, including from a frame the source's own `pull` is running
+  (the direct path executes pulled frames inside `pull`).
+- Producers: `QueueIngestSink::offer*`, `Completions::{after, after_marker, at, register}`, `AsyncIo` submissions,
+  `Lake::offer`, `LatticeHotSource::accept`, `LatticeHotReceiver::push`. Any thread.
+- `is_complete`, `pending`, `demand`, `size`: queries from any thread.
+- Everything a source's `request` pushes into (vertices, edges, caches): shared by all sources, so many workers are in
+  it at once, each under a different source's serialisation.
+- Cache partitions: a cache is a lattice node, not a source; its owner and the stealers take from it concurrently.
+- `Drop`: `&mut self`.
+
+**How lifecycle calls reach source state** (`serialize`): a lifecycle call that must touch a source's consumer state
+(cancel queued frames, drop the receiver, drop the lane pool) hands the work to whoever holds the source's
+serialisation, and never waits:
+
+- `LatticeReceiver` gains `fn serialize(&self, action: Box<dyn FnOnce() + Send>)`. The default runs the action at
+  once (a receiver that is not a lattice: the caller is the only driver).
+- `UpstreamInterceptor` implements it on its existing claim. The `lock` becomes an owner token (`AtomicU64`, 0 for
+  free) and the interceptor gets an `MpscQueue` of pending actions and a `pending` flag. `serialize` acquires the
+  claim if it is free, runs the action and any pending ones, and releases. If the calling thread holds the claim (an
+  action from a frame that the source's own `pull` runs) or another worker does, the action is queued; the holder runs
+  pending actions before it releases and looks again after (the `waiting`-flag protocol of
+  `euhedral-io/src/uring.rs:280-376`). Nobody waits, and an action never runs while a `pull` or `request` of the source
+  is in progress.
+- After the interceptor completes, workers stop servicing it, so `serialize` finds the claim free and runs at once.
+
+**`SourceCell<T>`** (new, `euhedral-core::generics`, next to `LatticeSource`) encodes the invariant once:
+
+```rust
+/// State that only a source's `pull` and `request` (and actions run by `serialize`) touch. The lattice serialises
+/// those calls (see the source invariant), so it needs no lock and no atomics.
+pub struct SourceCell<T> {
+    value: UnsafeCell<T>,
+    #[cfg(debug_assertions)]
+    inside: AtomicBool, // debug only: catches a second thread, or a nested `enter`
+}
+
+impl<T> SourceCell<T> {
+    pub const fn new(value: T) -> Self;
+    /// # Safety
+    /// The caller is inside this source's `pull` or `request`, or in an action `serialize` runs, and holds no other
+    /// guard of this cell.
+    pub unsafe fn enter(&self) -> SourceGuard<'_, T>; // DerefMut to T; debug: asserts and sets `inside`
+    pub fn get_mut(&mut self) -> &mut T;              // construction, Drop
+    pub fn into_inner(self) -> T;
+}
+unsafe impl<T: Send> Sync for SourceCell<T> {}
+```
+
+The name is meant for reuse by any component whose state lives behind a source: it says what serialises it.
+
+**`DownstreamSlot`** (core) is the receiver of a source: `receiver: SetOnce<Arc<dyn LatticeReceiver>>` and
+`state: AtomicU8` (empty, attaching, attached, complete).
+
+- `attach` claims the slot with a CAS (empty → attaching), sets the receiver, and moves to attached; if `complete` raced
+  in between, it delivers `on_complete` itself.
+- `complete` swaps in complete and calls `on_complete` if the previous state was attached.
+- Under the invariant, `receiver()` is a state load and a pointer load: no lock, no `Arc` clone.
+- The receiver is never cleared. The source ↔ interceptor cycle that `complete` breaks today by dropping the receiver
+  is broken on the other side: the interceptor keeps its source in a `SourceCell<Option<Arc<dyn LatticeSource>>>` and
+  drops it, through its own `serialize`, when it finishes.
+
+### 2.1 Route and reason, per HOT and MIXED finding
+
+| ID | Class | Route | Reason |
+|---|---|---|---|
+| C1 | HOT | OWNER | `LatticeHotSource::accept` is a push by the fragment's one worker, not a `pull`/`request`; the hooks are only called by that worker. |
+| C2 | HOT | OWNER | The stop watch lives in C1's hooks: same single caller. |
+| C3 | MIXED | OWNER | `BodyCost` is recorded from C1's hooks and read, calibrated and reset by the same worker's `DecisionTree`. |
+| C10 | MIXED | OWNER | Single pusher by the hot source's contract ("one thread is expected to do the pushing"); its downstream is attached once at clone build and becomes a `DownstreamSlot`. |
+| C11 | MIXED | SOURCE | The ingest receiver is read only in `pull`/`request`/`drain_requests`; written at attach (before registration) and at `complete` (state flag): `DownstreamSlot`. |
+| C12 | MIXED | SOURCE | The queue's consumer is used only by `pull` and `drain_requests` (from `request`); `clear`, kill's `discard_queued` and the after-close drain from `publish` go through `serialize`. The queue's `Single` consumer role in a `SourceCell`. |
+| C13 | MIXED | SOURCE | The one frame is taken only by `pull`/`request`; `complete` cancels it through `serialize`. |
+| G1 | HOT | SOURCE | `Completions::emit` runs only from `pull`/`request`; registrations arrive through the existing MPSC queue (producers); the `add`-side `sweep` goes (the next poll or `Drop` already guarantees it). |
+| G2 | MIXED | SOURCE | The lane pool is read only by `emit`; it moves into the `Poll` state and `complete` drops it through `serialize`. |
+| G3 | MIXED | SOURCE | Receiver read only by `request`: `DownstreamSlot`. |
+| I1 | HOT | SOURCE | `Front::reap` runs only from `AsyncIo::pull`/`request` (its doc already says "only the polling thread touches it"). |
+| I2 | MIXED | SOURCE | Receiver read only by `request`: `DownstreamSlot`. |
+| I4 | HOT | SOURCE | The ring's submission side is written today by the submitting thread and by the poll; moving all kernel submission into the poll (submitters only offer to the existing lock-free `incoming` queue) makes it single-consumer (question 6). |
+| I5 | HOT | SOURCE | Reaping the completion queue happens only in the poll; the lock "makes it a fact" (`uring.rs:67`): the invariant already does. |
+| I10 | HOT | SOURCE | The inbox is touched only by the poll. |
+| I14 | MIXED | SOURCE | Like I4 for an IoRing: build and submit move into the poll; `break_ring` goes through `serialize`. |
+| C15 | HOT | SPLIT | Deferred frames are produced by pushers (any thread); retrying them becomes the `pull`/`request` of a retry source the lattice polls, instead of a back-off loop. |
+| I3 | MIXED | SPLIT | Rings are appended by submitting threads (first submit) and walked only by the poll: an append-only array of `SetOnce` slots and a length. |
+| I6 | MIXED | SPLIT | An op is inserted by its ring's owner thread and reaped only by the poll: per-slot generations, and freed slot indexes go back over an SPSC queue (producer: the poll; consumer: the owner thread). |
+| I7 | HOT | SPLIT | Ops begin on any submitting thread and end in the poll: per-slot state atomics; freed indexes go back over an SPMC queue (producer: the poll; consumers: submitters). |
+| I8 | HOT | SPLIT | Failed calls are produced by submitters and drained by the poll: `MpscQueue`, `Single` consumer used under the invariant. |
+| I9 | HOT | SPLIT | Pool-job results are produced by pool threads and drained by the poll: `MpscQueue`. |
+| I13 | MIXED | SPLIT | As I3, for Windows rings. |
+| I15 | HOT | SPLIT | Entries are produced by `launch` on submitting threads and drained by the poll: `MpscQueue`. |
+| C5 | MIXED | SNAPSHOT | The directory is read by every stealing worker and written at cache build and close. |
+| C6 | MIXED | SNAPSHOT | The routing generation is read by every worker whose source `request` pushes (many sources at once), written at rebalance and close. |
+| C7 | MIXED | SNAPSHOT | `Book` is locked on a worker only because the last pusher retires a generation; with the writer retiring it after the grace period, `Book` is lifecycle-only. |
+| C8 | MIXED | SNAPSHOT | Edge downstreams are read by all pushing workers, written at attach and close. |
+| C9 | MIXED | SNAPSHOT | Edge parents are read by every worker that climbs edges, written at attach and remap. |
+| G7 | MIXED | SNAPSHOT | The lake's generation is read by `Lake::offer` from any thread (producers), written at attach and detach. |
+| I11 | HOT | SNAPSHOT | Handle routes are read per submit on any thread; a handle's first use is its attach. |
+| I12 | HOT | SNAPSHOT | As I11. |
+| C14 | HOT | FAN-IN | The outcome is set by a chain's last finalizer on any worker and read by the submitter: a one-shot cell. |
+| G4 | HOT | FAN-IN | `Join` parts arrive from any worker. |
+| G5 | HOT | FAN-IN | `Latch` is set from any worker, waited on by the main thread. |
+| G6 | HOT | FAN-IN | `Sequencer` slots are registered and completed from any thread; release is already serialised by its `wip` counter. |
+| G10 | HOT | FAN-IN | The quantum is read by stage frames on any worker; the run's `holds` count proves `conclude` owns it. |
+| G11 | HOT | FAN-IN | First outcome from any stage frame: set-once. |
+| G12 | HOT | FAN-IN | Inputs merge from every predecessor's frame: per-lane atomic maximum; `pending` reaching zero proves the stage's frame owns them. |
+| G13 | HOT | FAN-IN | Outputs published by one stage frame, subscribed by other quanta's frames: a set-once value plus a closable waiter stack. |
+| G14 | HOT | FAN-IN | The frontier is covered by many frames: per-lane atomic maximum plus a take-all stack of host completions. |
+| G15 | HOT | FAN-IN | Pins pushed at registration, taken once per stage and at quiesce: take-all stacks. |
+| C4 | MIXED | QUEUE-MC | The owner and stealing workers consume concurrently by design; the queue's `Multi` consumer role (a CAS claim inside the queue) replaces the `Mutex`. |
+| C16-C20, H1-H7 | MIXED | TICK | The periodic control loop; question 1. |
+| M1 | MIXED | OPEN | Whether a blocking CUDA free may run on a worker; question 4. |
+
+
+### 2.2 HOT (where the lock is taken today)
 
 | ID | Site | Protects | Hot paths |
 |---|---|---|---|
@@ -78,7 +258,6 @@ One finding is one lock (a field or a static) or one blocking call site, with al
 | C2 | `euhedral-core/src/control_plane/fragment.rs:748-753` | the sampling `StopWatch` (`Arc<Mutex<StopWatch>>`) | Same path as C1: `start` in `before_each`, `stop` in `after_each`, every frame. |
 | C14 | `euhedral-core/src/ingest/pipeline_runner.rs:39-43` | the outcome hand-off: `mpsc::sync_channel(1)` per submitted chain | Per request: `PipelineRunner::submit*` makes the channel; the chain's last finalizer `send`s it on a worker, which takes the channel waker's internal `Mutex` and wakes the waiting receiver. |
 | C15 | `euhedral-core/src/flow_control/hot_receiver.rs:46` | back-off (`spin_wait::await_while`: spin, yield, then 10 µs parks) until the `PushHook` takes the frame | Per push: `LatticeHotReceiver::push` waits on whatever frees the hook. Public API; nothing in the workspace uses it. |
-| D1 | `euhedral-data-structures/src/queues/core.rs:371-378` | the tail's `RESIZING` flag in `mp_reserve` | Per offer of every multi-producer queue at a chunk boundary: a producer spins while another allocates and links the next chunk (`mp_resize`, `:428`), allocator call included. Reached by `QueueIngestSink::offer`, every cache `offer`, `Completions::add`, the io_uring incoming queue, registry handle queues. |
 | G1 | `euhedral-graph/src/completions.rs:70` (`:310`, `:315`; `try_lock` at `:246`) | `Poll`: the consumer of incoming registrations and the waiting list | Per pull and request: worker → `UpstreamInterceptor::pull`/`request` → `Completions::pull`/`request` → `emit` (blocking `lock`); the lock is held while `consumer` runs the emitted frames on the direct path. `sweep` per `add` racing `complete`. |
 | G4 | `euhedral-graph/src/join.rs:10` (`:56`) | `JoinState` (values, ended flags, remaining, continuation) | Per completion: `Join::arrive` / `abandon` from each branch's frame. |
 | G5 | `euhedral-graph/src/latch.rs:27` (`:79`, `:97`, `:135`) | the value, abandoned flag and parked waiter | Per completion: `LatchSetter::set` / its `Drop` on a worker. The waiter's `thread::park` (`:147`) is on the main thread, by design. |
@@ -100,7 +279,7 @@ One finding is one lock (a field or a static) or one blocking call site, with al
 | I12 | `euhedral-io/src/win/mod.rs:378` (`:858`, `:861`) | handles a ring serves (`HashSet`) | Per file read/write (`file_route`). |
 | I15 | `euhedral-io/src/win/mod.rs:324` (`:696`, `:702`, `:730`, `:736`, `:809`, `:952`) | a ring's backlog of entries | Per ring submit (`launch`) and per flush (`flush_ring`, three acquisitions per entry). |
 
-### 2.2 MIXED
+### 2.3 MIXED
 
 | ID | Site | Protects | Hot paths | Lifecycle paths |
 |---|---|---|---|---|
@@ -135,9 +314,9 @@ One finding is one lock (a field or a static) or one blocking call site, with al
 | H5 | `euhedral-hardware-utils/src/monitor/dispatcher.rs:29-30` | the listener list and the latest value (`Mutex` + `Condvar`) | **tick**: `offer` (`:99`) per utilization; `dispatch_loop` (`:139`, `wait`) per delivery. | `add_listener`, `remove_listener` (attach), `begin_close`, `Drop`. |
 | H6 | `euhedral-hardware-utils/src/topology/mapper.rs:51` | per-socket topology versions | **tick**: `update` (`:125`) via `update_from` from `lattice.update` per utilization. | — |
 | H7 | `euhedral-hardware-utils/src/topology/mapper.rs:52` | the effective topology (`RwLock<Arc<..>>`) | **tick**: `effective_topology` read + `Arc` clone (`:95`) and write (`:184`) per utilization. | Lattice construction reads it. |
-| M1 | `euhedral-memory/src/cuda/backends.rs:49`, `:63`, `:444`, `:478` (and `free_vmm` `:319`) | blocking driver calls: `cuMemAlloc`, `cuMemHostAlloc`, `cuMemFree`, `cuMemFreeHost` (the frees synchronise the device) | Wherever the application runs `Reaper::reap` (`backend.rs:140`): its doc says "on the owner's lane", which is a lattice worker, per frame that reaps. | Arena and pool construction and teardown; the module doc (`backend.rs:5-7`) says a blocking free never runs on a worker. See question 8. |
+| M1 | `euhedral-memory/src/cuda/backends.rs:49`, `:63`, `:444`, `:478` (and `free_vmm` `:319`) | blocking driver calls: `cuMemAlloc`, `cuMemHostAlloc`, `cuMemFree`, `cuMemFreeHost` (the frees synchronise the device) | Wherever the application runs `Reaper::reap` (`backend.rs:140`): its doc says "on the owner's lane", which is a lattice worker, per frame that reaps. | Arena and pool construction and teardown; the module doc (`backend.rs:5-7`) says a blocking free never runs on a worker. See question 4. |
 
-### 2.3 LIFECYCLE
+### 2.4 LIFECYCLE
 
 | ID | Site | Protects | Paths |
 |---|---|---|---|
@@ -151,7 +330,7 @@ One finding is one lock (a field or a static) or one blocking call site, with al
 | C28 | `euhedral-core/src/control_plane/countdown.rs:9` | the rebalance continuation | `tick` (`:31`) as each retired shard shuts down. |
 | C29 | `euhedral-core/src/config/liveness.rs:76` (and `thread::sleep` at `:55`) | a worker slot's `Thread`; polling for termination | `enter`/`exit` at worker start and exit; `await_termination` on clone close. |
 | C30 | `euhedral-core/src/metrics/registry.rs:26` | registered meter sources | `register`/`remove` at worker and cache build and close; `snapshot` and `len` are observer queries, never taken by a worker. |
-| C31 | `euhedral-core/src/flow_control/edge.rs:164` | `add_upstream_handle` spin-waits (`await_while`) while the edge drains | Attaching a source during a rebalance. Reached from `Lake::offer` when a busy period starts on a worker (question 7). |
+| C31 | `euhedral-core/src/flow_control/edge.rs:164` | `add_upstream_handle` spin-waits (`await_while`) while the edge drains | Attaching a source during a rebalance. Reached from `Lake::offer` when a busy period starts on a worker (question 3). |
 | C32 | `euhedral-core/src/control_plane/shard.rs:445`, `:539`, `:605` | waiting for clones to drain; waiting for a rebalance before a reset | Rebalance, shut-down, reset (task-pool threads and the resetting thread). |
 | C33 | `euhedral-core/src/control_plane/lattice.rs:264`, `:508` | waiting for readiness; waiting for a rebalance before a reset | `start`, `clear`. |
 | C34 | `euhedral-core/src/control_plane/cache.rs:142`, `ingest/queue.rs:54`, `flow_control/vertex.rs:480` | set-once cells (`OnceLock`): SMT sibling, ingest owner, interceptor upstream | Set once at build or attach by one setter; `get` on hot paths is a lock-free load. |
@@ -169,482 +348,330 @@ One finding is one lock (a field or a static) or one blocking call site, with al
 `cuCtxSynchronize` and `cuEventSynchronize` are loaded (`euhedral-memory/src/cuda/mod.rs:145`, `:177`) but the
 library calls neither.
 
+
 ## 3. Replacement designs
 
 ### 3.0 Building blocks
 
-The designs below use, in the preferred order: single ownership; the queues of `euhedral-data-structures`
-(`Queue<T, P, C>` with `Single`/`Multi` handles, `PartitionedQueue`); atomics and copy-on-write snapshots written
-only at lifecycle time. Five small primitives are new, because nothing in the workspace offers them. They go in
-`euhedral-data-structures` (a new `sync` module), next to the queues, with the queues' style of role handles and
-drop safety:
+In the preferred order: single ownership (including the source invariant, which is single ownership the lattice
+already provides); the queues of `euhedral-data-structures` (`Queue<T, P, C>` with `Single`/`Multi` roles,
+`PartitionedQueue`); atomics and published snapshots written only at lifecycle time. New pieces, each because nothing
+in the workspace offers it:
 
-1. **`Claim<T>`**: a value behind an `AtomicBool`, the pattern `ChunkPool` already uses (`queues/chunk.rs:112`).
-   `try_claim(&self) -> Option<ClaimGuard<'_, T>>` never waits; the guard gives `&mut T` and releases on drop,
-   unwinding included (no poisoning: a panicking holder leaves the value as it was, as `try_hold` does today with
-   `PoisonError::into_inner`). `claim_spin(&self, deadline)` exists for lifecycle callers only and is listed in the
-   lint as a disallowed method outside lifecycle code. Why new: `Consumer<_, Multi>` gives the same claim for queue
-   consumers (and is used for those below), but several claimed values are not queues (`VecDeque`s, a slab, the
-   completions' waiting list).
-2. **`SetOnce<T>`**: `AtomicPtr<T>` installed by CAS from a `Box`; `get` is an acquire load returning `&T`; `set`
-   hands the value back if already set; no blocking init path. Why new: `OnceLock::set` can block a racing `get_or_init`
-   and its intent (lazy init) differs; here the cell is written once at attach or by the first of several writers
-   (`get_or_insert` semantics).
-3. **`Published<T>`**: an atomically replaceable `Option<Arc<T>>` whose reads are lock-free and whose writes are
-   lifecycle-only. Why new: there is no atomic `Arc` swap in the workspace, and `Arc` clones on the shared count are
-   themselves the contention C6 and C8 suffer from. Design (a two-parity reader count, a brief form of RCU):
-   - state: `current: AtomicPtr<T>` (from `Arc::into_raw`, null for `None`); `parity: AtomicUsize`;
-     `readers: [Box<[CachePadded<AtomicUsize>]>; 2]`, one padded counter per stripe. The stripe is the caller's CPU for
-     pinned workers (each worker writes only its own line) and a thread-local index for any other thread.
-   - `load(&self) -> Guard<'_, T>`: `p = parity.load`; `readers[p & 1][stripe].fetch_add(1)`; if
-     `parity.load != p`, undo and retry (only a concurrent writer causes a retry); then `current.load(Acquire)`. The
-     guard derefs to `Option<&T>` and decrements on drop. Cost: two read-modify-writes on the caller's own line and
-     two loads, against today's `RwLock` read (a CAS and a release on a line shared by every worker) plus an `Arc`
-     clone and drop (two more on a shared line). `Guard::to_arc()` clones when a caller must keep the value.
-   - `store(&self, new: Option<Arc<T>>) -> Retired<T>`: callers are serialised by a lifecycle lock or by
-     construction. `old = current.swap(new)`; `parity.fetch_add(1)`. `Retired` holds `old` and the parity it was read
-     under. It drops `old` once that parity's stripes sum to zero: `retired.wait(deadline)` (spins; lifecycle threads
-     only), or `cell.defer(retired)` (never waits: keeps it in the cell's single pending slot and frees it at the next
-     `store`, `try_reclaim` or drop that finds the stripes empty).
-   - Invariant: at most one retirement is pending. A `store` that finds the previous one still held by readers either
-     waits (lifecycle threads) or returns `Err(new)` to a caller that must not wait (`try_store`), which retries at its
-     next lifecycle step. A store whose `old` is `None` needs no grace period.
-   - A debug assertion fails a `store(...).wait()` called while the same thread holds a guard of that cell.
-4. **`OneShot<T>`**: one value from a setter to a receiver: `state: AtomicU8` (empty, waiting, set, abandoned),
-   `value: UnsafeCell<MaybeUninit<T>>`, `waiter: SetOnce<Thread>`. The setter writes the value, swaps the state to
-   set, and unparks the waiter if the previous state was waiting (a wake, never a wait). The receiver has
-   `try_recv` and `recv` (parks; for a thread outside the lattice). Why new: `std::sync::mpsc` and `Latch` both take a
-   lock on the setter's side.
-5. **`TakeAllStack<T>`**: a push-only stack (`AtomicPtr` head, CAS push) whose consumer takes the whole list with one
-   swap, optionally closing it (`take_and_close`: later pushes fail and hand the value back). Swapping the whole list
-   avoids the ABA problem of single pops. Why new: the queues allocate a chunk per queue, too heavy for the per-stage,
-   per-quantum lists of the stage graph, which hold a handful of entries and are drained once.
+- **In `euhedral-core`** (§2.0): `SourceCell<T>`, `DownstreamSlot`, and `LatticeReceiver::serialize` with its
+  implementation on `UpstreamInterceptor` (owner-token claim plus a pending-action `MpscQueue`).
+- **In `euhedral-data-structures`** (a new `sync` module, in the queues' style of role handles and drop safety):
+  1. **`SetOnce<T>`**: an `AtomicPtr<T>` installed by CAS from a `Box`; `get` is an acquire load returning `&T`; `set`
+     hands the value back if already set. No blocking init path (unlike `OnceLock::set`, which can block a racing
+     `get_or_init`).
+  2. **`Published<T>`**: an atomically replaceable `Option<Arc<T>>` with lock-free, count-free reads and
+     lifecycle-only writes, reclaimed by epochs. The domain is the lattice's: `UpstreamRegistry` already keeps one
+     queue per thread and now keeps one padded epoch slot per thread too.
+     - A **worker** announces a quiescent point once per cycle (`run_cycle` start: one load of the global epoch and
+       one store to its own slot) and marks itself idle before it parks. Inside the cycle, `load_in_cycle()` is a plain
+       acquire load of the pointer: no read-modify-write and no reference count per push. That is what C5, C6, C8 and
+       C9 need: their readers are workers (a source's `request` and the steals run only on workers; a thread that
+       never registers has an empty upstream queue, so it never services a source).
+     - **Any other thread** (`Lake::offer` and submissions from outside the lattice) uses `load()`, which marks its
+       slot active at the current epoch for the duration of the guard (one store and one fence, its own line).
+     - `store(new)` swaps the pointer, advances the epoch, and returns a `Retired<T>`. `wait(deadline)` (lifecycle
+       threads; spins) drops the old value once every slot is idle or past the new epoch. `defer` keeps it in the
+       cell's single pending slot until a later `store`, `try_reclaim` or `Drop` finds it reclaimable. A store with a
+       still-pending retirement waits (lifecycle) or, as `try_store`, hands the value back. A debug assertion catches a
+       writer that waits from inside its own read.
+  3. **`OneShot<T>`**: `state: AtomicU8` (empty, waiting, set, abandoned), the value, and a `SetOnce<Thread>` waiter.
+     The setter writes, swaps the state, and unparks a waiter it finds (a wake, not a wait). `try_recv` and a parking
+     `recv` for a thread outside the lattice.
+  4. **`TakeAllStack<T>`**: CAS push; the consumer takes the whole list with one swap, optionally closing it (later
+     pushes hand the value back). Whole-list swaps avoid ABA. For the stage graph's per-stage lists, where a queue's
+     chunk per list would be too heavy.
 
-And one composite in `euhedral-core` (public, since `euhedral-graph`, `euhedral-io` and `euhedral-memory` sources use
-it):
+### 3.1 SOURCE route
 
-6. **`DownstreamSlot<R: ?Sized>`**: a source's one receiver, attached once and detached once on completion, which
-   hears of completion exactly once. `cell: Published<R>`, `state: AtomicU8` (empty, attaching, attached, complete).
-   - `attach(r)`: CAS empty → attaching (otherwise: complete → `r.on_complete()`, attached → `r.on_error`); store
-     `Some(r)` (old is `None`: nothing to retire); CAS attaching → attached; if `complete` raced in between, take it
-     back and call `r.on_complete()`.
-   - `complete()`: `prev = state.swap(complete)`; if `prev == attached`: `store(None)`, `on_complete()` on the old
-     receiver, `defer` the retirement (no wait, so `complete` stays callable from a frame). If `prev == attaching`, the
-     attacher delivers the completion.
-   - `with(|r| ..)`: if attached, run `f` under a `load` guard. One store after attach, so the pending-retirement rule
-     never bites.
+**Ingest (C11, C12, C13).**
 
-### 3.1 `euhedral-core`
+- `Downstream` becomes `DownstreamSlot` plus the `demand` atomic. `demand` stays atomic because it is also a public
+  query; `request_pending` and the `try_hold` retry loop in `drain_requests` go, because under the invariant no
+  second thread can hold the consumer.
+- `QueueSource.consumer: SourceCell<PartitionedConsumer<_, Single>>`, entered by `pull` and `drain_requests`. The
+  three paths that touch it from outside go through `self.downstream.serialize(..)`: `clear` (lifecycle), kill's
+  `discard_queued` (lifecycle), and the drain that `publish` triggers after the sink closed (a producer, once). An
+  unattached sink (no lattice) runs them at once.
+- `SingleUseSource.frame: SourceCell<Option<Box<dyn Frame>>>`. `pull`/`request` test `stop` and take the frame;
+  `complete` cancels it in a serialised action, then completes the slot. Exactly one of them finishes the frame.
 
-**C1, C2, C3, C10: the worker's output path (single ownership).** The hooks, the stop watch and the body-cost window
-are only ever touched by the one worker that owns the output, so they move onto that worker's stack.
+**`Completions` (G1, G2, G3).** `poll: SourceCell<Poll>` with the lane pool moved inside it. `emit` enters the
+cell; registrations still arrive through the `incoming` MPSC queue. `complete` sets the flag, offers the `Closed`
+marker, completes the `DownstreamSlot`, and serialises an action that drops the lanes and cancels late registrations.
+The `sweep` that `add` runs when it races `complete` goes: the next poll, or `Drop` with `&mut self`, cancels them, as
+the code's own comment already guarantees.
+
+**`AsyncIo` (I1, I2, I4, I5, I10, I14).**
+
+- `Front.held: SourceCell<VecDeque<..>>`; `Front.downstream: DownstreamSlot`.
+- io_uring: `cq` loses its lock (reaping is only in the poll). The submission side becomes single-consumer: a
+  submitting thread only offers its entry to the ring's existing lock-free `incoming` queue, and the poll (under the
+  invariant) drains `incoming` into the kernel's submission queue, keeps the backlog, and enters the kernel. `sq`,
+  `waiting` and `flush_waiting` go. The cost is latency: an operation reaches the kernel at the next poll of the
+  `AsyncIo` source instead of during `submit` (question 6).
+- Windows: the inbox (I10) and a ring's `inner` (I14) become `SourceCell`s in the poll; `break_ring` from a submitter
+  serialises its cleanup.
+
+### 3.2 SPLIT route
+
+- **C15 `LatticeHotReceiver`**: a frame the hook defers goes to an owned `MpscQueue<Box<F>>`; the receiver is also a
+  `LatticeSource` whose `pull`/`request` (under the invariant, so a `Single` consumer) offers queued frames to the hook
+  again, in order; a new `push` while frames are queued queues behind them. Nothing spins: the lattice's polls retry.
+- **I3, I13 ring lists**: rings are never removed while the engine lives. `rings: Box<[SetOnce<Arc<Ring>>]>` of
+  `MAX_RINGS` slots and `len: AtomicUsize`; a thread's first submit reserves an index (`fetch_add`) and sets it; the
+  poll walks `0..len`. No clone or allocation per poll.
+- **I6 io_uring ops slab**: fixed segments of 256 slots (an append-only array of `SetOnce` segment pointers), each slot
+  an `UnsafeCell<Option<Op>>` with a `generation: AtomicU32`. The owner thread (the only submitter to its ring, by the
+  `MINE` thread-local) takes a free index, writes the op, stores the generation with release; the poll checks it with
+  acquire, updates `moved`, and on the end takes the op and returns the index over a `Queue<u32, Single, Single>`
+  (producer: the poll; consumer: the owner thread).
+- **I7 Windows slab**: the slot state machine (`Idle`, `Issuing`, `InFlight`, `Busy`) in an `AtomicU8` per slot,
+  changed by CAS; freed indexes return over an `SpmcQueue<u32>` (producer: the poll; consumers: submitters). The
+  `by_addr` map goes: `Rec` is `#[repr(C)]` with the `OVERLAPPED` first and the slot index, generation and an engine
+  tag beside it, so a packet's pointer leads to its slot by a cast, and the tag rejects strays.
+- **I8, I9, I15**: `MpscQueue`s (producers: failing submitters, pool threads, `launch`); the poll uses the `Single`
+  consumer under the invariant.
+
+### 3.3 OWNER route (C1, C2, C3, C10)
 
 - `LatticeHotSource` gains a single-role pusher, as the queues do: `pusher(&self) -> HotPusher` (panics if one is
-  live). `HotPusher` holds the hooks by value (`FnMut`, no `Mutex`) and pushes with `&mut self`. The shared part keeps
-  only the downstream, in a `DownstreamSlot` (C10): `accept` reads it under a guard, with no `Arc` clone per frame.
-  `before_each`/`after_each` move from the source builder to the pusher builder.
-- `ControlPlaneFragment` builds the pusher at start and keeps it in `Cycle` (the worker's own state), with the
-  `StopWatch` as a plain field. `timed` takes `&mut Cycle` and calls `cycle.output.push(frame)`.
-- `BodyCost` becomes a plain struct owned by `DecisionTree` (`&mut self` everywhere): `record`, `calibrate` and
-  `reset` already run only on the worker. The atomics `estimate_ns` and `samples` become plain fields. If anything
-  off the worker needs the estimate later, publish it with one relaxed `AtomicU64` store per window.
-- Result: zero shared writes per frame on the output path, besides the executor's own.
+  live), holding the hooks by value (`FnMut`) and pushing with `&mut self`. The shared part keeps only a
+  `DownstreamSlot`.
+- `ControlPlaneFragment` keeps the pusher and the `StopWatch` in `Cycle` (the worker's own state); `timed` takes
+  `&mut Cycle`.
+- `BodyCost` becomes a plain struct owned by `DecisionTree`; `record`, `calibrate` and `reset` already run only on the
+  worker.
+- Result: no shared write per frame on the output path besides the executor's own.
 
-**C4: cache partitions (existing queue role).** Build each cache's queue as a `PartitionedMpmcQueue` and hold one
-`Consumer<_, Multi>` per partition; its built-in non-blocking consumer claim (`try_lock_consumers`) replaces the
-`Mutex`.
+### 3.4 SNAPSHOT route
 
-- `greedy_while`: `consumer.drain_while(consume, stop, remaining)` with the queue's `max_consume_batch` set to
-  `u64::MAX` at construction, so one claim covers the whole take, as the held `MutexGuard` does today (stealers pass
-  over a claimed partition).
-- `poll_while`/`take_one`: `consumer.drain_while(consume, stop, 1)`, which peeks, tests `stop` and takes under one
-  claim, so a stealer never takes an ordered head.
-- `first_touch` and `reset_for_next_trial`: `Consumer<_, Multi>::clear` (spins on the claim: lifecycle only).
-- Producer side is unchanged (already `Multi`). The claim is released on unwind, which is what the poison takeover
-  does now.
+- **C6, C7 vertex routing**: `routing: Published<RoutingState>`. `try_push` uses `load_in_cycle` and holds the
+  reference across the downstream push. `set_downstream_mapping` and `close_after_routes_retire` store, `wait` for the
+  grace period (deadline: the lattice's shutdown timeout), then call `release(old)` themselves. `RoutingState` loses
+  its `Drop` hook, so `Book` is locked only by these lifecycle calls. A writer that reaches the deadline (one called
+  from inside a push) defers, and `release` runs at the next lifecycle step or at drop.
+- **C8, C9 edges**: `downstream` becomes a `DownstreamSlot`-like cell for the `Downstream` enum (attached once, then
+  detached at `close_edge` through `Published` with a deferred retirement); `parent` becomes
+  `Published<Weak<dyn LatticeNode>>`, still upgraded on the climb (off the stock worker loop), and `set_parent` skips
+  the store when unchanged.
+- **C5 cache directory**: `slots: Box<[Published<ControlPlaneCache>]>` with strong `Arc`s; a steal reads with
+  `load_in_cycle`; `withdraw` stores `None` and defers (a stealer may be running stolen frames).
+- **G7 lake**: `generation: Published<Generation>`. `offer` and `admit` use `load` (any thread). `attach` stores
+  `Some` under a lifecycle lock (nothing to retire); `detach` and `complete` store `None` and defer, and `detach` uses
+  `try_store`, staying attached until the next idle poll if a retirement is still pending.
+- **I11, I12 handle routes**: `Published<HashMap<Handle, Route>>`, copied on write when a handle is first seen (its
+  attach, under a lifecycle lock), read per operation. `join_port` then calls `associate` once per handle, not on every
+  send and receive.
 
-**C5: cache directory.** `slots: Box<[Published<ControlPlaneCache>]>` holding strong `Arc`s (the directory already
-lives no longer than the lattice; `withdraw` at close clears the slot, so no cycle survives close). `cache_at` returns
-a guard: no `Weak::upgrade` per steal. `claim` stores (old is `None`); `withdraw` stores `None` and `defer`s, because
-a stealer may hold the guard while it runs stolen frames, which can take long.
+### 3.5 FAN-IN route
 
-**C6, C7: vertex routing (copy-on-write generation, writer retires).** `routing: Published<RoutingState>`.
+- **C14 `PipelineRunner`**: `observed()` returns a `OneShot<Outcome>` receiver instead of `mpsc::Receiver`, recycled
+  through an `MpscQueue` pool so steady state allocates nothing (question 2).
+- **G4 `Join`**: `remaining: AtomicUsize`; per part `ended: AtomicBool` and `value: UnsafeCell<Option<T>>`. `end`
+  asserts `!ended.swap(true)`, writes the value, then `fetch_sub(1, AcqRel)`; the arrival that reaches zero takes the
+  values and the continuation.
+- **G5 `Latch`**: a wrapper of `OneShot`.
+- **G6 `Sequencer`**: admission order is the order of an `MpscQueue<Arc<SeqCell<T>>>` (cells with an `AtomicU8` state
+  and the value, recycled through a second queue). `register` offers a cell; `finish` writes and stores the state;
+  `release` keeps its `wip` counter, and its winner owns the order queue's `Single` consumer, popping and emitting
+  while the front is not pending.
+- **G10-G15 stage graph**: the counts (`pending`, `live`, `holds`) already order a run's phases with `AcqRel`:
+  - quantum (G10): `UnsafeCell<Option<Q>>`, read while `holds > 0`, taken by `conclude` after it reached zero;
+  - cause (G11): `SetOnce<QuantumOutcome>`;
+  - inputs (G12): `Box<[AtomicU64]>` per stage, one per lane, `fetch_max(value + 1)`, read after `pending` reached zero;
+  - boundary (G14): frontier markers the same way; host completions on a `TakeAllStack`, taken by `arm_boundary`;
+  - externals (G13): per stage a `SetOnce<Vec<Marker>>` output and a closable `TakeAllStack` of waiters; `quiesce`
+    closes the stacks and marks the run swept, and a late subscriber reads the boundary atomics;
+  - pins (G15): a `TakeAllStack<QuantumRef>` per stage.
 
-- `try_push` and `on_error` route under a guard held across the downstream push, as the cloned `Arc` is held today.
-- `set_downstream_mapping` and `close_after_routes_retire` store the new generation, then wait for the old one's
-  readers (`retired.wait(deadline)`, deadline from the lattice's shutdown timeout) and call `release(old)` themselves.
-  `RoutingState` loses its `Drop` hook, so `Book` (C7) is only ever locked by these lifecycle callers: it stays a
-  lifecycle `Mutex`.
-- A push in flight finishes on the generation it began with, and a dropped downstream is closed only after every such
-  push left, as today. What changes is the thread: retirement runs on the remapping or closing thread instead of the
-  last pushing worker (question 4). `ControlPlaneLattice::close` then no longer needs the spawned closing thread for the
-  "last route retires on a worker" case; it keeps it only if a wait past the deadline must not block the caller.
-- If the wait reaches its deadline (a writer called from inside a push), `defer` the retirement and run `release` at
-  the next lifecycle step or at drop.
+### 3.6 QUEUE-MC route (C4)
 
-**C8, C9: edge links.** `downstream` becomes a `DownstreamSlot`-like cell for the `Downstream` enum (attach once,
-cleared at `close_edge`). `push_downstream` reads it under a guard; no `Arc` clone per hop. `parent` becomes
-`Published<Weak<dyn LatticeNode>>`; the climb upgrades the `Weak` as today (it is off the stock worker loop) but takes
-no lock. `set_parent` skips the store when the parent is unchanged, which is every remap after the first.
+Build each cache's queue as a `PartitionedMpmcQueue` with one `Consumer<_, Multi>` per partition:
 
-**C11, C12, C13: stock ingest sources.**
+- `greedy_while`: `drain_while` with `max_consume_batch = u64::MAX`, so one claim covers the take, as the held
+  `MutexGuard` does;
+- `poll_while`/`take_one`: `drain_while(consume, stop, 1)`, which peeks, tests and takes under one claim, so a
+  stealer never takes an ordered head;
+- `first_touch` and `reset_for_next_trial`: `Consumer<_, Multi>::clear` (lifecycle).
 
-- `Downstream` (C11) becomes `DownstreamSlot<dyn LatticeReceiver>` plus the existing `demand` atomic.
-- `QueueSource` (C12) builds a `PartitionedMpmcQueue` and keeps a `PartitionedConsumer<_, Multi>`: `pull` and
-  `drain_requests` use its non-blocking claim (`try_hold` returns `None` today in the same cases); `clear` uses the
-  spinning `clear` (lifecycle). `discard_queued` keeps its retry loop over the non-blocking claim.
-- `SingleUseSource` (C13): `frame: Claim<Option<Box<dyn Frame>>>` plus a `cancelled: AtomicBool`. `pull`/`request`:
-  `try_claim`; test `stop` on the frame; take it or leave it; on release, if `cancelled` is set and the frame is still
-  there, cancel it. `complete`: set `cancelled`, then `try_claim` and cancel the frame; if a pull holds the claim, that
-  pull cancels it on release. The frame is finished exactly once.
+### 3.7 TICK route (question 1)
 
-**C14: `PipelineRunner` outcomes.** `observed()` returns a `OneShot<Outcome>` receiver instead of an `mpsc::Receiver`;
-the chain's finalizer sets it (no lock, at most one unpark). Allocation drops from a channel plus a boxed closure to
-one `Arc<OneShot>`, which a pool of `OneShot`s recycled through an `MpscQueue` can also remove. This changes the
-public return type of `submit*` (question 6).
+Only if ticks must be lock-free:
 
-**C15: `LatticeHotReceiver`.** Never wait on the hook. Recommended (question 5): a frame the hook defers goes to an
-owned retry queue (`MpscQueue<Box<F>>`); each later `push` first offers the retry queue's frames in order, and the
-receiver is also a `LatticeSource` whose `pull`/`request` offers them again, so the lattice's own polls retry them and
-nothing spins. Order: a deferred frame stays ahead of later pushes because they queue behind it while the queue is not
-empty.
+- The dispatcher thread becomes the only steady-state caller of `ControlPlaneLattice::update`, so `updating` goes.
+- The steady branch reads atomics and a `Published<ActiveSet>` and calls each shard's update directly, so the
+  per-tick `TaskPool` hop goes.
+- `ControlPlaneShard::update` reads a `Published` list of clones.
+- In the monitor, the poller owns its evaluation state and a per-monitor provider. The last utilization is
+  `Published`, the dispatcher takes the latest value from an `AtomicPtr` mailbox and is unparked, and listeners are a
+  copy-on-write `Published<Vec<..>>`.
+- In the mapper, versions are owned by the single updater and `current` is `Published`.
+- Lifecycle `Mutex`es and `Condvar`s stay for start, stop and close.
 
-**C16-C20 (tick).** Only if question 1 says ticks must be lock-free:
+### 3.8 OPEN (M1, question 4)
 
-- The dispatcher thread is the only caller of `ControlPlaneLattice::update` in steady state; `start` posts its first
-  update through the same path, so `updating` (C17) has one caller and goes.
-- The steady-state branch reads `closed` and `resetting` (atomics) and a `Published<ActiveSet>` (version and active
-  sockets) written only by rebalance; it then calls each shard's update directly (it is now atomics per clone), so the
-  per-tick `TaskPool` hop (C20) goes. `gate` (C16) stays as a lifecycle lock around the rebalance branch and close.
-- `ControlPlaneShard::update` reads a `Published<Vec<(core, clone)>>` written at rebalance; `State` (C19) stays for
-  lifecycle.
-- `TaskPool` keeps only lifecycle tasks; its `mpsc` + `Mutex<Receiver>` can become an `MpmcQueue` with park/unpark of
-  idle pool threads if lifecycle tasks should not lock either (they may).
+If blocking frees must never run on a worker, add a debug assertion in the CUDA backends' `free` (and in
+`Reaper::reap` when its backend `may_block`) that the thread is not in a hot scope, and document that reaping belongs on
+a lattice set aside for blocking work. If reaping on the owner's lane is intended, the alternative that keeps it
+lock-free is a reaper that issues `cuMemFreeAsync` on the owning stream (the stream pool already does,
+`backends.rs:160`) and never synchronises.
 
-**Lifecycle rows (C21-C34).** Keep. Two improvements that remove waits reachable from hot entry points:
+### 3.9 Lifecycle rows
 
-- C31: `add_upstream_handle` stops spinning while the edge drains. Handles that arrive during a drain go to an
-  `MpscQueue` on the edge; the code that clears the drain flag (`finish_rebalance`, `Reopen::drop`, the end of
-  `handle_system_topology_change`) flushes them into the registry (question 9).
-- C26: `add_upstream` calls `start`, which locks `started` on every attach; check an `AtomicBool started` first and lock
-  only when not started.
+Keep. Two adjustments remove lifecycle waits from hot entry points:
 
-### 3.2 `euhedral-data-structures`
-
-**D1: lock-free chunk install for multi-producer queues.** Two steps, each a PR on its own:
-
-1. Allocate before claiming: a producer that finds the ring full takes a chunk from the pool or allocates one
-   *before* it tries to set `RESIZING`; the loser of the race returns its chunk to the pool. The flag's window shrinks
-   to a few stores, with no allocator call inside.
-2. Helping: publish the resize as a descriptor (old chunk, new chunk, tail) in an `AtomicPtr` on the producer state.
-   A producer that sees `RESIZING` completes the install itself (CAS the old chunk's `next`, CAS `tail_chunk`, store
-   the epoch, clear the flag with a CAS on `tail`) instead of spinning; every step is idempotent, so the producer that
-   began the resize and any helpers converge. Then no producer waits on another, and a producer preempted mid-resize
-   stops nobody.
-
-The consumer side already never waits. A slot reserved and not yet published stops the consumer at that slot until its
-producer publishes; that is a progress dependency of every array queue, not a wait (question 12).
-
-D2 stays (lifecycle only); the lint below keeps `lock_consumers` and `Consumer<_, Multi>::clear` out of hot code.
-
-### 3.3 `euhedral-graph`
-
-**G1, G2, G3: `Completions`.**
-
-- `poll: Claim<Poll>`. `emit` uses `try_claim` and returns 0 if another poll holds it (the lattice's interceptor
-  already lets one worker at a time poll a source; a direct caller polling from two threads gets 0 on one of them).
-  `sweep` already does this.
-- `lanes` (G2) moves into `Poll`, so the claim holder owns it: `complete` sets the flag and, if it gets the claim,
-  drops the lanes; otherwise the next claim holder drops them when it sees the flag. `emit` reads lanes without a
-  lock or an `Arc` clone.
-- `downstream` (G3) becomes a `DownstreamSlot`.
-
-**G4: `Join`.** `remaining: AtomicUsize`; per part `ended: AtomicBool` and `value: UnsafeCell<Option<T>>`;
-`then: UnsafeCell<Option<Then<T>>>`. `end(part, v)`: `assert!(!ended[part].swap(true))` (one writer per part from
-here on), write the value, then `remaining.fetch_sub(1, AcqRel)`; the arrival that brings it to zero has seen every
-other part's write and takes the values and the continuation. Wait-free, no allocation per arrival.
-
-**G5: `Latch`.** Becomes a thin wrapper of `OneShot` (the setter's `Drop` sets abandoned). The waiter still parks on
-the main thread; the setter no longer locks.
-
-**G6: `Sequencer`.** Admission order becomes the order of an `MpscQueue<Arc<SeqCell<T>>>`, whose cells hold an
-`AtomicU8` state (pending, ready, abandoned) and the value.
-
-- `register`: take a cell (recycled through a second `MpscQueue`, so steady state allocates nothing), offer a clone
-  to the order queue, return the `Slot` holding the cell.
-- `finish`: write the value, store the state with release, then `release()`.
-- `release()` keeps its `wip` counter, which already lets one thread at a time drain; the drainer owns the order
-  queue's `Consumer<_, Single>` (in an `UnsafeCell` reached only by the `wip` winner), peeks the front, and pops and
-  emits while the front is not pending.
-- `len` becomes the queue's size.
-
-**G7: `Lake`.** `generation: Published<Generation>`. `offer` and `admit` read under a guard. `attach` (first offer of
-a busy period, a lifecycle step) keeps a lifecycle lock serialising writers and stores `Some` (nothing to retire).
-`detach` and `complete` store `None` and `defer`; `detach` uses `try_store` and, if a previous retirement is still
-held, stays attached until the next idle poll (detaching is already best effort). `retiring` (G8) stays.
-
-**G10-G15: stage graph runs.** A run's shared state is written by several arrivals and read once a count reaches zero.
-The counts (`pending`, `live`, `holds`) already order those phases with `AcqRel` read-modify-writes, so each piece
-becomes either atomics or single ownership proved by a count:
-
-- **G10 quantum**: `UnsafeCell<Option<Q>>`. Stage runs and `quiesce` read it while `holds > 0`; `conclude` runs once,
-  from the retirement frame, after `holds` reached zero, so it owns the cell. A debug counter asserts no reader is
-  active at `conclude`.
-- **G11 cause**: `SetOnce<QuantumOutcome>` (first outcome wins, as `get_or_insert` does); `conclude` takes it.
-- **G12 inputs**: markers merge as a per-lane maximum, so each stage's inputs become `Box<[AtomicU64]>`, one per lane
-  of the pool, updated with `fetch_max(value + 1)` (0 means none). `run_stage` and pass-through `submitted` read them
-  after `pending` reached zero. Wait-free, and the per-arrival `Vec` work goes.
-- **G14 boundary**: frontier markers the same way (per-lane `AtomicU64`, `fetch_max`), so `cover` is one atomic per
-  marker; host completions go to a `TakeAllStack<Box<dyn Ready>>` that `arm_boundary` takes after `holds` reached zero.
-- **G13 externals**: per stage, a one-shot event: `SetOnce<Vec<Marker>>` for the stage's output plus a
-  `TakeAllStack<ArriveWith>` of waiters. `subscribe`: if the output is set, call now; else push the waiter, and if the
-  push finds the stack closed, call with the published value. `notify_externals`: set the output, `take_and_close`
-  the waiters, call them. `quiesce` (swept) closes every stage's stack and marks it swept; a subscriber that finds it
-  swept reads the boundary atomics at that moment, as it reads the locked boundary now.
-- **G15 pins**: per stage, a `TakeAllStack<QuantumRef>`: `register_external` pushes; `release_pins(stage)` takes that
-  stage's list; `quiesce` takes every list.
-
-### 3.4 `euhedral-io`
-
-**I1, I2: `Front`.** `held: Claim<VecDeque<Box<dyn Frame>>>` (one poll at a time is the documented contract; a
-second concurrent poll returns 0 instead of waiting). `downstream: DownstreamSlot`.
-
-**I3, I13: ring lists (append-only).** Rings are never removed while the engine lives. Replace the `Mutex<Vec>` with
-`rings: Box<[SetOnce<Arc<Ring>>]>` of `MAX_RINGS` entries and `len: AtomicUsize`. A thread's first submit reserves an
-index (`fetch_add`), sets the slot, and the poll walks `0..len`, skipping slots not yet set. No clone, no allocation per
-poll.
-
-**I4, I5, I14: ring claims.** `sq: Claim<Queue>`, `cq: Claim<()>`, Windows `inner: Claim<RingInner>`, keeping the
-existing `waiting` flag and fence protocol, which already makes them non-blocking. `break_ring` sets `broken` and uses
-`try_claim`; if the claim is busy, the holder clears the backlog when it sees `broken` on release.
-
-**I6: io_uring operation slab.** Each ring belongs to its submitting thread (the `MINE` thread-local guarantees it),
-and one poller at a time reaps it (the `cq` claim), so:
-
-- slots live in fixed segments of 256 (an append-only array of `SetOnce` segment pointers), each slot an
-  `UnsafeCell<Option<Op>>` with a `generation: AtomicU32`;
-- `submit` (owner thread) takes a free index, writes the `Op`, then stores the generation with release;
-- `reap_one` (the `cq` holder) checks the generation with acquire, reads and updates `moved`, and on the end takes
-  the `Op` and returns the index through an `MpscQueue<u32>` free list whose consumer is the owner thread;
-- `Drop` has `&mut self`.
-
-**I7: Windows slab.** Same shape, with the state machine (`Idle`, `Issuing`, `InFlight`, `Busy`) in an `AtomicU8` per
-slot changed by CAS, and the free list an `MpmcQueue<u32>` (any thread submits). The `by_addr` map goes: `Rec` is
-`#[repr(C)]` with the `OVERLAPPED` first and the slot index and generation next to it, so a packet's `OVERLAPPED`
-pointer leads to its slot by a cast. Records sit in segments the engine allocates and never frees while it lives; a
-per-engine tag in each record rejects foreign pointers (strays).
-
-**I8, I9, I15: Windows queues.** `ready` and `pool_done` become `MpscQueue`s (producers: failing submitters, pool
-threads; consumer: the poller, through the `Front` claim). A ring's `backlog` becomes an `MpscQueue<Entry>` whose
-consumer is used by the `inner` claim holder; `clear` (break) is done by that holder.
-
-**I10: inbox.** Owned by the poller: `Claim<VecDeque<Packet>>` (taken once per poll alongside the `Front` claim), or
-folded into the `Front` claim's state.
-
-**I11, I12: handle routes.** A handle's first use is its attach. Keep a
-`Published<HashMap<Handle, Route>>` copied on write when a new handle joins (writers serialised by a lifecycle lock)
-and read lock-free per operation. This also removes the `associate` system call that `join_port` makes on every send
-and receive today: it is made once, when the handle is first seen.
-
-### 3.5 `euhedral-hardware-utils` (tick; question 1)
-
-- **H1-H4 monitor**: the poller thread owns the evaluation state (H2) and the snapshot provider (H4: a provider per
-  monitor, moved into the poller, instead of a process-wide `Mutex`). The last utilization (H3) becomes a
-  `Published<HardwareUtilization>`. The poller's wait between ticks becomes `park_timeout` on its own thread, which
-  `stop`/`close` unpark; `Lifecycle` (H1) stays a `Mutex` + `Condvar` used only by start, stop and close.
-- **H5 dispatcher**: the latest value goes into a coalescing mailbox (`AtomicPtr` swap of a boxed value; the dispatcher
-  takes it with a swap to null), and `offer` unparks the dispatcher thread. Listener add and remove become a
-  `Published<Vec<Listener>>` copied on write (attach).
-- **H6, H7 mapper**: per-socket versions are written only by the single updater (the dispatcher thread), so they become
-  plain fields behind `&mut` or `AtomicU64`s; `current` becomes a `Published<EffectiveSystemTopology>`.
-
-### 3.6 `euhedral-memory`
-
-**M1**: depends on question 8. If blocking frees must never run on a worker: enforce it, with a debug assertion in
-the CUDA backends' `free` (and in `Reaper::reap` when its backend `may_block`) that the calling thread is not inside a
-hot scope (§4, chunk 1), and document that reaping belongs on a lattice set aside for blocking work. If reaping on the
-owner's lane is intended, it stays, but it is then a blocking call per frame, which the rule forbids; the
-alternative is a reaper that issues the asynchronous frees (`cuMemFreeAsync` on the owning stream, which the stream
-pool already uses at `backends.rs:160`) and never synchronises.
+- `add_upstream` checks an `AtomicBool started` before locking `started` (C26).
+- How `Lake::offer` reaches attach (C31) depends on question 3.
 
 ## 4. Fix plan
 
-Each chunk is one PR, in this order. Every PR runs the workspace gates (`cargo fmt`, `cargo clippy --workspace
+Each chunk is one PR, in this order, and runs the workspace gates (`cargo fmt`, `cargo clippy --workspace
 --all-targets`, `cargo test --workspace`; the Windows workflow for `euhedral-io`) plus the tests named.
 
 **Chunk 1: guard rails (no behaviour change).**
 
-- `LifecycleMutex<T>` and `LifecycleRwLock<T>` (thin wrappers of the std types, in
-  `euhedral-data-structures::sync`), the only code allowed to name `std::sync::{Mutex, RwLock}`. Their lock methods
-  `debug_assert!` that the thread is not in a hot scope.
-- `HotScope`: a debug-only thread-local depth counter (`cfg(debug_assertions)`; nothing in release). Entered by
-  `ControlPlaneFragment::run_cycle`, `UpstreamQueue::pull`/`request`, `LatticeVertex::try_push`,
-  `ControlPlaneCache::{push, greedy_while, poll_while, work_steal, work_steal_polled}`, `QueueSource::{offer, pull,
-  request}`, `Completions::{emit, add}`, `Join::end`, `Sequencer::{register, finish}`, the stage graph's
-  `Run::{arrive, run_stage, submitted}`, `AsyncIo`'s `submit` and `reap`. A lifecycle call made from inside a frame
-  (attach from `Lake::offer`, `complete` from a finalizer) leaves the scope explicitly with `HotScope::lifecycle(|| ..)`.
-- Lint: a workspace-root `clippy.toml` (and the same entries added to `euhedral-graph/clippy.toml` and
-  `euhedral-io/clippy.toml`): `disallowed-types` = `std::sync::{Mutex, RwLock, Condvar, Barrier}`,
-  `std::sync::mpsc::{Sender, SyncSender, Receiver}`; `disallowed-methods` = `std::thread::{park, park_timeout, sleep,
-  yield_now}`, `std::hint::spin_loop`, `std::sync::Condvar::wait*`, `euhedral_core::utils::spin_wait::await_while`,
-  `Claim::claim_spin`, `Consumer::clear` (multi role). Allowed sites carry `#[allow(..., reason = "lifecycle: ..")]`
-  or `reason = "idle policy"` (the worker's parks).
-- Migration: every current HOT and MIXED site gets `#[allow(..., reason = "HOT-LOCK(<id>)")]`, and its lock calls a
-  `HotScope::lifecycle` exemption, so the lint and the assertions pass on day one.
-- Tests: `a_lifecycle_lock_inside_a_hot_scope_panics` (`should_panic`, debug); `hot_lock_ratchet` (an integration
-  test that counts `HOT-LOCK(` tags under `*/src` and fails above a constant each later PR lowers). The existing
-  lattice, graph and io tests run in debug, so any lifecycle lock reached from a hot scope fails them.
+- `LifecycleMutex<T>` / `LifecycleRwLock<T>` in `euhedral-data-structures::sync`, the only code allowed to name
+  `std::sync::{Mutex, RwLock}`; their lock methods `debug_assert!` that the thread is not in a hot scope.
+- `HotScope`, a debug-only thread-local depth counter, entered by:
+  - `run_cycle`, `UpstreamQueue::{pull, request}`, `LatticeVertex::try_push`, `ControlPlaneCache::{push,
+    greedy_while, poll_while, work_steal*}`;
+  - the producers `QueueSource::offer*`, `Completions::add`, `Join::end`, `Sequencer::{register, finish}`, the stage
+    graph's `Run::{arrive, run_stage, submitted}`, `AsyncIo` submissions.
 
-**Chunk 2: primitives.** `Claim`, `SetOnce`, `Published`, `OneShot`, `TakeAllStack` in
-`euhedral-data-structures::sync`; `DownstreamSlot` in `euhedral-core::flow_control`.
+  Lifecycle calls made from inside a frame leave the scope explicitly.
+- A workspace-root `clippy.toml`, with the same entries added to `euhedral-graph/clippy.toml` and
+  `euhedral-io/clippy.toml`:
+  - `disallowed-types`: `std::sync::{Mutex, RwLock, Condvar, Barrier}`, `std::sync::mpsc::{Sender, SyncSender,
+    Receiver}`;
+  - `disallowed-methods`: `std::thread::{park, park_timeout, sleep, yield_now}`, `std::hint::spin_loop` (queues' CAS
+    loops and the idle policy carry `#[allow(.., reason = ..)]`), `Condvar::wait*`, `spin_wait::await_while`,
+    `Consumer::clear` (multi role).
+- Every current HOT and MIXED site gets `#[allow(.., reason = "HOT-LOCK(<id>)")]` and a hot-scope exemption.
+- Tests:
+  - `a_lifecycle_lock_inside_a_hot_scope_panics` (`should_panic`, debug);
+  - `hot_lock_ratchet`, which counts `HOT-LOCK(` tags and fails above a constant that each later PR lowers.
 
-- Tests, in the crate's style (threaded, under deadlines):
-  - drop counting: every value dropped exactly once, none while a guard is held (a guard that sleeps while
-    `store().wait()` runs, which must not return before the guard drops);
-  - `try_store` refuses while a retirement is pending;
-  - `defer` frees at the next store;
-  - a writer waiting while its own thread holds a guard trips the debug assertion;
-  - `OneShot`: set-before-wait and wait-before-set, abandon, many pairs in parallel;
-  - `Claim` released on unwind;
-  - `TakeAllStack` close races (push after close hands the value back; no value lost under 8 pushers);
-  - `DownstreamSlot` exactly-once completion under attach/complete races.
-- Miri over these modules (question 10).
+**Chunk 2: the source invariant (SOURCE route plus C15).**
 
-**Chunk 3: queue chunk install (D1).** Step 1 (allocate before claiming) and step 2 (helping) as two commits.
+- Adds `SetOnce` (data-structures), and `SourceCell`, `DownstreamSlot`, `LatticeReceiver::serialize` and the
+  interceptor's owner-token claim and action queue (core).
+- Converts C11, C12, C13 (ingest), G1, G2, G3 (`Completions`), I1, I2, I5 (`AsyncIo` front and io_uring reaping) and
+  C15 (retry source).
+- Tests:
+  - the lattice test suites with `SourceCell`'s debug check armed: any second thread inside a source panics;
+  - `serialize` runs at once when the claim is free, at release when another worker holds it, and at release when
+    called from a frame the source's own `pull` runs;
+  - complete exactly once under attach/complete races;
+  - the interceptor drops its source when it finishes (a drop counter: no source ↔ interceptor leak);
+  - `QueueIngestSink::clear` and kill while a worker pulls: every frame is finished exactly once;
+  - `LatticeHotReceiver` with a hook that defers N times delivers in order, and `push` returns at once.
+- Ratchet: -10.
 
-- Tests: the existing model check against `VecDeque`; a stress test with chunk size 2 and 8 producers; a test hook
-  that pauses a producer after it sets `RESIZING`, during which the other producers' offers must complete (they spin
-  forever today).
-- Paired benchmark of offer throughput with the existing queue benches.
+**Chunk 3: worker output path (C1, C2, C3, C10).**
 
-**Chunk 4: worker output path (C1, C2, C3, C10).**
+- Tests: existing `hot_source`, `decision_tree` and fragment tests; a debug lattice run with those exemptions removed.
+- Paired benchmark: frames per second and p99 service time on short frames (profile, hypothesis, paired gate, keep or
+  discard).
+- Ratchet: -4.
 
-- Tests: existing `hot_source`, `decision_tree` and fragment tests; a new test that runs a lattice in debug with the
-  hot-scope assertion armed for the C1/C2/C3/C10 sites (their `HOT-LOCK` exemptions removed).
-- Ratchet: -4. Paired benchmark of a lattice of short frames (frames per second, p99 service time).
+**Chunk 4: snapshots and cache partitions (C4, C5, C6, C7, C8, C9).**
 
-**Chunk 5: caches (C4, C5).**
-
-- Tests: existing cache tests (ordered frames keep their order under stealing; in poll mode a blocked frame leaves
-  the unordered frames behind it to stealers); new: stealers racing a greedy owner never take an ordered or
-  `CacheLocal` frame; a cache closed while a stealer holds its directory guard is freed after the stealer leaves
-  (drop counter).
-- Ratchet: -2.
-
-**Chunk 6: routing and ingest (C6, C7, C8, C9, C11, C12, C13; C31 and C26 improvements).**
-
-- Tests: existing vertex retirement tests; new: remap while 8 threads push (no frame lost, every dropped downstream
-  closed exactly once, after its last push); `close_after_routes_retire` while pushes are in flight; ingest
-  complete-exactly-once under attach and complete races; a handle added during a drain is registered when the drain
-  ends without the adder waiting.
-- Ratchet: -7.
-
-**Chunk 7: completions and receivers in core (C14, C15).** After questions 5 and 6.
-
-- Tests: existing pipeline-runner tests ported to the new receiver; a hook that defers N times then accepts gets its
-  frames in order with no thread parked or spinning (the test checks the pusher returns at once).
-- Ratchet: -2.
-
-**Chunk 8: graph sources and fan-in (G1-G7).**
-
-- Tests: existing `completions`, `join`, `sequencer`, `latch` and `lake` tests (including the multi-threaded ones);
-  new: `Join` with 64 parts arriving from 8 threads; `Sequencer` registering from 4 threads and completing in
-  reverse; `Lake` offers racing detach and re-attach (no frame lost, no generation freed while offered to).
-- Ratchet: -9.
-
-**Chunk 9: stage graph (G10-G15).**
-
-- Tests: existing `stage_graph` tests and `tests/credit_graph.rs`; new: a diamond graph with concurrent arrivals
-  across 8 workers checking merged inputs equal the per-lane maximum; external edges subscribing before, during and
-  after publication and after quiesce.
+- Adds `Published` and the registry's epoch slots.
+- Tests:
+  - `Published` drop counting (a value never freed while read; `wait` never returns early; `try_store` refuses while
+    a retirement is pending);
+  - remap while 8 workers push (no frame lost; every dropped downstream closed once, after its last push);
+  - close while pushes are in flight;
+  - stealers racing a greedy owner never take an ordered or `CacheLocal` frame;
+  - a cache closed while stolen from is freed after the stealer's cycle.
+- Paired benchmark as in chunk 3.
 - Ratchet: -6.
 
-**Chunk 10: io_uring (I1-I6).**
+**Chunk 5: fan-in and lake (C14, G4, G5, G6, G7).**
 
-- Tests: existing `uring.rs` tests and `tests/io_owned.rs`; new: 8 submitting threads with one poller (no
-  operation lost, slots reused); a poll racing `complete`.
+- Adds `OneShot`.
+- Tests: existing `pipeline_runner`, `join`, `sequencer`, `latch`, `lake` tests; `Join` with 64 parts from 8
+  threads; `Sequencer` registering from 4 threads and completing in reverse; lake offers racing detach and re-attach.
+- Ratchet: -5.
+
+**Chunk 6: stage graph (G10-G15).**
+
+- Adds `TakeAllStack`.
+- Tests: existing `stage_graph` tests and `tests/credit_graph.rs`; a diamond graph with concurrent arrivals on 8
+  workers (merged inputs equal the per-lane maximum); external subscriptions before, during and after publication and
+  after quiesce.
 - Ratchet: -6.
 
-**Chunk 11: Windows engine (I7-I15).**
+**Chunk 7: io_uring rest (I3, I4, I6).** After question 6.
 
-- Tests: the simulated-sys tests (`win/tests.rs`, which run on every platform) and the Windows workflow's live tests;
-  new simulated tests: strays rejected by the record tag; a ring break while another thread holds the claim.
+- Tests: existing `uring.rs` tests and `tests/io_owned.rs`; 8 submitting threads and one poller (no operation lost,
+  slots reused); a poll racing `complete`.
+- Ratchet: -3.
+
+**Chunk 8: Windows engine (I7-I15).**
+
+- Tests: the simulated-sys tests (`win/tests.rs`, every platform) and the Windows workflow's live tests; strays
+  rejected by the record tag; a ring break raised by a submitter while the poll runs.
 - Ratchet: -9.
 
-**Chunk 12: memory (M1).** After question 8: the debug assertion, or the asynchronous reaper. Tests: a blocking-free
-backend reaped inside a hot scope panics in debug.
+**Chunk 9: memory (M1).** After question 4: the debug assertion, or the asynchronous reaper; a blocking-free backend
+reaped inside a hot scope panics in debug.
 
-**Chunk 13: tick path (C16-C20, H1-H7).** Only if question 1 says so.
+**Chunk 10: tick path (C16-C20, H1-H7).** Only if question 1 says so. Existing monitor, dispatcher, mapper and
+lattice tests; 10 000 synthetic ticks with the hot-scope assertion armed on the dispatcher thread. Ratchet: -12.
 
-- Tests: existing monitor, dispatcher, mapper and lattice tests (including coalescing to the latest value and
-  rebalance on topology change); new: 10 000 synthetic ticks with the hot-scope assertion armed on the dispatcher
-  thread.
-- Ratchet: -12.
-
-**Chunk 14: lock the door.** Ratchet constant at zero; the test becomes "no `HOT-LOCK(` tag exists". From here a new
-`Mutex` in hot code fails clippy, and a lifecycle lock reached from a hot path fails the debug test suite.
+**Chunk 11: lock the door.** The ratchet test becomes "no `HOT-LOCK(` tag exists". A new `Mutex` in hot code then
+fails clippy, a lifecycle lock reached from a hot path fails the debug suite, and a second thread inside a source
+fails it too.
 
 ## 5. Risks
 
-- **Reclamation bugs.** `Published` and the slabs free memory that other threads may read. Mitigation: the
-  drop-counting tests, Miri, and keeping every retirement either waited (lifecycle) or deferred to a known point; one
-  pending retirement per cell.
-- **Writer waits.** A lifecycle writer waits for readers. A writer running inside a reader of the same cell would wait
-  for itself: the debug assertion catches it, and the wait has a deadline after which the retirement is deferred.
-- **Retirement moves threads (C6, C7).** Downstreams and close retirements run on the remapping or closing thread
-  instead of the last pushing worker. Code that relied on running on a worker (none found) would change; lattice
-  close must keep its shard-closing thread if waiting there is unwanted.
-- **Claims return 0 instead of waiting.** `Completions`, `AsyncIo` and the ingest queue polled by two threads at once
-  outside a lattice: one gets 0. The lattice never does this.
-- **Public API changes**: `PipelineRunner::submit*` return type (C14), `LatticeHotSource` hooks moving to the pusher
-  (C1), `LatticeHotReceiver` retry semantics (C15).
-- **Behaviour under rebalance**: handles added during a drain register when it ends instead of after a spin (C31);
-  the same ordering, different thread.
-- **Windows slab rewrite (I7)**: largest single change, with the `OVERLAPPED`-to-record cast; the simulated tests run on
-  every platform, the live ones only on the Windows workflow.
-- **Stripe memory.** One padded counter per CPU per parity per `Published`: 2 × 128 B × CPUs. Hundreds of cells
-  (per-edge downstreams, one per source) would cost hundreds of kilobytes on a large host; stripes can be shared by
-  cells of one lattice (one stripe set per lattice, each cell a parity word) if that matters.
-- **Divergence from the upstream Java runtime.** The fixes change structure the port kept (generation `Arc`s released
-  by the last holder, `try_lock` partitions). Behaviour stays; the code reads less like upstream.
-- **Performance.** The new primitives must beat what they replace on the per-frame path; chunks 3-6 carry paired
-  benchmarks (profile, hypothesis, paired gate, keep or discard), and a chunk whose primitive does not win is redone,
-  not merged.
+- **The invariant becomes load-bearing for memory safety.** `SourceCell::enter` is `unsafe`; a source attached
+  outside a lattice and driven from two threads at once is undefined behaviour in release builds. Mitigations:
+  - the glossary contract already forbids it;
+  - the debug check in `SourceCell` turns any violation into a panic in every debug test;
+  - the interceptor's claim, which provides the invariant, is the only lattice-side change.
+- **Lifecycle calls on a source take effect when its worker leaves.** `clear`, kill and `complete` return before their
+  effect if a worker is inside the source; the effect runs before that worker releases the source. Waiting instead
+  would deadlock when the call comes from a frame the source's own `pull` runs.
+- **I/O submission latency** if the kernel submission moves into the poll (question 6).
+- **Reclamation bugs** in `Published` and the io slabs. Mitigations: drop-counting tests, Miri (question 5), one
+  pending retirement per cell, retirements either waited for on lifecycle threads or deferred to a known point.
+- **Grace periods follow worker cycles.** A remap waits for each busy worker to finish its current cycle, which
+  includes the frames it runs; a long frame lengthens the rebalance. The deadline then defers the retirement.
+- **Retirement moves threads (C6, C7).** Dropped downstreams and close retirements run on the remapping or closing
+  thread instead of the last pushing worker.
+- **Public API changes**: `PipelineRunner::submit*` (C14), `LatticeHotSource` hooks moving to its pusher (C1),
+  `LatticeHotReceiver` retrying through the lattice (C15), `LatticeReceiver::serialize` (a new defaulted method).
+- **Windows slab rewrite (I7)**, with the `OVERLAPPED`-to-record cast: the simulated tests run on every platform, the
+  live ones only on the Windows workflow.
+- **Divergence from the upstream Java runtime's structure**; behaviour stays.
+- **Performance**: chunks 3 and 4 carry paired benchmarks; a primitive that does not beat what it replaces on the
+  per-frame path is redone, not merged.
 
 ## 6. Questions for the user
 
 1. **Ticks.** Do the periodic control paths count as hot: the resource monitor's poller and dispatcher, the lattice's
-   and shards' utilization updates, the task pool they use (C16-C20, H1-H7)? They never run on a worker and never
-   contend with one. If they may lock, chunk 13 is dropped and those 12 rows become LIFECYCLE.
-2. **Non-blocking claims.** Is a claim that fails instead of waiting acceptable on a hot path (an `AtomicBool` CAS;
-   whoever finds it taken skips the work and leaves it to the holder or the next poll)? RustEE already does this in
-   `UpstreamInterceptor`, `ChunkPool` and the multi-consumer queue, and the designs for C4, C12, C13, G1, I1, I4, I5,
-   I10 and I14 rely on it.
-3. **Idle parks.** The worker's `park_timeout` and `yield_now` when it found no work (`fragment.rs:359-454`) are the
-   idle policy, not locks. Confirm they stay.
-4. **Who retires a routing generation.** OK to move closing dropped downstreams and running close retirements from the
-   last worker that pushed on the old generation to the thread that remaps or closes, which then waits (with a
-   deadline) for pushes in flight?
-5. **`LatticeHotReceiver`.** Its `push` backs off until the hook takes the frame. Which lock-free behaviour do you
-   want: (a) deferred frames go to a retry queue that later pushes and the lattice's polls drain, in order
-   (recommended), or (b) `push` hands a deferred frame back to its caller?
-6. **`PipelineRunner::submit*`** returns `std::sync::mpsc::Receiver<Outcome>`. OK to return a lock-free one-shot
-   receiver type instead (same `recv`/`try_recv` shape)?
-7. **Attach from `Lake::offer`.** The first offer of a busy period attaches the lake's sinks (`add_upstream`: the
-   `started` lock, a spin while a rebalance drains, the registry lock), on the offering thread, often a worker. Attach
-   is lifecycle by the rule; is it acceptable that a per-offer API reaches it, or should a lake keep its sinks attached
-   for its lifetime and only stop pulling from them when idle?
-8. **CUDA frees.** `euhedral-memory/src/backend.rs:5-7` says a blocking free never runs on a lattice worker, and
-   `Reaper`'s doc (`:95-97`) says to run `reap` on the owner's lane with its blocking time counted as service time.
-   Which is intended? The second puts `cuMemFree` (which synchronises the device) on a worker.
-9. **Attach during a drain.** OK for `add_upstream_handle` to queue a handle added while the edge drains and register
-   it when the drain ends, instead of spinning until then (C31)?
-10. **Verification tools.** For the new primitives, is a `loom` dev-dependency acceptable for model checking, and may
-    the plan run Miri (a nightly toolchain beside the pinned stable one)? Without them the tests are threaded stress
-    tests under deadlines, the crates' current style.
-11. **Strict scope of "lock".** The cache partitions and io rings use `Mutex::try_lock`, which never waits. Should these
-    still go (they are a `Mutex` type, and chunk 14's lint bans the type), or may a `try_lock`-only `Mutex` stay where a
-    claim would do the same?
-12. **Array-queue progress.** In the chunked queues, a producer preempted between reserving a slot and publishing it
-    holds up the consumer at that slot (the consumer returns empty, it does not wait). Acceptable, or should the
-    consumer skip unpublished slots, which breaks per-partition FIFO?
+   and shards' utilization updates, the task pool they use (C16-C20, H1-H7)? They never run on a worker. If they may
+   lock, chunk 10 is dropped and those 12 rows become LIFECYCLE.
+2. **`PipelineRunner::submit*`** returns `std::sync::mpsc::Receiver<Outcome>`, whose send takes a lock on the
+   completing worker. OK to return a lock-free one-shot receiver type instead (same `recv`/`try_recv` shape)?
+3. **Attach from `Lake::offer`.** The first offer of a busy period attaches the lake's sinks: `add_upstream`, the
+   `started` lock, a spin while a rebalance drains the edge (C31), and the registry lock. This runs on the offering
+   thread, often a worker. Attach may lock by the rule; is it acceptable that a per-offer call reaches it, or should a
+   lake keep its sinks attached for its lifetime and let them go idle instead of detaching?
+4. **CUDA frees.** `euhedral-memory/src/backend.rs:5-7` says a blocking free never runs on a lattice worker; the
+   `Reaper` doc (`:95-97`) says to run `reap` on the owner's lane, its blocking time counted as service time. Which is
+   intended? The second puts `cuMemFree` (which synchronises the device) on a worker.
+5. **Verification tools.** For `SetOnce`, `Published`, `OneShot`, `TakeAllStack` and the io slabs: is a `loom`
+   dev-dependency acceptable, and may the plan run Miri on a nightly toolchain beside the pinned stable one? Without
+   them, the tests are threaded stress tests under deadlines, the crates' current style.
+6. **I/O submission.** Should a submitting thread still enter the kernel itself? That keeps the ring's submission side
+   shared between the submitter and the poll, behind a non-blocking CAS claim as today. Or should all kernel
+   submission move into the `AsyncIo` source's poll? Then the submission side is single-consumer under the invariant,
+   and an operation reaches the kernel at the next poll. The design assumes the latter.
