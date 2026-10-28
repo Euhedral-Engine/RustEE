@@ -667,8 +667,8 @@ impl AsyncIo {
     }
 }
 
-/// The port of Euhedral-Inference's `AsyncReadsTest`, extended to writes, sockets and datagrams.
-/// The stand-in for `io_uring_enter` replaces Java's `Submitter` stand-in.
+/// Tests of the io_uring engine: reads, writes, sockets and datagrams.
+/// A stand-in for `io_uring_enter` plays the kernel's submission.
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)] // Test fixtures write files and open sockets synchronously, outside any lattice.
 mod tests {
@@ -783,7 +783,7 @@ mod tests {
         }
     }
 
-    /// AsyncReadsTest.aReadsCompletionIsAFrameEmittedWhenTheSinkIsPolledAndItsBytesArrived
+    /// A read's completion is a frame emitted when the sink is polled and its bytes have arrived.
     #[test]
     fn a_reads_completion_is_a_frame_emitted_when_polled_after_its_bytes_arrived() {
         let data = content(3 * 4096 + 123, 3);
@@ -906,7 +906,7 @@ mod tests {
         assert_eq!(arena[4096 + 100..], data[..4096]);
     }
 
-    /// AsyncReadsTest.readsFromManyThreadsEachCompleteOnce: 8 threads submit on rings of their own;
+    /// Reads from many threads each complete once: 8 threads submit on rings of their own;
     /// each stays alive (polling, one poller at a time) until every read completed, since io_uring
     /// cancels an exited thread's operations.
     #[test]
@@ -970,7 +970,7 @@ mod tests {
         assert_eq!(io.pending(), 0);
     }
 
-    /// AsyncReadsTest.aReadPastTheEndOfTheFileFails
+    /// A read past the end of the file fails.
     #[test]
     fn a_read_past_the_end_of_the_file_fails() {
         let (_guard, file) = temp_file("short", &[0; 100]);
@@ -997,8 +997,7 @@ mod tests {
         assert_eq!(&done.buf.bytes[..done.buf.filled], &data[..]);
     }
 
-    /// AsyncReadsTest.aRefusedSubmissionLeavesNoEntryThatReadsOrCompletesLater, as this port does
-    /// it: a refused enter leaves the operation queued (the caller has handed its buffer over), and
+    /// A refused submission leaves no entry that reads or completes later: a refused enter leaves the operation queued (the caller has handed its buffer over), and
     /// a later poll hands it to the kernel; it completes once, with its bytes, and nothing else
     /// completes.
     #[test]
@@ -1045,7 +1044,7 @@ mod tests {
         .unwrap()
     }
 
-    /// AsyncReadsTest's short read: the rest is resubmitted by the poll that reaped the short part,
+    /// A short read: the rest is resubmitted by the poll that reaped the short part,
     /// and the read completes once, with all its bytes.
     #[test]
     fn short_reads_and_writes_are_resubmitted_until_every_byte_moved() {

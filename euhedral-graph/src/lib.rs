@@ -12,14 +12,14 @@
 //! `LatticeSource`s that the lattice's own polls drive, and the rest are structures run from frame
 //! callbacks.
 //!
-//! | Piece | Module | Pattern it follows |
+//! | Piece | Module | What it is |
 //! |---|---|---|
-//! | [`Completions`] | [`completions`] | Euhedral-Inference `GpuCompletions` |
-//! | [`Sequencer`] | [`sequencer`] | Euhedral-Execution `FrameSequencer` / Kafka `OffsetCollector` |
-//! | [`Join`] | [`join`] | Euhedral-Inference `Join` |
-//! | [`LanePool`], [`Marker`], [`DeviceQueue`] | [`lanes`] | Euhedral-Inference `LanePool` |
-//! | [`StageGraph`] | [`stage_graph`] | Euhedral-Inference `StageGraph` |
-//! | [`Lake`], [`UnitGuard`] | [`lake`] | Euhedral-Inference `InferenceLake` |
+//! | [`Completions`] | [`completions`] | completions found by polls |
+//! | [`Sequencer`] | [`sequencer`] | execute in any order, conclude in admission order |
+//! | [`Join`] | [`join`] | run-time fan-in: the last arrival publishes the continuation |
+//! | [`LanePool`], [`Marker`], [`DeviceQueue`] | [`lanes`] | device lanes and markers |
+//! | [`StageGraph`] | [`stage_graph`] | static stage DAGs run per quantum |
+//! | [`Lake`], [`UnitGuard`] | [`lake`] | the pool of ready work of one kind |
 //! | [`Latch`] | [`latch`] | a one-shot hand-off from a frame to the main thread |
 //!
 //! Every public type is also re-exported at the crate root. Types of `euhedral-core` (`Frame`,

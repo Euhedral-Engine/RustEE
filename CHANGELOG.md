@@ -12,9 +12,8 @@ port engines and their simulated tests), its integration test `tests/io_owned.rs
 `euhedral-graph` loses the `async-io` feature and the `io-uring` and `windows-sys` dependencies; `Completions`,
 `ThreadUsage` and the rest stay.
 
-**Why.** Asynchronous I/O does not use anything else in `euhedral-graph` (completions, lanes, stage graphs), and the
-graph does not use it, so the two were joined for no reason. `euhedral-io` depends on `euhedral-core` and
-`euhedral-data-structures` only, not on `euhedral-graph`.
+**Why.** Asynchronous I/O is a piece of the control plane of its own, apart from completions, lanes and stage graphs.
+`euhedral-io` builds on `euhedral-core` and `euhedral-data-structures`.
 
 **Use.** `euhedral_graph::{AsyncIo, AsyncIoOptions, Continuation, Create, IoBuf, IoDone, IoDoneOwned, IoMemory, IoThen,
 OpenSpec, OwnedFile, OwnedSock, RawFile, RawSock}` become `euhedral_io::{...}`; add `euhedral-io` to the dependencies.

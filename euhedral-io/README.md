@@ -4,14 +4,12 @@ Asynchronous file and socket I/O on the RustEE lattice. `AsyncIo` is a `LatticeS
 continuations: each operation returns at once, and the lattice's own polls reap the completions and
 emit the continuation frames. See [`GLOSSARY.md`](../GLOSSARY.md) for every term used here.
 
-It is the port of Euhedral-Inference's `AsyncReads`, extended: writes, sends, receives, accepts and
-connects.
+Its operations are reads, writes, sends, receives, accepts and connects.
 
 **Where it sits.** It depends on [`euhedral-core`](../euhedral-core) and
 [`euhedral-data-structures`](../euhedral-data-structures) (`MpscQueue`), and, for the engines, on
-`io-uring` and `libc` (Linux and Android) or `windows-sys` (Windows). It does not depend on
-[`euhedral-graph`](../euhedral-graph/README.md), and nothing in the workspace depends on it;
-applications do. It does not re-export `euhedral-core`: import `Frame`, `LatticeSource` and the rest
+`io-uring` and `libc` (Linux and Android) or `windows-sys` (Windows). Nothing in the workspace depends
+on it; applications do. It does not re-export `euhedral-core`: import `Frame`, `LatticeSource` and the rest
 from there. Like the rest of the control plane it owns no thread and nothing in it waits.
 
 ## Contents

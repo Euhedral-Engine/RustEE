@@ -4,10 +4,7 @@ No-wait dataflow on the RustEE lattice: completions, in-order release, joins,
 device lanes and per-item stage graphs. Nothing in it waits and nothing in it owns a thread. See
 [`GLOSSARY.md`](../GLOSSARY.md) for every term used here.
 
-The pieces are ports of Euhedral-Inference's `runtime.graph` package (`StageGraph`, `LanePool`,
-`Join`, `AsyncReads`) and `quantization.lattice` (`GpuCompletions`), and of Euhedral-Execution's
-`FrameSequencer` (and the Kafka `OffsetCollector`). The port of `AsyncReads` is `AsyncIo`, in
-[`euhedral-io`](../euhedral-io/README.md).
+Asynchronous I/O (`AsyncIo`) is in [`euhedral-io`](../euhedral-io/README.md).
 
 **Where it sits.** It depends on [`euhedral-core`](../euhedral-core), on
 [`euhedral-data-structures`](../euhedral-data-structures) and, on Linux and Android, on `libc`.

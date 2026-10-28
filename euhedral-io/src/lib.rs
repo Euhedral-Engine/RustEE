@@ -1,4 +1,4 @@
-//! Asynchronous I/O whose completions are frames (Euhedral-Inference `AsyncReads`, extended).
+//! Asynchronous I/O whose completions are frames.
 //!
 //! [`AsyncIo`] is the one entry point, and this file is its portable half: the public API, the
 //! buffer and continuation types, and the `LatticeSource` behaviour (`pending`, demand, the

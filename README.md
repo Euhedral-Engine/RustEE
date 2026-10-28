@@ -24,7 +24,7 @@ arm64 (Linux, macOS and Windows back ends) and is untested on mobile.
 `euhedral-core` depends on the other three; they depend on none of each other. `euhedral-graph` builds
 on `euhedral-core`; nothing depends on it. `euhedral-memory` builds on `euhedral-core`, `euhedral-data-structures` and
 `euhedral-hashing`; nothing depends on it. `euhedral-io` builds on `euhedral-core` and `euhedral-data-structures`;
-nothing depends on it, and it does not depend on `euhedral-graph`.
+nothing depends on it.
 
 - [`GLOSSARY.md`](GLOSSARY.md): every term a user of RustEE meets, with links to the code.
 - [`CHANGELOG.md`](CHANGELOG.md): changes to the lattice's execution model, newest first.
