@@ -1,6 +1,6 @@
 # Builds and tests the whole workspace on Linux and Windows: formatting, Clippy with warnings as
 # errors, and every crate's tests and doctests. The toolchain is the one pinned in mise.toml.
-# windows-2025 is Windows Server 2025 (build 26100), which has IoRing, so euhedral-graph's
+# windows-2025 is Windows Server 2025 (build 26100), which has IoRing, so euhedral-io's
 # Windows engine runs on its kernel ring there (each of its tests also runs forced onto the
 # completion port).
 name: ci

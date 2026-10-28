@@ -1,19 +1,20 @@
-//! No-wait dataflow on the Euhedral control plane: completions, asynchronous I/O, sequencing,
-//! joins, device lanes and stage graphs.
+//! No-wait dataflow on the Euhedral control plane: completions, sequencing, joins, device lanes
+//! and stage graphs.
 //!
 //! Nothing here waits. Work is *submitted* and returns at once, and what follows it starts on one
 //! of two events:
 //! - **the submission** (a device successor orders itself behind the predecessor's [`Marker`] on
 //!   the device);
-//! - **the completion**, found when a lattice worker polls [`Completions`] or `AsyncIo`.
+//! - **the completion**, found when a lattice worker polls [`Completions`] or `euhedral-io`'s
+//!   `AsyncIo`.
 //!
-//! No piece owns a thread. The sources ([`Completions`], `AsyncIo`) are `LatticeSource`s that the
-//! lattice's own polls drive, and the rest are structures run from frame callbacks.
+//! No piece owns a thread. The sources ([`Completions`], and `euhedral-io`'s `AsyncIo`) are
+//! `LatticeSource`s that the lattice's own polls drive, and the rest are structures run from frame
+//! callbacks.
 //!
 //! | Piece | Module | Pattern it follows |
 //! |---|---|---|
 //! | [`Completions`] | [`completions`] | Euhedral-Inference `GpuCompletions` |
-//! | `AsyncIo` | `io` (Linux and Android) | Euhedral-Inference `AsyncReads`, extended to writes, sends, receives, accepts |
 //! | [`Sequencer`] | [`sequencer`] | Euhedral-Execution `FrameSequencer` / Kafka `OffsetCollector` |
 //! | [`Join`] | [`join`] | Euhedral-Inference `Join` |
 //! | [`LanePool`], [`Marker`], [`DeviceQueue`] | [`lanes`] | Euhedral-Inference `LanePool` |
@@ -24,19 +25,13 @@
 //! Every public type is also re-exported at the crate root. Types of `euhedral-core` (`Frame`,
 //! `LatticeSource`, ...) are not: import them from `euhedral_core`.
 //!
-//! Features: `async-io` (default) builds `AsyncIo` on Linux, Android and Windows; `testing` adds
-//! `testing::FakeDevice`.
+//! Feature: `testing` adds `testing::FakeDevice`. Asynchronous file and socket I/O (`AsyncIo`) is in
+//! `euhedral-io`.
 
-// The engines of `io` and its `IoMemory` contract need unsafe, and `ThreadUsage` makes two system
-// calls, each with a `// SAFETY:` comment; nowhere else.
+// `ThreadUsage` makes system calls, each with a `// SAFETY:` comment; nowhere else.
 #![deny(unsafe_code)]
 
 pub mod completions;
-#[cfg(all(
-    feature = "async-io",
-    any(target_os = "linux", target_os = "android", windows)
-))]
-pub mod io;
 pub mod join;
 pub mod lake;
 pub mod lanes;
@@ -47,14 +42,6 @@ pub mod stage_graph;
 pub mod testing;
 
 pub use completions::{Completions, Pending, Ready};
-#[cfg(all(
-    feature = "async-io",
-    any(target_os = "linux", target_os = "android", windows)
-))]
-pub use io::{
-    AsyncIo, AsyncIoOptions, Create, IoBuf, IoDone, IoDoneOwned, IoMemory, IoThen, OpenSpec,
-    OwnedFile, OwnedSock, RawFile, RawSock,
-};
 pub use join::Join;
 pub use lake::{Lake, LakeClosed, UnitGuard};
 pub use lanes::{DeviceQueue, LaneId, LanePool, Marker};
@@ -65,8 +52,6 @@ pub use stage_graph::{
     QuantumRef, RetryCounts, Stage, StageCx, StageError, StageGraph, StageGraphSpec, StageId,
     StageSpec, Submitted,
 };
-
-use euhedral_core::frames::Frame;
 
 /// Compiles and runs the examples in the crate README as doctests.
 #[cfg(doctest)]
@@ -130,6 +115,3 @@ impl ThreadUsage {
         }
     }
 }
-
-/// What turns a completed operation's result into the frame that continues the work.
-pub type Continuation<T> = Box<dyn FnOnce(T) -> Box<dyn Frame> + Send>;

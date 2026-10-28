@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use euhedral_core::frames::{Frame, FrameHeader};
 use euhedral_core::generics::LatticeSource;
-use euhedral_graph::{AsyncIo, Create, IoDoneOwned, OpenSpec, OwnedFile, RawFile};
+use euhedral_io::{AsyncIo, Create, IoDoneOwned, OpenSpec, OwnedFile, RawFile};
 
 /// The most bytes the engine moves in one piece is 256 KiB; a read of more is cut.
 const PIECE: usize = 256 * 1024;

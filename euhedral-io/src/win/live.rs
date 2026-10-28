@@ -19,7 +19,7 @@ use euhedral_core::generics::LatticeSource;
 use super::real::RealSys;
 use super::sys::Sys;
 use crate::Continuation;
-use crate::io::{
+use crate::{
     AsyncIo, AsyncIoOptions, Create, IoBuf, IoDone, IoDoneOwned, IoThen, OpenSpec, OwnedFile,
     OwnedSock,
 };

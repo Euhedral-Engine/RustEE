@@ -1,0 +1,38 @@
+# The no-thread, no-wait rules of this crate: nothing here blocks or spins, and the threads belong to the lattice.
+# A listed call is allowed only in a test fixture (peer threads, arrival races) or where a call has no non-blocking
+# form, under an `#[allow(clippy::disallowed_methods)]` that says why.
+disallowed-methods = [
+    { path = "std::thread::spawn", reason = "the lattice owns the threads" },
+    { path = "std::thread::Builder::spawn", reason = "the lattice owns the threads" },
+    { path = "std::thread::Builder::spawn_scoped", reason = "the lattice owns the threads" },
+    { path = "std::thread::scope", reason = "the lattice owns the threads" },
+    { path = "std::thread::sleep", reason = "nothing waits: submit, and continue on the completion" },
+    { path = "std::thread::park", reason = "nothing waits" },
+    { path = "std::thread::park_timeout", reason = "nothing waits" },
+    { path = "std::thread::yield_now", reason = "nothing spins" },
+    { path = "std::hint::spin_loop", reason = "nothing spins" },
+    { path = "std::sync::mpsc::channel", reason = "no channels: frames are offered to a source" },
+    { path = "std::sync::mpsc::sync_channel", reason = "no channels" },
+    { path = "std::sync::Condvar::wait", reason = "nothing waits" },
+    { path = "std::sync::Condvar::wait_while", reason = "nothing waits" },
+    { path = "std::sync::Condvar::wait_timeout", reason = "nothing waits" },
+    { path = "std::sync::Condvar::wait_timeout_while", reason = "nothing waits" },
+    { path = "std::sync::Barrier::wait", reason = "nothing waits" },
+    { path = "std::fs::read", reason = "blocking I/O: use AsyncIo" },
+    { path = "std::fs::read_to_string", reason = "blocking I/O: use AsyncIo" },
+    { path = "std::fs::write", reason = "blocking I/O: use AsyncIo" },
+    { path = "std::fs::copy", reason = "blocking I/O: use AsyncIo" },
+    { path = "std::net::TcpStream::connect", reason = "blocking I/O: use AsyncIo" },
+    { path = "std::net::TcpStream::connect_timeout", reason = "blocking I/O: use AsyncIo" },
+    { path = "std::net::TcpListener::accept", reason = "blocking I/O: use AsyncIo::accept" },
+    { path = "std::process::Command::output", reason = "waits for a child process" },
+    { path = "std::process::Child::wait", reason = "waits for a child process" },
+]
+disallowed-types = [
+    { path = "std::sync::mpsc::Sender", reason = "no channels" },
+    { path = "std::sync::mpsc::SyncSender", reason = "no channels" },
+    { path = "std::sync::mpsc::Receiver", reason = "no channels" },
+    { path = "std::sync::Condvar", reason = "nothing waits" },
+    { path = "std::sync::Barrier", reason = "nothing waits" },
+    { path = "std::net::TcpStream", reason = "sockets go through AsyncIo (raw fds)" },
+]

@@ -3,6 +3,25 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## `AsyncIo` moves to its own crate, `euhedral-io` (2026-10-28)
+
+**What.** `euhedral-graph`'s `io` module (the `AsyncIo` API, the io_uring engine, the Windows IoRing and completion
+port engines and their simulated tests), its integration test `tests/io_owned.rs`, its `async-io` feature and its
+`io-uring`, `windows-sys` and (for the engines) `libc` dependencies move into the new workspace member `euhedral-io`.
+`Continuation<T>` (what turns a completed operation's result into the next frame) moves with it: only the I/O used it.
+`euhedral-graph` loses the `async-io` feature and the `io-uring` and `windows-sys` dependencies; `Completions`,
+`ThreadUsage` and the rest stay.
+
+**Why.** Asynchronous I/O does not use anything else in `euhedral-graph` (completions, lanes, stage graphs), and the
+graph does not use it, so the two were joined for no reason. `euhedral-io` depends on `euhedral-core` and
+`euhedral-data-structures` only, not on `euhedral-graph`.
+
+**Use.** `euhedral_graph::{AsyncIo, AsyncIoOptions, Continuation, Create, IoBuf, IoDone, IoDoneOwned, IoMemory, IoThen,
+OpenSpec, OwnedFile, OwnedSock, RawFile, RawSock}` become `euhedral_io::{...}`; add `euhedral-io` to the dependencies.
+Behaviour is unchanged: the code, its docs and its tests moved as they were, with their paths adjusted.
+
+**Tests.** The same tests, now `cargo test -p euhedral-io`; the Windows workflow runs that package.
+
 ## Tiered admission and the copy rate: `euhedral-memory` (2026-10-28)
 
 **What.**

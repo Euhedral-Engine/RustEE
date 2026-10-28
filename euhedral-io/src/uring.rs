@@ -1,7 +1,7 @@
 //! The io_uring backend of [`AsyncIo`], for Linux and Android.
 //!
-//! The only code of the crate besides [`ThreadUsage`](crate::ThreadUsage) with unsafe code: the
-//! io_uring rings (`// SAFETY:` on every block).
+//! Besides the portable half's handle conversions and `IoMemory` contract, the only code of the crate
+//! with unsafe code: the io_uring rings (`// SAFETY:` on every block).
 #![allow(unsafe_code)]
 
 use std::cell::RefCell;

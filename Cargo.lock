@@ -45,9 +45,7 @@ dependencies = [
  "euhedral-data-structures",
  "euhedral-graph",
  "euhedral-hardware-utils",
- "io-uring",
  "libc",
- "windows-sys",
 ]
 
 [[package]]
@@ -62,6 +60,17 @@ dependencies = [
 [[package]]
 name = "euhedral-hashing"
 version = "0.1.0"
+
+[[package]]
+name = "euhedral-io"
+version = "0.1.0"
+dependencies = [
+ "euhedral-core",
+ "euhedral-data-structures",
+ "io-uring",
+ "libc",
+ "windows-sys",
+]
 
 [[package]]
 name = "euhedral-memory"
