@@ -30,6 +30,10 @@ euhedral-gpu = { path = ".", default-features = false, features = ["fake"] }
 # The acceptance example picks a CPU for its lattice.
 euhedral-hardware-utils = { path = "../euhedral-hardware-utils" }
 
+[[example]]
+name = "graph_replay"
+required-features = ["cuda"]
+
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 missing_debug_implementations = "warn"
