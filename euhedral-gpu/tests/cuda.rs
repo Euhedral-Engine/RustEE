@@ -172,7 +172,7 @@ mod streams {
         clippy::disallowed_methods,
         reason = "the test thread is not a lattice worker"
     )]
-    pub fn wait_until(limit: Duration, condition: impl Fn() -> bool) -> bool {
+    pub fn wait_until(limit: Duration, mut condition: impl FnMut() -> bool) -> bool {
         let start = Instant::now();
         while !condition() {
             if start.elapsed() > limit {
@@ -186,7 +186,7 @@ mod streams {
     struct Record(Arc<std::sync::Mutex<Vec<euhedral_gpu::RetireTicket>>>);
 
     impl euhedral_gpu::RetireListener for Record {
-        // Enqueue only: this runs on the driver's callback thread.
+        // Runs on the owner's thread, inside `poll_retired`.
         fn retired(self: Box<Self>, ticket: euhedral_gpu::RetireTicket) {
             self.0.lock().unwrap().push(ticket);
         }
@@ -207,11 +207,11 @@ mod streams {
             .unwrap();
             s[0].notify_retired(Box::new(Record(seen.clone()))).unwrap();
         }
-        assert!(wait_until(Duration::from_secs(5), || seen
-            .lock()
-            .unwrap()
-            .len()
-            >= 5));
+        // The driver's callbacks only queue the outcomes; the owner drains them here.
+        assert!(wait_until(Duration::from_secs(5), || {
+            s[0].poll_retired();
+            seen.lock().unwrap().len() >= 5
+        }));
         let tickets = seen.lock().unwrap().clone();
         assert_eq!(
             tickets.iter().map(|t| t.seq()).collect::<Vec<_>>(),
@@ -299,6 +299,8 @@ mod streams {
         s[1].notify_retired(Box::new(Record(from_b.clone())))
             .unwrap();
         assert!(wait_until(Duration::from_secs(5), || {
+            s[0].poll_retired();
+            s[1].poll_retired();
             !from_a.lock().unwrap().is_empty() && !from_b.lock().unwrap().is_empty()
         }));
         let (ticket_a, ticket_b) = (from_a.lock().unwrap()[0], from_b.lock().unwrap()[0]);
@@ -331,10 +333,10 @@ mod streams {
         })
         .unwrap();
         s[0].notify_retired(Box::new(Record(seen.clone()))).unwrap();
-        assert!(wait_until(Duration::from_secs(5), || !seen
-            .lock()
-            .unwrap()
-            .is_empty()));
+        assert!(wait_until(Duration::from_secs(5), || {
+            s[0].poll_retired();
+            !seen.lock().unwrap().is_empty()
+        }));
         assert_eq!(Arc::strong_count(&host), 2, "kept until confirmed");
         let ticket = seen.lock().unwrap()[0];
         assert_eq!(s[0].confirm_retired(ticket), None);
@@ -761,19 +763,24 @@ mod markers {
             unsafe { q.launch(&spin, Launch::linear(1, 1), &Args::new().arg(cycles(20))) }
         })
         .unwrap();
-        // The callback precedes the marker on stream a, and a callback finishes before later work on its stream.
+        // The callback precedes the marker on stream a, and a callback finishes before later work on its stream, so
+        // when b's retirement has arrived, a's has too.
         s[0].notify_retired(Box::new(Ordered(order.clone())))
             .unwrap();
         let m = s[0].mark().unwrap();
         s[1].await_marker(m).unwrap();
         s[1].notify_retired(Box::new(Ordered(order.clone())))
             .unwrap();
-        assert!(wait_until(Duration::from_secs(10), || order
-            .lock()
-            .unwrap()
-            .len()
-            == 2));
-        assert_eq!(*order.lock().unwrap(), [0, 1]);
+        assert!(wait_until(Duration::from_secs(10), || {
+            s[1].poll_retired();
+            order.lock().unwrap().contains(&1)
+        }));
+        s[0].poll_retired();
+        assert_eq!(
+            *order.lock().unwrap(),
+            [1, 0],
+            "told in the order the owner polled; a's outcome was already queued when b's arrived"
+        );
         drop((pool, s));
     }
 

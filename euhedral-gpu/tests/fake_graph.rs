@@ -166,20 +166,14 @@ impl Fixture {
     /// Runs the device idle, then arms a retirement on every stream, runs again and confirms each ticket: whatever the
     /// streams were keeping for the work so far is released.
     fn confirm_everything(&self, s: &mut [FakeStream]) {
-        struct Told(Arc<std::sync::Mutex<Vec<euhedral_gpu::RetireTicket>>>);
-        impl euhedral_gpu::RetireListener for Told {
-            fn retired(self: Box<Self>, ticket: euhedral_gpu::RetireTicket) {
-                self.0.lock().unwrap().push(ticket);
-            }
-        }
-        let told = Arc::new(std::sync::Mutex::new(Vec::new()));
         for stream in s.iter_mut() {
-            stream.notify_retired(Box::new(Told(told.clone()))).unwrap();
+            stream.arm_retirement().unwrap();
         }
         self.gpu.run_until_idle();
-        for ticket in told.lock().unwrap().iter() {
-            let stream = s.iter_mut().find(|s| s.id() == ticket.stream()).unwrap();
-            assert_eq!(stream.confirm_retired(*ticket), None);
+        for stream in s.iter_mut() {
+            while let Some(ticket) = stream.poll_retired() {
+                assert_eq!(stream.confirm_retired(ticket), None);
+            }
         }
     }
 }
@@ -343,12 +337,6 @@ fn a_sequence_names_only_its_own_streams() {
 
 #[test]
 fn a_replay_keeps_the_recordings_buffers_until_its_retirement_is_confirmed() {
-    struct Told(Arc<std::sync::Mutex<Vec<euhedral_gpu::RetireTicket>>>);
-    impl euhedral_gpu::RetireListener for Told {
-        fn retired(self: Box<Self>, ticket: euhedral_gpu::RetireTicket) {
-            self.0.lock().unwrap().push(ticket);
-        }
-    }
     let (mut f, mut s) = Fixture::new();
     let out = f.out_ptr(0);
     let token = Arc::new(());
@@ -364,9 +352,8 @@ fn a_replay_keeps_the_recordings_buffers_until_its_retirement_is_confirmed() {
         .unwrap();
     f.gpu.run_until_idle();
     assert_eq!(Arc::strong_count(&token), 2, "the graph holds it");
-    let told = Arc::new(std::sync::Mutex::new(Vec::new()));
     graph.replay(&mut s[0]).unwrap();
-    s[0].notify_retired(Box::new(Told(told.clone()))).unwrap();
+    s[0].arm_retirement().unwrap();
     drop(graph);
     assert_eq!(
         Arc::strong_count(&token),
@@ -374,7 +361,7 @@ fn a_replay_keeps_the_recordings_buffers_until_its_retirement_is_confirmed() {
         "the in-flight replay holds it after the graph dropped"
     );
     f.gpu.run_until_idle();
-    let ticket = told.lock().unwrap()[0];
+    let ticket = s[0].poll_retired().expect("the replay retired");
     assert_eq!(s[0].confirm_retired(ticket), None);
     // The recording's own run handed the same values to both streams, which hold them until they retire too.
     f.confirm_everything(&mut s);

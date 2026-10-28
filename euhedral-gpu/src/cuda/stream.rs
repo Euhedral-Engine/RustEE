@@ -7,6 +7,7 @@ use euhedral_graph::{DeviceQueue, LaneId, Marker, QueueId};
 use euhedral_memory::cuda::{CuEvent, CuStream, Device, STREAM_NON_BLOCKING};
 
 use crate::kept::Kept;
+use crate::retire::{RetireSink, Retirements};
 use crate::{GpuError, POISONED_STATUS, RetireListener, RetireTicket, Stream, StreamOptions};
 
 use super::{CudaEnqueue, CudaGpu, from_cuda};
@@ -107,6 +108,15 @@ pub struct CudaQueue {
     gpu: Arc<CudaGpu>,
     ring: Arc<LaneRing>,
     name: String,
+    /// The callback's end of the stream's retirement queue. Its address is the callbacks' user data, so it lives as
+    /// long as this shared side does, and the stream's drop waits for every callback first.
+    sink: RetireSink,
+}
+
+impl CudaQueue {
+    pub(crate) fn sink(&self) -> &RetireSink {
+        &self.sink
+    }
 }
 
 impl DeviceQueue for CudaQueue {
@@ -140,13 +150,13 @@ pub struct CudaStream {
     pub(crate) id: QueueId,
     lane: LaneId,
     pub(crate) raw: CuStream,
-    queue: Arc<CudaQueue>,
+    pub(crate) queue: Arc<CudaQueue>,
     ring: Arc<LaneRing>,
     lanes: Arc<[Arc<LaneRing>]>,
     /// The stream a recording captures this stream's work on, made on first use.
     pub(crate) shadow: Option<CuStream>,
-    /// The number the next armed retirement gets.
-    pub(crate) next_retire: u64,
+    /// The owner's end of the retirement queue, and the retirements armed.
+    pub(crate) retire: Retirements,
     pub(crate) kept: Kept,
 }
 
@@ -183,20 +193,23 @@ impl CudaStream {
             // SAFETY: an out pointer; the context is current.
             let code = unsafe { (f.stream_create)(&mut raw, STREAM_NON_BLOCKING) };
             device.check("cuStreamCreate", code).map_err(from_cuda)?;
+            let lane = LaneId(u16::try_from(i).expect("at most 64 lanes"));
+            let (retire, sink) = Retirements::new(lanes[i].id, lane);
             streams.push(CudaStream {
                 gpu: gpu.clone(),
                 id: lanes[i].id,
-                lane: LaneId(u16::try_from(i).expect("at most 64 lanes")),
+                lane,
                 raw,
                 queue: Arc::new(CudaQueue {
                     gpu: gpu.clone(),
                     ring: lanes[i].clone(),
                     name: (*name).to_owned(),
+                    sink,
                 }),
                 ring: lanes[i].clone(),
                 lanes: lanes.clone(),
                 shadow: None,
-                next_retire: 0,
+                retire,
                 kept: Kept::default(),
             });
         }
@@ -260,8 +273,14 @@ impl CudaStream {
         })
     }
 
-    pub(crate) fn lane_id(&self) -> LaneId {
-        self.lane
+    /// Arms a retirement: the callback is enqueued first, and registered once the driver accepted it.
+    fn arm(&mut self, listener: Option<Box<dyn RetireListener>>) -> Result<(), GpuError> {
+        self.gpu.poison.check()?;
+        let gpu = self.gpu.clone();
+        let _c = gpu.device().enter().map_err(from_cuda)?;
+        self.arm_callback()?;
+        self.retire.register(listener);
+        Ok(())
     }
 
     /// The context current on the calling thread for as long as the guard lives.
@@ -337,12 +356,16 @@ impl Stream for CudaStream {
     }
 
     fn notify_retired(&mut self, listener: Box<dyn RetireListener>) -> Result<(), GpuError> {
-        self.gpu.poison.check()?;
-        let gpu = self.gpu.clone();
-        let _c = gpu.device().enter().map_err(from_cuda)?;
-        self.arm(self.next_retire, listener)?;
-        self.next_retire += 1;
-        Ok(())
+        self.arm(Some(listener))
+    }
+
+    fn arm_retirement(&mut self) -> Result<(), GpuError> {
+        self.arm(None)
+    }
+
+    fn poll_retired(&mut self) -> Option<RetireTicket> {
+        let poisoned = self.gpu.poison.get().is_some();
+        self.retire.poll(poisoned)
     }
 
     fn confirm_retired(&mut self, ticket: RetireTicket) -> Option<GpuError> {

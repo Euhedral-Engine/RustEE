@@ -81,7 +81,7 @@ impl Graph for FakeGraph {
         // A replay runs after this graph may have dropped: the stream keeps the recording's buffers until the next
         // retirement armed after it is confirmed.
         if !self.kept.is_empty() {
-            let seq = stream.next_retire;
+            let seq = stream.retire.next_seq();
             stream.kept.push(seq, Box::new(self.kept.clone()));
         }
         Ok(())
@@ -175,7 +175,7 @@ impl FakeGpu {
         if !seq.rec.frozen.is_empty() {
             let frozen = seq.rec.frozen.clone();
             for stream in &mut seq.real {
-                let at = stream.next_retire;
+                let at = stream.retire.next_seq();
                 stream.kept.push(at, Box::new(frozen.clone()));
             }
         }

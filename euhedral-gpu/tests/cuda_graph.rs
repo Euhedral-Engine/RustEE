@@ -30,7 +30,7 @@ fn ops(gpu: &Arc<CudaGpu>) -> Option<CudaModule> {
     }
 }
 
-fn wait_until(limit: Duration, condition: impl Fn() -> bool) -> bool {
+fn wait_until(limit: Duration, mut condition: impl FnMut() -> bool) -> bool {
     let start = Instant::now();
     while !condition() {
         if start.elapsed() > limit {
@@ -262,18 +262,20 @@ impl Fixture {
     /// Arms a retirement on every stream, waits for both, and confirms them: whatever the streams were keeping for
     /// the work so far is released.
     fn confirm_everything(&self, s: &mut [CudaStream]) {
-        let told = Arc::new(std::sync::Mutex::new(Vec::new()));
         for stream in s.iter_mut() {
-            stream.notify_retired(Box::new(Told(told.clone()))).unwrap();
+            stream.arm_retirement().unwrap();
         }
-        assert!(wait_until(Duration::from_secs(10), || told
-            .lock()
-            .unwrap()
-            .len()
-            == 2));
-        for ticket in told.lock().unwrap().iter() {
-            let stream = s.iter_mut().find(|s| s.id() == ticket.stream()).unwrap();
-            assert_eq!(stream.confirm_retired(*ticket), None);
+        for stream in s.iter_mut() {
+            let mut ticket = None;
+            assert!(
+                wait_until(Duration::from_secs(10), || {
+                    ticket = stream.poll_retired();
+                    ticket.is_some()
+                }),
+                "the retirement arrives"
+            );
+            let ticket = ticket.unwrap();
+            assert_eq!(stream.confirm_retired(ticket), None);
         }
     }
 
@@ -749,14 +751,6 @@ fn an_error_in_the_closure_ends_the_capture_and_frees_the_streams() {
     drop(graph);
 }
 
-struct Told(Arc<std::sync::Mutex<Vec<euhedral_gpu::RetireTicket>>>);
-
-impl euhedral_gpu::RetireListener for Told {
-    fn retired(self: Box<Self>, ticket: euhedral_gpu::RetireTicket) {
-        self.0.lock().unwrap().push(ticket);
-    }
-}
-
 #[test]
 fn a_graph_dropped_after_a_replay_leaves_the_replay_its_buffers() {
     let Some((f, mut s)) = Fixture::new() else {
@@ -790,19 +784,19 @@ fn a_graph_dropped_after_a_replay_leaves_the_replay_its_buffers() {
     })
     .unwrap();
     graph.replay(&mut s[0]).unwrap();
-    let told = Arc::new(std::sync::Mutex::new(Vec::new()));
-    s[0].notify_retired(Box::new(Told(told.clone()))).unwrap();
+    s[0].arm_retirement().unwrap();
     drop(graph);
     assert_eq!(
         Arc::strong_count(&token),
         2,
         "the replay in flight holds the buffers after the graph dropped"
     );
-    assert!(wait_until(Duration::from_secs(10), || !told
-        .lock()
-        .unwrap()
-        .is_empty()));
-    let ticket = told.lock().unwrap()[0];
+    let mut arrived = None;
+    assert!(wait_until(Duration::from_secs(10), || {
+        arrived = s[0].poll_retired();
+        arrived.is_some()
+    }));
+    let ticket = arrived.unwrap();
     assert!(
         f.out_words(0) == f.reference(2.0, 1.0),
         "the replay completed with its buffers"

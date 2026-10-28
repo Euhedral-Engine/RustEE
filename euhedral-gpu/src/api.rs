@@ -132,8 +132,21 @@ pub trait Stream: Send + Sized + 'static {
     /// `Err(Invalid)`; it is never treated as already done.
     fn await_marker(&mut self, marker: Marker) -> Result<(), GpuError>;
 
-    /// Arms a retirement after the work submitted so far: `listener` runs once.
+    /// Arms a retirement after the work submitted so far: `listener` is told once, on the thread that owns this stream,
+    /// by [`poll_retired`](Self::poll_retired), in the order the retirements were armed. The backend's callback only
+    /// queues the outcome (it makes no driver call, frees and allocates nothing); the listener is made and dropped on
+    /// the owner's thread.
     fn notify_retired(&mut self, listener: Box<dyn RetireListener>) -> Result<(), GpuError>;
+
+    /// Arms a retirement after the work submitted so far, without a listener: its ticket comes back from
+    /// [`poll_retired`](Self::poll_retired). This is what [`retire_into`](crate::retire_into) uses.
+    fn arm_retirement(&mut self) -> Result<(), GpuError>;
+
+    /// Drains the stream's retirement queue, which the backend's callbacks fill. Each listener of an arrived
+    /// retirement is told here, in order; the first retirement armed with [`arm_retirement`](Self::arm_retirement)
+    /// returns its ticket. `None` when nothing more arrived. Once the device is poisoned, the retirements still
+    /// outstanding are reported with [`POISONED_STATUS`], so nothing is stranded.
+    fn poll_retired(&mut self) -> Option<RetireTicket>;
 
     /// Settles a retirement: the device failure behind it, or `None`. Never panics. Values kept for the retirement are
     /// released. A ticket armed on another stream is refused with `Some(Invalid)` and releases nothing.
@@ -266,12 +279,11 @@ pub trait Graph: Send + fmt::Debug {
 
 /// Told once that a retirement happened.
 ///
-/// The listener is consumed and dropped on the backend's callback thread. It must not own the last handle to a
-/// stream, a graph or a device (dropping those synchronizes with the device, which the callback must never do): hold
-/// only plain data, atomics and queue handles, as [`retire_into`](crate::retire_into)'s listener does.
+/// The listener is made, told and dropped on the thread that owns the stream, inside
+/// [`Stream::poll_retired`]; the backend's callback thread never touches it. So it may do what the owner may do, but
+/// it runs on the owner's poll: keep it short.
 pub trait RetireListener: Send + 'static {
-    /// Runs once, on the backend's callback thread: enqueue only. No driver calls, no blocking, no frames built or
-    /// dropped.
+    /// Runs once, on the owner's thread, from [`Stream::poll_retired`].
     fn retired(self: Box<Self>, ticket: RetireTicket);
 }
 

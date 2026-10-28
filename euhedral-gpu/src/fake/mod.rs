@@ -20,9 +20,11 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use euhedral_graph::{LanePool, QueueId};
 
+use crate::retire::RetireSink;
+
 use crate::{
     Args, Fingerprint, Gpu, GpuError, Kernel, Launch, POISONED_STATUS, Poison, Rerecorded,
-    RetireListener, RetireTicket, StreamOptions,
+    StreamOptions,
 };
 
 pub use enqueue::FakeEnqueue;
@@ -141,10 +143,9 @@ pub(crate) enum QOp {
         value: u64,
     },
     Retire {
-        /// The identity of the stream that armed it, and its number on that stream.
-        stream: QueueId,
+        /// The retirement's number on its stream, and the end of the stream's retirement queue the device pushes to.
         seq: u64,
-        listener: Box<dyn RetireListener>,
+        sink: Arc<RetireSink>,
     },
 }
 
@@ -289,13 +290,15 @@ impl FakeGpu {
             let Queued { lane, op, .. } = st.lanes[index].queue.pop_front().expect("a head");
             self.run(&mut st, index, lane, op, fault.as_ref())
         };
-        if let Some((listener, ticket)) = retire {
-            listener.retired(ticket);
+        // The device only queues the outcome, as a driver's callback would; the stream's owner dispatches it.
+        if let Some((sink, status)) = retire {
+            sink.push(status);
         }
         true
     }
 
-    /// Runs one operation under the state lock. A retirement is returned to be told with the lock released.
+    /// Runs one operation under the state lock. A retirement's outcome is returned to be queued after the lock is
+    /// released.
     fn run(
         &self,
         st: &mut State,
@@ -303,7 +306,7 @@ impl FakeGpu {
         lane: u16,
         op: QOp,
         fault: Option<&GpuError>,
-    ) -> Option<(Box<dyn RetireListener>, RetireTicket)> {
+    ) -> Option<(Arc<RetireSink>, i32)> {
         let status = match fault {
             Some(GpuError::Fault { code, .. }) => *code,
             Some(_) => POISONED_STATUS,
@@ -316,16 +319,9 @@ impl FakeGpu {
                     st.lanes[index].marks_run = value;
                     None
                 }
-                QOp::Retire {
-                    stream,
-                    seq,
-                    listener,
-                } => {
+                QOp::Retire { seq, sink } => {
                     st.log.push(FakeOp::Retire { lane, seq });
-                    Some((
-                        listener,
-                        RetireTicket::new(stream, euhedral_graph::LaneId(lane), seq, status),
-                    ))
+                    Some((sink, status))
                 }
                 _ => None,
             };
@@ -379,16 +375,9 @@ impl FakeGpu {
                 Ok(())
             }
             QOp::Await { .. } => Ok(()),
-            QOp::Retire {
-                stream,
-                seq,
-                listener,
-            } => {
+            QOp::Retire { seq, sink } => {
                 st.log.push(FakeOp::Retire { lane, seq });
-                return Some((
-                    listener,
-                    RetireTicket::new(stream, euhedral_graph::LaneId(lane), seq, 0),
-                ));
+                return Some((sink, 0));
             }
         };
         if let Err(fault) = outcome {

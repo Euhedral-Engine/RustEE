@@ -211,7 +211,7 @@ impl Enqueue for FakeEnqueue<'_> {
             (Some((rec, _)), _) if rec.mode == Mode::Record => rec.kept.push(value),
             (Some(_), _) => drop(value),
             (None, Some(stream)) => {
-                let seq = stream.next_retire;
+                let seq = stream.retire.next_seq();
                 stream.kept.push(seq, value);
             }
             (None, None) => drop(value),

@@ -166,7 +166,7 @@ impl Graph for CudaGraph {
         // The replay reads the recording's buffers when it runs, which may be after this graph dropped: the stream
         // keeps them until the next retirement armed on it after this replay is confirmed.
         if !self.kept.is_empty() {
-            let seq = stream.next_retire;
+            let seq = stream.retire.next_seq();
             stream.kept.push(seq, Box::new(self.kept.clone()));
         }
         Ok(())
@@ -209,7 +209,7 @@ impl CudaSequence<'_> {
             return;
         }
         for r in &mut self.real {
-            let seq = r.stream.next_retire;
+            let seq = r.stream.retire.next_seq();
             r.stream.kept.push(seq, Box::new(self.rec.frozen.clone()));
         }
     }

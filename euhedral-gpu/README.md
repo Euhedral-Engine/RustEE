@@ -51,21 +51,29 @@ Asynchronous, backend-neutral GPU access for the RustEE control plane. A lattice
   events (default 256). `mark()` returns `Err(Busy)` rather than reuse a slot whose marker has not completed; an
   await on a marker that already completed adds no device wait.
 - **Retirement.**
-  - `notify_retired(listener)` arms a completion point after the work submitted so far. The listener runs once, on the
-    backend's callback thread, and may only enqueue: no driver calls, no blocking, no frames built or dropped. A panic
-    in a listener is caught.
+  - A retirement is a completion point after the work submitted so far. **The driver's callback only queues its
+    outcome**: each stream owns one unbounded, lock-free MPSC queue (`Queue<_, Multi, Single>` of
+    `euhedral-data-structures`, chunk-growing, with pooled chunks so steady state recycles them), and the callback,
+    whose user data is a pointer to the stream's end of that queue, pushes the status of the work before it. It makes
+    no driver call, takes no lock, frees nothing, and allocates nothing in steady state (`tests/cuda_alloc.rs` counts
+    every allocation of the process over 1600 retirements: zero). A listener is never touched by the callback.
+  - The retirement's number is not sent: a stream's callbacks run in the order they were enqueued, and each armed
+    retirement enqueues one, so the n-th status that arrives belongs to the n-th retirement armed. The owner keeps what
+    to do with each (a `PlainQueue` by number), and `poll_retired()` drains the queue and dispatches: `notify_retired(
+    listener)` listeners are told, on the owner's thread, in order; the first retirement armed with
+    `arm_retirement()` returns its ticket. Listeners are made and dropped on the owner's thread only.
+  - If the device is poisoned, `poll_retired` reports the retirements still outstanding with `POISONED_STATUS` and
+    drops what arrives afterwards (it could no longer say whose it is).
   - `confirm_retired(ticket)` is a method of the submitter and returns the device failure behind the ticket, or `None`.
     The submitter owns its kept values (a `PlainQueue`), so releasing them needs no lock and no queue. It releases the values kept with `Enqueue::keep`, so the host buffers a copy reads live until the retirement is
     confirmed. A ticket carries the identity of the stream that armed it (its fields are private, made only by a
     backend); settling it on another stream is `Some(Invalid)` and releases nothing.
-  - A listener is dropped on the backend's callback thread, so it must not own the last handle to a stream, a graph or
-    a device.
   - `retire_into(stream, &completions, |stream, ticket| frame)` arms a retirement whose continuation is a frame
     emitted by the lattice's own poll. The submitter **travels with its continuation**: it is taken by value and
     handed back to the closure with the ticket, so the frame that continues the work owns the stream and its kept
-    values. The callback stores the result in three atomics (a wait-free hand-off to the poll), never in a queue it
-    could block on. A submission finishing never counts as completion. If the device is poisoned before the
-    callback runs, the continuation is emitted at once, so nothing is stranded.
+    values. `Completions` polls the stream's retirement queue through `Stream::poll_retired`; there is no
+    per-retirement cell. A submission finishing never counts as completion. If the device is poisoned before the
+    callback runs, the continuation is emitted at once with `POISONED_STATUS`, so nothing is stranded.
 - **Kernels from outside.** A `Module` loads from `from_source` or from `from_image`; the crate enumerates no kernels.
   - `from_source` compiles CUDA C with NVRTC for the device's exact architecture (or PTX for the newest architecture
     NVRTC knows, which the driver compiles forward), with the options, include paths and in-memory headers of

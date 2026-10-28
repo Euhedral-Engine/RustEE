@@ -5,6 +5,7 @@ use std::sync::Arc;
 use euhedral_graph::{DeviceQueue, LaneId, Marker, QueueId};
 
 use crate::kept::Kept;
+use crate::retire::{RetireSink, Retirements};
 use crate::{Gpu, GpuError, POISONED_STATUS, RetireListener, RetireTicket, Stream};
 
 use super::{FakeEnqueue, FakeGpu, QOp};
@@ -17,6 +18,9 @@ pub struct FakeQueue {
     name: String,
     /// Global index of this stream's lane.
     global: usize,
+    /// The end of the retirement queue the device pushes to. It lives as long as the shared side does, as a driver's
+    /// callback context would.
+    sink: Arc<RetireSink>,
 }
 
 impl DeviceQueue for FakeQueue {
@@ -51,8 +55,8 @@ pub struct FakeStream {
     base: usize,
     index: usize,
     count: usize,
-    /// The number the next armed retirement gets.
-    pub(crate) next_retire: u64,
+    /// The owner's end of the retirement queue, and the retirements armed.
+    pub(crate) retire: Retirements,
     pub(crate) kept: Kept,
 }
 
@@ -65,11 +69,14 @@ impl FakeStream {
         index: usize,
         count: usize,
     ) -> Self {
+        let lane = LaneId(u16::try_from(index).expect("at most 64 lanes"));
+        let (retire, sink) = Retirements::new(id, lane);
         let queue = Arc::new(FakeQueue {
             gpu: gpu.clone(),
             id,
             name: name.to_owned(),
             global: base + index,
+            sink: Arc::new(sink),
         });
         Self {
             gpu,
@@ -78,7 +85,7 @@ impl FakeStream {
             base,
             index,
             count,
-            next_retire: 1,
+            retire,
             kept: Kept::default(),
         }
     }
@@ -97,6 +104,16 @@ impl FakeStream {
 
     pub(crate) fn push(&self, op: QOp) {
         self.gpu.push(self.global(), self.lane_id(), op);
+    }
+
+    fn arm(&mut self, listener: Option<Box<dyn RetireListener>>) -> Result<(), GpuError> {
+        self.gpu.poison.check()?;
+        self.push(QOp::Retire {
+            seq: self.retire.next_seq(),
+            sink: self.queue.sink.clone(),
+        });
+        self.retire.register(listener);
+        Ok(())
     }
 
     /// A marker after the work enqueued so far.
@@ -193,15 +210,16 @@ impl Stream for FakeStream {
     }
 
     fn notify_retired(&mut self, listener: Box<dyn RetireListener>) -> Result<(), GpuError> {
-        self.gpu.poison.check()?;
-        let seq = self.next_retire;
-        self.next_retire += 1;
-        self.push(QOp::Retire {
-            stream: self.id,
-            seq,
-            listener,
-        });
-        Ok(())
+        self.arm(Some(listener))
+    }
+
+    fn arm_retirement(&mut self) -> Result<(), GpuError> {
+        self.arm(None)
+    }
+
+    fn poll_retired(&mut self) -> Option<RetireTicket> {
+        let poisoned = self.gpu.poison.get().is_some();
+        self.retire.poll(poisoned)
     }
 
     fn confirm_retired(&mut self, ticket: RetireTicket) -> Option<GpuError> {

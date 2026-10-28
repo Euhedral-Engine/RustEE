@@ -138,9 +138,14 @@ fn retirement_runs_each_listener_once_in_order() {
         s[0].notify_retired(Box::new(Record(seen.clone()))).unwrap();
     }
     gpu.run_until_idle();
-    gpu.run_until_idle();
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "the device only queued the outcomes; nothing is told until the owner polls"
+    );
+    assert!(s[0].poll_retired().is_none());
+    assert!(s[0].poll_retired().is_none(), "each exactly once");
     let seen = seen.lock().unwrap();
-    assert_eq!(seen.iter().map(|t| t.seq()).collect::<Vec<_>>(), [1, 2, 3]);
+    assert_eq!(seen.iter().map(|t| t.seq()).collect::<Vec<_>>(), [0, 1, 2]);
     assert!(seen.iter().all(RetireTicket::ok));
 }
 
@@ -163,6 +168,7 @@ fn kept_values_live_until_confirmed_or_the_stream_drops() {
     })
     .unwrap();
     gpu.run_until_idle();
+    s.poll_retired();
     assert_eq!(
         Arc::strong_count(&confirmed),
         2,
@@ -245,6 +251,7 @@ fn a_fault_surfaces_through_confirm_retired_and_poisons_the_device() {
     .unwrap();
     s[0].notify_retired(Box::new(Record(seen.clone()))).unwrap();
     gpu.run_until_idle();
+    s[0].poll_retired();
     let ticket = seen.lock().unwrap()[0];
     assert!(!ticket.ok());
     assert_eq!(ticket.status(), 700);
@@ -369,6 +376,8 @@ fn a_ticket_settles_only_on_the_stream_that_armed_it() {
     s[1].notify_retired(Box::new(Record(from_b.clone())))
         .unwrap();
     gpu.run_until_idle();
+    s[0].poll_retired();
+    s[1].poll_retired();
     let (ticket_a, ticket_b) = (from_a.lock().unwrap()[0], from_b.lock().unwrap()[0]);
     assert_ne!(s[0].id(), s[1].id());
     assert_eq!(
@@ -415,4 +424,33 @@ fn a_marker_of_another_pool_is_refused_not_treated_as_done() {
         a[0].await_marker(beyond),
         Err(GpuError::Invalid(_))
     ));
+}
+
+#[test]
+fn a_poisoned_device_reports_the_retirements_still_outstanding() {
+    let gpu = gpu_with_kernels();
+    let (_pool, mut s) = lanes(&gpu, &["a", "b"]);
+    let bad = faulting_kernel(&gpu);
+    s[0].submit(|q| {
+        // SAFETY: the fake kernel touches no memory.
+        unsafe { q.launch(&bad, Launch::linear(1, 1), &Args::new()) }
+    })
+    .unwrap();
+    let behind = s[0].mark().unwrap();
+    // Lane b waits for lane a, so its retirements are still outstanding when the fault happens.
+    s[1].await_marker(behind).unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    for _ in 0..2 {
+        s[1].notify_retired(Box::new(Record(seen.clone()))).unwrap();
+    }
+    assert!(gpu.step(), "only the faulting launch runs");
+    assert!(seen.lock().unwrap().is_empty());
+    s[1].poll_retired();
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 2, "each reported once, none stranded");
+    assert!(
+        seen.iter()
+            .all(|t| t.status() == euhedral_gpu::POISONED_STATUS)
+    );
+    assert_eq!(seen.iter().map(|t| t.seq()).collect::<Vec<_>>(), [0, 1]);
 }

@@ -578,8 +578,9 @@ goes to its owner, or to another lane.
 
 **retirement** ([`notify_retired`, `confirm_retired`, `RetireTicket`](euhedral-gpu/src/api.rs),
 [`retire_into`](euhedral-gpu/src/retire.rs)): the device reaching a point after the work submitted so far. The
-listener runs once on the backend's callback thread and only enqueues; `confirm_retired` settles the ticket on an
-ordinary thread and returns the device failure, or none; `retire_into` makes the retirement a frame of a
+driver's callback only pushes the outcome onto the stream's unbounded lock-free MPSC queue (no allocation, free or
+lock); the owner drains it with `poll_retired` and tells the listeners on its own thread, in order;
+`confirm_retired` settles the ticket (a submitter method) and returns the device failure, or none; `retire_into` makes the retirement a frame of a
 `Completions`, and the submitter travels with its continuation. A stage finishing its submission is never completion.
 
 **poisoned device** ([`Poison`](euhedral-gpu/src/poison.rs), [`GpuError::Poisoned`](euhedral-gpu/src/error.rs)): a

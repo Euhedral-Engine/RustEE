@@ -9,7 +9,7 @@
 //! | [`Gpu`], [`Stream`], [`Enqueue`] | `api` | a device, an ordered queue of device work, and what a submission enqueues |
 //! | [`Module`], [`Kernel`], [`Args`] | `api`, `args` | code loaded at run time and its typed arguments |
 //! | [`Sequence`], [`Graph`] | `api` | a recurring sequence of submissions, recorded once and replayed |
-//! | [`retire_into`], [`RetireListener`] | `retire`, `api` | retirement that continues as a frame |
+//! | [`retire_into`], [`RetireListener`] | `retire`, `api` | retirement: the callback queues, the owner drains and dispatches, and it continues as a frame |
 //! | [`ModuleCache`] | `module_cache` | compiled modules keyed by a content hash |
 //! | `fake::FakeGpu` (feature `fake`) | `fake` | a stepped device for tests, with no wall clock |
 //! | `cuda::CudaGpu` (feature `cuda`) | `cuda` | the CUDA backend on `euhedral-memory`'s driver and context |

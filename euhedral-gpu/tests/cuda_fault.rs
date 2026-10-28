@@ -29,7 +29,7 @@ impl RetireListener for Record {
     }
 }
 
-fn wait_until(limit: Duration, condition: impl Fn() -> bool) -> bool {
+fn wait_until(limit: Duration, mut condition: impl FnMut() -> bool) -> bool {
     let start = Instant::now();
     while !condition() {
         if start.elapsed() > limit {
@@ -103,10 +103,10 @@ fn a_device_fault_surfaces_through_confirm_retired_and_poisons_the_device() {
     );
 
     // The listener runs once, with the device's error.
-    assert!(wait_until(Duration::from_secs(10), || !seen
-        .lock()
-        .unwrap()
-        .is_empty()));
+    assert!(wait_until(Duration::from_secs(10), || {
+        s[0].poll_retired();
+        !seen.lock().unwrap().is_empty()
+    }));
     let ticket = seen.lock().unwrap()[0];
     assert_eq!(seen.lock().unwrap().len(), 1);
     assert!(!ticket.ok());

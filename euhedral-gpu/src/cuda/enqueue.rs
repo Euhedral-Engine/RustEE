@@ -284,7 +284,7 @@ impl Enqueue for CudaEnqueue<'_> {
             (Some((rec, _)), _) if rec.mode == Mode::Record => rec.kept.push(value),
             (Some(_), _) => drop(value),
             (None, Some(target)) => {
-                let seq = target.stream.next_retire;
+                let seq = target.stream.retire.next_seq();
                 target.stream.kept.push(seq, value);
             }
             (None, None) => drop(value),
