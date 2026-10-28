@@ -136,6 +136,8 @@ pub(crate) enum QOp {
         value: u64,
     },
     Retire {
+        /// The identity of the stream that armed it, and its number on that stream.
+        stream: u64,
         seq: u64,
         listener: Box<dyn RetireListener>,
     },
@@ -308,15 +310,15 @@ impl FakeGpu {
                     st.lanes[index].marks_run = value;
                     None
                 }
-                QOp::Retire { seq, listener } => {
+                QOp::Retire {
+                    stream,
+                    seq,
+                    listener,
+                } => {
                     st.log.push(FakeOp::Retire { lane, seq });
                     Some((
                         listener,
-                        RetireTicket {
-                            lane: euhedral_graph::LaneId(lane),
-                            seq,
-                            status,
-                        },
+                        RetireTicket::new(stream, euhedral_graph::LaneId(lane), seq, status),
                     ))
                 }
                 _ => None,
@@ -371,15 +373,15 @@ impl FakeGpu {
                 Ok(())
             }
             QOp::Await { .. } => Ok(()),
-            QOp::Retire { seq, listener } => {
+            QOp::Retire {
+                stream,
+                seq,
+                listener,
+            } => {
                 st.log.push(FakeOp::Retire { lane, seq });
                 return Some((
                     listener,
-                    RetireTicket {
-                        lane: euhedral_graph::LaneId(lane),
-                        seq,
-                        status: 0,
-                    },
+                    RetireTicket::new(stream, euhedral_graph::LaneId(lane), seq, 0),
                 ));
             }
         };

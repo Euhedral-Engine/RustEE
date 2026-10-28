@@ -20,6 +20,7 @@ pub(crate) struct StreamState {
 #[derive(Debug)]
 pub struct FakeStream {
     gpu: Arc<FakeGpu>,
+    id: u64,
     name: String,
     /// Global index of lane 0 of this stream's pool, this stream's index in the pool, and the pool's size.
     base: usize,
@@ -39,6 +40,7 @@ impl FakeStream {
     ) -> Self {
         Self {
             gpu,
+            id: crate::ids::next_stream_id(),
             name: name.to_owned(),
             base,
             index,
@@ -167,6 +169,10 @@ impl Stream for FakeStream {
         LaneId(self.lane_id())
     }
 
+    fn id(&self) -> u64 {
+        self.id
+    }
+
     fn submit<R>(
         &self,
         f: impl FnOnce(&mut FakeEnqueue<'_>) -> Result<R, GpuError>,
@@ -191,19 +197,28 @@ impl Stream for FakeStream {
         self.gpu.poison.check()?;
         let seq = guard.next_retire;
         guard.next_retire += 1;
-        self.push(QOp::Retire { seq, listener });
+        self.push(QOp::Retire {
+            stream: self.id,
+            seq,
+            listener,
+        });
         Ok(())
     }
 
     fn confirm_retired(&self, ticket: RetireTicket) -> Option<GpuError> {
-        if ticket.status == POISONED_STATUS {
+        if ticket.stream() != self.id {
+            return Some(GpuError::Invalid(
+                "a retirement ticket of another stream".into(),
+            ));
+        }
+        if ticket.status() == POISONED_STATUS {
             return self
                 .gpu
                 .poisoned()
                 .map(|cause| GpuError::Poisoned(Box::new(cause)));
         }
-        self.kept.release_through(ticket.seq);
-        if ticket.status != 0 {
+        self.kept.release_through(ticket.seq());
+        if ticket.status() != 0 {
             return self.gpu.poisoned();
         }
         self.gpu

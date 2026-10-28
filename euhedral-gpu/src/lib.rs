@@ -23,6 +23,7 @@ pub mod cuda;
 mod error;
 #[cfg(feature = "fake")]
 pub mod fake;
+mod ids;
 #[cfg(any(feature = "fake", feature = "cuda"))]
 mod kept;
 mod module_cache;

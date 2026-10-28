@@ -20,6 +20,7 @@ pub fn retire_into<S: Stream>(
 ) -> Result<(), GpuError> {
     let gpu = stream.gpu().clone();
     let (listener, pending) = armed(
+        stream.id(),
         stream.lane(),
         Box::new(move || gpu.poisoned().is_some()),
         Box::new(then),
@@ -41,8 +42,8 @@ struct CellListener(Arc<RetireCell>);
 
 impl RetireListener for CellListener {
     fn retired(self: Box<Self>, ticket: RetireTicket) {
-        self.0.seq.store(ticket.seq, Ordering::Relaxed);
-        self.0.status.store(ticket.status, Ordering::Relaxed);
+        self.0.seq.store(ticket.seq(), Ordering::Relaxed);
+        self.0.status.store(ticket.status(), Ordering::Relaxed);
         self.0.done.store(true, Ordering::Release);
     }
 }
@@ -51,6 +52,7 @@ type Then = Box<dyn FnOnce(RetireTicket) -> Box<dyn Frame> + Send>;
 
 struct CellPending {
     cell: Arc<RetireCell>,
+    stream: u64,
     lane: LaneId,
     poisoned: Box<dyn Fn() -> bool + Send>,
     then: Option<Then>,
@@ -59,17 +61,14 @@ struct CellPending {
 impl Pending for CellPending {
     fn poll(&mut self) -> Option<Box<dyn Frame>> {
         let ticket = if self.cell.done.load(Ordering::Acquire) {
-            RetireTicket {
-                lane: self.lane,
-                seq: self.cell.seq.load(Ordering::Relaxed),
-                status: self.cell.status.load(Ordering::Relaxed),
-            }
+            RetireTicket::new(
+                self.stream,
+                self.lane,
+                self.cell.seq.load(Ordering::Relaxed),
+                self.cell.status.load(Ordering::Relaxed),
+            )
         } else if (self.poisoned)() {
-            RetireTicket {
-                lane: self.lane,
-                seq: u64::MAX,
-                status: POISONED_STATUS,
-            }
+            RetireTicket::new(self.stream, self.lane, u64::MAX, POISONED_STATUS)
         } else {
             return None;
         };
@@ -80,6 +79,7 @@ impl Pending for CellPending {
 /// A listener and the pending that turns its retirement into `then`'s frame. `poisoned` says whether the device
 /// faulted.
 fn armed(
+    stream: u64,
     lane: LaneId,
     poisoned: Box<dyn Fn() -> bool + Send>,
     then: Then,
@@ -89,6 +89,7 @@ fn armed(
         Box::new(CellListener(cell.clone())),
         Box::new(CellPending {
             cell,
+            stream,
             lane,
             poisoned,
             then: Some(then),
@@ -114,34 +115,33 @@ mod tests {
     #[test]
     fn retire_cell_ticket_round_trips() {
         let seen = Arc::new(Mutex::new(Vec::new()));
-        let (listener, mut pending) = armed(LaneId(2), Box::new(|| false), {
+        let (listener, mut pending) = armed(5, LaneId(2), Box::new(|| false), {
             let seen = seen.clone();
             Box::new(move |t| frame_recording(&seen, t))
         });
         assert!(pending.poll().is_none(), "not retired yet");
-        listener.retired(RetireTicket {
-            lane: LaneId(2),
-            seq: 7,
-            status: 0,
-        });
+        listener.retired(RetireTicket::new(5, LaneId(2), 7, 0));
         assert!(pending.poll().is_some());
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 1);
-        assert_eq!((seen[0].seq, seen[0].lane), (7, LaneId(2)));
+        assert_eq!(
+            (seen[0].seq(), seen[0].lane(), seen[0].stream()),
+            (7, LaneId(2), 5)
+        );
         assert!(seen[0].ok());
     }
 
     #[test]
     fn a_poisoned_device_emits_the_continuation_without_the_listener() {
         let seen = Arc::new(Mutex::new(Vec::new()));
-        let (_listener, mut pending) = armed(LaneId(0), Box::new(|| true), {
+        let (_listener, mut pending) = armed(5, LaneId(0), Box::new(|| true), {
             let seen = seen.clone();
             Box::new(move |t| frame_recording(&seen, t))
         });
         assert!(pending.poll().is_some());
         assert!(pending.poll().is_none(), "emitted once");
         let seen = seen.lock().unwrap();
-        assert_eq!(seen[0].status, POISONED_STATUS);
+        assert_eq!(seen[0].status(), POISONED_STATUS);
         assert!(!seen[0].ok());
     }
 }

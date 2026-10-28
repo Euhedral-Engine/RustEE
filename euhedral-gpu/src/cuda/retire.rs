@@ -17,6 +17,7 @@ use super::stream::CudaStream;
 /// What a callback carries: the listener, and the ticket's lane and number.
 struct CallbackRecord {
     listener: Box<dyn RetireListener>,
+    stream: u64,
     lane: LaneId,
     seq: u64,
 }
@@ -27,10 +28,11 @@ fn tell(user: *mut c_void, status: CuResult) {
     let record = unsafe { Box::from_raw(user.cast::<CallbackRecord>()) };
     let CallbackRecord {
         listener,
+        stream,
         lane,
         seq,
     } = *record;
-    let ticket = RetireTicket { lane, seq, status };
+    let ticket = RetireTicket::new(stream, lane, seq, status);
     let _ = catch_unwind(AssertUnwindSafe(|| listener.retired(ticket)));
 }
 
@@ -49,6 +51,7 @@ impl CudaStream {
     pub(crate) fn arm(&self, seq: u64, listener: Box<dyn RetireListener>) -> Result<(), GpuError> {
         let user = Box::into_raw(Box::new(CallbackRecord {
             listener,
+            stream: self.id,
             lane: self.lane_id(),
             seq,
         }))

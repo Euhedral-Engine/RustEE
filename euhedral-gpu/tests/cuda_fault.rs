@@ -106,7 +106,7 @@ fn a_device_fault_surfaces_through_confirm_retired_and_poisons_the_device() {
     let ticket = seen.lock().unwrap()[0];
     assert_eq!(seen.lock().unwrap().len(), 1);
     assert!(!ticket.ok());
-    assert_eq!(ticket.status, 700);
+    assert_eq!(ticket.status(), 700);
     assert!(matches!(
         s[0].confirm_retired(ticket),
         Some(GpuError::Fault { code: 700, .. })

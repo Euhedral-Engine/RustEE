@@ -112,6 +112,7 @@ pub(crate) struct StreamState {
 #[derive(Debug)]
 pub struct CudaStream {
     pub(crate) gpu: Arc<CudaGpu>,
+    pub(crate) id: u64,
     lane: LaneId,
     name: String,
     pub(crate) raw: CuStream,
@@ -157,6 +158,7 @@ impl CudaStream {
             device.check("cuStreamCreate", code).map_err(from_cuda)?;
             streams.push(Arc::new(CudaStream {
                 gpu: gpu.clone(),
+                id: crate::ids::next_stream_id(),
                 lane: LaneId(u16::try_from(i).expect("at most 64 lanes")),
                 name: (*name).to_owned(),
                 raw,
@@ -295,6 +297,10 @@ impl Stream for CudaStream {
         self.lane
     }
 
+    fn id(&self) -> u64 {
+        self.id
+    }
+
     fn submit<R>(
         &self,
         f: impl FnOnce(&mut CudaEnqueue<'_>) -> Result<R, GpuError>,
@@ -327,23 +333,28 @@ impl Stream for CudaStream {
     }
 
     fn confirm_retired(&self, ticket: RetireTicket) -> Option<GpuError> {
-        if ticket.status == POISONED_STATUS {
+        if ticket.stream() != self.id {
+            return Some(GpuError::Invalid(
+                "a retirement ticket of another stream".into(),
+            ));
+        }
+        if ticket.status() == POISONED_STATUS {
             self.gpu
                 .poison
                 .get()
                 .map(|cause| GpuError::Poisoned(Box::new(cause)))
         } else {
             // Release only what this retirement covered; a poisoned ticket does not say which that was.
-            self.kept.release_through(ticket.seq);
-            if ticket.status != 0 {
+            self.kept.release_through(ticket.seq());
+            if ticket.status() != 0 {
                 // An ordinary thread may ask the driver for the error's name.
                 let err = self
                     .gpu
-                    .check("device work", ticket.status)
+                    .check("device work", ticket.status())
                     .err()
                     .unwrap_or(GpuError::Call {
                         call: "device work",
-                        code: ticket.status,
+                        code: ticket.status(),
                         name: "unknown".into(),
                     });
                 Some(err)

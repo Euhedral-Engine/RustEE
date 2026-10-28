@@ -142,7 +142,7 @@ fn retirement_runs_each_listener_once_in_order() {
     gpu.run_until_idle();
     gpu.run_until_idle();
     let seen = seen.lock().unwrap();
-    assert_eq!(seen.iter().map(|t| t.seq).collect::<Vec<_>>(), [1, 2, 3]);
+    assert_eq!(seen.iter().map(|t| t.seq()).collect::<Vec<_>>(), [1, 2, 3]);
     assert!(seen.iter().all(RetireTicket::ok));
 }
 
@@ -255,7 +255,7 @@ fn a_fault_surfaces_through_confirm_retired_and_poisons_the_device() {
     gpu.run_until_idle();
     let ticket = seen.lock().unwrap()[0];
     assert!(!ticket.ok());
-    assert_eq!(ticket.status, 700);
+    assert_eq!(ticket.status(), 700);
     assert!(matches!(
         s[0].confirm_retired(ticket),
         Some(GpuError::Fault { code: 700, .. })
@@ -350,4 +350,38 @@ fn a_poisoned_device_still_emits_retire_into_continuations() {
         confirmed.lock().unwrap().take(),
         Some(Some(GpuError::Poisoned(_)))
     ));
+}
+
+#[test]
+fn a_ticket_settles_only_on_the_stream_that_armed_it() {
+    let gpu = gpu_with_kernels();
+    let (_pool, s) = lanes(&gpu, &["a", "b"]);
+    let kept = Arc::new(());
+    let (from_a, from_b) = (
+        Arc::new(Mutex::new(Vec::new())),
+        Arc::new(Mutex::new(Vec::new())),
+    );
+    s[0].submit(|q| {
+        q.keep(Box::new(kept.clone()));
+        Ok(())
+    })
+    .unwrap();
+    s[0].notify_retired(Box::new(Record(from_a.clone())))
+        .unwrap();
+    s[1].notify_retired(Box::new(Record(from_b.clone())))
+        .unwrap();
+    gpu.run_until_idle();
+    let (ticket_a, ticket_b) = (from_a.lock().unwrap()[0], from_b.lock().unwrap()[0]);
+    assert_ne!(s[0].id(), s[1].id());
+    assert_eq!(
+        (ticket_a.stream(), ticket_b.stream()),
+        (s[0].id(), s[1].id())
+    );
+    // Settling stream b's ticket on stream a is refused and releases nothing of a's.
+    let refused = s[0].confirm_retired(ticket_b);
+    assert!(matches!(refused, Some(GpuError::Invalid(_))), "{refused:?}");
+    assert_eq!(Arc::strong_count(&kept), 2, "a's kept value is still held");
+    assert_eq!(s[0].confirm_retired(ticket_a), None);
+    assert_eq!(Arc::strong_count(&kept), 1);
+    assert_eq!(s[1].confirm_retired(ticket_b), None);
 }

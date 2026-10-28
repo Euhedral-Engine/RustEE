@@ -193,7 +193,7 @@ mod streams {
             >= 5));
         let tickets = seen.lock().unwrap().clone();
         assert_eq!(
-            tickets.iter().map(|t| t.seq).collect::<Vec<_>>(),
+            tickets.iter().map(|t| t.seq()).collect::<Vec<_>>(),
             [0, 1, 2, 3, 4]
         );
         for t in tickets {
@@ -246,6 +246,47 @@ mod streams {
         drop((completions, pool, s));
         // SAFETY: the stream ended its work; nothing uses the block.
         unsafe { mem.free(buf) };
+    }
+
+    #[test]
+    fn a_ticket_of_another_stream_is_refused_and_frees_nothing() {
+        let Some(gpu) = gpu() else { return };
+        let (pool, s) = gpu
+            .open_lanes(&["a", "b"], StreamOptions::default())
+            .unwrap();
+        let mem = device_memory(&gpu);
+        let pinned = PinnedHost::new(gpu.device().clone(), LocationId(1), 0);
+        let host = Arc::new(pinned.alloc(1 << 20).unwrap());
+        let dev = mem.alloc(1 << 20).unwrap();
+        let (from_a, from_b) = (
+            Arc::new(std::sync::Mutex::new(Vec::new())),
+            Arc::new(std::sync::Mutex::new(Vec::new())),
+        );
+        s[0].submit(|q| {
+            q.keep(Box::new(host.clone()));
+            // SAFETY: valid blocks; the host block is kept until a's retirement is confirmed.
+            unsafe { q.copy_to_device(dev.addr, host.addr as *const u8, 1 << 20) }
+        })
+        .unwrap();
+        s[0].notify_retired(Box::new(Record(from_a.clone())))
+            .unwrap();
+        s[1].notify_retired(Box::new(Record(from_b.clone())))
+            .unwrap();
+        assert!(wait_until(Duration::from_secs(5), || {
+            !from_a.lock().unwrap().is_empty() && !from_b.lock().unwrap().is_empty()
+        }));
+        let (ticket_a, ticket_b) = (from_a.lock().unwrap()[0], from_b.lock().unwrap()[0]);
+        let refused = s[0].confirm_retired(ticket_b);
+        assert!(matches!(refused, Some(GpuError::Invalid(_))), "{refused:?}");
+        assert_eq!(Arc::strong_count(&host), 2, "a's buffer is still kept");
+        assert_eq!(s[0].confirm_retired(ticket_a), None);
+        assert_eq!(Arc::strong_count(&host), 1);
+        drop((pool, s));
+        // SAFETY: the streams ended their work; nothing uses the blocks.
+        unsafe {
+            mem.free(dev);
+            pinned.free(*host);
+        }
     }
 
     #[test]
@@ -661,7 +702,7 @@ mod markers {
 
     impl RetireListener for Ordered {
         fn retired(self: Box<Self>, ticket: RetireTicket) {
-            self.0.lock().unwrap().push(ticket.lane.0);
+            self.0.lock().unwrap().push(ticket.lane().0);
         }
     }
 

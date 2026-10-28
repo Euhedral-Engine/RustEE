@@ -77,6 +77,10 @@ pub trait Stream: DeviceQueue + Sized + 'static {
 
     fn lane(&self) -> LaneId;
 
+    /// An identity of this stream, unique in the process. Tickets carry it, so a ticket settles only where it was
+    /// armed.
+    fn id(&self) -> u64;
+
     /// Runs `f` on the calling thread with the stream selected for every operation; the operations are contiguous
     /// on the stream. Keep `f` to enqueueing. A call on this stream from inside `f` is `Err(Invalid)`.
     fn submit<R>(
@@ -89,13 +93,18 @@ pub trait Stream: DeviceQueue + Sized + 'static {
     fn mark(&self) -> Result<Marker, GpuError>;
 
     /// Later work on this stream waits, on the device, for `marker`. The host does not wait.
+    ///
+    /// A marker names a lane and a value, and is meaningful only on the pool of the stream that made it; a marker of
+    /// another pool is not detected (it names the same lane of this pool). A lane beyond the pool, or a value that was
+    /// never made, is `Err(Invalid)`.
     fn await_marker(&self, marker: Marker) -> Result<(), GpuError>;
 
     /// Arms a retirement after the work submitted so far: `listener` runs once.
     fn notify_retired(&self, listener: Box<dyn RetireListener>) -> Result<(), GpuError>;
 
     /// Settles a retirement on an ordinary thread: the device failure behind it, or `None`. Never panics. Values
-    /// kept for the retirement are released.
+    /// kept for the retirement are released. A ticket armed on another stream is refused with `Some(Invalid)` and
+    /// releases nothing.
     fn confirm_retired(&self, ticket: RetireTicket) -> Option<GpuError>;
 }
 
@@ -207,6 +216,10 @@ pub trait Graph: Send + Sync + fmt::Debug {
 }
 
 /// Told once that a retirement happened.
+///
+/// The listener is consumed and dropped on the backend's callback thread. It must not own the last handle to a
+/// stream, a graph or a device (dropping those synchronizes with the device, which the callback must never do): hold
+/// only plain data, atomics and queue handles, as [`retire_into`](crate::retire_into)'s listener does.
 pub trait RetireListener: Send + 'static {
     /// Runs once, on the backend's callback thread: enqueue only. No driver calls, no blocking, no frames built or
     /// dropped.
@@ -216,16 +229,48 @@ pub trait RetireListener: Send + 'static {
 /// The status of a retirement that never reached the device: the device was poisoned first.
 pub const POISONED_STATUS: i32 = -1;
 
-/// A retirement: which lane, the retirement's number on it, and how the work before it ended.
+/// A retirement: which stream armed it, the retirement's number on it, and how the work before it ended.
+///
+/// Only a backend makes tickets. A ticket settles only on the stream that armed it
+/// ([`Stream::confirm_retired`]); a ticket of another stream is refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RetireTicket {
-    pub lane: LaneId,
-    pub seq: u64,
-    /// 0 when the work before it succeeded; a backend error code, or [`POISONED_STATUS`].
-    pub status: i32,
+    stream: u64,
+    lane: LaneId,
+    seq: u64,
+    status: i32,
 }
 
 impl RetireTicket {
+    pub(crate) fn new(stream: u64, lane: LaneId, seq: u64, status: i32) -> Self {
+        Self {
+            stream,
+            lane,
+            seq,
+            status,
+        }
+    }
+
+    /// The identity ([`Stream::id`]) of the stream that armed the retirement.
+    pub fn stream(&self) -> u64 {
+        self.stream
+    }
+
+    /// The lane of the stream that armed the retirement.
+    pub fn lane(&self) -> LaneId {
+        self.lane
+    }
+
+    /// The retirement's number on its stream, counting the retirements armed on it.
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    /// 0 when the work before it succeeded; a backend error code, or [`POISONED_STATUS`].
+    pub fn status(&self) -> i32 {
+        self.status
+    }
+
     pub fn ok(&self) -> bool {
         self.status == 0
     }
