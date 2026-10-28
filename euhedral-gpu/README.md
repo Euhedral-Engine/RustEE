@@ -71,10 +71,12 @@ Asynchronous, backend-neutral GPU access for the RustEE control plane. A lattice
     `arm_retirement()` returns its ticket. Listeners are made and dropped inside the owner's calls only.
   - If the device is poisoned, `poll_retired` reports the retirements still outstanding with `POISONED_STATUS` and
     drops what arrives afterwards (it could no longer say whose it is). A status that arrives with no retirement armed
-    is never dropped quietly: it poisons the device with `Invalid`. With the `cuLaunchHostFunc` fallback (a driver
-    without `cuStreamAddCallback`; the driver skips host functions after a fault), a poll that finds nothing arrived
-    while retirements are outstanding asks the stream (`cuStreamQuery`, which does not wait) and lets a failure
-    poison the device, so nothing is stranded.
+    is never dropped quietly: it poisons the device with `Invalid`.
+  - Retirement uses the stream callback (`cuStreamAddCallback`), which reports the status of the work before it exactly
+    once, even after a device fault, so a fault arrives as the retirement's status. The entry point is required when
+    the CUDA backend loads (every CUDA 13 driver exports it); a driver without it is a `GpuError::Load` ("libcuda: no
+    cuStreamAddCallback"), not a panic. There is no `cuLaunchHostFunc` fallback: a host function reports success
+    whatever became of the work before it.
   - `retire_into` refuses (the stream comes back in the error) a stream that has a listener-free retirement
     outstanding (`outstanding_tickets()`): its ticket would reach the continuation in place of its own.
     `retire_into_with` carries extra state with the stream and returns it on failure.

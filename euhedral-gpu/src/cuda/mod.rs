@@ -20,7 +20,6 @@ pub use stream::leaked_shared_sides;
 pub use stream::{CudaQueue, CudaStream};
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use euhedral_memory::cuda::{CudaError, Device, Driver};
 
@@ -79,8 +78,6 @@ pub struct CudaGpu {
     device: Arc<Device>,
     pub(crate) fns: GpuFns,
     pub(crate) poison: Poison,
-    /// Test switch: retirements use `cuLaunchHostFunc` even when `cuStreamAddCallback` exists.
-    force_host_func: AtomicBool,
     arch: (i32, i32),
     driver_version: i32,
 }
@@ -118,7 +115,6 @@ impl CudaGpu {
             device,
             fns,
             poison: Poison::new(),
-            force_host_func: AtomicBool::new(false),
             arch,
             driver_version,
         }))
@@ -150,22 +146,10 @@ impl CudaGpu {
         }
     }
 
-    /// A test hook (feature `test-hooks`): makes retirements use the `cuLaunchHostFunc` fallback, as on a driver without
-    /// `cuStreamAddCallback`.
-    #[cfg(feature = "test-hooks")]
-    pub fn force_host_func_fallback(&self, on: bool) {
-        self.force_host_func.store(on, Ordering::Relaxed);
-    }
-
     /// A test hook (feature `test-hooks`): poisons the device as an observed fault would.
     #[cfg(feature = "test-hooks")]
     pub fn poison_for_test(&self, what: &str) {
         self.fail_invalid(what);
-    }
-
-    /// Whether retirements are armed with `cuLaunchHostFunc`.
-    pub(crate) fn uses_host_func(&self) -> bool {
-        self.fns.stream_add_callback.is_none() || self.force_host_func.load(Ordering::Relaxed)
     }
 
     /// Poisons the device with a misuse that desynchronizes its bookkeeping, which must never pass silently.

@@ -15,8 +15,6 @@ pub type CuGraphNode = *mut c_void;
 
 /// `CUstreamCallback`.
 pub type StreamCallback = unsafe extern "C" fn(CuStream, CuResult, *mut c_void);
-/// `CUhostFn`.
-pub type HostFn = unsafe extern "C" fn(*mut c_void);
 
 /// `CUDA_KERNEL_NODE_PARAMS_v2`.
 #[repr(C)]
@@ -93,10 +91,10 @@ impl fmt::Debug for CaptureInfo {
 #[derive(Clone, Copy)]
 pub struct GpuFns {
     pub stream_wait_event: unsafe extern "C" fn(CuStream, CuEvent, c_uint) -> CuResult,
-    pub stream_query: unsafe extern "C" fn(CuStream) -> CuResult,
+    /// `cuStreamAddCallback`: required. Its callback receives the status of the work before it, exactly once, even
+    /// after a device fault, which is what retirement relies on.
     pub stream_add_callback:
-        Option<unsafe extern "C" fn(CuStream, StreamCallback, *mut c_void, c_uint) -> CuResult>,
-    pub launch_host_func: unsafe extern "C" fn(CuStream, HostFn, *mut c_void) -> CuResult,
+        unsafe extern "C" fn(CuStream, StreamCallback, *mut c_void, c_uint) -> CuResult,
     pub module_load_data_ex: unsafe extern "C" fn(
         *mut CuModule,
         *const c_void,
@@ -141,7 +139,6 @@ pub struct GpuFns {
 impl fmt::Debug for GpuFns {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("GpuFns")
-            .field("stream_add_callback", &self.stream_add_callback.is_some())
             .field("func_get_param_info", &self.func_get_param_info.is_some())
             .finish_non_exhaustive()
     }
@@ -193,9 +190,7 @@ impl GpuFns {
         };
         Ok(Self {
             stream_wait_event: cast!(required(driver, c"cuStreamWaitEvent")?),
-            stream_query: cast!(required(driver, c"cuStreamQuery")?),
-            stream_add_callback: optional(driver, c"cuStreamAddCallback").map(|p| cast!(p)),
-            launch_host_func: cast!(required(driver, c"cuLaunchHostFunc")?),
+            stream_add_callback: cast!(required(driver, c"cuStreamAddCallback")?),
             module_load_data_ex: cast!(required(driver, c"cuModuleLoadDataEx")?),
             module_get_function: cast!(required(driver, c"cuModuleGetFunction")?),
             module_unload: cast!(required(driver, c"cuModuleUnload")?),

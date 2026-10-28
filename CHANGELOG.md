@@ -28,7 +28,8 @@ done, looked like one of this pool and could be treated as done.
     `Send`, not `Sync`). `submit`, `mark`, `await_marker`, `notify_retired`, `confirm_retired` and `Graph::replay`
     take `&mut`, so ownership replaces locking: `euhedral-gpu`'s own submission, marker, retirement and replay paths take no lock (the lock-free chunk pool's try-lock and `Completions`' internal locks are tracked by the separate lock audit). `submit` enqueues launches, copies and
     memsets; `mark` and `await_marker` order work across streams on the device.
-  - `notify_retired` arms a completion point. The driver's callback only pushes the outcome onto the stream's
+  - `notify_retired` arms a completion point with the stream callback (`cuStreamAddCallback`, required at load; it reports
+    the device status exactly once, even after a fault). The driver's callback only pushes the outcome onto the stream's
     unbounded, lock-free MPSC queue (pooled chunks, no allocation or free in steady state); the owner drains it with
     `poll_retired` and tells the listeners inside the owning source's `request` or `pull`. `arm_retirement` is the listener-free form. `retire_into` takes the
     submitter by value, turns the retirement into a frame of a `Completions`, and hands the submitter back to the
