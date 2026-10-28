@@ -7,10 +7,14 @@
 //!   default pool, kept by a release threshold), [`Vmm`] (`cuMemCreate` + `cuMemMap`, exportable as a POSIX fd that
 //!   Vulkan imports with `VK_KHR_external_memory_fd`) and [`PinnedHost`] (`cuMemHostAlloc`, released buffers kept by
 //!   power-of-two size class up to a limit: a pinned free synchronizes the device).
+//! - [`StreamCopier`]: the [`Copier`](crate::Copier) between a device and host memory for the tiers' moves:
+//!   `cuMemcpy*Async` on one stream, completion by a ring of events created once.
 
 mod backends;
+mod copier;
 
 pub use backends::{DeviceMemory, PinnedHost, StreamPool, Vmm, VmmBlock};
+pub use copier::StreamCopier;
 
 use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
 use std::fmt;

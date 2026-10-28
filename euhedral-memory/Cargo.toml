@@ -17,6 +17,8 @@ cuda = ["dep:libc"]
 euhedral-core = { path = "../euhedral-core" }
 euhedral-data-structures = { path = "../euhedral-data-structures" }
 euhedral-hashing = { path = "../euhedral-hashing" }
+# `Marker` and `DeviceQueue`: a lane's marker as the completion test of a copy.
+euhedral-graph = { path = "../euhedral-graph", default-features = false }
 libc = { version = "0.2.174", optional = true }
 
 [dev-dependencies]

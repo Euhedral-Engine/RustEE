@@ -18,8 +18,9 @@ with `libcuda.so.1` loaded by `dlopen` at run time (no toolkit, no link-time dep
 | [`planner`](src/planner.rs) | `Planner`, `LocationSpec` / `LocationKind` / `LocationId`, `OwnerSpec` / `OwnerId`, `Priority`, `Scope`, `Claim`, `Elastic`, `ClaimResult`, `GiveBack` and the `GiveBacks` lattice source, `Snapshot`, `LeakReport`. |
 | [`admission`](src/admission.rs) | `PlanRequest`, `PlanItem`, `Admission`, `Placed`, `Reservation`. |
 | [`arena`](src/arena.rs) | `SlotArena` / `SlotLease`, `ScratchArena` / `ScratchLease`, `BackendCalls`. |
+| [`tiers`](src/tiers.rs) | `TierPool`, `Mover` and the `Moves` lattice source, `ResidentId`, `MoveDone`, the `Copier` trait, `HostCopier`, `MarkerRetired`. |
 | [`backend`](src/backend.rs) | The `Backend` trait, `Block`, `Allocation`, `Reaper` and `Retired`. |
-| [`cuda`](src/cuda/mod.rs) (feature `cuda`) | `Driver`, `Device` (primary context, `import_fd` for Vulkan-exported memory), `DeviceMemory`, `StreamPool`, `Vmm` (POSIX-fd export), `PinnedHost`. |
+| [`cuda`](src/cuda/mod.rs) (feature `cuda`) | `Driver`, `Device` (primary context, `import_fd` for Vulkan-exported memory), `DeviceMemory`, `StreamPool`, `Vmm` (POSIX-fd export), `PinnedHost`, `StreamCopier` (the tiers' device copies). |
 
 ## Key concepts
 
@@ -43,6 +44,16 @@ with `libcuda.so.1` loaded by `dlopen` at run time (no toolkit, no link-time dep
 - **Admission before allocation.** `admit` places a plan's items at their preferred locations, then spills the spillable
   ones, then cuts optional ones, both lowest priority first. Otherwise it refuses with a `Shortfall`. An admitted plan's
   `Reservation` gives its allocations their claims.
+- **Tiers move memory by plan.** A `TierPool` is one planned allocation at a location, cut into slots; a `Mover`
+  keeps each owner's residents in the fastest tier their priority earns and moves them by asynchronous copies
+  (`Copier`: host `memcpy`, CUDA stream copies, or a lane's `Marker` as the completion test).
+  - The destination slot is claimed before a copy starts and the source released after it completes: the owner holds
+    both while the bytes are in flight, and the location totals never change (slots only change hands).
+  - A resident placed in a full tier spills the lowest-priority one there; spilled residents come back, highest
+    priority first, as slots free up. Pairs no copier joins go through a staging tier in two hops.
+  - Free slots, and the slots of residents that can spill, are elastic: a higher-priority claim orders them back, and
+    the mover's give-back handler retires free slots, then spills residents and retires their slots.
+  - Completions reach owners as frames of the `Moves` source; releasing a resident mid-move cancels it.
 - **No locks.** Budgets are CAS loops on atomics. Owner slots, give-back orders, the reaper and the caches are lock-free
   queues.
 
@@ -89,7 +100,7 @@ assert!(planner.end_owner(plan).is_clean());
 ## Build and test
 
 ```sh
-mise exec -- cargo test -p euhedral-memory                       # planner, admission, arenas (no device needed)
-mise exec -- cargo test -p euhedral-memory --features cuda       # + the CUDA backends (skipped without a device)
+mise exec -- cargo test -p euhedral-memory                       # planner, admission, arenas, tiers (no device needed)
+mise exec -- cargo test -p euhedral-memory --features cuda       # + the CUDA backends and stream-copy moves (skipped without a device)
 mise exec -- cargo run --release -p euhedral-memory --features cuda --example alloc_sweep   # CUDA against Vulkan
 ```

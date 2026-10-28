@@ -1000,6 +1000,13 @@ impl Planner {
     }
 
     fn release(&self, owner: OwnerId, location: LocationId, bytes: u64, elastic: bool) {
+        self.unhold(owner, location, bytes, elastic);
+        self.loc(location).used.fetch_sub(bytes, Ordering::AcqRel);
+    }
+
+    /// Takes `bytes` off `owner`'s account at `location` (and off its elastic holdings and open order if `elastic`),
+    /// leaving the location's total as it is: the bytes are released, or moved to another owner's account.
+    fn unhold(&self, owner: OwnerId, location: LocationId, bytes: u64, elastic: bool) {
         let l = usize::from(location.0);
         let s = self.slot(owner);
         let loc = self.loc(location);
@@ -1025,7 +1032,6 @@ impl Planner {
                 }
             }
         }
-        loc.used.fetch_sub(bytes, Ordering::AcqRel);
     }
 }
 
@@ -1079,6 +1085,27 @@ impl Claim {
         self.planner.slot(self.owner).held[l].fetch_sub(bytes, Ordering::AcqRel);
         self.bytes -= bytes;
         Some(new)
+    }
+
+    /// Moves all of this claim's bytes to `to`'s account at the same location, as a firm or an elastic holding. The
+    /// location's total does not change; `to`'s total grows before this owner's shrinks. `Err(self)` when `to` is not
+    /// live.
+    pub fn transfer(mut self, to: OwnerId, elastic: bool) -> Result<Claim, Claim> {
+        let Some(new) = self
+            .planner
+            .make_claim(to, self.location, self.bytes, elastic)
+        else {
+            return Err(self);
+        };
+        self.planner
+            .unhold(self.owner, self.location, self.bytes, self.elastic);
+        self.bytes = 0;
+        Ok(new)
+    }
+
+    /// Whether the bytes are an elastic holding (counted as reclaimable by higher priorities).
+    pub fn is_elastic(&self) -> bool {
+        self.elastic
     }
 
     /// Gives `bytes` of this claim back now (a reservation trimmed to what the plan really allocated).
@@ -1152,6 +1179,11 @@ impl Elastic {
     }
 
     /// Shrinks to `bytes` (the memory above it was freed); counts against an ordered give-back first.
+    /// The holding as a plain claim (still elastic: reclaimable, and counted against its owner's orders when freed).
+    pub fn into_claim(self) -> Claim {
+        self.claim
+    }
+
     pub fn shrink_to(&mut self, bytes: u64) {
         if bytes < self.claim.bytes {
             let b = self.claim.bytes - bytes;

@@ -28,6 +28,7 @@ pub mod backend;
 #[cfg(feature = "cuda")]
 pub mod cuda;
 pub mod planner;
+pub mod tiers;
 
 pub use admission::{Admission, Placed, PlanItem, PlanRequest, Reservation};
 pub use arena::{BackendCalls, SCRATCH_MIN, ScratchArena, ScratchLease, SlotArena, SlotLease};
@@ -36,6 +37,10 @@ pub use planner::{
     Claim, ClaimResult, DEFAULT_OWNERS, Elastic, GiveBack, GiveBackHandler, GiveBacks, Leak,
     LeakReport, LocationId, LocationKind, LocationSpec, LocationUse, MAX_LOCATIONS, OwnerId,
     OwnerSpec, Planner, Priority, Scope, Shortfall, Snapshot,
+};
+pub use tiers::{
+    Copier, CopyError, HostCopier, MarkerRetired, MoveDone, MoveError, MoveHandler, Mover, Moves,
+    ResidentId, TierPool,
 };
 
 /// Compiles and runs the examples in the crate README as doctests.

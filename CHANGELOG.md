@@ -3,6 +3,52 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## Tier moves: `euhedral-memory::tiers` (2026-10-28)
+
+**What.** Planned movement of claimed memory between locations (device, pinned host, pageable host, any modeled one):
+- `TierPool`: one planned allocation per tier, cut into slots, leased and returned without allocating;
+- `Mover`: residents (one slot of an owner's data each) placed by priority, moved by asynchronous copies, spilled
+  under budget pressure and brought back as room returns;
+- `Copier`: the copy engine per pair of locations: `HostCopier` (`memcpy`), `cuda::StreamCopier` (`cuMemcpy*Async` on
+  one stream, a ring of events made once), or any copier whose completion is a lane's `Marker` (`MarkerRetired`);
+- `Moves`: a `LatticeSource` whose frames deliver completions to the residents' owners and drive the moves;
+- planner: `Claim::transfer` (a claim changes owner without leaving its location's total), `Claim::is_elastic`,
+  `Elastic::into_claim`.
+
+**Why.** Planning where memory lives is half the job; the other half is moving it when the plan changes: a
+higher-priority claim arrives, a consumer turns off, a budget shrinks. Each consumer copying its own buffers to host
+memory on its own repeats the race the planner removed. One mover does every move under the planner's accounting.
+
+**How to use it.** Allocate each tier once and give it to a `TierPool` under one owner. Make a `Mover` with the pools
+(fastest first), the copiers and an optional staging tier. `place` residents with a priority and a completion handler;
+`move_to` moves one; `with` reads or writes it while it is still; `release` gives it up (and cancels a move). Call
+`pump` from any thread, or add `mover.moves()` upstream of a lattice. Install `give_back_handler()` as the pools'
+owner's give-back handler and the handler of residents' owners, and call `restore` when budget frees up.
+
+**Semantics.**
+- No locks: residents are cells of atomics (free, resident, moving, busy); moves, free slots and completions go
+  through lock-free queues. Nothing waits: a copy's completion is a test (`Retired`) checked by `pump`.
+- Exact accounting at every point: a move leases the destination slot (its bytes become the resident owner's) before
+  the copy starts and returns the source slot after it retires. A location's total never changes during moves.
+- A resident placed in a full tier evicts that tier's lowest-priority resident below it to the next tier with room.
+  Spilled residents come back home, highest priority first, whenever their home tier has a free slot.
+- Slots of residents that can spill (not in the slowest tier) are elastic holdings of their owner. A give-back order
+  at a tier retires free slots first, then spills the lowest-priority residents; a spill for an order retires its
+  source slot rather than freeing it, so bring-back cannot refill it. `restore` takes retired slots back when the
+  location has room.
+- A pair no copier joins goes through the staging tier in two hops; a move that cannot continue leaves the resident
+  in the staging slot.
+- Releasing a resident mid-move marks it cancelled: when the copy retires, both slots go back and the owner hears a
+  cancelled `MoveDone`.
+
+**Tests.**
+- 5 tests without a device (a copier whose copies retire a few checks late): moves between every pair with the bytes
+  intact and the accounts exact while in flight and after; a move released midway; eviction by priority and
+  bring-back; a give-back order that retires a free slot, spills a resident and gets its budget back; eight owners
+  placing, filling and moving at once with no lock.
+- 1 test on a device (feature `cuda`): one resident from pageable host to device to pinned host and back through stream
+  copies and two-hop staging, bytes intact, accounts exact at each step.
+
 ## Memory planner: `euhedral-memory` (2026-10-28)
 
 **What.** A new crate, [`euhedral-memory`](euhedral-memory/README.md):

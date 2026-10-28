@@ -70,6 +70,7 @@ dependencies = [
  "ash",
  "euhedral-core",
  "euhedral-data-structures",
+ "euhedral-graph",
  "euhedral-hashing",
  "libc",
 ]

@@ -539,6 +539,19 @@ reuse. One planned allocation cut into slots or power-of-two pieces, leased and 
 lock-free free lists, so the steady state makes no allocation or free. `BackendCalls` counts the
 ones that do.
 
+**tier** ([`TierPool`](euhedral-memory/src/tiers.rs)): a location with one planned allocation cut
+into equal slots. Free slots are an elastic holding of the pool's owner; a retired slot's budget is
+back with the planner until `restore` takes it again.
+
+**resident** ([`ResidentId`, `Mover`](euhedral-memory/src/tiers.rs)): one slot's worth of an
+owner's data, kept in the fastest tier its priority earns and moved between tiers by copies. `with`
+gives its address while it is not moving.
+
+**move** ([`Mover::move_to`](euhedral-memory/src/tiers.rs), [`Copier`](euhedral-memory/src/tiers.rs)):
+an asynchronous copy of a resident to another tier: the destination slot is claimed first, the
+source released once the copy retired. Spills (to make room or on a give-back order) and
+bring-backs are moves the mover plans itself. Completions are frames of the `Moves` source.
+
 **backend** ([`Backend`](euhedral-memory/src/backend.rs), [`cuda`](euhedral-memory/src/cuda/mod.rs)):
 what allocates at a location. The CUDA backends (feature `cuda`, the driver loaded at run time) are
 `DeviceMemory`, the stream-ordered `StreamPool`, `Vmm` (exportable as a POSIX fd for Vulkan) and
