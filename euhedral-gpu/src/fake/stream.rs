@@ -1,22 +1,19 @@
 //! Fake streams.
 
-use std::any::Any;
 use std::sync::Arc;
 
 use euhedral_graph::{DeviceQueue, LaneId, Marker};
 
 use crate::kept::Kept;
 use crate::stream_lock::StreamLock;
-use crate::{
-    Args, Enqueue, Gpu, GpuError, Launch, POISONED_STATUS, RetireListener, RetireTicket, Stream,
-};
+use crate::{Gpu, GpuError, POISONED_STATUS, RetireListener, RetireTicket, Stream};
 
-use super::{FakeGpu, FakeKernel, QOp};
+use super::{FakeEnqueue, FakeGpu, QOp};
 
 #[derive(Debug)]
 pub(crate) struct StreamState {
     /// The number the next armed retirement gets.
-    next_retire: u64,
+    pub(crate) next_retire: u64,
 }
 
 /// A fake stream: lane `lane` of its pool.
@@ -29,7 +26,7 @@ pub struct FakeStream {
     index: usize,
     count: usize,
     state: StreamLock<StreamState>,
-    kept: Kept,
+    pub(crate) kept: Kept,
 }
 
 impl FakeStream {
@@ -49,6 +46,10 @@ impl FakeStream {
             state: StreamLock::new(StreamState { next_retire: 1 }),
             kept: Kept::default(),
         }
+    }
+
+    pub(crate) fn global_index(&self) -> usize {
+        self.global()
     }
 
     fn global(&self) -> usize {
@@ -108,18 +109,15 @@ impl FakeStream {
     }
 
     /// `mark` for a sequence that already holds this stream's lock.
-    #[allow(dead_code, reason = "used by the graph passes, which come next")]
     pub(crate) fn mark_held(&self) -> Result<Marker, GpuError> {
         self.mark_locked()
     }
 
     /// `await_marker` for a sequence that already holds this stream's lock.
-    #[allow(dead_code, reason = "used by the graph passes, which come next")]
     pub(crate) fn await_held(&self, marker: Marker) -> Result<(), GpuError> {
         self.await_locked(marker)
     }
 
-    #[allow(dead_code, reason = "used by the graph passes, which come next")]
     pub(crate) fn lock(
         &self,
     ) -> Result<crate::stream_lock::StreamGuard<'_, StreamState>, GpuError> {
@@ -128,8 +126,8 @@ impl FakeStream {
 
     pub(crate) fn enqueue<'a>(&'a self, state: &'a mut StreamState) -> FakeEnqueue<'a> {
         FakeEnqueue {
-            stream: self,
-            state,
+            target: Some((self, state)),
+            rec: None,
         }
     }
 }
@@ -211,72 +209,5 @@ impl Stream for FakeStream {
         self.gpu
             .poisoned()
             .map(|cause| GpuError::Poisoned(Box::new(cause)))
-    }
-}
-
-/// What a fake submission enqueues.
-#[derive(Debug)]
-pub struct FakeEnqueue<'a> {
-    stream: &'a FakeStream,
-    state: &'a mut StreamState,
-}
-
-impl Enqueue for FakeEnqueue<'_> {
-    type Kernel = FakeKernel;
-
-    unsafe fn launch(
-        &mut self,
-        kernel: &FakeKernel,
-        launch: Launch,
-        args: &Args,
-    ) -> Result<(), GpuError> {
-        self.stream.push(QOp::Launch {
-            kernel: kernel.clone(),
-            launch,
-            args: args.clone(),
-        });
-        Ok(())
-    }
-
-    unsafe fn copy_to_device(
-        &mut self,
-        dst: u64,
-        src: *const u8,
-        bytes: usize,
-    ) -> Result<(), GpuError> {
-        self.stream.push(QOp::ToDevice {
-            dst,
-            src: src as usize,
-            bytes,
-        });
-        Ok(())
-    }
-
-    unsafe fn copy_to_host(
-        &mut self,
-        dst: *mut u8,
-        src: u64,
-        bytes: usize,
-    ) -> Result<(), GpuError> {
-        self.stream.push(QOp::ToHost {
-            dst: dst as usize,
-            src,
-            bytes,
-        });
-        Ok(())
-    }
-
-    unsafe fn copy_on_device(&mut self, dst: u64, src: u64, bytes: usize) -> Result<(), GpuError> {
-        self.stream.push(QOp::OnDevice { dst, src, bytes });
-        Ok(())
-    }
-
-    unsafe fn memset(&mut self, dst: u64, value: u8, bytes: usize) -> Result<(), GpuError> {
-        self.stream.push(QOp::Memset { dst, value, bytes });
-        Ok(())
-    }
-
-    fn keep(&mut self, value: Box<dyn Any + Send>) {
-        self.stream.kept.push(self.state.next_retire, value);
     }
 }

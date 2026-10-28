@@ -27,9 +27,7 @@ pub trait Gpu: Send + Sync + fmt::Debug + Sized + 'static {
     type Module: Module<Gpu = Self>;
     type Kernel: Kernel;
     type Graph: Graph<Gpu = Self>;
-    type Sequence<'a>: Sequence<Kernel = Self::Kernel>
-    where
-        Self: 'a;
+    type Sequence<'a>: Sequence<Kernel = Self::Kernel>;
 
     /// New streams, `names[i]` as lane `i` of a new pool (1 to 64 names).
     fn open_lanes(
@@ -73,9 +71,7 @@ pub trait Gpu: Send + Sync + fmt::Debug + Sized + 'static {
 /// An ordered queue of device work and a lane of a [`LanePool`].
 pub trait Stream: DeviceQueue + Sized + 'static {
     type Gpu: Gpu<Stream = Self>;
-    type Enqueue<'a>: Enqueue<Kernel = <Self::Gpu as Gpu>::Kernel>
-    where
-        Self: 'a;
+    type Enqueue<'a>: Enqueue<Kernel = <Self::Gpu as Gpu>::Kernel>;
 
     fn gpu(&self) -> &Arc<Self::Gpu>;
 
@@ -184,9 +180,7 @@ pub trait Module: Send + Sync + fmt::Debug + Sized {
 /// A recurring sequence of submissions over a fixed set of streams, run as a recording, a probe or an update.
 pub trait Sequence {
     type Kernel: Kernel;
-    type Enqueue<'a>: Enqueue<Kernel = Self::Kernel>
-    where
-        Self: 'a;
+    type Enqueue<'a>: Enqueue<Kernel = Self::Kernel>;
 
     /// Submits on stream `stream` of the sequence (an index into the streams it runs over).
     fn submit(

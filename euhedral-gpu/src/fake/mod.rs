@@ -4,6 +4,7 @@
 //! a test decides the interleaving and every run is the same. Fake kernels are host closures registered by name that
 //! run on a bounds-checked fake memory; a kernel fault poisons the device as a CUDA fault does.
 
+mod enqueue;
 mod graph;
 mod module;
 mod stream;
@@ -19,9 +20,10 @@ use crate::{
     RetireListener, RetireTicket, StreamOptions,
 };
 
+pub use enqueue::FakeEnqueue;
 pub use graph::{FakeGraph, FakeSequence};
 pub use module::{FakeKernel, FakeModule};
-pub use stream::{FakeEnqueue, FakeStream};
+pub use stream::FakeStream;
 
 /// A fake kernel: runs on the fake memory with the launch geometry and arguments.
 pub type FakeKernelFn =
@@ -452,36 +454,39 @@ impl Gpu for FakeGpu {
         self.poison.get()
     }
 
-    fn record<F>(&self, _streams: &[&Arc<FakeStream>], _f: F) -> Result<FakeGraph, GpuError>
+    fn record<F>(&self, streams: &[&Arc<FakeStream>], f: F) -> Result<FakeGraph, GpuError>
     where
         F: FnOnce(&mut FakeSequence<'_>) -> Result<(), GpuError>,
     {
-        Err(GpuError::Invalid("not yet".into()))
+        self.record_graph(streams, f)
     }
 
     fn rerecord<F>(
         &self,
-        _graph: &mut FakeGraph,
-        _streams: &[&Arc<FakeStream>],
-        _f: F,
+        graph: &mut FakeGraph,
+        streams: &[&Arc<FakeStream>],
+        f: F,
     ) -> Result<Rerecorded, GpuError>
     where
         F: FnOnce(&mut FakeSequence<'_>) -> Result<(), GpuError>,
     {
-        Err(GpuError::Invalid("not yet".into()))
+        self.rerecord_graph(graph, streams, f)
     }
 
-    fn fingerprint<F>(&self, _streams: usize, _f: F) -> Result<Fingerprint, GpuError>
+    fn fingerprint<F>(&self, streams: usize, f: F) -> Result<Fingerprint, GpuError>
     where
         F: FnOnce(&mut FakeSequence<'_>) -> Result<(), GpuError>,
     {
-        Err(GpuError::Invalid("not yet".into()))
+        Ok(self
+            .probe_pass(enqueue::Mode::Probe, streams, f)?
+            .hasher
+            .finish())
     }
 
-    fn update<F>(&self, _graph: &mut FakeGraph, _f: F) -> Result<(), GpuError>
+    fn update<F>(&self, graph: &mut FakeGraph, f: F) -> Result<(), GpuError>
     where
         F: FnOnce(&mut FakeSequence<'_>) -> Result<(), GpuError>,
     {
-        Err(GpuError::Invalid("not yet".into()))
+        self.update_graph(graph, f)
     }
 }
