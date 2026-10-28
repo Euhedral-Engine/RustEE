@@ -20,11 +20,16 @@ arm64 (Linux, macOS and Windows back ends) and is untested on mobile.
 | [`euhedral-memory`](euhedral-memory/README.md) | A location-agnostic memory and residency planner: budgets, owners with lifetimes, claims with priorities, give-back as frames, admission, arenas and a leak check; CUDA allocation backends (feature `cuda`). |
 | [`euhedral-graph`](euhedral-graph/README.md) | No-wait dataflow on the lattice: completions, a sequencer, joins, device lanes and stage graphs. |
 | [`euhedral-io`](euhedral-io/README.md) | Asynchronous file and socket I/O whose completions are frames: `AsyncIo` (io_uring on Linux and Android; IoRing and completion ports on Windows). |
+| [`euhedral-gpu`](euhedral-gpu/README.md) | Asynchronous, backend-neutral GPU access: streams as device lanes, markers, retirement as frames, kernels loaded at run time, graph record and replay (CUDA backend, feature `cuda`). |
 
-`euhedral-core` depends on the other three; they depend on none of each other. `euhedral-graph` builds
-on `euhedral-core`; nothing depends on it. `euhedral-memory` builds on `euhedral-core`, `euhedral-data-structures` and
-`euhedral-hashing`; nothing depends on it. `euhedral-io` builds on `euhedral-core` and `euhedral-data-structures`;
-nothing depends on it.
+The crates form layers, and a crate builds only on lower ones. No cycles: nothing below `euhedral-gpu` depends on it,
+not even through a dev-dependency or a feature (`euhedral-gpu/tests/layering.rs` checks every manifest).
+
+1. Utilities: `euhedral-data-structures`, `euhedral-hashing`, `euhedral-hardware-utils`.
+2. `euhedral-core`, on the utilities.
+3. `euhedral-graph` and `euhedral-io`, on `euhedral-core` (and the utilities they use).
+4. `euhedral-memory`, on `euhedral-core`, `euhedral-graph` and the utilities.
+5. `euhedral-gpu`, on `euhedral-core`, `euhedral-graph`, `euhedral-memory` and `euhedral-hashing`.
 
 - [`GLOSSARY.md`](GLOSSARY.md): every term a user of RustEE meets, with links to the code.
 - [`CHANGELOG.md`](CHANGELOG.md): changes to the lattice's execution model, newest first.
