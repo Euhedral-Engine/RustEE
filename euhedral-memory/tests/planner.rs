@@ -468,3 +468,106 @@ fn accounting_existing_memory_always_succeeds_and_admission_sees_it() {
         "an ended owner accounts nothing"
     );
 }
+
+/// A device, pinned host memory and a window onto a file.
+fn three_tiers() -> std::sync::Arc<Planner> {
+    Planner::new([
+        LocationSpec {
+            kind: LocationKind::Device { ordinal: 0 },
+            capacity: 16 * GIB,
+            reserve: 0,
+        },
+        LocationSpec {
+            kind: LocationKind::HostPinned,
+            capacity: 4 * GIB,
+            reserve: 0,
+        },
+        LocationSpec {
+            kind: LocationKind::Other("file window"),
+            capacity: 2 * GIB,
+            reserve: 0,
+        },
+    ])
+}
+
+#[test]
+fn a_tiered_consumer_fills_the_device_then_the_slower_tiers_in_order() {
+    let p = three_tiers();
+    let dev = p.location(LocationKind::Device { ordinal: 0 }).unwrap();
+    let pin = p.location(LocationKind::HostPinned).unwrap();
+    let file = p.location(LocationKind::Other("file window")).unwrap();
+    let o = p.open_owner(OwnerSpec::new("plan", Priority(100), Scope::Plan(1)));
+    // The working set takes 12 GiB of the device; 100 units of 100 MiB, 8 required on the device.
+    let items = vec![
+        PlanItem::required("working set", dev, 12 * GIB),
+        PlanItem::tiered(
+            "buffer",
+            Priority(10),
+            true,
+            100 * MIB,
+            100,
+            8,
+            vec![dev, pin, file],
+        ),
+    ];
+    let a = p.admit(&PlanRequest { owner: o, items }).unwrap();
+    let t = &a.tiers[1];
+    // 4 GiB left on the device: 40 units; 4 GiB pinned: 40; the file window takes the last 20.
+    assert_eq!(t, &vec![(dev, 40), (pin, 40), (file, 20)], "{t:?}");
+    assert!(a.tiers[0].is_empty());
+    assert_eq!(a.bytes[0], 12 * GIB + 40 * 100 * MIB);
+    assert_eq!(a.bytes[1], 40 * 100 * MIB);
+    assert_eq!(a.bytes[2], 20 * 100 * MIB);
+    let r = a.reservation.expect("reserved");
+    assert_eq!(r.left(pin), 40 * 100 * MIB);
+}
+
+#[test]
+fn tiered_consumers_take_the_fast_tier_by_priority_and_what_fits_nowhere_is_left_out() {
+    let p = three_tiers();
+    let dev = p.location(LocationKind::Device { ordinal: 0 }).unwrap();
+    let pin = p.location(LocationKind::HostPinned).unwrap();
+    let o = p.open_owner(OwnerSpec::new("plan", Priority(100), Scope::Plan(1)));
+    let items = vec![
+        PlanItem::required("working set", dev, 14 * GIB),
+        // Listed first but lower: the higher one takes the device's room first.
+        PlanItem::tiered("low", Priority(10), false, GIB, 6, 0, vec![dev, pin]),
+        PlanItem::tiered("high", Priority(50), false, GIB, 3, 1, vec![dev, pin]),
+    ];
+    let a = p.admit(&PlanRequest { owner: o, items }).unwrap();
+    // The device has 2 GiB after the working set: "high" 1 required + 1 more; then pinned 1. "low": the 4 GiB pinned
+    // less "high"'s 1 GiB: 3 units; the other 3 fit nowhere.
+    assert_eq!(a.tiers[2], vec![(dev, 2), (pin, 1)]);
+    assert_eq!(a.tiers[1], vec![(dev, 0), (pin, 3)]);
+    assert_eq!(a.bytes[1], 4 * GIB);
+}
+
+#[test]
+fn a_tiered_consumer_whose_required_units_do_not_fit_is_refused_or_dropped() {
+    let p = three_tiers();
+    let dev = p.location(LocationKind::Device { ordinal: 0 }).unwrap();
+    let pin = p.location(LocationKind::HostPinned).unwrap();
+    let o = p.open_owner(OwnerSpec::new("plan", Priority(100), Scope::Plan(1)));
+    let need = |required| {
+        vec![
+            PlanItem::required("working set", dev, 15 * GIB),
+            PlanItem::tiered("buffer", Priority(10), required, GIB, 4, 2, vec![dev, pin]),
+        ]
+    };
+    assert!(
+        p.admit(&PlanRequest {
+            owner: o,
+            items: need(true)
+        })
+        .is_err(),
+        "2 GiB required, 1 free"
+    );
+    let a = p
+        .admit(&PlanRequest {
+            owner: o,
+            items: need(false),
+        })
+        .unwrap();
+    assert_eq!(a.placed[1], Placed::Dropped);
+    assert!(a.tiers[1].is_empty());
+}

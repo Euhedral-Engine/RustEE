@@ -30,7 +30,7 @@ pub mod cuda;
 pub mod planner;
 pub mod tiers;
 
-pub use admission::{Admission, Placed, PlanItem, PlanRequest, Reservation};
+pub use admission::{Admission, Placed, PlanItem, PlanRequest, Reservation, Tiers};
 pub use arena::{BackendCalls, SCRATCH_MIN, ScratchArena, ScratchLease, SlotArena, SlotLease};
 pub use backend::{AllocError, Allocation, Backend, Block, Reaper, Retired};
 pub use planner::{

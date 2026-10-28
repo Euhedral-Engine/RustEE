@@ -531,6 +531,10 @@ working set before it allocates: every item at its preferred location if it fits
 items (lowest priority first), else optional items cut (lowest priority first), else refused. An
 admitted plan holds a `Reservation`, from which its allocations `take` their claims.
 
+**tiered item** ([`PlanItem::tiered`](euhedral-memory/src/admission.rs)): an admission item of
+equal units over an ordered list of locations, fastest first: its required units go to the first,
+the rest to the first location with free room, then the next; units that fit nowhere are left out.
+
 **leak check** ([`Planner::end_owner`, `Planner::check_baseline`](euhedral-memory/src/planner.rs)):
 an ended owner's live claims are leaks; a snapshot taken at a baseline must come back.
 

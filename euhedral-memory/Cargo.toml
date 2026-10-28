@@ -31,6 +31,10 @@ libc = "0.2.174"
 name = "alloc_sweep"
 required-features = ["cuda"]
 
+[[example]]
+name = "copy_rate"
+required-features = ["cuda"]
+
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 missing_debug_implementations = "warn"
