@@ -23,6 +23,8 @@ use euhedral_memory::cuda::{CudaError, Device, Driver};
 
 use euhedral_graph::LanePool;
 
+use enqueue::Mode;
+
 use crate::{Fingerprint, Gpu, GpuError, Poison, Rerecorded, StreamOptions};
 
 use fns::{ATTR_CC_MAJOR, ATTR_CC_MINOR, GpuFns};
@@ -173,18 +175,18 @@ impl Gpu for CudaGpu {
         Err(GpuError::Invalid("not yet".into()))
     }
 
-    fn fingerprint<F>(&self, _streams: usize, _f: F) -> Result<Fingerprint, GpuError>
+    fn fingerprint<F>(&self, streams: usize, f: F) -> Result<Fingerprint, GpuError>
     where
         F: FnOnce(&mut CudaSequence<'_>) -> Result<(), GpuError>,
     {
-        Err(GpuError::Invalid("not yet".into()))
+        Ok(self.probe(Mode::Probe, streams, f)?.hasher.finish())
     }
 
-    fn update<F>(&self, _graph: &mut CudaGraph, _f: F) -> Result<(), GpuError>
+    fn update<F>(&self, graph: &mut CudaGraph, f: F) -> Result<(), GpuError>
     where
         F: FnOnce(&mut CudaSequence<'_>) -> Result<(), GpuError>,
     {
-        Err(GpuError::Invalid("not yet".into()))
+        graph.update(f)
     }
 }
 

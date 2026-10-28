@@ -21,7 +21,6 @@ pub(crate) enum Mode {
     /// Fingerprint only.
     Probe,
     /// Fingerprint, and stage the arguments of each launch.
-    #[allow(dead_code, reason = "made by the update pass, which comes next")]
     Update,
 }
 

@@ -13,7 +13,7 @@ use crate::stream_lock::StreamGuard;
 use crate::{Args, Fingerprint, GpuError, Graph, Launch, Sequence};
 
 use super::enqueue::{Mode, Node, Recording, Target};
-use super::fns::{CAPTURE_MODE_RELAXED, CuGraph, CuGraphExec};
+use super::fns::{CAPTURE_MODE_RELAXED, CuGraph, CuGraphExec, KernelNodeParams};
 use super::stream::{Handle, StreamState};
 use super::{CudaEnqueue, CudaGpu, CudaKernel, CudaStream, from_cuda};
 
@@ -26,12 +26,10 @@ pub struct CudaGraph {
     gpu: Arc<CudaGpu>,
     graph: CuGraph,
     exec: CuGraphExec,
-    #[allow(dead_code, reason = "read by the update pass, which comes next")]
     nodes: Vec<Node>,
     launches: Vec<(CudaKernel, Launch, Args)>,
     fingerprint: Fingerprint,
     /// The number of streams the recording ran over.
-    #[allow(dead_code, reason = "read by the update pass, which comes next")]
     streams: usize,
     /// Held for the graph's life: the buffers its copies read.
     #[allow(dead_code, reason = "held so the buffers outlive the replays")]
@@ -55,6 +53,54 @@ impl Drop for CudaGraph {
             (self.gpu.fns.graph_exec_destroy)(self.exec);
             (self.gpu.fns.graph_destroy)(self.graph);
         }
+    }
+}
+
+impl CudaGraph {
+    /// Runs `f` as an update pass: new argument values, launch `n` of `f` to launch `n` of the recording. A sequence
+    /// of another shape is `Err(ShapeChanged)` and applies nothing.
+    pub(crate) fn update<F>(&mut self, f: F) -> Result<(), GpuError>
+    where
+        F: FnOnce(&mut CudaSequence<'_>) -> Result<(), GpuError>,
+    {
+        let gpu = self.gpu.clone();
+        let rec = gpu.probe(Mode::Update, self.streams, f)?;
+        let now = rec.hasher.finish();
+        if now != self.fingerprint || rec.staged.len() != self.launches.len() {
+            return Err(GpuError::ShapeChanged {
+                recorded: self.fingerprint,
+                now,
+            });
+        }
+        let _c = gpu.device().enter().map_err(from_cuda)?;
+        for (n, staged) in rec.staged.into_iter().enumerate() {
+            let (kernel, launch, args) = &mut self.launches[n];
+            if *args == staged {
+                continue;
+            }
+            let mut pointers = staged.pointers();
+            let params = KernelNodeParams {
+                func: kernel.raw(),
+                grid_x: launch.grid.x,
+                grid_y: launch.grid.y,
+                grid_z: launch.grid.z,
+                block_x: launch.block.x,
+                block_y: launch.block.y,
+                block_z: launch.block.z,
+                shared_bytes: launch.shared_bytes,
+                kernel_params: pointers.as_mut_ptr(),
+                extra: std::ptr::null_mut(),
+                kern: std::ptr::null_mut(),
+                ctx: std::ptr::null_mut(),
+            };
+            // SAFETY: the executable and the node it was instantiated with; the parameters (copied by the driver
+            // during the call) point into `staged`; the context is current.
+            gpu.check("cuGraphExecKernelNodeSetParams", unsafe {
+                (gpu.fns.graph_exec_kernel_node_set_params)(self.exec, self.nodes[n].0, &params)
+            })?;
+            *args = staged;
+        }
+        Ok(())
     }
 }
 
@@ -248,6 +294,24 @@ impl Sequence for CudaSequence<'_> {
 }
 
 impl CudaGpu {
+    /// Runs `f` as a pass that touches no device: a fingerprint, or the staged arguments of an update.
+    pub(crate) fn probe<F>(&self, mode: Mode, streams: usize, f: F) -> Result<Recording, GpuError>
+    where
+        F: FnOnce(&mut CudaSequence<'_>) -> Result<(), GpuError>,
+    {
+        self.poison.check()?;
+        let mut seq = CudaSequence {
+            gpu: self,
+            rec: Recording::new(mode),
+            streams,
+            real: Vec::new(),
+            events: Vec::new(),
+            capturing: false,
+        };
+        f(&mut seq)?;
+        Ok(std::mem::replace(&mut seq.rec, Recording::new(Mode::Probe)))
+    }
+
     /// Runs `f` for real over `streams` and captures it: the recording, and the graph the driver made of it.
     pub(crate) fn capture<F>(
         self: &Arc<Self>,

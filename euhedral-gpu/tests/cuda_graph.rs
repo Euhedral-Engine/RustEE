@@ -358,3 +358,155 @@ fn submissions_from_other_threads_wait_out_a_recording() {
     );
     f.settle(0);
 }
+
+#[test]
+fn replays_with_changing_arguments_match_direct_submission() {
+    let Some(f) = Fixture::new() else { return };
+    f.clear();
+    let mut graph = f
+        .gpu
+        .record(&f.streams(), |q| f.sequence(q, 9.0, 1.0, 0))
+        .unwrap();
+    f.settle(0);
+    for a in [0.5f32, 1.0, 2.0, 3.5] {
+        f.clear();
+        f.gpu
+            .update(&mut graph, |q| f.sequence(q, a, 1.0, 0))
+            .unwrap();
+        graph.replay(&f.s[0]).unwrap();
+        f.settle(0);
+        let replayed = f.out_words(0);
+        f.clear();
+        f.direct(a, 1.0, 1);
+        f.settle(0);
+        assert!(
+            replayed == f.out_words(1),
+            "a = {a}: replay equals direct submission"
+        );
+        assert!(replayed == f.reference(a, 1.0), "a = {a}: and the CPU");
+    }
+}
+
+#[test]
+fn updates_between_replays_do_not_touch_a_replay_in_flight() {
+    let Some(f) = Fixture::new() else { return };
+    f.clear();
+    // One stream: a spin, then y[dst] = a x + 0.5, with the destination an argument.
+    let sequence = |q: &mut euhedral_gpu::cuda::CudaSequence<'_>, a: f32, dst: u64| {
+        let args = Args::new()
+            .device(dst)
+            .device(f.x.addr)
+            .arg(a)
+            .arg(0.5f32)
+            .arg(N as u32);
+        q.submit(0, |e| {
+            // SAFETY: matching arguments over live blocks.
+            unsafe {
+                e.launch(
+                    &f.spin,
+                    Launch::linear(1, 1),
+                    &Args::new().arg(75_000_000u64),
+                )?;
+                e.launch(&f.axpb, Launch::linear(N as u32, 256), &args)
+            }
+        })
+    };
+    let mut graph = f
+        .gpu
+        .record(&[&f.s[0]], |q| sequence(q, 9.0, f.y.addr))
+        .unwrap();
+    f.clear();
+    f.gpu
+        .update(&mut graph, |q| sequence(q, 1.0, f.y.addr))
+        .unwrap();
+    graph.replay(&f.s[0]).unwrap();
+    // The first replay is still spinning: the update must not reach it.
+    f.gpu
+        .update(&mut graph, |q| sequence(q, 2.0, f.z.addr))
+        .unwrap();
+    graph.replay(&f.s[0]).unwrap();
+    f.s[0]
+        .submit(|q| {
+            // SAFETY: live blocks; settled below.
+            unsafe {
+                q.copy_to_host(f.out[0].addr as *mut u8, f.y.addr, BYTES)?;
+                q.copy_to_host(f.out[1].addr as *mut u8, f.z.addr, BYTES)
+            }
+        })
+        .unwrap();
+    f.settle(0);
+    let expected = |a: f32| -> Vec<u32> {
+        (0..N)
+            .map(|i| a.mul_add(i as f32 * 0.25, 0.5).to_bits())
+            .collect()
+    };
+    assert!(
+        f.out_words(0) == expected(1.0),
+        "replay 1 read its own arguments"
+    );
+    assert!(
+        f.out_words(1) == expected(2.0),
+        "replay 2 read its own arguments"
+    );
+}
+
+#[test]
+fn the_probe_fingerprint_equals_the_recordings() {
+    let Some(f) = Fixture::new() else { return };
+    f.clear();
+    let graph = f
+        .gpu
+        .record(&f.streams(), |q| f.sequence(q, 2.0, 1.0, 0))
+        .unwrap();
+    f.settle(0);
+    let probed = f
+        .gpu
+        .fingerprint(2, |q| f.sequence(q, 9.0, -4.0, 0))
+        .unwrap();
+    assert_eq!(
+        probed,
+        graph.fingerprint(),
+        "values are not part of the shape"
+    );
+    let other_output = f
+        .gpu
+        .fingerprint(2, |q| f.sequence(q, 2.0, 1.0, 1))
+        .unwrap();
+    assert_ne!(
+        other_output,
+        graph.fingerprint(),
+        "a copy to another address is another shape"
+    );
+}
+
+#[test]
+fn an_update_of_another_shape_applies_nothing() {
+    let Some(f) = Fixture::new() else { return };
+    f.clear();
+    let mut graph = f
+        .gpu
+        .record(&f.streams(), |q| f.sequence(q, 2.0, 1.0, 0))
+        .unwrap();
+    f.settle(0);
+    // The same launches with another geometry.
+    let r = f.gpu.update(&mut graph, |q| {
+        let first = Args::new()
+            .device(f.y.addr)
+            .device(f.x.addr)
+            .arg(7.0f32)
+            .arg(7.0f32)
+            .arg(N as u32);
+        q.submit(0, |e| {
+            // SAFETY: matching arguments over live blocks (nothing is enqueued on an update).
+            unsafe { e.launch(&f.axpb, Launch::linear(N as u32, 128), &first) }
+        })
+    });
+    assert!(matches!(r, Err(GpuError::ShapeChanged { .. })), "{r:?}");
+    f.clear();
+    graph.replay(&f.s[0]).unwrap();
+    f.settle(0);
+    assert!(
+        f.out_words(0) == f.reference(2.0, 1.0),
+        "the previous arguments still apply"
+    );
+}
