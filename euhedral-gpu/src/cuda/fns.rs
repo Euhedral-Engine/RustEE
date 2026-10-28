@@ -170,7 +170,7 @@ fn optional(driver: &Driver, name: &CStr) -> Option<*mut c_void> {
 ///
 /// # Safety
 /// `F` is the `unsafe extern "C" fn` type of the C signature the driver exports under the name `p` was found by.
-unsafe fn cast<F: Copy>(p: *mut c_void) -> F {
+pub(super) unsafe fn cast<F: Copy>(p: *mut c_void) -> F {
     assert_eq!(size_of::<F>(), size_of::<*mut c_void>());
     // SAFETY: `F` is a function pointer, the same size as `p`; the caller vouches for the signature.
     unsafe { std::mem::transmute_copy::<*mut c_void, F>(&p) }

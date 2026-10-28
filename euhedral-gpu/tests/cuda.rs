@@ -276,3 +276,51 @@ mod streams {
         }
     }
 }
+
+mod compiler {
+    use super::*;
+    use euhedral_gpu::cuda::{Nvrtc, Target};
+    use euhedral_gpu::{CompileOptions, GpuError};
+
+    const OPS: &str = include_str!("kernels/ops.cu");
+
+    #[test]
+    fn nvrtc_compiles_for_this_device() {
+        let Some(gpu) = gpu() else { return };
+        let Ok(nvrtc) = Nvrtc::shared(None) else {
+            eprintln!("no NVRTC: skipped");
+            return;
+        };
+        let (major, minor) = gpu.arch();
+        let target = nvrtc.target_for(gpu.arch());
+        if nvrtc.version().0 >= 13 {
+            assert_eq!(target, Target::Cubin((major * 10 + minor) as u32));
+        }
+        let image = nvrtc
+            .compile(OPS, &CompileOptions::default(), target)
+            .unwrap();
+        match target {
+            Target::Cubin(_) => assert_eq!(&image[..4], b"\x7fELF"),
+            Target::Ptx(_) => assert_eq!(image.last(), Some(&0)),
+        }
+    }
+
+    #[test]
+    fn a_compile_error_returns_the_log() {
+        let Some(gpu) = gpu() else { return };
+        let Ok(nvrtc) = Nvrtc::shared(None) else {
+            eprintln!("no NVRTC: skipped");
+            return;
+        };
+        let target = nvrtc.target_for(gpu.arch());
+        let r = nvrtc.compile(
+            "extern \"C\" __global__ void k() { nope; }",
+            &CompileOptions::default(),
+            target,
+        );
+        match r {
+            Err(GpuError::Compile { log }) => assert!(log.contains("nope"), "{log}"),
+            other => panic!("{other:?}"),
+        }
+    }
+}

@@ -6,11 +6,13 @@
 pub mod fns;
 mod graph;
 mod module;
+pub mod nvrtc;
 mod retire;
 mod stream;
 
 pub use graph::{CudaGraph, CudaSequence};
 pub use module::{CudaKernel, CudaModule};
+pub use nvrtc::{Nvrtc, Target};
 pub use stream::{CudaEnqueue, CudaStream};
 
 use std::sync::Arc;
