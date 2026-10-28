@@ -15,6 +15,8 @@ pub use enqueue::CudaEnqueue;
 pub use graph::{CudaGraph, CudaSequence};
 pub use module::{CudaKernel, CudaModule};
 pub use nvrtc::{Nvrtc, Target};
+#[cfg(feature = "test-hooks")]
+pub use stream::leaked_shared_sides;
 pub use stream::{CudaQueue, CudaStream};
 
 use std::sync::Arc;
@@ -148,18 +150,17 @@ impl CudaGpu {
         }
     }
 
-    /// As [`check`](Self::check), for a call whose failure leaves the device unusable whatever the code: the device
-    /// is poisoned with it.
-    /// Poisons the device with a misuse that desynchronizes its bookkeeping, which must never pass silently.
-    pub(crate) fn fail_invalid(&self, what: &str) {
-        note_unrecoverable(&self.poison, &GpuError::Invalid(what.into()));
-    }
-
-    /// A test hook: makes retirements use the `cuLaunchHostFunc` fallback (a driver without `cuStreamAddCallback`),
-    /// which the driver skips after a fault.
-    #[doc(hidden)]
+    /// A test hook (feature `test-hooks`): makes retirements use the `cuLaunchHostFunc` fallback, as on a driver without
+    /// `cuStreamAddCallback`.
+    #[cfg(feature = "test-hooks")]
     pub fn force_host_func_fallback(&self, on: bool) {
         self.force_host_func.store(on, Ordering::Relaxed);
+    }
+
+    /// A test hook (feature `test-hooks`): poisons the device as an observed fault would.
+    #[cfg(feature = "test-hooks")]
+    pub fn poison_for_test(&self, what: &str) {
+        self.fail_invalid(what);
     }
 
     /// Whether retirements are armed with `cuLaunchHostFunc`.
@@ -167,6 +168,13 @@ impl CudaGpu {
         self.fns.stream_add_callback.is_none() || self.force_host_func.load(Ordering::Relaxed)
     }
 
+    /// Poisons the device with a misuse that desynchronizes its bookkeeping, which must never pass silently.
+    pub(crate) fn fail_invalid(&self, what: &str) {
+        note_unrecoverable(&self.poison, &GpuError::Invalid(what.into()));
+    }
+
+    /// As [`check`](Self::check), for a call whose failure leaves the device unusable whatever the code: the device
+    /// is poisoned with it.
     pub(crate) fn fail(&self, call: &'static str, code: i32) -> GpuError {
         let err = match self.device.driver.check(call, code) {
             Ok(()) => classify(call, code, "unknown".into()),

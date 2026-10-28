@@ -77,13 +77,31 @@ fn a_fault_with_host_function_retirements_still_reports_every_retirement() {
         [0, 1, 2]
     );
     assert_eq!(stream.outstanding_tickets(), 0);
-    // Whichever way the driver treated the host functions (this one runs them with status 0, an older one may skip
-    // them), every retirement was reported and the fault is real: the stream refuses new work with it.
+    // A host function reports success whatever became of the work before it, and this driver runs them after the fault.
+    // The stream's query shows the fault a little after the first host function ran, so the first ticket can still say
+    // success when it is handed out; what is guaranteed is that no retirement behind the fault *confirms* as a success.
+    // Using the stream observes the fault if the polls did not, and every ticket is then settled.
     let refused = stream.mark();
     assert!(
         matches!(refused, Err(GpuError::Fault { .. } | GpuError::Poisoned(_))),
-        "{refused:?}; tickets {:?}",
-        tickets.iter().map(|t| t.status()).collect::<Vec<_>>()
+        "{refused:?}"
     );
     assert!(gpu.poisoned().is_some());
+    for ticket in &tickets {
+        let failure = stream.confirm_retired(*ticket);
+        assert!(
+            matches!(
+                failure,
+                Some(GpuError::Fault { .. } | GpuError::Poisoned(_))
+            ),
+            "retirement {} (status {}) was armed behind the fault: {failure:?}",
+            ticket.seq(),
+            ticket.status()
+        );
+    }
+    // Tickets handed out after the fault was visible are already poisoned.
+    assert_eq!(
+        tickets.last().map(|t| t.status()),
+        Some(euhedral_gpu::POISONED_STATUS)
+    );
 }

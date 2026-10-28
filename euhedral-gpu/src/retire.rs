@@ -5,7 +5,7 @@
 //! Multi, Single>` of `euhedral-data-structures`, chunk-growing, with a small pool of chunks so that steady state
 //! recycles them). The backend's callback pushes the retirement's status and nothing else ([`RetireSink::push`]). The
 //! owner ([`Retirements`]) keeps what to do with each retirement, by number, in a `PlainQueue` of its own, drains the
-//! queue when it polls, and dispatches. The listeners are made and dropped on the owner's thread only.
+//! queue when it polls, and dispatches. The listeners are made and dropped inside the owning source's calls only.
 //!
 //! **The retirement number is not sent.** A stream's callbacks run in the order they were enqueued, and every armed
 //! retirement enqueues exactly one, so the n-th status that arrives belongs to the n-th retirement armed. Carrying the
@@ -96,9 +96,9 @@ pub struct RetireError<S, T = ()> {
 ///
 /// If the device is poisoned before the callback runs, the continuation is emitted at once with
 /// [`POISONED_STATUS`], so nothing is stranded. **Dropping a submitter is a shutdown call** (it waits for the device):
-/// a continuation that is done with a stream hands it back to a thread where blocking is allowed instead of dropping
-/// it on the lattice, and a [`Completions`] dropped or completed with a continuation still pending drops the stream
-/// there.
+/// a continuation that is done with a stream hands it back to the source that owns it, which drops it in its lifecycle
+/// stop path, instead of dropping it in a frame; a [`Completions`] dropped or completed with a continuation still
+/// pending drops the stream there.
 pub fn retire_into<S: Stream>(
     stream: S,
     completions: &Completions,
@@ -185,7 +185,7 @@ impl RetireSink {
 
 /// What the owner does when a retirement arrives.
 enum Armed {
-    /// Tell this listener, on the owner's thread.
+    /// Tell this listener, inside the owner's poll.
     Listener(Box<dyn RetireListener>),
     /// Hand the ticket to the caller of [`Retirements::poll`].
     Pull,
@@ -205,6 +205,9 @@ pub(crate) struct Retirements {
     tickets: usize,
     /// A status arrived with no armed retirement to belong to: the order the design relies on broke.
     desync: bool,
+    /// Statuses taken off the queue, whatever became of them (dispatched, dropped as late, or unmatched). Compared
+    /// with the retirements armed, it says whether a callback is still to come.
+    arrived: u64,
 }
 
 impl std::fmt::Debug for Retirements {
@@ -253,6 +256,7 @@ impl Retirements {
             abandoned: false,
             tickets: 0,
             desync: false,
+            arrived: 0,
         };
         (retirements, sink)
     }
@@ -269,6 +273,18 @@ impl Retirements {
     /// Retirements armed without a listener whose tickets have not been returned.
     pub(crate) fn outstanding_tickets(&self) -> usize {
         self.tickets
+    }
+
+    #[cfg_attr(
+        not(feature = "cuda"),
+        allow(dead_code, reason = "used by the CUDA stream's drop")
+    )]
+    /// Whether a driver callback armed here may still be to come: drains whatever has arrived (dropping it, counted) and
+    /// compares the retirements armed with the statuses seen. A stream that cannot wait for its callbacks keeps their
+    /// destination alive while this is true.
+    pub(crate) fn callbacks_pending(&mut self) -> bool {
+        self.arrived += self.consumer.drain_all(drop);
+        self.next > self.arrived
     }
 
     /// Whether a status arrived with no retirement to belong to (once; the flag is cleared).
@@ -294,11 +310,27 @@ impl Retirements {
     /// Drains the retirements that arrived: each listener is told, on this thread, in order; the first retirement armed
     /// without a listener returns its ticket (the rest stay queued for later polls).
     ///
+    /// `verify` is asked before a status of success is believed, and says whether the device failed meanwhile (then
+    /// the status becomes [`POISONED_STATUS`]). A backend whose callback sees the work's real outcome passes
+    /// `|| false`; one whose callback always reports success (a host function) passes a check of the stream.
+    ///
     /// With `poisoned` set, the retirements still outstanding after what arrived are reported with
     /// [`POISONED_STATUS`] (a poisoned device may never report them), and what arrives afterwards is dropped.
-    pub(crate) fn poll(&mut self, poisoned: bool) -> Option<RetireTicket> {
+    pub(crate) fn poll(
+        &mut self,
+        poisoned: bool,
+        verify: &mut dyn FnMut() -> bool,
+    ) -> Option<RetireTicket> {
         if !self.abandoned {
             while let Some(status) = self.consumer.poll() {
+                self.arrived += 1;
+                // A status of success from a backend that cannot see the work's outcome is checked against the device
+                // before it is believed (see `verify`).
+                let status = if status == 0 && verify() {
+                    POISONED_STATUS
+                } else {
+                    status
+                };
                 // Callbacks run in the order they were enqueued, so this status belongs to the oldest armed one.
                 let Some((seq, armed)) = self.armed.poll() else {
                     // A status nobody armed: never drop it quietly. The stream poisons its device with this.
@@ -312,7 +344,7 @@ impl Retirements {
         }
         if poisoned {
             self.abandoned = true;
-            self.consumer.clear();
+            self.arrived += self.consumer.drain_all(drop);
             while let Some((seq, armed)) = self.armed.poll() {
                 if let Some(ticket) = self.dispatch(seq, armed, POISONED_STATUS) {
                     return Some(ticket);
@@ -355,11 +387,15 @@ mod tests {
         for _ in 0..3 {
             r.register(None);
         }
-        assert!(r.poll(false).is_none(), "nothing arrived yet");
+        assert!(
+            r.poll(false, &mut || false).is_none(),
+            "nothing arrived yet"
+        );
         sink.push(0);
         sink.push(0);
         sink.push(7);
-        let tickets: Vec<RetireTicket> = std::iter::from_fn(|| r.poll(false)).collect();
+        let tickets: Vec<RetireTicket> =
+            std::iter::from_fn(|| r.poll(false, &mut || false)).collect();
         assert_eq!(
             tickets
                 .iter()
@@ -373,7 +409,7 @@ mod tests {
                 .all(|t| t.stream() == id && t.lane() == LaneId(3))
         );
         assert!(tickets[0].ok() && !tickets[2].ok());
-        assert!(r.poll(false).is_none(), "each exactly once");
+        assert!(r.poll(false, &mut || false).is_none(), "each exactly once");
     }
 
     #[test]
@@ -410,7 +446,7 @@ mod tests {
             "nothing is told until the owner polls"
         );
         assert!(
-            r.poll(false).is_none(),
+            r.poll(false, &mut || false).is_none(),
             "listener-style retirements return no ticket"
         );
         let told = told.lock().unwrap();
@@ -432,16 +468,62 @@ mod tests {
         }
         sink.push(700);
         // What arrived keeps its status; the two never reported are poisoned.
-        let first = r.poll(true).unwrap();
+        let first = r.poll(true, &mut || false).unwrap();
         assert_eq!((first.seq(), first.status()), (0, 700));
-        let second = r.poll(true).unwrap();
+        let second = r.poll(true, &mut || false).unwrap();
         assert_eq!((second.seq(), second.status()), (1, POISONED_STATUS));
-        let third = r.poll(true).unwrap();
+        let third = r.poll(true, &mut || false).unwrap();
         assert_eq!((third.seq(), third.status()), (2, POISONED_STATUS));
         // Late callbacks no longer say whose they are: dropped, never matched to anything.
         sink.push(0);
-        assert!(r.poll(true).is_none());
-        assert!(r.poll(false).is_none());
+        assert!(r.poll(true, &mut || false).is_none());
+        assert!(r.poll(false, &mut || false).is_none());
+    }
+
+    #[test]
+    fn a_success_the_device_contradicts_is_reported_poisoned() {
+        let (mut r, sink, _) = channel();
+        for _ in 0..3 {
+            r.register(None);
+        }
+        sink.push(0);
+        sink.push(0);
+        sink.push(5);
+        let mut asked = 0;
+        let mut verify = || {
+            asked += 1;
+            asked >= 2
+        };
+        let statuses: Vec<i32> = std::iter::from_fn(|| r.poll(false, &mut verify))
+            .map(|t| t.status())
+            .collect();
+        assert_eq!(
+            statuses,
+            [0, POISONED_STATUS, 5],
+            "asked before each success, never about a failure"
+        );
+        assert_eq!(asked, 2);
+    }
+
+    #[test]
+    fn arrivals_are_counted_even_when_they_are_dropped() {
+        let (mut r, sink, _) = channel();
+        for _ in 0..3 {
+            r.register(None);
+        }
+        assert!(r.callbacks_pending(), "none arrived yet");
+        sink.push(0);
+        // The retirements were reported as poisoned before their callbacks arrived.
+        let reported: Vec<_> = std::iter::from_fn(|| r.poll(true, &mut || false)).collect();
+        assert_eq!(reported.len(), 3);
+        assert_eq!(r.outstanding(), 0, "nothing is armed any more");
+        assert!(
+            r.callbacks_pending(),
+            "yet two callbacks are still to come, and the sink must outlive them"
+        );
+        sink.push(0);
+        sink.push(0);
+        assert!(!r.callbacks_pending(), "all three arrived");
     }
 
     #[test]
@@ -453,7 +535,7 @@ mod tests {
     fn a_status_nobody_armed_is_flagged() {
         let (mut r, sink, _) = channel();
         sink.push(0);
-        assert!(r.poll(false).is_none());
+        assert!(r.poll(false, &mut || false).is_none());
         assert!(r.take_desync(), "a desync must never be silent");
         assert!(!r.take_desync(), "reported once");
     }
@@ -465,7 +547,7 @@ mod tests {
         r.register(None);
         assert_eq!((r.outstanding(), r.outstanding_tickets()), (2, 2));
         sink.push(0);
-        assert!(r.poll(false).is_some());
+        assert!(r.poll(false, &mut || false).is_some());
         assert_eq!((r.outstanding(), r.outstanding_tickets()), (1, 1));
     }
 }

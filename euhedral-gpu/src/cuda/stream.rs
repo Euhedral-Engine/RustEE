@@ -351,19 +351,6 @@ impl CudaStream {
         })
     }
 
-    /// `cuStreamQuery`: success and "not ready" are normal; anything else means the stream's work will never finish
-    /// (a fault), and poisons the device.
-    fn check_stream(&self) {
-        let Ok(_c) = self.gpu.device().enter() else {
-            return;
-        };
-        // SAFETY: a stream of this device; the context is current.
-        let code = unsafe { (self.gpu.fns.stream_query)(self.raw) };
-        if code != 0 && code != NOT_READY {
-            self.gpu.fail("cuStreamQuery", code);
-        }
-    }
-
     /// Arms a retirement: the callback is enqueued first, and registered once the driver accepted it.
     fn arm(&mut self, listener: Option<Box<dyn RetireListener>>) -> Result<(), GpuError> {
         self.gpu.poison.check()?;
@@ -378,6 +365,29 @@ impl CudaStream {
     pub(crate) fn enter(&self) -> Result<euhedral_memory::cuda::Current<'_>, GpuError> {
         self.gpu.device().enter().map_err(from_cuda)
     }
+}
+
+/// `cuStreamQuery`: success and "not ready" are normal; anything else means the stream's work will never finish (a
+/// fault), and poisons the device. Never waits.
+fn check_stream(gpu: &CudaGpu, raw: CuStream) {
+    let Ok(_c) = gpu.device().enter() else {
+        return;
+    };
+    // SAFETY: a stream of this device; the context is current.
+    let code = unsafe { (gpu.fns.stream_query)(raw) };
+    if code != 0 && code != NOT_READY {
+        gpu.fail("cuStreamQuery", code);
+    }
+}
+
+/// How many shared sides were leaked by streams that could not wait for their callbacks (test builds only).
+#[cfg(feature = "test-hooks")]
+static LEAKED_SHARED_SIDES: AtomicU64 = AtomicU64::new(0);
+
+/// A test hook (feature `test-hooks`): how many stream drops leaked their shared side.
+#[cfg(feature = "test-hooks")]
+pub fn leaked_shared_sides() -> u64 {
+    LEAKED_SHARED_SIDES.load(Ordering::Relaxed)
 }
 
 impl Drop for CudaStream {
@@ -404,11 +414,14 @@ impl Drop for CudaStream {
                 }
             }
         }
-        if !waited && self.retire.outstanding() > 0 {
-            // The wait did not complete (the context is lost, or a sticky fault made it return at once) while the
-            // driver may still deliver the callbacks armed here, each of which pushes into the shared side's sink. Keep
-            // that side alive for good: a leaked reference is the price of never freeing the sink under a callback.
+        if !waited && self.retire.callbacks_pending() {
+            // The wait did not complete (the context is lost, or a sticky fault made it return at once) while a callback
+            // armed here is still to arrive (more retirements armed than statuses seen, counting those reported as
+            // poisoned before their callbacks came), and each pushes into the shared side's sink. Keep that side alive
+            // for good: a leaked reference is the price of never freeing the sink under a callback.
             std::mem::forget(self.queue.clone());
+            #[cfg(feature = "test-hooks")]
+            LEAKED_SHARED_SIDES.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -464,7 +477,16 @@ impl Stream for CudaStream {
 
     fn poll_retired(&mut self) -> Option<RetireTicket> {
         let poisoned = self.gpu.poison.get().is_some();
-        let mut ticket = self.retire.poll(poisoned);
+        // A host function always reports success, whatever became of the work before it (the driver runs it after a
+        // fault), so on that path a success is checked against the stream, which does not wait, before it is believed.
+        let (gpu, raw, host) = (&self.gpu, self.raw, self.gpu.uses_host_func());
+        let mut verify = || {
+            host && {
+                check_stream(gpu, raw);
+                gpu.poison.get().is_some()
+            }
+        };
+        let mut ticket = self.retire.poll(poisoned, &mut verify);
         // A host function enqueued after a fault is skipped by the driver (the `cuLaunchHostFunc` fallback), so no
         // callback may ever come: ask the stream, without waiting, and let a failure poison the device.
         if ticket.is_none()
@@ -472,9 +494,9 @@ impl Stream for CudaStream {
             && self.retire.outstanding() > 0
             && self.gpu.uses_host_func()
         {
-            self.check_stream();
+            check_stream(&self.gpu, self.raw);
             if self.gpu.poison.get().is_some() {
-                ticket = self.retire.poll(true);
+                ticket = self.retire.poll(true, &mut || false);
             }
         }
         if self.retire.take_desync() {
@@ -502,8 +524,13 @@ impl Stream for CudaStream {
         } else {
             // Release only what this retirement covered; a poisoned ticket does not say which that was.
             self.kept.release_through(ticket.seq());
+            // A host function reports success whatever happened to the work before it: look at the stream (without
+            // waiting) before a success is believed.
+            if ticket.status() == 0 && self.gpu.uses_host_func() {
+                check_stream(&self.gpu, self.raw);
+            }
             if ticket.status() != 0 {
-                // An ordinary thread may ask the driver for the error's name.
+                // Asking the driver for the error's name is a plain call.
                 let err = self
                     .gpu
                     .check("device work", ticket.status())

@@ -9,7 +9,7 @@
 
 use std::time::Duration;
 
-use euhedral_gpu::cuda::{CudaGpu, CudaModule};
+use euhedral_gpu::cuda::{CudaGpu, CudaModule, leaked_shared_sides};
 use euhedral_gpu::{Args, CompileOptions, Enqueue, Gpu, Launch, Module, Stream, StreamOptions};
 
 const OPS: &str = include_str!("kernels/ops.cu");
@@ -53,12 +53,26 @@ fn a_stream_dropped_after_its_pool_is_safe_with_callbacks_still_to_come() {
     for _ in 0..4 {
         stream.arm_retirement().unwrap();
     }
+    // The device is observed poisoned before the driver delivers any callback (a lattice worker polling right after a
+    // fault is noticed): polling reports the four retirements as poisoned, and nothing is armed any more, yet all four
+    // callbacks are still to come.
+    gpu.poison_for_test("a fault noticed before the callbacks");
+    let mut reported = 0;
+    while let Some(ticket) = stream.poll_retired() {
+        assert_eq!(ticket.status(), euhedral_gpu::POISONED_STATUS);
+        reported += 1;
+    }
+    assert_eq!(reported, 4);
+    let leaked_before = leaked_shared_sides();
     // The pool (the only other holder of the stream's shared side) goes first; then the stream, whose wait ends with
     // the fault while the callbacks are still to be delivered.
     drop(pool);
     drop(stream);
+    assert_eq!(
+        leaked_shared_sides() - leaked_before,
+        1,
+        "the shared side is kept alive for the callbacks still to come"
+    );
     // The driver delivers whatever it still has; a callback that pushed into freed memory would crash here or later.
     std::thread::sleep(Duration::from_millis(500));
-    // Reaching this line is the assertion: the process is alive after the callbacks ran.
-    let _ = gpu.poisoned();
 }

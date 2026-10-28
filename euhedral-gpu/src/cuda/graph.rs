@@ -214,9 +214,9 @@ impl CudaSequence<'_> {
         }
     }
 
-    /// A test hook: marks the capture failed, as a refused operation would. The sequence's work still runs for
-    /// real, and recording ends with `Err(Capture)`.
-    #[doc(hidden)]
+    /// A test hook (feature `test-hooks`): marks the capture failed, as a refused operation would. The sequence's work
+    /// still runs for real, and recording ends with `Err(Capture)`.
+    #[cfg(feature = "test-hooks")]
     pub fn fail_capture(&mut self) {
         if self.rec.failed.is_none() {
             self.rec.failed = Some(GpuError::Capture("failed by the test hook".into()));

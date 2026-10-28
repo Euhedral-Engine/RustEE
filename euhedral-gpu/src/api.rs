@@ -18,9 +18,11 @@
 //!   Exclusivity is the borrow checker's, so there is no lock to take or to wait on, and a call on a stream from
 //!   inside its own `submit` closure does not compile.
 //!
-//! Work for a stream from another thread goes to the thread that owns it (through one of RustEE's lock-free queues, or
-//! by handing the submitter over inside a frame, as [`retire_into`](crate::retire_into) does), or runs on another
-//! lane. This crate has no routing layer.
+//! The intended shape is RustEE's own: a lane's `LatticeSource` owns its submitter. The lattice serializes the source's
+//! `request` and `pull`, so whichever worker runs them is the submitter's only user, and nothing is locked. Work for the
+//! lane from other frames reaches the source through one of RustEE's lock-free queues (an MPSC intake the source
+//! drains), or the submitter is handed from frame to frame inside a chain, as [`retire_into`](crate::retire_into) does,
+//! or the work runs on another lane. This crate has no routing layer.
 
 use std::any::Any;
 use std::fmt;
@@ -87,8 +89,13 @@ pub trait Gpu: Send + Sync + fmt::Debug + Sized + 'static {
 /// The submitter of one ordered queue of device work, and a lane of a [`LanePool`].
 ///
 /// A stream has one owner: every call that enqueues takes `&mut self`, and the type is `Send` (it can move to another
-/// thread, or travel inside a frame) but not `Sync`. The pool and `Completions` hold the stream's [`queue`](Self::queue)
-/// instead, which is shared and only reads.
+/// thread, or travel inside a frame) but not `Sync`. In RustEE's model the owner is a `LatticeSource`: the lattice
+/// serializes its `request` and `pull`, so the source is the submitter's only user, whichever worker runs it. The pool
+/// and `Completions` hold the stream's [`queue`](Self::queue) instead, which is shared and only reads.
+///
+/// **Dropping a submitter is a shutdown call**: it waits for the stream's work, and every callback it armed, to end. A
+/// submitter is dropped in the owning source's lifecycle stop path; a continuation that is done with a stream hands it
+/// back to that source instead of dropping it in a frame (see [`retire_into`](crate::retire_into)).
 pub trait Stream: Send + Sized + 'static {
     type Gpu: Gpu<Stream = Self>;
     type Enqueue<'a>: Enqueue<Kernel = <Self::Gpu as Gpu>::Kernel>;
@@ -121,8 +128,9 @@ pub trait Stream: Send + Sized + 'static {
         f: impl FnOnce(&mut Self::Enqueue<'_>) -> Result<R, GpuError>,
     ) -> Result<R, GpuError>;
 
-    /// A marker after the work submitted so far. `Err(Busy)` when the marker ring is full of markers that have not
-    /// completed.
+    /// A marker after the work submitted so far. `Err(Busy)` (retry; this never waits) when the marker ring is full of
+    /// markers that have not completed, or when the slot the marker would reuse is pinned by an awaiter on another
+    /// lane.
     fn mark(&mut self) -> Result<Marker, GpuError>;
 
     /// Later work on this stream waits, on the device, for `marker`. The host does not wait.
@@ -132,10 +140,10 @@ pub trait Stream: Send + Sized + 'static {
     /// `Err(Invalid)`; it is never treated as already done.
     fn await_marker(&mut self, marker: Marker) -> Result<(), GpuError>;
 
-    /// Arms a retirement after the work submitted so far: `listener` is told once, on the thread that owns this stream,
-    /// by [`poll_retired`](Self::poll_retired), in the order the retirements were armed. The backend's callback only
-    /// queues the outcome (it makes no driver call, frees and allocates nothing); the listener is made and dropped on
-    /// the owner's thread.
+    /// Arms a retirement after the work submitted so far: `listener` is told once, inside the owning source's
+    /// [`poll_retired`](Self::poll_retired) call (on whichever worker runs its `request` or `pull`), in the order the
+    /// retirements were armed. The backend's callback only queues the outcome (it makes no driver call, frees and
+    /// allocates nothing); the listener is made and dropped inside the owner's calls.
     fn notify_retired(&mut self, listener: Box<dyn RetireListener>) -> Result<(), GpuError>;
 
     /// Arms a retirement after the work submitted so far, without a listener: its ticket comes back from
@@ -153,10 +161,6 @@ pub trait Stream: Send + Sized + 'static {
     /// outstanding: their tickets would reach its continuation in place of its own.
     fn outstanding_tickets(&self) -> usize;
 
-    /// Dropping a submitter is a **shutdown call**: it waits for the stream's work (and every callback it armed) to end.
-    /// A thread that must not block does not drop one: it hands the stream back to a thread that may, as the
-    /// continuations of [`retire_into`](crate::retire_into) do.
-    ///
     /// Settles a retirement: the device failure behind it, or `None`. Never panics. Values kept for the retirement are
     /// released. A ticket armed on another stream is refused with `Some(Invalid)` and releases nothing.
     ///
@@ -288,11 +292,11 @@ pub trait Graph: Send + fmt::Debug {
 
 /// Told once that a retirement happened.
 ///
-/// The listener is made, told and dropped on the thread that owns the stream, inside
-/// [`Stream::poll_retired`]; the backend's callback thread never touches it. So it may do what the owner may do, but
-/// it runs on the owner's poll: keep it short.
+/// The listener is made, told and dropped inside the owning source's calls, in [`Stream::poll_retired`]; the backend's
+/// callback thread never touches it. So it may do what the source may do in its `request` or `pull`, and it runs
+/// there: keep it short.
 pub trait RetireListener: Send + 'static {
-    /// Runs once, on the owner's thread, from [`Stream::poll_retired`].
+    /// Runs once, inside the owning source's [`Stream::poll_retired`].
     fn retired(self: Box<Self>, ticket: RetireTicket);
 }
 

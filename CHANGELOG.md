@@ -30,7 +30,7 @@ done, looked like one of this pool and could be treated as done.
     memsets; `mark` and `await_marker` order work across streams on the device.
   - `notify_retired` arms a completion point. The driver's callback only pushes the outcome onto the stream's
     unbounded, lock-free MPSC queue (pooled chunks, no allocation or free in steady state); the owner drains it with
-    `poll_retired` and tells the listeners on its own thread. `arm_retirement` is the listener-free form. `retire_into` takes the
+    `poll_retired` and tells the listeners inside the owning source's `request` or `pull`. `arm_retirement` is the listener-free form. `retire_into` takes the
     submitter by value, turns the retirement into a frame of a `Completions`, and hands the submitter back to the
     continuation with the ticket; `OnceFrame` runs an `FnOnce` that owns it. `confirm_retired` is a submitter method.
   - A `Module` loads from source (NVRTC, loaded at run time, cached under a content hash) or from a prebuilt image

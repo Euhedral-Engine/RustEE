@@ -3,7 +3,8 @@
 //! The callback runs on a thread the driver owns. It reads a pointer to the stream's [`RetireSink`] (its user data,
 //! stable for the stream's life), pushes the status of the work before it onto the stream's lock-free retirement
 //! queue, and returns. It makes no driver call, allocates nothing in steady state, frees nothing, takes no lock, and
-//! touches no listener: the stream's owner drains the queue (`Stream::poll_retired`) and dispatches on its own thread.
+//! touches no listener: the stream's owner (a lattice source, in its `request` or `pull`) drains the queue (`Stream::poll_retired`) and
+//! dispatches.
 
 use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind};

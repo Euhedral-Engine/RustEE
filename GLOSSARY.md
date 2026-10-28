@@ -579,7 +579,7 @@ goes to its owner, or to another lane.
 **retirement** ([`notify_retired`, `confirm_retired`, `RetireTicket`](euhedral-gpu/src/api.rs),
 [`retire_into`](euhedral-gpu/src/retire.rs)): the device reaching a point after the work submitted so far. The
 driver's callback only pushes the outcome onto the stream's unbounded lock-free MPSC queue (no allocation, free or
-lock); the owner drains it with `poll_retired` and tells the listeners on its own thread, in order;
+lock); the owning source drains it with `poll_retired` (in its `request` or `pull`) and tells the listeners, in order;
 `confirm_retired` settles the ticket (a submitter method) and returns the device failure, or none; `retire_into` makes the retirement a frame of a
 `Completions`, and the submitter travels with its continuation. A stage finishing its submission is never completion.
 

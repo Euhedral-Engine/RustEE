@@ -10,6 +10,9 @@ license = "Apache-2.0"
 default = []
 # `fake`: a stepped, wall-clock-free fake device for tests of code built on this crate.
 fake = []
+# `test-hooks`: switches that tests use to reach paths a healthy driver does not take (the host-function fallback of
+# retirement, a failed capture, counters of deliberate leaks). Not for production use.
+test-hooks = []
 # `cuda`: the CUDA backend, on the driver `euhedral-memory` loads (one library, one primary context); the run-time
 # compiler (NVRTC) is loaded with dlopen as well.
 cuda = ["euhedral-memory/cuda", "dep:libc"]
@@ -28,7 +31,7 @@ libc = { version = "0.2.174", optional = true }
 
 [dev-dependencies]
 # The crate's own tests use the fake backend.
-euhedral-gpu = { path = ".", default-features = false, features = ["fake"] }
+euhedral-gpu = { path = ".", default-features = false, features = ["fake", "test-hooks"] }
 # The acceptance example picks a CPU for its lattice.
 euhedral-hardware-utils = { path = "../euhedral-hardware-utils" }
 

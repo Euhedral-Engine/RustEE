@@ -39,9 +39,10 @@ Asynchronous, backend-neutral GPU access for the RustEE control plane. A lattice
     `Graph::replay`. Exclusivity is the borrow checker's, so there is no lock to take or wait on, the operations of one
     submission are contiguous on the stream because nothing else can enqueue on it, and a call on a stream from inside
     its own `submit` does not compile (a `compile_fail` doctest and `tests/ownership.rs` pin this).
-  - Work for a stream from another thread goes to the thread that owns it (one of RustEE's lock-free queues, for
-    instance an `MpscQueue` the owner drains, or the submitter handed over inside a frame, which is what `retire_into`
-    does), or runs on another lane. There is no routing layer.
+  - In RustEE's model the owner is a `LatticeSource`: the lattice serializes its `request` and `pull`, so whichever
+    worker runs them is the submitter's only user. Work for a lane from other frames reaches its source through a
+    lock-free queue (an `MpscQueue` the source drains), or the submitter is handed from frame to frame inside a chain,
+    which is what `retire_into` does, or the work runs on another lane. There is no routing layer.
   - Enqueue operations (`launch`, the copies, `memset`) are `unsafe fn`s, as `euhedral_memory::Copier::start` is: a
     kernel or a copy can touch any device-visible memory.
 - **Markers across streams.** `mark()` records a marker after the work submitted so far; `await_marker(m)` orders later
@@ -66,8 +67,8 @@ Asynchronous, backend-neutral GPU access for the RustEE control plane. A lattice
   - The retirement's number is not sent: a stream's callbacks run in the order they were enqueued, and each armed
     retirement enqueues one, so the n-th status that arrives belongs to the n-th retirement armed. The owner keeps what
     to do with each (a `PlainQueue` by number), and `poll_retired()` drains the queue and dispatches: `notify_retired(
-    listener)` listeners are told, on the owner's thread, in order; the first retirement armed with
-    `arm_retirement()` returns its ticket. Listeners are made and dropped on the owner's thread only.
+    listener)` listeners are told, inside the owning source's call, in order; the first retirement armed with
+    `arm_retirement()` returns its ticket. Listeners are made and dropped inside the owner's calls only.
   - If the device is poisoned, `poll_retired` reports the retirements still outstanding with `POISONED_STATUS` and
     drops what arrives afterwards (it could no longer say whose it is). A status that arrives with no retirement armed
     is never dropped quietly: it poisons the device with `Invalid`. With the `cuLaunchHostFunc` fallback (a driver
@@ -77,8 +78,8 @@ Asynchronous, backend-neutral GPU access for the RustEE control plane. A lattice
   - `retire_into` refuses (the stream comes back in the error) a stream that has a listener-free retirement
     outstanding (`outstanding_tickets()`): its ticket would reach the continuation in place of its own.
     `retire_into_with` carries extra state with the stream and returns it on failure.
-  - Dropping a submitter is a shutdown call (it waits for the device and its callbacks): a thread that must not block
-    hands the stream back instead of dropping it. If the wait cannot complete (a lost context or a sticky fault) while
+  - Dropping a submitter is a shutdown call (it waits for the device and its callbacks): a submitter is dropped in the
+    owning source's lifecycle stop path, and a continuation hands the stream back to that source instead of dropping it. If the wait cannot complete (a lost context or a sticky fault) while
     retirements are outstanding, the drop leaks one reference to the stream's shared side, so a callback still to come
     never pushes into freed memory.
   - `confirm_retired(ticket)` is a method of the submitter and returns the device failure behind the ticket, or `None`.
@@ -175,8 +176,7 @@ streams[1]
     .unwrap();
 
 // The copy's retirement continues as a frame, emitted by the lattice's own poll. The submitter travels with it,
-// and the frame hands it back: dropping a submitter waits for the device, so a thread that must not block (the
-// lattice's) never drops one.
+// and the frame hands it back to its source: dropping a submitter waits for the device, so a frame never drops one.
 let completions = Completions::new(lanes);
 let returned = Arc::new(Mutex::new(None));
 let copy_lane = streams.remove(1);
@@ -206,8 +206,32 @@ while completions.pending() > 0 {
 let (failure, copy_lane) = returned.lock().unwrap().take().expect("the continuation ran");
 assert_eq!(failure, None); // retired, no failure
 assert_eq!(u32::from_le_bytes(out), 1);
-drop(copy_lane); // a shutdown call, made here, where blocking is allowed
+drop(copy_lane); // a shutdown call: made here, in the source's stop path, never in a frame
 ```
+
+## The intended shape: a lane is a source
+
+In RustEE a lane's work belongs to a `LatticeSource`. The lattice serializes the source's `request` and `pull`, so the
+submitter it owns is only ever used by one call at a time, on whichever worker runs it, and nothing is locked. A sketch
+(not code of this crate):
+
+```rust,ignore
+struct LaneSource {
+    stream: CudaStream,                 // the submitter: this source is its one owner
+    intake: Consumer<Job, Single>,      // an MPSC queue other frames push jobs into
+    downstream: Option<Arc<dyn LatticeReceiver>>,
+}
+
+// In `request`/`pull`, whichever worker runs it:
+//   1. drain the intake: each job is `stream.submit(..)` (launches, copies) and, if it needs its completion,
+//      `stream.notify_retired(listener)` or `stream.arm_retirement()`;
+//   2. drain the retirements: `while let Some(ticket) = stream.poll_retired() { stream.confirm_retired(ticket); .. }`
+//      and push the follow-on frames downstream;
+// and in the stop path (`complete`): drop the stream, a shutdown call that waits for the device.
+```
+
+`retire_into` is the same shape for a chain of frames: the stream travels inside the continuation instead of living in a
+source, and the last frame hands it back to the source that stops it.
 
 ## Features
 
