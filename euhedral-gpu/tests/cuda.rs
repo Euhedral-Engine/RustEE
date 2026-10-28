@@ -554,3 +554,186 @@ mod launches {
         assert_eq!(gpu.poisoned(), None);
     }
 }
+
+mod markers {
+    use super::streams::{device_memory, reached_within, wait_until};
+    use super::*;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    use euhedral_gpu::cuda::CudaModule;
+    use euhedral_gpu::{
+        Args, CompileOptions, Enqueue, Gpu, GpuError, Launch, Module, RetireListener, RetireTicket,
+        Stream, StreamOptions,
+    };
+    use euhedral_graph::DeviceQueue;
+    use euhedral_memory::cuda::PinnedHost;
+    use euhedral_memory::{Backend, LocationId};
+
+    const OPS: &str = include_str!("kernels/ops.cu");
+    const OPS_PTX: &[u8] = include_bytes!("kernels/ops.ptx");
+
+    /// The test kernels, from the image when the driver takes it, else from source.
+    pub fn ops(gpu: &Arc<CudaGpu>) -> Option<CudaModule> {
+        if gpu.driver_version() >= 13010 {
+            CudaModule::from_image(gpu, OPS_PTX).ok()
+        } else {
+            CudaModule::from_source(gpu, OPS, &CompileOptions::default()).ok()
+        }
+    }
+
+    /// Cycles of the `spin` kernel for about `ms` milliseconds.
+    pub fn cycles(ms: u64) -> u64 {
+        ms * 2_500_000
+    }
+
+    #[test]
+    fn a_marker_orders_another_streams_work_on_the_device() {
+        let Some(gpu) = gpu() else { return };
+        let Some(ops) = ops(&gpu) else { return };
+        let (spin, add) = (ops.kernel("spin").unwrap(), ops.kernel("add_u32").unwrap());
+        let (pool, s) = gpu
+            .open_lanes(&["a", "b"], StreamOptions::default())
+            .unwrap();
+        let mem = device_memory(&gpu);
+        let pinned = PinnedHost::new(gpu.device().clone(), LocationId(1), 0);
+        let n = 1usize << 16;
+        let bytes = n * 4;
+        let x_host = pinned.alloc(bytes as u64).unwrap();
+        let out_host = pinned.alloc(bytes as u64).unwrap();
+        // SAFETY: pinned blocks of `bytes` bytes owned by this test.
+        let (x_slice, out_slice) = unsafe {
+            (
+                std::slice::from_raw_parts_mut(x_host.addr as *mut u32, n),
+                std::slice::from_raw_parts_mut(out_host.addr as *mut u32, n),
+            )
+        };
+        for (i, v) in x_slice.iter_mut().enumerate() {
+            *v = i as u32;
+        }
+        out_slice.fill(0xFFFF_FFFF);
+        let (x, z) = (
+            mem.alloc(bytes as u64).unwrap(),
+            mem.alloc(bytes as u64).unwrap(),
+        );
+        let add_args = Args::new()
+            .device(z.addr)
+            .device(x.addr)
+            .arg(7u32)
+            .arg(n as u32);
+        s[0].submit(|q| {
+            // SAFETY: valid blocks and matching arguments; the buffers outlive the markers waited for below.
+            unsafe {
+                q.copy_to_device(x.addr, x_host.addr as *const u8, bytes)?;
+                q.memset(z.addr, 0, bytes)?;
+                q.launch(&spin, Launch::linear(1, 1), &Args::new().arg(cycles(50)))?;
+                q.launch(&add, Launch::linear(n as u32, 256), &add_args)
+            }
+        })
+        .unwrap();
+        let m = s[0].mark().unwrap();
+        s[1].await_marker(m).unwrap();
+        s[1].submit(|q| {
+            // SAFETY: as above; this copy is ordered behind the marker on the device.
+            unsafe { q.copy_to_host(out_host.addr as *mut u8, z.addr, bytes) }
+        })
+        .unwrap();
+        let m1 = s[1].mark().unwrap();
+        assert!(reached_within(&pool, m1, Duration::from_secs(10)));
+        assert!(
+            out_slice
+                .iter()
+                .enumerate()
+                .all(|(i, &v)| v == i as u32 + 7),
+            "the copy ran after the kernel"
+        );
+        drop((pool, s));
+        // SAFETY: the streams ended their work; nothing uses the blocks.
+        unsafe {
+            mem.free(x);
+            mem.free(z);
+            pinned.free(x_host);
+            pinned.free(out_host);
+        }
+    }
+
+    struct Ordered(Arc<Mutex<Vec<u16>>>);
+
+    impl RetireListener for Ordered {
+        fn retired(self: Box<Self>, ticket: RetireTicket) {
+            self.0.lock().unwrap().push(ticket.lane.0);
+        }
+    }
+
+    #[test]
+    fn retirements_on_two_streams_follow_their_markers() {
+        let Some(gpu) = gpu() else { return };
+        let Some(ops) = ops(&gpu) else { return };
+        let spin = ops.kernel("spin").unwrap();
+        let (pool, s) = gpu
+            .open_lanes(&["a", "b"], StreamOptions::default())
+            .unwrap();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        s[0].submit(|q| {
+            // SAFETY: `spin` takes one 64-bit argument and touches no memory.
+            unsafe { q.launch(&spin, Launch::linear(1, 1), &Args::new().arg(cycles(20))) }
+        })
+        .unwrap();
+        // The callback precedes the marker on stream a, and a callback finishes before later work on its stream.
+        s[0].notify_retired(Box::new(Ordered(order.clone())))
+            .unwrap();
+        let m = s[0].mark().unwrap();
+        s[1].await_marker(m).unwrap();
+        s[1].notify_retired(Box::new(Ordered(order.clone())))
+            .unwrap();
+        assert!(wait_until(Duration::from_secs(10), || order
+            .lock()
+            .unwrap()
+            .len()
+            == 2));
+        assert_eq!(*order.lock().unwrap(), [0, 1]);
+        drop((pool, s));
+    }
+
+    #[test]
+    fn a_full_marker_ring_is_busy_and_old_markers_need_no_wait() {
+        let Some(gpu) = gpu() else { return };
+        let Some(ops) = ops(&gpu) else { return };
+        let spin = ops.kernel("spin").unwrap();
+        let (pool, s) = gpu
+            .open_lanes(&["a", "b"], StreamOptions { markers: 4 })
+            .unwrap();
+        let spin_for = |ms: u64| {
+            s[0].submit(|q| {
+                // SAFETY: `spin` takes one 64-bit argument and touches no memory.
+                unsafe { q.launch(&spin, Launch::linear(1, 1), &Args::new().arg(cycles(ms))) }
+            })
+            .unwrap();
+        };
+        spin_for(300);
+        let first = s[0].mark().unwrap();
+        let mut last = first;
+        for _ in 1..4 {
+            last = s[0].mark().unwrap();
+        }
+        assert_eq!(
+            s[0].mark(),
+            Err(GpuError::Busy),
+            "four markers are outstanding"
+        );
+        assert!(reached_within(&pool, last, Duration::from_secs(10)));
+        // A fifth marker reuses the first slot, behind a long spin.
+        spin_for(1500);
+        let fifth = s[0].mark().unwrap();
+        assert_eq!(fifth.value, 5);
+        // The first marker completed long ago: waiting for it adds no device wait, though its slot now holds the
+        // fifth marker, which is behind the spin.
+        s[1].await_marker(first).unwrap();
+        let other = s[1].mark().unwrap();
+        assert!(reached_within(&pool, other, Duration::from_secs(10)));
+        assert!(!pool.reached(fifth), "stream a is still spinning");
+        assert!(reached_within(&pool, fifth, Duration::from_secs(30)));
+        let _ = s[0].completed();
+        drop((pool, s));
+    }
+}
