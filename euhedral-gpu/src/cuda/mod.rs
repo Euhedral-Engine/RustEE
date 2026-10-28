@@ -29,10 +29,32 @@ use crate::{Fingerprint, Gpu, GpuError, Poison, Rerecorded, StreamOptions};
 
 use fns::{ATTR_CC_MAJOR, ATTR_CC_MINOR, GpuFns};
 
-/// Device faults: the context is lost and the device is poisoned. (Illegal address, launch failure, misaligned and
-/// other device-side exceptions, hardware stack and instruction errors.)
+/// Device faults: the context is lost and the device is poisoned. These are the codes for which the driver says
+/// further work returns the same error or the process must be relaunched:
+/// - 214 uncorrectable ECC error, 220 uncorrectable NVLink error, 226 contained error (an error contained to the
+///   context);
+/// - 700 illegal address, 702 launch timeout, 709 destroyed context, 710 assert;
+/// - 714 hardware stack error, 715 illegal instruction, 716 misaligned address, 717 invalid address space, 718
+///   invalid program counter, 719 launch failed;
+/// - 721 tensor memory leak, and 999 unknown.
 pub(crate) fn is_fault(code: i32) -> bool {
-    matches!(code, 700 | 702 | 710 | 714..=719)
+    matches!(
+        code,
+        214 | 220 | 226 | 700 | 702 | 709 | 710 | 714..=719 | 721 | 999
+    )
+}
+
+/// Records `err` as the device's cause when it is a device fault.
+pub(crate) fn note_fault(poison: &Poison, err: &GpuError) {
+    if matches!(err, GpuError::Fault { .. }) {
+        poison.set(err.clone());
+    }
+}
+
+/// Records `err` as the device's cause whatever it is: for a query that fails in a way nobody can recover from, where
+/// carrying on would strand the continuations behind it.
+pub(crate) fn note_unrecoverable(poison: &Poison, err: &GpuError) {
+    poison.set(err.clone());
 }
 
 /// The error for driver `code` of `call`: a [`GpuError::Fault`] for a device fault, else a [`GpuError::Call`].
@@ -116,12 +138,21 @@ impl CudaGpu {
             Ok(()) => Ok(()),
             Err(e) => {
                 let err = from_cuda(e);
-                if matches!(err, GpuError::Fault { .. }) {
-                    self.poison.set(err.clone());
-                }
+                note_fault(&self.poison, &err);
                 Err(err)
             }
         }
+    }
+
+    /// As [`check`](Self::check), for a call whose failure leaves the device unusable whatever the code: the device
+    /// is poisoned with it.
+    pub(crate) fn fail(&self, call: &'static str, code: i32) -> GpuError {
+        let err = match self.device.driver.check(call, code) {
+            Ok(()) => classify(call, code, "unknown".into()),
+            Err(e) => from_cuda(e),
+        };
+        note_unrecoverable(&self.poison, &err);
+        err
     }
 }
 
@@ -199,7 +230,10 @@ mod tests {
     #[test]
     fn fault_codes_are_classified() {
         assert!(is_fault(700) && is_fault(719) && is_fault(710));
-        assert!(!is_fault(1) && !is_fault(600) && !is_fault(0));
+        for sticky in [214, 220, 226, 702, 709, 714, 715, 716, 717, 718, 721, 999] {
+            assert!(is_fault(sticky), "{sticky}");
+        }
+        assert!(!is_fault(1) && !is_fault(600) && !is_fault(0) && !is_fault(101) && !is_fault(222));
         assert!(matches!(
             classify("k", 700, "X".into()),
             GpuError::Fault { code: 700, .. }
@@ -207,6 +241,31 @@ mod tests {
         assert!(matches!(
             classify("k", 1, "X".into()),
             GpuError::Call { code: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn only_faults_poison_by_default_but_an_unrecoverable_failure_always_does() {
+        let poison = Poison::new();
+        note_fault(&poison, &classify("k", 101, "INVALID_DEVICE".into()));
+        assert_eq!(
+            poison.get(),
+            None,
+            "an ordinary error leaves the device usable"
+        );
+        note_fault(&poison, &classify("k", 700, "ILLEGAL_ADDRESS".into()));
+        assert!(matches!(
+            poison.get(),
+            Some(GpuError::Fault { code: 700, .. })
+        ));
+        let other = Poison::new();
+        note_unrecoverable(
+            &other,
+            &classify("cuEventQuery", 101, "INVALID_DEVICE".into()),
+        );
+        assert!(matches!(
+            other.get(),
+            Some(GpuError::Call { code: 101, .. })
         ));
     }
 }

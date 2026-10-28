@@ -66,27 +66,34 @@ impl LaneRing {
         self.events[(value % self.events.len() as u64) as usize]
     }
 
-    /// Advances `done` over the markers that completed. The context is current.
+    /// Advances `done` over the markers that completed. The context is current. A query that fails for any reason
+    /// but "not ready" poisons the device, so `completed` reports every marker and nothing is stranded behind it.
     fn scan(&self, gpu: &CudaGpu) {
         let f = &gpu.device().driver.fns;
         let marked = self.marked.load(Ordering::Acquire);
-        let mut done = self.done.load(Ordering::Acquire);
-        while done < marked {
+        let from = self.done.load(Ordering::Acquire);
+        let (done, failed) = advance(from, marked, |value| {
             // SAFETY: an event of this ring; the context is current.
-            let code = unsafe { (f.event_query)(self.slot(done + 1)) };
-            match code {
-                0 => done += 1,
-                NOT_READY => break,
-                // A fault poisons the device (`completed` then reports every marker); another error leaves the
-                // marker unreached.
-                other => {
-                    let _ = gpu.check("cuEventQuery", other);
-                    break;
-                }
-            }
-        }
+            unsafe { (f.event_query)(self.slot(value)) }
+        });
         self.done.fetch_max(done, Ordering::AcqRel);
+        if let Some(code) = failed {
+            gpu.fail("cuEventQuery", code);
+        }
     }
+}
+
+/// Walks the markers after `done` up to `marked`, asking `query` (a driver result code) about each. Returns the new
+/// `done` and the error code that stopped the walk, if it was neither success nor "not ready".
+fn advance(mut done: u64, marked: u64, mut query: impl FnMut(u64) -> i32) -> (u64, Option<i32>) {
+    while done < marked {
+        match query(done + 1) {
+            0 => done += 1,
+            NOT_READY => return (done, None),
+            other => return (done, Some(other)),
+        }
+    }
+    (done, None)
 }
 
 impl Drop for LaneRing {
@@ -365,5 +372,25 @@ impl Stream for CudaStream {
                     .map(|cause| GpuError::Poisoned(Box::new(cause)))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_walk_stops_at_the_first_marker_not_ready() {
+        let results = [0, 0, NOT_READY, 0];
+        let (done, failed) = advance(0, 4, |v| results[(v - 1) as usize]);
+        assert_eq!((done, failed), (2, None));
+        assert_eq!(advance(2, 2, |_| unreachable!()), (2, None));
+    }
+
+    #[test]
+    fn a_walk_reports_an_error_other_than_not_ready() {
+        let results = [0, 101, 0];
+        let (done, failed) = advance(0, 3, |v| results[(v - 1) as usize]);
+        assert_eq!((done, failed), (1, Some(101)));
     }
 }
