@@ -18,7 +18,7 @@ pub use copier::StreamCopier;
 
 use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
 use std::fmt;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, PoisonError};
 
 pub type CuResult = c_int;
 pub type CuDevicePtr = u64;
@@ -243,12 +243,19 @@ impl Driver {
         Ok(Arc::new(d))
     }
 
-    /// The process's driver: loaded and initialized on first use; every call returns the same `Arc` (or the same
-    /// error). Code that shares the device with this crate (another crate's streams and kernels) takes the driver
-    /// from here, so there is one loaded library and, through [`Device::open`], one primary context.
+    /// The process's driver: loaded and initialized on first use; every call returns the same `Arc`. Code that
+    /// shares the device with this crate (another crate's streams and kernels) takes the driver from here, so there
+    /// is one loaded library and, through [`Device::open`], one primary context. A failed load is not remembered: a
+    /// later call tries again.
     pub fn shared() -> Result<Arc<Self>, String> {
-        static SHARED: OnceLock<Result<Arc<Driver>, String>> = OnceLock::new();
-        SHARED.get_or_init(Driver::load).clone()
+        static SHARED: Mutex<Option<Arc<Driver>>> = Mutex::new(None);
+        let mut shared = SHARED.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(driver) = &*shared {
+            return Ok(driver.clone());
+        }
+        let driver = Driver::load()?;
+        *shared = Some(driver.clone());
+        Ok(driver)
     }
 
     /// An entry point beyond [`Fns`], looked up in the loaded library; null when the driver lacks it.

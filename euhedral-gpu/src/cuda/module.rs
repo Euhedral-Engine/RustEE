@@ -128,16 +128,16 @@ fn load_image(gpu: &Arc<CudaGpu>, image: &[u8], key: u64) -> Result<CudaModule, 
     if code != 0 {
         let end = log.iter().position(|&b| b == 0).unwrap_or(log.len());
         let log = String::from_utf8_lossy(&log[..end]).trim().to_owned();
-        let call = gpu
-            .device()
+        // A device fault poisons the device (and stays a fault); anything else is a module that will not load.
+        let error = gpu
             .check("cuModuleLoadDataEx", code)
             .err()
-            .map_or_else(|| format!("code {code}"), |e| e.to_string());
-        return Err(GpuError::Load(if log.is_empty() {
-            call
-        } else {
-            format!("{call}: {log}")
-        }));
+            .unwrap_or_else(|| GpuError::Load(format!("cuModuleLoadDataEx: code {code}")));
+        return Err(match error {
+            fault @ GpuError::Fault { .. } => fault,
+            other if log.is_empty() => GpuError::Load(other.to_string()),
+            other => GpuError::Load(format!("{other}: {log}")),
+        });
     }
     Ok(CudaModule {
         inner: Arc::new(ModuleInner {
@@ -157,7 +157,7 @@ impl Module for CudaModule {
         options: &CompileOptions,
     ) -> Result<Self, GpuError> {
         let nvrtc = Nvrtc::shared(options.compiler.as_deref())?;
-        let target = nvrtc.target_for(gpu.arch());
+        let target = nvrtc.target_for(gpu.arch())?;
         let (target_name, ext) = match target {
             Target::Cubin(sm) => (format!("sm_{sm}"), "cubin"),
             Target::Ptx(cc) => (format!("compute_{cc}"), "ptx"),
@@ -167,6 +167,7 @@ impl Module for CudaModule {
             options,
             target: &target_name,
             compiler_version: nvrtc.version(),
+            compiler_build: nvrtc.build(),
         });
         let cache = options.cache_dir.as_ref().map(ModuleCache::new);
         if let Some(cache) = &cache

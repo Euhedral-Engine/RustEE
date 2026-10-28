@@ -23,6 +23,22 @@ pub enum Target {
     Ptx(u32),
 }
 
+/// The target for a device of `sm` (`X * 10 + Y`) among the architectures NVRTC `supported`: its exact machine code
+/// when supported, else PTX for the newest supported architecture that is not newer than the device (the driver
+/// compiles PTX forward, never backward).
+pub(crate) fn pick_target(supported: &[u32], sm: u32) -> Option<Target> {
+    if supported.contains(&sm) {
+        Some(Target::Cubin(sm))
+    } else {
+        supported
+            .iter()
+            .copied()
+            .filter(|&a| a <= sm)
+            .max()
+            .map(Target::Ptx)
+    }
+}
+
 /// A place to try loading the library from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Candidate {
@@ -124,6 +140,11 @@ pub struct Nvrtc {
     fns: Fns,
     version: (i32, i32),
     supported: Vec<u32>,
+    /// The library file the compiler was loaded from, when the loader says.
+    library: Option<PathBuf>,
+    /// Names the build of the compiler beyond its version: the library file's name (a toolkit's carries the patch
+    /// level), size and modification time. Part of the module cache key.
+    build: String,
 }
 
 impl std::fmt::Debug for Nvrtc {
@@ -175,14 +196,79 @@ macro_rules! sym {
     };
 }
 
+/// The file the loader mapped the code at `address` from.
+fn library_path(address: *mut c_void) -> Option<PathBuf> {
+    let mut info: libc::Dl_info = libc::Dl_info {
+        dli_fname: std::ptr::null(),
+        dli_fbase: std::ptr::null_mut(),
+        dli_sname: std::ptr::null(),
+        dli_saddr: std::ptr::null_mut(),
+    };
+    // SAFETY: an address inside a loaded library and an out pointer to a zeroed `Dl_info`.
+    if unsafe { libc::dladdr(address, &mut info) } == 0 || info.dli_fname.is_null() {
+        return None;
+    }
+    // SAFETY: `dli_fname` is a NUL-terminated path owned by the loader.
+    let name = unsafe { CStr::from_ptr(info.dli_fname) };
+    Some(PathBuf::from(name.to_string_lossy().into_owned()))
+}
+
+/// Whether two paths name one file.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "module loading is a build-time call; resolving a path blocks by nature"
+)]
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
+/// The library's real file name, size and modification time.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "module loading is a build-time call; reading a file's metadata blocks by nature"
+)]
+fn build_name(path: &Path) -> String {
+    let real = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
+    let name = real
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let (len, modified) = std::fs::metadata(&real)
+        .map(|m| {
+            let secs = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_secs());
+            (m.len(), secs)
+        })
+        .unwrap_or((0, 0));
+    format!("{name}:{len}:{modified}")
+}
+
 static SHARED: Mutex<Option<Arc<Nvrtc>>> = Mutex::new(None);
 
 impl Nvrtc {
     /// The process's NVRTC: the first successful load, by `explicit` or the search order. Loading blocks (file
-    /// reads); it is a build-time call.
+    /// reads); it is a build-time call. A failed load is not remembered: a later call tries again.
+    ///
+    /// One compiler serves the process. Asking for a different library file once one is loaded is
+    /// `Err(Invalid)`, not a silent use of the loaded one.
     pub fn shared(explicit: Option<&Path>) -> Result<Arc<Self>, GpuError> {
         let mut shared = SHARED.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(nvrtc) = &*shared {
+            if let (Some(want), Some(have)) = (explicit, &nvrtc.library)
+                && !same_file(want, have)
+            {
+                return Err(GpuError::Invalid(format!(
+                    "NVRTC is already loaded from {}; this process cannot also use {}",
+                    have.display(),
+                    want.display()
+                )));
+            }
             return Ok(nvrtc.clone());
         }
         let nvrtc = Arc::new(Self::find(explicit)?);
@@ -257,10 +343,14 @@ impl Nvrtc {
             destroy_program: sym!(lib, c"nvrtcDestroyProgram"),
             get_error_string: sym!(lib, c"nvrtcGetErrorString"),
         };
+        let library = library_path(symbol(lib, c"nvrtcVersion")?);
+        let build = library.as_deref().map(build_name).unwrap_or_default();
         let mut nvrtc = Self {
             fns,
             version: (0, 0),
             supported: Vec::new(),
+            library,
+            build,
         };
         let (mut major, mut minor) = (0, 0);
         // SAFETY: out pointers.
@@ -305,14 +395,21 @@ impl Nvrtc {
         self.version
     }
 
-    /// `sm_XY` machine code when NVRTC supports the architecture, else PTX for the newest `compute_XY` it supports.
-    pub fn target_for(&self, arch: (i32, i32)) -> Target {
+    /// Names this build of the compiler beyond its version (see the module cache key).
+    pub fn build(&self) -> &str {
+        &self.build
+    }
+
+    /// `sm_XY` machine code when NVRTC supports the architecture, else PTX for the newest `compute_XY` it supports
+    /// that is not newer than the device. An error when NVRTC supports nothing that old.
+    pub fn target_for(&self, arch: (i32, i32)) -> Result<Target, GpuError> {
         let sm = u32::try_from(arch.0 * 10 + arch.1).unwrap_or(0);
-        if self.supported.contains(&sm) {
-            Target::Cubin(sm)
-        } else {
-            Target::Ptx(self.supported.iter().copied().max().unwrap_or(sm))
-        }
+        pick_target(&self.supported, sm).ok_or_else(|| {
+            GpuError::Load(format!(
+                "NVRTC {}.{} supports no architecture up to sm_{sm}",
+                self.version.0, self.version.1
+            ))
+        })
     }
 
     /// Compiles `source` for `target`: a cubin, or PTX with a trailing NUL. `options.options` are passed as given,
@@ -481,5 +578,19 @@ mod tests {
             [file("/elsewhere/nvrtc.so")],
             "an explicit path is the only candidate"
         );
+    }
+
+    #[test]
+    fn the_target_is_never_newer_than_the_device() {
+        let supported = [75, 80, 86, 89, 90, 100, 120];
+        assert_eq!(pick_target(&supported, 120), Some(Target::Cubin(120)));
+        // A device NVRTC supports exactly gets machine code.
+        assert_eq!(pick_target(&supported, 89), Some(Target::Cubin(89)));
+        // A device between two supported architectures gets the older one's PTX, never a newer one.
+        assert_eq!(pick_target(&supported, 87), Some(Target::Ptx(86)));
+        assert_eq!(pick_target(&supported, 121), Some(Target::Ptx(120)));
+        // A device older than everything NVRTC knows has no target.
+        assert_eq!(pick_target(&supported, 61), None);
+        assert_eq!(pick_target(&[], 120), None);
     }
 }

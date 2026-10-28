@@ -337,7 +337,7 @@ mod compiler {
             return;
         };
         let (major, minor) = gpu.arch();
-        let target = nvrtc.target_for(gpu.arch());
+        let target = nvrtc.target_for(gpu.arch()).unwrap();
         if nvrtc.version().0 >= 13 {
             assert_eq!(target, Target::Cubin((major * 10 + minor) as u32));
         }
@@ -351,13 +351,29 @@ mod compiler {
     }
 
     #[test]
+    fn another_compiler_library_is_refused_once_one_is_loaded() {
+        let Ok(loaded) = Nvrtc::shared(None) else {
+            eprintln!("no NVRTC: skipped");
+            return;
+        };
+        let again = Nvrtc::shared(None).unwrap();
+        assert!(Arc::ptr_eq(&loaded, &again));
+        let other = Nvrtc::shared(Some(std::path::Path::new("/nonexistent/other/libnvrtc.so")));
+        assert!(matches!(other, Err(GpuError::Invalid(_))), "{other:?}");
+        assert!(
+            !loaded.build().is_empty(),
+            "the build is named for the cache key"
+        );
+    }
+
+    #[test]
     fn a_compile_error_returns_the_log() {
         let Some(gpu) = gpu() else { return };
         let Ok(nvrtc) = Nvrtc::shared(None) else {
             eprintln!("no NVRTC: skipped");
             return;
         };
-        let target = nvrtc.target_for(gpu.arch());
+        let target = nvrtc.target_for(gpu.arch()).unwrap();
         let r = nvrtc.compile(
             "extern \"C\" __global__ void k() { nope; }",
             &CompileOptions::default(),

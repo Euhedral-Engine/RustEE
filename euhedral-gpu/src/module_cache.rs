@@ -1,9 +1,11 @@
 //! A cache of compiled modules, keyed by a hash of everything that went into them.
 //!
-//! The key covers the source, each option in order, the in-memory headers, the include paths (as strings; the files
-//! under them are not hashed), the target and the compiler version. Entries are written to a temporary file and
+//! The key covers the source, each option in order, the in-memory headers, the include paths (as strings), the target
+//! and the compiler's version and build. The files under the include paths are not hashed: when they change, change the
+//! options (a `-D` of a revision number, say) or the headers, or use another cache directory. Entries are written to a temporary file and
 //! renamed into place, so a reader sees a whole file or none, even with two processes writing one key.
 
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -23,6 +25,8 @@ pub struct KeyMaterial<'a> {
     /// The target the compiler is asked for, for example `sm_120`.
     pub target: &'a str,
     pub compiler_version: (i32, i32),
+    /// Names the compiler's build beyond its version (its patch level): see `Nvrtc::build`.
+    pub compiler_build: &'a str,
 }
 
 fn field(out: &mut Vec<u8>, bytes: &[u8]) {
@@ -50,6 +54,7 @@ pub fn cache_key(material: &KeyMaterial<'_>) -> CacheKey {
     field(&mut bytes, material.target.as_bytes());
     bytes.extend_from_slice(&material.compiler_version.0.to_le_bytes());
     bytes.extend_from_slice(&material.compiler_version.1.to_le_bytes());
+    field(&mut bytes, material.compiler_build.as_bytes());
     CacheKey(
         hash_bytes_with_seed(&bytes, 0x6d6f_6475_6c65_0001),
         hash_bytes_with_seed(&bytes, 0x6d6f_6475_6c65_0002),
@@ -93,7 +98,12 @@ impl ModuleCache {
             std::process::id(),
             STORES.fetch_add(1, Ordering::Relaxed)
         ));
-        std::fs::write(&temporary, bytes)?;
+        {
+            // The bytes reach the disk before the name does, so a crash leaves a whole entry or none.
+            let mut file = std::fs::File::create(&temporary)?;
+            file.write_all(bytes)?;
+            file.sync_all()?;
+        }
         std::fs::rename(&temporary, &path).inspect_err(|_| {
             let _ = std::fs::remove_file(&temporary);
         })
@@ -117,43 +127,60 @@ mod tests {
         dir
     }
 
-    fn key(
-        edit: impl FnOnce(&mut CompileOptions, &mut String, &mut String, &mut (i32, i32)),
-    ) -> CacheKey {
-        let mut options = CompileOptions {
-            options: vec!["--std=c++17".into(), "-O3".into()],
-            headers: vec![("a.h".into(), "#define A 1".into())],
-            include_paths: vec![PathBuf::from("/inc")],
-            ..CompileOptions::default()
-        };
-        let mut source = "kernel".to_owned();
-        let mut target = "sm_120".to_owned();
-        let mut version = (13, 1);
-        edit(&mut options, &mut source, &mut target, &mut version);
+    /// Everything a key covers, to edit one input at a time.
+    #[derive(Clone)]
+    struct Inputs {
+        options: CompileOptions,
+        source: String,
+        target: String,
+        version: (i32, i32),
+        build: String,
+    }
+
+    fn inputs() -> Inputs {
+        Inputs {
+            options: CompileOptions {
+                options: vec!["--std=c++17".into(), "-O3".into()],
+                headers: vec![("a.h".into(), "#define A 1".into())],
+                include_paths: vec![PathBuf::from("/inc")],
+                ..CompileOptions::default()
+            },
+            source: "kernel".into(),
+            target: "sm_120".into(),
+            version: (13, 1),
+            build: "libnvrtc.so.13.1.80:1000:1".into(),
+        }
+    }
+
+    fn key(i: &Inputs) -> CacheKey {
         cache_key(&KeyMaterial {
-            source: &source,
-            options: &options,
-            target: &target,
-            compiler_version: version,
+            source: &i.source,
+            options: &i.options,
+            target: &i.target,
+            compiler_version: i.version,
+            compiler_build: &i.build,
         })
     }
 
     #[test]
     fn the_key_changes_with_each_input() {
-        let base = key(|_, _, _, _| {});
-        assert_eq!(base, key(|_, _, _, _| {}));
-        let edits: Vec<CacheKey> = vec![
-            key(|_, s, _, _| s.push(' ')),
-            key(|o, _, _, _| o.options[0] = "--std=c++20".into()),
-            key(|o, _, _, _| o.options.reverse()),
-            key(|o, _, _, _| o.headers[0].1 = "#define A 2".into()),
-            key(|o, _, _, _| o.headers[0].0 = "b.h".into()),
-            key(|o, _, _, _| o.include_paths[0] = PathBuf::from("/other")),
-            key(|_, _, t, _| *t = "sm_90".into()),
-            key(|_, _, _, v| *v = (13, 2)),
+        let base = key(&inputs());
+        assert_eq!(base, key(&inputs()));
+        let edits: [fn(&mut Inputs); 9] = [
+            |i| i.source.push(' '),
+            |i| i.options.options[0] = "--std=c++20".into(),
+            |i| i.options.options.reverse(),
+            |i| i.options.headers[0].1 = "#define A 2".into(),
+            |i| i.options.headers[0].0 = "b.h".into(),
+            |i| i.options.include_paths[0] = PathBuf::from("/other"),
+            |i| i.target = "sm_90".into(),
+            |i| i.version = (13, 2),
+            |i| i.build = "libnvrtc.so.13.1.115:1000:1".into(),
         ];
-        for (i, edited) in edits.iter().enumerate() {
-            assert_ne!(*edited, base, "edit {i}");
+        for (n, edit) in edits.iter().enumerate() {
+            let mut edited = inputs();
+            edit(&mut edited);
+            assert_ne!(key(&edited), base, "edit {n}");
         }
     }
 
