@@ -24,6 +24,7 @@ impl Kept {
             .push_back((seq, value));
     }
 
+    #[allow(dead_code, reason = "used by the CUDA retirement, which comes next")]
     /// Drops every value kept for a retirement numbered `seq` or lower.
     pub(crate) fn release_through(&self, seq: u64) {
         let mut released = Vec::new();

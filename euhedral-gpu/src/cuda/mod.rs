@@ -4,12 +4,21 @@
 //! context, and looks up its extra entry points ([`fns::GpuFns`]) in the same library.
 
 pub mod fns;
+mod graph;
+mod module;
+mod stream;
+
+pub use graph::{CudaGraph, CudaSequence};
+pub use module::{CudaKernel, CudaModule};
+pub use stream::{CudaEnqueue, CudaStream};
 
 use std::sync::Arc;
 
 use euhedral_memory::cuda::{CudaError, Device, Driver};
 
-use crate::{GpuError, Poison};
+use euhedral_graph::LanePool;
+
+use crate::{Fingerprint, Gpu, GpuError, Poison, Rerecorded, StreamOptions};
 
 use fns::{ATTR_CC_MAJOR, ATTR_CC_MINOR, GpuFns};
 
@@ -36,7 +45,6 @@ pub(crate) fn from_cuda(e: CudaError) -> GpuError {
 #[derive(Debug)]
 pub struct CudaGpu {
     device: Arc<Device>,
-    #[allow(dead_code, reason = "used by the streams, which come next")]
     pub(crate) fns: GpuFns,
     pub(crate) poison: Poison,
     arch: (i32, i32),
@@ -96,7 +104,6 @@ impl CudaGpu {
     }
 
     /// `Ok` for `CUDA_SUCCESS`; else the error, and a device fault poisons the device.
-    #[allow(dead_code, reason = "used by the streams, which come next")]
     pub(crate) fn check(&self, call: &'static str, code: i32) -> Result<(), GpuError> {
         match self.device.driver.check(call, code) {
             Ok(()) => Ok(()),
@@ -108,6 +115,64 @@ impl CudaGpu {
                 Err(err)
             }
         }
+    }
+}
+
+impl Gpu for CudaGpu {
+    type Stream = CudaStream;
+    type Module = CudaModule;
+    type Kernel = CudaKernel;
+    type Graph = CudaGraph;
+    type Sequence<'a> = CudaSequence<'a>;
+
+    fn open_lanes(
+        self: &Arc<Self>,
+        names: &[&str],
+        options: StreamOptions,
+    ) -> Result<crate::Lanes<Self>, GpuError> {
+        let streams = CudaStream::open(self, names, options)?;
+        let queues = streams
+            .iter()
+            .map(|s| s.clone() as Arc<dyn euhedral_graph::DeviceQueue>)
+            .collect();
+        Ok((Arc::new(LanePool::new(queues)), streams))
+    }
+
+    fn poisoned(&self) -> Option<GpuError> {
+        self.poison.get()
+    }
+
+    fn record<F>(&self, _streams: &[&Arc<CudaStream>], _f: F) -> Result<CudaGraph, GpuError>
+    where
+        F: FnOnce(&mut CudaSequence<'_>) -> Result<(), GpuError>,
+    {
+        Err(GpuError::Invalid("not yet".into()))
+    }
+
+    fn rerecord<F>(
+        &self,
+        _graph: &mut CudaGraph,
+        _streams: &[&Arc<CudaStream>],
+        _f: F,
+    ) -> Result<Rerecorded, GpuError>
+    where
+        F: FnOnce(&mut CudaSequence<'_>) -> Result<(), GpuError>,
+    {
+        Err(GpuError::Invalid("not yet".into()))
+    }
+
+    fn fingerprint<F>(&self, _streams: usize, _f: F) -> Result<Fingerprint, GpuError>
+    where
+        F: FnOnce(&mut CudaSequence<'_>) -> Result<(), GpuError>,
+    {
+        Err(GpuError::Invalid("not yet".into()))
+    }
+
+    fn update<F>(&self, _graph: &mut CudaGraph, _f: F) -> Result<(), GpuError>
+    where
+        F: FnOnce(&mut CudaSequence<'_>) -> Result<(), GpuError>,
+    {
+        Err(GpuError::Invalid("not yet".into()))
     }
 }
 
