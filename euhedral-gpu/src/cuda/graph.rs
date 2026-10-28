@@ -196,6 +196,15 @@ pub struct CudaSequence<'a> {
 }
 
 impl CudaSequence<'_> {
+    /// A test hook: marks the capture failed, as a refused operation would. The sequence's work still runs for
+    /// real, and recording ends with `Err(Capture)`.
+    #[doc(hidden)]
+    pub fn fail_capture(&mut self) {
+        if self.rec.failed.is_none() {
+            self.rec.failed = Some(GpuError::Capture("failed by the test hook".into()));
+        }
+    }
+
     fn event(&mut self) -> Result<CuEvent, GpuError> {
         let mut event = std::ptr::null_mut();
         // SAFETY: an out pointer; the context is current.

@@ -646,3 +646,80 @@ fn a_rerecord_of_another_topology_instantiates_anew() {
         .collect();
     assert!(f.out_words(0) == expected, "and takes updates");
 }
+
+#[test]
+fn a_failed_capture_never_disturbs_the_real_work() {
+    let Some(f) = Fixture::new() else { return };
+    f.clear();
+    // Pageable host memory. This driver captures such a copy without complaint, so the capture is also failed by
+    // the test hook, as a driver that refuses the copy would fail it.
+    let pageable: Vec<u8> = (0..BYTES).map(|i| (i * 7 % 251) as u8).collect();
+    let result = f.gpu.record(&f.streams(), |q| {
+        q.submit(1, |e| {
+            // SAFETY: `pageable` outlives the work (settled below); `z` is a live block.
+            unsafe { e.copy_to_device(f.z.addr, pageable.as_ptr(), BYTES) }
+        })?;
+        q.fail_capture();
+        q.order(1, 0)?;
+        q.submit(0, |e| {
+            // SAFETY: a live block and a pinned output.
+            unsafe { e.copy_to_host(f.out[0].addr as *mut u8, f.z.addr, BYTES) }
+        })
+    });
+    assert!(
+        matches!(result, Err(GpuError::Capture(_))),
+        "{:?}",
+        result.map(|_| ())
+    );
+    f.settle(0);
+    f.settle(1);
+    let got: Vec<u8> = f
+        .out_words(0)
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+    assert!(got == pageable, "the real work ran and is correct");
+    assert_eq!(f.gpu.poisoned(), None);
+    // The streams and their shadows are usable again: direct submission, then a recording.
+    f.clear();
+    f.direct(2.0, 1.0, 0);
+    f.settle(0);
+    assert!(f.out_words(0) == f.reference(2.0, 1.0));
+    f.clear();
+    let graph = f
+        .gpu
+        .record(&f.streams(), |q| f.sequence(q, 1.0, 1.0, 0))
+        .unwrap();
+    f.settle(0);
+    assert!(f.out_words(0) == f.reference(1.0, 1.0));
+    drop(graph);
+}
+
+#[test]
+fn an_error_in_the_closure_ends_the_capture_and_frees_the_streams() {
+    let Some(f) = Fixture::new() else { return };
+    f.clear();
+    let result = f.gpu.record(&f.streams(), |q| {
+        f.sequence(q, 1.0, 1.0, 0)?;
+        Err(GpuError::Invalid("the caller gave up".into()))
+    });
+    assert!(
+        matches!(result, Err(GpuError::Invalid(_))),
+        "{:?}",
+        result.map(|_| ())
+    );
+    f.settle(0);
+    f.settle(1);
+    assert!(
+        f.out_words(0) == f.reference(1.0, 1.0),
+        "the work submitted before the error ran"
+    );
+    f.clear();
+    let graph = f
+        .gpu
+        .record(&f.streams(), |q| f.sequence(q, 2.0, 1.0, 0))
+        .unwrap();
+    f.settle(0);
+    assert!(f.out_words(0) == f.reference(2.0, 1.0));
+    drop(graph);
+}
