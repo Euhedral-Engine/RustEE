@@ -87,7 +87,8 @@ Asynchronous, backend-neutral GPU access for the RustEE control plane. A lattice
     drops. A replay hands the recording's kept values to its stream, which holds them until the next retirement armed
     after the replay is confirmed, so a replay in flight survives the graph dropping; arm one per replay. Launches of
     one graph are serialized inside it, so replays from several workers are safe. A re-record replaces the old
-    recording's kept values.
+    recording's kept values. The recording's own run is a real run too: whatever the closure kept is handed to every
+    stream it ran on, so a failed recording, or a graph dropped right after `record`, leaves the run its buffers.
   - Recording forks and joins the real streams with events of its own, and a panic in the recording closure ends the
     capture.
 - **Failures are values.** A device fault (an illegal address, a launch failure) surfaces through `confirm_retired`

@@ -2,6 +2,7 @@
 
 use std::any::Any;
 
+use crate::kept::SharedKept;
 use crate::shape::{CopyKind, ShapeHasher};
 use crate::{Args, Enqueue, GpuError, Kernel, Launch};
 
@@ -59,7 +60,7 @@ pub(crate) struct Recording {
     pub(crate) args: Vec<Args>,
     pub(crate) hasher: ShapeHasher,
     pub(crate) launches: usize,
-    pub(crate) kept: Vec<Box<dyn Any + Send>>,
+    pub(crate) kept: SharedKept,
     pub(crate) staged: Vec<Args>,
 }
 
@@ -71,7 +72,7 @@ impl Recording {
             args: Vec::new(),
             hasher: ShapeHasher::default(),
             launches: 0,
-            kept: Vec::new(),
+            kept: crate::kept::shared(),
             staged: Vec::new(),
         }
     }
@@ -204,7 +205,7 @@ impl Enqueue for FakeEnqueue<'_> {
     fn keep(&mut self, value: Box<dyn Any + Send>) {
         match (&mut self.rec, &mut self.target) {
             // In a recording the value belongs to the graph.
-            (Some((rec, _)), _) if rec.mode == Mode::Record => rec.kept.push(value),
+            (Some((rec, _)), _) if rec.mode == Mode::Record => crate::kept::add(&rec.kept, value),
             (Some(_), _) => drop(value),
             (None, Some((stream, state))) => stream.kept.push(state.next_retire, value),
             (None, None) => drop(value),

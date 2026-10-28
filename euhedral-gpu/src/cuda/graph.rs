@@ -4,11 +4,11 @@
 //! on one shadow stream per stream, so a real stream is never in capture mode and a failed capture never disturbs
 //! the work itself.
 
-use std::any::Any;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use euhedral_memory::cuda::{CuEvent, CuStream, STREAM_NON_BLOCKING};
 
+use crate::kept::SharedKept;
 use crate::stream_lock::StreamGuard;
 use crate::{Args, Fingerprint, GpuError, Graph, Launch, Rerecorded, Sequence};
 
@@ -21,9 +21,6 @@ use super::{CudaEnqueue, CudaGpu, CudaKernel, CudaStream, from_cuda};
 
 /// `CU_EVENT_DISABLE_TIMING`.
 const EVENT_DISABLE_TIMING: u32 = 2;
-
-/// Values a recording holds: the buffers its copies read. Replays share them (see [`Graph::replay`]).
-type SharedKept = Arc<Mutex<Vec<Box<dyn Any + Send>>>>;
 
 /// A recording. Dropping it is a shutdown call; replays still in flight when it drops keep the values it holds (see
 /// [`Graph::replay`]) and finish.
@@ -94,7 +91,7 @@ impl CudaGraph {
             self.streams = streams;
             // The new recording's buffers replace the old ones. A replay of the old recording that is still in flight
             // holds its own handle to them.
-            self.kept = Arc::new(Mutex::new(rec.kept));
+            self.kept = rec.kept;
             return Ok(Rerecorded::Updated);
         }
         // Any other outcome leaves the executable as it was (an update that fails does not half apply).
@@ -210,9 +207,30 @@ pub struct CudaSequence<'a> {
     /// Events made for the capture, destroyed when it ends.
     events: Vec<CuEvent>,
     capturing: bool,
+    /// Whether the recording's kept values were handed to the real streams.
+    handed_over: bool,
 }
 
 impl CudaSequence<'_> {
+    /// Hands the values the recording kept to every real stream, to be held until that stream's next retirement is
+    /// confirmed. The record pass runs the work for real, and its copies may still be reading those buffers when
+    /// the recording ends, fails or is dropped; the graph shares the same values, so they outlive whichever of the
+    /// run and the graph ends last. Done while the streams are still locked.
+    fn hand_over_kept(&mut self) {
+        if self.rec.mode != Mode::Record || self.handed_over {
+            return;
+        }
+        self.handed_over = true;
+        if crate::kept::is_empty(&self.rec.kept) {
+            return;
+        }
+        for r in &mut self.real {
+            r.stream
+                .kept
+                .push(r.guard.next_retire, Box::new(self.rec.kept.clone()));
+        }
+    }
+
     /// A test hook: marks the capture failed, as a refused operation would. The sequence's work still runs for
     /// real, and recording ends with `Err(Capture)`.
     #[doc(hidden)]
@@ -314,6 +332,7 @@ impl CudaSequence<'_> {
 
 impl Drop for CudaSequence<'_> {
     fn drop(&mut self) {
+        self.hand_over_kept();
         // A recording the closure never finished (it panicked): end the capture, so the shadows leave capture mode
         // and later recordings work.
         if self.capturing
@@ -396,6 +415,7 @@ impl CudaGpu {
             real: Vec::new(),
             events: Vec::new(),
             capturing: false,
+            handed_over: false,
         };
         f(&mut seq)?;
         Ok(std::mem::replace(&mut seq.rec, Recording::new(Mode::Probe)))
@@ -459,6 +479,7 @@ impl CudaGpu {
             real,
             events: Vec::new(),
             capturing: false,
+            handed_over: false,
         };
         let begun = seq.begin();
         let ran = begun.and_then(|()| f(&mut seq));
@@ -467,6 +488,7 @@ impl CudaGpu {
         } else {
             Ok(None)
         };
+        seq.hand_over_kept();
         let mut rec = std::mem::replace(&mut seq.rec, Recording::new(Mode::Probe));
         drop(seq);
         // The real work was submitted whatever came of the capture.
@@ -523,7 +545,7 @@ impl CudaGpu {
             launches: rec.launches,
             fingerprint: rec.hasher.finish(),
             streams,
-            kept: Arc::new(Mutex::new(rec.kept)),
+            kept: rec.kept,
             launch_lock: Mutex::new(()),
         })
     }

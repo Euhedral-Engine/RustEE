@@ -163,6 +163,26 @@ impl Fixture {
             .unwrap();
     }
 
+    /// Runs the device idle, then arms a retirement on every stream, runs again and confirms each ticket: whatever the
+    /// streams were keeping for the work so far is released.
+    fn confirm_everything(&self) {
+        struct Told(Arc<std::sync::Mutex<Vec<euhedral_gpu::RetireTicket>>>);
+        impl euhedral_gpu::RetireListener for Told {
+            fn retired(self: Box<Self>, ticket: euhedral_gpu::RetireTicket) {
+                self.0.lock().unwrap().push(ticket);
+            }
+        }
+        let told = Arc::new(std::sync::Mutex::new(Vec::new()));
+        for stream in &self.s {
+            stream.notify_retired(Box::new(Told(told.clone()))).unwrap();
+        }
+        self.gpu.run_until_idle();
+        for ticket in told.lock().unwrap().iter() {
+            let stream = self.s.iter().find(|s| s.id() == ticket.stream()).unwrap();
+            assert_eq!(stream.confirm_retired(*ticket), None);
+        }
+    }
+
     fn streams(&self) -> [&Arc<FakeStream>; 2] {
         [&self.s[0], &self.s[1]]
     }
@@ -351,7 +371,13 @@ fn a_replay_keeps_the_recordings_buffers_until_its_retirement_is_confirmed() {
     f.gpu.run_until_idle();
     let ticket = told.lock().unwrap()[0];
     assert_eq!(f.s[0].confirm_retired(ticket), None);
-    assert_eq!(Arc::strong_count(&token), 1, "released by the confirmation");
+    // The recording's own run handed the same values to both streams, which hold them until they retire too.
+    f.confirm_everything();
+    assert_eq!(
+        Arc::strong_count(&token),
+        1,
+        "released by the confirmations"
+    );
 }
 
 /// `Fixture::sequence`, with `token` kept for the recording's life.
@@ -385,10 +411,59 @@ fn a_rerecord_replaces_the_old_recordings_buffers() {
         .unwrap();
     assert_eq!(
         Arc::strong_count(&first),
+        2,
+        "the old recording's own run still holds them"
+    );
+    f.gpu.run_until_idle();
+    f.confirm_everything();
+    assert_eq!(
+        Arc::strong_count(&first),
         1,
         "the old buffers are not accumulated"
     );
     assert_eq!(Arc::strong_count(&second), 2);
     drop(graph);
+    f.confirm_everything();
     assert_eq!(Arc::strong_count(&second), 1);
+}
+
+#[test]
+fn a_failed_recording_keeps_its_buffers_until_the_run_retired() {
+    let mut f = Fixture::new();
+    let out = f.out_ptr(0);
+    let token = Arc::new(());
+    let failed = f.gpu.record(&f.streams(), |q| {
+        q.submit(0, |e| {
+            e.keep(Box::new(token.clone()));
+            Ok(())
+        })?;
+        f.sequence(q, 2, out)?;
+        Err(GpuError::Invalid("the caller gave up".into()))
+    });
+    assert!(matches!(failed, Err(GpuError::Invalid(_))));
+    assert_eq!(
+        Arc::strong_count(&token),
+        2,
+        "the real run may still read the buffer: the streams hold it"
+    );
+    f.gpu.run_until_idle();
+    assert_eq!(f.out_words(0), f.reference(2), "the run completed");
+    f.confirm_everything();
+    assert_eq!(Arc::strong_count(&token), 1);
+}
+
+#[test]
+fn a_graph_dropped_right_after_recording_leaves_the_run_its_buffers() {
+    let mut f = Fixture::new();
+    let out = f.out_ptr(0);
+    let token = Arc::new(());
+    let graph = f
+        .gpu
+        .record(&f.streams(), |q| keeping(&f, q, token.clone(), out))
+        .unwrap();
+    drop(graph);
+    assert_eq!(Arc::strong_count(&token), 2, "the run in flight holds it");
+    f.gpu.run_until_idle();
+    f.confirm_everything();
+    assert_eq!(Arc::strong_count(&token), 1);
 }

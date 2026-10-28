@@ -5,6 +5,7 @@ use std::ffi::c_void;
 
 use euhedral_memory::cuda::CuStream;
 
+use crate::kept::SharedKept;
 use crate::shape::{CopyKind, ShapeHasher};
 use crate::stream_lock::StreamGuard;
 use crate::{Args, Enqueue, GpuError, Kernel, Launch};
@@ -44,7 +45,7 @@ pub(crate) struct Recording {
     /// The captured node of each launch (a record pass).
     pub(crate) nodes: Vec<Node>,
     pub(crate) hasher: ShapeHasher,
-    pub(crate) kept: Vec<Box<dyn Any + Send>>,
+    pub(crate) kept: SharedKept,
     /// The arguments of each launch (an update pass).
     pub(crate) staged: Vec<Args>,
     /// The first reason the capture cannot be used. The real work is unaffected.
@@ -58,7 +59,7 @@ impl Recording {
             launches: Vec::new(),
             nodes: Vec::new(),
             hasher: ShapeHasher::default(),
-            kept: Vec::new(),
+            kept: crate::kept::shared(),
             staged: Vec::new(),
             failed: None,
         }
@@ -283,7 +284,7 @@ impl Enqueue for CudaEnqueue<'_> {
     fn keep(&mut self, value: Box<dyn Any + Send>) {
         match (&mut self.rec, &mut self.target) {
             // In a recording the value belongs to the graph.
-            (Some((rec, _)), _) if rec.mode == Mode::Record => rec.kept.push(value),
+            (Some((rec, _)), _) if rec.mode == Mode::Record => crate::kept::add(&rec.kept, value),
             (Some(_), _) => drop(value),
             (None, Some(target)) => target.stream.kept.push(target.state.next_retire, value),
             (None, None) => drop(value),

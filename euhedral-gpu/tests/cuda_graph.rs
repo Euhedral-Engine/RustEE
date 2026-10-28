@@ -263,6 +263,24 @@ impl Fixture {
             .unwrap();
     }
 
+    /// Arms a retirement on every stream, waits for both, and confirms them: whatever the streams were keeping for
+    /// the work so far is released.
+    fn confirm_everything(&self) {
+        let told = Arc::new(std::sync::Mutex::new(Vec::new()));
+        for stream in &self.s {
+            stream.notify_retired(Box::new(Told(told.clone()))).unwrap();
+        }
+        assert!(wait_until(Duration::from_secs(10), || told
+            .lock()
+            .unwrap()
+            .len()
+            == 2));
+        for ticket in told.lock().unwrap().iter() {
+            let stream = self.s.iter().find(|s| s.id() == ticket.stream()).unwrap();
+            assert_eq!(stream.confirm_retired(*ticket), None);
+        }
+    }
+
     fn streams(&self) -> [&Arc<CudaStream>; 2] {
         [&self.s[0], &self.s[1]]
     }
@@ -782,7 +800,13 @@ fn a_graph_dropped_after_a_replay_leaves_the_replay_its_buffers() {
         "the replay completed with its buffers"
     );
     assert_eq!(f.s[0].confirm_retired(ticket), None);
-    assert_eq!(Arc::strong_count(&token), 1, "released by the confirmation");
+    // The recording's own run handed the same values to both streams, which hold them until they retire too.
+    f.confirm_everything();
+    assert_eq!(
+        Arc::strong_count(&token),
+        1,
+        "released by the confirmations"
+    );
 }
 
 #[test]
@@ -833,4 +857,81 @@ fn a_panic_in_the_recording_closure_ends_the_capture() {
     f.settle(0);
     assert!(f.out_words(0) == f.reference(2.0, 1.0));
     drop(graph);
+}
+
+#[test]
+fn a_failed_capture_keeps_its_buffers_until_the_real_run_retired() {
+    let Some(f) = Fixture::new() else { return };
+    f.clear();
+    let token = Arc::new(());
+    // A long spin ahead of the copy keeps the real run in flight when the recording fails.
+    let failed = f.gpu.record(&f.streams(), |q| {
+        q.submit(0, |e| {
+            e.keep(Box::new(token.clone()));
+            // SAFETY: `spin` takes one 64-bit argument and touches no memory.
+            unsafe {
+                e.launch(
+                    &f.spin,
+                    Launch::linear(1, 1),
+                    &Args::new().arg(125_000_000u64),
+                )
+            }
+        })?;
+        f.sequence(q, 2.0, 1.0, 0)?;
+        q.fail_capture();
+        Ok(())
+    });
+    assert!(
+        matches!(failed, Err(GpuError::Capture(_))),
+        "{:?}",
+        failed.map(|_| ())
+    );
+    assert_eq!(
+        Arc::strong_count(&token),
+        2,
+        "the real run is still in flight: the streams hold its buffers"
+    );
+    f.confirm_everything();
+    assert_eq!(
+        Arc::strong_count(&token),
+        1,
+        "released once the run retired"
+    );
+    assert!(
+        f.out_words(0) == f.reference(2.0, 1.0),
+        "the real run completed"
+    );
+}
+
+#[test]
+fn a_graph_dropped_right_after_recording_leaves_the_run_its_buffers() {
+    let Some(f) = Fixture::new() else { return };
+    f.clear();
+    let token = Arc::new(());
+    let graph = f
+        .gpu
+        .record(&f.streams(), |q| {
+            q.submit(0, |e| {
+                e.keep(Box::new(token.clone()));
+                // SAFETY: `spin` takes one 64-bit argument and touches no memory.
+                unsafe {
+                    e.launch(
+                        &f.spin,
+                        Launch::linear(1, 1),
+                        &Args::new().arg(125_000_000u64),
+                    )
+                }
+            })?;
+            f.sequence(q, 2.0, 1.0, 0)
+        })
+        .unwrap();
+    drop(graph);
+    assert_eq!(
+        Arc::strong_count(&token),
+        2,
+        "the recording's run is in flight: the streams hold its buffers"
+    );
+    f.confirm_everything();
+    assert_eq!(Arc::strong_count(&token), 1);
+    assert!(f.out_words(0) == f.reference(2.0, 1.0), "the run completed");
 }

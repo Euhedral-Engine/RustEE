@@ -193,6 +193,15 @@ impl FakeGpu {
             real,
         };
         let result = f(&mut seq);
+        // The record pass runs the work for real: hand what it kept to every real stream, to be held until that
+        // stream's next retirement is confirmed, whatever becomes of the recording. The graph shares the same values.
+        if !crate::kept::is_empty(&seq.rec.kept) {
+            for (stream, guard) in &seq.real {
+                stream
+                    .kept
+                    .push(guard.next_retire, Box::new(seq.rec.kept.clone()));
+            }
+        }
         let FakeSequence { rec, real, .. } = seq;
         // Join: streams[0] ends behind every other stream. Done even when `f` failed, so the streams stay consistent.
         let mut joined = Ok(());
@@ -238,7 +247,7 @@ impl FakeGpu {
             args: rec.args,
             fingerprint,
             streams: streams.len(),
-            kept: Arc::new(Mutex::new(rec.kept)),
+            kept: rec.kept,
         })
     }
 

@@ -2,7 +2,27 @@
 
 use std::any::Any;
 use std::collections::VecDeque;
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
+
+/// The values a recording keeps, shared between the recording's own run, its graph and every replay: each holds a
+/// handle through the streams it ran on, so the buffers live until the last of them retired.
+pub(crate) type SharedKept = Arc<Mutex<Vec<Box<dyn Any + Send>>>>;
+
+pub(crate) fn shared() -> SharedKept {
+    Arc::new(Mutex::new(Vec::new()))
+}
+
+pub(crate) fn add(kept: &SharedKept, value: Box<dyn Any + Send>) {
+    kept.lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push(value);
+}
+
+pub(crate) fn is_empty(kept: &SharedKept) -> bool {
+    kept.lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .is_empty()
+}
 
 /// Values held until a retirement is confirmed: `(retirement seq, value)`, released in order.
 #[derive(Default)]
