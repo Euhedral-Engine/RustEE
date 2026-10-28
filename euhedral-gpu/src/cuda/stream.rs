@@ -1,7 +1,5 @@
 //! CUDA streams as device lanes: an event ring behind `DeviceQueue::completed`, device-side awaits, and enqueueing.
 
-use std::any::Any;
-use std::ffi::c_void;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -9,13 +7,10 @@ use euhedral_graph::{DeviceQueue, LaneId, Marker};
 use euhedral_memory::cuda::{CuEvent, CuStream, Device, STREAM_NON_BLOCKING};
 
 use crate::kept::Kept;
-use crate::stream_lock::{StreamGuard, StreamLock};
-use crate::{
-    Args, Enqueue, GpuError, Kernel, Launch, POISONED_STATUS, RetireListener, RetireTicket, Stream,
-    StreamOptions,
-};
+use crate::stream_lock::StreamLock;
+use crate::{GpuError, POISONED_STATUS, RetireListener, RetireTicket, Stream, StreamOptions};
 
-use super::{CudaGpu, CudaKernel, from_cuda};
+use super::{CudaEnqueue, CudaGpu, from_cuda};
 
 /// `CU_EVENT_DISABLE_TIMING`: the events only mark completion.
 const EVENT_DISABLE_TIMING: u32 = 2;
@@ -307,7 +302,7 @@ impl Stream for CudaStream {
         let mut guard = self.state.lock()?;
         self.gpu.poison.check()?;
         let _c = self.enter()?;
-        f(&mut CudaEnqueue::new(self, &mut guard))
+        f(&mut CudaEnqueue::on_stream(self, &mut guard))
     }
 
     fn mark(&self) -> Result<Marker, GpuError> {
@@ -359,121 +354,5 @@ impl Stream for CudaStream {
                     .map(|cause| GpuError::Poisoned(Box::new(cause)))
             }
         }
-    }
-}
-
-/// What a CUDA submission enqueues.
-#[derive(Debug)]
-pub struct CudaEnqueue<'a> {
-    stream: &'a CudaStream,
-    state: &'a mut StreamState,
-}
-
-impl<'a> CudaEnqueue<'a> {
-    pub(crate) fn new(stream: &'a CudaStream, state: &'a mut StreamGuard<'_, StreamState>) -> Self {
-        Self { stream, state }
-    }
-}
-
-impl Enqueue for CudaEnqueue<'_> {
-    type Kernel = CudaKernel;
-
-    unsafe fn launch(
-        &mut self,
-        kernel: &CudaKernel,
-        launch: Launch,
-        args: &Args,
-    ) -> Result<(), GpuError> {
-        if let Some(expected) = kernel.parameter_sizes() {
-            let got: Vec<usize> = args.sizes().collect();
-            if expected.len() != got.len()
-                || expected.iter().zip(&got).any(|(e, g)| *e as usize != *g)
-            {
-                return Err(GpuError::Args(format!(
-                    "{}: expected sizes {expected:?}, got {got:?}",
-                    kernel.name()
-                )));
-            }
-        }
-        let gpu = &self.stream.gpu;
-        let mut pointers = args.pointers();
-        // SAFETY: the caller's contract (arguments match the kernel; addresses valid until retired); the pointers
-        // address `args`, which outlives the call; the context is current.
-        let code = unsafe {
-            (gpu.fns.launch_kernel)(
-                kernel.raw(),
-                launch.grid.x,
-                launch.grid.y,
-                launch.grid.z,
-                launch.block.x,
-                launch.block.y,
-                launch.block.z,
-                launch.shared_bytes,
-                self.stream.raw,
-                pointers.as_mut_ptr(),
-                std::ptr::null_mut(),
-            )
-        };
-        gpu.check("cuLaunchKernel", code)
-    }
-
-    unsafe fn copy_to_device(
-        &mut self,
-        dst: u64,
-        src: *const u8,
-        bytes: usize,
-    ) -> Result<(), GpuError> {
-        let gpu = &self.stream.gpu;
-        // SAFETY: the caller's contract (valid ranges untouched until retired); the context is current.
-        let code = unsafe {
-            (gpu.device().driver.fns.memcpy_htod_async)(
-                dst,
-                src.cast::<c_void>(),
-                bytes,
-                self.stream.raw,
-            )
-        };
-        gpu.check("cuMemcpyHtoDAsync", code)
-    }
-
-    unsafe fn copy_to_host(
-        &mut self,
-        dst: *mut u8,
-        src: u64,
-        bytes: usize,
-    ) -> Result<(), GpuError> {
-        let gpu = &self.stream.gpu;
-        // SAFETY: as above.
-        let code = unsafe {
-            (gpu.device().driver.fns.memcpy_dtoh_async)(
-                dst.cast::<c_void>(),
-                src,
-                bytes,
-                self.stream.raw,
-            )
-        };
-        gpu.check("cuMemcpyDtoHAsync", code)
-    }
-
-    unsafe fn copy_on_device(&mut self, dst: u64, src: u64, bytes: usize) -> Result<(), GpuError> {
-        let gpu = &self.stream.gpu;
-        // SAFETY: as above.
-        let code = unsafe {
-            (gpu.device().driver.fns.memcpy_dtod_async)(dst, src, bytes, self.stream.raw)
-        };
-        gpu.check("cuMemcpyDtoDAsync", code)
-    }
-
-    unsafe fn memset(&mut self, dst: u64, value: u8, bytes: usize) -> Result<(), GpuError> {
-        let gpu = &self.stream.gpu;
-        // SAFETY: as above.
-        let code = unsafe {
-            (gpu.device().driver.fns.memset_d8_async)(dst, value, bytes, self.stream.raw)
-        };
-        gpu.check("cuMemsetD8Async", code)
-    }
-
-    fn keep(&mut self, value: Box<dyn Any + Send>) {
-        self.stream.kept.push(self.state.next_retire, value);
     }
 }

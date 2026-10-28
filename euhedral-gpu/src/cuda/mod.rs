@@ -3,6 +3,7 @@
 //! It takes `euhedral-memory`'s shared [`Driver`] and [`Device`], so there is one loaded driver and one primary
 //! context, and looks up its extra entry points ([`fns::GpuFns`]) in the same library.
 
+mod enqueue;
 pub mod fns;
 mod graph;
 mod module;
@@ -10,10 +11,11 @@ pub mod nvrtc;
 mod retire;
 mod stream;
 
+pub use enqueue::CudaEnqueue;
 pub use graph::{CudaGraph, CudaSequence};
 pub use module::{CudaKernel, CudaModule};
 pub use nvrtc::{Nvrtc, Target};
-pub use stream::{CudaEnqueue, CudaStream};
+pub use stream::CudaStream;
 
 use std::sync::Arc;
 
@@ -145,11 +147,18 @@ impl Gpu for CudaGpu {
         self.poison.get()
     }
 
-    fn record<F>(&self, _streams: &[&Arc<CudaStream>], _f: F) -> Result<CudaGraph, GpuError>
+    fn record<F>(&self, streams: &[&Arc<CudaStream>], f: F) -> Result<CudaGraph, GpuError>
     where
         F: FnOnce(&mut CudaSequence<'_>) -> Result<(), GpuError>,
     {
-        Err(GpuError::Invalid("not yet".into()))
+        // The graph keeps its device alive: the streams hold the `Arc`.
+        let gpu = streams
+            .first()
+            .ok_or_else(|| GpuError::Invalid("a recording needs a stream".into()))?
+            .gpu
+            .clone();
+        let (rec, graph) = gpu.capture(streams, f)?;
+        gpu.instantiate(rec, graph, streams.len())
     }
 
     fn rerecord<F>(
