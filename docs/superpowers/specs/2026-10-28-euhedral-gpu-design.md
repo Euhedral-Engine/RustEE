@@ -1,6 +1,6 @@
 # euhedral-gpu: asynchronous, backend-neutral GPU access (design)
 
-Date: 2026-10-28. Status: draft for the user's approval.
+Date: 2026-10-28. Status: approved by the user (2026-10-28).
 
 ## Why
 
@@ -81,6 +81,8 @@ It does all of this without a line of RustEE changed, and with one driver contex
   - sources are `LatticeSource`s driven by the lattice's polls;
   - no blocking on the lattice;
   - generic language only. Code, docs and comments name no other repository and no application domain.
+- **No dependency cycles** *(user, 2026-10-28)*. The crates stay layered: the leaf utilities (`euhedral-data-structures`, `euhedral-hashing`, `euhedral-hardware-utils`), then `euhedral-core`, then `euhedral-graph` and `euhedral-io`, then `euhedral-memory`, then `euhedral-gpu` on top. Nothing below `euhedral-gpu` may depend on it, not even through a dev-dependency or a feature. If something both `euhedral-memory` and `euhedral-gpu` need would otherwise point upward, it moves down a layer (into `euhedral-memory` or a new lower crate), never across.
+- **All utility crates are free to use** *(user, 2026-10-28)*: for example `euhedral-hashing` for the module cache key, `euhedral-data-structures` for rings and slabs, `euhedral-hardware-utils` for topology, `euhedral-io` for cache file reads and writes.
 - The CUDA driver is loaded at run time, as `euhedral-memory` does today, and so is NVRTC: there is no link-time dependency. A machine without NVRTC can still load prebuilt images.
 - Linux first. Windows must compile the traits and the fake backend; the CUDA backend on Windows follows the existing `euhedral-memory` pattern.
 
