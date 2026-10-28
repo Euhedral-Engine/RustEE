@@ -18,7 +18,7 @@ pub use copier::StreamCopier;
 
 use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 pub type CuResult = c_int;
 pub type CuDevicePtr = u64;
@@ -188,6 +188,8 @@ type ErrorNameFn = unsafe extern "C" fn(CuResult, *mut *const c_char) -> CuResul
 pub struct Driver {
     pub fns: Fns,
     error_name: ErrorNameFn,
+    /// The `dlopen` handle, kept as an integer so `Driver` stays `Send + Sync`. The library is never closed.
+    lib: usize,
 }
 
 impl fmt::Debug for Driver {
@@ -230,11 +232,29 @@ impl Driver {
         }
         // SAFETY: the documented signature.
         let error_name = unsafe { std::mem::transmute::<*mut c_void, ErrorNameFn>(p) };
-        let d = Driver { fns, error_name };
+        let d = Driver {
+            fns,
+            error_name,
+            lib: lib as usize,
+        };
         // SAFETY: flags must be 0.
         d.check("cuInit", unsafe { (d.fns.init)(0) })
             .map_err(|e| e.to_string())?;
         Ok(Arc::new(d))
+    }
+
+    /// The process's driver: loaded and initialized on first use; every call returns the same `Arc` (or the same
+    /// error). Code that shares the device with this crate (another crate's streams and kernels) takes the driver
+    /// from here, so there is one loaded library and, through [`Device::open`], one primary context.
+    pub fn shared() -> Result<Arc<Self>, String> {
+        static SHARED: OnceLock<Result<Arc<Driver>, String>> = OnceLock::new();
+        SHARED.get_or_init(Driver::load).clone()
+    }
+
+    /// An entry point beyond [`Fns`], looked up in the loaded library; null when the driver lacks it.
+    pub fn symbol(&self, name: &CStr) -> *mut c_void {
+        // SAFETY: the handle is live for the process (never closed) and `name` is NUL-terminated.
+        unsafe { libc::dlsym(self.lib as *mut c_void, name.as_ptr()) }
     }
 
     /// `Ok` for `CUDA_SUCCESS`, else the error with its name.

@@ -177,3 +177,23 @@ fn residents_move_between_the_device_and_host_tiers_by_stream_copies() {
     }
     drop(pageable);
 }
+
+#[test]
+fn the_shared_driver_is_loaded_once() {
+    let Ok(first) = Driver::shared() else {
+        eprintln!("no CUDA driver: skipped");
+        return;
+    };
+    let second = Driver::shared().unwrap();
+    assert!(std::sync::Arc::ptr_eq(&first, &second));
+}
+
+#[test]
+fn symbols_beyond_the_table_are_found() {
+    let Ok(d) = Driver::shared() else {
+        eprintln!("no CUDA driver: skipped");
+        return;
+    };
+    assert!(!d.symbol(c"cuLaunchKernel").is_null());
+    assert!(d.symbol(c"cuNoSuchCall").is_null());
+}
