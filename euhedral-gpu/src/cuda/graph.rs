@@ -5,15 +5,17 @@
 //! the work itself.
 
 use std::any::Any;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use euhedral_memory::cuda::{CuEvent, CuStream, STREAM_NON_BLOCKING};
 
 use crate::stream_lock::StreamGuard;
-use crate::{Args, Fingerprint, GpuError, Graph, Launch, Sequence};
+use crate::{Args, Fingerprint, GpuError, Graph, Launch, Rerecorded, Sequence};
 
 use super::enqueue::{Mode, Node, Recording, Target};
-use super::fns::{CAPTURE_MODE_RELAXED, CuGraph, CuGraphExec, KernelNodeParams};
+use super::fns::{
+    CAPTURE_MODE_RELAXED, CuGraph, CuGraphExec, ExecUpdateResultInfo, KernelNodeParams,
+};
 use super::stream::{Handle, StreamState};
 use super::{CudaEnqueue, CudaGpu, CudaKernel, CudaStream, from_cuda};
 
@@ -57,6 +59,53 @@ impl Drop for CudaGraph {
 }
 
 impl CudaGraph {
+    pub(crate) fn gpu(&self) -> &Arc<CudaGpu> {
+        &self.gpu
+    }
+
+    /// Takes a new recording: into the existing executable when the driver can update it, else as a new executable.
+    /// An update keeps the original graph and its node handles, which name the executable's nodes.
+    pub(crate) fn replace(
+        &mut self,
+        rec: Recording,
+        new: CuGraph,
+        streams: usize,
+    ) -> Result<Rerecorded, GpuError> {
+        let gpu = self.gpu.clone();
+        let _c = gpu.device().enter().map_err(from_cuda)?;
+        let mut info = ExecUpdateResultInfo {
+            result: 0,
+            error_node: std::ptr::null_mut(),
+            error_from_node: std::ptr::null_mut(),
+        };
+        // SAFETY: the executable and a graph of the same device; an out pointer; the context is current.
+        let code = unsafe { (gpu.fns.graph_exec_update)(self.exec, new, &mut info) };
+        if code == 0 && info.result == 0 {
+            // SAFETY: the new graph is no longer needed: the executable took its parameters.
+            unsafe { (gpu.fns.graph_destroy)(new) };
+            self.launches = rec.launches;
+            self.fingerprint = rec.hasher.finish();
+            self.streams = streams;
+            // The old recording's buffers stay: replays of it may be in flight.
+            self.kept
+                .get_mut()
+                .unwrap_or_else(PoisonError::into_inner)
+                .extend(rec.kept);
+            return Ok(Rerecorded::Updated);
+        }
+        // Any other outcome leaves the executable as it was (an update that fails does not half apply).
+        let mut fresh = gpu.instantiate(rec, new, streams)?;
+        std::mem::swap(self, &mut fresh);
+        let old_kept = fresh.kept.get_mut().unwrap_or_else(PoisonError::into_inner);
+        let kept = std::mem::take(old_kept);
+        self.kept
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend(kept);
+        // `fresh` is now the old graph: dropping it frees its executable once its launches in flight end.
+        Ok(Rerecorded::Instantiated)
+    }
+
     /// Runs `f` as an update pass: new argument values, launch `n` of `f` to launch `n` of the recording. A sequence
     /// of another shape is `Err(ShapeChanged)` and applies nothing.
     pub(crate) fn update<F>(&mut self, f: F) -> Result<(), GpuError>

@@ -165,14 +165,16 @@ impl Gpu for CudaGpu {
 
     fn rerecord<F>(
         &self,
-        _graph: &mut CudaGraph,
-        _streams: &[&Arc<CudaStream>],
-        _f: F,
+        graph: &mut CudaGraph,
+        streams: &[&Arc<CudaStream>],
+        f: F,
     ) -> Result<Rerecorded, GpuError>
     where
         F: FnOnce(&mut CudaSequence<'_>) -> Result<(), GpuError>,
     {
-        Err(GpuError::Invalid("not yet".into()))
+        let gpu = graph.gpu().clone();
+        let (rec, new) = gpu.capture(streams, f)?;
+        graph.replace(rec, new, streams.len())
     }
 
     fn fingerprint<F>(&self, streams: usize, f: F) -> Result<Fingerprint, GpuError>

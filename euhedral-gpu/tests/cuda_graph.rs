@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 
 use euhedral_gpu::cuda::{CudaGpu, CudaKernel, CudaModule, CudaStream};
 use euhedral_gpu::{
-    Args, CompileOptions, Enqueue, Gpu, GpuError, Graph, Launch, Module, Sequence, Stream,
-    StreamOptions,
+    Args, CompileOptions, Enqueue, Gpu, GpuError, Graph, Launch, Module, Rerecorded, Sequence,
+    Stream, StreamOptions,
 };
 use euhedral_graph::{LanePool, Marker};
 use euhedral_memory::cuda::{DeviceMemory, PinnedHost};
@@ -177,6 +177,51 @@ impl Fixture {
         q.submit(0, |e| {
             // SAFETY: as above; the pinned output outlives the work.
             unsafe { e.copy_to_host(self.out[which].addr as *mut u8, self.z.addr, BYTES) }
+        })
+    }
+
+    /// As `sequence`, with one more launch (`z += extra`) before the copy.
+    fn sequence_extra<S: Sequence<Kernel = CudaKernel>>(
+        &self,
+        q: &mut S,
+        a: f32,
+        b: f32,
+        extra: u32,
+        which: usize,
+    ) -> Result<(), GpuError> {
+        let first = Args::new()
+            .device(self.y.addr)
+            .device(self.x.addr)
+            .arg(a)
+            .arg(b)
+            .arg(N as u32);
+        let second = Args::new()
+            .device(self.z.addr)
+            .device(self.y.addr)
+            .arg(3u32)
+            .arg(N as u32);
+        let third = Args::new()
+            .device(self.z.addr)
+            .device(self.z.addr)
+            .arg(extra)
+            .arg(N as u32);
+        let geometry = Launch::linear(N as u32, 256);
+        q.submit(0, |e| {
+            // SAFETY: matching arguments over live blocks, which the fixture keeps until the work retires.
+            unsafe { e.launch(&self.axpb, geometry, &first) }
+        })?;
+        q.order(0, 1)?;
+        q.submit(1, |e| {
+            // SAFETY: as above.
+            unsafe { e.launch(&self.add, geometry, &second) }
+        })?;
+        q.order(1, 0)?;
+        q.submit(0, |e| {
+            // SAFETY: as above; the pinned output outlives the work.
+            unsafe {
+                e.launch(&self.add, geometry, &third)?;
+                e.copy_to_host(self.out[which].addr as *mut u8, self.z.addr, BYTES)
+            }
         })
     }
 
@@ -509,4 +554,95 @@ fn an_update_of_another_shape_applies_nothing() {
         f.out_words(0) == f.reference(2.0, 1.0),
         "the previous arguments still apply"
     );
+}
+
+#[test]
+fn a_rerecord_of_the_same_topology_updates_in_place() {
+    let Some(f) = Fixture::new() else { return };
+    f.clear();
+    let mut graph = f
+        .gpu
+        .record(&f.streams(), |q| f.sequence(q, 1.5, -2.0, 0))
+        .unwrap();
+    f.settle(0);
+    f.clear();
+    // The same launches, copying to the other output buffer.
+    let how = f
+        .gpu
+        .rerecord(&mut graph, &f.streams(), |q| f.sequence(q, 2.0, 0.5, 1))
+        .unwrap();
+    assert_eq!(how, Rerecorded::Updated);
+    f.settle(0);
+    assert!(
+        f.out_words(1) == f.reference(2.0, 0.5),
+        "the re-recording ran for real"
+    );
+    f.clear();
+    graph.replay(&f.s[0]).unwrap();
+    f.settle(0);
+    assert!(
+        f.out_words(1) == f.reference(2.0, 0.5),
+        "the replay writes the new buffer"
+    );
+    assert!(
+        f.out_words(0).iter().all(|&w| w == 0),
+        "and not the old one"
+    );
+    // The node handles of the original graph still name the executable's nodes.
+    f.clear();
+    f.gpu
+        .update(&mut graph, |q| f.sequence(q, 3.0, 0.0, 1))
+        .unwrap();
+    graph.replay(&f.s[0]).unwrap();
+    f.settle(0);
+    assert!(
+        f.out_words(1) == f.reference(3.0, 0.0),
+        "an update after a re-record takes effect"
+    );
+}
+
+#[test]
+fn a_rerecord_of_another_topology_instantiates_anew() {
+    let Some(f) = Fixture::new() else { return };
+    f.clear();
+    let mut graph = f
+        .gpu
+        .record(&f.streams(), |q| f.sequence(q, 1.5, -2.0, 0))
+        .unwrap();
+    f.settle(0);
+    f.clear();
+    let how = f
+        .gpu
+        .rerecord(&mut graph, &f.streams(), |q| {
+            f.sequence_extra(q, 2.0, 0.5, 5, 0)
+        })
+        .unwrap();
+    assert_eq!(how, Rerecorded::Instantiated);
+    assert_eq!(graph.launches(), 3);
+    f.settle(0);
+    let expected: Vec<u32> = f
+        .reference(2.0, 0.5)
+        .into_iter()
+        .map(|w| w.wrapping_add(5))
+        .collect();
+    assert!(f.out_words(0) == expected, "the re-recording ran for real");
+    f.clear();
+    graph.replay(&f.s[0]).unwrap();
+    f.settle(0);
+    assert!(
+        f.out_words(0) == expected,
+        "the new executable replays the new topology"
+    );
+    f.clear();
+    f.gpu
+        .update(&mut graph, |q| f.sequence_extra(q, 4.0, 0.5, 9, 0))
+        .unwrap();
+    graph.replay(&f.s[0]).unwrap();
+    f.settle(0);
+    let expected: Vec<u32> = f
+        .reference(4.0, 0.5)
+        .into_iter()
+        .map(|w| w.wrapping_add(9))
+        .collect();
+    assert!(f.out_words(0) == expected, "and takes updates");
 }
