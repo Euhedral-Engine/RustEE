@@ -277,10 +277,10 @@ static RING_VERSION: AtomicI32 = AtomicI32::new(IORING_VERSION_1);
 /// The Winsock extension functions, found once for the process.
 static EXTENSIONS: OnceLock<Extensions> = OnceLock::new();
 
-pub(in crate::io) struct RealSys;
+pub(crate) struct RealSys;
 
 impl RealSys {
-    pub(in crate::io) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self
     }
 

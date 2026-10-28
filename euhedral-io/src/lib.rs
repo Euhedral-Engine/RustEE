@@ -1,4 +1,4 @@
-//! Asynchronous I/O whose completions are frames (Euhedral-Inference `AsyncReads`, extended).
+//! Asynchronous I/O whose completions are frames.
 //!
 //! [`AsyncIo`] is the one entry point, and this file is its portable half: the public API, the
 //! buffer and continuation types, and the `LatticeSource` behaviour (`pending`, demand, the
@@ -10,12 +10,17 @@
 //! | Linux, Android | io_uring | `uring` |
 //! | Windows | IoRing for file reads and writes where the OS has a kernel ring, I/O completion ports for everything else | `win` |
 //!
-//! The feature `async-io` (default) builds this module. macOS has no engine yet.
+//! The feature `async-io` (default) builds the crate's contents; without it, or on a platform with no
+//! engine (macOS yet), the crate is empty.
 //!
 //! Unsafe code lives here and in the engines, nowhere else in the crate: the handle conversions, and
 //! the [`IoMemory`] contract that lets an operation read into memory the caller owns (`// SAFETY:` on
 //! every block).
 #![allow(unsafe_code)]
+#![cfg(all(
+    feature = "async-io",
+    any(target_os = "linux", target_os = "android", windows)
+))]
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -27,7 +32,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use euhedral_core::frames::Frame;
 use euhedral_core::generics::{LatticeReceiver, LatticeSource};
 
-use crate::Continuation;
+/// What turns a completed operation's result into the frame that continues the work.
+pub type Continuation<T> = Box<dyn FnOnce(T) -> Box<dyn Frame> + Send>;
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod uring;

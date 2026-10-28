@@ -18,11 +18,13 @@ arm64 (Linux, macOS and Windows back ends) and is untested on mobile.
 | [`euhedral-data-structures`](euhedral-data-structures/README.md) | Cache-line padded atomics and lock-free chunked queues. |
 | [`euhedral-hashing`](euhedral-hashing/README.md) | xxHash64 for routing keys, ordered-chain ids and vectors. |
 | [`euhedral-memory`](euhedral-memory/README.md) | A location-agnostic memory and residency planner: budgets, owners with lifetimes, claims with priorities, give-back as frames, admission, arenas and a leak check; CUDA allocation backends (feature `cuda`). |
-| [`euhedral-graph`](euhedral-graph/README.md) | No-wait dataflow on the lattice: completions, async I/O (io_uring; IoRing and completion ports on Windows), a sequencer, joins, device lanes and stage graphs. |
+| [`euhedral-graph`](euhedral-graph/README.md) | No-wait dataflow on the lattice: completions, a sequencer, joins, device lanes and stage graphs. |
+| [`euhedral-io`](euhedral-io/README.md) | Asynchronous file and socket I/O whose completions are frames: `AsyncIo` (io_uring on Linux and Android; IoRing and completion ports on Windows). |
 
 `euhedral-core` depends on the other three; they depend on none of each other. `euhedral-graph` builds
 on `euhedral-core`; nothing depends on it. `euhedral-memory` builds on `euhedral-core`, `euhedral-data-structures` and
-`euhedral-hashing`; nothing depends on it.
+`euhedral-hashing`; nothing depends on it. `euhedral-io` builds on `euhedral-core` and `euhedral-data-structures`;
+nothing depends on it.
 
 - [`GLOSSARY.md`](GLOSSARY.md): every term a user of RustEE meets, with links to the code.
 - [`CHANGELOG.md`](CHANGELOG.md): changes to the lattice's execution model, newest first.

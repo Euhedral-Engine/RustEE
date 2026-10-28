@@ -15,8 +15,8 @@ use super::sys::{
     verbatim_path,
 };
 use super::{Engine, MAX_PIECE};
-use crate::io::lock;
-use crate::io::{
+use crate::lock;
+use crate::{
     AsyncIoOptions, Buf, Create, Engine as EngineTrait, Front, IoBuf, IoDone, IoDoneOwned,
     OpenSpec, Region, Request, Then,
 };

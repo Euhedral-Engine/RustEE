@@ -271,8 +271,9 @@ park; prefer it for graphics loops, because the adaptive timing is not built for
 
 ## Dataflow
 
-The terms of [`euhedral-graph`](euhedral-graph/README.md): work that is submitted, never waited
-for, and continues on a completion.
+The terms of [`euhedral-graph`](euhedral-graph/README.md) and of [`euhedral-io`](euhedral-io/README.md)
+(`AsyncIo`, ring, completion port, IoRing): work that is submitted, never waited for, and continues on a
+completion.
 
 **completion token, Ready, Pending** ([`Ready`](euhedral-graph/src/completions.rs),
 [`Pending`](euhedral-graph/src/completions.rs)): what says an operation has completed. A `Ready` is
@@ -280,8 +281,8 @@ one cheap query (`is_ready`) that never blocks; a `Pending` is polled until it y
 continuation frame, for a completion that carries a result. A device lane's marker and a timer's
 deadline are completion tokens too.
 
-**continuation** ([`Continuation`](euhedral-graph/src/lib.rs),
-[`IoThen`](euhedral-graph/src/io/mod.rs)): the frame (or the closure that builds it) that carries
+**continuation** ([`Continuation`](euhedral-io/src/lib.rs),
+[`IoThen`](euhedral-io/src/lib.rs)): the frame (or the closure that builds it) that carries
 on the work once an operation completed. The source emits it, and the lattice runs it like any
 other frame.
 
@@ -292,15 +293,15 @@ no timer thread. Not `Completion` of a pipeline chain (the owner notification in
 [`frames::pipeline`](euhedral-core/src/frames/pipeline.rs)): that is an event on one chain, this is
 a source of frames.
 
-**AsyncIo** ([`AsyncIo`](euhedral-graph/src/io/mod.rs)): a `LatticeSource` of continuations behind
+**AsyncIo** ([`AsyncIo`](euhedral-io/src/lib.rs)): a `LatticeSource` of continuations behind
 file and socket operations. A submission returns at once; the lattice's polls reap the completions.
 io_uring on Linux and Android; IoRing and completion ports on Windows.
 
-**ring** ([`uring`](euhedral-graph/src/io/uring.rs), [`win`](euhedral-graph/src/io/win/mod.rs)): an
+**ring** ([`uring`](euhedral-io/src/uring.rs), [`win`](euhedral-io/src/win/mod.rs)): an
 io_uring (or Windows IoRing) submission and completion queue pair. Each submitting thread has its
 own, so submitting never contends; an operation belongs to the ring of the thread that submitted it.
 
-**completion port, IoRing** ([`win`](euhedral-graph/src/io/win/mod.rs)): the two engines of
+**completion port, IoRing** ([`win`](euhedral-io/src/win/mod.rs)): the two engines of
 `AsyncIo` on Windows. A completion port collects the packets of overlapped calls and is polled with
 a zero timeout; IoRing is Windows' kernel ring for file reads and writes (Windows 11), used where
 the OS has one that is not emulated in user mode. Open and rename run on the OS thread pool and

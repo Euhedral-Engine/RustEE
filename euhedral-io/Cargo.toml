@@ -1,0 +1,43 @@
+[package]
+name = "euhedral-io"
+version = "0.1.0"
+edition = "2024"
+description = "Asynchronous file and socket I/O on the Euhedral control plane: io_uring on Linux and Android; IoRing and I/O completion ports on Windows"
+readme = "README.md"
+license = "Apache-2.0"
+
+[features]
+default = ["async-io"]
+# `AsyncIo`: io_uring on Linux and Android; IoRing and I/O completion ports on Windows. Without it, or
+# on another platform, the crate is empty.
+async-io = ["dep:io-uring", "dep:windows-sys"]
+
+[dependencies]
+euhedral-core = { path = "../euhedral-core" }
+# `MpscQueue`: any thread registers, the polling thread drains.
+euhedral-data-structures = { path = "../euhedral-data-structures" }
+
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+libc = "0.2.174"
+io-uring = { version = "=0.7.15", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", optional = true, features = [
+    "Wdk_Storage_FileSystem",
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+] }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"
+dbg_macro = "warn"
+todo = "warn"
