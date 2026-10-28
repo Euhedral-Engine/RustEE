@@ -17,10 +17,12 @@ arm64 (Linux, macOS and Windows back ends) and is untested on mobile.
 | [`euhedral-hardware-utils`](euhedral-hardware-utils/README.md) | CPU topology, thread affinity, pinned executors and resource-pressure monitoring. |
 | [`euhedral-data-structures`](euhedral-data-structures/README.md) | Cache-line padded atomics and lock-free chunked queues. |
 | [`euhedral-hashing`](euhedral-hashing/README.md) | xxHash64 for routing keys, ordered-chain ids and vectors. |
+| [`euhedral-memory`](euhedral-memory/README.md) | A location-agnostic memory and residency planner: budgets, owners with lifetimes, claims with priorities, give-back as frames, admission, arenas and a leak check; CUDA allocation backends (feature `cuda`). |
 | [`euhedral-graph`](euhedral-graph/README.md) | No-wait dataflow on the lattice: completions, async I/O (io_uring; IoRing and completion ports on Windows), a sequencer, joins, device lanes and stage graphs. |
 
 `euhedral-core` depends on the other three; they depend on none of each other. `euhedral-graph` builds
-on `euhedral-core`; nothing depends on it.
+on `euhedral-core`; nothing depends on it. `euhedral-memory` builds on `euhedral-core`, `euhedral-data-structures` and
+`euhedral-hashing`; nothing depends on it.
 
 - [`GLOSSARY.md`](GLOSSARY.md): every term a user of RustEE meets, with links to the code.
 - [`CHANGELOG.md`](CHANGELOG.md): changes to the lattice's execution model, newest first.
