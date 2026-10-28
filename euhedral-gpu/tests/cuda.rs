@@ -1,5 +1,9 @@
 //! The CUDA backend on a real device. Every test skips, passing, when no driver or device is present.
 #![cfg(feature = "cuda")]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "the test thread is not a lattice worker: it polls and sleeps, and test fixtures use files"
+)]
 
 use std::sync::Arc;
 
@@ -322,5 +326,116 @@ mod compiler {
             Err(GpuError::Compile { log }) => assert!(log.contains("nope"), "{log}"),
             other => panic!("{other:?}"),
         }
+    }
+}
+
+mod modules {
+    use super::*;
+    use std::path::PathBuf;
+
+    use euhedral_gpu::cuda::{CudaModule, Nvrtc};
+    use euhedral_gpu::{CompileOptions, GpuError, Module};
+
+    const OPS: &str = include_str!("kernels/ops.cu");
+    const OPS_PTX: &[u8] = include_bytes!("kernels/ops.ptx");
+
+    fn nvrtc_available() -> bool {
+        let ok = Nvrtc::shared(None).is_ok();
+        if !ok {
+            eprintln!("no NVRTC: the source half is skipped");
+        }
+        ok
+    }
+
+    /// A fresh cache directory under the build's temporary directory.
+    fn cache_dir(name: &str) -> PathBuf {
+        let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn modules_load_from_source_and_from_an_image() {
+        let Some(gpu) = gpu() else { return };
+        if nvrtc_available() {
+            let module = CudaModule::from_source(&gpu, OPS, &CompileOptions::default()).unwrap();
+            let axpb = module.kernel("axpb").unwrap();
+            assert_eq!(axpb.name(), "axpb");
+            assert_eq!(axpb.parameter_sizes(), Some(&[8, 8, 4, 4, 4][..]));
+        }
+        if gpu.driver_version() >= 13010 {
+            let module = CudaModule::from_image(&gpu, OPS_PTX).unwrap();
+            let axpb = module.kernel("axpb").unwrap();
+            assert_eq!(axpb.parameter_sizes(), Some(&[8, 8, 4, 4, 4][..]));
+            assert_ne!(
+                axpb.id(),
+                module.kernel("add_u32").unwrap().id(),
+                "kernels differ in identity"
+            );
+        } else {
+            eprintln!("driver older than 13.1: the image half is skipped");
+        }
+    }
+
+    use euhedral_gpu::Kernel;
+
+    #[test]
+    fn missing_kernels_are_not_found() {
+        let Some(gpu) = gpu() else { return };
+        if gpu.driver_version() < 13010 {
+            return;
+        }
+        let module = CudaModule::from_image(&gpu, OPS_PTX).unwrap();
+        let r = module.kernel("axpbx");
+        assert!(matches!(r, Err(GpuError::NotFound(_))), "{r:?}");
+    }
+
+    #[test]
+    fn a_corrupt_cache_entry_is_rebuilt() {
+        let Some(gpu) = gpu() else { return };
+        if !nvrtc_available() {
+            return;
+        }
+        let dir = cache_dir("corrupt");
+        let options = CompileOptions {
+            cache_dir: Some(dir.clone()),
+            ..CompileOptions::default()
+        };
+        CudaModule::from_source(&gpu, OPS, &options).unwrap();
+        let entry = std::fs::read_dir(&dir)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        std::fs::write(&entry, [0x13u8; 16]).unwrap();
+        CudaModule::from_source(&gpu, OPS, &options).unwrap();
+        assert_ne!(std::fs::metadata(&entry).unwrap().len(), 16, "rewritten");
+    }
+
+    #[test]
+    fn a_cache_hit_skips_the_compiler() {
+        let Some(gpu) = gpu() else { return };
+        if !nvrtc_available() {
+            return;
+        }
+        let dir = cache_dir("hit");
+        let options = CompileOptions {
+            cache_dir: Some(dir.clone()),
+            ..CompileOptions::default()
+        };
+        CudaModule::from_source(&gpu, OPS, &options).unwrap();
+        let entry = std::fs::read_dir(&dir)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let first = std::fs::metadata(&entry).unwrap().modified().unwrap();
+        CudaModule::from_source(&gpu, OPS, &options).unwrap();
+        let second = std::fs::metadata(&entry).unwrap().modified().unwrap();
+        assert_eq!(first, second, "the cached file was used, not rewritten");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
     }
 }
