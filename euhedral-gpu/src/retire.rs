@@ -3,30 +3,95 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 
-use euhedral_core::frames::Frame;
+use euhedral_core::frames::{Frame, FrameError, FrameHeader};
 use euhedral_graph::{Completions, LaneId, Pending, QueueId};
 
 use crate::{Gpu, GpuError, POISONED_STATUS, RetireListener, RetireTicket, Stream};
 
-/// Arms a retirement on `stream` whose continuation `then(ticket)` is emitted by `completions`. The frame is built
-/// by the lattice's own poll, never by the driver's callback. If the device is poisoned before the callback runs, the
-/// continuation is emitted at once with [`POISONED_STATUS`], so nothing is stranded.
+/// A frame that runs a closure once and owns whatever the closure moved in: the frame of a chain that carries a
+/// submitter (and a graph) from one continuation to the next.
 ///
-/// The continuation settles the ticket with [`Stream::confirm_retired`].
+/// [`RunnableFrame`](euhedral_core::frames::RunnableFrame) runs a shared `Fn`, which cannot give away what it holds;
+/// this runs an `FnOnce` through `&mut self`, so the closure may own a submitter and hand it on, with no lock or
+/// atomic to take it out of. A frame dropped without running drops the closure, and what it owns, where it is
+/// dropped.
+pub struct OnceFrame {
+    header: FrameHeader,
+    run: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl OnceFrame {
+    /// An ordered frame of lane `id_hash` that runs `run` once.
+    pub fn new(id_hash: u64, run: impl FnOnce() + Send + 'static) -> Self {
+        Self {
+            header: FrameHeader::new(id_hash),
+            run: Some(Box::new(run)),
+        }
+    }
+}
+
+impl std::fmt::Debug for OnceFrame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OnceFrame")
+            .field("pending", &self.run.is_some())
+            .finish()
+    }
+}
+
+impl Frame for OnceFrame {
+    fn header(&self) -> &FrameHeader {
+        &self.header
+    }
+
+    fn header_mut(&mut self) -> &mut FrameHeader {
+        &mut self.header
+    }
+
+    fn execute(&mut self) -> Result<(), FrameError> {
+        if let Some(run) = self.run.take() {
+            run();
+        }
+        Ok(())
+    }
+}
+
+/// A stream handed back with the error that stopped [`retire_into`] from arming its retirement.
+#[derive(Debug)]
+pub struct RetireError<S> {
+    pub stream: S,
+    pub error: GpuError,
+}
+
+/// Arms a retirement on `stream` whose continuation is a frame emitted by `completions`. The frame is built by the
+/// lattice's own poll, never by the driver's callback.
+///
+/// The stream **travels with its continuation**: this takes the submitter by value, and `then(stream, ticket)` gets it
+/// back together with the ticket. A submitter has one owner, so the frame that continues the work is the next owner,
+/// and nothing is shared or locked between the frames of a chain. `then` settles the ticket with
+/// [`Stream::confirm_retired`], submits more, and arms the next retirement with the stream it was given. If the arming
+/// fails the stream comes back in the error.
+///
+/// If the device is poisoned before the callback runs, the continuation is emitted at once with
+/// [`POISONED_STATUS`], so nothing is stranded. If `completions` is dropped or completed with the continuation still
+/// pending, the stream is dropped there (a shutdown call: it waits for the device).
 pub fn retire_into<S: Stream>(
-    stream: &Arc<S>,
+    mut stream: S,
     completions: &Completions,
-    then: impl FnOnce(RetireTicket) -> Box<dyn Frame> + Send + 'static,
-) -> Result<(), GpuError> {
+    then: impl FnOnce(S, RetireTicket) -> Box<dyn Frame> + Send + 'static,
+) -> Result<(), RetireError<S>> {
+    let (listener, cell) = new_cell();
+    if let Err(error) = stream.notify_retired(listener) {
+        return Err(RetireError { stream, error });
+    }
     let gpu = stream.gpu().clone();
-    let (listener, pending) = armed(
-        stream.id(),
-        stream.lane(),
-        Box::new(move || gpu.poisoned().is_some()),
-        Box::new(then),
-    );
-    stream.notify_retired(listener)?;
-    completions.register(pending);
+    completions.register(Box::new(CellPending {
+        cell,
+        id: stream.id(),
+        lane: stream.lane(),
+        stream: Some(stream),
+        poisoned: Box::new(move || gpu.poisoned().is_some()),
+        then: Some(Box::new(then)),
+    }));
     Ok(())
 }
 
@@ -48,53 +113,40 @@ impl RetireListener for CellListener {
     }
 }
 
-type Then = Box<dyn FnOnce(RetireTicket) -> Box<dyn Frame> + Send>;
+type Then<S> = Box<dyn FnOnce(S, RetireTicket) -> Box<dyn Frame> + Send>;
 
-struct CellPending {
+struct CellPending<S> {
     cell: Arc<RetireCell>,
-    stream: QueueId,
+    id: QueueId,
     lane: LaneId,
+    stream: Option<S>,
     poisoned: Box<dyn Fn() -> bool + Send>,
-    then: Option<Then>,
+    then: Option<Then<S>>,
 }
 
-impl Pending for CellPending {
+impl<S: Send> Pending for CellPending<S> {
     fn poll(&mut self) -> Option<Box<dyn Frame>> {
         let ticket = if self.cell.done.load(Ordering::Acquire) {
             RetireTicket::new(
-                self.stream,
+                self.id,
                 self.lane,
                 self.cell.seq.load(Ordering::Relaxed),
                 self.cell.status.load(Ordering::Relaxed),
             )
         } else if (self.poisoned)() {
-            RetireTicket::new(self.stream, self.lane, u64::MAX, POISONED_STATUS)
+            RetireTicket::new(self.id, self.lane, u64::MAX, POISONED_STATUS)
         } else {
             return None;
         };
-        self.then.take().map(|then| then(ticket))
+        let (stream, then) = (self.stream.take()?, self.then.take()?);
+        Some(then(stream, ticket))
     }
 }
 
-/// A listener and the pending that turns its retirement into `then`'s frame. `poisoned` says whether the device
-/// faulted.
-fn armed(
-    stream: QueueId,
-    lane: LaneId,
-    poisoned: Box<dyn Fn() -> bool + Send>,
-    then: Then,
-) -> (Box<dyn RetireListener>, Box<dyn Pending>) {
+/// A listener and the cell its retirement lands in.
+fn new_cell() -> (Box<dyn RetireListener>, Arc<RetireCell>) {
     let cell = Arc::new(RetireCell::default());
-    (
-        Box::new(CellListener(cell.clone())),
-        Box::new(CellPending {
-            cell,
-            stream,
-            lane,
-            poisoned,
-            then: Some(then),
-        }),
-    )
+    (Box::new(CellListener(cell.clone())), cell)
 }
 
 #[cfg(test)]
@@ -102,6 +154,25 @@ mod tests {
     use super::*;
     use euhedral_core::frames::RunnableFrame;
     use std::sync::Mutex;
+
+    /// A listener and a pending over a stand-in stream (the unit `()`), as `retire_into` builds them.
+    fn armed(
+        id: QueueId,
+        lane: LaneId,
+        poisoned: Box<dyn Fn() -> bool + Send>,
+        then: Then<()>,
+    ) -> (Box<dyn RetireListener>, Box<dyn Pending>) {
+        let (listener, cell) = new_cell();
+        let pending = CellPending {
+            cell,
+            id,
+            lane,
+            stream: Some(()),
+            poisoned,
+            then: Some(then),
+        };
+        (listener, Box::new(pending))
+    }
 
     fn frame_recording(
         seen: &Arc<Mutex<Vec<RetireTicket>>>,
@@ -118,7 +189,7 @@ mod tests {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let (listener, mut pending) = armed(id, LaneId(2), Box::new(|| false), {
             let seen = seen.clone();
-            Box::new(move |t| frame_recording(&seen, t))
+            Box::new(move |(), t| frame_recording(&seen, t))
         });
         assert!(pending.poll().is_none(), "not retired yet");
         listener.retired(RetireTicket::new(id, LaneId(2), 7, 0));
@@ -138,7 +209,7 @@ mod tests {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let (_listener, mut pending) = armed(id, LaneId(0), Box::new(|| true), {
             let seen = seen.clone();
-            Box::new(move |t| frame_recording(&seen, t))
+            Box::new(move |(), t| frame_recording(&seen, t))
         });
         assert!(pending.poll().is_some());
         assert!(pending.poll().is_none(), "emitted once");

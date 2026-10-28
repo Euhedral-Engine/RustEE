@@ -569,15 +569,18 @@ last used the memory (a `Retired` test, such as a lane's marker), freed by `reap
 ## GPU
 
 **GPU stream** ([`Stream`](euhedral-gpu/src/api.rs), [`CudaStream`](euhedral-gpu/src/cuda/stream.rs)): an ordered
-queue of device work and a lane of a `LanePool`. `submit` runs a closure on the calling thread that enqueues launches,
-copies and memsets; one submission's operations are contiguous on the stream. `mark` and `await_marker` order work
-across streams on the device.
+queue of device work and a lane of a `LanePool`, split in two. Its **queue** (`DeviceQueue`, shared and `Sync`) is what
+the pool and `Completions` hold. Its **submitter** (`Stream`) is `Send`, not `Sync`, and has one owner: `submit`,
+`mark`, `await_marker`, `notify_retired`, `confirm_retired` and a graph's `replay` take `&mut`, so ownership replaces
+locking. `submit` runs a closure that enqueues launches, copies and memsets; one submission's operations are contiguous
+on the stream. `mark` and `await_marker` order work across streams on the device. Work for a stream from another thread
+goes to its owner, or to another lane.
 
 **retirement** ([`notify_retired`, `confirm_retired`, `RetireTicket`](euhedral-gpu/src/api.rs),
 [`retire_into`](euhedral-gpu/src/retire.rs)): the device reaching a point after the work submitted so far. The
 listener runs once on the backend's callback thread and only enqueues; `confirm_retired` settles the ticket on an
 ordinary thread and returns the device failure, or none; `retire_into` makes the retirement a frame of a
-`Completions`. A stage finishing its submission is never completion.
+`Completions`, and the submitter travels with its continuation. A stage finishing its submission is never completion.
 
 **poisoned device** ([`Poison`](euhedral-gpu/src/poison.rs), [`GpuError::Poisoned`](euhedral-gpu/src/error.rs)): a
 device that faulted (an illegal address, a launch failure). The first fault is kept; later submissions fail fast with

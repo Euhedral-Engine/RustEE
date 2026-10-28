@@ -29,7 +29,6 @@ mod module_cache;
 mod poison;
 mod retire;
 mod shape;
-mod stream_lock;
 
 pub use api::{
     CompileOptions, Enqueue, Gpu, Graph, Kernel, Lanes, Module, POISONED_STATUS, Rerecorded,
@@ -39,9 +38,8 @@ pub use args::{Args, Dim3, KernelArg, Launch};
 pub use error::GpuError;
 pub use module_cache::{CacheKey, KeyMaterial, ModuleCache, cache_key};
 pub use poison::Poison;
-pub use retire::retire_into;
+pub use retire::{OnceFrame, RetireError, retire_into};
 pub use shape::{CopyKind, Fingerprint, ShapeHasher};
-pub use stream_lock::{StreamGuard, StreamLock};
 
 /// Compiles and runs the examples in the crate README as doctests.
 #[cfg(doctest)]

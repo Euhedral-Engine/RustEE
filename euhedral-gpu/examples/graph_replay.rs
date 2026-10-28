@@ -5,27 +5,29 @@
 //! - The kernels are in `kernels/pipeline.cu`, outside the crate's `src`, and are compiled with
 //!   `CudaModule::from_source`. Compiled modules are cached in `$EUHEDRAL_GPU_CACHE` when it is set, else in a
 //!   `gpu-module-cache` directory beside this executable.
-//! - Nothing on the lattice waits for the device: a replay's completion arrives as a frame, which checks the
-//!   result, updates the arguments, submits the next replay and arms its retirement. The main thread waits on a
-//!   latch for the last frame.
+//! - Nothing on the lattice waits for the device, and nothing is locked: a replay's completion arrives as a frame,
+//!   which checks the result, updates the arguments, submits the next replay and arms its retirement. Lane a's
+//!   submitter and the graph have one owner at a time: each continuation frame owns them, uses them, and hands them to
+//!   the next (`retire_into` carries the stream with its continuation). The main thread waits on a latch for the last
+//!   frame, which hands them back so that dropping them (which waits for the device) happens there.
 //!
 //! Run with `cargo run -p euhedral-gpu --features cuda --example graph_replay`; NVRTC is found through
 //! `EUHEDRAL_NVRTC` or `CUDA_HOME`.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 use std::time::Duration;
 
 use euhedral_core::config::LatticeConfig;
 use euhedral_core::control_plane::ControlPlaneLattice;
-use euhedral_core::frames::{Frame, RunnableFrame};
+use euhedral_core::frames::Frame;
 use euhedral_core::generics::LatticeSource;
 use euhedral_core::impls::DefaultExecutor;
 use euhedral_gpu::cuda::{CudaGpu, CudaGraph, CudaKernel, CudaModule, CudaStream};
 use euhedral_gpu::{
-    Args, CompileOptions, Enqueue, Gpu, GpuError, Graph, Launch, Module, Sequence, Stream,
-    StreamOptions, retire_into,
+    Args, CompileOptions, Enqueue, Gpu, GpuError, Graph, Launch, Module, OnceFrame, Sequence,
+    Stream, StreamOptions, retire_into,
 };
 use euhedral_graph::{Completions, Latch, LatchSetter};
 use euhedral_hardware_utils::affinity;
@@ -61,9 +63,8 @@ fn reference(x: &[u32], i: u32) -> Vec<u32> {
         .collect()
 }
 
-/// Everything the continuation frames share.
+/// What the continuation frames share, read-only.
 struct Shared {
-    s: Vec<Arc<CudaStream>>,
     mix: CudaKernel,
     fold: CudaKernel,
     x: Block,
@@ -73,9 +74,46 @@ struct Shared {
     out: Block,
     x_host: Vec<u32>,
     gpu: Arc<CudaGpu>,
-    graph: Mutex<Option<CudaGraph>>,
     completions: Arc<Completions>,
-    done: Mutex<Option<LatchSetter<Result<(), String>>>>,
+}
+
+/// What the chain hands back to the main thread when it ends: its result, and the pieces it owned, so that dropping
+/// them (which waits for the device) happens on the main thread.
+struct Outcome {
+    result: Result<(), String>,
+    parts: Option<(CudaStream, CudaGraph)>,
+}
+
+/// The way out of the chain. If the chain is dropped without finishing (a retirement that could not be armed, a
+/// lattice that closed early), the guard still ends the main thread's wait.
+struct Finish(Option<LatchSetter<Outcome>>);
+
+impl Finish {
+    fn with(mut self, outcome: Outcome) {
+        if let Some(setter) = self.0.take() {
+            setter.set(outcome);
+        }
+    }
+}
+
+impl Drop for Finish {
+    fn drop(&mut self) {
+        if let Some(setter) = self.0.take() {
+            setter.set(Outcome {
+                result: Err("the chain ended before it finished".into()),
+                parts: None,
+            });
+        }
+    }
+}
+
+/// Lane a's state, owned by one frame at a time: each continuation receives it, uses it, and hands it to the next.
+/// Nothing in it is shared or locked.
+struct Chain {
+    shared: Arc<Shared>,
+    stream: CudaStream,
+    graph: CudaGraph,
+    finish: Finish,
 }
 
 impl Shared {
@@ -113,59 +151,82 @@ impl Shared {
             unsafe { e.copy_to_host(self.out.addr as *mut u8, self.z.addr, BYTES) }
         })
     }
+}
 
-    fn finish(&self, result: Result<(), String>) {
-        if let Some(setter) = self
-            .done
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take()
-        {
-            setter.set(result);
-        }
+/// Arms the retirement of iteration `i`. The chain travels with its continuation: the frame the lattice's own poll
+/// emits owns the stream and the graph, so no lock is taken anywhere on the path.
+fn arm(chain: Chain, i: u32) {
+    let Chain {
+        shared,
+        stream,
+        graph,
+        finish,
+    } = chain;
+    let completions = shared.completions.clone();
+    let armed = retire_into(stream, &completions, move |stream, ticket| {
+        let chain = Chain {
+            shared,
+            stream,
+            graph,
+            finish,
+        };
+        let frame: Box<dyn Frame> = Box::new(OnceFrame::new(LANE, move || step(chain, i, ticket)));
+        frame
+    });
+    if let Err(e) = armed {
+        // The closure (and the guard it owns) was dropped: the guard ends the wait. The stream comes back here.
+        eprintln!("graph_replay: arming a retirement failed: {}", e.error);
     }
+}
 
-    /// Arms the retirement of iteration `i`: its continuation frame is emitted by the lattice's own poll.
-    fn arm(self: &Arc<Self>, i: u32) -> Result<(), GpuError> {
-        let shared = self.clone();
-        retire_into(&self.s[0], &self.completions, move |ticket| {
-            let frame: Box<dyn Frame> = Box::new(RunnableFrame::new(
-                LANE,
-                Arc::new(move || {
-                    if let Err(message) = shared.step(i, ticket) {
-                        shared.finish(Err(message));
-                    }
-                }),
-            ));
-            frame
-        })
+/// Iteration `i` retired: check it, then submit the next replay with its arguments, or finish.
+fn step(chain: Chain, i: u32, ticket: euhedral_gpu::RetireTicket) {
+    let Chain {
+        shared,
+        mut stream,
+        mut graph,
+        finish,
+    } = chain;
+    let end = |finish: Finish, stream, graph, result| {
+        finish.with(Outcome {
+            result,
+            parts: Some((stream, graph)),
+        });
+    };
+    if let Some(error) = stream.confirm_retired(ticket) {
+        return end(
+            finish,
+            stream,
+            graph,
+            Err(format!("iteration {i}: {error}")),
+        );
     }
-
-    /// Iteration `i` retired: check it, then submit the next replay with its arguments.
-    fn step(self: &Arc<Self>, i: u32, ticket: euhedral_gpu::RetireTicket) -> Result<(), String> {
-        if let Some(error) = self.s[0].confirm_retired(ticket) {
-            return Err(format!("iteration {i}: {error}"));
-        }
-        // SAFETY: `out` holds N words the retired copy wrote; nothing writes it until the next replay, which is
-        // submitted below.
-        let got = unsafe { std::slice::from_raw_parts(self.out.addr as *const u32, N) };
-        if got != reference(&self.x_host, i) {
-            return Err(format!("iteration {i} differs from the CPU reference"));
-        }
-        if i == REPLAYS {
-            self.finish(Ok(()));
-            return Ok(());
-        }
-        let next = i + 1;
-        {
-            let mut graph = self.graph.lock().unwrap_or_else(PoisonError::into_inner);
-            let graph = graph.as_mut().ok_or("no graph")?;
-            self.gpu
-                .update(graph, |q| self.sequence(q, next))
-                .map_err(|e| e.to_string())?;
-            graph.replay(&self.s[0]).map_err(|e| e.to_string())?;
-        }
-        self.arm(next).map_err(|e| e.to_string())
+    // SAFETY: `out` holds N words the retired copy wrote; nothing writes it until the next replay, which is
+    // submitted below.
+    let got = unsafe { std::slice::from_raw_parts(shared.out.addr as *const u32, N) };
+    if got != reference(&shared.x_host, i) {
+        let message = format!("iteration {i} differs from the CPU reference");
+        return end(finish, stream, graph, Err(message));
+    }
+    if i == REPLAYS {
+        return end(finish, stream, graph, Ok(()));
+    }
+    let next = i + 1;
+    let submitted = shared
+        .gpu
+        .update(&mut graph, |q| shared.sequence(q, next))
+        .and_then(|()| graph.replay(&mut stream));
+    match submitted {
+        Ok(()) => arm(
+            Chain {
+                shared,
+                stream,
+                graph,
+                finish,
+            },
+            next,
+        ),
+        Err(e) => end(finish, stream, graph, Err(e.to_string())),
     }
 }
 
@@ -210,9 +271,14 @@ fn run() -> Result<(), String> {
     config.startup_timeout = Duration::from_secs(10);
     config.shutdown_timeout = Duration::from_secs(5);
     let lattice = ControlPlaneLattice::new(config).map_err(|e| format!("{e:?}"))?;
-    let (pool, s) = gpu
+    let (pool, streams) = gpu
         .open_lanes(&["compute-a", "compute-b"], StreamOptions::default())
         .map_err(|e| e.to_string())?;
+    let mut streams = streams.into_iter();
+    let (mut lane_a, lane_b) = (
+        streams.next().ok_or("no lane a")?,
+        streams.next().ok_or("no lane b")?,
+    );
     let completions = Completions::new(pool);
     lattice
         .add_upstream(completions.clone())
@@ -233,9 +299,7 @@ fn run() -> Result<(), String> {
     // SAFETY: a pinned block of BYTES bytes that only this thread touches until the upload retires.
     unsafe { std::slice::from_raw_parts_mut(staging.addr as *mut u32, N) }.copy_from_slice(&x_host);
 
-    let (setter, waiter) = Latch::new();
     let shared = Arc::new(Shared {
-        s: s.clone(),
         mix,
         fold,
         x,
@@ -244,58 +308,55 @@ fn run() -> Result<(), String> {
         out,
         x_host,
         gpu: gpu.clone(),
-        graph: Mutex::new(None),
         completions: completions.clone(),
-        done: Mutex::new(Some(setter)),
     });
 
-    // The input upload; its completion is a frame too, so the main thread polls nothing.
-    let (uploaded_set, uploaded) = Latch::new();
-    s[0].submit(|q| {
-        // SAFETY: valid blocks; the staging block is not touched until the marker is reached.
-        unsafe { q.copy_to_device(x.addr, staging.addr as *const u8, BYTES) }
-    })
-    .map_err(|e| e.to_string())?;
-    let marker = s[0].mark().map_err(|e| e.to_string())?;
-    let uploaded_set = Mutex::new(Some(uploaded_set));
-    completions.after_marker(
-        marker,
-        Box::new(RunnableFrame::new(
-            LANE,
-            Arc::new(move || {
-                if let Some(set) = uploaded_set
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .take()
-                {
-                    set.set(());
-                }
-            }),
-        )),
-    );
-    uploaded.wait();
-
-    // Iteration 0 is the recording's own run, on both streams.
-    let graph = gpu
-        .record(&[&s[0], &s[1]], |q| shared.sequence(q, 0))
+    // The input upload. Its completion is a frame that carries lane a back to the main thread, so the main thread
+    // polls nothing and lane a is never shared.
+    lane_a
+        .submit(|q| {
+            // SAFETY: valid blocks; the staging block is not touched until the upload retires.
+            unsafe { q.copy_to_device(x.addr, staging.addr as *const u8, BYTES) }
+        })
         .map_err(|e| e.to_string())?;
-    *shared.graph.lock().unwrap_or_else(PoisonError::into_inner) = Some(graph);
-    shared.arm(0).map_err(|e| e.to_string())?;
+    let (uploaded_set, uploaded) = Latch::new();
+    retire_into(lane_a, &completions, move |mut stream, ticket| {
+        let failure = stream.confirm_retired(ticket);
+        Box::new(OnceFrame::new(LANE, move || {
+            uploaded_set.set((stream, failure));
+        }))
+    })
+    .map_err(|e| e.error.to_string())?;
+    let (mut lane_a, failure) = uploaded.wait();
+    if let Some(error) = failure {
+        return Err(format!("the upload: {error}"));
+    }
 
-    let result = waiter.wait();
+    // Iteration 0 is the recording's own run, on both lanes. Lane b is needed only to record.
+    let mut lane_b = lane_b;
+    let graph = gpu
+        .record(&mut [&mut lane_a, &mut lane_b], |q| shared.sequence(q, 0))
+        .map_err(|e| e.to_string())?;
+    drop(lane_b);
+    let (setter, waiter) = Latch::new();
+    arm(
+        Chain {
+            shared: shared.clone(),
+            stream: lane_a,
+            graph,
+            finish: Finish(Some(setter)),
+        },
+        0,
+    );
 
-    // Shut down: nothing is pending once the last frame ran.
+    let outcome = waiter.wait();
+
+    // Shut down: nothing is pending once the last frame ran. The streams and the graph come home to be dropped here.
     let (p50, p99, max) = completions.lateness_us();
     LatticeSource::complete(&*completions);
     lattice.close();
-    drop(
-        shared
-            .graph
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take(),
-    );
-    drop((shared, s));
+    drop(outcome.parts);
+    drop(shared);
     // SAFETY: the streams ended their work as they dropped; nothing uses the blocks.
     unsafe {
         for b in [x, y, z] {
@@ -304,7 +365,7 @@ fn run() -> Result<(), String> {
         pinned.free(staging);
         pinned.free(out);
     }
-    result?;
+    outcome.result?;
     println!(
         "{REPLAYS} replays matched the CPU reference; lateness p50/p99/max µs: {p50}/{p99}/{max}"
     );

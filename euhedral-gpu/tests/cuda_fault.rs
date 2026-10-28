@@ -16,7 +16,7 @@ use euhedral_gpu::{
     Args, CompileOptions, Enqueue, Gpu, GpuError, Launch, Module, RetireListener, RetireTicket,
     Stream, StreamOptions, retire_into,
 };
-use euhedral_graph::{Completions, DeviceQueue};
+use euhedral_graph::Completions;
 
 const OPS: &str = include_str!("kernels/ops.cu");
 const OPS_PTX: &[u8] = include_bytes!("kernels/ops.ptx");
@@ -59,7 +59,7 @@ fn a_device_fault_surfaces_through_confirm_retired_and_poisons_the_device() {
         module.kernel("spin").unwrap(),
         module.kernel("poke").unwrap(),
     );
-    let (pool, s) = gpu
+    let (pool, mut s) = gpu
         .open_lanes(&["a", "b"], StreamOptions::default())
         .unwrap();
     let seen = Arc::new(Mutex::new(Vec::new()));
@@ -82,21 +82,25 @@ fn a_device_fault_surfaces_through_confirm_retired_and_poisons_the_device() {
     s[1].await_marker(after_poke).unwrap();
     let completions = Completions::new(pool.clone());
     let confirmed = Arc::new(Mutex::new(Vec::new()));
-    retire_into(&s[1], &completions, {
-        let (stream, confirmed) = (s[1].clone(), confirmed.clone());
-        move |ticket| {
-            Box::new(RunnableFrame::new(
-                1,
-                Arc::new(move || {
-                    confirmed
-                        .lock()
-                        .unwrap()
-                        .push(stream.confirm_retired(ticket))
-                }),
-            ))
-        }
-    })
-    .unwrap();
+    // Lane b's submitter travels with its continuation, which also tries to use the faulted device.
+    let b = s.remove(1);
+    assert!(
+        retire_into(b, &completions, {
+            let confirmed = confirmed.clone();
+            move |mut stream, ticket| {
+                let outcome = (
+                    stream.confirm_retired(ticket),
+                    matches!(stream.submit(|_| Ok(())), Err(GpuError::Poisoned(_))),
+                    matches!(stream.mark(), Err(GpuError::Poisoned(_))),
+                );
+                Box::new(RunnableFrame::new(
+                    1,
+                    Arc::new(move || confirmed.lock().unwrap().push(outcome.clone())),
+                ))
+            }
+        })
+        .is_ok()
+    );
 
     // The listener runs once, with the device's error.
     assert!(wait_until(Duration::from_secs(10), || !seen
@@ -118,17 +122,17 @@ fn a_device_fault_surfaces_through_confirm_retired_and_poisons_the_device() {
 
     // Later calls fail fast with the cause.
     assert!(matches!(
-        s[1].submit(|_| Ok(())),
+        s[0].submit(|_| Ok(())),
         Err(GpuError::Poisoned(_))
     ));
-    assert!(matches!(s[1].mark(), Err(GpuError::Poisoned(_))));
+    assert!(matches!(s[0].mark(), Err(GpuError::Poisoned(_))));
     assert!(matches!(
         s[0].notify_retired(Box::new(Record(seen.clone()))),
         Err(GpuError::Poisoned(_))
     ));
     // Nothing is stranded: every marker reads as reached.
     assert!(pool.reached(after_poke));
-    assert_eq!(s[0].completed(), after_poke.value);
+    assert_eq!(s[0].queue().completed(), after_poke.value);
 
     // The continuation behind the fault is still emitted by the lattice's own poll.
     assert!(wait_until(Duration::from_secs(10), || {
@@ -144,8 +148,10 @@ fn a_device_fault_surfaces_through_confirm_retired_and_poisons_the_device() {
     }));
     let confirmed = confirmed.lock().unwrap();
     assert_eq!(confirmed.len(), 1);
+    let (failure, submit_refused, mark_refused) = &confirmed[0];
+    assert!(failure.is_some(), "the fault is known to the continuation");
     assert!(
-        confirmed[0].is_some(),
-        "the fault is known to the continuation"
+        *submit_refused && *mark_refused,
+        "the stream fails fast with the cause"
     );
 }

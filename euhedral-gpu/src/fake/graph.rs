@@ -1,15 +1,11 @@
 //! Fake recurring sequences: record, probe, update, re-record and replay.
 
-use std::any::Any;
-use std::sync::{Arc, Mutex, PoisonError};
-
 use euhedral_graph::Marker;
 
-use crate::stream_lock::StreamGuard;
+use crate::kept::{Frozen, freeze};
 use crate::{Fingerprint, GpuError, Graph, Kernel, Rerecorded, Sequence, Stream};
 
 use super::enqueue::{Mode, RecOp, Recording};
-use super::stream::StreamState;
 use super::{FakeEnqueue, FakeGpu, FakeKernel, FakeStream, QOp};
 
 /// A fake recording.
@@ -20,8 +16,8 @@ pub struct FakeGraph {
     args: Vec<crate::Args>,
     fingerprint: Fingerprint,
     streams: usize,
-    /// The buffers the recording reads, shared with every replay (see `Graph::replay`).
-    kept: Arc<Mutex<Vec<Box<dyn Any + Send>>>>,
+    /// The buffers the recording reads, frozen and shared with every replay (see `Graph::replay`).
+    kept: Frozen,
 }
 
 impl FakeGraph {
@@ -47,8 +43,7 @@ impl Graph for FakeGraph {
         self.args.len()
     }
 
-    fn replay(&self, stream: &FakeStream) -> Result<(), GpuError> {
-        let guard = stream.lock()?;
+    fn replay(&mut self, stream: &mut FakeStream) -> Result<(), GpuError> {
         stream.gpu().poison.check()?;
         for op in &self.ops {
             stream.push(match op {
@@ -85,15 +80,9 @@ impl Graph for FakeGraph {
         }
         // A replay runs after this graph may have dropped: the stream keeps the recording's buffers until the next
         // retirement armed after it is confirmed.
-        if !self
-            .kept
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .is_empty()
-        {
-            stream
-                .kept
-                .push(guard.next_retire, Box::new(self.kept.clone()));
+        if !self.kept.is_empty() {
+            let seq = stream.next_retire;
+            stream.kept.push(seq, Box::new(self.kept.clone()));
         }
         Ok(())
     }
@@ -104,8 +93,8 @@ impl Graph for FakeGraph {
 pub struct FakeSequence<'a> {
     rec: Recording,
     streams: usize,
-    /// The real streams and their held locks, in the sequence's order (a record pass only).
-    real: Vec<(&'a FakeStream, StreamGuard<'a, StreamState>)>,
+    /// The real streams, borrowed for the whole closure, in the sequence's order (a record pass only).
+    real: Vec<&'a mut FakeStream>,
 }
 
 impl Sequence for FakeSequence<'_> {
@@ -123,10 +112,7 @@ impl Sequence for FakeSequence<'_> {
                 self.streams
             )));
         }
-        let target = self
-            .real
-            .get_mut(stream)
-            .map(|(s, guard)| (*s, &mut **guard));
+        let target = self.real.get_mut(stream).map(|s| &mut **s);
         let mut q = FakeEnqueue {
             target,
             rec: Some((&mut self.rec, stream)),
@@ -145,19 +131,20 @@ impl Sequence for FakeSequence<'_> {
             return Ok(());
         }
         self.rec.hasher.order(after, before);
-        if let (Some(&(a, _)), Some(&(b, _))) = (self.real.get(after), self.real.get(before)) {
-            let marker: Marker = a.mark_held()?;
-            b.await_held(marker)?;
+        if let (Some(a), Some(b)) = (self.real.get(after), self.real.get(before)) {
+            let marker: Marker = a.mark_now()?;
+            b.await_now(marker)?;
         }
         Ok(())
     }
 }
 
 impl FakeGpu {
-    /// Runs `f` for real over `streams`, forked from and joined to `streams[0]`, collecting the recording.
+    /// Runs `f` for real over `streams`, forked from and joined to `streams[0]`, collecting the recording. The
+    /// streams are borrowed mutably for the whole run: nothing else can enqueue on them meanwhile.
     pub(crate) fn record_pass<F>(
         &self,
-        streams: &[&Arc<FakeStream>],
+        streams: &mut [&mut FakeStream],
         f: F,
     ) -> Result<(Recording, Fingerprint), GpuError>
     where
@@ -167,24 +154,12 @@ impl FakeGpu {
         if streams.is_empty() {
             return Err(GpuError::Invalid("a recording needs a stream".into()));
         }
-        // Lock in ascending lane order, so two recordings never wait on each other crosswise.
-        let mut order: Vec<usize> = (0..streams.len()).collect();
-        order.sort_by_key(|&i| streams[i].global_index());
-        let mut guards: Vec<Option<StreamGuard<'_, StreamState>>> =
-            (0..streams.len()).map(|_| None).collect();
-        for i in order {
-            guards[i] = Some(streams[i].lock()?);
-        }
-        let real: Vec<(&FakeStream, StreamGuard<'_, StreamState>)> = streams
-            .iter()
-            .zip(guards)
-            .filter_map(|(s, g)| g.map(|g| (&***s, g)))
-            .collect();
+        let real: Vec<&mut FakeStream> = streams.iter_mut().map(|s| &mut **s).collect();
         // Fork: the other streams start behind streams[0], as a replay on streams[0] would.
         if real.len() > 1 {
-            let marker = real[0].0.mark_held()?;
-            for (s, _) in &real[1..] {
-                s.await_held(marker)?;
+            let marker = real[0].mark_now()?;
+            for s in &real[1..] {
+                s.await_now(marker)?;
             }
         }
         let mut seq = FakeSequence {
@@ -193,20 +168,22 @@ impl FakeGpu {
             real,
         };
         let result = f(&mut seq);
-        // The record pass runs the work for real: hand what it kept to every real stream, to be held until that
-        // stream's next retirement is confirmed, whatever becomes of the recording. The graph shares the same values.
-        if !crate::kept::is_empty(&seq.rec.kept) {
-            for (stream, guard) in &seq.real {
-                stream
-                    .kept
-                    .push(guard.next_retire, Box::new(seq.rec.kept.clone()));
+        // The record pass runs the work for real: freeze what it kept and hand it to every real stream, to be held
+        // until that stream's next retirement is confirmed, whatever becomes of the recording. The graph shares the
+        // same values.
+        seq.rec.frozen = freeze(std::mem::take(&mut seq.rec.kept));
+        if !seq.rec.frozen.is_empty() {
+            let frozen = seq.rec.frozen.clone();
+            for stream in &mut seq.real {
+                let at = stream.next_retire;
+                stream.kept.push(at, Box::new(frozen.clone()));
             }
         }
-        let FakeSequence { rec, real, .. } = seq;
+        let rec = std::mem::replace(&mut seq.rec, Recording::new(Mode::Probe));
         // Join: streams[0] ends behind every other stream. Done even when `f` failed, so the streams stay consistent.
         let mut joined = Ok(());
-        for (s, _) in real.iter().skip(1) {
-            joined = joined.and_then(|()| real[0].0.await_held(s.mark_held()?));
+        for s in seq.real.iter().skip(1) {
+            joined = joined.and_then(|()| seq.real[0].await_now(s.mark_now()?));
         }
         result?;
         joined?;
@@ -235,26 +212,27 @@ impl FakeGpu {
 
     pub(crate) fn record_graph<F>(
         &self,
-        streams: &[&Arc<FakeStream>],
+        streams: &mut [&mut FakeStream],
         f: F,
     ) -> Result<FakeGraph, GpuError>
     where
         F: FnOnce(&mut FakeSequence<'_>) -> Result<(), GpuError>,
     {
+        let count = streams.len();
         let (rec, fingerprint) = self.record_pass(streams, f)?;
         Ok(FakeGraph {
             ops: rec.ops,
             args: rec.args,
             fingerprint,
-            streams: streams.len(),
-            kept: rec.kept,
+            streams: count,
+            kept: rec.frozen,
         })
     }
 
     pub(crate) fn rerecord_graph<F>(
         &self,
         graph: &mut FakeGraph,
-        streams: &[&Arc<FakeStream>],
+        streams: &mut [&mut FakeStream],
         f: F,
     ) -> Result<Rerecorded, GpuError>
     where

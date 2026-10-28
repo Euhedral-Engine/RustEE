@@ -2,11 +2,10 @@
 
 use std::any::Any;
 
-use crate::kept::SharedKept;
+use crate::kept::{Frozen, freeze};
 use crate::shape::{CopyKind, ShapeHasher};
 use crate::{Args, Enqueue, GpuError, Kernel, Launch};
 
-use super::stream::StreamState;
 use super::{FakeKernel, FakeStream, QOp};
 
 /// An operation of a recording, replayed in recording order.
@@ -60,7 +59,10 @@ pub(crate) struct Recording {
     pub(crate) args: Vec<Args>,
     pub(crate) hasher: ShapeHasher,
     pub(crate) launches: usize,
-    pub(crate) kept: SharedKept,
+    /// The values the closure kept while recording.
+    pub(crate) kept: Vec<Box<dyn Any + Send>>,
+    /// The same, frozen once the run ended, to be shared by the streams, the graph and every replay.
+    pub(crate) frozen: Frozen,
     pub(crate) staged: Vec<Args>,
 }
 
@@ -72,7 +74,8 @@ impl Recording {
             args: Vec::new(),
             hasher: ShapeHasher::default(),
             launches: 0,
-            kept: crate::kept::shared(),
+            kept: Vec::new(),
+            frozen: freeze(Vec::new()),
             staged: Vec::new(),
         }
     }
@@ -82,14 +85,14 @@ impl Recording {
 #[derive(Debug)]
 pub struct FakeEnqueue<'a> {
     /// The stream the operations go to; none on a probe or an update.
-    pub(crate) target: Option<(&'a FakeStream, &'a mut StreamState)>,
+    pub(crate) target: Option<&'a mut FakeStream>,
     /// The pass collecting them, and the sequence's index of the stream.
     pub(crate) rec: Option<(&'a mut Recording, usize)>,
 }
 
 impl FakeEnqueue<'_> {
     fn push(&self, op: QOp) {
-        if let Some((stream, _)) = &self.target {
+        if let Some(stream) = &self.target {
             stream.push(op);
         }
     }
@@ -205,9 +208,12 @@ impl Enqueue for FakeEnqueue<'_> {
     fn keep(&mut self, value: Box<dyn Any + Send>) {
         match (&mut self.rec, &mut self.target) {
             // In a recording the value belongs to the graph.
-            (Some((rec, _)), _) if rec.mode == Mode::Record => crate::kept::add(&rec.kept, value),
+            (Some((rec, _)), _) if rec.mode == Mode::Record => rec.kept.push(value),
             (Some(_), _) => drop(value),
-            (None, Some((stream, state))) => stream.kept.push(state.next_retire, value),
+            (None, Some(stream)) => {
+                let seq = stream.next_retire;
+                stream.kept.push(seq, value);
+            }
             (None, None) => drop(value),
         }
     }

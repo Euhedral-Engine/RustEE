@@ -21,7 +21,7 @@ Asynchronous, backend-neutral GPU access for the RustEE control plane. A lattice
 | [`args`](src/args.rs) | `KernelArg`, `Args` (the typed argument builder), `Launch`, `Dim3`. |
 | [`error`](src/error.rs) | `GpuError`, the one error type. |
 | [`poison`](src/poison.rs) | `Poison`: a device's first fault, set once. |
-| [`stream_lock`](src/stream_lock.rs) | `StreamLock`: the mutual exclusion of one stream's submissions. |
+| [`kept`](src/kept.rs) | The values a submitter keeps until a retirement is confirmed (a `PlainQueue`), and the frozen values a recording shares. |
 | [`shape`](src/shape.rs) | `Fingerprint`, `ShapeHasher`, `CopyKind`. |
 | [`retire`](src/retire.rs) | `retire_into`: a retirement that continues as a frame of a `Completions`. |
 | [`module_cache`](src/module_cache.rs) | `ModuleCache`, `CacheKey`, `cache_key`: compiled modules keyed by a content hash. |
@@ -30,13 +30,18 @@ Asynchronous, backend-neutral GPU access for the RustEE control plane. A lattice
 
 ## Key concepts
 
-- **Streams are lanes.**
-  - `Gpu::open_lanes` opens streams as the lanes of a new `LanePool`. A stream is a `DeviceQueue`, so a stage graph's
-    lane choice, `Marker` and `Completions::after_marker` work with it as they are.
-  - `Stream::submit(|q| ...)` runs on the calling thread with the stream selected for every operation. The operations
-    of one submission are contiguous on the stream, even with other workers submitting at the same moment: a
-    per-stream lock is held only while the closure enqueues, which is a few non-blocking driver calls. A call on a
-    stream from inside its own `submit` is `Err(Invalid)`, never a deadlock.
+- **Streams are lanes, and ownership replaces locking.**
+  - `Gpu::open_lanes` opens streams as the lanes of a new `LanePool` and returns one *submitter* per lane. A stream is
+    split in two. Its **queue** (`DeviceQueue`: `id`, `completed`, `name`) is shared and `Sync`: the pool and
+    `Completions` hold it, so a stage graph's lane choice, `Marker` and `Completions::after_marker` work with it as
+    they are. Its **submitter** (`Stream`) is `Send` and not `Sync`, with exactly one owner.
+  - Everything that enqueues takes `&mut`: `submit`, `mark`, `await_marker`, `notify_retired`, `confirm_retired`, and
+    `Graph::replay`. Exclusivity is the borrow checker's, so there is no lock to take or wait on, the operations of one
+    submission are contiguous on the stream because nothing else can enqueue on it, and a call on a stream from inside
+    its own `submit` does not compile (a `compile_fail` doctest and `tests/ownership.rs` pin this).
+  - Work for a stream from another thread goes to the thread that owns it (one of RustEE's lock-free queues, for
+    instance an `MpscQueue` the owner drains, or the submitter handed over inside a frame, which is what `retire_into`
+    does), or runs on another lane. There is no routing layer.
   - Enqueue operations (`launch`, the copies, `memset`) are `unsafe fn`s, as `euhedral_memory::Copier::start` is: a
     kernel or a copy can touch any device-visible memory.
 - **Markers across streams.** `mark()` records a marker after the work submitted so far; `await_marker(m)` orders later
@@ -49,14 +54,17 @@ Asynchronous, backend-neutral GPU access for the RustEE control plane. A lattice
   - `notify_retired(listener)` arms a completion point after the work submitted so far. The listener runs once, on the
     backend's callback thread, and may only enqueue: no driver calls, no blocking, no frames built or dropped. A panic
     in a listener is caught.
-  - `confirm_retired(ticket)` runs on an ordinary thread and returns the device failure behind the ticket, or `None`.
-    It releases the values kept with `Enqueue::keep`, so the host buffers a copy reads live until the retirement is
+  - `confirm_retired(ticket)` is a method of the submitter and returns the device failure behind the ticket, or `None`.
+    The submitter owns its kept values (a `PlainQueue`), so releasing them needs no lock and no queue. It releases the values kept with `Enqueue::keep`, so the host buffers a copy reads live until the retirement is
     confirmed. A ticket carries the identity of the stream that armed it (its fields are private, made only by a
     backend); settling it on another stream is `Some(Invalid)` and releases nothing.
   - A listener is dropped on the backend's callback thread, so it must not own the last handle to a stream, a graph or
     a device.
-  - `retire_into(&stream, &completions, |ticket| frame)` arms a retirement whose continuation is a frame emitted by the
-    lattice's own poll. A submission finishing never counts as completion. If the device is poisoned before the
+  - `retire_into(stream, &completions, |stream, ticket| frame)` arms a retirement whose continuation is a frame
+    emitted by the lattice's own poll. The submitter **travels with its continuation**: it is taken by value and
+    handed back to the closure with the ticket, so the frame that continues the work owns the stream and its kept
+    values. The callback stores the result in three atomics (a wait-free hand-off to the poll), never in a queue it
+    could block on. A submission finishing never counts as completion. If the device is poisoned before the
     callback runs, the continuation is emitted at once, so nothing is stranded.
 - **Kernels from outside.** A `Module` loads from `from_source` or from `from_image`; the crate enumerates no kernels.
   - `from_source` compiles CUDA C with NVRTC for the device's exact architecture (or PTX for the newest architecture
@@ -72,7 +80,7 @@ Asynchronous, backend-neutral GPU access for the RustEE control plane. A lattice
     arguments (`Args::new().device(addr).arg(2.5f32)`); where the driver reports the kernel's parameter sizes, a launch
     with arguments that do not fit is `Err(Args)` before the driver sees it.
 - **Recurring sequences.**
-  - `Gpu::record(&streams, |q| ...)` runs the closure once for real and records it. The same code path then serves
+  - `Gpu::record(&mut [&mut a, &mut b], |q| ...)` runs the closure once for real and records it. The same code path then serves
     `fingerprint` (a probe: nothing reaches the device) and `update` (new argument values: launch *n* of the update
     is launch *n* of the recording).
   - The **shape** is the operations in order, their stream indexes, the `order` edges, kernel identities, launch
@@ -86,8 +94,10 @@ Asynchronous, backend-neutral GPU access for the RustEE control plane. A lattice
   - Host memory that a recorded copy reads is read again by every replay: use pinned memory, and hand it to the
     recording with `Enqueue::keep`. Every pointer a recording names must stay valid for every replay until the graph
     drops. A replay hands the recording's kept values to its stream, which holds them until the next retirement armed
-    after the replay is confirmed, so a replay in flight survives the graph dropping; arm one per replay. Launches of
-    one graph are serialized inside it, so replays from several workers are safe. A re-record replaces the old
+    after the replay is confirmed, so a replay in flight survives the graph dropping; arm one per replay. `replay` takes
+    `&mut` the graph, so a replay has its executable to itself without a lock: the owner of the graph decides which
+    stream replays it, and a graph that several lanes need is one graph per lane. The recording's kept values are
+    frozen into an immutable `Arc<[..]>` that streams and replays share. A re-record replaces the old
     recording's kept values. The recording's own run is a real run too: whatever the closure kept is handed to every
     stream it ran on, so a failed recording, or a graph dropped right after `record`, leaves the run its buffers.
   - Recording forks and joins the real streams with events of its own, and a panic in the recording closure ends the
@@ -120,7 +130,7 @@ gpu.define("add1", |memory, _launch, args| {
 });
 let module = FakeModule::from_source(&gpu, "// the kernels' source", &CompileOptions::default()).unwrap();
 let add1 = module.kernel("add1").unwrap();
-let (lanes, streams) = gpu.open_lanes(&["compute", "copy"], StreamOptions::default()).unwrap();
+let (lanes, mut streams) = gpu.open_lanes(&["compute", "copy"], StreamOptions::default()).unwrap();
 let buffer = gpu.alloc(4);
 let mut out = [0u8; 4];
 
@@ -140,19 +150,21 @@ streams[1]
     })
     .unwrap();
 
-// The copy's retirement continues as a frame, emitted by the lattice's own poll.
+// The copy's retirement continues as a frame, emitted by the lattice's own poll. The submitter travels with it.
 let completions = Completions::new(lanes);
 let confirmed = Arc::new(Mutex::new(None));
-retire_into(&streams[1], &completions, {
-    let (stream, confirmed) = (streams[1].clone(), confirmed.clone());
-    move |ticket| {
+let copy_lane = streams.remove(1);
+retire_into(copy_lane, &completions, {
+    let confirmed = confirmed.clone();
+    move |mut stream, ticket| {
+        let failure = stream.confirm_retired(ticket);
         Box::new(RunnableFrame::new(
             1,
-            Arc::new(move || *confirmed.lock().unwrap() = Some(stream.confirm_retired(ticket))),
+            Arc::new(move || *confirmed.lock().unwrap() = Some(failure.clone())),
         ))
     }
 })
-.unwrap();
+.unwrap_or_else(|e| panic!("{}", e.error));
 
 // A fake device runs when it is stepped; a real one runs by itself. Here the loop is the worker.
 gpu.run_until_idle();

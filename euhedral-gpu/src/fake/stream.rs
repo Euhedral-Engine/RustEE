@@ -1,32 +1,58 @@
-//! Fake streams.
+//! Fake streams: a shared query side and a single-owner submitter.
 
 use std::sync::Arc;
 
 use euhedral_graph::{DeviceQueue, LaneId, Marker, QueueId};
 
 use crate::kept::Kept;
-use crate::stream_lock::StreamLock;
 use crate::{Gpu, GpuError, POISONED_STATUS, RetireListener, RetireTicket, Stream};
 
 use super::{FakeEnqueue, FakeGpu, QOp};
 
+/// The query side of a fake stream: what the pool and `Completions` hold. Shared and `Sync`.
 #[derive(Debug)]
-pub(crate) struct StreamState {
-    /// The number the next armed retirement gets.
-    pub(crate) next_retire: u64,
-}
-
-/// A fake stream: lane `lane` of its pool.
-#[derive(Debug)]
-pub struct FakeStream {
+pub struct FakeQueue {
     gpu: Arc<FakeGpu>,
     id: QueueId,
     name: String,
+    /// Global index of this stream's lane.
+    global: usize,
+}
+
+impl DeviceQueue for FakeQueue {
+    fn id(&self) -> QueueId {
+        self.id
+    }
+
+    fn completed(&self) -> u64 {
+        let poisoned = self.gpu.poison.get().is_some();
+        let st = self.gpu.lock();
+        let lane = &st.lanes[self.global];
+        if poisoned {
+            lane.marks_enqueued
+        } else {
+            lane.marks_run
+        }
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+/// A fake stream's submitter: lane `lane` of its pool. It has one owner, `Send` and not `Sync`; everything that
+/// enqueues takes `&mut self`.
+#[derive(Debug)]
+pub struct FakeStream {
+    gpu: Arc<FakeGpu>,
+    queue: Arc<FakeQueue>,
+    id: QueueId,
     /// Global index of lane 0 of this stream's pool, this stream's index in the pool, and the pool's size.
     base: usize,
     index: usize,
     count: usize,
-    state: StreamLock<StreamState>,
+    /// The number the next armed retirement gets.
+    pub(crate) next_retire: u64,
     pub(crate) kept: Kept,
 }
 
@@ -39,20 +65,26 @@ impl FakeStream {
         index: usize,
         count: usize,
     ) -> Self {
-        Self {
-            gpu,
+        let queue = Arc::new(FakeQueue {
+            gpu: gpu.clone(),
             id,
             name: name.to_owned(),
+            global: base + index,
+        });
+        Self {
+            gpu,
+            queue,
+            id,
             base,
             index,
             count,
-            state: StreamLock::new(StreamState { next_retire: 1 }),
+            next_retire: 1,
             kept: Kept::default(),
         }
     }
 
-    pub(crate) fn global_index(&self) -> usize {
-        self.global()
+    pub(crate) fn queue_arc(&self) -> Arc<FakeQueue> {
+        self.queue.clone()
     }
 
     fn global(&self) -> usize {
@@ -67,7 +99,8 @@ impl FakeStream {
         self.gpu.push(self.global(), self.lane_id(), op);
     }
 
-    fn mark_locked(&self) -> Result<Marker, GpuError> {
+    /// A marker after the work enqueued so far.
+    pub(crate) fn mark_now(&self) -> Result<Marker, GpuError> {
         self.gpu.poison.check()?;
         let value = {
             let st = self.gpu.lock();
@@ -81,7 +114,8 @@ impl FakeStream {
         Ok(Marker::new(self.id, LaneId(self.lane_id()), value))
     }
 
-    fn await_locked(&self, marker: Marker) -> Result<(), GpuError> {
+    /// Later work on this stream waits for `marker`.
+    pub(crate) fn await_now(&self, marker: Marker) -> Result<(), GpuError> {
         self.gpu.poison.check()?;
         let lane = usize::from(marker.lane.0);
         if lane >= self.count {
@@ -117,56 +151,6 @@ impl FakeStream {
         });
         Ok(())
     }
-
-    /// `mark` for a sequence that already holds this stream's lock.
-    pub(crate) fn mark_held(&self) -> Result<Marker, GpuError> {
-        self.mark_locked()
-    }
-
-    /// `await_marker` for a sequence that already holds this stream's lock.
-    pub(crate) fn await_held(&self, marker: Marker) -> Result<(), GpuError> {
-        self.await_locked(marker)
-    }
-
-    pub(crate) fn lock(
-        &self,
-    ) -> Result<crate::stream_lock::StreamGuard<'_, StreamState>, GpuError> {
-        self.state.lock()
-    }
-
-    pub(crate) fn enqueue<'a>(&'a self, state: &'a mut StreamState) -> FakeEnqueue<'a> {
-        FakeEnqueue {
-            target: Some((self, state)),
-            rec: None,
-        }
-    }
-}
-
-impl Drop for FakeStream {
-    fn drop(&mut self) {
-        self.kept.clear();
-    }
-}
-
-impl DeviceQueue for FakeStream {
-    fn id(&self) -> QueueId {
-        self.id
-    }
-
-    fn completed(&self) -> u64 {
-        let poisoned = self.gpu.poison.get().is_some();
-        let st = self.gpu.lock();
-        let lane = &st.lanes[self.global()];
-        if poisoned {
-            lane.marks_enqueued
-        } else {
-            lane.marks_run
-        }
-    }
-
-    fn name(&self) -> &str {
-        &self.name
-    }
 }
 
 impl Stream for FakeStream {
@@ -181,30 +165,37 @@ impl Stream for FakeStream {
         LaneId(self.lane_id())
     }
 
+    fn id(&self) -> QueueId {
+        self.id
+    }
+
+    fn queue(&self) -> Arc<dyn DeviceQueue> {
+        self.queue.clone()
+    }
+
     fn submit<R>(
-        &self,
+        &mut self,
         f: impl FnOnce(&mut FakeEnqueue<'_>) -> Result<R, GpuError>,
     ) -> Result<R, GpuError> {
-        let mut guard = self.state.lock()?;
         self.gpu.poison.check()?;
-        f(&mut self.enqueue(&mut guard))
+        f(&mut FakeEnqueue {
+            target: Some(self),
+            rec: None,
+        })
     }
 
-    fn mark(&self) -> Result<Marker, GpuError> {
-        let _guard = self.state.lock()?;
-        self.mark_locked()
+    fn mark(&mut self) -> Result<Marker, GpuError> {
+        self.mark_now()
     }
 
-    fn await_marker(&self, marker: Marker) -> Result<(), GpuError> {
-        let _guard = self.state.lock()?;
-        self.await_locked(marker)
+    fn await_marker(&mut self, marker: Marker) -> Result<(), GpuError> {
+        self.await_now(marker)
     }
 
-    fn notify_retired(&self, listener: Box<dyn RetireListener>) -> Result<(), GpuError> {
-        let mut guard = self.state.lock()?;
+    fn notify_retired(&mut self, listener: Box<dyn RetireListener>) -> Result<(), GpuError> {
         self.gpu.poison.check()?;
-        let seq = guard.next_retire;
-        guard.next_retire += 1;
+        let seq = self.next_retire;
+        self.next_retire += 1;
         self.push(QOp::Retire {
             stream: self.id,
             seq,
@@ -213,7 +204,7 @@ impl Stream for FakeStream {
         Ok(())
     }
 
-    fn confirm_retired(&self, ticket: RetireTicket) -> Option<GpuError> {
+    fn confirm_retired(&mut self, ticket: RetireTicket) -> Option<GpuError> {
         if ticket.stream() != self.id {
             return Some(GpuError::Invalid(
                 "a retirement ticket of another stream".into(),

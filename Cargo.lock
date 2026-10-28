@@ -42,6 +42,7 @@ name = "euhedral-gpu"
 version = "0.1.0"
 dependencies = [
  "euhedral-core",
+ "euhedral-data-structures",
  "euhedral-gpu",
  "euhedral-graph",
  "euhedral-hardware-utils",

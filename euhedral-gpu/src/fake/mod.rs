@@ -3,6 +3,11 @@
 //! Nothing runs until a test steps the device: [`FakeGpu::step`] runs the oldest runnable operation of any stream, so
 //! a test decides the interleaving and every run is the same. Fake kernels are host closures registered by name that
 //! run on a bounds-checked fake memory; a kernel fault poisons the device as a CUDA fault does.
+//!
+//! The streams of the fake follow the same ownership rules as any backend's: a shared queue and a single-owner
+//! submitter, with no lock in the submitter. The simulated *device* (its memory, its per-lane operation logs and its
+//! kernel registry) is one state behind a mutex: it stands for hardware in tests, not for a submission path, and a real
+//! backend has no such state in the host.
 
 mod enqueue;
 mod graph;
@@ -23,7 +28,7 @@ use crate::{
 pub use enqueue::FakeEnqueue;
 pub use graph::{FakeGraph, FakeSequence};
 pub use module::{FakeKernel, FakeModule};
-pub use stream::FakeStream;
+pub use stream::{FakeQueue, FakeStream};
 
 /// A fake kernel: runs on the fake memory with the launch geometry and arguments.
 pub type FakeKernelFn =
@@ -445,14 +450,15 @@ impl Gpu for FakeGpu {
             base
         };
         let count = names.len();
-        let streams: Vec<Arc<FakeStream>> = names
+        let streams: Vec<FakeStream> = names
             .iter()
             .enumerate()
-            .map(|(i, name)| Arc::new(FakeStream::new(self.clone(), ids[i], name, base, i, count)))
+            .map(|(i, name)| FakeStream::new(self.clone(), ids[i], name, base, i, count))
             .collect();
+        // The pool holds the shared query sides; the submitters go to their owners.
         let queues = streams
             .iter()
-            .map(|s| s.clone() as Arc<dyn euhedral_graph::DeviceQueue>)
+            .map(|s| s.queue_arc() as Arc<dyn euhedral_graph::DeviceQueue>)
             .collect();
         Ok((Arc::new(LanePool::new(queues)), streams))
     }
@@ -461,7 +467,7 @@ impl Gpu for FakeGpu {
         self.poison.get()
     }
 
-    fn record<F>(&self, streams: &[&Arc<FakeStream>], f: F) -> Result<FakeGraph, GpuError>
+    fn record<F>(&self, streams: &mut [&mut FakeStream], f: F) -> Result<FakeGraph, GpuError>
     where
         F: FnOnce(&mut FakeSequence<'_>) -> Result<(), GpuError>,
     {
@@ -471,7 +477,7 @@ impl Gpu for FakeGpu {
     fn rerecord<F>(
         &self,
         graph: &mut FakeGraph,
-        streams: &[&Arc<FakeStream>],
+        streams: &mut [&mut FakeStream],
         f: F,
     ) -> Result<Rerecorded, GpuError>
     where

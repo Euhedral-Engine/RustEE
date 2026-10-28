@@ -5,13 +5,11 @@ use std::ffi::c_void;
 
 use euhedral_memory::cuda::CuStream;
 
-use crate::kept::SharedKept;
+use crate::kept::{Frozen, freeze};
 use crate::shape::{CopyKind, ShapeHasher};
-use crate::stream_lock::StreamGuard;
 use crate::{Args, Enqueue, GpuError, Kernel, Launch};
 
 use super::fns::{CAPTURE_STATUS_ACTIVE, CaptureInfo, CuGraph, CuGraphNode};
-use super::stream::StreamState;
 use super::{CudaGpu, CudaKernel, CudaStream};
 
 /// Which pass a sequence is running.
@@ -45,7 +43,10 @@ pub(crate) struct Recording {
     /// The captured node of each launch (a record pass).
     pub(crate) nodes: Vec<Node>,
     pub(crate) hasher: ShapeHasher,
-    pub(crate) kept: SharedKept,
+    /// The values the closure kept while recording.
+    pub(crate) kept: Vec<Box<dyn Any + Send>>,
+    /// The same, frozen once the run ended, to be shared by the streams, the graph and every replay.
+    pub(crate) frozen: Frozen,
     /// The arguments of each launch (an update pass).
     pub(crate) staged: Vec<Args>,
     /// The first reason the capture cannot be used. The real work is unaffected.
@@ -59,7 +60,8 @@ impl Recording {
             launches: Vec::new(),
             nodes: Vec::new(),
             hasher: ShapeHasher::default(),
-            kept: crate::kept::shared(),
+            kept: Vec::new(),
+            frozen: freeze(Vec::new()),
             staged: Vec::new(),
             failed: None,
         }
@@ -69,8 +71,7 @@ impl Recording {
 /// The stream an operation goes to, and the shadow that captures it while recording.
 #[derive(Debug)]
 pub(crate) struct Target<'a> {
-    pub(crate) stream: &'a CudaStream,
-    pub(crate) state: &'a mut StreamState,
+    pub(crate) stream: &'a mut CudaStream,
     pub(crate) shadow: Option<CuStream>,
 }
 
@@ -84,15 +85,11 @@ pub struct CudaEnqueue<'a> {
 }
 
 impl<'a> CudaEnqueue<'a> {
-    pub(crate) fn on_stream(
-        stream: &'a CudaStream,
-        state: &'a mut StreamGuard<'_, StreamState>,
-    ) -> Self {
+    pub(crate) fn on_stream(gpu: &'a CudaGpu, stream: &'a mut CudaStream) -> Self {
         Self {
-            gpu: &stream.gpu,
+            gpu,
             target: Some(Target {
                 stream,
-                state,
                 shadow: None,
             }),
             rec: None,
@@ -284,9 +281,12 @@ impl Enqueue for CudaEnqueue<'_> {
     fn keep(&mut self, value: Box<dyn Any + Send>) {
         match (&mut self.rec, &mut self.target) {
             // In a recording the value belongs to the graph.
-            (Some((rec, _)), _) if rec.mode == Mode::Record => crate::kept::add(&rec.kept, value),
+            (Some((rec, _)), _) if rec.mode == Mode::Record => rec.kept.push(value),
             (Some(_), _) => drop(value),
-            (None, Some(target)) => target.stream.kept.push(target.state.next_retire, value),
+            (None, Some(target)) => {
+                let seq = target.stream.next_retire;
+                target.stream.kept.push(seq, value);
+            }
             (None, None) => drop(value),
         }
     }

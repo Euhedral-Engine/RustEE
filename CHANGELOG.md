@@ -24,10 +24,13 @@ done, looked like one of this pool and could be treated as done.
 **What.**
 - A new workspace member, `euhedral-gpu`: backend-neutral, asynchronous GPU access on the lattice, with a stepped fake
   backend (feature `fake`) and a CUDA backend (feature `cuda`).
-  - Streams are `DeviceQueue`s and lanes of a `LanePool`. `Stream::submit` enqueues launches, copies and memsets on the
-    calling thread; `mark` and `await_marker` order work across streams on the device.
-  - `notify_retired` arms a completion point; its listener only enqueues. `confirm_retired` settles it on an ordinary
-    thread. `retire_into` turns a retirement into a frame of a `Completions`.
+  - A stream is a shared, `Sync` queue (`DeviceQueue`, held by the `LanePool`) and a single-owner submitter (`Stream`:
+    `Send`, not `Sync`). `submit`, `mark`, `await_marker`, `notify_retired`, `confirm_retired` and `Graph::replay`
+    take `&mut`, so ownership replaces locking and the hot path takes no lock. `submit` enqueues launches, copies and
+    memsets; `mark` and `await_marker` order work across streams on the device.
+  - `notify_retired` arms a completion point; its listener only enqueues (three atomics). `retire_into` takes the
+    submitter by value, turns the retirement into a frame of a `Completions`, and hands the submitter back to the
+    continuation with the ticket; `OnceFrame` runs an `FnOnce` that owns it. `confirm_retired` is a submitter method.
   - A `Module` loads from source (NVRTC, loaded at run time, cached under a content hash) or from a prebuilt image
     (PTX, cubin, fatbin). `Args` packs typed arguments; the driver's parameter sizes are checked before a launch.
   - `Gpu::record`, `fingerprint`, `update` and `rerecord` record a recurring sequence on shadow streams, probe its

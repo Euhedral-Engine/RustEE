@@ -4,19 +4,17 @@
 //! on one shadow stream per stream, so a real stream is never in capture mode and a failed capture never disturbs
 //! the work itself.
 
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 
 use euhedral_memory::cuda::{CuEvent, CuStream, STREAM_NON_BLOCKING};
 
-use crate::kept::SharedKept;
-use crate::stream_lock::StreamGuard;
+use crate::kept::{Frozen, freeze};
 use crate::{Args, Fingerprint, GpuError, Graph, Launch, Rerecorded, Sequence};
 
 use super::enqueue::{Mode, Node, Recording, Target};
 use super::fns::{
     CAPTURE_MODE_RELAXED, CuGraph, CuGraphExec, ExecUpdateResultInfo, KernelNodeParams,
 };
-use super::stream::{Handle, StreamState};
 use super::{CudaEnqueue, CudaGpu, CudaKernel, CudaStream, from_cuda};
 
 /// `CU_EVENT_DISABLE_TIMING`.
@@ -34,18 +32,15 @@ pub struct CudaGraph {
     fingerprint: Fingerprint,
     /// The number of streams the recording ran over.
     streams: usize,
-    /// The buffers its copies read, shared with every replay: a replay hands a handle to its stream, which holds it
-    /// until the next retirement armed after the replay is confirmed.
-    kept: SharedKept,
-    /// Launches of one executable are serialized here, whatever streams they come from.
-    launch_lock: Mutex<()>,
+    /// The buffers its copies read, frozen and shared with every replay: a replay hands a handle to its stream, which
+    /// holds it until the next retirement armed after the replay is confirmed.
+    kept: Frozen,
 }
 
-// SAFETY: the graph and its executable belong to the primary context. Every use is a driver call: launches take
-// `launch_lock`, and argument updates and re-recording take `&mut self`, so no two calls on one executable overlap.
+// SAFETY: the graph and its executable belong to the primary context. Every use is a driver call, and every call
+// that launches, updates or re-records takes `&mut self`: one owner at a time, so no two calls on one executable
+// overlap, and no lock is needed. It is deliberately not `Sync`.
 unsafe impl Send for CudaGraph {}
-// SAFETY: as above.
-unsafe impl Sync for CudaGraph {}
 
 impl Drop for CudaGraph {
     fn drop(&mut self) {
@@ -91,7 +86,7 @@ impl CudaGraph {
             self.streams = streams;
             // The new recording's buffers replace the old ones. A replay of the old recording that is still in flight
             // holds its own handle to them.
-            self.kept = rec.kept;
+            self.kept = rec.frozen;
             return Ok(Rerecorded::Updated);
         }
         // Any other outcome leaves the executable as it was (an update that fails does not half apply).
@@ -160,40 +155,28 @@ impl Graph for CudaGraph {
         self.launches.len()
     }
 
-    fn replay(&self, stream: &CudaStream) -> Result<(), GpuError> {
-        let state = stream.state.lock()?;
+    fn replay(&mut self, stream: &mut CudaStream) -> Result<(), GpuError> {
         self.gpu.poison.check()?;
-        let _c = stream.enter()?;
-        let _serial = self
-            .launch_lock
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        // SAFETY: the executable and a stream of the same device; launches of this executable are serialized by
-        // `launch_lock`, and the context is current.
+        let _c = self.gpu.device().enter().map_err(from_cuda)?;
+        // SAFETY: the executable and a stream of the same device; `&mut self` makes this launch the executable's only
+        // user; the context is current.
         self.gpu.check("cuGraphLaunch", unsafe {
             (self.gpu.fns.graph_launch)(self.exec, stream.raw)
         })?;
         // The replay reads the recording's buffers when it runs, which may be after this graph dropped: the stream
         // keeps them until the next retirement armed on it after this replay is confirmed.
-        if !self
-            .kept
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .is_empty()
-        {
-            stream
-                .kept
-                .push(state.next_retire, Box::new(self.kept.clone()));
+        if !self.kept.is_empty() {
+            let seq = stream.next_retire;
+            stream.kept.push(seq, Box::new(self.kept.clone()));
         }
         Ok(())
     }
 }
 
-/// One stream of a record pass: held for the whole closure.
+/// One stream of a record pass: borrowed mutably for the whole closure.
 #[derive(Debug)]
 pub(crate) struct Real<'a> {
-    stream: &'a CudaStream,
-    guard: StreamGuard<'a, StreamState>,
+    stream: &'a mut CudaStream,
     shadow: CuStream,
 }
 
@@ -215,19 +198,19 @@ impl CudaSequence<'_> {
     /// Hands the values the recording kept to every real stream, to be held until that stream's next retirement is
     /// confirmed. The record pass runs the work for real, and its copies may still be reading those buffers when
     /// the recording ends, fails or is dropped; the graph shares the same values, so they outlive whichever of the
-    /// run and the graph ends last. Done while the streams are still locked.
+    /// run and the graph ends last. Done while the streams are still borrowed by the recording.
     fn hand_over_kept(&mut self) {
         if self.rec.mode != Mode::Record || self.handed_over {
             return;
         }
         self.handed_over = true;
-        if crate::kept::is_empty(&self.rec.kept) {
+        self.rec.frozen = freeze(std::mem::take(&mut self.rec.kept));
+        if self.rec.frozen.is_empty() {
             return;
         }
         for r in &mut self.real {
-            r.stream
-                .kept
-                .push(r.guard.next_retire, Box::new(self.rec.kept.clone()));
+            let seq = r.stream.next_retire;
+            r.stream.kept.push(seq, Box::new(self.rec.frozen.clone()));
         }
     }
 
@@ -366,8 +349,7 @@ impl Sequence for CudaSequence<'_> {
         }
         let record = self.rec.mode == Mode::Record;
         let target = self.real.get_mut(stream).map(|r| Target {
-            stream: r.stream,
-            state: &mut r.guard,
+            stream: &mut *r.stream,
             shadow: record.then_some(r.shadow),
         });
         let mut q = CudaEnqueue {
@@ -424,7 +406,7 @@ impl CudaGpu {
     /// Runs `f` for real over `streams` and captures it: the recording, and the graph the driver made of it.
     pub(crate) fn capture<F>(
         self: &Arc<Self>,
-        streams: &[&Arc<CudaStream>],
+        streams: &mut [&mut CudaStream],
         f: F,
     ) -> Result<(Recording, CuGraph), GpuError>
     where
@@ -434,27 +416,14 @@ impl CudaGpu {
         if streams.is_empty() {
             return Err(GpuError::Invalid("a recording needs a stream".into()));
         }
-        for (i, a) in streams.iter().enumerate() {
-            if streams[..i].iter().any(|b| Arc::ptr_eq(a, b)) {
-                return Err(GpuError::Invalid("a stream listed twice".into()));
-            }
-        }
-        // Lock in ascending lane order, so two recordings never wait on each other crosswise.
-        let mut order: Vec<usize> = (0..streams.len()).collect();
-        order.sort_by_key(|&i| (streams[i].lane_id(), Arc::as_ptr(streams[i]) as usize));
-        let mut guards: Vec<Option<StreamGuard<'_, StreamState>>> =
-            (0..streams.len()).map(|_| None).collect();
-        for i in order {
-            guards[i] = Some(streams[i].state.lock()?);
-        }
         let _c = self.device().enter().map_err(from_cuda)?;
         let mut real = Vec::with_capacity(streams.len());
-        for (stream, guard) in streams.iter().zip(guards) {
-            let Some(mut guard) = guard else {
-                return Err(GpuError::Invalid("a stream was not locked".into()));
-            };
-            let shadow = match guard.shadow {
-                Some(shadow) => shadow.0,
+        // The streams are borrowed mutably for the whole run: nothing else can enqueue on them meanwhile, and two
+        // entries can never name one stream.
+        for stream in streams.iter_mut() {
+            let stream: &mut CudaStream = stream;
+            let shadow = match stream.shadow {
+                Some(shadow) => shadow,
                 None => {
                     let mut raw = std::ptr::null_mut();
                     // SAFETY: an out pointer; the context is current.
@@ -462,15 +431,11 @@ impl CudaGpu {
                         (self.device().driver.fns.stream_create)(&mut raw, STREAM_NON_BLOCKING)
                     };
                     self.check("cuStreamCreate", code)?;
-                    guard.shadow = Some(Handle(raw));
+                    stream.shadow = Some(raw);
                     raw
                 }
             };
-            real.push(Real {
-                stream,
-                guard,
-                shadow,
-            });
+            real.push(Real { stream, shadow });
         }
         let mut seq = CudaSequence {
             gpu: self,
@@ -490,6 +455,7 @@ impl CudaGpu {
         };
         seq.hand_over_kept();
         let mut rec = std::mem::replace(&mut seq.rec, Recording::new(Mode::Probe));
+        // `hand_over_kept` froze the values into the recording that was just taken out of the sequence.
         drop(seq);
         // The real work was submitted whatever came of the capture.
         match (ran, ended) {
@@ -545,8 +511,7 @@ impl CudaGpu {
             launches: rec.launches,
             fingerprint: rec.hasher.finish(),
             streams,
-            kept: rec.kept,
-            launch_lock: Mutex::new(()),
+            kept: rec.frozen,
         })
     }
 }

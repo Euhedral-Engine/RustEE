@@ -2,7 +2,7 @@
 #![cfg(feature = "fake")]
 #![allow(
     clippy::disallowed_methods,
-    reason = "peer threads stand in for lattice workers"
+    reason = "peer threads stand in for the lattice's workers, each owning a stream"
 )]
 
 use std::sync::{Arc, Mutex};
@@ -12,7 +12,7 @@ use euhedral_gpu::{
     Args, CompileOptions, Enqueue, Gpu, GpuError, Launch, Module, RetireListener, RetireTicket,
     Stream, StreamOptions,
 };
-use euhedral_graph::{DeviceQueue, LaneId, Marker, QueueId};
+use euhedral_graph::{LaneId, Marker, QueueId};
 
 struct Record(Arc<Mutex<Vec<RetireTicket>>>);
 
@@ -42,10 +42,7 @@ fn module(gpu: &Arc<FakeGpu>) -> euhedral_gpu::fake::FakeModule {
         .unwrap()
 }
 
-fn lanes(
-    gpu: &Arc<FakeGpu>,
-    names: &[&str],
-) -> (Arc<euhedral_graph::LanePool>, Vec<Arc<FakeStream>>) {
+fn lanes(gpu: &Arc<FakeGpu>, names: &[&str]) -> (Arc<euhedral_graph::LanePool>, Vec<FakeStream>) {
     gpu.open_lanes(names, StreamOptions::default()).unwrap()
 }
 
@@ -57,7 +54,7 @@ fn add1(m: &euhedral_gpu::fake::FakeModule, at: u64) -> (euhedral_gpu::fake::Fak
 fn ops_on_one_stream_run_in_submission_order() {
     let gpu = gpu_with_kernels();
     let m = module(&gpu);
-    let (_pool, s) = lanes(&gpu, &["compute"]);
+    let (_pool, mut s) = lanes(&gpu, &["compute"]);
     let buf = gpu.alloc(4);
     let mut out = vec![9u8; 4];
     let (k, args) = add1(&m, buf);
@@ -89,7 +86,7 @@ fn ops_on_one_stream_run_in_submission_order() {
 fn an_await_orders_work_behind_another_streams_marker() {
     let gpu = gpu_with_kernels();
     let m = module(&gpu);
-    let (pool, s) = lanes(&gpu, &["a", "b"]);
+    let (pool, mut s) = lanes(&gpu, &["a", "b"]);
     let buf = gpu.alloc(4);
     let mut out = vec![0u8; 4];
     let (k, args) = add1(&m, buf);
@@ -125,7 +122,7 @@ fn an_await_orders_work_behind_another_streams_marker() {
 #[test]
 fn markers_complete_as_the_device_reaches_them() {
     let gpu = gpu_with_kernels();
-    let (pool, s) = lanes(&gpu, &["a"]);
+    let (pool, mut s) = lanes(&gpu, &["a"]);
     let m = s[0].mark().unwrap();
     assert!(!pool.reached(m));
     gpu.run_until_idle();
@@ -135,7 +132,7 @@ fn markers_complete_as_the_device_reaches_them() {
 #[test]
 fn retirement_runs_each_listener_once_in_order() {
     let gpu = gpu_with_kernels();
-    let (_pool, s) = lanes(&gpu, &["a"]);
+    let (_pool, mut s) = lanes(&gpu, &["a"]);
     let seen = Arc::new(Mutex::new(Vec::new()));
     for _ in 0..3 {
         s[0].notify_retired(Box::new(Record(seen.clone()))).unwrap();
@@ -151,7 +148,7 @@ fn retirement_runs_each_listener_once_in_order() {
 fn kept_values_live_until_confirmed_or_the_stream_drops() {
     let gpu = gpu_with_kernels();
     let (pool, mut s) = lanes(&gpu, &["a"]);
-    let s = s.remove(0);
+    let mut s = s.remove(0);
     let (confirmed, forgotten) = (Arc::new(()), Arc::new(()));
     let seen = Arc::new(Mutex::new(Vec::new()));
     s.submit(|q| {
@@ -184,50 +181,44 @@ fn kept_values_live_until_confirmed_or_the_stream_drops() {
 }
 
 #[test]
-fn concurrent_submissions_to_one_stream_stay_contiguous() {
+fn submitters_move_to_their_own_threads_and_stay_contiguous() {
     let gpu = gpu_with_kernels();
     let m = module(&gpu);
-    let (_pool, s) = lanes(&gpu, &["a"]);
-    let s0 = &s[0];
+    let (_pool, streams) = lanes(&gpu, &["a", "b"]);
+    // Each lane's submitter is owned by one thread, as a lattice worker owns it. Nothing is locked: a submission is
+    // contiguous on its stream because nothing else can enqueue on it.
     std::thread::scope(|scope| {
-        for name in ["a", "b"] {
+        for (mut stream, name) in streams.into_iter().zip(["a", "b"]) {
             let k = m.kernel(name).unwrap();
             scope.spawn(move || {
                 for _ in 0..100 {
-                    s0.submit(|q| {
-                        for _ in 0..3 {
-                            // SAFETY: the fake kernels touch no memory.
-                            unsafe { q.launch(&k, Launch::linear(1, 1), &Args::new())? };
-                        }
-                        Ok(())
-                    })
-                    .unwrap();
+                    stream
+                        .submit(|q| {
+                            for _ in 0..3 {
+                                // SAFETY: the fake kernels touch no memory.
+                                unsafe { q.launch(&k, Launch::linear(1, 1), &Args::new())? };
+                            }
+                            Ok(())
+                        })
+                        .unwrap();
                 }
             });
         }
     });
     gpu.run_until_idle();
-    let names: Vec<String> = gpu
-        .log()
-        .into_iter()
-        .map(|o| match o {
-            FakeOp::Launch { kernel, .. } => kernel,
-            other => panic!("unexpected {other:?}"),
-        })
-        .collect();
-    assert_eq!(names.len(), 600);
-    for run in names.chunks(3) {
-        assert!(run.iter().all(|n| *n == run[0]), "{run:?}");
+    let log = gpu.log();
+    assert_eq!(log.len(), 600);
+    for lane in [0u16, 1] {
+        let names: Vec<&str> = log
+            .iter()
+            .filter_map(|o| match o {
+                FakeOp::Launch { lane: l, kernel } if *l == lane => Some(kernel.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names.len(), 300);
+        assert!(names.iter().all(|n| *n == names[0]), "one kernel per lane");
     }
-}
-
-#[test]
-fn a_call_inside_its_own_submit_is_refused() {
-    let gpu = gpu_with_kernels();
-    let (_pool, s) = lanes(&gpu, &["a"]);
-    let r = s[0].submit(|_| s[0].mark().map(|_| ()));
-    assert!(matches!(r, Err(GpuError::Invalid(_))), "{r:?}");
-    assert!(s[0].mark().is_ok(), "the lock was released");
 }
 
 #[test]
@@ -244,7 +235,7 @@ fn faulting_kernel(gpu: &Arc<FakeGpu>) -> euhedral_gpu::fake::FakeKernel {
 #[test]
 fn a_fault_surfaces_through_confirm_retired_and_poisons_the_device() {
     let gpu = gpu_with_kernels();
-    let (_pool, s) = lanes(&gpu, &["a", "b"]);
+    let (_pool, mut s) = lanes(&gpu, &["a", "b"]);
     let k = faulting_kernel(&gpu);
     let seen = Arc::new(Mutex::new(Vec::new()));
     s[0].submit(|q| {
@@ -277,7 +268,7 @@ fn a_fault_surfaces_through_confirm_retired_and_poisons_the_device() {
 fn work_queued_behind_a_fault_never_runs_but_its_markers_are_reached() {
     let gpu = gpu_with_kernels();
     let m = module(&gpu);
-    let (pool, s) = lanes(&gpu, &["a"]);
+    let (pool, mut s) = lanes(&gpu, &["a"]);
     let bad = faulting_kernel(&gpu);
     let after = m.kernel("a").unwrap();
     let before_fault = s[0].mark().unwrap();
@@ -306,7 +297,7 @@ fn a_poisoned_device_still_emits_retire_into_continuations() {
     use euhedral_core::frames::RunnableFrame;
     use euhedral_core::generics::LatticeSource;
     let gpu = gpu_with_kernels();
-    let (pool, s) = lanes(&gpu, &["a", "b"]);
+    let (pool, mut s) = lanes(&gpu, &["a", "b"]);
     let bad = faulting_kernel(&gpu);
     s[0].submit(|q| {
         // SAFETY: the fake kernel touches no memory.
@@ -318,18 +309,24 @@ fn a_poisoned_device_still_emits_retire_into_continuations() {
     s[1].await_marker(after_fault).unwrap();
     let completions = euhedral_graph::Completions::new(pool);
     let confirmed = Arc::new(Mutex::new(None));
-    euhedral_gpu::retire_into(&s[1], &completions, {
-        let (stream, confirmed) = (s[1].clone(), confirmed.clone());
-        move |ticket| {
-            Box::new(RunnableFrame::new(
-                1,
-                Arc::new(move || {
-                    *confirmed.lock().unwrap() = Some(stream.confirm_retired(ticket));
-                }),
-            ))
-        }
-    })
-    .unwrap();
+    // Lane b's submitter travels with its continuation.
+    let b = s.remove(1);
+    assert!(
+        euhedral_gpu::retire_into(b, &completions, {
+            let confirmed = confirmed.clone();
+            move |mut stream, ticket| {
+                Box::new(RunnableFrame::new(
+                    1,
+                    Arc::new({
+                        let confirmed = confirmed.clone();
+                        let outcome = stream.confirm_retired(ticket);
+                        move || *confirmed.lock().unwrap() = Some(outcome.clone())
+                    }),
+                ))
+            }
+        })
+        .is_ok()
+    );
     assert!(gpu.step(), "only the faulting launch runs");
     assert!(gpu.poisoned().is_some());
     let mut emitted = 0;
@@ -356,7 +353,7 @@ fn a_poisoned_device_still_emits_retire_into_continuations() {
 #[test]
 fn a_ticket_settles_only_on_the_stream_that_armed_it() {
     let gpu = gpu_with_kernels();
-    let (_pool, s) = lanes(&gpu, &["a", "b"]);
+    let (_pool, mut s) = lanes(&gpu, &["a", "b"]);
     let kept = Arc::new(());
     let (from_a, from_b) = (
         Arc::new(Mutex::new(Vec::new())),
@@ -390,8 +387,8 @@ fn a_ticket_settles_only_on_the_stream_that_armed_it() {
 #[test]
 fn a_marker_of_another_pool_is_refused_not_treated_as_done() {
     let gpu = gpu_with_kernels();
-    let (pool_a, a) = lanes(&gpu, &["a0", "a1"]);
-    let (pool_b, b) = lanes(&gpu, &["b0", "b1"]);
+    let (pool_a, mut a) = lanes(&gpu, &["a0", "a1"]);
+    let (pool_b, mut b) = lanes(&gpu, &["b0", "b1"]);
     // A marker of pool b that has long completed: its lane exists in pool a, and its value is below a's own.
     let from_b = b[0].mark().unwrap();
     let first = a[0].mark().unwrap();
@@ -403,8 +400,8 @@ fn a_marker_of_another_pool_is_refused_not_treated_as_done() {
     // Not even its own lane's number saves it: pool a does not reach it either.
     assert!(!pool_a.reached(from_b));
     // The same lane and value stamped with a's queue is a's own marker, already done.
-    a[1].await_marker(Marker::new(a[0].id(), from_b.lane, from_b.value))
-        .unwrap();
+    let own = Marker::new(a[0].id(), from_b.lane, from_b.value);
+    a[1].await_marker(own).unwrap();
     // Neither pool's queue: refused, and never reached.
     let stranger = Marker::new(QueueId::next(), LaneId(0), 1);
     assert!(matches!(

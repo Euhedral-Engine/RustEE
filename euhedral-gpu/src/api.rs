@@ -1,13 +1,26 @@
 //! The backend-neutral traits.
 //!
 //! - [`Gpu`]: a device. It opens streams as the lanes of a [`LanePool`] and records recurring sequences.
-//! - [`Stream`]: an ordered device queue ([`DeviceQueue`]). Submissions run on the calling thread and only enqueue.
+//! - [`Stream`]: the submitter of one ordered device queue. One owner enqueues through `&mut self`; the queue's query
+//!   side is a separate, shared [`DeviceQueue`] in the pool.
 //! - [`Enqueue`]: what a submission can do: launches, copies, memsets.
 //! - [`Module`] and [`Kernel`]: code loaded at run time, from source or from a prebuilt image.
 //! - [`Sequence`] and [`Graph`]: a recurring sequence, recorded once and replayed.
 //! - [`RetireListener`]: told, once, that the work submitted so far has retired.
 //!
 //! The traits use associated types, not trait objects, so a backend costs no indirection and no allocation per call.
+//!
+//! **Ownership replaces locking.** A stream is split in two:
+//! - the **queue** (`DeviceQueue`: `id`, `completed`, `name`) is shared and `Sync`, held by the `LanePool` and
+//!   `Completions`; it reads atomics and never waits;
+//! - the **submitter** (`Stream`) is `Send` and not `Sync`: it has exactly one owner, and everything that enqueues
+//!   (`submit`, `mark`, `await_marker`, `notify_retired`, `confirm_retired`, and a graph's `replay`) takes `&mut`.
+//!   Exclusivity is the borrow checker's, so there is no lock to take or to wait on, and a call on a stream from
+//!   inside its own `submit` closure does not compile.
+//!
+//! Work for a stream from another thread goes to the thread that owns it (through one of RustEE's lock-free queues, or
+//! by handing the submitter over inside a frame, as [`retire_into`](crate::retire_into) does), or runs on another
+//! lane. This crate has no routing layer.
 
 use std::any::Any;
 use std::fmt;
@@ -19,7 +32,7 @@ use euhedral_graph::{DeviceQueue, LaneId, LanePool, Marker, QueueId};
 use crate::{Args, Fingerprint, GpuError, Launch};
 
 /// The pool and the streams that [`Gpu::open_lanes`] makes: stream `i` is lane `i` of the pool.
-pub type Lanes<G> = (Arc<LanePool>, Vec<Arc<<G as Gpu>::Stream>>);
+pub type Lanes<G> = (Arc<LanePool>, Vec<<G as Gpu>::Stream>);
 
 /// A device and its backend.
 pub trait Gpu: Send + Sync + fmt::Debug + Sized + 'static {
@@ -29,7 +42,8 @@ pub trait Gpu: Send + Sync + fmt::Debug + Sized + 'static {
     type Graph: Graph<Gpu = Self>;
     type Sequence<'a>: Sequence<Kernel = Self::Kernel>;
 
-    /// New streams, `names[i]` as lane `i` of a new pool (1 to 64 names).
+    /// New streams, `names[i]` as lane `i` of a new pool (1 to 64 names). The pool holds each stream's query side;
+    /// the submitters are returned to be owned, one per lane.
     fn open_lanes(
         self: &Arc<Self>,
         names: &[&str],
@@ -44,7 +58,7 @@ pub trait Gpu: Send + Sync + fmt::Debug + Sized + 'static {
     /// work. The other streams fork from
     /// `streams[0]` at the start and join it at the end. A failed recording is `Err(Capture)`; the work itself was
     /// submitted and is unaffected.
-    fn record<F>(&self, streams: &[&Arc<Self::Stream>], f: F) -> Result<Self::Graph, GpuError>
+    fn record<F>(&self, streams: &mut [&mut Self::Stream], f: F) -> Result<Self::Graph, GpuError>
     where
         F: FnOnce(&mut Self::Sequence<'_>) -> Result<(), GpuError>;
 
@@ -52,7 +66,7 @@ pub trait Gpu: Send + Sync + fmt::Debug + Sized + 'static {
     fn rerecord<F>(
         &self,
         graph: &mut Self::Graph,
-        streams: &[&Arc<Self::Stream>],
+        streams: &mut [&mut Self::Stream],
         f: F,
     ) -> Result<Rerecorded, GpuError>
     where
@@ -70,8 +84,12 @@ pub trait Gpu: Send + Sync + fmt::Debug + Sized + 'static {
         F: FnOnce(&mut Self::Sequence<'_>) -> Result<(), GpuError>;
 }
 
-/// An ordered queue of device work and a lane of a [`LanePool`].
-pub trait Stream: DeviceQueue + Sized + 'static {
+/// The submitter of one ordered queue of device work, and a lane of a [`LanePool`].
+///
+/// A stream has one owner: every call that enqueues takes `&mut self`, and the type is `Send` (it can move to another
+/// thread, or travel inside a frame) but not `Sync`. The pool and `Completions` hold the stream's [`queue`](Self::queue)
+/// instead, which is shared and only reads.
+pub trait Stream: Send + Sized + 'static {
     type Gpu: Gpu<Stream = Self>;
     type Enqueue<'a>: Enqueue<Kernel = <Self::Gpu as Gpu>::Kernel>;
 
@@ -79,31 +97,51 @@ pub trait Stream: DeviceQueue + Sized + 'static {
 
     fn lane(&self) -> LaneId;
 
-    /// Runs `f` on the calling thread with the stream selected for every operation; the operations are contiguous
-    /// on the stream. Keep `f` to enqueueing. A call on this stream from inside `f` is `Err(Invalid)`.
+    /// This stream's identity, stamped on its markers and tickets: the same as its queue's.
+    fn id(&self) -> QueueId;
+
+    /// The shared query side of this stream, as the pool holds it.
+    fn queue(&self) -> Arc<dyn DeviceQueue>;
+
+    /// Runs `f` with the stream selected for every operation; the operations are contiguous on the stream. Keep `f`
+    /// to enqueueing. The stream is borrowed for the call, so `f` cannot use it again: a call on the stream from
+    /// inside its own `submit` does not compile.
+    ///
+    /// ```compile_fail,E0499
+    /// use euhedral_gpu::fake::FakeGpu;
+    /// use euhedral_gpu::{Gpu, Stream, StreamOptions};
+    ///
+    /// let gpu = FakeGpu::new();
+    /// let (_pool, mut streams) = gpu.open_lanes(&["a"], StreamOptions::default()).unwrap();
+    /// let stream = &mut streams[0];
+    /// stream.submit(|_| stream.mark().map(|_| ())).unwrap();
+    /// ```
     fn submit<R>(
-        &self,
+        &mut self,
         f: impl FnOnce(&mut Self::Enqueue<'_>) -> Result<R, GpuError>,
     ) -> Result<R, GpuError>;
 
     /// A marker after the work submitted so far. `Err(Busy)` when the marker ring is full of markers that have not
     /// completed.
-    fn mark(&self) -> Result<Marker, GpuError>;
+    fn mark(&mut self) -> Result<Marker, GpuError>;
 
     /// Later work on this stream waits, on the device, for `marker`. The host does not wait.
     ///
     /// A marker names the queue that made it ([`DeviceQueue::id`]) as well as a lane and a value. A marker of a queue
     /// that is not one of this stream's pool, a lane beyond the pool, or a value that was never made, is
     /// `Err(Invalid)`; it is never treated as already done.
-    fn await_marker(&self, marker: Marker) -> Result<(), GpuError>;
+    fn await_marker(&mut self, marker: Marker) -> Result<(), GpuError>;
 
     /// Arms a retirement after the work submitted so far: `listener` runs once.
-    fn notify_retired(&self, listener: Box<dyn RetireListener>) -> Result<(), GpuError>;
+    fn notify_retired(&mut self, listener: Box<dyn RetireListener>) -> Result<(), GpuError>;
 
-    /// Settles a retirement on an ordinary thread: the device failure behind it, or `None`. Never panics. Values
-    /// kept for the retirement are released. A ticket armed on another stream is refused with `Some(Invalid)` and
-    /// releases nothing.
-    fn confirm_retired(&self, ticket: RetireTicket) -> Option<GpuError>;
+    /// Settles a retirement: the device failure behind it, or `None`. Never panics. Values kept for the retirement are
+    /// released. A ticket armed on another stream is refused with `Some(Invalid)` and releases nothing.
+    ///
+    /// This is a method of the submitter, which owns the kept values, so the continuation that follows a retirement
+    /// owns the stream too (see [`retire_into`](crate::retire_into)): nothing is shared, and nothing is locked or
+    /// queued to release the values.
+    fn confirm_retired(&mut self, ticket: RetireTicket) -> Option<GpuError>;
 }
 
 /// What a submission enqueues.
@@ -206,7 +244,7 @@ pub trait Sequence {
 }
 
 /// A recorded sequence.
-pub trait Graph: Send + Sync + fmt::Debug {
+pub trait Graph: Send + fmt::Debug {
     type Gpu: Gpu<Graph = Self>;
 
     fn fingerprint(&self) -> Fingerprint;
@@ -216,10 +254,14 @@ pub trait Graph: Send + Sync + fmt::Debug {
 
     /// Replays the recording as one submission on `stream`, with the arguments set by the last update.
     ///
+    /// Takes `&mut self`: a replay has exclusive use of the graph's executable, and the owner of the graph decides
+    /// which stream replays it. A graph shared by several lanes is one graph per lane (record it again), or one owner
+    /// that hands it from lane to lane.
+    ///
     /// The values the recording keeps (`Enqueue::keep`) are handed to `stream`, which holds them until the next
     /// retirement armed on it after this call is confirmed: arm one per replay (or per batch of replays), or they
     /// are held until the stream drops. The graph may drop while its replays are in flight.
-    fn replay(&self, stream: &<Self::Gpu as Gpu>::Stream) -> Result<(), GpuError>;
+    fn replay(&mut self, stream: &mut <Self::Gpu as Gpu>::Stream) -> Result<(), GpuError>;
 }
 
 /// Told once that a retirement happened.

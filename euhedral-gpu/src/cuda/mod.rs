@@ -15,7 +15,7 @@ pub use enqueue::CudaEnqueue;
 pub use graph::{CudaGraph, CudaSequence};
 pub use module::{CudaKernel, CudaModule};
 pub use nvrtc::{Nvrtc, Target};
-pub use stream::CudaStream;
+pub use stream::{CudaQueue, CudaStream};
 
 use std::sync::Arc;
 
@@ -169,9 +169,10 @@ impl Gpu for CudaGpu {
         options: StreamOptions,
     ) -> Result<crate::Lanes<Self>, GpuError> {
         let streams = CudaStream::open(self, names, options)?;
+        // The pool holds the shared query sides; the submitters go to their owners.
         let queues = streams
             .iter()
-            .map(|s| s.clone() as Arc<dyn euhedral_graph::DeviceQueue>)
+            .map(|s| s.queue_arc() as Arc<dyn euhedral_graph::DeviceQueue>)
             .collect();
         Ok((Arc::new(LanePool::new(queues)), streams))
     }
@@ -180,7 +181,7 @@ impl Gpu for CudaGpu {
         self.poison.get()
     }
 
-    fn record<F>(&self, streams: &[&Arc<CudaStream>], f: F) -> Result<CudaGraph, GpuError>
+    fn record<F>(&self, streams: &mut [&mut CudaStream], f: F) -> Result<CudaGraph, GpuError>
     where
         F: FnOnce(&mut CudaSequence<'_>) -> Result<(), GpuError>,
     {
@@ -190,22 +191,24 @@ impl Gpu for CudaGpu {
             .ok_or_else(|| GpuError::Invalid("a recording needs a stream".into()))?
             .gpu
             .clone();
+        let count = streams.len();
         let (rec, graph) = gpu.capture(streams, f)?;
-        gpu.instantiate(rec, graph, streams.len())
+        gpu.instantiate(rec, graph, count)
     }
 
     fn rerecord<F>(
         &self,
         graph: &mut CudaGraph,
-        streams: &[&Arc<CudaStream>],
+        streams: &mut [&mut CudaStream],
         f: F,
     ) -> Result<Rerecorded, GpuError>
     where
         F: FnOnce(&mut CudaSequence<'_>) -> Result<(), GpuError>,
     {
         let gpu = graph.gpu().clone();
+        let count = streams.len();
         let (rec, new) = gpu.capture(streams, f)?;
-        graph.replace(rec, new, streams.len())
+        graph.replace(rec, new, count)
     }
 
     fn fingerprint<F>(&self, streams: usize, f: F) -> Result<Fingerprint, GpuError>

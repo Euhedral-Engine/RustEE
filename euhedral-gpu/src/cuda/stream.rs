@@ -7,7 +7,6 @@ use euhedral_graph::{DeviceQueue, LaneId, Marker, QueueId};
 use euhedral_memory::cuda::{CuEvent, CuStream, Device, STREAM_NON_BLOCKING};
 
 use crate::kept::Kept;
-use crate::stream_lock::StreamLock;
 use crate::{GpuError, POISONED_STATUS, RetireListener, RetireTicket, Stream, StreamOptions};
 
 use super::{CudaEnqueue, CudaGpu, from_cuda};
@@ -16,15 +15,6 @@ use super::{CudaEnqueue, CudaGpu, from_cuda};
 const EVENT_DISABLE_TIMING: u32 = 2;
 /// `CUDA_ERROR_NOT_READY`, from `cuEventQuery` while the work before the event runs.
 const NOT_READY: i32 = 600;
-
-/// A driver handle that moves between threads.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct Handle(pub CuStream);
-
-// SAFETY: a stream of the primary context, usable from any thread with that context current.
-unsafe impl Send for Handle {}
-// SAFETY: as above; the handle is only read.
-unsafe impl Sync for Handle {}
 
 /// A lane's marker events: value `v` is recorded in slot `v % events.len()`.
 #[derive(Debug)]
@@ -110,33 +100,60 @@ impl Drop for LaneRing {
     }
 }
 
+/// The query side of a CUDA stream: what the pool and `Completions` hold. It reads the marker ring's atomics and asks
+/// the driver whether an event completed; it never waits and takes no lock.
 #[derive(Debug)]
-pub(crate) struct StreamState {
-    /// The stream a recording captures this stream's work on, made on first use.
-    pub(crate) shadow: Option<Handle>,
-    /// The number the next armed retirement gets.
-    pub(crate) next_retire: u64,
+pub struct CudaQueue {
+    gpu: Arc<CudaGpu>,
+    ring: Arc<LaneRing>,
+    name: String,
 }
 
-/// A CUDA stream: lane `lane` of its pool.
+impl DeviceQueue for CudaQueue {
+    fn id(&self) -> QueueId {
+        self.ring.id
+    }
+
+    fn completed(&self) -> u64 {
+        if self.gpu.poison.get().is_some() {
+            return self.ring.marked.load(Ordering::Acquire);
+        }
+        if let Ok(_c) = self.gpu.device().enter().map_err(from_cuda) {
+            self.ring.scan(&self.gpu);
+        }
+        if self.gpu.poison.get().is_some() {
+            return self.ring.marked.load(Ordering::Acquire);
+        }
+        self.ring.done.load(Ordering::Acquire)
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+/// A CUDA stream's submitter: lane `lane` of its pool. It has one owner: it is `Send` and not `Sync`, and everything
+/// that enqueues takes `&mut self`, so nothing is locked. The shared query side is [`CudaQueue`].
 #[derive(Debug)]
 pub struct CudaStream {
     pub(crate) gpu: Arc<CudaGpu>,
     pub(crate) id: QueueId,
     lane: LaneId,
-    name: String,
     pub(crate) raw: CuStream,
+    queue: Arc<CudaQueue>,
     ring: Arc<LaneRing>,
     lanes: Arc<[Arc<LaneRing>]>,
-    pub(crate) state: StreamLock<StreamState>,
+    /// The stream a recording captures this stream's work on, made on first use.
+    pub(crate) shadow: Option<CuStream>,
+    /// The number the next armed retirement gets.
+    pub(crate) next_retire: u64,
     pub(crate) kept: Kept,
 }
 
-// SAFETY: the stream belongs to the primary context and is usable from any thread with it current; every enqueue
-// holds the stream's lock.
+// SAFETY: the stream belongs to the primary context and is usable from any thread with it current. A submitter has
+// one owner at a time (every enqueue takes `&mut self`), so moving it to another thread moves the whole of its state.
+// It is deliberately not `Sync`: the `Kept` list holds values that are `Send` only.
 unsafe impl Send for CudaStream {}
-// SAFETY: as above.
-unsafe impl Sync for CudaStream {}
 
 impl CudaStream {
     /// New streams `names[i]` as lane `i`, each with a ring of `options.markers` events.
@@ -144,7 +161,7 @@ impl CudaStream {
         gpu: &Arc<CudaGpu>,
         names: &[&str],
         options: StreamOptions,
-    ) -> Result<Vec<Arc<CudaStream>>, GpuError> {
+    ) -> Result<Vec<CudaStream>, GpuError> {
         if names.is_empty() || names.len() > 64 {
             return Err(GpuError::Invalid("a pool has 1 to 64 lanes".into()));
         }
@@ -166,26 +183,32 @@ impl CudaStream {
             // SAFETY: an out pointer; the context is current.
             let code = unsafe { (f.stream_create)(&mut raw, STREAM_NON_BLOCKING) };
             device.check("cuStreamCreate", code).map_err(from_cuda)?;
-            streams.push(Arc::new(CudaStream {
+            streams.push(CudaStream {
                 gpu: gpu.clone(),
                 id: lanes[i].id,
                 lane: LaneId(u16::try_from(i).expect("at most 64 lanes")),
-                name: (*name).to_owned(),
                 raw,
+                queue: Arc::new(CudaQueue {
+                    gpu: gpu.clone(),
+                    ring: lanes[i].clone(),
+                    name: (*name).to_owned(),
+                }),
                 ring: lanes[i].clone(),
                 lanes: lanes.clone(),
-                state: StreamLock::new(StreamState {
-                    shadow: None,
-                    next_retire: 0,
-                }),
+                shadow: None,
+                next_retire: 0,
                 kept: Kept::default(),
-            }));
+            });
         }
         Ok(streams)
     }
 
-    /// A marker after the work submitted so far. The caller holds the stream's lock and the context is current.
-    pub(crate) fn mark_held(&self) -> Result<Marker, GpuError> {
+    pub(crate) fn queue_arc(&self) -> Arc<CudaQueue> {
+        self.queue.clone()
+    }
+
+    /// A marker after the work submitted so far. The context is current.
+    pub(crate) fn mark_now(&self) -> Result<Marker, GpuError> {
         self.gpu.poison.check()?;
         let ring = &self.ring;
         let n = ring.events.len() as u64;
@@ -205,9 +228,8 @@ impl CudaStream {
         Ok(Marker::new(self.id, self.lane, value))
     }
 
-    /// Later work on `target` (this stream, or a stream of a recording) waits for `marker`. The caller holds the
-    /// lock of `target` and the context is current.
-    pub(crate) fn await_held(&self, target: CuStream, marker: Marker) -> Result<(), GpuError> {
+    /// Later work on `target` (this stream, or its shadow) waits for `marker`. The context is current.
+    pub(crate) fn await_now(&self, target: CuStream, marker: Marker) -> Result<(), GpuError> {
         self.gpu.poison.check()?;
         let other = self
             .lanes
@@ -255,16 +277,10 @@ impl Drop for CudaStream {
             return;
         };
         let f = &self.gpu.device().driver.fns;
-        let shadow = self
-            .state
-            .lock()
-            .ok()
-            .and_then(|state| state.shadow)
-            .map(|h| h.0);
         // SAFETY: streams made by this value, no longer in use; the context is current.
         unsafe {
             (f.stream_synchronize)(self.raw);
-            if let Some(shadow) = shadow {
+            if let Some(shadow) = self.shadow {
                 (f.stream_synchronize)(shadow);
             }
         }
@@ -272,33 +288,10 @@ impl Drop for CudaStream {
         // SAFETY: as above.
         unsafe {
             (f.stream_destroy)(self.raw);
-            if let Some(shadow) = shadow {
+            if let Some(shadow) = self.shadow {
                 (f.stream_destroy)(shadow);
             }
         }
-    }
-}
-
-impl DeviceQueue for CudaStream {
-    fn id(&self) -> QueueId {
-        self.id
-    }
-
-    fn completed(&self) -> u64 {
-        if self.gpu.poison.get().is_some() {
-            return self.ring.marked.load(Ordering::Acquire);
-        }
-        if let Ok(_c) = self.enter() {
-            self.ring.scan(&self.gpu);
-        }
-        if self.gpu.poison.get().is_some() {
-            return self.ring.marked.load(Ordering::Acquire);
-        }
-        self.ring.done.load(Ordering::Acquire)
-    }
-
-    fn name(&self) -> &str {
-        &self.name
     }
 }
 
@@ -314,38 +307,45 @@ impl Stream for CudaStream {
         self.lane
     }
 
+    fn id(&self) -> QueueId {
+        self.id
+    }
+
+    fn queue(&self) -> Arc<dyn DeviceQueue> {
+        self.queue.clone()
+    }
+
     fn submit<R>(
-        &self,
+        &mut self,
         f: impl FnOnce(&mut CudaEnqueue<'_>) -> Result<R, GpuError>,
     ) -> Result<R, GpuError> {
-        let mut guard = self.state.lock()?;
         self.gpu.poison.check()?;
-        let _c = self.enter()?;
-        f(&mut CudaEnqueue::on_stream(self, &mut guard))
+        // One reference-count increment, so the context guard does not borrow the stream that `f` enqueues on.
+        let gpu = self.gpu.clone();
+        let _c = gpu.device().enter().map_err(from_cuda)?;
+        f(&mut CudaEnqueue::on_stream(&gpu, self))
     }
 
-    fn mark(&self) -> Result<Marker, GpuError> {
-        let _guard = self.state.lock()?;
+    fn mark(&mut self) -> Result<Marker, GpuError> {
         let _c = self.enter()?;
-        self.mark_held()
+        self.mark_now()
     }
 
-    fn await_marker(&self, marker: Marker) -> Result<(), GpuError> {
-        let _guard = self.state.lock()?;
+    fn await_marker(&mut self, marker: Marker) -> Result<(), GpuError> {
         let _c = self.enter()?;
-        self.await_held(self.raw, marker)
+        self.await_now(self.raw, marker)
     }
 
-    fn notify_retired(&self, listener: Box<dyn RetireListener>) -> Result<(), GpuError> {
-        let mut guard = self.state.lock()?;
+    fn notify_retired(&mut self, listener: Box<dyn RetireListener>) -> Result<(), GpuError> {
         self.gpu.poison.check()?;
-        let _c = self.enter()?;
-        self.arm(guard.next_retire, listener)?;
-        guard.next_retire += 1;
+        let gpu = self.gpu.clone();
+        let _c = gpu.device().enter().map_err(from_cuda)?;
+        self.arm(self.next_retire, listener)?;
+        self.next_retire += 1;
         Ok(())
     }
 
-    fn confirm_retired(&self, ticket: RetireTicket) -> Option<GpuError> {
+    fn confirm_retired(&mut self, ticket: RetireTicket) -> Option<GpuError> {
         if ticket.stream() != self.id {
             return Some(GpuError::Invalid(
                 "a retirement ticket of another stream".into(),

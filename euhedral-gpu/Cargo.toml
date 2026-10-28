@@ -20,6 +20,8 @@ euhedral-core = { path = "../euhedral-core" }
 euhedral-graph = { path = "../euhedral-graph", default-features = false }
 # The driver, the device and the allocations that kernels and copies use.
 euhedral-memory = { path = "../euhedral-memory", default-features = false }
+# `PlainQueue`: a submitter's single-owner list of kept values.
+euhedral-data-structures = { path = "../euhedral-data-structures" }
 # The module cache key and the shape fingerprint.
 euhedral-hashing = { path = "../euhedral-hashing" }
 libc = { version = "0.2.174", optional = true }

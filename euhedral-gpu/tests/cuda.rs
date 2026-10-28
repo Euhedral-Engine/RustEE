@@ -64,7 +64,7 @@ mod streams {
     #[test]
     fn a_stream_is_a_lane_whose_markers_complete() {
         let Some(gpu) = gpu() else { return };
-        let (pool, s) = gpu
+        let (pool, mut s) = gpu
             .open_lanes(&["compute"], StreamOptions::default())
             .unwrap();
         let mem = device_memory(&gpu);
@@ -77,18 +77,16 @@ mod streams {
         let m = s[0].mark().unwrap();
         assert_eq!(m, Marker::new(s[0].id(), LaneId(0), 1));
         assert!(reached_within(&pool, m, Duration::from_secs(5)));
-        assert_eq!(s[0].name(), "compute");
+        assert_eq!(s[0].queue().name(), "compute");
         drop((pool, s));
         // SAFETY: the stream ended its work before it dropped; nothing uses the block.
         unsafe { mem.free(buf) };
     }
 
-    use euhedral_graph::DeviceQueue;
-
     #[test]
     fn copies_round_trip_through_the_device() {
         let Some(gpu) = gpu() else { return };
-        let (pool, s) = gpu.open_lanes(&["copy"], StreamOptions::default()).unwrap();
+        let (pool, mut s) = gpu.open_lanes(&["copy"], StreamOptions::default()).unwrap();
         let mem = device_memory(&gpu);
         let pinned = PinnedHost::new(gpu.device().clone(), LocationId(1), 0);
         let len = 1usize << 20;
@@ -119,7 +117,7 @@ mod streams {
         let m = s[0].mark().unwrap();
         assert!(reached_within(&pool, m, Duration::from_secs(5)));
         assert_eq!(src_bytes, dst_bytes);
-        assert_eq!(s[0].completed(), 1);
+        assert_eq!(s[0].queue().completed(), 1);
         drop((pool, s));
         // SAFETY: the stream is gone and nothing uses the blocks.
         unsafe {
@@ -132,18 +130,19 @@ mod streams {
     #[test]
     fn a_marker_from_an_unknown_lane_is_invalid() {
         let Some(gpu) = gpu() else { return };
-        let (_pool, s) = gpu.open_lanes(&["a"], StreamOptions::default()).unwrap();
-        let r = s[0].await_marker(Marker::new(s[0].id(), LaneId(9), 1));
+        let (_pool, mut s) = gpu.open_lanes(&["a"], StreamOptions::default()).unwrap();
+        let own = s[0].id();
+        let r = s[0].await_marker(Marker::new(own, LaneId(9), 1));
         assert!(matches!(r, Err(GpuError::Invalid(_))), "{r:?}");
     }
 
     #[test]
     fn a_marker_of_another_pool_is_refused_not_treated_as_done() {
         let Some(gpu) = gpu() else { return };
-        let (pool_a, a) = gpu
+        let (pool_a, mut a) = gpu
             .open_lanes(&["a0", "a1"], StreamOptions::default())
             .unwrap();
-        let (pool_b, b) = gpu
+        let (pool_b, mut b) = gpu
             .open_lanes(&["b0", "b1"], StreamOptions::default())
             .unwrap();
         // A real marker of pool b, made and long done: its lane exists in pool a and its value is below a's own.
@@ -155,8 +154,8 @@ mod streams {
         let refused = a[1].await_marker(from_b);
         assert!(matches!(refused, Err(GpuError::Invalid(_))), "{refused:?}");
         // The same lane and value, stamped with pool a's queue, is accepted (and needs no device wait).
-        a[1].await_marker(Marker::new(a[0].id(), from_b.lane, from_b.value))
-            .unwrap();
+        let own = Marker::new(a[0].id(), from_b.lane, from_b.value);
+        a[1].await_marker(own).unwrap();
         // Another pool's pool does not reach it either.
         assert!(!pool_a.reached(from_b));
         // A marker with an in-range lane and a done value, but a queue that is neither pool's, is refused too.
@@ -196,7 +195,7 @@ mod streams {
     #[test]
     fn retirement_listeners_run_once_in_order() {
         let Some(gpu) = gpu() else { return };
-        let (pool, s) = gpu.open_lanes(&["a"], StreamOptions::default()).unwrap();
+        let (pool, mut s) = gpu.open_lanes(&["a"], StreamOptions::default()).unwrap();
         let mem = device_memory(&gpu);
         let buf = mem.alloc(1 << 20).unwrap();
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -232,7 +231,7 @@ mod streams {
         use euhedral_core::frames::RunnableFrame;
         use euhedral_core::generics::LatticeSource;
         let Some(gpu) = gpu() else { return };
-        let (pool, s) = gpu.open_lanes(&["a"], StreamOptions::default()).unwrap();
+        let (pool, mut s) = gpu.open_lanes(&["a"], StreamOptions::default()).unwrap();
         let mem = device_memory(&gpu);
         let buf = mem.alloc(1 << 20).unwrap();
         let completions = euhedral_graph::Completions::new(pool.clone());
@@ -242,16 +241,21 @@ mod streams {
             unsafe { q.memset(buf.addr, 1, 1 << 20) }
         })
         .unwrap();
-        euhedral_gpu::retire_into(&s[0], &completions, {
-            let (stream, ran) = (s[0].clone(), ran.clone());
-            move |ticket| {
-                Box::new(RunnableFrame::new(
-                    1,
-                    Arc::new(move || ran.lock().unwrap().push(stream.confirm_retired(ticket))),
-                ))
-            }
-        })
-        .unwrap();
+        // The submitter travels with its continuation: the frame owns it, confirms the ticket, and drops it.
+        let stream = s.remove(0);
+        assert!(
+            euhedral_gpu::retire_into(stream, &completions, {
+                let ran = ran.clone();
+                move |mut stream, ticket| {
+                    let outcome = stream.confirm_retired(ticket);
+                    Box::new(RunnableFrame::new(
+                        1,
+                        Arc::new(move || ran.lock().unwrap().push(outcome.clone())),
+                    ))
+                }
+            })
+            .is_ok()
+        );
         // The test thread is the worker: it polls until the continuation is emitted.
         assert!(wait_until(Duration::from_secs(5), || {
             completions.pull(
@@ -273,7 +277,7 @@ mod streams {
     #[test]
     fn a_ticket_of_another_stream_is_refused_and_frees_nothing() {
         let Some(gpu) = gpu() else { return };
-        let (pool, s) = gpu
+        let (pool, mut s) = gpu
             .open_lanes(&["a", "b"], StreamOptions::default())
             .unwrap();
         let mem = device_memory(&gpu);
@@ -314,7 +318,7 @@ mod streams {
     #[test]
     fn kept_host_buffers_outlive_the_copy_until_confirmed() {
         let Some(gpu) = gpu() else { return };
-        let (pool, s) = gpu.open_lanes(&["a"], StreamOptions::default()).unwrap();
+        let (pool, mut s) = gpu.open_lanes(&["a"], StreamOptions::default()).unwrap();
         let mem = device_memory(&gpu);
         let pinned = PinnedHost::new(gpu.device().clone(), LocationId(1), 0);
         let host = Arc::new(pinned.alloc(1 << 20).unwrap());
@@ -548,7 +552,7 @@ mod launches {
             eprintln!("neither NVRTC nor a 13.1 driver: skipped");
             return;
         }
-        let (pool, s) = gpu
+        let (pool, mut s) = gpu
             .open_lanes(&["compute"], StreamOptions::default())
             .unwrap();
         let mem = device_memory(&gpu);
@@ -617,7 +621,7 @@ mod launches {
         }
         let module = CudaModule::from_image(&gpu, OPS_PTX).unwrap();
         let axpb = module.kernel("axpb").unwrap();
-        let (_pool, s) = gpu
+        let (_pool, mut s) = gpu
             .open_lanes(&["compute"], StreamOptions::default())
             .unwrap();
         let args = Args::new()
@@ -645,7 +649,6 @@ mod markers {
         Args, CompileOptions, Enqueue, Gpu, GpuError, Launch, Module, RetireListener, RetireTicket,
         Stream, StreamOptions,
     };
-    use euhedral_graph::DeviceQueue;
     use euhedral_memory::cuda::PinnedHost;
     use euhedral_memory::{Backend, LocationId};
 
@@ -671,7 +674,7 @@ mod markers {
         let Some(gpu) = gpu() else { return };
         let Some(ops) = ops(&gpu) else { return };
         let (spin, add) = (ops.kernel("spin").unwrap(), ops.kernel("add_u32").unwrap());
-        let (pool, s) = gpu
+        let (pool, mut s) = gpu
             .open_lanes(&["a", "b"], StreamOptions::default())
             .unwrap();
         let mem = device_memory(&gpu);
@@ -749,7 +752,7 @@ mod markers {
         let Some(gpu) = gpu() else { return };
         let Some(ops) = ops(&gpu) else { return };
         let spin = ops.kernel("spin").unwrap();
-        let (pool, s) = gpu
+        let (pool, mut s) = gpu
             .open_lanes(&["a", "b"], StreamOptions::default())
             .unwrap();
         let order = Arc::new(Mutex::new(Vec::new()));
@@ -779,17 +782,18 @@ mod markers {
         let Some(gpu) = gpu() else { return };
         let Some(ops) = ops(&gpu) else { return };
         let spin = ops.kernel("spin").unwrap();
-        let (pool, s) = gpu
+        let (pool, mut s) = gpu
             .open_lanes(&["a", "b"], StreamOptions { markers: 4 })
             .unwrap();
-        let spin_for = |ms: u64| {
-            s[0].submit(|q| {
-                // SAFETY: `spin` takes one 64-bit argument and touches no memory.
-                unsafe { q.launch(&spin, Launch::linear(1, 1), &Args::new().arg(cycles(ms))) }
-            })
-            .unwrap();
+        let spin_for = |stream: &mut euhedral_gpu::cuda::CudaStream, ms: u64| {
+            stream
+                .submit(|q| {
+                    // SAFETY: `spin` takes one 64-bit argument and touches no memory.
+                    unsafe { q.launch(&spin, Launch::linear(1, 1), &Args::new().arg(cycles(ms))) }
+                })
+                .unwrap();
         };
-        spin_for(300);
+        spin_for(&mut s[0], 300);
         let first = s[0].mark().unwrap();
         let mut last = first;
         for _ in 1..4 {
@@ -802,7 +806,7 @@ mod markers {
         );
         assert!(reached_within(&pool, last, Duration::from_secs(10)));
         // A fifth marker reuses the first slot, behind a long spin.
-        spin_for(1500);
+        spin_for(&mut s[0], 1500);
         let fifth = s[0].mark().unwrap();
         assert_eq!(fifth.value, 5);
         // The first marker completed long ago: waiting for it adds no device wait, though its slot now holds the
@@ -812,7 +816,7 @@ mod markers {
         assert!(reached_within(&pool, other, Duration::from_secs(10)));
         assert!(!pool.reached(fifth), "stream a is still spinning");
         assert!(reached_within(&pool, fifth, Duration::from_secs(30)));
-        let _ = s[0].completed();
+        let _ = s[0].queue().completed();
         drop((pool, s));
     }
 }

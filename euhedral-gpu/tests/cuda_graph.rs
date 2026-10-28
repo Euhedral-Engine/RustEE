@@ -13,7 +13,7 @@ use euhedral_gpu::{
     Args, CompileOptions, Enqueue, Gpu, GpuError, Graph, Launch, Module, Rerecorded, Sequence,
     Stream, StreamOptions,
 };
-use euhedral_graph::{DeviceQueue, LanePool, Marker};
+use euhedral_graph::{LanePool, Marker};
 use euhedral_memory::cuda::{DeviceMemory, PinnedHost};
 use euhedral_memory::{Backend, Block, LocationId};
 
@@ -45,7 +45,6 @@ fn wait_until(limit: Duration, condition: impl Fn() -> bool) -> bool {
 struct Fixture {
     gpu: Arc<CudaGpu>,
     pool: Arc<LanePool>,
-    s: Vec<Arc<CudaStream>>,
     axpb: CudaKernel,
     add: CudaKernel,
     spin: CudaKernel,
@@ -59,7 +58,9 @@ struct Fixture {
 }
 
 impl Fixture {
-    fn new() -> Option<Self> {
+    /// The fixture and its two submitters: each lane's stream is owned by the test, not by the fixture. Declare the
+    /// streams after the fixture, so they drop (and end their work) first.
+    fn new() -> Option<(Self, Vec<CudaStream>)> {
         let gpu = match CudaGpu::open(0) {
             Ok(gpu) => gpu,
             Err(e) => {
@@ -68,7 +69,7 @@ impl Fixture {
             }
         };
         let module = ops(&gpu)?;
-        let (pool, s) = gpu
+        let (pool, mut s) = gpu
             .open_lanes(&["a", "b"], StreamOptions::default())
             .unwrap();
         let mem = DeviceMemory {
@@ -91,7 +92,6 @@ impl Fixture {
             spin: module.kernel("spin").unwrap(),
             gpu,
             pool,
-            s,
             mem,
             pinned,
             x,
@@ -104,14 +104,13 @@ impl Fixture {
         for (i, v) in init.iter_mut().enumerate() {
             *v = (i as f32 * 0.25).to_bits();
         }
-        fixture.s[0]
-            .submit(|q| {
-                // SAFETY: valid blocks; the marker below is waited for before the buffers are used again.
-                unsafe { q.copy_to_device(fixture.x.addr, fixture.out[0].addr as *const u8, BYTES) }
-            })
-            .unwrap();
-        fixture.settle(0);
-        Some(fixture)
+        s[0].submit(|q| {
+            // SAFETY: valid blocks; the marker below is waited for before the buffers are used again.
+            unsafe { q.copy_to_device(fixture.x.addr, fixture.out[0].addr as *const u8, BYTES) }
+        })
+        .unwrap();
+        fixture.settle(&mut s, 0);
+        Some((fixture, s))
     }
 
     #[allow(
@@ -128,8 +127,8 @@ impl Fixture {
     }
 
     /// Waits (from the test thread) for everything submitted so far on stream `which`, and the streams it joined.
-    fn settle(&self, which: usize) {
-        let m: Marker = self.s[which].mark().unwrap();
+    fn settle(&self, s: &mut [CudaStream], which: usize) {
+        let m: Marker = s[which].mark().unwrap();
         assert!(
             wait_until(Duration::from_secs(10), || self.pool.reached(m)),
             "the work ends"
@@ -226,7 +225,7 @@ impl Fixture {
     }
 
     /// The same work submitted directly, with markers between the streams.
-    fn direct(&self, a: f32, b: f32, which: usize) {
+    fn direct(&self, s: &mut [CudaStream], a: f32, b: f32, which: usize) {
         let first = Args::new()
             .device(self.y.addr)
             .device(self.x.addr)
@@ -239,35 +238,32 @@ impl Fixture {
             .arg(3u32)
             .arg(N as u32);
         let geometry = Launch::linear(N as u32, 256);
-        self.s[0]
-            .submit(|e| {
-                // SAFETY: matching arguments over live blocks.
-                unsafe { e.launch(&self.axpb, geometry, &first) }
-            })
-            .unwrap();
-        let m = self.s[0].mark().unwrap();
-        self.s[1].await_marker(m).unwrap();
-        self.s[1]
-            .submit(|e| {
-                // SAFETY: as above.
-                unsafe { e.launch(&self.add, geometry, &second) }
-            })
-            .unwrap();
-        let m = self.s[1].mark().unwrap();
-        self.s[0].await_marker(m).unwrap();
-        self.s[0]
-            .submit(|e| {
-                // SAFETY: as above.
-                unsafe { e.copy_to_host(self.out[which].addr as *mut u8, self.z.addr, BYTES) }
-            })
-            .unwrap();
+        s[0].submit(|e| {
+            // SAFETY: matching arguments over live blocks.
+            unsafe { e.launch(&self.axpb, geometry, &first) }
+        })
+        .unwrap();
+        let m = s[0].mark().unwrap();
+        s[1].await_marker(m).unwrap();
+        s[1].submit(|e| {
+            // SAFETY: as above.
+            unsafe { e.launch(&self.add, geometry, &second) }
+        })
+        .unwrap();
+        let m = s[1].mark().unwrap();
+        s[0].await_marker(m).unwrap();
+        s[0].submit(|e| {
+            // SAFETY: as above.
+            unsafe { e.copy_to_host(self.out[which].addr as *mut u8, self.z.addr, BYTES) }
+        })
+        .unwrap();
     }
 
     /// Arms a retirement on every stream, waits for both, and confirms them: whatever the streams were keeping for
     /// the work so far is released.
-    fn confirm_everything(&self) {
+    fn confirm_everything(&self, s: &mut [CudaStream]) {
         let told = Arc::new(std::sync::Mutex::new(Vec::new()));
-        for stream in &self.s {
+        for stream in s.iter_mut() {
             stream.notify_retired(Box::new(Told(told.clone()))).unwrap();
         }
         assert!(wait_until(Duration::from_secs(10), || told
@@ -276,37 +272,36 @@ impl Fixture {
             .len()
             == 2));
         for ticket in told.lock().unwrap().iter() {
-            let stream = self.s.iter().find(|s| s.id() == ticket.stream()).unwrap();
+            let stream = s.iter_mut().find(|s| s.id() == ticket.stream()).unwrap();
             assert_eq!(stream.confirm_retired(*ticket), None);
         }
     }
 
-    fn streams(&self) -> [&Arc<CudaStream>; 2] {
-        [&self.s[0], &self.s[1]]
-    }
-
-    fn clear(&self) {
-        self.settle(0);
-        self.settle(1);
+    fn clear(&self, s: &mut [CudaStream]) {
+        self.settle(s, 0);
+        self.settle(s, 1);
         self.out_words_mut(0).fill(0);
         self.out_words_mut(1).fill(0);
-        self.s[0]
-            .submit(|q| {
-                // SAFETY: live blocks; settled before the next use.
-                unsafe {
-                    q.memset(self.y.addr, 0, BYTES)?;
-                    q.memset(self.z.addr, 0, BYTES)
-                }
-            })
-            .unwrap();
-        self.settle(0);
+        s[0].submit(|q| {
+            // SAFETY: live blocks; settled before the next use.
+            unsafe {
+                q.memset(self.y.addr, 0, BYTES)?;
+                q.memset(self.z.addr, 0, BYTES)
+            }
+        })
+        .unwrap();
+        self.settle(s, 0);
     }
+}
+
+/// Both submitters, borrowed for a recording.
+fn pair(s: &mut [CudaStream]) -> [&mut CudaStream; 2] {
+    let (a, b) = s.split_at_mut(1);
+    [&mut a[0], &mut b[0]]
 }
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        // The streams end their work as they drop (a shutdown call).
-        self.s.clear();
         // SAFETY: nothing runs on the device any more; the blocks are unused.
         unsafe {
             for b in [self.x, self.y, self.z] {
@@ -321,42 +316,46 @@ impl Drop for Fixture {
 
 #[test]
 fn record_runs_the_sequence_once_and_replay_repeats_it() {
-    let Some(f) = Fixture::new() else { return };
-    f.clear();
-    let graph = f
+    let Some((f, mut s)) = Fixture::new() else {
+        return;
+    };
+    f.clear(&mut s);
+    let mut graph = f
         .gpu
-        .record(&f.streams(), |q| f.sequence(q, 1.5, -2.0, 0))
+        .record(&mut pair(&mut s), |q| f.sequence(q, 1.5, -2.0, 0))
         .unwrap();
     assert_eq!(graph.launches(), 2);
-    f.settle(0);
+    f.settle(&mut s, 0);
     let reference = f.reference(1.5, -2.0);
     assert!(
         f.out_words(0) == reference,
         "the recording ran the sequence for real"
     );
-    f.clear();
-    graph.replay(&f.s[0]).unwrap();
-    f.settle(0);
+    f.clear(&mut s);
+    graph.replay(&mut s[0]).unwrap();
+    f.settle(&mut s, 0);
     assert!(f.out_words(0) == reference, "the replay repeats it");
     drop(graph);
 }
 
 #[test]
 fn replay_matches_direct_submission_bit_for_bit() {
-    let Some(f) = Fixture::new() else { return };
-    f.clear();
-    let graph = f
+    let Some((f, mut s)) = Fixture::new() else {
+        return;
+    };
+    f.clear(&mut s);
+    let mut graph = f
         .gpu
-        .record(&f.streams(), |q| f.sequence(q, 0.5, 1.0, 0))
+        .record(&mut pair(&mut s), |q| f.sequence(q, 0.5, 1.0, 0))
         .unwrap();
-    f.settle(0);
-    f.clear();
-    graph.replay(&f.s[0]).unwrap();
-    f.settle(0);
+    f.settle(&mut s, 0);
+    f.clear(&mut s);
+    graph.replay(&mut s[0]).unwrap();
+    f.settle(&mut s, 0);
     let replayed = f.out_words(0);
-    f.clear();
-    f.direct(0.5, 1.0, 1);
-    f.settle(0);
+    f.clear(&mut s);
+    f.direct(&mut s, 0.5, 1.0, 1);
+    f.settle(&mut s, 0);
     assert!(
         replayed == f.out_words(1),
         "replay equals direct submission"
@@ -366,82 +365,75 @@ fn replay_matches_direct_submission_bit_for_bit() {
 
 #[test]
 fn a_replay_runs_on_any_stream() {
-    let Some(f) = Fixture::new() else { return };
-    f.clear();
-    let graph = f
+    let Some((f, mut s)) = Fixture::new() else {
+        return;
+    };
+    f.clear(&mut s);
+    let mut graph = f
         .gpu
-        .record(&f.streams(), |q| f.sequence(q, 2.0, 0.0, 0))
+        .record(&mut pair(&mut s), |q| f.sequence(q, 2.0, 0.0, 0))
         .unwrap();
-    f.settle(0);
-    f.clear();
-    graph.replay(&f.s[1]).unwrap();
-    f.settle(1);
+    f.settle(&mut s, 0);
+    f.clear(&mut s);
+    graph.replay(&mut s[1]).unwrap();
+    f.settle(&mut s, 1);
     assert!(f.out_words(0) == f.reference(2.0, 0.0));
 }
 
 #[test]
-fn submissions_from_other_threads_wait_out_a_recording() {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    let Some(f) = Fixture::new() else { return };
-    f.clear();
-    let inside = AtomicBool::new(false);
-    let seen_inside = AtomicBool::new(true);
-    let graph = std::thread::scope(|scope| {
-        let peer = scope.spawn(|| {
-            assert!(wait_until(Duration::from_secs(10), || inside.load(Ordering::Acquire)));
-            f.s[0]
-                .submit(|q| {
-                    seen_inside.store(inside.load(Ordering::Acquire), Ordering::Release);
-                    // SAFETY: `spin` takes one 64-bit argument and touches no memory.
-                    unsafe { q.launch(&f.spin, Launch::linear(1, 1), &Args::new().arg(1000u64)) }
-                })
-                .unwrap();
-        });
-        let graph = f
-            .gpu
-            .record(&f.streams(), |q| {
-                inside.store(true, Ordering::Release);
-                f.sequence(q, 1.0, 1.0, 0)?;
-                std::thread::sleep(Duration::from_millis(20));
-                inside.store(false, Ordering::Release);
-                Ok(())
+fn a_graph_and_its_submitter_move_to_another_thread_and_replay_there() {
+    let Some((f, mut s)) = Fixture::new() else {
+        return;
+    };
+    f.clear(&mut s);
+    let mut graph = f
+        .gpu
+        .record(&mut pair(&mut s), |q| f.sequence(q, 2.0, 1.0, 0))
+        .unwrap();
+    f.settle(&mut s, 0);
+    f.clear(&mut s);
+    // The owner hands the graph and lane b's submitter to another thread, as a frame would carry them to a worker.
+    // Nothing is locked: only the owner can use them.
+    let mut b = s.remove(1);
+    let (graph, mut b) = std::thread::scope(|scope| {
+        scope
+            .spawn(move || {
+                for _ in 0..20 {
+                    graph.replay(&mut b).unwrap();
+                }
+                (graph, b)
             })
-            .unwrap();
-        peer.join().unwrap();
-        graph
+            .join()
+            .unwrap()
     });
-    assert!(
-        !seen_inside.load(Ordering::Acquire),
-        "the peer's submission ran after the recording ended"
-    );
-    assert_eq!(
-        graph.launches(),
-        2,
-        "the peer's launch is not in the recording"
-    );
-    f.settle(0);
+    f.settle(std::slice::from_mut(&mut b), 0);
+    assert!(f.out_words(0) == f.reference(2.0, 1.0));
+    assert_eq!(f.gpu.poisoned(), None);
+    drop((graph, b));
 }
 
 #[test]
 fn replays_with_changing_arguments_match_direct_submission() {
-    let Some(f) = Fixture::new() else { return };
-    f.clear();
+    let Some((f, mut s)) = Fixture::new() else {
+        return;
+    };
+    f.clear(&mut s);
     let mut graph = f
         .gpu
-        .record(&f.streams(), |q| f.sequence(q, 9.0, 1.0, 0))
+        .record(&mut pair(&mut s), |q| f.sequence(q, 9.0, 1.0, 0))
         .unwrap();
-    f.settle(0);
+    f.settle(&mut s, 0);
     for a in [0.5f32, 1.0, 2.0, 3.5] {
-        f.clear();
+        f.clear(&mut s);
         f.gpu
             .update(&mut graph, |q| f.sequence(q, a, 1.0, 0))
             .unwrap();
-        graph.replay(&f.s[0]).unwrap();
-        f.settle(0);
+        graph.replay(&mut s[0]).unwrap();
+        f.settle(&mut s, 0);
         let replayed = f.out_words(0);
-        f.clear();
-        f.direct(a, 1.0, 1);
-        f.settle(0);
+        f.clear(&mut s);
+        f.direct(&mut s, a, 1.0, 1);
+        f.settle(&mut s, 0);
         assert!(
             replayed == f.out_words(1),
             "a = {a}: replay equals direct submission"
@@ -452,8 +444,10 @@ fn replays_with_changing_arguments_match_direct_submission() {
 
 #[test]
 fn updates_between_replays_do_not_touch_a_replay_in_flight() {
-    let Some(f) = Fixture::new() else { return };
-    f.clear();
+    let Some((f, mut s)) = Fixture::new() else {
+        return;
+    };
+    f.clear(&mut s);
     // One stream: a spin, then y[dst] = a x + 0.5, with the destination an argument.
     let sequence = |q: &mut euhedral_gpu::cuda::CudaSequence<'_>, a: f32, dst: u64| {
         let args = Args::new()
@@ -476,28 +470,27 @@ fn updates_between_replays_do_not_touch_a_replay_in_flight() {
     };
     let mut graph = f
         .gpu
-        .record(&[&f.s[0]], |q| sequence(q, 9.0, f.y.addr))
+        .record(&mut [&mut s[0]], |q| sequence(q, 9.0, f.y.addr))
         .unwrap();
-    f.clear();
+    f.clear(&mut s);
     f.gpu
         .update(&mut graph, |q| sequence(q, 1.0, f.y.addr))
         .unwrap();
-    graph.replay(&f.s[0]).unwrap();
+    graph.replay(&mut s[0]).unwrap();
     // The first replay is still spinning: the update must not reach it.
     f.gpu
         .update(&mut graph, |q| sequence(q, 2.0, f.z.addr))
         .unwrap();
-    graph.replay(&f.s[0]).unwrap();
-    f.s[0]
-        .submit(|q| {
-            // SAFETY: live blocks; settled below.
-            unsafe {
-                q.copy_to_host(f.out[0].addr as *mut u8, f.y.addr, BYTES)?;
-                q.copy_to_host(f.out[1].addr as *mut u8, f.z.addr, BYTES)
-            }
-        })
-        .unwrap();
-    f.settle(0);
+    graph.replay(&mut s[0]).unwrap();
+    s[0].submit(|q| {
+        // SAFETY: live blocks; settled below.
+        unsafe {
+            q.copy_to_host(f.out[0].addr as *mut u8, f.y.addr, BYTES)?;
+            q.copy_to_host(f.out[1].addr as *mut u8, f.z.addr, BYTES)
+        }
+    })
+    .unwrap();
+    f.settle(&mut s, 0);
     let expected = |a: f32| -> Vec<u32> {
         (0..N)
             .map(|i| a.mul_add(i as f32 * 0.25, 0.5).to_bits())
@@ -515,13 +508,15 @@ fn updates_between_replays_do_not_touch_a_replay_in_flight() {
 
 #[test]
 fn the_probe_fingerprint_equals_the_recordings() {
-    let Some(f) = Fixture::new() else { return };
-    f.clear();
+    let Some((f, mut s)) = Fixture::new() else {
+        return;
+    };
+    f.clear(&mut s);
     let graph = f
         .gpu
-        .record(&f.streams(), |q| f.sequence(q, 2.0, 1.0, 0))
+        .record(&mut pair(&mut s), |q| f.sequence(q, 2.0, 1.0, 0))
         .unwrap();
-    f.settle(0);
+    f.settle(&mut s, 0);
     let probed = f
         .gpu
         .fingerprint(2, |q| f.sequence(q, 9.0, -4.0, 0))
@@ -544,13 +539,15 @@ fn the_probe_fingerprint_equals_the_recordings() {
 
 #[test]
 fn an_update_of_another_shape_applies_nothing() {
-    let Some(f) = Fixture::new() else { return };
-    f.clear();
+    let Some((f, mut s)) = Fixture::new() else {
+        return;
+    };
+    f.clear(&mut s);
     let mut graph = f
         .gpu
-        .record(&f.streams(), |q| f.sequence(q, 2.0, 1.0, 0))
+        .record(&mut pair(&mut s), |q| f.sequence(q, 2.0, 1.0, 0))
         .unwrap();
-    f.settle(0);
+    f.settle(&mut s, 0);
     // The same launches with another geometry.
     let r = f.gpu.update(&mut graph, |q| {
         let first = Args::new()
@@ -565,9 +562,9 @@ fn an_update_of_another_shape_applies_nothing() {
         })
     });
     assert!(matches!(r, Err(GpuError::ShapeChanged { .. })), "{r:?}");
-    f.clear();
-    graph.replay(&f.s[0]).unwrap();
-    f.settle(0);
+    f.clear(&mut s);
+    graph.replay(&mut s[0]).unwrap();
+    f.settle(&mut s, 0);
     assert!(
         f.out_words(0) == f.reference(2.0, 1.0),
         "the previous arguments still apply"
@@ -576,28 +573,32 @@ fn an_update_of_another_shape_applies_nothing() {
 
 #[test]
 fn a_rerecord_of_the_same_topology_updates_in_place() {
-    let Some(f) = Fixture::new() else { return };
-    f.clear();
+    let Some((f, mut s)) = Fixture::new() else {
+        return;
+    };
+    f.clear(&mut s);
     let mut graph = f
         .gpu
-        .record(&f.streams(), |q| f.sequence(q, 1.5, -2.0, 0))
+        .record(&mut pair(&mut s), |q| f.sequence(q, 1.5, -2.0, 0))
         .unwrap();
-    f.settle(0);
-    f.clear();
+    f.settle(&mut s, 0);
+    f.clear(&mut s);
     // The same launches, copying to the other output buffer.
     let how = f
         .gpu
-        .rerecord(&mut graph, &f.streams(), |q| f.sequence(q, 2.0, 0.5, 1))
+        .rerecord(&mut graph, &mut pair(&mut s), |q| {
+            f.sequence(q, 2.0, 0.5, 1)
+        })
         .unwrap();
     assert_eq!(how, Rerecorded::Updated);
-    f.settle(0);
+    f.settle(&mut s, 0);
     assert!(
         f.out_words(1) == f.reference(2.0, 0.5),
         "the re-recording ran for real"
     );
-    f.clear();
-    graph.replay(&f.s[0]).unwrap();
-    f.settle(0);
+    f.clear(&mut s);
+    graph.replay(&mut s[0]).unwrap();
+    f.settle(&mut s, 0);
     assert!(
         f.out_words(1) == f.reference(2.0, 0.5),
         "the replay writes the new buffer"
@@ -607,12 +608,12 @@ fn a_rerecord_of_the_same_topology_updates_in_place() {
         "and not the old one"
     );
     // The node handles of the original graph still name the executable's nodes.
-    f.clear();
+    f.clear(&mut s);
     f.gpu
         .update(&mut graph, |q| f.sequence(q, 3.0, 0.0, 1))
         .unwrap();
-    graph.replay(&f.s[0]).unwrap();
-    f.settle(0);
+    graph.replay(&mut s[0]).unwrap();
+    f.settle(&mut s, 0);
     assert!(
         f.out_words(1) == f.reference(3.0, 0.0),
         "an update after a re-record takes effect"
@@ -621,42 +622,44 @@ fn a_rerecord_of_the_same_topology_updates_in_place() {
 
 #[test]
 fn a_rerecord_of_another_topology_instantiates_anew() {
-    let Some(f) = Fixture::new() else { return };
-    f.clear();
+    let Some((f, mut s)) = Fixture::new() else {
+        return;
+    };
+    f.clear(&mut s);
     let mut graph = f
         .gpu
-        .record(&f.streams(), |q| f.sequence(q, 1.5, -2.0, 0))
+        .record(&mut pair(&mut s), |q| f.sequence(q, 1.5, -2.0, 0))
         .unwrap();
-    f.settle(0);
-    f.clear();
+    f.settle(&mut s, 0);
+    f.clear(&mut s);
     let how = f
         .gpu
-        .rerecord(&mut graph, &f.streams(), |q| {
+        .rerecord(&mut graph, &mut pair(&mut s), |q| {
             f.sequence_extra(q, 2.0, 0.5, 5, 0)
         })
         .unwrap();
     assert_eq!(how, Rerecorded::Instantiated);
     assert_eq!(graph.launches(), 3);
-    f.settle(0);
+    f.settle(&mut s, 0);
     let expected: Vec<u32> = f
         .reference(2.0, 0.5)
         .into_iter()
         .map(|w| w.wrapping_add(5))
         .collect();
     assert!(f.out_words(0) == expected, "the re-recording ran for real");
-    f.clear();
-    graph.replay(&f.s[0]).unwrap();
-    f.settle(0);
+    f.clear(&mut s);
+    graph.replay(&mut s[0]).unwrap();
+    f.settle(&mut s, 0);
     assert!(
         f.out_words(0) == expected,
         "the new executable replays the new topology"
     );
-    f.clear();
+    f.clear(&mut s);
     f.gpu
         .update(&mut graph, |q| f.sequence_extra(q, 4.0, 0.5, 9, 0))
         .unwrap();
-    graph.replay(&f.s[0]).unwrap();
-    f.settle(0);
+    graph.replay(&mut s[0]).unwrap();
+    f.settle(&mut s, 0);
     let expected: Vec<u32> = f
         .reference(4.0, 0.5)
         .into_iter()
@@ -667,12 +670,14 @@ fn a_rerecord_of_another_topology_instantiates_anew() {
 
 #[test]
 fn a_failed_capture_never_disturbs_the_real_work() {
-    let Some(f) = Fixture::new() else { return };
-    f.clear();
+    let Some((f, mut s)) = Fixture::new() else {
+        return;
+    };
+    f.clear(&mut s);
     // Pageable host memory. This driver captures such a copy without complaint, so the capture is also failed by
     // the test hook, as a driver that refuses the copy would fail it.
     let pageable: Vec<u8> = (0..BYTES).map(|i| (i * 7 % 251) as u8).collect();
-    let result = f.gpu.record(&f.streams(), |q| {
+    let result = f.gpu.record(&mut pair(&mut s), |q| {
         q.submit(1, |e| {
             // SAFETY: `pageable` outlives the work (settled below); `z` is a live block.
             unsafe { e.copy_to_device(f.z.addr, pageable.as_ptr(), BYTES) }
@@ -689,8 +694,8 @@ fn a_failed_capture_never_disturbs_the_real_work() {
         "{:?}",
         result.map(|_| ())
     );
-    f.settle(0);
-    f.settle(1);
+    f.settle(&mut s, 0);
+    f.settle(&mut s, 1);
     let got: Vec<u8> = f
         .out_words(0)
         .iter()
@@ -699,25 +704,27 @@ fn a_failed_capture_never_disturbs_the_real_work() {
     assert!(got == pageable, "the real work ran and is correct");
     assert_eq!(f.gpu.poisoned(), None);
     // The streams and their shadows are usable again: direct submission, then a recording.
-    f.clear();
-    f.direct(2.0, 1.0, 0);
-    f.settle(0);
+    f.clear(&mut s);
+    f.direct(&mut s, 2.0, 1.0, 0);
+    f.settle(&mut s, 0);
     assert!(f.out_words(0) == f.reference(2.0, 1.0));
-    f.clear();
+    f.clear(&mut s);
     let graph = f
         .gpu
-        .record(&f.streams(), |q| f.sequence(q, 1.0, 1.0, 0))
+        .record(&mut pair(&mut s), |q| f.sequence(q, 1.0, 1.0, 0))
         .unwrap();
-    f.settle(0);
+    f.settle(&mut s, 0);
     assert!(f.out_words(0) == f.reference(1.0, 1.0));
     drop(graph);
 }
 
 #[test]
 fn an_error_in_the_closure_ends_the_capture_and_frees_the_streams() {
-    let Some(f) = Fixture::new() else { return };
-    f.clear();
-    let result = f.gpu.record(&f.streams(), |q| {
+    let Some((f, mut s)) = Fixture::new() else {
+        return;
+    };
+    f.clear(&mut s);
+    let result = f.gpu.record(&mut pair(&mut s), |q| {
         f.sequence(q, 1.0, 1.0, 0)?;
         Err(GpuError::Invalid("the caller gave up".into()))
     });
@@ -726,18 +733,18 @@ fn an_error_in_the_closure_ends_the_capture_and_frees_the_streams() {
         "{:?}",
         result.map(|_| ())
     );
-    f.settle(0);
-    f.settle(1);
+    f.settle(&mut s, 0);
+    f.settle(&mut s, 1);
     assert!(
         f.out_words(0) == f.reference(1.0, 1.0),
         "the work submitted before the error ran"
     );
-    f.clear();
+    f.clear(&mut s);
     let graph = f
         .gpu
-        .record(&f.streams(), |q| f.sequence(q, 2.0, 1.0, 0))
+        .record(&mut pair(&mut s), |q| f.sequence(q, 2.0, 1.0, 0))
         .unwrap();
-    f.settle(0);
+    f.settle(&mut s, 0);
     assert!(f.out_words(0) == f.reference(2.0, 1.0));
     drop(graph);
 }
@@ -752,12 +759,14 @@ impl euhedral_gpu::RetireListener for Told {
 
 #[test]
 fn a_graph_dropped_after_a_replay_leaves_the_replay_its_buffers() {
-    let Some(f) = Fixture::new() else { return };
-    f.clear();
+    let Some((f, mut s)) = Fixture::new() else {
+        return;
+    };
+    f.clear(&mut s);
     let token = Arc::new(());
-    let graph = f
+    let mut graph = f
         .gpu
-        .record(&f.streams(), |q| {
+        .record(&mut pair(&mut s), |q| {
             q.submit(0, |e| {
                 e.keep(Box::new(token.clone()));
                 Ok(())
@@ -765,25 +774,24 @@ fn a_graph_dropped_after_a_replay_leaves_the_replay_its_buffers() {
             f.sequence(q, 2.0, 1.0, 0)
         })
         .unwrap();
-    f.settle(0);
-    f.clear();
+    f.settle(&mut s, 0);
+    f.clear(&mut s);
     assert_eq!(Arc::strong_count(&token), 2, "the graph holds it");
     // A long spin ahead of the replay keeps it in flight while the graph drops.
-    f.s[0]
-        .submit(|q| {
-            // SAFETY: `spin` takes one 64-bit argument and touches no memory.
-            unsafe {
-                q.launch(
-                    &f.spin,
-                    Launch::linear(1, 1),
-                    &Args::new().arg(125_000_000u64),
-                )
-            }
-        })
-        .unwrap();
-    graph.replay(&f.s[0]).unwrap();
+    s[0].submit(|q| {
+        // SAFETY: `spin` takes one 64-bit argument and touches no memory.
+        unsafe {
+            q.launch(
+                &f.spin,
+                Launch::linear(1, 1),
+                &Args::new().arg(125_000_000u64),
+            )
+        }
+    })
+    .unwrap();
+    graph.replay(&mut s[0]).unwrap();
     let told = Arc::new(std::sync::Mutex::new(Vec::new()));
-    f.s[0].notify_retired(Box::new(Told(told.clone()))).unwrap();
+    s[0].notify_retired(Box::new(Told(told.clone()))).unwrap();
     drop(graph);
     assert_eq!(
         Arc::strong_count(&token),
@@ -799,9 +807,9 @@ fn a_graph_dropped_after_a_replay_leaves_the_replay_its_buffers() {
         f.out_words(0) == f.reference(2.0, 1.0),
         "the replay completed with its buffers"
     );
-    assert_eq!(f.s[0].confirm_retired(ticket), None);
+    assert_eq!(s[0].confirm_retired(ticket), None);
     // The recording's own run handed the same values to both streams, which hold them until they retire too.
-    f.confirm_everything();
+    f.confirm_everything(&mut s);
     assert_eq!(
         Arc::strong_count(&token),
         1,
@@ -810,62 +818,40 @@ fn a_graph_dropped_after_a_replay_leaves_the_replay_its_buffers() {
 }
 
 #[test]
-fn replays_from_two_threads_are_serialized() {
-    let Some(f) = Fixture::new() else { return };
-    f.clear();
-    let graph = f
-        .gpu
-        .record(&f.streams(), |q| f.sequence(q, 2.0, 1.0, 0))
-        .unwrap();
-    f.settle(0);
-    f.clear();
-    std::thread::scope(|scope| {
-        for stream in &f.s {
-            let graph = &graph;
-            scope.spawn(move || {
-                for _ in 0..50 {
-                    graph.replay(stream).unwrap();
-                }
-            });
-        }
-    });
-    f.settle(0);
-    f.settle(1);
-    assert!(f.out_words(0) == f.reference(2.0, 1.0));
-    assert_eq!(f.gpu.poisoned(), None);
-}
-
-#[test]
 fn a_panic_in_the_recording_closure_ends_the_capture() {
-    let Some(f) = Fixture::new() else { return };
-    f.clear();
+    let Some((f, mut s)) = Fixture::new() else {
+        return;
+    };
+    f.clear(&mut s);
     let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _ = f.gpu.record(&f.streams(), |q| {
+        let _ = f.gpu.record(&mut pair(&mut s), |q| {
             f.sequence(q, 1.0, 1.0, 0)?;
             panic!("the caller's closure panicked");
         });
     }));
     assert!(panicked.is_err());
-    f.settle(0);
-    f.settle(1);
-    f.clear();
+    f.settle(&mut s, 0);
+    f.settle(&mut s, 1);
+    f.clear(&mut s);
     // The streams and their shadows left capture mode: a new recording works.
     let graph = f
         .gpu
-        .record(&f.streams(), |q| f.sequence(q, 2.0, 1.0, 0))
+        .record(&mut pair(&mut s), |q| f.sequence(q, 2.0, 1.0, 0))
         .unwrap();
-    f.settle(0);
+    f.settle(&mut s, 0);
     assert!(f.out_words(0) == f.reference(2.0, 1.0));
     drop(graph);
 }
 
 #[test]
 fn a_failed_capture_keeps_its_buffers_until_the_real_run_retired() {
-    let Some(f) = Fixture::new() else { return };
-    f.clear();
+    let Some((f, mut s)) = Fixture::new() else {
+        return;
+    };
+    f.clear(&mut s);
     let token = Arc::new(());
     // A long spin ahead of the copy keeps the real run in flight when the recording fails.
-    let failed = f.gpu.record(&f.streams(), |q| {
+    let failed = f.gpu.record(&mut pair(&mut s), |q| {
         q.submit(0, |e| {
             e.keep(Box::new(token.clone()));
             // SAFETY: `spin` takes one 64-bit argument and touches no memory.
@@ -891,7 +877,7 @@ fn a_failed_capture_keeps_its_buffers_until_the_real_run_retired() {
         2,
         "the real run is still in flight: the streams hold its buffers"
     );
-    f.confirm_everything();
+    f.confirm_everything(&mut s);
     assert_eq!(
         Arc::strong_count(&token),
         1,
@@ -905,12 +891,14 @@ fn a_failed_capture_keeps_its_buffers_until_the_real_run_retired() {
 
 #[test]
 fn a_graph_dropped_right_after_recording_leaves_the_run_its_buffers() {
-    let Some(f) = Fixture::new() else { return };
-    f.clear();
+    let Some((f, mut s)) = Fixture::new() else {
+        return;
+    };
+    f.clear(&mut s);
     let token = Arc::new(());
     let graph = f
         .gpu
-        .record(&f.streams(), |q| {
+        .record(&mut pair(&mut s), |q| {
             q.submit(0, |e| {
                 e.keep(Box::new(token.clone()));
                 // SAFETY: `spin` takes one 64-bit argument and touches no memory.
@@ -931,7 +919,7 @@ fn a_graph_dropped_right_after_recording_leaves_the_run_its_buffers() {
         2,
         "the recording's run is in flight: the streams hold its buffers"
     );
-    f.confirm_everything();
+    f.confirm_everything(&mut s);
     assert_eq!(Arc::strong_count(&token), 1);
     assert!(f.out_words(0) == f.reference(2.0, 1.0), "the run completed");
 }
