@@ -6,6 +6,8 @@
 
 mod api;
 mod args;
+#[cfg(feature = "cuda")]
+pub mod cuda;
 mod error;
 #[cfg(feature = "fake")]
 pub mod fake;
