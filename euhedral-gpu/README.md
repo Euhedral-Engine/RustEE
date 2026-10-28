@@ -40,7 +40,8 @@ Asynchronous, backend-neutral GPU access for the RustEE control plane. A lattice
   - Enqueue operations (`launch`, the copies, `memset`) are `unsafe fn`s, as `euhedral_memory::Copier::start` is: a
     kernel or a copy can touch any device-visible memory.
 - **Markers across streams.** `mark()` records a marker after the work submitted so far; `await_marker(m)` orders later
-  work behind it on the device, and the host does not wait. Each CUDA stream has a ring of `StreamOptions::markers`
+  work behind it on the device, and the host does not wait. A marker belongs to the pool of the stream that made it; a
+  marker of another pool is not detected. Each CUDA stream has a ring of `StreamOptions::markers`
   events (default 256). `mark()` returns `Err(Busy)` rather than reuse a slot whose marker has not completed; an
   await on a marker that already completed adds no device wait.
 - **Retirement.**
@@ -49,7 +50,10 @@ Asynchronous, backend-neutral GPU access for the RustEE control plane. A lattice
     in a listener is caught.
   - `confirm_retired(ticket)` runs on an ordinary thread and returns the device failure behind the ticket, or `None`.
     It releases the values kept with `Enqueue::keep`, so the host buffers a copy reads live until the retirement is
-    confirmed.
+    confirmed. A ticket carries the identity of the stream that armed it (its fields are private, made only by a
+    backend); settling it on another stream is `Some(Invalid)` and releases nothing.
+  - A listener is dropped on the backend's callback thread, so it must not own the last handle to a stream, a graph or
+    a device.
   - `retire_into(&stream, &completions, |ticket| frame)` arms a retirement whose continuation is a frame emitted by the
     lattice's own poll. A submission finishing never counts as completion. If the device is poisoned before the
     callback runs, the continuation is emitted at once, so nothing is stranded.
@@ -78,14 +82,20 @@ Asynchronous, backend-neutral GPU access for the RustEE control plane. A lattice
     capture is `Err(Capture)`, and the work itself ran regardless.
   - A replay is one submission on the stream it is launched on; its lane marker is that stream's `mark()` afterwards.
     A replay with the arguments of an update does not touch a replay in flight.
-  - Host memory that a recorded copy reads must stay valid for the graph's life and is read again by every replay: use
-    pinned memory, and hand it to the recording with `Enqueue::keep`.
+  - Host memory that a recorded copy reads is read again by every replay: use pinned memory, and hand it to the
+    recording with `Enqueue::keep`. Every pointer a recording names must stay valid for every replay until the graph
+    drops. A replay hands the recording's kept values to its stream, which holds them until the next retirement armed
+    after the replay is confirmed, so a replay in flight survives the graph dropping; arm one per replay. Launches of
+    one graph are serialized inside it, so replays from several workers are safe. A re-record replaces the old
+    recording's kept values.
+  - Recording forks and joins the real streams with events of its own, and a panic in the recording closure ends the
+    capture.
 - **Failures are values.** A device fault (an illegal address, a launch failure) surfaces through `confirm_retired`
-  and poisons the device: later calls return `Err(Poisoned(cause))` at once, and every marker reads as reached. A
-  fault is sticky for the process, so recovery is a new process. Nothing panics on the lattice.
+  and poisons the device: later calls return `Err(Poisoned(cause))` at once, and every marker reads as reached. The
+  driver's other unrecoverable errors (an event query that fails for any reason but "not ready") poison it the same
+  way. A fault is sticky for the process, so recovery is a new process. Nothing panics on the lattice.
 - **Build-time calls.** Module loading (compile, file reads, the driver's load), dropping a stream and dropping a
-  graph block. Make them at start-up or shutdown, or on a lattice set aside for blocking work. Drop a graph after its
-  last replay retired.
+  graph block. Make them at start-up or shutdown, or on a lattice set aside for blocking work.
 
 ```rust
 use std::sync::{Arc, Mutex};

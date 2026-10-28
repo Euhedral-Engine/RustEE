@@ -24,11 +24,36 @@ fn layer(name: &str) -> Option<u8> {
     LAYERS.iter().find(|(n, _)| *n == name).map(|(_, l)| *l)
 }
 
-/// Every `euhedral-*` name declared in any dependency table of `manifest`.
+/// The `package = "name"` of a dependency line, if it renames one.
+fn package_of(line: &str) -> Option<String> {
+    let mut rest = line;
+    while let Some(at) = rest.find("package") {
+        let (before, after) = rest.split_at(at);
+        let boundary = before
+            .chars()
+            .next_back()
+            .is_none_or(|c| !(c.is_alphanumeric() || c == '_' || c == '-'));
+        let after = after["package".len()..].trim_start();
+        if boundary
+            && let Some(value) = after.strip_prefix('=')
+            && let Some(value) = value.trim_start().strip_prefix('"')
+            && let Some(end) = value.find('"')
+        {
+            return Some(value[..end].to_owned());
+        }
+        rest = &rest[at + "package".len()..];
+    }
+    None
+}
+
+/// Every `euhedral-*` crate named by any dependency table of `manifest`, by the package it names, so
+/// `alias = { package = "euhedral-core" }` counts as `euhedral-core` and `euhedral-core = { package = "other" }` does
+/// not.
 fn euhedral_deps(manifest: &str) -> Vec<String> {
-    let mut deps = Vec::new();
-    // The name from a dotted header (`[dependencies.euhedral-memory]`), if the current table is one.
-    let mut dotted: Option<String> = None;
+    // (the key a dependency is declared under, the package it renames to).
+    let mut entries: Vec<(String, Option<String>)> = Vec::new();
+    // The dependency a dotted header (`[dependencies.euhedral-memory]`) is the table of.
+    let mut dotted: Option<usize> = None;
     let mut in_deps = false;
     for line in manifest.lines() {
         let line = line.trim();
@@ -37,7 +62,7 @@ fn euhedral_deps(manifest: &str) -> Vec<String> {
         }
         if let Some(header) = line.strip_prefix('[') {
             let header = header.trim_start_matches('[');
-            let header = header.trim_end_matches(']').trim_end_matches(']').trim();
+            let header = header.trim_end_matches(']').trim();
             dotted = None;
             in_deps = false;
             if let Some(at) = header.find("dependencies.") {
@@ -45,26 +70,43 @@ fn euhedral_deps(manifest: &str) -> Vec<String> {
                 let name = header[at + "dependencies.".len()..]
                     .trim()
                     .trim_matches('"');
-                dotted = Some(name.to_owned());
+                entries.push((name.to_owned(), None));
+                dotted = Some(entries.len() - 1);
                 in_deps = true;
-                if name.starts_with("euhedral-") {
-                    deps.push(name.to_owned());
-                }
             } else if header.ends_with("dependencies") {
                 in_deps = true;
             }
             continue;
         }
-        if in_deps && dotted.is_none() {
-            let key = line
-                .split(['=', '.'])
-                .next()
-                .unwrap_or_default()
-                .trim()
-                .trim_matches('"');
-            if key.starts_with("euhedral-") && !deps.iter().any(|d| d == key) {
-                deps.push(key.to_owned());
+        if !in_deps {
+            continue;
+        }
+        if let Some(entry) = dotted {
+            if let Some(package) = package_of(line) {
+                entries[entry].1 = Some(package);
             }
+            continue;
+        }
+        let key = line
+            .split(['=', '.'])
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .trim_matches('"');
+        if key.is_empty() {
+            continue;
+        }
+        let package = package_of(line);
+        match entries.iter_mut().find(|(alias, _)| alias == key) {
+            Some(entry) => entry.1 = entry.1.take().or(package),
+            None => entries.push((key.to_owned(), package)),
+        }
+    }
+    let mut deps: Vec<String> = Vec::new();
+    for (alias, package) in entries {
+        let real = package.unwrap_or(alias);
+        if real.starts_with("euhedral-") && !deps.contains(&real) {
+            deps.push(real);
         }
     }
     deps
@@ -103,6 +145,34 @@ fn the_parser_finds_every_kind_of_dependency_table() {
             "euhedral-graph",
             "euhedral-hashing",
             "euhedral-io",
+            "euhedral-memory"
+        ]
+    );
+}
+
+#[test]
+fn a_renamed_dependency_counts_as_the_package_it_names() {
+    let m = "[dependencies]\n\
+             core = { path = \"../c\", package = \"euhedral-core\" }\n\
+             euhedral-io = { path = \"../x\", package = \"something-else\" }\n\
+             lower = { version = \"1\", features = [\"x\"], package=\"euhedral-hashing\" }\n\
+             [dev-dependencies]\n\
+             alias.package = \"euhedral-graph\"\n\
+             [dependencies.memory]\n\
+             path = \"../m\"\n\
+             package = \"euhedral-memory\"\n\
+             [target.'cfg(unix)'.dependencies.plain]\n\
+             version = \"1\"\n\
+             [features]\n\
+             default = [\"package\"]\n";
+    let mut got = euhedral_deps(m);
+    got.sort();
+    assert_eq!(
+        got,
+        [
+            "euhedral-core",
+            "euhedral-graph",
+            "euhedral-hashing",
             "euhedral-memory"
         ]
     );
