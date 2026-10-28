@@ -141,4 +141,138 @@ mod streams {
         });
         assert!(matches!(r, Err(GpuError::Invalid(_))), "{r:?}");
     }
+
+    /// Polls `condition` from the test thread until it holds or `limit` passes.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the test thread is not a lattice worker"
+    )]
+    pub fn wait_until(limit: Duration, condition: impl Fn() -> bool) -> bool {
+        let start = Instant::now();
+        while !condition() {
+            if start.elapsed() > limit {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        true
+    }
+
+    struct Record(Arc<std::sync::Mutex<Vec<euhedral_gpu::RetireTicket>>>);
+
+    impl euhedral_gpu::RetireListener for Record {
+        // Enqueue only: this runs on the driver's callback thread.
+        fn retired(self: Box<Self>, ticket: euhedral_gpu::RetireTicket) {
+            self.0.lock().unwrap().push(ticket);
+        }
+    }
+
+    #[test]
+    fn retirement_listeners_run_once_in_order() {
+        let Some(gpu) = gpu() else { return };
+        let (pool, s) = gpu.open_lanes(&["a"], StreamOptions::default()).unwrap();
+        let mem = device_memory(&gpu);
+        let buf = mem.alloc(1 << 20).unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        for i in 0..5u8 {
+            s[0].submit(|q| {
+                // SAFETY: a live device allocation, used by nothing else.
+                unsafe { q.memset(buf.addr, i, 1 << 20) }
+            })
+            .unwrap();
+            s[0].notify_retired(Box::new(Record(seen.clone()))).unwrap();
+        }
+        assert!(wait_until(Duration::from_secs(5), || seen
+            .lock()
+            .unwrap()
+            .len()
+            >= 5));
+        let tickets = seen.lock().unwrap().clone();
+        assert_eq!(
+            tickets.iter().map(|t| t.seq).collect::<Vec<_>>(),
+            [0, 1, 2, 3, 4]
+        );
+        for t in tickets {
+            assert!(t.ok());
+            assert_eq!(s[0].confirm_retired(t), None);
+        }
+        drop((pool, s));
+        // SAFETY: the stream ended its work; nothing uses the block.
+        unsafe { mem.free(buf) };
+    }
+
+    #[test]
+    fn retire_into_emits_a_continuation_frame() {
+        use euhedral_core::frames::RunnableFrame;
+        use euhedral_core::generics::LatticeSource;
+        let Some(gpu) = gpu() else { return };
+        let (pool, s) = gpu.open_lanes(&["a"], StreamOptions::default()).unwrap();
+        let mem = device_memory(&gpu);
+        let buf = mem.alloc(1 << 20).unwrap();
+        let completions = euhedral_graph::Completions::new(pool.clone());
+        let ran = Arc::new(std::sync::Mutex::new(Vec::new()));
+        s[0].submit(|q| {
+            // SAFETY: a live device allocation, used by nothing else.
+            unsafe { q.memset(buf.addr, 1, 1 << 20) }
+        })
+        .unwrap();
+        euhedral_gpu::retire_into(&s[0], &completions, {
+            let (stream, ran) = (s[0].clone(), ran.clone());
+            move |ticket| {
+                Box::new(RunnableFrame::new(
+                    1,
+                    Arc::new(move || ran.lock().unwrap().push(stream.confirm_retired(ticket))),
+                ))
+            }
+        })
+        .unwrap();
+        // The test thread is the worker: it polls until the continuation is emitted.
+        assert!(wait_until(Duration::from_secs(5), || {
+            completions.pull(
+                &mut |mut frame| {
+                    frame.execute().unwrap();
+                    frame.do_finally();
+                },
+                &mut |_| false,
+                u64::MAX,
+            );
+            completions.pending() == 0
+        }));
+        assert_eq!(*ran.lock().unwrap(), [None]);
+        drop((completions, pool, s));
+        // SAFETY: the stream ended its work; nothing uses the block.
+        unsafe { mem.free(buf) };
+    }
+
+    #[test]
+    fn kept_host_buffers_outlive_the_copy_until_confirmed() {
+        let Some(gpu) = gpu() else { return };
+        let (pool, s) = gpu.open_lanes(&["a"], StreamOptions::default()).unwrap();
+        let mem = device_memory(&gpu);
+        let pinned = PinnedHost::new(gpu.device().clone(), LocationId(1), 0);
+        let host = Arc::new(pinned.alloc(1 << 20).unwrap());
+        let dev = mem.alloc(1 << 20).unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        s[0].submit(|q| {
+            q.keep(Box::new(host.clone()));
+            // SAFETY: valid blocks; the host block is kept until the retirement is confirmed.
+            unsafe { q.copy_to_device(dev.addr, host.addr as *const u8, 1 << 20) }
+        })
+        .unwrap();
+        s[0].notify_retired(Box::new(Record(seen.clone()))).unwrap();
+        assert!(wait_until(Duration::from_secs(5), || !seen
+            .lock()
+            .unwrap()
+            .is_empty()));
+        assert_eq!(Arc::strong_count(&host), 2, "kept until confirmed");
+        let ticket = seen.lock().unwrap()[0];
+        assert_eq!(s[0].confirm_retired(ticket), None);
+        assert_eq!(Arc::strong_count(&host), 1, "released by the confirmation");
+        drop((pool, s));
+        // SAFETY: the stream ended its work; nothing uses the blocks.
+        unsafe {
+            mem.free(dev);
+            pinned.free(*host);
+        }
+    }
 }

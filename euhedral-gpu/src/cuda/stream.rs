@@ -10,7 +10,10 @@ use euhedral_memory::cuda::{CuEvent, CuStream, Device, STREAM_NON_BLOCKING};
 
 use crate::kept::Kept;
 use crate::stream_lock::{StreamGuard, StreamLock};
-use crate::{Args, Enqueue, GpuError, Launch, RetireListener, RetireTicket, Stream, StreamOptions};
+use crate::{
+    Args, Enqueue, GpuError, Launch, POISONED_STATUS, RetireListener, RetireTicket, Stream,
+    StreamOptions,
+};
 
 use super::{CudaGpu, CudaKernel, from_cuda};
 
@@ -225,6 +228,10 @@ impl CudaStream {
         })
     }
 
+    pub(crate) fn lane_id(&self) -> LaneId {
+        self.lane
+    }
+
     /// The context current on the calling thread for as long as the guard lives.
     pub(crate) fn enter(&self) -> Result<euhedral_memory::cuda::Current<'_>, GpuError> {
         self.gpu.device().enter().map_err(from_cuda)
@@ -315,12 +322,43 @@ impl Stream for CudaStream {
         self.await_held(self.raw, marker)
     }
 
-    fn notify_retired(&self, _listener: Box<dyn RetireListener>) -> Result<(), GpuError> {
-        Err(GpuError::Invalid("not yet".into()))
+    fn notify_retired(&self, listener: Box<dyn RetireListener>) -> Result<(), GpuError> {
+        let mut guard = self.state.lock()?;
+        self.gpu.poison.check()?;
+        let _c = self.enter()?;
+        self.arm(guard.next_retire, listener)?;
+        guard.next_retire += 1;
+        Ok(())
     }
 
-    fn confirm_retired(&self, _ticket: RetireTicket) -> Option<GpuError> {
-        None
+    fn confirm_retired(&self, ticket: RetireTicket) -> Option<GpuError> {
+        if ticket.status == POISONED_STATUS {
+            self.gpu
+                .poison
+                .get()
+                .map(|cause| GpuError::Poisoned(Box::new(cause)))
+        } else {
+            // Release only what this retirement covered; a poisoned ticket does not say which that was.
+            self.kept.release_through(ticket.seq);
+            if ticket.status != 0 {
+                // An ordinary thread may ask the driver for the error's name.
+                let err = self
+                    .gpu
+                    .check("device work", ticket.status)
+                    .err()
+                    .unwrap_or(GpuError::Call {
+                        call: "device work",
+                        code: ticket.status,
+                        name: "unknown".into(),
+                    });
+                Some(err)
+            } else {
+                self.gpu
+                    .poison
+                    .get()
+                    .map(|cause| GpuError::Poisoned(Box::new(cause)))
+            }
+        }
     }
 }
 

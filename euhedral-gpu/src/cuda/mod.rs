@@ -6,6 +6,7 @@
 pub mod fns;
 mod graph;
 mod module;
+mod retire;
 mod stream;
 
 pub use graph::{CudaGraph, CudaSequence};
