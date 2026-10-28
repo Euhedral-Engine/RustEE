@@ -1,0 +1,40 @@
+[package]
+name = "euhedral-gpu"
+version = "0.1.0"
+edition = "2024"
+description = "Asynchronous, backend-neutral GPU access on the Euhedral control plane: streams as device lanes, markers, retirement as frames, kernels loaded at run time, graph record and replay"
+readme = "README.md"
+license = "Apache-2.0"
+
+[features]
+default = []
+# `fake`: a stepped, wall-clock-free fake device for tests of code built on this crate.
+fake = []
+# `cuda`: the CUDA backend, on the driver `euhedral-memory` loads (one library, one primary context); the run-time
+# compiler (NVRTC) is loaded with dlopen as well.
+cuda = ["euhedral-memory/cuda", "dep:libc"]
+
+[dependencies]
+euhedral-core = { path = "../euhedral-core" }
+# `DeviceQueue`, `Marker`, `LanePool` and `Completions`: streams are device lanes and retirement is a completion.
+euhedral-graph = { path = "../euhedral-graph", default-features = false }
+# The driver, the device and the allocations that kernels and copies use.
+euhedral-memory = { path = "../euhedral-memory", default-features = false }
+# The module cache key and the shape fingerprint.
+euhedral-hashing = { path = "../euhedral-hashing" }
+libc = { version = "0.2.174", optional = true }
+
+[dev-dependencies]
+# The crate's own tests use the fake backend.
+euhedral-gpu = { path = ".", default-features = false, features = ["fake"] }
+# The acceptance example picks a CPU for its lattice.
+euhedral-hardware-utils = { path = "../euhedral-hardware-utils" }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"
+dbg_macro = "warn"
+todo = "warn"

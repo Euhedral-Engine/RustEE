@@ -38,6 +38,19 @@ name = "euhedral-data-structures"
 version = "0.1.0"
 
 [[package]]
+name = "euhedral-gpu"
+version = "0.1.0"
+dependencies = [
+ "euhedral-core",
+ "euhedral-gpu",
+ "euhedral-graph",
+ "euhedral-hardware-utils",
+ "euhedral-hashing",
+ "euhedral-memory",
+ "libc",
+]
+
+[[package]]
 name = "euhedral-graph"
 version = "0.1.0"
 dependencies = [
