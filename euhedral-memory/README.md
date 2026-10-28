@@ -44,6 +44,10 @@ with `libcuda.so.1` loaded by `dlopen` at run time (no toolkit, no link-time dep
 - **Admission before allocation.** `admit` places a plan's items at their preferred locations, then spills the spillable
   ones, then cuts optional ones, both lowest priority first. Otherwise it refuses with a `Shortfall`. An admitted plan's
   `Reservation` gives its allocations their claims.
+  - A tiered item (`PlanItem::tiered`) is a set of equal units over an ordered list of locations, fastest first (a
+    device, pinned host memory, a window onto a file): its required units go to the first location as above; the rest
+    fill the first location with free room, then the next, highest priority first, and what fits nowhere is left out
+    (`Admission::tiers`). The fast tier is filled first, and only what cannot fit is refused.
 - **Tiers move memory by plan.** A `TierPool` is one planned allocation at a location, cut into slots; a `Mover`
   keeps each owner's residents in the fastest tier their priority earns and moves them by asynchronous copies
   (`Copier`: host `memcpy`, CUDA stream copies, or a lane's `Marker` as the completion test).
@@ -103,4 +107,5 @@ assert!(planner.end_owner(plan).is_clean());
 mise exec -- cargo test -p euhedral-memory                       # planner, admission, arenas, tiers (no device needed)
 mise exec -- cargo test -p euhedral-memory --features cuda       # + the CUDA backends and stream-copy moves (skipped without a device)
 mise exec -- cargo run --release -p euhedral-memory --features cuda --example alloc_sweep   # CUDA against Vulkan
+mise exec -- cargo run --release -p euhedral-memory --features cuda --example copy_rate     # pinned host <-> device GB/s
 ```

@@ -11,6 +11,12 @@
 //! 3. else optional consumers are dropped, lowest priority first;
 //! 4. else the plan is refused, with the shortfall.
 //!
+//! A **tiered** consumer ([`PlanItem::tiered`]) is a set of equal units (slots of a buffer, pages of a cache) that may
+//! live in any of an ordered list of locations, fastest first (a device, then pinned host memory, then a window onto
+//! a file): its first `min_first` units are required in the first location and placed as above; once everything fits,
+//! its other units go to the first location that has free room for them, then the next, highest priority first. The
+//! units that fit nowhere are left out ([`Admission::tiers`] says where each went): the consumer runs with fewer.
+//!
 //! An admitted plan comes with a [`Reservation`]: firm claims for its whole working set, from which its allocations
 //! take their claims ([`Reservation::take`]). When give-back is needed first, the admission carries the orders and no
 //! reservation: admit again once they are done (nothing waits).
@@ -30,6 +36,19 @@ pub struct PlanItem {
     pub needs: Vec<(LocationId, u64)>,
     /// Bytes per location if spilled, if the consumer can spill.
     pub spill: Option<Vec<(LocationId, u64)>>,
+    /// A tiered consumer's units beyond those in `needs` (see the module docs).
+    pub tiers: Option<Tiers>,
+}
+
+/// The units of a tiered consumer placed after its first location's required ones.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Tiers {
+    /// Bytes of one unit.
+    pub unit: u64,
+    /// Units beyond the required ones.
+    pub extra: u32,
+    /// Where they may go, fastest first (the first is where the required units are).
+    pub order: Vec<LocationId>,
 }
 
 impl PlanItem {
@@ -40,6 +59,7 @@ impl PlanItem {
             required: true,
             needs: vec![(location, bytes)],
             spill: None,
+            tiers: None,
         }
     }
 
@@ -55,6 +75,34 @@ impl PlanItem {
             required: false,
             needs: vec![(location, bytes)],
             spill: None,
+            tiers: None,
+        }
+    }
+
+    /// A tiered consumer: `units` units of `unit` bytes over `order` (fastest first), the first `min_first` of them
+    /// required in `order[0]`.
+    pub fn tiered(
+        consumer: impl Into<String>,
+        priority: Priority,
+        required: bool,
+        unit: u64,
+        units: u32,
+        min_first: u32,
+        order: Vec<LocationId>,
+    ) -> Self {
+        let first = order.first().copied().unwrap_or(LocationId(0));
+        let min_first = min_first.min(units);
+        PlanItem {
+            consumer: consumer.into(),
+            priority,
+            required,
+            needs: vec![(first, unit * u64::from(min_first))],
+            spill: None,
+            tiers: Some(Tiers {
+                unit,
+                extra: units - min_first,
+                order,
+            }),
         }
     }
 
@@ -86,6 +134,9 @@ pub struct Admission {
     pub placed: Vec<Placed>,
     /// Bytes per location of the admitted placement.
     pub bytes: Vec<u64>,
+    /// Per item, a tiered consumer's units per location (its required ones included), in its order; empty for the
+    /// others and for a dropped one.
+    pub tiers: Vec<Vec<(LocationId, u32)>>,
     /// Give-back orders issued; when not empty there is no reservation yet: admit again once they are done.
     pub orders: Vec<GiveBack>,
     pub reservation: Option<Reservation>,
@@ -206,7 +257,8 @@ impl Planner {
                 }
             }
         }
-        let bytes = total(&placed);
+        let mut bytes = total(&placed);
+        let tiers = self.place_tiers(request, &placed, &room, &mut bytes);
         if let Some((loc, (&need, &(free, reclaim)))) = bytes
             .iter()
             .zip(&room)
@@ -240,6 +292,7 @@ impl Planner {
             return Ok(Admission {
                 placed,
                 bytes,
+                tiers,
                 orders,
                 reservation: None,
             });
@@ -248,8 +301,64 @@ impl Planner {
         Ok(Admission {
             placed,
             bytes,
+            tiers,
             orders,
             reservation: Some(Reservation { claims }),
         })
+    }
+
+    /// The tiered consumers' units beyond their required ones, highest priority first, each to the first location of
+    /// its order with free room (not reclaimable room: these never order a give-back); added to `bytes`.
+    fn place_tiers(
+        &self,
+        request: &PlanRequest,
+        placed: &[Placed],
+        room: &[(u64, u64)],
+        bytes: &mut [u64],
+    ) -> Vec<Vec<(LocationId, u32)>> {
+        let mut out = vec![Vec::new(); request.items.len()];
+        let mut order: Vec<usize> = (0..request.items.len()).collect();
+        // Highest priority first; ties: the item listed first.
+        order.sort_by(|&a, &b| {
+            request.items[b]
+                .priority
+                .cmp(&request.items[a].priority)
+                .then(a.cmp(&b))
+        });
+        for i in order {
+            let item = &request.items[i];
+            let Some(t) = item.tiers.as_ref().filter(|_| placed[i] != Placed::Dropped) else {
+                continue;
+            };
+            let unit = t.unit.max(1);
+            let mut units: Vec<(LocationId, u32)> = t.order.iter().map(|&l| (l, 0)).collect();
+            if let Some(first) = units.first_mut() {
+                first.1 = u32::try_from(
+                    item.needs
+                        .iter()
+                        .filter(|(l, _)| *l == first.0)
+                        .map(|(_, b)| b / unit)
+                        .sum::<u64>(),
+                )
+                .unwrap_or(u32::MAX);
+            }
+            let mut left = t.extra;
+            for (loc, n) in &mut units {
+                if left == 0 {
+                    break;
+                }
+                let k = usize::from(loc.0);
+                let (Some(&(free, _)), Some(used)) = (room.get(k), bytes.get_mut(k)) else {
+                    continue;
+                };
+                let fit = u32::try_from(free.saturating_sub(*used) / unit).unwrap_or(u32::MAX);
+                let take = fit.min(left);
+                *n += take;
+                *used += u64::from(take) * unit;
+                left -= take;
+            }
+            out[i] = units;
+        }
+        out
     }
 }

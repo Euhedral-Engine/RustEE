@@ -3,6 +3,29 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## Tiered admission and the copy rate: `euhedral-memory` (2026-10-28)
+
+**What.**
+- `PlanItem::tiered(consumer, priority, required, unit, units, min_first, order)`: a consumer of equal units that may
+  live in any of `order`'s locations, fastest first. `Planner::admit` places its `min_first` units in `order[0]` with
+  the plan's other items (spill, cut, refuse as before); once those fit, the other units fill the first location of
+  `order` with free room, then the next, highest priority first. `Admission::tiers` gives the units per location;
+  units that fit nowhere are left out (the consumer runs with fewer). Extra units use free room only, never ordering a
+  give-back.
+- Example `copy_rate` (feature `cuda`): pinned host memory to and from the device, by how the host memory is pinned
+  (the driver's `cuMemHostAlloc`, a registered mapping on huge pages, on small pages), copy size and stream count.
+
+**Why.** Residency in tiers: as much as possible in the fastest location, the rest streamed from the next, refused only
+when nothing can hold it. And a measured answer to how to saturate the link.
+
+**Measured** (RTX 5070 Ti, PCIe 5, 1 GiB per direction): registered huge pages 50-52 GB/s host to device, 57 device to
+host, 58 both ways; registered small pages and `cuMemHostAlloc` 24-27 one way, 31 both. Copy size (2-128 MiB) and
+stream count (1-4) change nothing: pin on huge pages.
+
+**Tests.** `tests/planner.rs`: `a_tiered_consumer_fills_the_device_then_the_slower_tiers_in_order`,
+`tiered_consumers_take_the_fast_tier_by_priority_and_what_fits_nowhere_is_left_out`,
+`a_tiered_consumer_whose_required_units_do_not_fit_is_refused_or_dropped`.
+
 ## Tier moves: `euhedral-memory::tiers` (2026-10-28)
 
 **What.** Planned movement of claimed memory between locations (device, pinned host, pageable host, any modeled one):
