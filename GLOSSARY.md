@@ -497,3 +497,52 @@ a cache line.
 ordered-chain ids and vectors, identical to the Java hashers. Strings hash as UTF-16, `_pair`
 functions chain multi-part keys, and `mix_with_zero_check` never returns zero, which is what
 `randomize_hash` mixes a seed with.
+
+## Memory
+
+**planner** ([`Planner`](euhedral-memory/src/planner.rs)): one process's accounting of memory by
+location and owner. It decides; it never allocates and never waits. Budgets and owner totals are
+atomics, owner slots are recycled through a lock-free queue, and nothing takes a lock.
+
+**location** ([`LocationId`, `LocationKind`, `LocationSpec`](euhedral-memory/src/planner.rs)): a
+memory space with a budget: a device's memory, pinned host memory, pageable host memory or another.
+Its capacity is what this process may hold; its reserve is always left free.
+
+**owner** ([`OwnerSpec`, `OwnerId`](euhedral-memory/src/planner.rs)): who holds memory: a static
+name, a priority, a scope and an optional parent. An owner id is a slot and its generation, so a
+recycled slot is a different owner.
+
+**scope** ([`Scope`](euhedral-memory/src/planner.rs)): an owner's lifetime: `Process`, `Epoch`,
+`Plan` or `Lease`. `end_scope` ends every owner of one at once.
+
+**claim** ([`Claim`](euhedral-memory/src/planner.rs)): bytes accounted to an owner at a location.
+It is a value: dropping it gives the bytes back, so it travels with the memory it accounts for.
+
+**elastic holding** ([`Elastic`](euhedral-memory/src/planner.rs)): a claim that grows into free
+memory and gives back on order: a cache, a buffer of slots that can spill, a lease.
+
+**give-back order** ([`GiveBack`](euhedral-memory/src/planner.rs)): the planner's order to a
+lower-priority elastic owner to free bytes for a higher-priority claim
+(`claim_or_reclaim`). Orders reach their owners as frames of the planner's `GiveBacks`
+`LatticeSource`, which run the owner's handler.
+
+**admission** ([`Planner::admit`](euhedral-memory/src/admission.rs)): placing a plan's whole
+working set before it allocates: every item at its preferred location if it fits, else spilled
+items (lowest priority first), else optional items cut (lowest priority first), else refused. An
+admitted plan holds a `Reservation`, from which its allocations `take` their claims.
+
+**leak check** ([`Planner::end_owner`, `Planner::check_baseline`](euhedral-memory/src/planner.rs)):
+an ended owner's live claims are leaks; a snapshot taken at a baseline must come back.
+
+**arena** ([`SlotArena`, `ScratchArena`](euhedral-memory/src/arena.rs)): plan once, allocate once,
+reuse. One planned allocation cut into slots or power-of-two pieces, leased and returned through
+lock-free free lists, so the steady state makes no allocation or free. `BackendCalls` counts the
+ones that do.
+
+**backend** ([`Backend`](euhedral-memory/src/backend.rs), [`cuda`](euhedral-memory/src/cuda/mod.rs)):
+what allocates at a location. The CUDA backends (feature `cuda`, the driver loaded at run time) are
+`DeviceMemory`, the stream-ordered `StreamPool`, `Vmm` (exportable as a POSIX fd for Vulkan) and
+`PinnedHost` (a capacity cache by size class).
+
+**reaper** ([`Reaper`](euhedral-memory/src/backend.rs)): frees queued behind the device work that
+last used the memory (a `Retired` test, such as a lane's marker), freed by `reap` on the owner's lane.

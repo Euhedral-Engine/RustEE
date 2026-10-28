@@ -1,0 +1,39 @@
+[package]
+name = "euhedral-memory"
+version = "0.1.0"
+edition = "2024"
+description = "A location-agnostic memory and residency planner: budgets, owners with lifetimes, claims with priorities, elastic give-back, admission and a leak check; with a CUDA allocation backend"
+readme = "README.md"
+
+[features]
+default = []
+# `cuda`: the CUDA driver backend (device, stream-ordered pool, VMM with POSIX-fd export, pinned host), loaded
+# with dlopen at run time: no CUDA toolkit or link-time dependency.
+cuda = ["dep:libc"]
+
+[dependencies]
+# Lock-free queues (owner slots, give-back orders, the reaper, the pinned cache) and LatticeSource / RunnableFrame (the
+# give-back frames); the hash of an order's owner routes its frame.
+euhedral-core = { path = "../euhedral-core" }
+euhedral-data-structures = { path = "../euhedral-data-structures" }
+euhedral-hashing = { path = "../euhedral-hashing" }
+libc = { version = "0.2.174", optional = true }
+
+[dev-dependencies]
+euhedral-core = { path = "../euhedral-core" }
+# The allocation sweep (examples/alloc_sweep.rs) compares CUDA with Vulkan; the library never uses Vulkan.
+ash = "0.38.0"
+libc = "0.2.174"
+
+[[example]]
+name = "alloc_sweep"
+required-features = ["cuda"]
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"
+dbg_macro = "warn"
+todo = "warn"

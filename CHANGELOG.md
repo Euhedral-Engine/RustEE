@@ -3,6 +3,52 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## Memory planner: `euhedral-memory` (2026-10-28)
+
+**What.** A new crate, [`euhedral-memory`](euhedral-memory/README.md):
+- a location-agnostic `Planner`: budgets per location, owners with priorities and scopes, firm claims, elastic
+  holdings, give-back orders, and a leak check;
+- admission of a plan's whole working set before it allocates (`admit`: spill, then cut, then refuse);
+- arenas (`SlotArena`, `ScratchArena`) that hand a session's planned memory out and back without the driver, with
+  `BackendCalls` to prove the steady state allocates nothing;
+- CUDA allocation backends (feature `cuda`): `DeviceMemory`, `StreamPool`, `Vmm` with POSIX-fd export, `PinnedHost` with
+  a capacity cache, and `Device::import_fd`.
+
+The rest of the workspace is unchanged.
+
+**Why.** Consumers that size themselves from the free memory, each on its own, race: the last to allocate fails, and a
+leak shows only as an out-of-memory error somewhere else. One planner per process accounts every location and owner,
+admits a plan before it allocates and orders give-back by priority: "a pool where you can claim or free memory on a
+device or the host".
+
+**How to use it.** Make one `Planner` with the process's locations. Open an owner per component and lifetime.
+- `admit` a plan before building it, and allocate from its `Reservation` once.
+- Lease slots and scratch from arenas per unit of work.
+- Drop the arenas (and so the claims) at the session's end, then `end_scope`.
+- Add `planner.give_backs()` upstream of a lattice so give-back orders run as frames.
+
+**Semantics.**
+- No locks.
+  - Claims are CAS loops on a location's `used`, which never exceeds capacity less reserve.
+  - Owner slots are recycled through a lock-free queue once an ended owner's last claim drops. The slot's generation
+    changes, so a stale `OwnerId` is refused.
+  - A claim pins its slot; an order reads its owner's handler only under a pin.
+- Give-back takes only from strictly lower priorities: lowest first, then the biggest holder. An elastic holding does not
+  grow while an order to its owner is open. Freed elastic bytes count against the open order first.
+- `end_owner` ends the owner's live descendants too. What they still hold is reported, and stays accounted until those
+  claims drop (the memory is still allocated).
+- Admission places an item's bytes per location. It keeps everything preferred if that fits in free plus reclaimable.
+  Otherwise it spills items lowest priority first, each only if the spill location has room, then drops optional items
+  lowest priority first, else returns `Shortfall`.
+  - With give-back needed, it returns the orders and no reservation.
+  - Otherwise a `Reservation` holds firm claims per location, and `take` moves bytes from it to an allocation's owner.
+
+**Tests.**
+- 14 tests without a device: claims, reserve, elastic give-back and its frames through the `GiveBacks` source, priority,
+  leaks, baseline, admission fit / spill / cut / refuse / reclaim, the reaper, slot recycling under 1000 owners, eight
+  threads claiming at once, and arenas over 10,000 units of work with no backend call.
+- 3 tests on a device (feature `cuda`): every backend at 256 B to 100 MiB, VMM fd export, and pinned cache reuse.
+- The `alloc_sweep` example measures CUDA against Vulkan allocation, import and copy on the local GPU.
 ## `Completions` and the io_uring ring take registrations through `MpscQueue` (2026-10-26)
 
 **What.** In `euhedral-graph`, `Completions`' registrations (`after`, `after_marker`, `at`, `register`) go into a
