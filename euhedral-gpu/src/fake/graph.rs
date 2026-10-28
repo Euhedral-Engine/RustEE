@@ -20,11 +20,8 @@ pub struct FakeGraph {
     args: Vec<crate::Args>,
     fingerprint: Fingerprint,
     streams: usize,
-    #[allow(
-        dead_code,
-        reason = "held for the graph's life, like the buffers a recording reads"
-    )]
-    kept: Mutex<Vec<Box<dyn Any + Send>>>,
+    /// The buffers the recording reads, shared with every replay (see `Graph::replay`).
+    kept: Arc<Mutex<Vec<Box<dyn Any + Send>>>>,
 }
 
 impl FakeGraph {
@@ -51,7 +48,7 @@ impl Graph for FakeGraph {
     }
 
     fn replay(&self, stream: &FakeStream) -> Result<(), GpuError> {
-        let _guard = stream.lock()?;
+        let guard = stream.lock()?;
         stream.gpu().poison.check()?;
         for op in &self.ops {
             stream.push(match op {
@@ -85,6 +82,18 @@ impl Graph for FakeGraph {
                     bytes: *bytes,
                 },
             });
+        }
+        // A replay runs after this graph may have dropped: the stream keeps the recording's buffers until the next
+        // retirement armed after it is confirmed.
+        if !self
+            .kept
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_empty()
+        {
+            stream
+                .kept
+                .push(guard.next_retire, Box::new(self.kept.clone()));
         }
         Ok(())
     }
@@ -229,7 +238,7 @@ impl FakeGpu {
             args: rec.args,
             fingerprint,
             streams: streams.len(),
-            kept: Mutex::new(rec.kept),
+            kept: Arc::new(Mutex::new(rec.kept)),
         })
     }
 
@@ -242,17 +251,13 @@ impl FakeGpu {
     where
         F: FnOnce(&mut FakeSequence<'_>) -> Result<(), GpuError>,
     {
-        let mut new = self.record_graph(streams, f)?;
+        let new = self.record_graph(streams, f)?;
         let how = if new.kernels() == graph.kernels() {
             Rerecorded::Updated
         } else {
             Rerecorded::Instantiated
         };
-        // The old recording's kept buffers stay alive with the new one: replays of it may be in flight.
-        new.kept
-            .get_mut()
-            .unwrap_or_else(PoisonError::into_inner)
-            .append(graph.kept.get_mut().unwrap_or_else(PoisonError::into_inner));
+        // The old recording's buffers go with it; a replay still in flight holds its own handle.
         *graph = new;
         Ok(how)
     }

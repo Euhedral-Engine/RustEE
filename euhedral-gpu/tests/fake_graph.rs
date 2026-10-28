@@ -315,3 +315,80 @@ fn a_sequence_names_only_its_own_streams() {
         .unwrap();
     let _ = &f.pool;
 }
+
+#[test]
+fn a_replay_keeps_the_recordings_buffers_until_its_retirement_is_confirmed() {
+    struct Told(Arc<std::sync::Mutex<Vec<euhedral_gpu::RetireTicket>>>);
+    impl euhedral_gpu::RetireListener for Told {
+        fn retired(self: Box<Self>, ticket: euhedral_gpu::RetireTicket) {
+            self.0.lock().unwrap().push(ticket);
+        }
+    }
+    let mut f = Fixture::new();
+    let out = f.out_ptr(0);
+    let token = Arc::new(());
+    let graph = f
+        .gpu
+        .record(&f.streams(), |q| {
+            q.submit(0, |e| {
+                e.keep(Box::new(token.clone()));
+                Ok(())
+            })?;
+            f.sequence(q, 2, out)
+        })
+        .unwrap();
+    f.gpu.run_until_idle();
+    assert_eq!(Arc::strong_count(&token), 2, "the graph holds it");
+    let told = Arc::new(std::sync::Mutex::new(Vec::new()));
+    graph.replay(&f.s[0]).unwrap();
+    f.s[0].notify_retired(Box::new(Told(told.clone()))).unwrap();
+    drop(graph);
+    assert_eq!(
+        Arc::strong_count(&token),
+        2,
+        "the in-flight replay holds it after the graph dropped"
+    );
+    f.gpu.run_until_idle();
+    let ticket = told.lock().unwrap()[0];
+    assert_eq!(f.s[0].confirm_retired(ticket), None);
+    assert_eq!(Arc::strong_count(&token), 1, "released by the confirmation");
+}
+
+/// `Fixture::sequence`, with `token` kept for the recording's life.
+fn keeping<S: Sequence<Kernel = FakeKernel>>(
+    f: &Fixture,
+    q: &mut S,
+    token: Arc<()>,
+    out: *mut u8,
+) -> Result<(), GpuError> {
+    q.submit(0, |e| {
+        e.keep(Box::new(token));
+        Ok(())
+    })?;
+    f.sequence(q, 2, out)
+}
+
+#[test]
+fn a_rerecord_replaces_the_old_recordings_buffers() {
+    let mut f = Fixture::new();
+    let out = f.out_ptr(0);
+    let (first, second) = (Arc::new(()), Arc::new(()));
+    let mut graph = f
+        .gpu
+        .record(&f.streams(), |q| keeping(&f, q, first.clone(), out))
+        .unwrap();
+    assert_eq!(Arc::strong_count(&first), 2);
+    f.gpu
+        .rerecord(&mut graph, &f.streams(), |q| {
+            keeping(&f, q, second.clone(), out)
+        })
+        .unwrap();
+    assert_eq!(
+        Arc::strong_count(&first),
+        1,
+        "the old buffers are not accumulated"
+    );
+    assert_eq!(Arc::strong_count(&second), 2);
+    drop(graph);
+    assert_eq!(Arc::strong_count(&second), 1);
+}

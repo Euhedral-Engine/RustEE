@@ -22,7 +22,11 @@ use super::{CudaEnqueue, CudaGpu, CudaKernel, CudaStream, from_cuda};
 /// `CU_EVENT_DISABLE_TIMING`.
 const EVENT_DISABLE_TIMING: u32 = 2;
 
-/// A recording. Drop it after its last replay has retired: it is a shutdown call.
+/// Values a recording holds: the buffers its copies read. Replays share them (see [`Graph::replay`]).
+type SharedKept = Arc<Mutex<Vec<Box<dyn Any + Send>>>>;
+
+/// A recording. Dropping it is a shutdown call; replays still in flight when it drops keep the values it holds (see
+/// [`Graph::replay`]) and finish.
 #[derive(Debug)]
 pub struct CudaGraph {
     gpu: Arc<CudaGpu>,
@@ -33,13 +37,15 @@ pub struct CudaGraph {
     fingerprint: Fingerprint,
     /// The number of streams the recording ran over.
     streams: usize,
-    /// Held for the graph's life: the buffers its copies read.
-    #[allow(dead_code, reason = "held so the buffers outlive the replays")]
-    kept: Mutex<Vec<Box<dyn Any + Send>>>,
+    /// The buffers its copies read, shared with every replay: a replay hands a handle to its stream, which holds it
+    /// until the next retirement armed after the replay is confirmed.
+    kept: SharedKept,
+    /// Launches of one executable are serialized here, whatever streams they come from.
+    launch_lock: Mutex<()>,
 }
 
-// SAFETY: the graph and its executable belong to the primary context; every use is a driver call, and the
-// executable is replayed through `&self` only by calls the driver orders.
+// SAFETY: the graph and its executable belong to the primary context. Every use is a driver call: launches take
+// `launch_lock`, and argument updates and re-recording take `&mut self`, so no two calls on one executable overlap.
 unsafe impl Send for CudaGraph {}
 // SAFETY: as above.
 unsafe impl Sync for CudaGraph {}
@@ -86,23 +92,16 @@ impl CudaGraph {
             self.launches = rec.launches;
             self.fingerprint = rec.hasher.finish();
             self.streams = streams;
-            // The old recording's buffers stay: replays of it may be in flight.
-            self.kept
-                .get_mut()
-                .unwrap_or_else(PoisonError::into_inner)
-                .extend(rec.kept);
+            // The new recording's buffers replace the old ones. A replay of the old recording that is still in flight
+            // holds its own handle to them.
+            self.kept = Arc::new(Mutex::new(rec.kept));
             return Ok(Rerecorded::Updated);
         }
         // Any other outcome leaves the executable as it was (an update that fails does not half apply).
         let mut fresh = gpu.instantiate(rec, new, streams)?;
         std::mem::swap(self, &mut fresh);
-        let old_kept = fresh.kept.get_mut().unwrap_or_else(PoisonError::into_inner);
-        let kept = std::mem::take(old_kept);
-        self.kept
-            .get_mut()
-            .unwrap_or_else(PoisonError::into_inner)
-            .extend(kept);
-        // `fresh` is now the old graph: dropping it frees its executable once its launches in flight end.
+        // `fresh` is now the old graph: dropping it frees its executable once its launches in flight end. Replays in
+        // flight hold their own handle to its buffers.
         Ok(Rerecorded::Instantiated)
     }
 
@@ -165,13 +164,31 @@ impl Graph for CudaGraph {
     }
 
     fn replay(&self, stream: &CudaStream) -> Result<(), GpuError> {
-        let _guard = stream.state.lock()?;
+        let state = stream.state.lock()?;
         self.gpu.poison.check()?;
         let _c = stream.enter()?;
-        // SAFETY: the executable and a stream of the same device; the context is current.
+        let _serial = self
+            .launch_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        // SAFETY: the executable and a stream of the same device; launches of this executable are serialized by
+        // `launch_lock`, and the context is current.
         self.gpu.check("cuGraphLaunch", unsafe {
             (self.gpu.fns.graph_launch)(self.exec, stream.raw)
-        })
+        })?;
+        // The replay reads the recording's buffers when it runs, which may be after this graph dropped: the stream
+        // keeps them until the next retirement armed on it after this replay is confirmed.
+        if !self
+            .kept
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_empty()
+        {
+            stream
+                .kept
+                .push(state.next_retire, Box::new(self.kept.clone()));
+        }
+        Ok(())
     }
 }
 
@@ -216,18 +233,28 @@ impl CudaSequence<'_> {
         Ok(event)
     }
 
-    /// `after`'s shadow records an event that `before`'s shadow waits on.
-    fn shadow_order(&mut self, after: usize, before: usize) -> Result<(), GpuError> {
+    /// `later` waits, on the device, for the work enqueued so far on `earlier`: an event made for the purpose, so the
+    /// streams' marker rings are never involved.
+    fn link(&mut self, earlier: CuStream, later: CuStream) -> Result<(), GpuError> {
+        self.gpu.poison.check()?;
         let event = self.event()?;
         let fns = &self.gpu.device().driver.fns;
-        // SAFETY: an event of this sequence and the shadow of a locked stream; the context is current.
+        // SAFETY: an event of this sequence and a stream of a locked stream (or its shadow); the context is current.
         self.gpu.check("cuEventRecord", unsafe {
-            (fns.event_record)(event, self.real[after].shadow)
+            (fns.event_record)(event, earlier)
         })?;
         // SAFETY: as above.
         self.gpu.check("cuStreamWaitEvent", unsafe {
-            (self.gpu.fns.stream_wait_event)(self.real[before].shadow, event, 0)
+            (self.gpu.fns.stream_wait_event)(later, event, 0)
         })
+    }
+
+    fn raw(&self, index: usize) -> CuStream {
+        self.real[index].stream.raw
+    }
+
+    fn shadow(&self, index: usize) -> CuStream {
+        self.real[index].shadow
     }
 
     /// Starts the capture on the first shadow and forks the others (and the real streams) from it.
@@ -239,56 +266,62 @@ impl CudaSequence<'_> {
         })?;
         self.capturing = true;
         for other in 1..self.real.len() {
-            self.shadow_order(0, other)
+            self.link(self.shadow(0), self.shadow(other))
                 .map_err(|e| GpuError::Capture(e.to_string()))?;
         }
         // The real streams fork the same way, so the real run equals a replay on the first stream.
-        if self.real.len() > 1 {
-            let marker = self.real[0].stream.mark_held()?;
-            for r in &self.real[1..] {
-                r.stream.await_held(r.stream.raw, marker)?;
-            }
+        for other in 1..self.real.len() {
+            self.link(self.raw(0), self.raw(other))?;
         }
         Ok(())
     }
 
-    /// Joins the streams back into the first, ends the capture, and returns the graph.
+    /// Joins the streams back into the first, ends the capture, and returns the graph. Every step is attempted
+    /// whatever failed before it, and the graph is destroyed on any error.
     fn finish(&mut self) -> Result<CuGraph, GpuError> {
-        let mut real = Ok(());
+        let mut failure: Option<GpuError> = None;
+        // The real streams join first: the first stream ends behind all the others, whatever happens to the capture.
         for other in 1..self.real.len() {
-            real = real.and_then(|()| {
-                let marker = self.real[other].stream.mark_held()?;
-                let first = &self.real[0].stream;
-                first.await_held(first.raw, marker)
-            });
+            if let Err(e) = self.link(self.raw(other), self.raw(0)) {
+                failure.get_or_insert(e);
+            }
         }
         // The shadows join even after a failure, so the end of the capture has the best chance to succeed.
-        let mut shadows = Ok(());
         for other in 1..self.real.len() {
-            let joined = self.shadow_order(other, 0);
-            if shadows.is_ok() {
-                shadows = joined;
+            if let Err(e) = self.link(self.shadow(other), self.shadow(0)) {
+                failure.get_or_insert(GpuError::Capture(e.to_string()));
             }
         }
         let mut graph: CuGraph = std::ptr::null_mut();
         // SAFETY: the first shadow, which is capturing; an out pointer; the context is current.
         let code = unsafe { (self.gpu.fns.stream_end_capture)(self.real[0].shadow, &mut graph) };
         self.capturing = false;
-        let ended = self.gpu.check("cuStreamEndCapture", code);
-        real?;
-        if let Err(e) = shadows.and(ended) {
-            if !graph.is_null() {
-                // SAFETY: a graph the driver returned and nothing else owns.
-                unsafe { (self.gpu.fns.graph_destroy)(graph) };
-            }
-            return Err(GpuError::Capture(e.to_string()));
+        if let Err(e) = self.gpu.check("cuStreamEndCapture", code) {
+            failure.get_or_insert(GpuError::Capture(e.to_string()));
         }
-        Ok(graph)
+        match failure {
+            None => Ok(graph),
+            Some(e) => {
+                if !graph.is_null() {
+                    // SAFETY: a graph the driver returned and nothing else owns.
+                    unsafe { (self.gpu.fns.graph_destroy)(graph) };
+                }
+                Err(e)
+            }
+        }
     }
 }
 
 impl Drop for CudaSequence<'_> {
     fn drop(&mut self) {
+        // A recording the closure never finished (it panicked): end the capture, so the shadows leave capture mode
+        // and later recordings work.
+        if self.capturing
+            && let Ok(graph) = self.finish()
+        {
+            // SAFETY: a graph the driver returned and nothing else owns.
+            unsafe { (self.gpu.fns.graph_destroy)(graph) };
+        }
         let f = &self.gpu.device().driver.fns;
         for event in self.events.drain(..) {
             // SAFETY: events made by `event`, unused after the capture ended.
@@ -338,11 +371,9 @@ impl Sequence for CudaSequence<'_> {
         }
         self.rec.hasher.order(after, before);
         if self.rec.mode == Mode::Record {
-            let marker = self.real[after].stream.mark_held()?;
-            let waiter = &self.real[before].stream;
-            waiter.await_held(waiter.raw, marker)?;
+            self.link(self.raw(after), self.raw(before))?;
             if self.rec.failed.is_none()
-                && let Err(e) = self.shadow_order(after, before)
+                && let Err(e) = self.link(self.shadow(after), self.shadow(before))
             {
                 self.rec.failed = Some(GpuError::Capture(e.to_string()));
             }
@@ -492,7 +523,8 @@ impl CudaGpu {
             launches: rec.launches,
             fingerprint: rec.hasher.finish(),
             streams,
-            kept: Mutex::new(rec.kept),
+            kept: Arc::new(Mutex::new(rec.kept)),
+            launch_lock: Mutex::new(()),
         })
     }
 }

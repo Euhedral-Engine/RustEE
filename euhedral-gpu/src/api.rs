@@ -39,7 +39,9 @@ pub trait Gpu: Send + Sync + fmt::Debug + Sized + 'static {
     /// The device's first fault, once it has one.
     fn poisoned(&self) -> Option<GpuError>;
 
-    /// Runs `f` once for real, as a replay on `streams[0]` would, and records it. The other streams fork from
+    /// Runs `f` once for real, as a replay on `streams[0]` would, and records it. Every pointer the closure names
+    /// (host buffers above all) must stay valid for every replay until the graph drops: the recording replays raw
+    /// work. The other streams fork from
     /// `streams[0]` at the start and join it at the end. A failed recording is `Err(Capture)`; the work itself was
     /// submitted and is unaffected.
     fn record<F>(&self, streams: &[&Arc<Self::Stream>], f: F) -> Result<Self::Graph, GpuError>
@@ -154,8 +156,13 @@ pub trait Enqueue {
     /// As [`copy_to_device`](Self::copy_to_device).
     unsafe fn memset(&mut self, dst: u64, value: u8, bytes: usize) -> Result<(), GpuError>;
 
-    /// Keeps `value` alive until the next retirement armed on this stream is confirmed (in a recording: until the
-    /// graph drops). Host buffers that a copy reads belong here.
+    /// Keeps `value` alive until the next retirement armed on this stream is confirmed. Host buffers that a copy
+    /// reads belong here.
+    ///
+    /// In a recording the value belongs to the graph. A recorded copy reads its host buffer again at every replay, so
+    /// every pointer a recording names must stay valid for every replay until the graph drops, and a host buffer must
+    /// be kept. Each replay hands the graph's values to its stream, which holds them until the next retirement armed
+    /// after the replay is confirmed, so a replay in flight survives the graph dropping.
     fn keep(&mut self, value: Box<dyn Any + Send>);
 }
 
@@ -212,6 +219,10 @@ pub trait Graph: Send + Sync + fmt::Debug {
     fn launches(&self) -> usize;
 
     /// Replays the recording as one submission on `stream`, with the arguments set by the last update.
+    ///
+    /// The values the recording keeps (`Enqueue::keep`) are handed to `stream`, which holds them until the next
+    /// retirement armed on it after this call is confirmed: arm one per replay (or per batch of replays), or they
+    /// are held until the stream drops. The graph may drop while its replays are in flight.
     fn replay(&self, stream: &<Self::Gpu as Gpu>::Stream) -> Result<(), GpuError>;
 }
 

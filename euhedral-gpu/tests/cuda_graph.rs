@@ -723,3 +723,114 @@ fn an_error_in_the_closure_ends_the_capture_and_frees_the_streams() {
     assert!(f.out_words(0) == f.reference(2.0, 1.0));
     drop(graph);
 }
+
+struct Told(Arc<std::sync::Mutex<Vec<euhedral_gpu::RetireTicket>>>);
+
+impl euhedral_gpu::RetireListener for Told {
+    fn retired(self: Box<Self>, ticket: euhedral_gpu::RetireTicket) {
+        self.0.lock().unwrap().push(ticket);
+    }
+}
+
+#[test]
+fn a_graph_dropped_after_a_replay_leaves_the_replay_its_buffers() {
+    let Some(f) = Fixture::new() else { return };
+    f.clear();
+    let token = Arc::new(());
+    let graph = f
+        .gpu
+        .record(&f.streams(), |q| {
+            q.submit(0, |e| {
+                e.keep(Box::new(token.clone()));
+                Ok(())
+            })?;
+            f.sequence(q, 2.0, 1.0, 0)
+        })
+        .unwrap();
+    f.settle(0);
+    f.clear();
+    assert_eq!(Arc::strong_count(&token), 2, "the graph holds it");
+    // A long spin ahead of the replay keeps it in flight while the graph drops.
+    f.s[0]
+        .submit(|q| {
+            // SAFETY: `spin` takes one 64-bit argument and touches no memory.
+            unsafe {
+                q.launch(
+                    &f.spin,
+                    Launch::linear(1, 1),
+                    &Args::new().arg(125_000_000u64),
+                )
+            }
+        })
+        .unwrap();
+    graph.replay(&f.s[0]).unwrap();
+    let told = Arc::new(std::sync::Mutex::new(Vec::new()));
+    f.s[0].notify_retired(Box::new(Told(told.clone()))).unwrap();
+    drop(graph);
+    assert_eq!(
+        Arc::strong_count(&token),
+        2,
+        "the replay in flight holds the buffers after the graph dropped"
+    );
+    assert!(wait_until(Duration::from_secs(10), || !told
+        .lock()
+        .unwrap()
+        .is_empty()));
+    let ticket = told.lock().unwrap()[0];
+    assert!(
+        f.out_words(0) == f.reference(2.0, 1.0),
+        "the replay completed with its buffers"
+    );
+    assert_eq!(f.s[0].confirm_retired(ticket), None);
+    assert_eq!(Arc::strong_count(&token), 1, "released by the confirmation");
+}
+
+#[test]
+fn replays_from_two_threads_are_serialized() {
+    let Some(f) = Fixture::new() else { return };
+    f.clear();
+    let graph = f
+        .gpu
+        .record(&f.streams(), |q| f.sequence(q, 2.0, 1.0, 0))
+        .unwrap();
+    f.settle(0);
+    f.clear();
+    std::thread::scope(|scope| {
+        for stream in &f.s {
+            let graph = &graph;
+            scope.spawn(move || {
+                for _ in 0..50 {
+                    graph.replay(stream).unwrap();
+                }
+            });
+        }
+    });
+    f.settle(0);
+    f.settle(1);
+    assert!(f.out_words(0) == f.reference(2.0, 1.0));
+    assert_eq!(f.gpu.poisoned(), None);
+}
+
+#[test]
+fn a_panic_in_the_recording_closure_ends_the_capture() {
+    let Some(f) = Fixture::new() else { return };
+    f.clear();
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = f.gpu.record(&f.streams(), |q| {
+            f.sequence(q, 1.0, 1.0, 0)?;
+            panic!("the caller's closure panicked");
+        });
+    }));
+    assert!(panicked.is_err());
+    f.settle(0);
+    f.settle(1);
+    f.clear();
+    // The streams and their shadows left capture mode: a new recording works.
+    let graph = f
+        .gpu
+        .record(&f.streams(), |q| f.sequence(q, 2.0, 1.0, 0))
+        .unwrap();
+    f.settle(0);
+    assert!(f.out_words(0) == f.reference(2.0, 1.0));
+    drop(graph);
+}
