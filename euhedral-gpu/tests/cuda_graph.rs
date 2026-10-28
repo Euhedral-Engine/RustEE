@@ -13,7 +13,7 @@ use euhedral_gpu::{
     Args, CompileOptions, Enqueue, Gpu, GpuError, Graph, Launch, Module, Rerecorded, Sequence,
     Stream, StreamOptions,
 };
-use euhedral_graph::{LanePool, Marker};
+use euhedral_graph::{DeviceQueue, LanePool, Marker};
 use euhedral_memory::cuda::{DeviceMemory, PinnedHost};
 use euhedral_memory::{Backend, Block, LocationId};
 

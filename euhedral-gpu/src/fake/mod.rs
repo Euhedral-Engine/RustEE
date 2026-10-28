@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use euhedral_graph::LanePool;
+use euhedral_graph::{LanePool, QueueId};
 
 use crate::{
     Args, Fingerprint, Gpu, GpuError, Kernel, Launch, POISONED_STATUS, Poison, Rerecorded,
@@ -137,7 +137,7 @@ pub(crate) enum QOp {
     },
     Retire {
         /// The identity of the stream that armed it, and its number on that stream.
-        stream: u64,
+        stream: QueueId,
         seq: u64,
         listener: Box<dyn RetireListener>,
     },
@@ -150,8 +150,9 @@ pub(crate) struct Queued {
     op: QOp,
 }
 
-#[derive(Default)]
 pub(crate) struct Lane {
+    /// The identity of the stream that owns the lane, stamped on its markers.
+    pub(crate) id: QueueId,
     queue: VecDeque<Queued>,
     /// Marks submitted, and marks run.
     pub(crate) marks_enqueued: u64,
@@ -428,13 +429,17 @@ impl Gpu for FakeGpu {
             return Err(GpuError::Invalid("a pool has 1 to 64 lanes".into()));
         }
         self.poison.check()?;
+        let ids: Vec<QueueId> = names.iter().map(|_| QueueId::next()).collect();
         let base = {
             let mut st = self.lock();
             let base = st.lanes.len();
-            for _ in names {
+            for id in &ids {
                 st.lanes.push(Lane {
+                    id: *id,
+                    queue: VecDeque::new(),
+                    marks_enqueued: 0,
+                    marks_run: 0,
                     markers: options.markers,
-                    ..Lane::default()
                 });
             }
             base
@@ -443,7 +448,7 @@ impl Gpu for FakeGpu {
         let streams: Vec<Arc<FakeStream>> = names
             .iter()
             .enumerate()
-            .map(|(i, name)| Arc::new(FakeStream::new(self.clone(), name, base, i, count)))
+            .map(|(i, name)| Arc::new(FakeStream::new(self.clone(), ids[i], name, base, i, count)))
             .collect();
         let queues = streams
             .iter()

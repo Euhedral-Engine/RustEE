@@ -121,8 +121,8 @@ assert_eq!(*released.lock().unwrap(), [0, 1, 2]); // released in admission order
 
 A `DeviceQueue` is a device timeline that runs submissions in order: a Vulkan queue with a timeline
 semaphore, a CUDA stream with events, a hardware codec engine, or a fake. What is generic is the
-query, `completed()`, one cheap read. A `Marker` names a lane and a value on it; a `LanePool` holds
-the lanes and answers `reached(marker)`. Submitting is technology-specific and lives with whoever
+query, `completed()`, one cheap read. A `Marker` names the queue that made it (`QueueId`, from `DeviceQueue::id`), a lane and a value on it;
+a `LanePool` holds the lanes and answers `reached(marker)`, which is false for a marker of another queue. Submitting is technology-specific and lives with whoever
 owns the queue: it takes the markers its work must wait for on the device and returns the marker
 of the new work.
 

@@ -3,6 +3,22 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## `Marker` names its queue (2026-10-28)
+
+**What.** `euhedral-graph`: `Marker` gained `queue: QueueId`, and `Marker::new(queue, lane, value)`. `QueueId` is an opaque,
+non-zero identity drawn with `QueueId::next()` from one process-wide counter. `DeviceQueue` gained `fn id(&self) -> QueueId`.
+**Breaking** for code that builds a marker with a struct literal (`Marker { lane, value }`) or implements `DeviceQueue`:
+draw an id once per queue, return it from `id()`, and stamp it on the markers the queue makes (`Marker::new`).
+`LanePool::reached` is false for a marker whose queue is not the lane's (or whose lane the pool does not have);
+`FakeDevice` and `MarkerRetired` check the same. `euhedral-gpu`'s `await_marker` refuses a marker of another pool with
+`Err(Invalid)`, and its `RetireTicket` carries the stream's `QueueId`.
+
+**Why.** A marker named only a lane and a value, so a marker of another pool, with a lane in range and a value already
+done, looked like one of this pool and could be treated as done.
+
+**Tests.** `a_marker_of_another_queue_or_lane_is_never_reached`, `queue_ids_are_unique_and_non_zero` (`euhedral-graph`);
+`a_marker_of_another_pool_is_refused_not_treated_as_done` (`euhedral-gpu`, fake and CUDA).
+
 ## GPU access: `euhedral-gpu` (2026-10-28)
 
 **What.**

@@ -12,6 +12,7 @@ use euhedral_gpu::{
     Args, CompileOptions, Enqueue, Gpu, GpuError, Launch, Module, RetireListener, RetireTicket,
     Stream, StreamOptions,
 };
+use euhedral_graph::{DeviceQueue, LaneId, Marker, QueueId};
 
 struct Record(Arc<Mutex<Vec<RetireTicket>>>);
 
@@ -384,4 +385,37 @@ fn a_ticket_settles_only_on_the_stream_that_armed_it() {
     assert_eq!(s[0].confirm_retired(ticket_a), None);
     assert_eq!(Arc::strong_count(&kept), 1);
     assert_eq!(s[1].confirm_retired(ticket_b), None);
+}
+
+#[test]
+fn a_marker_of_another_pool_is_refused_not_treated_as_done() {
+    let gpu = gpu_with_kernels();
+    let (pool_a, a) = lanes(&gpu, &["a0", "a1"]);
+    let (pool_b, b) = lanes(&gpu, &["b0", "b1"]);
+    // A marker of pool b that has long completed: its lane exists in pool a, and its value is below a's own.
+    let from_b = b[0].mark().unwrap();
+    let first = a[0].mark().unwrap();
+    a[0].mark().unwrap();
+    gpu.run_until_idle();
+    assert!(pool_b.reached(from_b) && pool_a.reached(first));
+    let refused = a[1].await_marker(from_b);
+    assert!(matches!(refused, Err(GpuError::Invalid(_))), "{refused:?}");
+    // Not even its own lane's number saves it: pool a does not reach it either.
+    assert!(!pool_a.reached(from_b));
+    // The same lane and value stamped with a's queue is a's own marker, already done.
+    a[1].await_marker(Marker::new(a[0].id(), from_b.lane, from_b.value))
+        .unwrap();
+    // Neither pool's queue: refused, and never reached.
+    let stranger = Marker::new(QueueId::next(), LaneId(0), 1);
+    assert!(matches!(
+        a[0].await_marker(stranger),
+        Err(GpuError::Invalid(_))
+    ));
+    assert!(!pool_a.reached(stranger));
+    // A lane beyond the pool, with the right queue: invalid.
+    let beyond = Marker::new(a[0].id(), LaneId(7), 1);
+    assert!(matches!(
+        a[0].await_marker(beyond),
+        Err(GpuError::Invalid(_))
+    ));
 }

@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use euhedral_graph::{DeviceQueue, LaneId, Marker};
+use euhedral_graph::{DeviceQueue, LaneId, Marker, QueueId};
 use euhedral_memory::cuda::{CuEvent, CuStream, Device, STREAM_NON_BLOCKING};
 
 use crate::kept::Kept;
@@ -29,6 +29,8 @@ unsafe impl Sync for Handle {}
 /// A lane's marker events: value `v` is recorded in slot `v % events.len()`.
 #[derive(Debug)]
 pub(crate) struct LaneRing {
+    /// The identity of the stream this ring belongs to, stamped on its markers.
+    id: QueueId,
     device: Arc<Device>,
     events: Vec<CuEvent>,
     /// Markers made so far (the highest value), and the highest value known complete.
@@ -42,11 +44,12 @@ unsafe impl Send for LaneRing {}
 unsafe impl Sync for LaneRing {}
 
 impl LaneRing {
-    fn new(device: &Arc<Device>, markers: u32) -> Result<Self, GpuError> {
+    fn new(id: QueueId, device: &Arc<Device>, markers: u32) -> Result<Self, GpuError> {
         let _c = device.enter().map_err(from_cuda)?;
         let f = &device.driver.fns;
         // The ring owns the events from the first one made, so a failure part way destroys them.
         let mut ring = Self {
+            id,
             device: device.clone(),
             events: Vec::with_capacity(markers as usize),
             marked: AtomicU64::new(0),
@@ -119,7 +122,7 @@ pub(crate) struct StreamState {
 #[derive(Debug)]
 pub struct CudaStream {
     pub(crate) gpu: Arc<CudaGpu>,
-    pub(crate) id: u64,
+    pub(crate) id: QueueId,
     lane: LaneId,
     name: String,
     pub(crate) raw: CuStream,
@@ -152,7 +155,7 @@ impl CudaStream {
         let device = gpu.device();
         let rings = names
             .iter()
-            .map(|_| LaneRing::new(device, options.markers).map(Arc::new))
+            .map(|_| LaneRing::new(QueueId::next(), device, options.markers).map(Arc::new))
             .collect::<Result<Vec<_>, _>>()?;
         let lanes: Arc<[Arc<LaneRing>]> = rings.into();
         let _c = device.enter().map_err(from_cuda)?;
@@ -165,7 +168,7 @@ impl CudaStream {
             device.check("cuStreamCreate", code).map_err(from_cuda)?;
             streams.push(Arc::new(CudaStream {
                 gpu: gpu.clone(),
-                id: crate::ids::next_stream_id(),
+                id: lanes[i].id,
                 lane: LaneId(u16::try_from(i).expect("at most 64 lanes")),
                 name: (*name).to_owned(),
                 raw,
@@ -199,10 +202,7 @@ impl CudaStream {
             (f.event_record)(ring.slot(value), self.raw)
         })?;
         ring.marked.store(value, Ordering::Release);
-        Ok(Marker {
-            lane: self.lane,
-            value,
-        })
+        Ok(Marker::new(self.id, self.lane, value))
     }
 
     /// Later work on `target` (this stream, or a stream of a recording) waits for `marker`. The caller holds the
@@ -212,7 +212,13 @@ impl CudaStream {
         let other = self
             .lanes
             .get(usize::from(marker.lane.0))
-            .ok_or_else(|| GpuError::Invalid("a marker of another pool".into()))?;
+            .filter(|ring| ring.id == marker.queue)
+            .ok_or_else(|| {
+                GpuError::Invalid(format!(
+                    "{} lane {} is not a lane of this stream's pool",
+                    marker.queue, marker.lane.0
+                ))
+            })?;
         if marker.value == 0 {
             return Ok(());
         }
@@ -274,6 +280,10 @@ impl Drop for CudaStream {
 }
 
 impl DeviceQueue for CudaStream {
+    fn id(&self) -> QueueId {
+        self.id
+    }
+
     fn completed(&self) -> u64 {
         if self.gpu.poison.get().is_some() {
             return self.ring.marked.load(Ordering::Acquire);
@@ -302,10 +312,6 @@ impl Stream for CudaStream {
 
     fn lane(&self) -> LaneId {
         self.lane
-    }
-
-    fn id(&self) -> u64 {
-        self.id
     }
 
     fn submit<R>(

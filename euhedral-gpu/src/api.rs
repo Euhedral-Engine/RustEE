@@ -14,7 +14,7 @@ use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use euhedral_graph::{DeviceQueue, LaneId, LanePool, Marker};
+use euhedral_graph::{DeviceQueue, LaneId, LanePool, Marker, QueueId};
 
 use crate::{Args, Fingerprint, GpuError, Launch};
 
@@ -79,10 +79,6 @@ pub trait Stream: DeviceQueue + Sized + 'static {
 
     fn lane(&self) -> LaneId;
 
-    /// An identity of this stream, unique in the process. Tickets carry it, so a ticket settles only where it was
-    /// armed.
-    fn id(&self) -> u64;
-
     /// Runs `f` on the calling thread with the stream selected for every operation; the operations are contiguous
     /// on the stream. Keep `f` to enqueueing. A call on this stream from inside `f` is `Err(Invalid)`.
     fn submit<R>(
@@ -96,9 +92,9 @@ pub trait Stream: DeviceQueue + Sized + 'static {
 
     /// Later work on this stream waits, on the device, for `marker`. The host does not wait.
     ///
-    /// A marker names a lane and a value, and is meaningful only on the pool of the stream that made it; a marker of
-    /// another pool is not detected (it names the same lane of this pool). A lane beyond the pool, or a value that was
-    /// never made, is `Err(Invalid)`.
+    /// A marker names the queue that made it ([`DeviceQueue::id`]) as well as a lane and a value. A marker of a queue
+    /// that is not one of this stream's pool, a lane beyond the pool, or a value that was never made, is
+    /// `Err(Invalid)`; it is never treated as already done.
     fn await_marker(&self, marker: Marker) -> Result<(), GpuError>;
 
     /// Arms a retirement after the work submitted so far: `listener` runs once.
@@ -246,14 +242,14 @@ pub const POISONED_STATUS: i32 = -1;
 /// ([`Stream::confirm_retired`]); a ticket of another stream is refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RetireTicket {
-    stream: u64,
+    stream: QueueId,
     lane: LaneId,
     seq: u64,
     status: i32,
 }
 
 impl RetireTicket {
-    pub(crate) fn new(stream: u64, lane: LaneId, seq: u64, status: i32) -> Self {
+    pub(crate) fn new(stream: QueueId, lane: LaneId, seq: u64, status: i32) -> Self {
         Self {
             stream,
             lane,
@@ -262,8 +258,8 @@ impl RetireTicket {
         }
     }
 
-    /// The identity ([`Stream::id`]) of the stream that armed the retirement.
-    pub fn stream(&self) -> u64 {
+    /// The identity ([`DeviceQueue::id`]) of the stream that armed the retirement.
+    pub fn stream(&self) -> QueueId {
         self.stream
     }
 

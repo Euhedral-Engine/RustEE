@@ -8,6 +8,7 @@ use euhedral_gpu::{
     Args, CompileOptions, Enqueue, Gpu, GpuError, Graph, Launch, Module, Rerecorded, Sequence,
     Stream, StreamOptions,
 };
+use euhedral_graph::DeviceQueue;
 
 const WORDS: usize = 8;
 const BYTES: usize = WORDS * 4;

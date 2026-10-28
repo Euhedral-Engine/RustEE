@@ -40,8 +40,9 @@ Asynchronous, backend-neutral GPU access for the RustEE control plane. A lattice
   - Enqueue operations (`launch`, the copies, `memset`) are `unsafe fn`s, as `euhedral_memory::Copier::start` is: a
     kernel or a copy can touch any device-visible memory.
 - **Markers across streams.** `mark()` records a marker after the work submitted so far; `await_marker(m)` orders later
-  work behind it on the device, and the host does not wait. A marker belongs to the pool of the stream that made it; a
-  marker of another pool is not detected. Each CUDA stream has a ring of `StreamOptions::markers`
+  work behind it on the device, and the host does not wait. A marker carries the identity of the queue that made it (`QueueId`, from `DeviceQueue::id`): `await_marker`
+  refuses a marker of a queue that is not in the stream's pool with `Err(Invalid)`, whatever its lane and value, and a
+  `LanePool` never reaches one. Each CUDA stream has a ring of `StreamOptions::markers`
   events (default 256). `mark()` returns `Err(Busy)` rather than reuse a slot whose marker has not completed; an
   await on a marker that already completed adds no device wait.
 - **Retirement.**

@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use euhedral_graph::{DeviceQueue, LaneId, Marker};
+use euhedral_graph::{DeviceQueue, LaneId, Marker, QueueId};
 
 use crate::kept::Kept;
 use crate::stream_lock::StreamLock;
@@ -20,7 +20,7 @@ pub(crate) struct StreamState {
 #[derive(Debug)]
 pub struct FakeStream {
     gpu: Arc<FakeGpu>,
-    id: u64,
+    id: QueueId,
     name: String,
     /// Global index of lane 0 of this stream's pool, this stream's index in the pool, and the pool's size.
     base: usize,
@@ -33,6 +33,7 @@ pub struct FakeStream {
 impl FakeStream {
     pub(crate) fn new(
         gpu: Arc<FakeGpu>,
+        id: QueueId,
         name: &str,
         base: usize,
         index: usize,
@@ -40,7 +41,7 @@ impl FakeStream {
     ) -> Self {
         Self {
             gpu,
-            id: crate::ids::next_stream_id(),
+            id,
             name: name.to_owned(),
             base,
             index,
@@ -77,25 +78,32 @@ impl FakeStream {
             lane.marks_enqueued + 1
         };
         self.push(QOp::Mark { value });
-        Ok(Marker {
-            lane: LaneId(self.lane_id()),
-            value,
-        })
+        Ok(Marker::new(self.id, LaneId(self.lane_id()), value))
     }
 
     fn await_locked(&self, marker: Marker) -> Result<(), GpuError> {
         self.gpu.poison.check()?;
-        if marker.lane.0 == self.lane_id() {
-            return Ok(());
+        let lane = usize::from(marker.lane.0);
+        if lane >= self.count {
+            return Err(GpuError::Invalid(format!(
+                "{} lane {} is not a lane of this stream's pool",
+                marker.queue, marker.lane.0
+            )));
         }
-        let target = usize::from(marker.lane.0);
-        if target >= self.count {
-            return Err(GpuError::Invalid("a marker of another pool".into()));
-        }
-        let target = self.base + target;
+        let target = self.base + lane;
         {
             let st = self.gpu.lock();
             let lane = &st.lanes[target];
+            // A marker of another queue is refused, whatever its lane and value say.
+            if lane.id != marker.queue {
+                return Err(GpuError::Invalid(format!(
+                    "{} lane {} is not a lane of this stream's pool",
+                    marker.queue, marker.lane.0
+                )));
+            }
+            if target == self.global() {
+                return Ok(());
+            }
             if marker.value > lane.marks_enqueued {
                 return Err(GpuError::Invalid("a marker that was never made".into()));
             }
@@ -141,6 +149,10 @@ impl Drop for FakeStream {
 }
 
 impl DeviceQueue for FakeStream {
+    fn id(&self) -> QueueId {
+        self.id
+    }
+
     fn completed(&self) -> u64 {
         let poisoned = self.gpu.poison.get().is_some();
         let st = self.gpu.lock();
@@ -167,10 +179,6 @@ impl Stream for FakeStream {
 
     fn lane(&self) -> LaneId {
         LaneId(self.lane_id())
-    }
-
-    fn id(&self) -> u64 {
-        self.id
     }
 
     fn submit<R>(

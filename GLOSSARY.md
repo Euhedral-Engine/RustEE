@@ -312,8 +312,9 @@ runs its submissions in order and whose progress is one cheap read (`completed`)
 with a timeline semaphore, a CUDA stream with events, a hardware codec engine, or a fake
 ([`FakeDevice`](euhedral-graph/src/testing.rs)).
 
-**marker** ([`Marker`](euhedral-graph/src/lanes.rs)): a lane and a value on its timeline: the lane's
-work up to that value. Copyable; querying it never blocks. A successor on another lane orders itself
+**marker** ([`Marker`](euhedral-graph/src/lanes.rs)): a queue ([`QueueId`](euhedral-graph/src/lanes.rs), an opaque
+identity unique in the process), a lane and a value on its timeline: the lane's work up to that value. A marker of
+another queue is never reached by a `LanePool` and is refused by a backend's await. Copyable; querying it never blocks. A successor on another lane orders itself
 behind a marker on the device.
 
 **LanePool** ([`LanePool`](euhedral-graph/src/lanes.rs), [`LaneId`](euhedral-graph/src/lanes.rs)):

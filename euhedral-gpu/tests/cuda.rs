@@ -75,13 +75,7 @@ mod streams {
         })
         .unwrap();
         let m = s[0].mark().unwrap();
-        assert_eq!(
-            m,
-            Marker {
-                lane: LaneId(0),
-                value: 1
-            }
-        );
+        assert_eq!(m, Marker::new(s[0].id(), LaneId(0), 1));
         assert!(reached_within(&pool, m, Duration::from_secs(5)));
         assert_eq!(s[0].name(), "compute");
         drop((pool, s));
@@ -139,11 +133,39 @@ mod streams {
     fn a_marker_from_an_unknown_lane_is_invalid() {
         let Some(gpu) = gpu() else { return };
         let (_pool, s) = gpu.open_lanes(&["a"], StreamOptions::default()).unwrap();
-        let r = s[0].await_marker(Marker {
-            lane: LaneId(9),
-            value: 1,
-        });
+        let r = s[0].await_marker(Marker::new(s[0].id(), LaneId(9), 1));
         assert!(matches!(r, Err(GpuError::Invalid(_))), "{r:?}");
+    }
+
+    #[test]
+    fn a_marker_of_another_pool_is_refused_not_treated_as_done() {
+        let Some(gpu) = gpu() else { return };
+        let (pool_a, a) = gpu
+            .open_lanes(&["a0", "a1"], StreamOptions::default())
+            .unwrap();
+        let (pool_b, b) = gpu
+            .open_lanes(&["b0", "b1"], StreamOptions::default())
+            .unwrap();
+        // A real marker of pool b, made and long done: its lane exists in pool a and its value is below a's own.
+        let from_b = b[0].mark().unwrap();
+        assert!(reached_within(&pool_b, from_b, Duration::from_secs(5)));
+        a[0].mark().unwrap();
+        let first = a[0].mark().unwrap();
+        assert!(reached_within(&pool_a, first, Duration::from_secs(5)));
+        let refused = a[1].await_marker(from_b);
+        assert!(matches!(refused, Err(GpuError::Invalid(_))), "{refused:?}");
+        // The same lane and value, stamped with pool a's queue, is accepted (and needs no device wait).
+        a[1].await_marker(Marker::new(a[0].id(), from_b.lane, from_b.value))
+            .unwrap();
+        // Another pool's pool does not reach it either.
+        assert!(!pool_a.reached(from_b));
+        // A marker with an in-range lane and a done value, but a queue that is neither pool's, is refused too.
+        let stranger = Marker::new(euhedral_graph::QueueId::next(), LaneId(0), 1);
+        assert!(matches!(
+            a[0].await_marker(stranger),
+            Err(GpuError::Invalid(_))
+        ));
+        assert!(!pool_a.reached(stranger));
     }
 
     /// Polls `condition` from the test thread until it holds or `limit` passes.

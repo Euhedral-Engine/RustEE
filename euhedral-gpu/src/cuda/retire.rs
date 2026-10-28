@@ -7,7 +7,7 @@
 use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use euhedral_graph::LaneId;
+use euhedral_graph::{LaneId, QueueId};
 use euhedral_memory::cuda::{CuResult, CuStream};
 
 use crate::{GpuError, RetireListener, RetireTicket};
@@ -17,7 +17,7 @@ use super::stream::CudaStream;
 /// What a callback carries: the listener, and the ticket's lane and number.
 struct CallbackRecord {
     listener: Box<dyn RetireListener>,
-    stream: u64,
+    stream: QueueId,
     lane: LaneId,
     seq: u64,
 }
