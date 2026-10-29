@@ -31,6 +31,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use euhedral_core::frames::Frame;
 use euhedral_core::generics::{LatticeReceiver, LatticeSource};
+use euhedral_data_structures::sync::HotScope;
 
 /// What turns a completed operation's result into the frame that continues the work.
 pub type Continuation<T> = Box<dyn FnOnce(T) -> Box<dyn Frame> + Send>;
@@ -629,6 +630,7 @@ impl AsyncIo {
     }
 
     fn submit(&self, request: Request, buf: Buf, then: Then) -> io::Result<()> {
+        let _hot = HotScope::enter();
         if self.front.complete.load(Ordering::Acquire) {
             return Err(io::Error::other("this AsyncIo is complete"));
         }

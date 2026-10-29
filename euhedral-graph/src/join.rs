@@ -50,6 +50,7 @@
     reason = "parts own their slots until the count publishes them"
 )]
 
+use euhedral_data_structures::sync::HotScope;
 use std::any::Any;
 use std::cell::Cell;
 use std::fmt;
@@ -356,6 +357,7 @@ impl<T> Join<T> {
     }
 
     fn end(&self, part: usize, value: Option<T>) {
+        let _hot = HotScope::enter();
         let Some(slot) = self.slots.get(part) else {
             panic!("part {part} of a join of capacity {}", self.slots.len());
         };

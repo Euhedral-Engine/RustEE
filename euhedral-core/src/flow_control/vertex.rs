@@ -6,7 +6,7 @@ use crate::generics::{LatticeReceiver, LatticeSource, LatticeTerminal, SourceCel
 use crate::utils::math::unsigned_multiply_high;
 use euhedral_data_structures::atomics::CachePadded;
 use euhedral_data_structures::queues::{Consumer, MpscQueue, Multi, Producer, Single};
-use euhedral_data_structures::sync::SetOnce;
+use euhedral_data_structures::sync::{HotScope, SetOnce};
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
@@ -104,6 +104,8 @@ impl RoutingState {
 
 impl Drop for RoutingState {
     fn drop(&mut self) {
+        // The last reader of a retired generation retires it: rebalance work on whichever thread that is.
+        let _cold = HotScope::leave();
         if let Some(owner) = self.owner.upgrade() {
             owner.release(self);
         }
@@ -350,6 +352,7 @@ impl LatticeVertex {
     ///
     /// Panics if the routing function returns an index outside the active downstreams.
     pub fn try_push(&self, frame: Box<dyn Frame>) -> Result<(), Box<dyn Frame>> {
+        let _hot = HotScope::enter();
         let state = self.routing_state();
         if state.is_empty() {
             return Err(frame);

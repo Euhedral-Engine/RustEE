@@ -11,6 +11,7 @@ use crate::generics::LatticeSource;
 use crate::internal::task_pool::TaskPool;
 use crate::metrics::{MetricsRegistry, MetricsSnapshot};
 use crate::utils::spin_wait;
+use euhedral_data_structures::sync::HotScope;
 use euhedral_hardware_utils::monitor::{
     HardwareUtilization, MonitorError, ResourceMonitor, SocketSnapshot,
 };
@@ -291,6 +292,8 @@ impl ControlPlaneLattice {
         &self,
         source: Arc<dyn LatticeSource>,
     ) -> Result<Arc<UpstreamInterceptor>, LatticeError> {
+        // Attaching a source is rebalance work, also when a frame does it.
+        let _cold = HotScope::leave();
         log::trace!(target: &self.name, "adding an upstream");
         self.start()?;
         self.controller

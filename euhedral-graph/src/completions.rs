@@ -9,6 +9,7 @@ use std::time::Instant;
 use euhedral_core::frames::Frame;
 use euhedral_core::generics::{LatticeReceiver, LatticeSource};
 use euhedral_data_structures::queues::{Consumer, MpscQueue, Multi, Producer, Single};
+use euhedral_data_structures::sync::HotScope;
 
 use euhedral_core::metrics::Histogram;
 
@@ -162,6 +163,7 @@ impl Completions {
     /// Registers `what`. Exactly one end for its frame, whatever races `complete` (the argument is
     /// on [`LatticeSource::complete`]'s implementation below).
     fn add(&self, what: Waits) {
+        let _hot = HotScope::enter();
         // The fast path of the sequential case: the flag is set and visible (`complete` returned
         // before this call, by any synchronisation), so nothing is queued and the frame ends here.
         // Only a speed-up and the visible failure: a registration that misses the flag takes the

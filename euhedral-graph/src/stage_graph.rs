@@ -1,6 +1,7 @@
 //! Static stage DAGs run per quantum, with submission, completion and external edges
 //! (Euhedral-Inference `StageGraph`).
 
+use euhedral_data_structures::sync::HotScope;
 use std::collections::VecDeque;
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
@@ -818,6 +819,7 @@ impl<Q: Send + Sync + 'static> Run<Q> {
 
     /// An edge into `stage` arrived with `markers`; the last one publishes it.
     fn arrive(self: &Arc<Self>, stage: StageId, markers: &[Marker]) {
+        let _hot = HotScope::enter();
         let state = &self.stages[usize::from(stage.0)];
         if !markers.is_empty() {
             let mut inputs = lock(&state.inputs);
@@ -846,6 +848,7 @@ impl<Q: Send + Sync + 'static> Run<Q> {
 
     /// Runs `stage` (in its frame's `execute`), unless the quantum stopped.
     fn run_stage(&self, stage: StageId) -> Option<Result<Submitted, StageError>> {
+        let _hot = HotScope::enter();
         if self.stopped.load(Ordering::Acquire) {
             return None;
         }
@@ -905,6 +908,7 @@ impl<Q: Send + Sync + 'static> Run<Q> {
     /// `stage` submitted: its edges are satisfied (submission edges now, completion edges once its
     /// work completed).
     fn submitted(self: &Arc<Self>, stage: StageId, submitted: Submitted) {
+        let _hot = HotScope::enter();
         let index = usize::from(stage.0);
         let Submitted { marker, completion } = submitted;
         // Device order passes through a stage that queued nothing.

@@ -12,7 +12,9 @@
 // The wrappers are the one place a standard lock type is named.
 #![allow(clippy::disallowed_types)]
 
-use std::sync::{Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
+use std::sync::{
+    Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError,
+};
 
 #[cfg(debug_assertions)]
 use std::cell::Cell;
@@ -53,7 +55,9 @@ impl HotScope {
     pub fn enter() -> HotGuard {
         #[cfg(debug_assertions)]
         DEPTH.with(|depth| depth.set(depth.get() + 1));
-        HotGuard { _thread: PhantomData }
+        HotGuard {
+            _thread: PhantomData,
+        }
     }
 
     /// Suspends every open hot scope of this thread for a lifecycle step.

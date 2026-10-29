@@ -9,6 +9,7 @@ use crate::utils::math::ewma;
 use euhedral_data_structures::atomics::CachePadded;
 use euhedral_data_structures::queues::partitioned::{PartitionedMpscQueue, PartitionedProducer};
 use euhedral_data_structures::queues::queue::{Consumer, Multi, Single};
+use euhedral_data_structures::sync::HotScope;
 use euhedral_hardware_utils::monitor::CoreSnapshot;
 use euhedral_hardware_utils::topology::{CpuCacheLayout, Topology};
 use euhedral_hardware_utils::util::CpuSet;
@@ -419,6 +420,7 @@ impl ControlPlaneCache {
         mut stop: impl FnMut(&dyn Frame) -> bool,
         limit: u64,
     ) -> u64 {
+        let _hot = HotScope::enter();
         if limit == 0 || self.count.load(Ordering::Acquire) <= 0 {
             return 0;
         }
@@ -474,6 +476,7 @@ impl ControlPlaneCache {
         mut stop: impl FnMut(&dyn Frame) -> bool,
         limit: u64,
     ) -> u64 {
+        let _hot = HotScope::enter();
         if limit == 0 || self.count.load(Ordering::Acquire) <= 0 {
             return 0;
         }
@@ -510,6 +513,7 @@ impl ControlPlaneCache {
         limit: u64,
         cursor: usize,
     ) -> u64 {
+        let _hot = HotScope::enter();
         if !self.config.work_steal() {
             return 0;
         }
@@ -538,6 +542,7 @@ impl ControlPlaneCache {
         limit: u64,
         cursor: usize,
     ) -> u64 {
+        let _hot = HotScope::enter();
         if !self.config.work_steal() {
             return 0;
         }
@@ -630,6 +635,7 @@ impl LatticeNode for ControlPlaneCache {
 
     /// Queues `frame` and counts it toward the calling worker's request.
     fn push(&self, frame: Box<dyn Frame>) {
+        let _hot = HotScope::enter();
         if let Some(lane) = self.offer(frame) {
             lane.count.fetch_add(1, Ordering::AcqRel);
             FlowContext::with(|context| {

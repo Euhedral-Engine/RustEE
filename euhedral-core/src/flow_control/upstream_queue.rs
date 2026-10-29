@@ -3,6 +3,7 @@ use crate::utils::math::unsigned_multiply_high;
 use crate::utils::{ACQUIRE_CONTENTION_SCALE, AverageFlow, FlowContext};
 use euhedral_data_structures::atomics::PaddedAtomicLong;
 use euhedral_data_structures::queues::{Consumer, MpscQueue, Multi, Producer, Single};
+use euhedral_data_structures::sync::HotScope;
 use euhedral_hashing::hasher_api;
 use std::cell::Cell;
 use std::f64::consts::LN_2;
@@ -386,6 +387,7 @@ impl UpstreamQueue {
 
     /// Passes demand for `demand` frames on to the handles, which push what they produce.
     pub fn request(&mut self, demand: u64) {
+        let _hot = HotScope::enter();
         self.service(None, demand);
     }
 
@@ -398,6 +400,7 @@ impl UpstreamQueue {
         stop: &mut dyn FnMut(&dyn Frame) -> bool,
         demand: u64,
     ) -> u64 {
+        let _hot = HotScope::enter();
         self.service(Some(Pull { consumer, stop }), demand)
     }
 

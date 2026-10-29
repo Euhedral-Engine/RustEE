@@ -12,5 +12,5 @@ mod lifecycle;
 mod loom;
 mod set_once;
 
-pub use set_once::SetOnce;
 pub use lifecycle::{ColdGuard, HotGuard, HotScope, LifecycleMutex, LifecycleRwLock};
+pub use set_once::SetOnce;

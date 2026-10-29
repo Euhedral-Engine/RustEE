@@ -9,6 +9,7 @@ use crate::metrics::{
 };
 use crate::utils::{FlowContext, FlowRecorder, StopWatch};
 use euhedral_data_structures::atomics::CachePadded;
+use euhedral_data_structures::sync::HotScope;
 use euhedral_hardware_utils::affinity::{self, ExecutorError, PinnedThreadExecutor, TaskInterrupt};
 use euhedral_hardware_utils::monitor::CoreSnapshot;
 use std::error::Error;
@@ -344,7 +345,9 @@ impl ControlPlaneFragment {
     }
 
     fn run_cycle(&self, policy: &mut DecisionTree, cycle: &mut Cycle) {
+        // A reset is lifecycle work; the cycle proper is the hot path.
         self.handle_reset_request(policy, cycle);
+        let _hot = HotScope::enter();
 
         let half_life = policy.idle_policy().contention_half_life();
         let (contention, upstreams) = self

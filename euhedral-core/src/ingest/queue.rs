@@ -6,6 +6,7 @@ use euhedral_data_structures::queues::partitioned::{
     PartitionedConsumer, PartitionedMpscQueue, PartitionedProducer,
 };
 use euhedral_data_structures::queues::queue::{Multi, Single};
+use euhedral_data_structures::sync::HotScope;
 use std::num::NonZeroUsize;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering, fence};
@@ -95,6 +96,7 @@ impl QueueSource {
             Box<dyn Frame>,
         ) -> Result<(), Box<dyn Frame>>,
     ) -> Result<(), Box<dyn Frame>> {
+        let _hot = HotScope::enter();
         if self.publication_closed.load(Ordering::Acquire) {
             return Err(frame);
         }
@@ -396,6 +398,8 @@ impl IngestSink for QueueIngestSink {
 
     /// Stops publication and detaches from the lattice; queued frames stay until cleared.
     fn complete(&self) {
+        // Completing is lifecycle work, also when a frame does it.
+        let _cold = HotScope::leave();
         self.source.close();
     }
 

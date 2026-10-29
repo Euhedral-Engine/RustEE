@@ -38,6 +38,7 @@ use euhedral_core::control_plane::{ControlPlaneLattice, LatticeError};
 use euhedral_core::frames::Frame;
 use euhedral_core::generics::{FrameSink, LatticeReceiver, LatticeSource};
 use euhedral_core::ingest::{IngestSink, QueueIngestSink};
+use euhedral_data_structures::sync::HotScope;
 
 /// Set in the admission word once admission closes; the rest counts the units admitted and not
 /// yet terminated.
@@ -320,6 +321,8 @@ impl Lake {
         {
             return Ok(current);
         }
+        // The first attach of a busy period is rebalance work, also when an offer starts it.
+        let _cold = HotScope::leave();
         let (generation, fresh) = {
             let mut slot = self
                 .generation
