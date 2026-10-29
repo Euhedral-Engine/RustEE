@@ -57,6 +57,7 @@ fn fold_plan(
         device_word: word,
         host_word: Arc::new(AtomicU32::new(0)),
         probe: Probe::new(),
+        retire_steps: false,
         _stream: PhantomData,
     });
     (plan, expected)
@@ -210,6 +211,7 @@ fn a_busy_marker_ring_stalls_then_resumes() {
         device_word: word,
         host_word: Arc::new(AtomicU32::new(0)),
         probe: Probe::new(),
+        retire_steps: false,
         _stream: PhantomData,
     });
     for tag in 1..=4 {
@@ -300,6 +302,7 @@ fn a_retirement_failure_from_a_faulted_device_reaches_the_item() {
         device_word: word,
         host_word: Arc::new(AtomicU32::new(0)),
         probe: Probe::new(),
+        retire_steps: false,
         _stream: PhantomData,
     });
     opened

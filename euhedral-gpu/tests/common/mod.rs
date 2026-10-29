@@ -61,6 +61,8 @@ pub struct Plan<S: Stream> {
     pub device_word: u64,
     pub host_word: Arc<AtomicU32>,
     pub probe: Arc<Probe>,
+    /// Every kernel item asks for a retirement too, not only the last item.
+    pub retire_steps: bool,
     pub _stream: PhantomData<fn() -> S>,
 }
 
@@ -132,7 +134,9 @@ where
             }
         });
         match result {
-            Ok(()) => Outcome::Submitted { retire: last },
+            Ok(()) => Outcome::Submitted {
+                retire: last || plan.retire_steps,
+            },
             Err(error) => {
                 lock(&probe.submit_errors).push((self.tag, error));
                 Outcome::Finished
