@@ -182,6 +182,23 @@ impl Control {
         self.lock().tasks.is_empty()
     }
 
+    /// Waits until no task is left, or `deadline`; whether none is.
+    fn wait_empty(&self, deadline: Instant) -> bool {
+        let mut control = self.lock();
+        while !control.tasks.is_empty() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            control = self
+                .changed
+                .wait_timeout(control, remaining)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        true
+    }
+
     /// Adds a use if the executor can still be had, restarting a shut-down one under `restart` when
     /// that is given. `false` for a closed executor, and for a shut-down one when not restarting.
     /// The check and the new use are one step, so a use never joins an executor that has just closed.
@@ -364,6 +381,43 @@ impl Registry {
         result
     }
 
+    /// Like [`acquire`](Self::acquire), but a closed executor whose tasks are still winding down is waited for, up to
+    /// `timeout`, instead of refused at once.
+    pub(crate) fn acquire_within(
+        &self,
+        cpu: usize,
+        name: &str,
+        timeout: Duration,
+    ) -> Result<PinnedThreadExecutor, ExecutorError> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self.acquire(cpu, name) {
+                Err(ExecutorError::ClosedWithActiveTasks(busy)) => {
+                    let control = self
+                        .shared
+                        .entries
+                        .lock()
+                        .get(&cpu)
+                        .map(|entry| entry.control.clone());
+                    match control {
+                        // Wait only for the closed executor `acquire` refused. If another executor has replaced it
+                        // since, or it ended, the next `acquire` decides; do not wait on a running one's tasks.
+                        Some(control) if control.state() == State::Closed => {
+                            if !control.wait_empty(deadline) {
+                                return Err(ExecutorError::ClosedWithActiveTasks(busy));
+                            }
+                        }
+                        _ if Instant::now() >= deadline => {
+                            return Err(ExecutorError::ClosedWithActiveTasks(busy));
+                        }
+                        _ => {}
+                    }
+                }
+                other => return other,
+            }
+        }
+    }
+
     /// A new use of the running executor for `cpu`, if any; never restarts one.
     pub(crate) fn get(&self, cpu: usize) -> Result<Option<PinnedThreadExecutor>, ExecutorError> {
         self.validate(cpu)?;
@@ -482,6 +536,18 @@ impl PinnedThreadExecutor {
     /// thread name `name` (upstream `getOrSetIfAbsent`).
     pub fn get_or_create(cpu: usize, name: &str) -> Result<Self, ExecutorError> {
         Registry::global().acquire(cpu, name)
+    }
+
+    /// Like [`get_or_create`](Self::get_or_create), but a closed executor whose tasks are still winding down is waited
+    /// for, up to `timeout`, instead of refused at once: closing an executor returns before its tasks have ended, and
+    /// a build on the same CPU right after would otherwise fail with
+    /// [`ClosedWithActiveTasks`](ExecutorError::ClosedWithActiveTasks).
+    pub fn get_or_create_within(
+        cpu: usize,
+        name: &str,
+        timeout: Duration,
+    ) -> Result<Self, ExecutorError> {
+        Registry::global().acquire_within(cpu, name, timeout)
     }
 
     /// A new use of the running executor for `cpu`, if one exists.
@@ -944,6 +1010,90 @@ mod tests {
         assert!(executor.await_termination(Duration::from_secs(5)));
         assert_eq!(registry.entry_count(), 0);
         assert!(registry.acquire(3, "b").is_ok());
+    }
+
+    #[test]
+    fn acquiring_within_a_timeout_waits_for_a_closed_executors_tasks_to_end() {
+        let (registry, _) = registry();
+        let executor = registry.acquire(3, "a").unwrap();
+        let (started, started_rx) = mpsc::channel();
+        let handle = executor
+            .submit(move || {
+                started.send(()).unwrap();
+                while !is_interrupted() {
+                    thread::park_timeout(Duration::from_millis(5));
+                }
+                // Winding down takes a while after the interrupt.
+                thread::sleep(Duration::from_millis(80));
+            })
+            .unwrap();
+        started_rx.recv().unwrap();
+        executor.close();
+        assert_eq!(
+            registry.acquire(3, "b").unwrap_err(),
+            ExecutorError::ClosedWithActiveTasks(3),
+            "the plain acquire refuses at once"
+        );
+        let started = Instant::now();
+        let again = registry
+            .acquire_within(3, "b", Duration::from_secs(10))
+            .expect("the closed executor's task ended, so the CPU is free");
+        assert!(started.elapsed() >= Duration::from_millis(50));
+        handle.join().unwrap();
+        drop(again);
+        // A task that does not end within the timeout is still refused.
+        let held = registry.acquire(1, "a").unwrap();
+        let (running, running_rx) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel::<()>();
+        let blocked = held
+            .submit(move || {
+                running.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })
+            .unwrap();
+        running_rx.recv().unwrap();
+        held.close();
+        assert_eq!(
+            registry
+                .acquire_within(1, "b", Duration::from_millis(30))
+                .unwrap_err(),
+            ExecutorError::ClosedWithActiveTasks(1)
+        );
+        release.send(()).unwrap();
+        blocked.join().unwrap();
+    }
+
+    #[test]
+    fn acquiring_within_a_timeout_returns_as_soon_as_the_closed_executors_tasks_end() {
+        let (registry, _) = registry();
+        let executor = registry.acquire(1, "a").unwrap();
+        let (started, started_rx) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel::<()>();
+        let old = executor
+            .submit(move || {
+                started.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })
+            .unwrap();
+        started_rx.recv().unwrap();
+        executor.close();
+        // The closed executor winds down in a moment; a replacement is running by the time the waiter looks again.
+        let waiter = {
+            let registry = &registry;
+            thread::scope(|scope| {
+                let waiting = scope.spawn(|| {
+                    let started = Instant::now();
+                    let got = registry.acquire_within(1, "b", Duration::from_secs(10));
+                    (got.is_ok(), started.elapsed())
+                });
+                thread::sleep(Duration::from_millis(30));
+                release.send(()).unwrap();
+                old.join().unwrap();
+                waiting.join().unwrap()
+            })
+        };
+        assert!(waiter.0, "the CPU was free once the old tasks ended");
+        assert!(waiter.1 < Duration::from_secs(5));
     }
 
     #[test]

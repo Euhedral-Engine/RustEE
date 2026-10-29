@@ -8,7 +8,10 @@ use euhedral_hardware_utils::affinity::PinnedThreadExecutor;
 use euhedral_hardware_utils::monitor::CoreSnapshot;
 use std::panic;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// How long placing a clone waits for the CPU's previous executor, closed but with workers still winding down.
+const EXECUTOR_WAIT: Duration = Duration::from_secs(5);
 
 /// The stock [`CloneableObject`]: on each core, a [`ControlPlaneFragment`] whose workers hand
 /// their frames to an [`AbstractExecutor`].
@@ -75,9 +78,10 @@ impl<E: AbstractExecutor> BaseCloneableObject<E> {
             .effective_cpus()
             .first()
             .unwrap_or_else(|| panic!("core {} has no effective CPU", config.core_id()));
-        let pinned = PinnedThreadExecutor::get_or_create(
+        let pinned = PinnedThreadExecutor::get_or_create_within(
             cpu,
             &format!("{}-Worker-{}", config.shard_name(), config.core_id()),
+            EXECUTOR_WAIT,
         )
         .unwrap_or_else(|error| panic!("no pinned executor for CPU {cpu}: {error}"));
         let fragment_config = self.fragment_config.clone();

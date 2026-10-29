@@ -1,6 +1,8 @@
 use super::*;
 use crate::config::CacheConfig;
-use crate::control_plane::testing::{PATIENCE, SINGLE_CORE, SMT_CORE, pinned_turn, wait_until};
+use crate::control_plane::testing::{
+    PATIENCE, PinnedTurn, SINGLE_CORE, SMT_CORE, pinned_turn, wait_until,
+};
 use crate::flow_control::testing::{TestReceiver, frame};
 use crate::flow_control::{Claim, LatticeNode, UpstreamHandle};
 use crate::frames::Failure;
@@ -32,7 +34,7 @@ struct Fixture {
     fragment: Arc<ControlPlaneFragment>,
     receiver: Arc<Gate>,
     buddy_receiver: Arc<Gate>,
-    _serial: MutexGuard<'static, ()>,
+    _serial: PinnedTurn,
 }
 
 impl Fixture {

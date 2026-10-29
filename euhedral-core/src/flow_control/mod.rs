@@ -18,6 +18,7 @@ mod registry;
 pub(crate) mod testing;
 mod upstream_queue;
 mod vertex;
+mod views;
 
 pub use edge::{LatticeEdge, LatticeNode, Retirement};
 pub use hot_receiver::{LatticeHotReceiver, PushHook, Response};
@@ -29,6 +30,7 @@ pub use upstream_queue::{
 pub use vertex::{
     LatticeClosed, LatticeVertex, RoutingFunction, RoutingState, UpstreamInterceptor, route_by_hash,
 };
+pub use views::{Cell, View};
 
 /// How close to its [origin](crate::frames::FrameHeader::origin) a frame must stay.
 ///

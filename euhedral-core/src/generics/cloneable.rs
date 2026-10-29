@@ -165,6 +165,7 @@ mod tests {
         let Some(cpu) = affinity::base_mask().first() else {
             return;
         };
+        let _turn = crate::control_plane::testing::pinned_turn();
         let executor = PinnedThreadExecutor::get_or_create(cpu, "clone-test").unwrap();
         let config = CloneConfig::new("shard", 0, CpuSet::from_iter([cpu]));
         let original = Minimal::default();

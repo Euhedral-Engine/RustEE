@@ -24,6 +24,9 @@ use std::time::{Duration, Instant};
 /// Converts a rate per nanosecond to one per second.
 const NANOS_PER_SECOND: f64 = 1_000_000_000.0;
 /// How long a worker with neither upstreams nor cached frames parks.
+/// How long building a fragment waits for the CPU's previous executor, closed but with workers still winding down.
+const EXECUTOR_WAIT: Duration = Duration::from_secs(5);
+
 const EMPTY_PARK: Duration = Duration::from_micros(15);
 /// The last snapshot timestamp before any snapshot is followed: older than any real one.
 const NO_SNAPSHOT: i64 = i64::MIN;
@@ -146,8 +149,8 @@ impl ControlPlaneFragment {
             .core_info(info.core)
             .is_some_and(|core| core.p_core);
         let name = format!("{}-Worker-{}", clone.shard_name(), clone.core_id());
-        let executor =
-            PinnedThreadExecutor::get_or_create(cpu, &name).map_err(FragmentError::Executor)?;
+        let executor = PinnedThreadExecutor::get_or_create_within(cpu, &name, EXECUTOR_WAIT)
+            .map_err(FragmentError::Executor)?;
         let cache = ControlPlaneCache::new(
             config.cache_config(),
             clone,
@@ -362,6 +365,10 @@ impl ControlPlaneFragment {
         // A reset is lifecycle work; the cycle proper is the hot path.
         self.handle_reset_request(policy, cycle);
         let _hot = HotScope::enter();
+        // The cycle's drain: what the lattice's cells changed to since the last cycle (a new routing generation, a
+        // parent, a cache) reaches this worker's view now, and the values it replaced are let go of. One load when
+        // nothing changed.
+        self.registry.refresh_view();
 
         let half_life = policy.idle_policy().contention_half_life();
         let (contention, upstreams) = self
