@@ -3,6 +3,30 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## Sequencer on Java's terms: any thread offers, the order grows, the entry is the caller's (2026-10-29)
+
+**What.** `Sequencer<E: Entry>` is Java's `Sequencer` again. **Breaking:** `Registrar`, the fixed ring with its capacity
+and `register` returning `None` are gone.
+- The order is a growing multi-producer queue: `offer(entry)` from any thread, never refused (`MpscQueue`, whose chunks
+  are recycled).
+- The entry is the caller's own object and carries `Entry::ready`; the sequencer allocates nothing for it. `Progress` is
+  the readiness word an entry embeds (pending, ready or abandoned; an abandoned entry is ready and concludes with
+  nothing, so one that is killed or dropped never stalls the order). A caller that pools its entries allocates nothing
+  on the whole path (`tests/sequencer_alloc.rs`: 0 allocations over 20 000 rounds after warm-up).
+- `drain()` is unchanged: the work-in-progress count, the `missed` loop, and a panic in the conclusion is the entry's own
+  (the entries behind it still conclude; the first panic resumes on the draining thread once the drain ended). The
+  conclusion takes `&E` and the entry is polled after it, as Java's `finally`.
+- For callers without an entry type: `Ticket<T>` (an entry that carries a value), `Slot<T>` (its holder's handle: complete
+  it, abandon it, or drop it), `Sequencer::ordered(emit)` and `register()`, which allocates the ticket.
+
+**Why.** The ring needed one registering thread (a `Registrar` that is not `Clone`), so a consumer that admits from more
+than one thread put a lock around it (`tests/credit_graph.rs`), and a full ring refused. Java's order is a queue any
+thread offers to, and its entry is the caller's.
+
+**Tests.** The reference ports, growth to 100 000 entries, offers from four threads, the caller's own entry type, loom
+models of an offer racing a drain, two completions racing, and a dropped slot racing a completion (each fails if the
+`missed` loop is removed; the order queue is not modelled).
+
 ## Lane source gaps from the first consumer (2026-10-29)
 
 **What.**

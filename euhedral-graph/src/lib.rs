@@ -15,7 +15,7 @@
 //! | Piece | Module | What it is |
 //! |---|---|---|
 //! | [`Completions`] | [`completions`] | completions found by polls |
-//! | [`Sequencer`] | [`sequencer`] | execute in any order, conclude in admission order |
+//! | [`Sequencer`] | [`sequencer`] | execute in any order, conclude in offer order |
 //! | [`Join`], [`Part`], [`Parts`], [`Round`] | [`join`] | re-armable run-time fan-in: the last arrival runs the continuation |
 //! | [`LanePool`], [`Marker`], [`DeviceQueue`] | [`lanes`] | device lanes and markers |
 //! | [`StageGraph`] | [`stage_graph`] | static stage DAGs run per quantum |
@@ -57,7 +57,7 @@ pub use lane_source::{
     LaneState, LaneSubmit, LaneWork, Outcome, Retired,
 };
 pub use lanes::{DeviceQueue, LaneId, LanePool, LanePoolBuilder, Marker, QueueId};
-pub use sequencer::{Registrar, Sequencer, Slot};
+pub use sequencer::{Entry, Progress, Sequencer, Slot, Ticket};
 pub use stage_graph::{
     DEFAULT_RETRY_BACKSTOP, EdgeKind, ExternalEdge, GraphError, GraphRuntime, QuantumOutcome,
     QuantumRef, RetryCounts, Stage, StageCx, StageError, StageGraph, StageGraphSpec, StageId,

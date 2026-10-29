@@ -50,8 +50,8 @@ use euhedral_core::ingest::{IngestSink, QueueIngestSink};
 use euhedral_graph::testing::FakeDevice;
 use euhedral_graph::{
     Completions, DEFAULT_RETRY_BACKSTOP, EdgeKind, GraphRuntime, Join, Lake, LaneId, LanePool,
-    Marker, Part, QuantumOutcome, Registrar, Sequencer, Slot, Stage, StageCx, StageError,
-    StageGraph, StageGraphSpec, StageSpec, Submitted,
+    Marker, Part, QuantumOutcome, Sequencer, Slot, Stage, StageCx, StageError, StageGraph,
+    StageGraphSpec, StageSpec, Submitted, Ticket,
 };
 use euhedral_hardware_utils::affinity;
 
@@ -345,9 +345,7 @@ struct Ctx {
     completions: Arc<Completions>,
     device: Arc<Device>,
     graph: OnceLock<Arc<StageGraph<Item>>>,
-    sequencer: OnceLock<Arc<Sequencer<Staged>>>,
-    /// The one registrar: items are admitted by one thread at a time, so the lock is never contended.
-    registrar: Mutex<Option<Registrar<Staged>>>,
+    sequencer: OnceLock<Arc<Sequencer<Arc<Ticket<Staged>>>>>,
     link: Mutex<Admission>,
     delivering: AtomicBool,
     again: AtomicBool,
@@ -372,7 +370,6 @@ impl Ctx {
             device: Arc::new(Device { lanes: devices }),
             graph: OnceLock::new(),
             sequencer: OnceLock::new(),
-            registrar: Mutex::new(None),
             link: Mutex::new(Admission {
                 generation: 0,
                 kill: Arc::new(AtomicBool::new(false)),
@@ -390,7 +387,7 @@ impl Ctx {
             me: me.clone(),
         });
         let me = ctx.me.clone();
-        let (sequencer, registrar) = Sequencer::new(64, move |ready: Staged| {
+        let sequencer = Sequencer::ordered(move |ready: Staged| {
             let Some(ctx) = me.upgrade() else { return };
             hop(2, ready.generation, ready.seq);
             let frame = Pack {
@@ -401,7 +398,6 @@ impl Ctx {
             ctx.offer(Box::new(frame));
         });
         assert!(ctx.sequencer.set(sequencer).is_ok());
-        *lock(&ctx.registrar) = Some(registrar);
         let mut spec = StageGraphSpec::new();
         let fetch = spec.stage(StageSpec {
             name: "fetch",
@@ -506,11 +502,7 @@ impl Ctx {
             }
         });
         let (retired, sent) = (lease.next(), lease.next());
-        let slot = lock(&self.registrar)
-            .as_mut()
-            .expect("the registrar")
-            .register()
-            .expect("the ring holds the pool's items");
+        let slot = self.sequencer.get().expect("the sequencer").register();
         let item = Item {
             generation: link.generation,
             seq,

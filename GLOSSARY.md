@@ -438,11 +438,14 @@ results. Drop it when nothing will depend on the quantum.
 runs again when any lane of the pool made progress, or after this deadline (20 ms by default) for a
 resource outside the pool. Set it longer than any one pass on your devices.
 
-**Sequencer, slot, releaser** ([`Sequencer`](euhedral-graph/src/sequencer.rs),
-[`Slot`](euhedral-graph/src/sequencer.rs)): execute in any order, release in admission order.
-`register` takes a slot in admission order; a slot is completed with a value or abandoned (dropping
-it abandons it). The **releaser** is the one thread at a time (a work-in-progress counter) that
-passes the prefix of finished slots to `emit`, in order, on its own thread.
+**Sequencer, entry, progress, ticket, slot, drainer** ([`Sequencer`](euhedral-graph/src/sequencer.rs),
+[`Entry`](euhedral-graph/src/sequencer.rs), [`Progress`](euhedral-graph/src/sequencer.rs),
+[`Ticket`](euhedral-graph/src/sequencer.rs), [`Slot`](euhedral-graph/src/sequencer.rs)): execute in any order,
+conclude in offer order. Entries are the caller's own objects, offered from any thread to a growing queue; an entry
+that finished calls `drain`. The **drainer** is the one thread at a time (a work-in-progress counter) that concludes
+the prefix of ready entries, in order, on its own thread. `Progress` is an entry's readiness word (pending, ready,
+abandoned: an abandoned entry concludes with nothing); a `Ticket` is an entry that carries a value, and a `Slot` its
+holder's handle (completing it or dropping it).
 
 **Join, fan-in cell, join part, Round** ([`Join`](euhedral-graph/src/join.rs)): a fan-in that waits
 for no one. A round is armed with its part count (`reset`); each part arrives with a value or is

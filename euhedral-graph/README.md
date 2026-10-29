@@ -18,7 +18,7 @@ so it needs no thread of its own. It does not re-export `euhedral-core`: import 
 | Module | Main types |
 |---|---|
 | [`completions`](src/completions.rs) | `Completions`, a `LatticeSource` of continuation frames behind completions: markers, timers, `Ready` tokens and `Pending` operations. |
-| [`sequencer`](src/sequencer.rs) | `Sequencer` and `Slot`: execute in any order, release in admission order (Java's order queue and work-in-progress drain, no lock). |
+| [`sequencer`](src/sequencer.rs) | `Sequencer`, `Entry`, `Progress`, `Ticket` and `Slot`: execute in any order, conclude in offer order (Java's order queue and work-in-progress drain; any thread offers, no lock, no refusal). |
 | [`join`](src/join.rs) | `Join`, `Round`: a re-armable fan-in cell; the continuation runs when its last part arrives. |
 | [`lake`](src/lake.rs) | `Lake`, `UnitGuard` and `LakeClosed`: the pool of ready work of one kind, as several ingest sinks that attach to the lattice for a busy period; offering reads the attached set with no lock. A `FrameSink`. |
 | [`lanes`](src/lanes.rs) | `LanePool`, `LanePoolBuilder`, `LaneId`, `Marker` and the trait `DeviceQueue`: device timelines that are queried, never waited on. |
@@ -66,7 +66,7 @@ One poll runs at a time and none waits. A `request` that finds a poll running ba
 and the running poll pushes within the demand as it lets go; the same holds for the sweep that cancels a
 registration made after `complete`.
 
-This runs one by hand, with a `Sequencer` that releases in admission order whatever order the
+This runs one by hand, with a `Sequencer` that concludes in offer order whatever order the
 items finished in:
 
 ```rust
@@ -83,7 +83,7 @@ let (lanes, _devices) = FakeDevice::pool(&["compute"]);
 let completions = Completions::new(lanes);
 
 let released = Arc::new(Mutex::new(Vec::new()));
-let (sequencer, mut registrar) = Sequencer::new(8, {
+let sequencer = Sequencer::ordered({
     let released = released.clone();
     move |seq: u32| released.lock().unwrap().push(seq)
 });
@@ -92,12 +92,12 @@ let (sequencer, mut registrar) = Sequencer::new(8, {
 let fired = Arc::new(Mutex::new(Vec::new()));
 let now = Instant::now();
 for (seq, after_ms) in [(0u32, 6), (1, 0), (2, 3)] {
-    let slot = Mutex::new(registrar.register());
+    let slot = Mutex::new(Some(sequencer.register()));
     let fired = fired.clone();
     let task = Arc::new(move || {
         fired.lock().unwrap().push(seq);
         if let Some(slot) = slot.lock().unwrap().take() {
-            slot.complete(seq); // the sequencer releases it once every earlier slot did
+            slot.complete(seq); // the sequencer concludes it once every earlier entry did
         }
     });
     let continuation = Box::new(RunnableFrame::new(7, task));
@@ -118,7 +118,7 @@ while completions.pending() > 0 {
 }
 
 assert_eq!(*fired.lock().unwrap(), [1, 2, 0]); // finished out of order
-assert_eq!(*released.lock().unwrap(), [0, 1, 2]); // released in admission order
+assert_eq!(*released.lock().unwrap(), [0, 1, 2]); // concluded in offer order
 ```
 
 ### Device lanes and markers
@@ -285,12 +285,16 @@ A frame hands a result back to the main thread with a `one_shot` (`euhedral_data
 
 ### Sequencer and Join
 
-A `Sequencer<T>` hands values out in admission order. `Sequencer::new(capacity, emit)` returns it with
-its one `Registrar`; `registrar.register()` takes a slot, in the order the caller admits work (and
-returns `None` while `capacity` slots are unreleased); the slot is completed with a value, or abandoned
-(dropping it abandons it), from any thread. A registration allocates nothing and takes no
-read-modify-write. One releaser at a time (a work-in-progress counter) releases the prefix of
-finished slots to `emit`, on its own thread, and `emit` must not wait: it offers the next frame.
+A `Sequencer<E: Entry>` (Java's `Sequencer`) concludes entries in the order they were offered, whatever order they
+complete in. `offer(entry)` appends to the order from any thread (the order is a growing multi-producer queue, so an
+offer is never refused); an entry is the caller's own object, and `Entry::ready` says whether it finished. The thread
+that finishes an entry calls `drain()`: one drainer at a time (a work-in-progress counter) concludes the prefix of
+ready entries, on its own thread, through the function given to `Sequencer::new`, which must not wait (it offers the
+next frame). An entry embeds a `Progress` (pending, ready or abandoned; an abandoned entry concludes with nothing, so
+one that is killed never stalls the order), and a caller that pools its entries allocates nothing on the whole path.
+For callers without an entry type of their own, `Sequencer::ordered(emit)` makes a sequencer of `Ticket`s that carry a
+value, and `register()` offers a ticket and returns its `Slot`: complete it with a value or abandon it (dropping it
+abandons it), from any thread. `register` allocates the ticket.
 
 A `Join<T>` is a continuation that runs on the thread of its last arrival, after `parts` parts
 arrived or were abandoned. Neither is a queue, and neither blocks. `Join::once` makes a join of one
