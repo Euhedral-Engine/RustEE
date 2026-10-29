@@ -1107,6 +1107,106 @@ fn a_retirement_never_runs_on_a_light_reader_that_let_go_of_the_generation_last(
     );
 }
 
+/// The vertex's own drop can be the last hold on its generation, on a frame-path thread that held the last upgraded
+/// `Weak`. It runs no retirement and waits for nothing: the release of a generation needs the vertex, which is gone.
+#[test]
+fn dropping_a_vertex_runs_no_retirement_and_waits_for_nothing() {
+    const WAIT: Duration = Duration::from_millis(400);
+    let registry = registry();
+    let vertex = Arc::new(LatticeVertex::new(&registry, "retire-drop", 1));
+    let (child, _) = receiving_edge(&registry);
+    assert!(map(&vertex, &[0], &[node(&child)]));
+    let ran = Arc::new(AtomicBool::new(false));
+    {
+        let ran = ran.clone();
+        child.defer_retirement(Box::new(move || {
+            thread::sleep(WAIT);
+            ran.store(true, Ordering::Release);
+        }));
+    }
+    let worker = thread::Builder::new()
+        .name("worker-d".into())
+        .spawn({
+            let registry = registry.clone();
+            move || {
+                registry.register();
+                let started = Instant::now();
+                drop(vertex);
+                started.elapsed()
+            }
+        })
+        .unwrap();
+    let dropping = worker.join().unwrap();
+    assert!(
+        dropping < WAIT / 4,
+        "dropping the vertex took {dropping:?}: a retirement ran on the dropping thread"
+    );
+    thread::sleep(WAIT * 2);
+    assert!(
+        !ran.load(Ordering::Acquire),
+        "a dropped vertex abandons its retirements"
+    );
+}
+
+#[test]
+fn a_retirement_never_runs_in_the_exit_of_a_thread_whose_mailbox_held_the_last_generation() {
+    const WAIT: Duration = Duration::from_millis(400);
+    let registry = registry();
+    let vertex = Arc::new(LatticeVertex::new(&registry, "retire-exit", 2));
+    let (child, _) = receiving_edge(&registry);
+    let (other, _) = receiving_edge(&registry);
+    // The first generation routes to `other` only.
+    assert!(map(&vertex, &[1], &[None, node(&other)]));
+    let ran_on = Arc::new(Mutex::new(None));
+    let done = Arc::new(AtomicBool::new(false));
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (go_tx, go_rx) = mpsc::channel::<()>();
+    let reader = thread::Builder::new()
+        .name("exiting".into())
+        .spawn({
+            let (registry, vertex) = (registry.clone(), vertex.clone());
+            move || {
+                registry.register_reader();
+                assert_eq!(vertex.with_routing_state(|state| state.len()), 1);
+                ready_tx.send(()).unwrap();
+                go_rx.recv().unwrap();
+                // Exits without draining: the later generations are updates in its mailbox.
+            }
+        })
+        .unwrap();
+    ready_rx.recv().unwrap();
+    // Generation two routes to the child; generation three does not. Once the store lets go of two, the reader's
+    // mailbox holds the last reference to it.
+    assert!(map(&vertex, &[0], &[node(&child)]));
+    {
+        let (ran_on, done) = (ran_on.clone(), done.clone());
+        child.defer_retirement(Box::new(move || {
+            *ran_on.lock().unwrap() = thread::current().name().map(str::to_owned);
+            thread::sleep(WAIT);
+            done.store(true, Ordering::Release);
+        }));
+    }
+    assert!(map(&vertex, &[1], &[None, node(&other)]));
+    assert!(!done.load(Ordering::Acquire));
+    let started = Instant::now();
+    go_tx.send(()).unwrap();
+    reader.join().unwrap();
+    let exiting = started.elapsed();
+    assert!(
+        exiting < WAIT / 4,
+        "the thread's exit took {exiting:?}: the retirement ran in its destructor"
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !done.load(Ordering::Acquire) {
+        assert!(Instant::now() < deadline, "the retirement never ran");
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(
+        ran_on.lock().unwrap().as_deref(),
+        Some("retire-exit-retire")
+    );
+}
+
 #[test]
 fn a_panicking_retirement_does_not_stop_the_rest() {
     let registry = registry();

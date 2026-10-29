@@ -509,6 +509,9 @@ impl LatticeVertex {
 impl Drop for LatticeVertex {
     fn drop(&mut self) {
         // The registry holds the generation, and the generation holds the downstreams: let go of it with the vertex.
+        // This can be the last hold on a generation, on a frame-path thread that held the last upgraded `Weak`, but it
+        // runs no retirement: the release of a generation upgrades the vertex's `Weak`, and a vertex that is being
+        // dropped has no strong count left, so the generation's handles just drop (`RoutingState::drop`).
         self.edge.registry().set_cell(&self.routing, None);
     }
 }
