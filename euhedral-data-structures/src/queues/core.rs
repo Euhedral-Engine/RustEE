@@ -378,7 +378,10 @@ impl<T> Core<T> {
                 continue;
             }
             let epoch = self.producer.epoch.load(Ordering::Acquire);
-            let chunk = self.producer.tail_chunk.load(Ordering::Acquire);
+            // Java reads the tail chunk plain. The acquire load of `tail` above pairs with the release a resizing
+            // producer ends with, which follows its store of the chunk, so this load sees that chunk or a newer one;
+            // the compare-and-set of `tail` below fails if the chunk changed since.
+            let chunk = self.producer.tail_chunk.load(Ordering::Relaxed);
 
             let mut limit = epoch;
             if epoch <= tail {

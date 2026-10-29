@@ -3,6 +3,12 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## Queue fidelity, step 1: the audit and the first weakening (2026-10-29)
+
+**What.** `mp_reserve` reads the producer's tail chunk with a relaxed load (Java reads it plain); the acquire load of the
+tail that precedes it already orders it after the resizing producer's store. The field-by-field audit of the queues
+against Java is in the pull request; the remaining rows are not changed here.
+
 ## High-contention throughput benchmark (2026-10-29)
 
 **What.** A new workspace member, `euhedral-benchmarks`, with the binary `high_contention_throughput`: the average time
