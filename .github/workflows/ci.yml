@@ -51,6 +51,8 @@ jobs:
           cargo test --release -p euhedral-core --lib flow_control::vertex
           cargo test --release -p euhedral-core --lib generics::
           cargo test --release -p euhedral-core --lib ingest::
+          cargo test --release -p euhedral-core --lib flow_control::hot_source
+          cargo test --release -p euhedral-core --lib utils::stop_watch
           cargo test --release -p euhedral-graph --lib completions::
 
       - name: Loom models
