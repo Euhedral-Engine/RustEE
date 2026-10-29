@@ -28,11 +28,12 @@
 //! [`Duration::ZERO`] as the idle time keeps the sinks attached.
 //!
 //! **The hot side is lock-free** (Java's volatile `generation`): the attached set is a cell of the lattice's registry,
-//! so [`Lake::offer`] and [`Lake::admit`] read it from the calling thread's view with no lock and no reference count
-//! (a thread that is not a registered reader of the registry takes the lock for each call: a producer thread calls
-//! [`UpstreamRegistry::register_reader`] once). Attaching a set (the first unit of a busy period) and detaching it are
-//! rebalance work under a lifecycle lock, taken off the hot scope; a set that is detached stays allocated until every
-//! reader has applied the change.
+//! so [`Lake::offer`] and [`Lake::admit`] read it from the calling thread's view with no lock. A producer thread gets a
+//! light view on its first call and upgrades a weak reference for the length of each call (one reference-count update);
+//! one that offers every frame calls [`UpstreamRegistry::register_reader`] once to hold the set and pay nothing.
+//! Attaching a set (the first unit of a busy period) and detaching it are rebalance work under a lifecycle lock, taken
+//! off the hot scope; a set that is detached stays allocated until the registered readers that hold it have applied
+//! the change.
 
 use std::error::Error;
 use std::fmt;

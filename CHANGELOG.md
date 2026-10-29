@@ -52,8 +52,9 @@ default, the output lines, and a smoke run of a fork with a tiny target on a rea
   emit)` returns the sequencer with its one `Registrar` (not `Clone`; `register(&mut self)` returns `None` while
   `capacity` slots are unreleased). A registration allocates nothing and takes no read-modify-write; the registrar
   keeps the order, so registration is by one thread at a time. A slot still holds an `Arc` of the sequencer.
-- `Lake` (G7-G9): the attached set is a `Published` reference in the lattice's epoch domain; `offer` and `admit` read
-  it with one pinned load. Attach and detach run under a lifecycle lock off the hot scope. The idle watch's downstream
+- `Lake` (G7-G9): the attached set is a cell of the lattice's registry; `offer` and `admit` read it from the calling
+  thread's view (a producer thread that offers every frame calls `register_reader` once, to hold the set and read it
+  with no reference-count update). Attach and detach run under a lifecycle lock off the hot scope. The idle watch's downstream
   is a `DownstreamSlot`. `ControlPlaneLattice::registry()` is new.
 - Lane sources and `Join` (G16, G17; barriers, not locks): `LaneSource::request` banks demand with one release
   `fetch_add` (and spends unbounded demand with none) and sets its wake flag with a release store, where it did

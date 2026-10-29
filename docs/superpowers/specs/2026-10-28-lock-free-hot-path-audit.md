@@ -458,7 +458,7 @@ workspace offers it:
    - A reader that stops reading keeps the values it last saw until it reads again, exits, or calls `remove_reader`;
      a worker drains at every cycle start and its parks are timed.
    - Deviation (missing Rust equivalent): Java's volatile read of a field the collector keeps alive. Later chunks that
-     planned a `Published` cell (the lake's generation, the shard's arrays, the monitor and the mapper) use a cell
+     planned a `Published` cell (the shard's arrays, the monitor and the mapper) use a cell
      where they have a registry and a queue of updates where they have not.
 3. **`OneShot<T>`** (chunk 5): Java's `CompletableFuture` as `PipelineRunner.submit` uses it. `state: AtomicU8`
    (empty, waiting, set, abandoned), the value in an `UnsafeCell`, and a `SetOnce<Thread>` waiter. The setter writes,
@@ -630,9 +630,10 @@ Java `LatticeHotSource`, `ControlPlaneFragment`'s output, `StopWatch`, `Fragment
 - **G7, G8, G9: the lake's two modes** (Java's lake, the `FrameLake` implementation). `idle_release` stays:
   `Duration::ZERO` keeps the sinks attached for life (Java `idleDetachNanos <= 0`); a positive value detaches them once
   no unit has been active for that long, and the next offer re-attaches a fresh set. The hot side is Java's:
-  - `generation: Published<Generation>` (Java `volatile Generation generation`). `offer` and `admit` read it with one
-    pinned `load()`: no lock and no `Arc` clone. Deviation: `Published` stands in for the collector, because an
-    offering thread may hold a set that is being detached.
+  - `generation: Cell<Generation>` (Java `volatile Generation generation`). `offer` and `admit` read it from the
+    thread's view: no lock and no `Arc` clone for a registered reader. Deviation: a cell stands in for the collector,
+    because an offering thread may hold a set that is being detached; the set is released when the last view that
+    holds it drains.
   - `offer` (Java `publish`): read the set; offer to the sink its routing hash picks; a detached set's sinks refuse
     (publication closed), and the offer then calls `attach` and tries the set attached since, as Java's loop; a lake
     that finished, or an `attach` that returns the same set, refuses.
@@ -834,7 +835,7 @@ runtime" is the Java runtime `euhedral-graph` is derived from (its `runtime/grap
 | G6 sequencer | graph runtime `Sequencer` | A panic in `emit` resumes on the releasing thread once the drain ended; Java logs it (the Rust caller of `complete` sees it). Entries are `Arc`s (no GC); `len` is the order queue's length. `ready` is release/acquire and the work-in-progress count is the one read-modify-write (the claim). |
 | G16 lane source request | core `QueueIngestSink.hookOnRequest` | A release-ordered bank and flag; the claim attempt is the barrier (Java: volatile bank and flag). |
 | G17 join | graph runtime `Join` | Debug-only double-arrival check (Java: none); `arm_owned` is Java's `expect` and `unsafe` (no collector); `is_idle`. |
-| G7-G9 lake | graph runtime `FrameLake` implementation (both modes) | `Published` for the generation (no GC), with the attach lock's own strong reference to the set for the lifecycle side; retirements held in `retiring`. The terminating unit stores `idle_since` before it lowers the count and the watch reads the count before the time (Java stores after the decrement, so a watch that sees the count at zero can read the previous idle time and detach a set that just went idle: a Java bug). The watch's downstream is a `DownstreamSlot`. |
+| G7-G9 lake | graph runtime `FrameLake` implementation (both modes) | A cell for the generation (no GC), with the attach lock's own strong reference to the set for the lifecycle side; retirements held in `retiring`. The terminating unit stores `idle_since` before it lowers the count and the watch reads the count before the time (Java stores after the decrement, so a watch that sees the count at zero can read the previous idle time and detach a set that just went idle: a Java bug). The watch's downstream is a `DownstreamSlot`. |
 | G10-G15 stage graph | graph runtime `StageGraph`, `StageFrame`, `AbstractQuantum` | Wider-than-64-lane masks. |
 | I1-I6 io_uring | graph runtime `AsyncReads`, `UringBackend` | Operations written in place behind a reserve step (no allocation per operation). I1, I2: a request that finds the front entered leaves a wakeup for the holder (`request_pending`, as `QueueIngestSink`'s). |
 | I7-I15 Windows | graph runtime `CompletionPortBackend`, `IoRingBackend` | `register` for sockets (Java reads files only); pool-job results have no counterpart. |
