@@ -28,7 +28,8 @@
 //! Feature: `testing` adds `testing::FakeDevice`. Asynchronous file and socket I/O (`AsyncIo`) is in
 //! `euhedral-io`.
 
-// `ThreadUsage` makes system calls, each with a `// SAFETY:` comment; nowhere else.
+// `ThreadUsage` makes system calls and `Join` shares its part slots across threads, each with a
+// `// SAFETY:` comment; nowhere else.
 #![deny(unsafe_code)]
 
 pub mod completions;
@@ -38,11 +39,12 @@ pub mod lanes;
 pub mod latch;
 pub mod sequencer;
 pub mod stage_graph;
+pub(crate) mod sync;
 #[cfg(feature = "testing")]
 pub mod testing;
 
 pub use completions::{Completions, Pending, Ready};
-pub use join::Join;
+pub use join::{Join, Round};
 pub use lake::{Lake, LakeClosed, UnitGuard};
 pub use lanes::{DeviceQueue, LaneId, LanePool, Marker, QueueId};
 pub use latch::{Latch, LatchSetter, LatchWaiter};

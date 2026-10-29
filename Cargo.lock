@@ -82,6 +82,7 @@ dependencies = [
  "euhedral-graph",
  "euhedral-hardware-utils",
  "libc",
+ "loom",
 ]
 
 [[package]]

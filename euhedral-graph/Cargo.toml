@@ -24,8 +24,13 @@ euhedral-graph = { path = ".", default-features = false, features = ["testing"] 
 # The credit-graph test checks the CPUs this process may run on.
 euhedral-hardware-utils = { path = "../euhedral-hardware-utils" }
 
+# The model checker behind `--cfg loom` (`RUSTFLAGS="--cfg loom" cargo test -p euhedral-graph --release --lib loom`).
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7"
+
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 missing_debug_implementations = "warn"
 
 [lints.clippy]
