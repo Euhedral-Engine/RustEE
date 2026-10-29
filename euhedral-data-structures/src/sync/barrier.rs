@@ -103,6 +103,10 @@ mod os {
     ),
     all(windows, not(any(loom, miri)))
 )))]
+#[cfg_attr(
+    any(loom, miri),
+    allow(dead_code, reason = "the symmetric form is the one modelled")
+)]
 mod os {
     pub fn register() -> bool {
         false

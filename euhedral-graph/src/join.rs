@@ -8,16 +8,28 @@
 //!
 //! # Memory ordering
 //!
-//! - `pending` is the round's count. [`Join::reset`] and [`Round::rearm`] store it with `SeqCst`; each
-//!   arrival is one `fetch_sub(1, SeqCst)`, a single read-modify-write, so the arrival that reads 1 is the
-//!   last and sees, through the chain of read-modify-writes, every earlier arrival's slot write.
+//! A frame's path hits no full barrier, so an arrival is one read-modify-write and nothing else:
+//!
+//! - `pending` is the round's count. Each arrival is one `fetch_sub(1, AcqRel)`; the arrival that reads 1 is the
+//!   last, and it sees, through the release sequence the chain of arrivals forms, every earlier arrival's slot
+//!   write (the argument of a reference count's last release).
 //! - A part writes its slot plainly before that read-modify-write and the last arrival reads the slots plainly
-//!   after it.
-//! - `closed[part]` says whether a part may still end. An arrival takes it with one `swap(true, Acquire)`, so
-//!   exactly one of two racing arrivals of a part proceeds, and an arrival checks it before it touches the
-//!   count. Arming stores the count first and then reopens the parts with `Release`: a late arrival of the
-//!   previous round meets a closed part, and a part's reopening is what makes the slot's earlier reads
-//!   happen before the new round's write to it.
+//!   after it. Arming stores the count with release ordering before any part is published, so a part's arrival
+//!   happens after the arming it belongs to.
+//! - **The contract** (Java's, which has no check either): a round is armed before any of its parts is
+//!   published, and each part of it ends exactly once, by [`Join::arrive`] or [`Join::abandon`]. A debug build
+//!   checks it (a part that ends twice, and one outside the round, are refused); a release build checks only
+//!   that the part is inside the round, since the check that a part ends once is a second read-modify-write on
+//!   the frame's path. A part that ends twice in a release build is a data race on its slot.
+//!
+//! # Arming
+//!
+//! [`Join::reset`] arms the next round and refuses while the previous one is armed or its continuation still
+//! runs: it takes the right to arm with one compare-and-set. An owner that knows its cell is quiet (a pooled
+//! unit it has just taken, a round it knows ended) arms with [`Join::arm_owned`], which is Java's `expect`: a
+//! plain release store of the count, no check, no read-modify-write. It is the way to re-arm a cell whose
+//! previous round was cut short, as a unit whose frames were killed: the parts that never arrived are not
+//! waited for, and the values that did arrive are dropped. [`Join::is_idle`] says whether a round is armed.
 //!
 //! # The continuation and the next round
 //!
@@ -59,7 +71,9 @@ use std::mem;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::Arc;
 
-use crate::sync::{AtomicBool, AtomicUsize, Ordering, UnsafeCell};
+#[cfg(debug_assertions)]
+use crate::sync::AtomicBool;
+use crate::sync::{AtomicUsize, Ordering, UnsafeCell};
 
 /// No round is armed and no continuation is running.
 const IDLE: usize = usize::MAX;
@@ -82,7 +96,8 @@ pub struct Join<T> {
 struct Part<T> {
     /// Written by the part's one arrival, read by the last arrival.
     value: UnsafeCell<Option<T>>,
-    /// The part has ended, or is not part of the round.
+    /// The part has ended, or is not part of the round: the contract's check, in debug builds only.
+    #[cfg(debug_assertions)]
     closed: AtomicBool,
 }
 
@@ -225,7 +240,7 @@ impl<T> Drop for Round<'_, T> {
     /// when the continuation panics.
     fn drop(&mut self) {
         let panic = self.join.clear(self.parts);
-        self.join.pending.store(IDLE, Ordering::SeqCst);
+        self.join.pending.store(IDLE, Ordering::Release);
         if let Some(panic) = panic
             && !std::thread::panicking()
         {
@@ -266,6 +281,7 @@ impl<T> Join<T> {
             slots: (0..capacity)
                 .map(|_| Part {
                     value: UnsafeCell::new(None),
+                    #[cfg(debug_assertions)]
                     closed: AtomicBool::new(true),
                 })
                 .collect(),
@@ -295,7 +311,7 @@ impl<T> Join<T> {
         // complete and its continuation has returned.
         if self
             .pending
-            .compare_exchange(IDLE, RESETTING, Ordering::SeqCst, Ordering::SeqCst)
+            .compare_exchange(IDLE, RESETTING, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
             panic!("the previous round of the join is not complete");
@@ -332,11 +348,48 @@ impl<T> Join<T> {
     /// inside a continuation that gave up its loan.
     fn arm(&self, parts: usize) {
         self.parts.store(parts, Ordering::Relaxed);
-        // The count first: until the parts are reopened below, a late arrival of the previous round meets a
-        // closed part and is refused before it touches the count.
-        self.pending.store(parts, Ordering::SeqCst);
+        // In debug builds the parts reopen first (those of the round) and close (the rest), so that the count,
+        // stored last, publishes them with it.
+        #[cfg(debug_assertions)]
         for (index, slot) in self.slots.iter().enumerate() {
-            slot.closed.store(index >= parts, Ordering::Release);
+            slot.closed.store(index >= parts, Ordering::Relaxed);
+        }
+        self.pending.store(parts, Ordering::Release);
+    }
+
+    /// Whether no round is armed and no continuation runs: the state of a join that was never armed, or whose last
+    /// round ended. An acquire load, a hint for an owner deciding how to arm.
+    pub fn is_idle(&self) -> bool {
+        self.pending.load(Ordering::Acquire) == IDLE
+    }
+
+    /// Arms a round of `parts` parts (1 to the capacity) without asking whether the previous one ended: Java's
+    /// `expect`. One release store of the count, no read-modify-write. Values the previous round left in the
+    /// slots are dropped first, and parts of it that never arrived are not waited for.
+    ///
+    /// For a pooled cell whose owner knows it is quiet, including one whose previous round was cut short (the
+    /// frames that held its parts were killed and dropped, so some never ended).
+    ///
+    /// # Safety
+    ///
+    /// No part of the previous round may arrive or be abandoned from now on, and no continuation of the join may
+    /// be running or about to run: the caller is the cell's only user until its parts are published. A part of
+    /// the previous round that arrives afterwards writes a slot of the new round.
+    ///
+    /// # Panics
+    /// When `parts` is 0 or above the capacity, or on a join made by [`Join::new`], which has one round. If a
+    /// value's drop panics, the round is armed and the panic is raised after.
+    pub unsafe fn arm_owned(&self, parts: usize) {
+        self.check_parts(parts);
+        assert!(
+            matches!(self.then, Then::Each(_)),
+            "a join made for one round cannot be re-armed"
+        );
+        let previous = self.parts.load(Ordering::Relaxed);
+        let panic = self.clear(previous);
+        self.arm(parts);
+        if let Some(panic) = panic {
+            resume_unwind(panic);
         }
     }
 
@@ -361,16 +414,22 @@ impl<T> Join<T> {
         let Some(slot) = self.slots.get(part) else {
             panic!("part {part} of a join of capacity {}", self.slots.len());
         };
-        // One read-modify-write takes the part: of two arrivals of the same part only one passes.
+        // The part must belong to the round: one plain load, so a part outside it never writes a slot.
+        let parts = self.parts.load(Ordering::Relaxed);
+        if part >= parts {
+            self.refuse(part);
+        }
+        // The contract's second half, in debug builds only: a part ends once.
+        #[cfg(debug_assertions)]
         if slot.closed.swap(true, Ordering::Acquire) {
             self.refuse(part);
         }
-        // SAFETY: closing the part gave this arrival the slot alone. The round's last arrival reads it only
-        // after the read-modify-write below, and arming (which reopens it) happens after that read.
+        // SAFETY: by the contract this arrival is the part's only one, so it has the slot alone. The round's last
+        // arrival reads it only after the read-modify-write below, and arming happens after that read.
         slot.value.with_mut(|cell| unsafe { *cell = value });
-        // One read-modify-write, so the chain of arrivals carries every earlier slot write to the arrival
-        // that sees 1.
-        if self.pending.fetch_sub(1, Ordering::SeqCst) == 1 {
+        // One read-modify-write, and nothing else on this path: the chain of arrivals carries every earlier slot
+        // write to the arrival that sees 1.
+        if self.pending.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.finish();
         }
     }
@@ -452,12 +511,27 @@ mod tests {
         assert_eq!(*runs.lock().unwrap(), [vec![Some("only")]]);
     }
 
+    /// The check that a part ends once is made in debug builds only: a release build trusts the contract.
+    #[cfg(debug_assertions)]
     #[test]
-    fn a_part_ending_twice_or_out_of_range_is_refused() {
+    fn a_part_ending_twice_is_refused_in_a_debug_build() {
         let (join, runs) = recording(2);
         join.arrive(0, "a");
         assert!(catch_unwind(AssertUnwindSafe(|| join.arrive(0, "again"))).is_err());
+        join.arrive(1, "b");
+        assert_eq!(
+            *runs.lock().unwrap(),
+            [vec![Some("a"), Some("b")]],
+            "a refused part changes nothing"
+        );
+    }
+
+    #[test]
+    fn a_part_out_of_range_is_refused_in_every_build() {
+        let (join, runs) = recording(2);
+        join.arrive(0, "a");
         assert!(catch_unwind(AssertUnwindSafe(|| join.abandon(2))).is_err());
+        assert!(catch_unwind(AssertUnwindSafe(|| join.arrive(usize::MAX, "x"))).is_err());
         join.arrive(1, "b");
         assert_eq!(
             *runs.lock().unwrap(),
@@ -627,8 +701,9 @@ mod tests {
         join.arrive(0, ());
     }
 
+    #[cfg(debug_assertions)]
     #[test]
-    fn an_arrival_after_the_round_completed_is_refused() {
+    fn an_arrival_after_the_round_completed_is_refused_in_a_debug_build() {
         let join = Join::<()>::with_capacity(1, |_| {});
         join.reset(1);
         join.arrive(0, ());
@@ -664,6 +739,66 @@ mod tests {
         join.reset(1);
         assert!(catch_unwind(AssertUnwindSafe(|| join.arrive(0, ()))).is_err());
         join.reset(1);
+    }
+
+    #[test]
+    fn a_join_is_idle_until_armed_and_again_once_its_round_ended() {
+        let join = Join::<u8>::with_capacity(2, |_| {});
+        assert!(join.is_idle());
+        join.reset(2);
+        assert!(!join.is_idle());
+        join.arrive(0, 1);
+        assert!(!join.is_idle());
+        join.abandon(1);
+        assert!(join.is_idle(), "the continuation returned");
+    }
+
+    #[test]
+    fn an_owner_arms_a_quiet_cell_without_the_check_and_a_cut_short_round_is_dropped() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        struct Counted(Arc<AtomicUsize>);
+        impl Drop for Counted {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+        let ran = Arc::new(AtomicUsize::new(0));
+        let counted = ran.clone();
+        let join = Join::<Counted>::with_capacity(3, move |_| {
+            counted.fetch_add(1, Ordering::AcqRel);
+        });
+        // A round that was cut short: two of three parts arrived, and the third's frame was killed and dropped.
+        join.reset(3);
+        join.arrive(0, Counted(drops.clone()));
+        join.arrive(1, Counted(drops.clone()));
+        assert!(!join.is_idle());
+        assert!(catch_unwind(AssertUnwindSafe(|| join.reset(2))).is_err());
+        // SAFETY: the owner knows the third part's frame is gone and no continuation runs.
+        unsafe { join.arm_owned(2) };
+        assert_eq!(
+            drops.load(Ordering::Acquire),
+            2,
+            "the values that arrived were dropped"
+        );
+        join.arrive(1, Counted(drops.clone()));
+        join.arrive(0, Counted(drops.clone()));
+        assert_eq!(ran.load(Ordering::Acquire), 1, "the new round ran once");
+        // SAFETY: the round ended and its continuation returned.
+        unsafe { join.arm_owned(1) };
+        join.arrive(0, Counted(drops.clone()));
+        assert_eq!(ran.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn arm_owned_refuses_a_bad_part_count_and_a_one_round_join() {
+        let join = Join::<u8>::with_capacity(2, |_| {});
+        // SAFETY: nothing is armed.
+        assert!(catch_unwind(AssertUnwindSafe(|| unsafe { join.arm_owned(0) })).is_err());
+        // SAFETY: as above.
+        assert!(catch_unwind(AssertUnwindSafe(|| unsafe { join.arm_owned(3) })).is_err());
+        let once = Join::<u8>::new(1, |_| {});
+        // SAFETY: the call refuses before it touches anything.
+        assert!(catch_unwind(AssertUnwindSafe(|| unsafe { once.arm_owned(1) })).is_err());
     }
 
     #[test]
@@ -731,6 +866,7 @@ mod tests {
     }
 
     /// The text of a panic.
+    #[cfg(debug_assertions)]
     fn message(payload: Box<dyn std::any::Any + Send>) -> String {
         match payload.downcast::<String>() {
             Ok(text) => *text,
@@ -741,8 +877,9 @@ mod tests {
         }
     }
 
+    #[cfg(debug_assertions)]
     #[test]
-    fn a_duplicate_arrival_around_a_re_arm_is_refused_and_the_count_survives() {
+    fn a_duplicate_arrival_around_a_re_arm_is_refused_and_the_count_survives_in_a_debug_build() {
         let slot: Arc<OnceLock<Arc<Join<u8>>>> = Arc::new(OnceLock::new());
         let weak = Arc::downgrade(&slot);
         let refusals = Arc::new(Mutex::new(Vec::new()));
@@ -963,31 +1100,36 @@ mod loom {
         });
     }
 
+    // An owner re-arms a round that was cut short (one part arrived, the other's frame was killed and dropped) with
+    // `arm_owned`, a plain release store, after the arrival thread has been joined: the new round's two arrivals
+    // run the continuation once, and no read of a slot is unordered with the write that fills it.
     #[test]
-    fn loom_one_part_racing_itself_is_taken_once() {
+    fn loom_an_owner_re_arms_a_cut_short_round_and_the_next_one_runs_once() {
         ::loom::model(|| {
-            let join = Arc::new(Join::<usize>::with_capacity(1, |_| {}));
-            join.reset(1);
-            let refused = Arc::new(AtomicUsize::new(0));
+            let ran = Arc::new(AtomicUsize::new(0));
+            let counted = ran.clone();
+            let join = Arc::new(Join::<usize>::with_capacity(2, move |round| {
+                assert_eq!(round.len(), 2);
+                counted.fetch_add(1, Ordering::SeqCst);
+            }));
+            join.reset(2);
+            let first = {
+                let join = join.clone();
+                thread::spawn(move || join.arrive(0, 1))
+            };
+            first.join().unwrap();
+            // SAFETY: the only arrival of the cut-short round has been joined; no continuation runs.
+            unsafe { join.arm_owned(2) };
             let threads: Vec<_> = (0..2)
-                .map(|_| {
+                .map(|part| {
                     let join = join.clone();
-                    let refused = refused.clone();
-                    thread::spawn(move || {
-                        // Two arrivals of one part: one passes, the other is refused (the panic is caught).
-                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            join.arrive(0, 1)
-                        }));
-                        if result.is_err() {
-                            refused.fetch_add(1, Ordering::SeqCst);
-                        }
-                    })
+                    thread::spawn(move || join.arrive(part, part + 10))
                 })
                 .collect();
             for thread in threads {
                 thread.join().unwrap();
             }
-            assert_eq!(refused.load(Ordering::SeqCst), 1);
+            assert_eq!(ran.load(Ordering::SeqCst), 1);
         });
     }
 }

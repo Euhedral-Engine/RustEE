@@ -11,3 +11,6 @@ euhedral-data-structures = { path = "../euhedral-data-structures" }
 euhedral-hardware-utils = { path = "../euhedral-hardware-utils" }
 euhedral-hashing = { path = "../euhedral-hashing" }
 log = "0.4.29"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
