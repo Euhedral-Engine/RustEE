@@ -173,7 +173,51 @@ fn a_pin_inside_an_active_slot_keeps_the_slots_older_announcement() {
     assert_eq!(held.magic.load(StdOrdering::SeqCst), LIVE);
     assert!(worker.is_active());
 
+    drop(outer);
     worker.quiescent();
+    cell.try_reclaim();
+    assert_eq!(count.load(StdOrdering::SeqCst), 1);
+}
+
+#[test]
+fn quiescent_and_idle_while_a_guard_is_alive_leave_what_it_protects_protected() {
+    let domain = EpochDomain::new(2);
+    let count = drops();
+    let cell = Published::new(domain.clone(), Some(Counted::new(&count)));
+    let worker = domain.register();
+    worker.quiescent();
+    let guard = worker.pin();
+    let held = cell.load(&guard).unwrap();
+
+    cell.store(Some(Counted::new(&count))).defer();
+    // The owner asks for a new point and for idle while the guard's reference is live: both wait for the guard.
+    worker.quiescent();
+    worker.idle();
+    cell.try_reclaim();
+    assert_eq!(count.load(StdOrdering::SeqCst), 0);
+    assert_eq!(held.magic.load(StdOrdering::SeqCst), LIVE);
+
+    drop(guard);
+    assert!(!worker.is_active(), "the deferred idle took effect");
+    cell.try_reclaim();
+    assert_eq!(count.load(StdOrdering::SeqCst), 1);
+}
+
+#[test]
+fn a_quiescent_point_during_a_pin_from_idle_is_ignored_and_the_pin_still_withdraws() {
+    let domain = EpochDomain::new(1);
+    let count = drops();
+    let cell = Published::new(domain.clone(), Some(Counted::new(&count)));
+    let thread = domain.register();
+    let guard = thread.pin();
+    let held = cell.load(&guard).unwrap();
+    cell.store(None).defer();
+    thread.quiescent();
+    cell.try_reclaim();
+    assert_eq!(count.load(StdOrdering::SeqCst), 0);
+    assert_eq!(held.magic.load(StdOrdering::SeqCst), LIVE);
+    drop(guard);
+    assert!(!thread.is_active());
     cell.try_reclaim();
     assert_eq!(count.load(StdOrdering::SeqCst), 1);
 }

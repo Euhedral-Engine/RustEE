@@ -171,10 +171,17 @@ pub struct EpochSlot {
     node: *const SlotNode,
     /// Whether the slot holds an announcement. Only the owning thread reads and writes it.
     active: Cell<bool>,
+    /// The guards alive: while any is, the announcement only holds still or ages, so what the guards protect stays
+    /// protected whatever the owner calls.
+    pins: Cell<usize>,
+    /// Whether the outermost guard announced the slot, and so withdraws it when the last guard drops.
+    pinned_from_idle: Cell<bool>,
+    /// Whether [`idle`](Self::idle) arrived while a guard was alive: the last guard withdraws the announcement.
+    idle_requested: Cell<bool>,
 }
 
-// SAFETY: the node is reached through atomics and outlives the slot's `Arc` of the domain; the `Cell` is used by the
-// owning thread alone, which `!Sync` guarantees while `Send` moves the whole slot.
+// SAFETY: the node is reached through atomics and outlives the slot's `Arc` of the domain; the `Cell`s are used by
+// the owning thread alone, which `!Sync` guarantees while `Send` moves the whole slot.
 unsafe impl Send for EpochSlot {}
 
 impl EpochSlot {
@@ -183,6 +190,9 @@ impl EpochSlot {
             domain,
             node,
             active: Cell::new(false),
+            pins: Cell::new(0),
+            pinned_from_idle: Cell::new(false),
+            idle_requested: Cell::new(false),
         }
     }
 
@@ -201,51 +211,61 @@ impl EpochSlot {
         self.active.get()
     }
 
+    /// Announces the current epoch from idle, with the fence that keeps the loads that follow from passing the
+    /// announcement.
+    fn announce_from_idle(&self) {
+        let epoch = self.domain.epoch.load(Ordering::Acquire);
+        self.state().store(epoch, Ordering::SeqCst);
+        fence(Ordering::SeqCst);
+        self.active.set(true);
+    }
+
+    fn withdraw(&self) {
+        self.state().store(IDLE, Ordering::Release);
+        self.active.set(false);
+    }
+
     /// Announces that this thread holds no reference to a published value from before this call, and that the
     /// values it loads from now on stay valid until the next call of [`quiescent`](Self::quiescent) or
     /// [`idle`](Self::idle).
     ///
     /// For an active slot this is a load of the epoch and a release store: a writer that reads the older
     /// announcement waits, which is safe. Leaving idle also fences, so that the loads that follow cannot pass the
-    /// announcement.
+    /// announcement. While a guard is alive the call changes nothing: the guard's values were loaded before it.
     pub fn quiescent(&self) {
-        let epoch = self.domain.epoch.load(Ordering::Acquire);
+        if self.pins.get() > 0 {
+            return;
+        }
         if self.active.get() {
+            let epoch = self.domain.epoch.load(Ordering::Acquire);
             self.state().store(epoch, Ordering::Release);
         } else {
-            self.state().store(epoch, Ordering::SeqCst);
-            fence(Ordering::SeqCst);
-            self.active.set(true);
+            self.announce_from_idle();
         }
     }
 
     /// Withdraws the announcement: the thread holds no reference to a published value, and writers stop waiting
-    /// for it.
+    /// for it. While a guard is alive the withdrawal waits for the last guard to drop.
     pub fn idle(&self) {
-        self.state().store(IDLE, Ordering::Release);
-        self.active.set(false);
+        if self.pins.get() > 0 {
+            self.idle_requested.set(true);
+            return;
+        }
+        self.withdraw();
     }
 
     /// Keeps the values loaded under the guard valid until it drops.
     ///
     /// An active slot is already announced at an epoch no later than now: the guard changes nothing and the values
-    /// stay valid until the slot's next quiescent point. An idle slot announces the current epoch, with a fence,
-    /// and the guard withdraws it.
+    /// stay valid until the slot's next quiescent point after the guard drops. An idle slot announces the current
+    /// epoch, with a fence, and the last guard withdraws it.
     pub fn pin(&self) -> EpochGuard<'_> {
-        if self.active.get() {
-            return EpochGuard {
-                slot: self,
-                owned: false,
-            };
+        if self.pins.get() == 0 && !self.active.get() {
+            self.announce_from_idle();
+            self.pinned_from_idle.set(true);
         }
-        let epoch = self.domain.epoch.load(Ordering::Acquire);
-        self.state().store(epoch, Ordering::SeqCst);
-        fence(Ordering::SeqCst);
-        self.active.set(true);
-        EpochGuard {
-            slot: self,
-            owned: true,
-        }
+        self.pins.set(self.pins.get() + 1);
+        EpochGuard { slot: self }
     }
 }
 
@@ -269,14 +289,16 @@ impl fmt::Debug for EpochSlot {
 #[must_use = "the values loaded under the guard are valid while it lives"]
 pub struct EpochGuard<'a> {
     slot: &'a EpochSlot,
-    /// Whether this guard announced the slot, and so withdraws it.
-    owned: bool,
 }
 
 impl Drop for EpochGuard<'_> {
     fn drop(&mut self) {
-        if self.owned {
-            self.slot.idle();
+        let slot = self.slot;
+        let pins = slot.pins.get() - 1;
+        slot.pins.set(pins);
+        if pins == 0 && (slot.pinned_from_idle.replace(false) | slot.idle_requested.replace(false))
+        {
+            slot.withdraw();
         }
     }
 }
@@ -421,16 +443,21 @@ impl<T: Send + Sync> Published<T> {
         }
     }
 
-    /// The number of retirements waiting; for tests and metrics.
+    /// The number of retirements waiting; for tests and metrics. A reclaim that runs meanwhile holds its list
+    /// away from the count, so the number is a lower bound.
     pub fn pending(&self) -> usize {
+        let list = self.retired.swap(ptr::null_mut(), Ordering::AcqRel);
         let mut count = 0;
-        // The list is taken whole by a reclaim; a count made meanwhile is a lower bound.
-        let mut node = self.retired.load(Ordering::Acquire);
-        // SAFETY: nodes are freed only by a reclaim, which takes the list first; the caller is a test or a metric
-        // read while no reclaim runs.
+        let mut last = list;
+        let mut node = list;
+        // SAFETY: the swap took the whole list, so its nodes are ours until they are pushed back below.
         while let Some(current) = unsafe { node.as_ref() } {
             count += 1;
+            last = node;
             node = current.next;
+        }
+        if !list.is_null() {
+            self.push_chain(list, last);
         }
         count
     }

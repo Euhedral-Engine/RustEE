@@ -106,6 +106,8 @@ impl CacheDirectory {
         if let Some(retired) = retired {
             retired.defer();
         }
+        // Closing is lifecycle work: free what earlier withdrawals left once the workers have passed.
+        self.reclaim();
     }
 
     /// Frees the references that withdrawn or replaced caches left behind, once the workers have passed.

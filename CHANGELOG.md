@@ -48,7 +48,9 @@ downstream with an opaque load and the parent with an acquire load, and claims a
   stealer that found one holds it for the steal, so a closed cache lives until its last stealer lets go.
 - A `Published` store never waits and never fails; the retirements a cell cannot free yet chain on a list, which
   each store, deferral and `try_reclaim` sweeps. A worker that parks, or whose loop ends by a panic, holds nothing
-  back.
+  back. While an `EpochGuard` is alive its slot keeps its announcement: a quiescent point or an idle requested
+  meanwhile takes effect when the last guard drops, so a reference loaded under a guard stays valid as long as the
+  guard.
 
 **Tests.** `a_value_is_never_dropped_while_a_reader_holds_it`, `wait_never_returns_before_every_slot_passed_the_epoch`,
 `a_store_never_waits_and_the_retirements_chain_until_the_readers_pass`, `readers_never_see_a_freed_value`,
