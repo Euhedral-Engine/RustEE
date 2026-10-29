@@ -13,6 +13,7 @@ use std::sync::atomic::{
 };
 
 use euhedral_data_structures::queues::{Consumer, MpmcQueue, Multi, Producer};
+use euhedral_data_structures::sync::HotScope;
 
 /// The most locations a planner has (a device or two, pinned and pageable host memory).
 pub const MAX_LOCATIONS: usize = 8;
@@ -1265,6 +1266,7 @@ impl GiveBacks {
     /// An order was queued: push it downstream if the lattice asked for frames.
     // HOT-FIX(S1): a producer pushes to the downstream itself, outside `request`.
     fn wake(&self) {
+        let _hot = HotScope::enter();
         let Some(downstream) = self.downstream.get() else {
             return;
         };

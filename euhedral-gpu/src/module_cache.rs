@@ -72,7 +72,7 @@ static STORES: AtomicU64 = AtomicU64::new(0);
 
 #[allow(
     clippy::disallowed_methods,
-    reason = "module loading is a build-time call; it blocks by nature (compile, driver load)"
+    reason = "LIFECYCLE(load): module loading is a build-time call; it blocks by nature (compile, driver load)"
 )]
 impl ModuleCache {
     pub fn new(dir: impl Into<PathBuf>) -> Self {

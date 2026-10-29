@@ -231,6 +231,7 @@ impl Lake {
     /// Queues `frame` in the sink its routing hash selects, or hands it back when no unit is
     /// admitted or the lake has completed.
     pub fn offer(&self, frame: Box<dyn Frame>) -> Result<(), Box<dyn Frame>> {
+        let _hot = HotScope::enter();
         let mut frame = frame;
         let Ok(mut generation) = self.attach_for_offer() else {
             return Err(frame);

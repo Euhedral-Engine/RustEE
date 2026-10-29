@@ -25,6 +25,7 @@ use std::sync::{Arc, OnceLock, Weak};
 use euhedral_core::frames::{Frame, RunnableFrame};
 use euhedral_core::generics::{LatticeReceiver, LatticeSource};
 use euhedral_data_structures::queues::{Consumer, MpmcQueue, Multi, Producer};
+use euhedral_data_structures::sync::HotScope;
 use euhedral_graph::{DeviceQueue, Marker};
 
 use crate::backend::Retired;
@@ -1119,6 +1120,7 @@ impl Moves {
 
     // HOT-FIX(S2): a producer pushes to the downstream itself, outside `request`.
     fn wake(&self) {
+        let _hot = HotScope::enter();
         let Some(downstream) = self.downstream.get() else {
             return;
         };

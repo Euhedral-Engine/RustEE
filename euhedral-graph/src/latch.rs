@@ -130,7 +130,7 @@ impl<T> LatchWaiter<T> {
     /// If the setter was dropped without setting.
     #[allow(
         clippy::disallowed_methods,
-        reason = "the main thread has nothing to run while the lattice works: this is where it waits"
+        reason = "LIFECYCLE(G5): the main thread has nothing to run while the lattice works: this is where it waits"
     )]
     pub fn wait(self) -> T {
         loop {

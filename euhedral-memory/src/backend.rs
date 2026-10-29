@@ -9,6 +9,7 @@
 use std::fmt;
 
 use euhedral_data_structures::queues::{Consumer, MpmcQueue, Multi, Producer};
+use euhedral_data_structures::sync::HotScope;
 
 use crate::planner::{Claim, LocationId};
 
@@ -139,6 +140,7 @@ impl<T: Send> Reaper<T> {
     /// Drops every queued item whose work retired and returns how many; the others stay queued (behind the newer
     /// ones). Another thread reaping at the same moment makes this return early, never wait.
     pub fn reap(&self) -> usize {
+        let _hot = HotScope::enter();
         let mut n = 0;
         let mut keep = Vec::new();
         let limit = self.queue.size_long();
