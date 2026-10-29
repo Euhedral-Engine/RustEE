@@ -82,8 +82,8 @@ pub struct Completions {
     demand: AtomicU64,
     downstream: DownstreamSlot,
     complete: AtomicBool,
-    /// Registrations whose marker was still unreached when the source dropped, leaked (see the
-    /// `Drop` impl); shared, so it can be read after the drop.
+    /// Registrations whose marker was still unreached when they were cancelled, leaked (see
+    /// `cancel`); shared, so it can be read after the drop.
     leaked: Arc<AtomicUsize>,
     /// How late each emission was, in µs, since the start (lock-free: polls record, readers copy).
     lateness: Histogram,
@@ -127,15 +127,8 @@ enum Waits {
 
 impl Drop for Completions {
     /// The last owner lets go: no thread can register any more, and none will poll. What is still
-    /// in the queue, and what was absorbed and never emitted, ends here, so no registration is left
-    /// without an end:
-    ///
-    /// - a registration that waits for a lane's marker the lane has still not reached is **leaked**
-    ///   (`mem::forget`) and counted in [`leaked_at_drop`](Completions::leaked_at_drop). The device
-    ///   may still use what its frame holds, and finishing the frame would release it; a leak is
-    ///   the same choice as a ring's in-flight buffers make when it drops;
-    /// - every other registration, including one whose marker was reached, is finished with
-    ///   `do_finally` (cancelled), as before.
+    /// in the queue, and what was absorbed and never emitted, ends here through [`Completions::cancel`]
+    /// (finished, or leaked when its marker is unreached), so no registration is left without an end.
     fn drop(&mut self) {
         let poll = self.poll.get_mut();
         let mut ends = Self::absorb(poll);
@@ -145,13 +138,7 @@ impl Drop for Completions {
                 .map(|entry| entry.what),
         );
         for what in ends {
-            match what {
-                Waits::Marker(marker, _) if !self.lanes.reached(marker) => {
-                    self.leaked.fetch_add(1, Ordering::Release);
-                    std::mem::forget(what);
-                }
-                what => Self::cancel(what),
-            }
+            self.cancel(what);
         }
     }
 }
@@ -220,7 +207,7 @@ impl Completions {
         // Only a speed-up and the visible failure: a registration that misses the flag takes the
         // queue and is told apart by its position behind `Slot::Closed`.
         if self.complete.load(Ordering::SeqCst) {
-            Self::cancel(what);
+            self.cancel(what);
             debug_assert!(
                 false,
                 "a completion registered after Completions::complete (its frame was cancelled)"
@@ -237,7 +224,7 @@ impl Completions {
         if let Err(Slot::Waiting(Waiting { what, .. })) = self.incoming.offer(slot) {
             // Unreachable for the unbounded queue; ends the frame rather than losing it.
             self.pending.fetch_sub(1, Ordering::AcqRel);
-            Self::cancel(what);
+            self.cancel(what);
             return;
         }
         // Racing `complete`: the flag may be set by now, and this one may be behind the marker.
@@ -248,9 +235,22 @@ impl Completions {
         }
     }
 
-    /// Ends what a refused registration holds: its frame is finished without running; a
-    /// [`Pending`] has no frame, so it is dropped.
-    fn cancel(what: Waits) {
+    /// Ends what a refused, late or abandoned registration holds: its frame is finished without
+    /// running; a [`Pending`] has no frame, so it is dropped.
+    ///
+    /// A registration that waits for a lane's marker the lane has still not reached is **leaked**
+    /// instead (`mem::forget`) and counted in [`leaked_unreached`](Completions::leaked_unreached):
+    /// the device may still use what its frame holds, and finishing the frame would release it. It
+    /// is the choice an I/O ring makes for its in-flight buffers. Wherever a frame's resources
+    /// could be released while the device may still use them, they are not.
+    fn cancel(&self, what: Waits) {
+        if let Waits::Marker(marker, _) = &what
+            && !self.lanes.reached(*marker)
+        {
+            self.leaked.fetch_add(1, Ordering::Release);
+            std::mem::forget(what);
+            return;
+        }
         match what {
             Waits::Ready(_, frame)
             | Waits::Marker(_, frame)
@@ -286,7 +286,7 @@ impl Completions {
         }
         let count = late.len();
         for what in late {
-            Self::cancel(what);
+            self.cancel(what);
         }
         self.pending.fetch_sub(count, Ordering::AcqRel);
     }
@@ -398,9 +398,10 @@ impl Completions {
         self.add(Waits::Pending(pending));
     }
 
-    /// How many registrations the source leaked when it dropped because their marker was still
-    /// unreached (see its `Drop`). The counter outlives the source.
-    pub fn leaked_at_drop(&self) -> Arc<AtomicUsize> {
+    /// How many registrations the source leaked, instead of finishing them, because they were
+    /// refused, late or abandoned while their marker was still unreached (see `cancel`). The
+    /// counter outlives the source.
+    pub fn leaked_unreached(&self) -> Arc<AtomicUsize> {
         self.leaked.clone()
     }
 
@@ -1416,7 +1417,7 @@ mod tests {
                 emitted, 0,
                 "an unreached lane emits nothing, also after complete"
             );
-            let leaks = completions.leaked_at_drop();
+            let leaks = completions.leaked_unreached();
             drop(completions);
             // Cancelled behind the marker (ended), or registered ahead of it and still waiting on an
             // unreached lane at drop (leaked and counted): one or the other, exactly once.
@@ -1559,7 +1560,7 @@ mod tests {
     #[test]
     fn dropping_with_an_unreached_marker_leaks_the_frame_and_counts_it() {
         let (completions, lane) = setup();
-        let leaks = completions.leaked_at_drop();
+        let leaks = completions.leaked_unreached();
         let (unreached, unreached_ends) = counted(1);
         let (reached, reached_ends) = counted(2);
         completions.after_marker(Marker::new(lane.id, LaneId(0), 9), unreached);
@@ -1577,5 +1578,46 @@ mod tests {
             1,
             "one whose marker was reached is finished"
         );
+    }
+
+    #[test]
+    fn a_late_registration_on_an_unreached_marker_is_leaked_and_counted() {
+        let (completions, lane) = setup();
+        let leaks = completions.leaked_unreached();
+        completions.complete();
+        let late_marker = |seq: u64, id: u64| {
+            let (frame, ends) = counted(id);
+            completions.pending.fetch_add(1, Ordering::AcqRel);
+            let queued = completions.incoming.offer(Slot::Waiting(Waiting {
+                what: Waits::Marker(Marker::new(lane.id, LaneId(0), seq), frame),
+                last_seen: Instant::now(),
+            }));
+            assert!(queued.is_ok());
+            ends
+        };
+        let unreached = late_marker(9, 1);
+        let reached = late_marker(0, 2);
+        // A poll of a completed source sweeps what landed behind the marker.
+        completions.request(1);
+        assert_eq!(
+            unreached.load(Ordering::Acquire),
+            0,
+            "the device may still use its frame"
+        );
+        assert_eq!(
+            reached.load(Ordering::Acquire),
+            1,
+            "a reached marker is cancelled"
+        );
+        assert_eq!(leaks.load(Ordering::Acquire), 1);
+        assert_eq!(completions.pending(), 0);
+        // A registration refused on the spot is handled the same way (debug builds also panic).
+        let (frame, refused) = counted(3);
+        let marker = Marker::new(lane.id, LaneId(0), 9);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            completions.after_marker(marker, frame)
+        }));
+        assert_eq!(refused.load(Ordering::Acquire), 0);
+        assert_eq!(leaks.load(Ordering::Acquire), 2);
     }
 }
