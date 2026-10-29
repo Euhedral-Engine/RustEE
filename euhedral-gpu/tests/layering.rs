@@ -19,6 +19,7 @@ const LAYERS: &[(&str, u8)] = &[
     ("euhedral-io", 3),
     ("euhedral-memory", 4),
     ("euhedral-gpu", 5),
+    ("euhedral-benchmarks", 6),
 ];
 
 fn layer(name: &str) -> Option<u8> {
