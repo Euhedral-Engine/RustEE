@@ -769,8 +769,8 @@ runtime" is the Java runtime `euhedral-graph` is derived from (its `runtime/grap
 
 | Place | Java counterpart | Deviation and why |
 |---|---|---|
-| C1, C10 hot source | core `flow_control/LatticeHotSource` | Acquire pointer load (no final-field rule); retired receivers kept until drop (no GC); `on_complete` at complete (the interceptor drops its source on it: no GC); `accept` finishes an unsent frame (Java bug: it drops it unfinished). |
-| C2 stop watch | core `utils/StopWatch` | Relaxed atomics: Rust closures sharing it must be `Sync`. |
+| C1, C10 hot source | core `flow_control/LatticeHotSource` | Acquire pointer load (no final-field rule); retired receivers kept until drop (no GC), on an intrusive push-only stack of links rather than a lifecycle-locked list, so `add_downstream` and `complete` set atomics only; `add_downstream` skips Java's second compare-and-set when its first installed the link (it could only re-install a link a racing `complete` had retired); `on_complete` at complete (the interceptor drops its source on it: no GC); `accept` finishes an unsent frame (Java bug: it drops it unfinished) and runs the after-hook whenever the before-hook ran. |
+| C2 stop watch | core `utils/StopWatch` | Relaxed atomics: Rust closures sharing it must be `Sync`. `stop` takes the running flag with a swap (once per sampled pair), so racing stops take a measurement once. |
 | C3 body cost | core `control_plane/FragmentDecisionTree` | Relaxed atomics, as C2. |
 | C4 cache partitions | core `ControlPlaneCache.pLocks` | Always claimed (no safe unguarded form). |
 | C5 cache directory | core `ControlPlaneCache.WORK_STEAL` | `Published` (no GC). |

@@ -143,7 +143,8 @@ sink that runs typed `PipelineFrame` chains. `run` and `submit` admit an input; 
 stops admission and completes once every accepted chain has finished; `complete` kills the chains.
 
 **LatticeHotSource** ([`LatticeHotSource`](euhedral-core/src/flow_control/hot_source.rs)): a source
-its owner pushes frames into by hand with `accept`, without waiting for demand.
+its owner pushes frames into by hand with `accept`, without waiting for demand. Its optional hooks are `Fn`; it reads
+its downstream with atomics and keeps every receiver it installed until it drops, so a pusher never holds a freed one.
 
 ## The lattice
 

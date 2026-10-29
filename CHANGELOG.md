@@ -3,6 +3,54 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## The hot source and the fragment's output without locks (2026-10-29)
+
+**What.**
+- `LatticeHotSource` (audit C1, C10):
+  - `before_each` and `after_each` take `Fn + Send + Sync` hooks, set when the source is built and called without a lock
+    (**breaking**: they took `FnMut + Send`);
+  - the downstream is Java's pair of words: `complete: AtomicBool` and `downstream: AtomicPtr`. `accept` reads them
+    (`Relaxed` and `Acquire`), runs the before-hook, reads the pointer again, pushes and runs the after-hook;
+  - `add_downstream` follows Java's compare-and-set sequence (`SeqCst`), `complete` is `store(true)` then
+    `swap(null)`, and the receiver it removed hears `on_complete` once.
+- `StopWatch` (C2): `start` and `stop` take `&self`. The count, the start time (nanoseconds from the watch's creation)
+  and the running flag are relaxed atomics, Java's plain fields; `stop` takes the running flag with a swap, so one of
+  several racing stops takes each measurement. `StopWatch` is still `Clone`.
+- `BodyCost` (C3): the window's samples (as `f64` bits), threshold and confirmation count are relaxed atomics, and the
+  mutex is gone.
+- `HOT_FIX_TAGS` loses C1, C2, C3 and C10 and lists 45.
+
+**Why.** The fragment's output runs for every frame its worker runs. Its two hooks shared a `StopWatch` behind a
+mutex, took a second mutex per sampled frame for the body cost, and the source read its downstream under a read lock.
+Java has none of that: the hooks are final fields, the stop watch and cost window are plain fields of the one worker,
+and the downstream is read with an opaque load.
+
+**How.**
+- Build a hot source with `LatticeHotSource::new().before_each(|frame| ..).after_each(|| ..)`; hooks that count or time
+  use atomics.
+- A watch shared by the two hooks is an `Arc<StopWatch>`, with no mutex.
+
+**Semantics.**
+- Every receiver a source installed stays alive until the source drops (Java's collector keeps a detached receiver for
+  a pusher still holding it). The source holds each in a link; a removed link is pushed onto a stack that only grows
+  and is freed with the source. A source that is completed and reattached many times keeps one small link per
+  attach. No lifecycle call takes a lock.
+- `accept` finishes the frame with an error when the source is complete or has no downstream, also when the
+  before-hook completes it; the after-hook runs whenever the before-hook did.
+- A reopened source (`complete` then `add_downstream`) takes the new receiver; a second `add_downstream` on a live
+  source is told `AlreadyAttached` and the first is kept. Racing attaches install exactly one.
+- A `StopWatch` serves one thread at a time, as Java's does. Shared by two threads it still hands each measurement to
+  one stop; which pair is timed can shift, because the count of untimed starts is a load and a store.
+
+**Tests.** `hooks_run_around_each_push_from_one_pusher`, `complete_while_accepting_never_frees_the_receiver_in_use`,
+`a_complete_source_reopens_with_a_new_receiver`, `complete_tells_the_old_receiver_on_complete_once`,
+`racing_attaches_install_one_receiver_and_refuse_the_rest`,
+`attaching_and_completing_from_many_threads_leaves_every_receiver_told_at_most_once`,
+`dropping_the_source_drops_every_receiver_it_kept`,
+`a_source_completed_by_its_before_hook_fails_the_frame_and_runs_the_after_hook`,
+`a_shared_stop_watch_times_one_call_in_256`, `one_of_several_racing_stops_takes_the_measurement`,
+`body_cost_estimate_is_unchanged_by_the_atomics`. They run under Miri with many seeds (the `miri` CI job).
+
 ## Lock-free sources and claims (2026-10-29)
 
 **What.**
