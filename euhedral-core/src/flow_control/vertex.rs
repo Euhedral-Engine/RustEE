@@ -22,6 +22,7 @@ use crate::utils::math::unsigned_multiply_high;
 use euhedral_data_structures::atomics::CachePadded;
 use euhedral_data_structures::queues::{Consumer, MpscQueue, Multi, Producer, Single};
 use euhedral_data_structures::sync::{HotScope, LifecycleMutex, SetOnce};
+use euhedral_hardware_utils::util::CpuSet;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
@@ -174,6 +175,8 @@ pub struct LatticeVertex {
     route: RoutingFunction,
     /// The placement policy that runs on every frame before the routing function, if this vertex has one.
     placement: Option<Arc<Placement>>,
+    /// Whether a policy is set: the one thing a push reads of the placement when there is none.
+    placed: AtomicBool,
     /// Java's `routingState`: the published generation, a cell of the registry that each worker reads from its view.
     routing: Cell<RoutingState>,
     /// Java's `routingUpdateLock` and the state it guards.
@@ -217,6 +220,21 @@ impl LatticeVertex {
         Self::build(registry, name, downstream_count, route, Some(placement))
     }
 
+    /// Sets the placement policy of a vertex made with [`with_placement`](Self::with_placement); returns whether it has
+    /// one. Lifecycle work: the caller does it while nothing routes. See
+    /// [`ControlPlaneLattice::set_placement_policy`](crate::control_plane::ControlPlaneLattice::set_placement_policy).
+    pub fn set_placement_policy(
+        &self,
+        policy: impl Fn(&mut dyn Frame, &CpuSet) + Send + Sync + 'static,
+    ) -> bool {
+        let Some(placement) = &self.placement else {
+            return false;
+        };
+        placement.set_policy(self.edge.registry(), policy);
+        self.placed.store(true, Ordering::Release);
+        true
+    }
+
     fn build(
         registry: &Arc<UpstreamRegistry>,
         name: impl Into<String>,
@@ -232,6 +250,7 @@ impl LatticeVertex {
             downstream_count,
             route: Arc::new(route),
             placement,
+            placed: AtomicBool::new(false),
             routing,
             book: LifecycleMutex::new(Book {
                 references: HashMap::new(),
@@ -470,7 +489,9 @@ impl LatticeVertex {
         let routed = self.with_route(|state| {
             let mut frame = slot.take().expect("routed once");
             // The very first thing a routed frame meets: the placement policy, if the vertex has one and it is set.
-            if let Some(placement) = &self.placement {
+            if self.placed.load(Ordering::Relaxed)
+                && let Some(placement) = &self.placement
+            {
                 placement.apply(self.edge.registry(), &mut *frame);
             }
             if state.is_empty() {

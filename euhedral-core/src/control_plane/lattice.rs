@@ -338,7 +338,7 @@ impl ControlPlaneLattice {
         if *started && !self.closed.load(Ordering::Acquire) {
             return Err(LatticeError::Running);
         }
-        self.placement.set_policy(self.registry(), policy);
+        self.controller.set_placement_policy(policy);
         Ok(())
     }
 

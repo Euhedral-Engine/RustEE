@@ -8,8 +8,8 @@
 //! not allocate and not block; whatever it reads is the caller's to make safe to read from many threads.
 //!
 //! The policy and the CPU set are cells of the lattice's registry, so a thread reads them from its view with no lock
-//! and no reference-count update (a light reader pays the reference-count pair a view read costs). A vertex without a
-//! placement pays a branch; one with a placement and no policy set pays a branch and a relaxed load.
+//! and no reference-count update (a light reader pays the reference-count pair a view read costs). A vertex pays one
+//! relaxed load of its own flag per frame when no policy is set.
 
 use super::registry::UpstreamRegistry;
 use super::views::Cell;
@@ -17,7 +17,6 @@ use crate::frames::Frame;
 use euhedral_hardware_utils::util::CpuSet;
 use std::sync::Arc;
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 /// What a placement policy is: it may change the frame's origin and routing policy, given the CPUs the lattice routes
 /// with. Called concurrently from many threads: `Fn`, never `FnMut`.
@@ -28,10 +27,9 @@ struct PolicyBox(Box<PlacementPolicy>);
 
 static NO_CPUS: LazyLock<CpuSet> = LazyLock::new(CpuSet::new);
 
-/// The placement of one vertex: its policy and the CPUs it is given.
+/// The placement of one vertex: its policy and the CPUs it is given. Whether a policy is set is a flag of the vertex
+/// (next to the fields a push reads anyway), so that a frame without a policy reads nothing here.
 pub struct Placement {
-    /// Whether a policy is set: the only thing a frame reads when there is none.
-    active: AtomicBool,
     policy: Cell<PolicyBox>,
     cpus: Cell<CpuSet>,
 }
@@ -40,20 +38,19 @@ impl Placement {
     /// A placement with no policy.
     pub fn new(registry: &UpstreamRegistry) -> Arc<Self> {
         Arc::new(Self {
-            active: AtomicBool::new(false),
             policy: registry.cell(),
             cpus: registry.cell(),
         })
     }
 
-    /// Sets the policy. Lifecycle work, for the caller to do while nothing routes.
+    /// Sets the policy. Lifecycle work, for the caller to do while nothing routes. A vertex runs it only once its
+    /// [`set_placement_policy`](super::LatticeVertex::set_placement_policy), which calls this, has raised its flag.
     pub fn set_policy(
         &self,
         registry: &UpstreamRegistry,
         policy: impl Fn(&mut dyn Frame, &CpuSet) + Send + Sync + 'static,
     ) {
         registry.set_cell(&self.policy, Some(Arc::new(PolicyBox(Box::new(policy)))));
-        self.active.store(true, Ordering::Release);
     }
 
     /// Publishes the CPUs the policy is given from now on.
@@ -64,9 +61,6 @@ impl Placement {
     /// Runs the policy on `frame`, if one is set.
     #[inline]
     pub fn apply(&self, registry: &Arc<UpstreamRegistry>, frame: &mut dyn Frame) {
-        if !self.active.load(Ordering::Relaxed) {
-            return;
-        }
         registry.with_view(|view| {
             if let Some(policy) = view.get(&self.policy) {
                 (policy.0)(frame, view.get(&self.cpus).unwrap_or(&NO_CPUS));
@@ -77,8 +71,6 @@ impl Placement {
 
 impl std::fmt::Debug for Placement {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Placement")
-            .field("active", &self.active.load(Ordering::Relaxed))
-            .finish_non_exhaustive()
+        f.debug_struct("Placement").finish_non_exhaustive()
     }
 }
