@@ -10,8 +10,8 @@
 //!   reason with `HOT-FIX(<id>)` (one or more, comma separated, each listed), `LIFECYCLE(<id>)` (a row of the audit)
 //!   or, for a call, `JAVA-BACKOFF`; or it is a test-only `cfg_attr`, or a file-level allow of a file on
 //!   [`EXEMPT_FILES`].
-//! - `euhedral-io`'s engines lock through the `lock!` macro, which names no lock type; its call sites are counted per
-//!   file ([`LOCK_MACRO_SITES`]) and only shrink.
+//! - A file that locks through the `lock!` macro, which names no lock type, has its call sites counted per file
+//!   ([`LOCK_MACRO_SITES`]); the count only shrinks.
 //! - A type alias may not name a lock type: the lint reports the alias, not its uses, so an alias would hide the lock
 //!   from every site that uses it.
 
@@ -76,9 +76,9 @@ const HOT_FIX_TAGS: &[(&str, usize)] = &[
     ("S6a", 1),
 ];
 
-/// The `lock!(..)` call sites of `euhedral-io`'s engines (the macro names no lock type, so the lint cannot see them),
-/// by file, with the ids of the audit the locks it takes belong to. A file's count only shrinks, and is 0 once none
-/// of its ids is listed in [`HOT_FIX_TAGS`]; a file not listed here has no site.
+/// The `lock!(..)` call sites by file (the macro names no lock type, so the lint cannot see them), with the ids of the
+/// audit the locks it takes belong to. A file's count only shrinks, and is 0 once none of its ids is listed in
+/// [`HOT_FIX_TAGS`]; a file not listed here has no site.
 const LOCK_MACRO_SITES: &[(&str, &[&str], usize)] = &[
     ("euhedral-io/src/uring.rs", &["I3", "I4", "I5", "I6"], 5),
     (
