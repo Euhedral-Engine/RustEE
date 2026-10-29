@@ -3,9 +3,9 @@ use super::upstream_queue::UpstreamHandle;
 use crate::frames::{Failure, Frame, FrameError};
 use crate::generics::LatticeReceiver;
 use crate::utils::spin_wait;
-use std::sync::atomic::{AtomicBool, Ordering};
-#[allow(clippy::disallowed_types, reason = "HOT-FIX(C9), HOT-FIX(C8)")]
-use std::sync::{Arc, RwLock, Weak};
+use euhedral_data_structures::sync::{Published, SetOnce};
+use std::sync::atomic::{AtomicBool, Ordering, fence};
+use std::sync::{Arc, Weak};
 
 /// Work to run once a retiring edge can no longer receive frames.
 pub type Retirement = Box<dyn FnOnce() + Send>;
@@ -40,7 +40,6 @@ pub trait LatticeNode: Send + Sync {
 }
 
 /// Where an edge sends its frames.
-#[derive(Clone)]
 enum Downstream {
     Receiver(Arc<dyn LatticeReceiver>),
     Node(Arc<dyn LatticeNode>),
@@ -49,22 +48,27 @@ enum Downstream {
 /// The link every lattice node is built on, and the plain node that only links.
 ///
 /// An edge has at most one downstream: a receiver, which is the floor of the edge's branch, or
-/// another node, which extends the branch. Frames pushed into the edge go to the downstream.
+/// another node, which extends the branch. Frames pushed into the edge go to the downstream. The
+/// downstream is set once, by a compare-and-set (Java's `DOWNSTREAM`), and stays until the edge drops: an edge
+/// closes for good, so nothing attaches again, and a push that read it just before the close may still be using it.
 ///
 /// An edge may have a parent, the node above it. Demand from a request or pull climbs from parent
 /// to parent, skipped by any closed or draining edge on the way, and the topmost edge serves it
 /// from the calling thread's [`UpstreamQueue`](super::UpstreamQueue). Upstream handles are added
-/// to the [`UpstreamRegistry`] all linked edges share, through any of them.
+/// to the [`UpstreamRegistry`] all linked edges share, through any of them. The parent is a
+/// [`Published`] weak reference in the registry's epoch domain (Java's `PARENT`): reading it takes no lock, and a
+/// replaced reference is freed once the workers have passed the store.
 pub struct LatticeEdge {
     registry: Arc<UpstreamRegistry>,
     drain: Arc<AtomicBool>,
     /// The node built on this edge, handed to children as their parent.
     node: Weak<dyn LatticeNode>,
-    #[allow(clippy::disallowed_types, reason = "HOT-FIX(C9)")]
-    parent: RwLock<Option<Weak<dyn LatticeNode>>>,
-    #[allow(clippy::disallowed_types, reason = "HOT-FIX(C8)")]
-    downstream: RwLock<Option<Downstream>>,
+    parent: Published<Weak<dyn LatticeNode>>,
+    downstream: SetOnce<Downstream>,
     closed: AtomicBool,
+    /// Whether the receiver below was told the edge completed: the closing thread and an attach that finds the
+    /// edge closed both try, and the first to take the flag tells.
+    told: AtomicBool,
 }
 
 impl LatticeEdge {
@@ -74,7 +78,6 @@ impl LatticeEdge {
     }
 
     /// The edge of the node `node` will point to once constructed.
-    #[allow(clippy::disallowed_types, reason = "HOT-FIX(C9), HOT-FIX(C8)")]
     pub(crate) fn for_node(
         registry: &Arc<UpstreamRegistry>,
         drain: Arc<AtomicBool>,
@@ -84,9 +87,10 @@ impl LatticeEdge {
             registry: registry.clone(),
             drain,
             node,
-            parent: RwLock::new(None),
-            downstream: RwLock::new(None),
+            parent: Published::new(registry.epochs().clone(), None),
+            downstream: SetOnce::new(),
             closed: AtomicBool::new(false),
+            told: AtomicBool::new(false),
         }
     }
 
@@ -110,7 +114,8 @@ impl LatticeEdge {
 
     /// The node above this edge, if it is still alive.
     pub fn parent(&self) -> Option<Arc<dyn LatticeNode>> {
-        self.parent.read().unwrap().as_ref()?.upgrade()
+        self.registry
+            .with_pinned(|guard| self.parent.load(guard)?.upgrade())
     }
 
     /// Makes `parent` the node above this edge, or detaches the edge with `None`. The edge holds its
@@ -126,7 +131,23 @@ impl LatticeEdge {
                 "linked edges must share one upstream registry"
             );
         }
-        *self.parent.write().unwrap() = parent.map(Arc::downgrade);
+        let replaced = self.registry.with_pinned(|guard| {
+            let unchanged = match (self.parent.load(guard), parent) {
+                (None, None) => true,
+                (Some(current), Some(parent)) => {
+                    current.as_ptr().cast::<()>() == Arc::as_ptr(parent).cast::<()>()
+                }
+                _ => false,
+            };
+            (!unchanged).then(|| {
+                self.parent
+                    .store(parent.map(|parent| Arc::new(Arc::downgrade(parent))))
+            })
+        });
+        // Outside the pin, which would hold back the very reclamation the deferral tries.
+        if let Some(replaced) = replaced {
+            replaced.defer();
+        }
     }
 
     /// Signals demand for `demand` frames to the upstream handles, through the parents.
@@ -171,21 +192,22 @@ impl LatticeEdge {
 
     /// Makes `receiver` the floor of this edge's branch: the downstream of this edge, or of the
     /// lowest node below it. If the branch already has a receiver, `receiver` is told of the error
-    /// instead.
+    /// instead. An edge that has closed completes the receiver it takes.
     pub fn add_downstream(&self, receiver: Arc<dyn LatticeReceiver>) {
-        let existing = {
-            let mut downstream = self.downstream.write().unwrap();
-            match &*downstream {
-                None => {
-                    *downstream = Some(Downstream::Receiver(receiver));
-                    return;
+        let receiver = match self.downstream.set(Downstream::Receiver(receiver)) {
+            Ok(()) => {
+                // The close may have run before the receiver was installed and found nobody to tell.
+                if self.closed.load(Ordering::SeqCst) {
+                    self.tell_complete();
                 }
-                Some(existing) => existing.clone(),
+                return;
             }
+            Err(Downstream::Receiver(receiver)) => receiver,
+            Err(Downstream::Node(_)) => unreachable!("the value handed back is the receiver set"),
         };
-        match existing {
-            Downstream::Node(node) => node.edge().add_downstream(receiver),
-            Downstream::Receiver(_) => receiver.on_error(already_attached()),
+        match self.downstream.get() {
+            Some(Downstream::Node(node)) => node.edge().add_downstream(receiver),
+            Some(Downstream::Receiver(_)) | None => receiver.on_error(already_attached()),
         }
     }
 
@@ -197,27 +219,26 @@ impl LatticeEdge {
     ///
     /// Panics if `node` belongs to another registry.
     pub fn add_downstream_node(&self, node: Arc<dyn LatticeNode>) {
-        let existing = {
-            let mut downstream = self.downstream.write().unwrap();
-            match &*downstream {
-                None => {
+        let node = match self.downstream.set(Downstream::Node(node)) {
+            Ok(()) => {
+                if let Some(Downstream::Node(node)) = self.downstream.get() {
                     let parent = self.node.upgrade().expect("a live node owns its edge");
                     node.edge().set_parent(Some(&parent));
-                    *downstream = Some(Downstream::Node(node));
-                    return;
                 }
-                Some(existing) => existing.clone(),
+                return;
             }
+            Err(Downstream::Node(node)) => node,
+            Err(Downstream::Receiver(_)) => unreachable!("the value handed back is the node set"),
         };
-        match existing {
-            Downstream::Node(below) => below.edge().add_downstream_node(node),
-            Downstream::Receiver(_) => node.on_error(already_attached()),
+        match self.downstream.get() {
+            Some(Downstream::Node(below)) => below.edge().add_downstream_node(node),
+            Some(Downstream::Receiver(_)) | None => node.on_error(already_attached()),
         }
     }
 
-    /// Sends `frame` to the downstream, or finishes it with an error if there is none.
+    /// Sends `frame` to the downstream, or finishes it with an error if there is none or the edge has closed.
     pub fn push_downstream(&self, frame: Box<dyn Frame>) {
-        match self.downstream() {
+        match self.live_downstream() {
             Some(Downstream::Receiver(receiver)) => receiver.push(frame),
             Some(Downstream::Node(node)) => node.push(frame),
             None => frame.do_finally_with_error(FrameError::failed("the edge has no downstream")),
@@ -226,27 +247,41 @@ impl LatticeEdge {
 
     /// Passes `error` to the downstream, if any.
     pub fn error_downstream(&self, error: Failure) {
-        match self.downstream() {
+        match self.live_downstream() {
             Some(Downstream::Receiver(receiver)) => receiver.on_error(error),
             Some(Downstream::Node(node)) => node.on_error(error),
             None => {}
         }
     }
 
-    fn downstream(&self) -> Option<Downstream> {
-        self.downstream.read().unwrap().clone()
+    /// The downstream, unless the edge has closed: a relaxed read of the flag (Java's opaque one) and an acquire
+    /// load of the slot. No reference count: the slot's value lives as long as the edge.
+    fn live_downstream(&self) -> Option<&Downstream> {
+        if self.closed.load(Ordering::Relaxed) {
+            return None;
+        }
+        self.downstream.get()
     }
 
-    /// Closes the edge for good and detaches its downstream, telling a receiver it is complete.
-    /// Returns whether this call closed it.
-    pub fn close_edge(&self) -> bool {
-        if self.closed.swap(true, Ordering::AcqRel) {
-            return false;
-        }
-        let downstream = self.downstream.write().unwrap().take();
-        if let Some(Downstream::Receiver(receiver)) = downstream {
+    /// Tells the receiver below, if any, that the edge completed, unless something did already.
+    fn tell_complete(&self) {
+        if let Some(Downstream::Receiver(receiver)) = self.downstream.get()
+            && !self.told.swap(true, Ordering::SeqCst)
+        {
             receiver.on_complete();
         }
+    }
+
+    /// Closes the edge for good: pushes stop reaching its downstream, and a receiver is told it is complete.
+    /// Returns whether this call closed it.
+    pub fn close_edge(&self) -> bool {
+        if self.closed.swap(true, Ordering::SeqCst) {
+            return false;
+        }
+        // Pairs with the attach that sets the downstream and then reads the flag: either that attach sees the edge
+        // closed, or this read of the downstream sees the attach.
+        fence(Ordering::SeqCst);
+        self.tell_complete();
         true
     }
 
@@ -625,5 +660,242 @@ mod tests {
             action();
         }
         assert!(ran.load(Ordering::Acquire));
+    }
+
+    /// Counts the frames it receives and the times it is told the edge completed.
+    #[derive(Default)]
+    struct Told {
+        pushed: std::sync::atomic::AtomicUsize,
+        completions: std::sync::atomic::AtomicUsize,
+    }
+
+    impl crate::generics::LatticeTerminal for Told {
+        fn add_upstream(&self, _upstream: Arc<dyn crate::generics::LatticeSource>) {}
+    }
+
+    impl LatticeReceiver for Told {
+        fn push(&self, _frame: Box<dyn Frame>) {
+            self.pushed.fetch_add(1, Ordering::SeqCst);
+        }
+        fn on_complete(&self) {
+            self.completions.fetch_add(1, Ordering::SeqCst);
+        }
+        fn on_error(&self, _error: Failure) {}
+    }
+
+    #[cfg(not(miri))]
+    const ROUNDS: usize = 2_000;
+    #[cfg(miri)]
+    const ROUNDS: usize = 20;
+
+    #[test]
+    fn close_while_pushing_finishes_or_delivers_every_frame() {
+        for _ in 0..ROUNDS / 10 {
+            let edge = edge(&registry());
+            let told = Arc::new(Told::default());
+            edge.add_downstream(told.clone());
+            let fates = Fates::default();
+            let pushers: Vec<_> = (0..3)
+                .map(|pusher| {
+                    let (edge, fates) = (edge.clone(), fates.clone());
+                    thread::spawn(move || {
+                        for id in 0..50_u64 {
+                            edge.push(Tracked::new(pusher * 1_000 + id, &fates));
+                        }
+                    })
+                })
+                .collect();
+            let closer = {
+                let edge = edge.clone();
+                thread::spawn(move || edge.close_edge())
+            };
+            for pusher in pushers {
+                pusher.join().unwrap();
+            }
+            assert!(closer.join().unwrap());
+            let failed = fates.lock().unwrap().len();
+            assert_eq!(
+                told.pushed.load(Ordering::SeqCst) + failed,
+                150,
+                "every frame is delivered or finished"
+            );
+            assert_eq!(told.completions.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn a_closed_edge_refuses_a_new_downstream() {
+        let edge = edge(&registry());
+        assert!(edge.close_edge());
+
+        let told = Arc::new(Told::default());
+        edge.add_downstream(told.clone());
+        assert_eq!(
+            told.completions.load(Ordering::SeqCst),
+            1,
+            "a receiver of a closed edge is told it is complete"
+        );
+
+        let fates = Fates::default();
+        edge.push(Tracked::new(1, &fates));
+        assert_eq!(told.pushed.load(Ordering::SeqCst), 0);
+        assert_eq!(fates.lock().unwrap().len(), 1);
+        edge.close_edge();
+        assert_eq!(told.completions.load(Ordering::SeqCst), 1, "told once");
+    }
+
+    #[test]
+    fn a_second_downstream_is_refused_or_attached_below() {
+        let registry = registry();
+        let top = edge(&registry);
+        let below = edge(&registry);
+        top.add_downstream_node(below.clone());
+        let told = Arc::new(Told::default());
+        top.add_downstream(told.clone());
+        top.push(frame(1));
+        assert_eq!(
+            told.pushed.load(Ordering::SeqCst),
+            1,
+            "attached at the bottom"
+        );
+
+        let second = TestReceiver::new();
+        top.add_downstream(second.clone());
+        assert_eq!(second.errors().len(), 1, "a branch ends in one receiver");
+    }
+
+    #[test]
+    fn attaches_racing_a_close_tell_the_receiver_exactly_once() {
+        for _ in 0..ROUNDS {
+            let edge = edge(&registry());
+            let told = Arc::new(Told::default());
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let attacher = {
+                let (edge, told, barrier) = (edge.clone(), told.clone(), barrier.clone());
+                thread::spawn(move || {
+                    barrier.wait();
+                    edge.add_downstream(told);
+                })
+            };
+            barrier.wait();
+            edge.close_edge();
+            attacher.join().unwrap();
+            assert_eq!(
+                told.completions.load(Ordering::SeqCst),
+                1,
+                "a receiver of a closed edge is told once, whichever came first"
+            );
+        }
+    }
+
+    #[test]
+    fn racing_attaches_install_one_downstream_and_refuse_the_rest() {
+        for _ in 0..ROUNDS / 10 {
+            let edge = edge(&registry());
+            let receivers: Vec<_> = (0..4).map(|_| TestReceiver::new()).collect();
+            let attachers: Vec<_> = receivers
+                .iter()
+                .map(|receiver| {
+                    let (edge, receiver) = (edge.clone(), receiver.clone());
+                    thread::spawn(move || edge.add_downstream(receiver))
+                })
+                .collect();
+            for attacher in attachers {
+                attacher.join().unwrap();
+            }
+            edge.push(frame(1));
+            let delivered = receivers
+                .iter()
+                .filter(|r| !r.received().is_empty())
+                .count();
+            let refused = receivers.iter().filter(|r| !r.errors().is_empty()).count();
+            assert_eq!((delivered, refused), (1, 3));
+        }
+    }
+
+    #[test]
+    fn set_parent_with_the_same_parent_stores_nothing() {
+        let registry = registry();
+        let child = edge(&registry);
+        let parent: Arc<dyn LatticeNode> = edge(&registry);
+        child.set_parent(Some(&parent));
+        child.set_parent(None);
+        child.set_parent(Some(&parent));
+        child.set_parent(None);
+        child.set_parent(None);
+        assert_eq!(
+            child.parent.pending(),
+            0,
+            "no worker is mid-cycle, so the replaced references were freed as they were stored"
+        );
+
+        let reader = registry.epochs().register();
+        reader.quiescent();
+        child.set_parent(Some(&parent));
+        for _ in 0..10 {
+            child.set_parent(Some(&parent));
+        }
+        assert_eq!(
+            child.parent.pending(),
+            0,
+            "setting the same parent stores nothing"
+        );
+        let other: Arc<dyn LatticeNode> = edge(&registry);
+        child.set_parent(Some(&other));
+        assert_eq!(child.parent.pending(), 1, "a changed parent is stored");
+        assert!(Arc::ptr_eq(&child.parent().unwrap(), &other));
+    }
+
+    #[test]
+    fn a_parent_replaced_while_a_worker_reads_is_freed_after_its_next_point() {
+        let registry = registry();
+        let child = edge(&registry);
+        let first: Arc<dyn LatticeNode> = edge(&registry);
+        let second: Arc<dyn LatticeNode> = edge(&registry);
+        child.set_parent(Some(&first));
+        let worker = registry.epochs().register();
+        worker.quiescent();
+
+        child.set_parent(Some(&second));
+        assert_eq!(child.parent.pending(), 1, "the worker may be reading it");
+        assert!(Arc::ptr_eq(&child.parent().unwrap(), &second));
+
+        worker.quiescent();
+        child.parent.try_reclaim();
+        assert_eq!(child.parent.pending(), 0);
+    }
+
+    #[test]
+    fn pushes_and_set_parent_race_without_a_lock() {
+        let registry = registry();
+        let child = edge(&registry);
+        let told = Arc::new(Told::default());
+        child.add_downstream(told.clone());
+        let parents: Vec<Arc<dyn LatticeNode>> = (0..4).map(|_| edge(&registry) as _).collect();
+        let stop = Arc::new(AtomicBool::new(false));
+        let readers: Vec<_> = (0..3)
+            .map(|_| {
+                let (child, stop) = (child.clone(), stop.clone());
+                thread::spawn(move || {
+                    let mut seen = 0_u64;
+                    while !stop.load(Ordering::Acquire) {
+                        if let Some(parent) = child.parent() {
+                            assert!(!parent.is_closed());
+                            seen += 1;
+                        }
+                        child.push(frame(1));
+                    }
+                    seen
+                })
+            })
+            .collect();
+        for round in 0..ROUNDS {
+            child.set_parent(Some(&parents[round % 4]));
+        }
+        stop.store(true, Ordering::Release);
+        for reader in readers {
+            reader.join().unwrap();
+        }
+        assert!(child.parent().is_some());
     }
 }
