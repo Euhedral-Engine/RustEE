@@ -2,15 +2,16 @@ use super::edge::{LatticeEdge, LatticeNode, Retirement};
 use super::registry::UpstreamRegistry;
 use super::upstream_queue::{UpstreamHandle, note_routed_push};
 use crate::frames::{Failure, Frame, FrameError};
-use crate::generics::{LatticeReceiver, LatticeSource, LatticeTerminal};
+use crate::generics::{LatticeReceiver, LatticeSource, LatticeTerminal, SourceCell};
 use crate::utils::math::unsigned_multiply_high;
 use euhedral_data_structures::atomics::CachePadded;
+use euhedral_data_structures::queues::{Consumer, MpscQueue, Multi, Producer, Single};
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering, fence};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 
 /// Picks the active downstream for a frame: an index below `state.len()` into
 /// [`RoutingState::mappings`].
@@ -466,57 +467,118 @@ impl Error for SharedFailure {
     }
 }
 
+/// An action [`LatticeReceiver::serialize`] hands to the interceptor.
+type Action = Box<dyn FnOnce() + Send>;
+
 /// A source fed into a [`LatticeVertex`], as an [`UpstreamHandle`] workers service.
 ///
 /// Frames the source pushes are routed by the vertex. A worker pulls or requests through the
-/// interceptor only while it holds the interceptor's lock, so the source sees one worker at a time.
+/// interceptor only while it holds the interceptor's claim, so the source sees one worker at a time.
 /// A panic in the source's pull or request is logged and completes the interceptor.
+///
+/// # The claim
+///
+/// The claim is a counter, `wip`. A caller that moves it from zero holds the claim; a caller that
+/// finds it non-zero has lost and goes elsewhere. Releasing sets it back to zero. Nothing waits.
+///
+/// # Serialized actions
+///
+/// [`serialize`](LatticeReceiver::serialize) hands an action to whoever holds the claim, or runs it
+/// itself when nobody does. Three steps keep an action from being stranded between a loser's
+/// check and the holder's release:
+///
+/// 1. the action is offered to a queue, then `pending` is published, then the claim is tried;
+/// 2. a holder runs the queued actions before it releases;
+/// 3. after releasing, the holder fences and looks at `pending` again, and takes the claim back to
+///    run what arrived behind its drain.
+///
+/// An action therefore never runs while a `pull` or `request` of the source is in progress, and
+/// runs exactly once, in the order it was handed over.
+///
+/// # The source
+///
+/// The interceptor holds the source in a [`SourceCell`], and lets it go when it finishes, so a
+/// source that holds the interceptor in turn is not kept alive by the pair.
 pub struct UpstreamInterceptor {
     vertex: Weak<LatticeVertex>,
     registry: Arc<UpstreamRegistry>,
     log_target: String,
     sequence: u64,
-    lock: CachePadded<AtomicBool>,
-    upstream: OnceLock<Arc<dyn LatticeSource>>,
+    wip: CachePadded<AtomicU64>,
+    pending: AtomicBool,
+    actions: Producer<Action, Multi>,
+    drain: SourceCell<Consumer<Action, Single>>,
+    upstream: SourceCell<Option<Arc<dyn LatticeSource>>>,
+    /// The address of the source taken, for identity only; never dereferenced.
+    source_addr: AtomicUsize,
     complete: AtomicBool,
     this: Weak<UpstreamInterceptor>,
 }
 
+/// A source's identity: its address, which no live source shares with another.
+fn address(source: &Arc<dyn LatticeSource>) -> usize {
+    Arc::as_ptr(source).cast::<()>() as usize
+}
+
 impl UpstreamInterceptor {
     fn new(vertex: &LatticeVertex) -> Arc<Self> {
+        let actions = MpscQueue::new(16);
         Arc::new_cyclic(|this| Self {
             vertex: vertex.this.clone(),
             registry: vertex.edge.registry().clone(),
             log_target: vertex.name.clone(),
             sequence: vertex.upstream_sequence.fetch_add(1, Ordering::Relaxed),
-            lock: CachePadded::new(AtomicBool::new(false)),
-            upstream: OnceLock::new(),
+            wip: CachePadded::new(AtomicU64::new(0)),
+            pending: AtomicBool::new(false),
+            actions: actions.producer(),
+            drain: SourceCell::new(actions.consumer()),
+            upstream: SourceCell::new(None),
+            source_addr: AtomicUsize::new(0),
             complete: AtomicBool::new(false),
             this: this.clone(),
         })
     }
 
-    /// The source this interceptor feeds from, once attached.
-    pub fn upstream(&self) -> Option<&Arc<dyn LatticeSource>> {
-        self.upstream.get()
+    /// Whether `source` is the source this interceptor took. The interceptor lets its source go
+    /// when it finishes, and still answers for it.
+    pub fn has_upstream(&self, source: &Arc<dyn LatticeSource>) -> bool {
+        self.source_addr.load(Ordering::Acquire) == address(source)
     }
 
     /// Takes `source` as the upstream and adds the interceptor to the registry. Attaching the same
     /// source again does nothing; a different source is completed and left out.
     fn attach(&self, source: Arc<dyn LatticeSource>) {
-        if let Err(other) = self.upstream.set(source) {
-            let attached = self.upstream.get().expect("set above");
-            if !Arc::ptr_eq(attached, &other) {
+        let identity = address(&source);
+        if let Err(attached) =
+            self.source_addr
+                .compare_exchange(0, identity, Ordering::SeqCst, Ordering::SeqCst)
+        {
+            if attached != identity {
                 log::error!(target: &self.log_target, "an interceptor takes one source");
-                other.complete();
+                source.complete();
             }
             return;
         }
-        let this: Arc<dyn UpstreamHandle> = self.this.upgrade().expect("a live interceptor");
+        let this = self.this.upgrade().expect("a live interceptor");
+        let handle: Arc<dyn UpstreamHandle> = this.clone();
+        // The source is installed as a serialized action: an interceptor that finishes while it
+        // attaches runs its own release of the source through the same queue, in order.
+        self.serialize(Box::new(move || {
+            // SAFETY: a serialized action runs while no `pull` or `request` is in progress, and
+            // the actions run one at a time.
+            let mut upstream = unsafe { this.upstream.enter() };
+            if this.is_complete() {
+                // The interceptor finished before its source arrived: nothing will release it.
+                drop(upstream);
+                source.complete();
+            } else {
+                *upstream = Some(source);
+            }
+        }));
         let vertex = self.vertex.upgrade();
         match &vertex {
-            Some(vertex) => vertex.edge.add_upstream_handle(this),
-            None => self.registry.add_handle(this),
+            Some(vertex) => vertex.edge.add_upstream_handle(handle),
+            None => self.registry.add_handle(handle),
         }
         if vertex.is_none_or(|vertex| vertex.is_closed()) {
             self.complete();
@@ -527,9 +589,7 @@ impl UpstreamInterceptor {
     pub fn complete(&self) {
         if self.finish() {
             log::trace!(target: &self.log_target, "closing an upstream interceptor");
-            if let Some(upstream) = self.upstream.get() {
-                upstream.complete();
-            }
+            self.let_go_of_the_source(true);
         }
     }
 
@@ -542,16 +602,45 @@ impl UpstreamInterceptor {
         finished
     }
 
-    /// The source, if a worker may service it now.
-    fn serviceable(&self, demand: u64) -> Option<&Arc<dyn LatticeSource>> {
-        if demand == 0 || !self.lock.load(Ordering::Acquire) || self.is_complete() {
-            return None;
+    /// Drops the source, after completing it if `complete_it`, once no `pull` or `request` of it
+    /// is in progress.
+    fn let_go_of_the_source(&self, complete_it: bool) {
+        let Some(this) = self.this.upgrade() else {
+            return;
+        };
+        self.serialize(Box::new(move || {
+            // SAFETY: as in `attach`: a serialized action.
+            let source = unsafe { this.upstream.enter() }.take();
+            if complete_it && let Some(source) = &source {
+                source.complete();
+            }
+        }));
+    }
+
+    /// Whether a worker may service the source now.
+    fn serviceable(&self, demand: u64) -> bool {
+        if demand == 0 || self.wip.load(Ordering::Relaxed) == 0 || self.is_complete() {
+            return false;
         }
-        let vertex = self.vertex.upgrade()?;
-        if vertex.is_closed() || vertex.is_draining() {
-            return None;
+        self.vertex
+            .upgrade()
+            .is_some_and(|vertex| !vertex.is_closed() && !vertex.is_draining())
+    }
+
+    /// Runs the queued actions. The caller holds the claim.
+    fn run_actions(&self) {
+        if !self.pending.load(Ordering::SeqCst) {
+            return;
         }
-        self.upstream.get()
+        self.pending.store(false, Ordering::SeqCst);
+        // SAFETY: the caller holds the claim, which admits one thread at a time, and no `pull` or
+        // `request` is in progress while it is held by a caller of this method.
+        let mut drain = unsafe { self.drain.enter() };
+        while let Some(action) = drain.poll() {
+            if panic::catch_unwind(AssertUnwindSafe(action)).is_err() {
+                log::error!(target: &self.log_target, "a serialized action panicked");
+            }
+        }
     }
 }
 
@@ -566,7 +655,13 @@ impl UpstreamHandle for UpstreamInterceptor {
         stop: &mut dyn FnMut(&dyn Frame) -> bool,
         demand: u64,
     ) -> Option<u64> {
-        let upstream = self.serviceable(demand)?;
+        if !self.serviceable(demand) {
+            return None;
+        }
+        // SAFETY: the handle is serviced only under its claim, so this is the one `pull` or
+        // `request` of the source, and no serialized action runs meanwhile.
+        let upstream = unsafe { self.upstream.enter() };
+        let upstream = upstream.as_ref()?;
         match panic::catch_unwind(AssertUnwindSafe(|| upstream.pull(consumer, stop, demand))) {
             Ok(pulled) => Some(pulled),
             Err(_) => {
@@ -578,7 +673,12 @@ impl UpstreamHandle for UpstreamInterceptor {
     }
 
     fn request(&self, demand: u64) {
-        let Some(upstream) = self.serviceable(demand) else {
+        if !self.serviceable(demand) {
+            return;
+        }
+        // SAFETY: as in `pull`.
+        let upstream = unsafe { self.upstream.enter() };
+        let Some(upstream) = upstream.as_ref() else {
             return;
         };
         if panic::catch_unwind(AssertUnwindSafe(|| upstream.request(demand))).is_err() {
@@ -592,11 +692,22 @@ impl UpstreamHandle for UpstreamInterceptor {
     }
 
     fn try_acquire(&self) -> bool {
-        !self.lock.swap(true, Ordering::Acquire)
+        self.wip.fetch_add(1, Ordering::SeqCst) == 0
     }
 
     fn release(&self) {
-        self.lock.store(false, Ordering::Release);
+        loop {
+            self.run_actions();
+            self.wip.store(0, Ordering::Release);
+            // Order the release before the look at `pending`: an action offered behind the drain is
+            // either seen here, or its caller finds the claim free and runs it.
+            fence(Ordering::SeqCst);
+            if !(self.pending.load(Ordering::SeqCst)
+                && self.wip.fetch_add(1, Ordering::SeqCst) == 0)
+            {
+                return;
+            }
+        }
     }
 }
 
@@ -622,12 +733,25 @@ impl LatticeReceiver for UpstreamInterceptor {
     fn on_complete(&self) {
         if self.finish() {
             log::trace!(target: &self.log_target, "an upstream completed");
+            self.let_go_of_the_source(false);
         }
     }
 
     fn on_error(&self, error: Failure) {
         if self.finish() {
             log::error!(target: &self.log_target, "an upstream failed: {error}");
+            self.let_go_of_the_source(false);
+        }
+    }
+
+    /// Runs `action` at once if no worker holds the source, otherwise when the holder releases it.
+    fn serialize(&self, action: Box<dyn FnOnce() + Send>) {
+        if self.actions.offer(action).is_err() {
+            unreachable!("the action queue is unbounded");
+        }
+        self.pending.store(true, Ordering::SeqCst);
+        if self.wip.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.release();
         }
     }
 }
