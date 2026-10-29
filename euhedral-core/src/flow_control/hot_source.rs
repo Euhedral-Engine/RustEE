@@ -1,10 +1,16 @@
 //! A source its owner pushes frames into by hand.
 //!
-//! The source keeps Java's two words: `complete` and `downstream`, read without a lock on every push. A
-//! receiver that is detached may still be in the hands of a pusher that read it just before, and Java's
-//! collector keeps it alive; here every receiver the source ever installed stays in a [`Link`] until the
-//! source drops. A link is installed once, removed once, and then pushed onto the `retired` stack, which
-//! only grows and is read again only when the source drops.
+//! The source keeps its state in one word, `downstream`: null while it is open with no receiver, a [`Link`] while a
+//! receiver is attached, and [`COMPLETE`] once it has completed. Java keeps two words, `complete` and `downstream`,
+//! and sets them in two steps; with one word `complete` and `add_downstream` are each a single atomic step, so
+//! however they race, a receiver is either refused, or attached and told `on_complete` once if the source ends
+//! complete.
+//!
+//! A receiver that is detached may still be in the hands of a pusher that read it just before, and Java's collector
+//! keeps it alive; here every receiver the source installs stays in a [`Link`] until the source drops. A link is
+//! installed once, removed once (by `complete`), and then pushed onto the `retired` stack, which only grows and is read
+//! again only when the source drops. A source attached `k` times holds `k` retired receivers, and what they own,
+//! until it drops.
 
 // The links the source installed are freed only when it drops, so a pusher may read one through a shared reference.
 #![allow(
@@ -14,12 +20,17 @@
 
 use crate::frames::{Failure, Frame, FrameError};
 use crate::generics::{AlreadyAttached, LatticeReceiver, LatticeSource};
+use std::panic::{self, AssertUnwindSafe};
 use std::ptr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicPtr, Ordering};
+use std::thread;
 
 type BeforeEach = Box<dyn Fn(&dyn Frame) + Send + Sync>;
 type AfterEach = Box<dyn Fn() + Send + Sync>;
+
+/// The `downstream` word of a completed source. Never the address of a link: no allocation sits at address 8.
+const COMPLETE: *mut Link = ptr::without_provenance_mut(8);
 
 /// A receiver the source installed. Its allocation lives until the source drops.
 struct Link {
@@ -34,12 +45,43 @@ const _: () = {
     shared::<Link>();
 };
 
+/// The link a `downstream` word holds, if it holds one.
+///
+/// # Safety
+/// `word` was read from a source's `downstream`, which the caller still borrows.
+unsafe fn link_in<'a>(word: *mut Link) -> Option<&'a Link> {
+    if word.is_null() || word == COMPLETE {
+        return None;
+    }
+    // SAFETY: every other value of the word is a link that was published by a compare-and-set, and a published link
+    // is freed only when the source drops.
+    Some(unsafe { &*word })
+}
+
+/// Runs the after-hook when dropped, so it follows the before-hook whether or not the push returns.
+struct AfterGuard<'a>(Option<&'a AfterEach>);
+
+impl Drop for AfterGuard<'_> {
+    fn drop(&mut self) {
+        let Some(after_each) = self.0 else {
+            return;
+        };
+        if thread::panicking() {
+            // A second panic during unwinding would abort; the first one is the one that goes on.
+            let _ = panic::catch_unwind(AssertUnwindSafe(after_each));
+        } else {
+            after_each();
+        }
+    }
+}
+
 /// A source its owner pushes frames into by hand, one stage handing frames to the next. It has at
 /// most one downstream and pushes without waiting for demand; one thread is expected to do the
 /// pushing.
 ///
 /// Optional hooks run around each push, for example to time it. They are set when the source is
-/// built and called without a lock, so they are `Fn` and `Sync`.
+/// built and called without a lock, so they are `Fn` and `Sync`. The after-hook follows every
+/// before-hook that returned, also when the push panics.
 ///
 /// Every state change of the source is an atomic operation: attaching, completing and pushing take no lock,
 /// and a call that detaches a receiver does not free it.
@@ -47,9 +89,7 @@ const _: () = {
 pub struct LatticeHotSource {
     before_each: Option<BeforeEach>,
     after_each: Option<AfterEach>,
-    /// Java's `complete`.
-    complete: AtomicBool,
-    /// Java's `downstream`: the installed link, or null.
+    /// Null, a published link, or [`COMPLETE`].
     downstream: AtomicPtr<Link>,
     /// Links that were installed and then removed, newest first.
     retired: AtomicPtr<Link>,
@@ -73,33 +113,30 @@ impl LatticeHotSource {
     }
 
     /// Pushes `frame` to the downstream. Without a downstream, or once the source is complete, the
-    /// frame is finished with an error instead; a before-hook that has run is followed by the
-    /// after-hook either way.
+    /// frame is finished with an error instead. A before-hook that panics finishes the frame with an
+    /// error too, and the panic goes on.
     ///
     /// A frame accepted while another thread completes the source may still reach the downstream
     /// being detached.
     pub fn accept(&self, frame: Box<dyn Frame>) {
-        if self.complete.load(Ordering::Relaxed) {
-            frame.do_finally_with_error(FrameError::failed("the source is complete"));
-            return;
-        }
-        if self.downstream.load(Ordering::Acquire).is_null() {
+        // SAFETY: `&self` borrows the source.
+        if unsafe { link_in(self.downstream.load(Ordering::Acquire)) }.is_none() {
             frame.do_finally_with_error(FrameError::failed("the source has no downstream"));
             return;
         }
 
-        if let Some(before_each) = &self.before_each {
-            before_each(&*frame);
+        if let Some(before_each) = &self.before_each
+            && let Err(panic) = panic::catch_unwind(AssertUnwindSafe(|| before_each(&*frame)))
+        {
+            frame.do_finally_with_error(FrameError::failed("the source's before-hook panicked"));
+            panic::resume_unwind(panic);
         }
+        let _after = AfterGuard(self.after_each.as_ref());
         // Read again after the hook, as Java does: the source may have completed meanwhile.
-        let link = self.downstream.load(Ordering::Acquire);
-        // SAFETY: a link is freed only when the source drops, and `&self` keeps it alive.
-        match unsafe { link.as_ref() } {
+        // SAFETY: `&self` borrows the source.
+        match unsafe { link_in(self.downstream.load(Ordering::Acquire)) } {
             Some(link) => link.receiver.push(frame),
             None => frame.do_finally_with_error(FrameError::failed("the source has no downstream")),
-        }
-        if let Some(after_each) = &self.after_each {
-            after_each();
         }
     }
 
@@ -126,8 +163,14 @@ impl LatticeHotSource {
 
 impl Drop for LatticeHotSource {
     fn drop(&mut self) {
+        let installed = *self.downstream.get_mut();
+        let installed = if installed == COMPLETE {
+            ptr::null_mut()
+        } else {
+            installed
+        };
         for head in [
-            *self.downstream.get_mut(),
+            installed,
             std::mem::replace(self.retired.get_mut(), ptr::null_mut()),
         ] {
             let mut next = head;
@@ -142,49 +185,30 @@ impl Drop for LatticeHotSource {
 }
 
 impl LatticeSource for LatticeHotSource {
-    /// Attaches `downstream` if the source has none, or reopens a complete source with it, by Java's
-    /// sequence. Otherwise `downstream` is told of the error and the current one is kept.
+    /// Attaches `downstream` if the source has none, or reopens a complete source with it. Otherwise
+    /// `downstream` is told of the error and the current one is kept.
     fn add_downstream(self: Arc<Self>, downstream: Arc<dyn LatticeReceiver>) {
         let link = Box::into_raw(Box::new(Link {
             receiver: downstream.clone(),
             next: AtomicPtr::new(ptr::null_mut()),
         }));
-        // The link was never published: drop it and tell the receiver.
-        let refuse = || {
-            // SAFETY: the link was made above and no compare-and-set installed it.
-            drop(unsafe { Box::from_raw(link) });
-            downstream.on_error(Failure::from(AlreadyAttached));
-        };
-
-        // Java installs with a second compare-and-set after the first. Here a link the first one installed is
-        // left as it is: the second could only re-install a link that a racing `complete` had already
-        // removed and retired.
-        let reopened = self
-            .complete
-            .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok();
-        if !reopened {
-            if self
-                .downstream
-                .compare_exchange(ptr::null_mut(), link, Ordering::SeqCst, Ordering::SeqCst)
-                .is_err()
-            {
-                refuse();
+        let mut observed = self.downstream.load(Ordering::Acquire);
+        loop {
+            // SAFETY: `self` borrows the source.
+            if unsafe { link_in(observed) }.is_some() {
+                // SAFETY: the link was made above and no compare-and-set installed it.
+                drop(unsafe { Box::from_raw(link) });
+                downstream.on_error(Failure::from(AlreadyAttached));
                 return;
             }
-        } else {
-            // A reopened source takes whatever a racing `complete` has not yet removed.
-            let observed = self.downstream.load(Ordering::Acquire);
-            if self
-                .downstream
-                .compare_exchange(observed, link, Ordering::SeqCst, Ordering::SeqCst)
-                .is_err()
-            {
-                refuse();
-                return;
-            }
-            if !observed.is_null() {
-                self.retire(observed);
+            match self.downstream.compare_exchange(
+                observed,
+                link,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(current) => observed = current,
             }
         }
         downstream.add_upstream(self);
@@ -205,19 +229,19 @@ impl LatticeSource for LatticeHotSource {
 
     /// Detaches the downstream and tells it the source is complete.
     fn complete(&self) {
-        self.complete.store(true, Ordering::SeqCst);
-        let link = self.downstream.swap(ptr::null_mut(), Ordering::SeqCst);
-        // SAFETY: the swap made this call the link's remover; it is kept until the source drops.
-        let Some(removed) = (unsafe { link.as_ref() }) else {
+        let word = self.downstream.swap(COMPLETE, Ordering::SeqCst);
+        // SAFETY: `&self` borrows the source.
+        let Some(removed) = (unsafe { link_in(word) }) else {
             return;
         };
+        // The swap made this call the link's remover.
         let receiver = removed.receiver.clone();
-        self.retire(link);
+        self.retire(word);
         receiver.on_complete();
     }
 
     fn is_complete(&self) -> bool {
-        self.complete.load(Ordering::Acquire)
+        self.downstream.load(Ordering::Acquire) == COMPLETE
     }
 }
 
@@ -227,6 +251,7 @@ mod tests {
     use crate::flow_control::testing::{Fate, Fates, TestReceiver, Tracked, frame};
     use crate::frames::FrameHeader;
     use crate::generics::LatticeTerminal;
+    use std::panic::AssertUnwindSafe;
     use std::sync::atomic::AtomicUsize;
     use std::sync::{Barrier, Mutex, Weak};
     use std::thread;
@@ -712,5 +737,141 @@ mod tests {
         assert_eq!(receiver.pushes.load(Ordering::SeqCst), 0);
         assert_eq!(receiver.completes.load(Ordering::SeqCst), 1);
         assert_eq!(after.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn attach_racing_complete_tells_every_receiver_exactly_once() {
+        const ATTACHERS: usize = 2;
+        let rounds = if cfg!(miri) { 4 } else { 20_000 };
+        for round in 0..rounds {
+            let source = Arc::new(LatticeHotSource::new());
+            // Half of the rounds start with a receiver already attached.
+            let first = (round % 2 == 0).then(|| {
+                let first = Arc::new(Tally::default());
+                source.clone().add_downstream(first.clone());
+                first
+            });
+            let attached: Vec<Arc<Tally>> =
+                (0..ATTACHERS).map(|_| Arc::new(Tally::default())).collect();
+            let barrier = Barrier::new(ATTACHERS + 1);
+            thread::scope(|scope| {
+                scope.spawn(|| {
+                    barrier.wait();
+                    source.complete();
+                });
+                for receiver in &attached {
+                    let (source, barrier) = (&source, &barrier);
+                    scope.spawn(move || {
+                        barrier.wait();
+                        source.clone().add_downstream(receiver.clone());
+                    });
+                }
+            });
+
+            let all: Vec<&Arc<Tally>> = first.iter().chain(attached.iter()).collect();
+            let live = |tally: &&Arc<Tally>| tally.errors.load(Ordering::SeqCst) == 0;
+            let told = |tally: &Arc<Tally>| tally.completes.load(Ordering::SeqCst);
+            // A refused receiver hears of nothing else.
+            for refused in all.iter().filter(|tally| !live(tally)) {
+                assert_eq!(refused.upstreams.load(Ordering::SeqCst), 0);
+                assert_eq!(told(refused), 0);
+            }
+            let outcomes = Arc::new(Outcomes::default());
+            source.accept(Counted::new(1, &outcomes));
+            if source.is_complete() {
+                // Every receiver the source held was told.
+                assert_eq!(outcomes.failed.load(Ordering::SeqCst), 1);
+                for tally in all.iter().filter(|tally| live(tally)) {
+                    assert_eq!(told(tally), 1, "round {round}: a receiver was never told");
+                }
+            } else {
+                // An open source has one live receiver, and it was not told; the others were.
+                assert_eq!(outcomes.finished.load(Ordering::SeqCst), 1);
+                let open: Vec<_> = all
+                    .iter()
+                    .filter(|tally| live(tally) && told(tally) == 0)
+                    .collect();
+                assert_eq!(open.len(), 1, "round {round}");
+                assert_eq!(open[0].pushes.load(Ordering::SeqCst), 1, "round {round}");
+                for tally in all.iter().filter(|tally| live(tally)) {
+                    assert!(told(tally) <= 1);
+                }
+            }
+            source.complete();
+            for tally in all.iter().filter(|tally| live(tally)) {
+                assert_eq!(told(tally), 1, "round {round}");
+            }
+        }
+    }
+
+    /// Panics in `push`.
+    struct PanicsOnPush;
+
+    impl LatticeTerminal for PanicsOnPush {
+        fn add_upstream(&self, _upstream: Arc<dyn LatticeSource>) {}
+    }
+
+    impl LatticeReceiver for PanicsOnPush {
+        fn push(&self, _frame: Box<dyn Frame>) {
+            panic!("the receiver failed");
+        }
+
+        fn on_complete(&self) {}
+
+        fn on_error(&self, _error: Failure) {}
+    }
+
+    #[test]
+    fn the_after_hook_runs_when_the_push_panics() {
+        let (before, after) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let source = Arc::new(
+            LatticeHotSource::new()
+                .before_each({
+                    let before = before.clone();
+                    move |_| {
+                        before.fetch_add(1, Ordering::SeqCst);
+                    }
+                })
+                .after_each({
+                    let after = after.clone();
+                    move || {
+                        after.fetch_add(1, Ordering::SeqCst);
+                    }
+                }),
+        );
+        source.clone().add_downstream(Arc::new(PanicsOnPush));
+        let outcomes = Arc::new(Outcomes::default());
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            source.accept(Counted::new(1, &outcomes));
+        }));
+        assert!(result.is_err());
+        assert_eq!(before.load(Ordering::SeqCst), 1);
+        assert_eq!(after.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_panicking_before_hook_fails_the_frame_and_the_panic_goes_on() {
+        let after = Arc::new(AtomicUsize::new(0));
+        let source = Arc::new(
+            LatticeHotSource::new()
+                .before_each(|_| panic!("the hook failed"))
+                .after_each({
+                    let after = after.clone();
+                    move || {
+                        after.fetch_add(1, Ordering::SeqCst);
+                    }
+                }),
+        );
+        let receiver = Arc::new(Tally::default());
+        source.clone().add_downstream(receiver.clone());
+        let outcomes = Arc::new(Outcomes::default());
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            source.accept(Counted::new(1, &outcomes));
+        }));
+        assert!(result.is_err());
+        assert_eq!(outcomes.failed.load(Ordering::SeqCst), 1);
+        assert_eq!(receiver.pushes.load(Ordering::SeqCst), 0);
+        // The hooks pair up after a before-hook that returned.
+        assert_eq!(after.load(Ordering::SeqCst), 0);
     }
 }

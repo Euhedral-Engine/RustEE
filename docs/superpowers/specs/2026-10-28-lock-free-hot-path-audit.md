@@ -511,15 +511,16 @@ Java `LatticeHotSource`, `ControlPlaneFragment`'s output, `StopWatch`, `Fragment
 
 - **C1**: the hooks are final fields, `Option<Box<dyn Fn(&dyn Frame) + Send + Sync>>` and `Option<Box<dyn Fn() + Send
   + Sync>>`, called without a lock. The builder methods take `Fn` instead of `FnMut` (a public API change).
-- **C10**: `downstream: AtomicPtr<Arc<dyn LatticeReceiver>>`, `complete: AtomicBool`.
-  - `accept`: return when there is no downstream or the source is complete (Java `getOpaque` of both → `Relaxed` for
-    `complete`, `Acquire` for the pointer); before-hook; push; after-hook.
-  - `add_downstream`: Java's sequence with `SeqCst`: reopen a complete source (`complete` CAS true → false), else
-    install by CAS null → receiver, else `on_error`; then CAS observed → receiver; then `receiver.add_upstream`.
-  - `complete`: `complete.store(true, SeqCst)`, `downstream.swap(null, SeqCst)`.
+- **C10**: one word, `downstream: AtomicPtr<Link>` (a link holds the receiver's `Arc`): null is open with no receiver,
+  a link is attached, and a `COMPLETE` tag is completed (Java's two words, folded; see §3.12).
+  - `accept`: load (`Acquire`); return a failed frame when it is null or `COMPLETE`; before-hook; load again; push;
+    after-hook.
+  - `add_downstream`: a `SeqCst` CAS loop that installs over null or `COMPLETE` and refuses (`on_error`) over a link;
+    then `receiver.add_upstream`.
+  - `complete`: `downstream.swap(COMPLETE, SeqCst)`; a removed link is retired, and its receiver told `on_complete`.
   - Deviations: the pointer load is `Acquire`, not opaque (Java's final-field publication has no Rust equivalent).
-    A swapped-out receiver is kept on a retired list (a `LifecycleMutex<Vec<_>>`, touched only at attach and
-    complete) until the source drops, because the pusher may still hold the pointer (no garbage collector).
+    A swapped-out receiver is kept on a retired list (an intrusive push-only stack of links, touched only by
+    `complete`) until the source drops, because the pusher may still hold the pointer (no garbage collector).
     `complete` tells the old receiver `on_complete`, which Java does not: Rust's interceptor drops its source on
     `on_complete` (lane-source Part 1) to break the cycle Java's collector breaks. `accept` without a downstream
     finishes the frame with an error (a genuine Java bug: Java's `accept` returns without finishing the frame, so its
@@ -769,7 +770,7 @@ runtime" is the Java runtime `euhedral-graph` is derived from (its `runtime/grap
 
 | Place | Java counterpart | Deviation and why |
 |---|---|---|
-| C1, C10 hot source | core `flow_control/LatticeHotSource` | Acquire pointer load (no final-field rule); retired receivers kept until drop (no GC), on an intrusive push-only stack of links rather than a lifecycle-locked list, so `add_downstream` and `complete` set atomics only; `add_downstream` skips Java's second compare-and-set when its first installed the link (it could only re-install a link a racing `complete` had retired); `on_complete` at complete (the interceptor drops its source on it: no GC); `accept` finishes an unsent frame (Java bug: it drops it unfinished) and runs the after-hook whenever the before-hook ran. |
+| C1, C10 hot source | core `flow_control/LatticeHotSource` | **One word, not Java's two.** `downstream` is null (open, no receiver), a link, or a `COMPLETE` tag, so `complete` is one `swap(COMPLETE)` and `add_downstream` one CAS loop that installs over null or `COMPLETE` and refuses over a link. Java sets `complete` and `downstream` in two steps; racing `complete` and `add_downstream` can then leave an attached receiver never told (the attach lands between the two steps) or tell a live receiver the source completed (a reopen between them). Here Rust has `on_complete` and no GC, and a receiver that is not told leaks the interceptor's source cycle, so the one word makes `complete` linearizable, as the lock the base held made it. Acquire pointer load (no final-field rule). Retired receivers are kept until drop (no GC), on an intrusive push-only stack of links rather than a lifecycle-locked list, so `add_downstream` and `complete` set atomics only; a source attached `k` times holds `k` retired receivers until it drops (a bounded scheme, counting the pushes in flight and freeing a retired link at zero, is possible if a reattach-heavy user appears; not built). `on_complete` at complete (the interceptor drops its source on it: no GC). `accept` finishes an unsent frame (Java bug: it drops it unfinished), finishes the frame when the before-hook panics, and runs the after-hook after every before-hook that returned, also when the push panics. |
 | C2 stop watch | core `utils/StopWatch` | Relaxed atomics: Rust closures sharing it must be `Sync`. `stop` takes the running flag with a swap (once per sampled pair), so racing stops take a measurement once. |
 | C3 body cost | core `control_plane/FragmentDecisionTree` | Relaxed atomics, as C2. |
 | C4 cache partitions | core `ControlPlaneCache.pLocks` | Always claimed (no safe unguarded form). |
