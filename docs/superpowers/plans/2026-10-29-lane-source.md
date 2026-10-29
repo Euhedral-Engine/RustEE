@@ -94,9 +94,34 @@ The requirements, restated:
 
 ## Java counterparts
 
-The upstream Java runtime is the reference for every concurrent field this plan touches. Its core is the
-`core` package of the Java repository's `euhedral-core` module. `Join`, `Sequencer`, `LanePool`,
-`StageFrame` and `FrameLake` are in the Java runtime's graph package (`core/runtime/graph/`).
+Two Java code bases are the reference for every concurrent field this plan touches. Mirror their fields, atomics and
+orderings, and deviate only for a genuine Java bug or a missing Rust equivalent. Each deviation is listed with its reason.
+- **`euhedral-core` and `euhedral-data-structures` places** (sources, the upstream queue and interceptor, the hot source
+  and receiver, the queues): the `core` package of the Java execution runtime's `euhedral-core` module.
+- **`euhedral-graph` places** (lanes and `LanePool`, completions, join, latch, sequencer, stage graph, lake, and the new
+  lane source and delivery): the Java runtime that `euhedral-graph` is derived from. That means its `runtime/graph`
+  package (`LanePool`, `StageFrame`, `Join`, `Sequencer`, `FrameLake` and its lake implementation), its `gpu` package (`GpuStream`
+  and its CUDA implementation) and its architecture notes 03 (execution engine), 07 (CUDA execution) and 08
+  (concurrency and ownership).
+
+**How that runtime drives lanes, which `LaneSource` and delivery start from:**
+- A ready stage (`StageFrame`) is a frame published into the lake (the `FrameLake` implementation's `publish`).
+  - The lake is several queue ingest sinks, each its own lattice source.
+  - The frame's routing hash picks the sink, and "a sink is like a GPU stream": one producer partition keeps publish
+    order, so equal hashes keep one sink's order.
+- Whichever worker runs the stage picks its lane from the shared `LanePool` (`final GpuStream[] lanes`). In
+  `StageFrame.submit` it then:
+  - awaits each predecessor's `marker` that ran on another lane, skipping same-lane and host predecessors;
+  - submits on the stream;
+  - `mark`s its reusable marker.
+  A host-only stage records no marker.
+- Arrivals are `ARRIVALS.getAndAdd` (volatile). The last arrival publishes the successor, which reads its predecessors'
+  plain `marker`/`lane` fields.
+- A deferred stage satisfies its edges when its asynchronous completion arrives. A failure goes to `owner.fail`, the
+  frame publishes no successor, and `doFinally` drops its live count.
+- Retirement is `GpuStream.notifyRetired`. Its listener on the driver thread only enqueues (`publishFromCallback`), and
+  `confirmRetired` runs on an ordinary thread.
+- The lake counts admitted units (`accepted`) and completes once they have all terminated.
 
 **Mapping of access modes, used throughout:**
 
@@ -119,12 +144,14 @@ The upstream Java runtime is the reference for every concurrent field this plan 
 | interceptor `complete` / `on_complete` / `on_error` (1.4) | `UpstreamInterceptor.COMPLETE.compareAndSet(false, true)`, then `upstream.complete()` and `removeUpstream()` | the same | The interceptor also drops its source, through `serialize`, when it finishes. Rust has no GC to collect the cycle. |
 | `UpstreamQueue` (none) | `UpstreamQueue` | — | Not touched. |
 | `Join` (2.1) | `Join` (Java graph package): `pending` (`AtomicInteger`), `failure` (`AtomicReference`, first wins), a fixed continuation; `expect(n)` is `failure.set(null)` then `pending.set(n)`; `arrive` is `decrementAndGet() == 0`; per-part values as in `StageFrame.arrive` (`ARRIVALS.getAndAdd`, then plain reads of the predecessors' `marker`) | `pending: AtomicUsize`; `reset` stores `SeqCst`; arrivals `fetch_sub(1, SeqCst)`; the last runs the continuation. Values are written plainly before the read-modify-write and read plainly by the last arrival. | Per-part value slots instead of one failure (decision 8). A debug-only `ended` flag per part, and a debug-only "round complete" check on `reset`. The continuation is a stored `Fn` that delivers work, where Java's is a frame published to the lake: same effect, with no allocation per round. |
-| `Sequencer`, `Latch`, `Completions` (none) | `Sequencer` (`wip` drain), — | — | Not touched; they are the audit's chunk 5 and G1-G3. |
-| `LanePool` (3.1) | `LanePool`: `final GpuStream[] lanes`; `withTransferLane` composes the array before construction | Immutable after `build()`. The builder is plain and single-threaded, before the pool is shared. | `LanePoolBuilder` is new. Its closest counterpart is `withTransferLane`'s array composition. |
-| `LaneIntakes` own and shared intakes (3.2) | `FrameLake` (publish never runs a frame and never waits; any worker takes) over `MpscQueue`; the multi-consumer queues of `ControlPlaneCache` | the existing queue ports: `MpscQueue` (`Multi` producers, `Single` consumer) and `MpmcQueue` (`Multi` consumer CAS claim) | None. They are the data-structures ports of the Java queues. |
-| `LaneSource` (3.3-3.6) | `AbstractIngestSink.Delegate` + `QueueIngestSink.Delegate`: `demand` (`PaddedAtomicLong`, `accumulateAndGet` with `accumulate`), `COMPLETE`, `DOWNSTREAM`; `request` returns at once when complete, without a receiver, or with `demand <= 0`, then drains within `demand.getAcquire()` and subtracts what it pushed; `pull` has the same guards and hands over at most its own demand; `complete` is CAS, then `demand.lazySet(0)`, then `getAndSet(null)` → `onComplete` | `demand: CachePadded<AtomicU64>` with the same `accumulate` (saturating, a negative step floors at 0) through a `fetch_update(SeqCst, SeqCst)` CAS loop; the same guards; `complete` as Java, with `demand.store(0, Release)` | The lane's own state (submitter, waiting items, ready frames, armed continuations) is plain, in a `SourceCell`, under the interceptor's claim, as `QueueIngestSink` keeps its consumer side under `draining`. `request` runs device work before it pushes (RE-3). `complete` does not drain queued work, as Java's does not ("Does not clear the queue"): what remains is dropped with the source. |
-| retirement continuations (3.4) | the Java graph package's driver callback → `FrameLake.publishFromCallback` | `euhedral-gpu`'s retirement queue is drained by the owner (merged PR #10) | Not reworked. |
-| `euhedral-gpu` streams (4.x) | `GpuStream` | Unchanged except the lane array and the priority | — |
+| `Sequencer`, `Latch`, `Completions`, `StageGraph`, `Lake` (none) | `Sequencer` (`wip` drain over an `MpscQueue`), `FrameLake` and its lake implementation, `StageGraph` | — | Not touched. They are the audit's chunks 5-6 and G1-G3. |
+| `LanePool`, `LanePoolBuilder` (3.1) | `LanePool`: `final GpuStream[] lanes`, immutable after construction; `withTransferLane` composes the array before construction | The pool is immutable after `build()`. The builder is plain and single-threaded, before the pool is shared. | `LanePoolBuilder` is new; its closest counterpart is `withTransferLane`'s array composition. `choose` and `nextHome` (lane choice) are not used by lane sources: in the approved design a worker takes work from whichever source it enters. |
+| `LaneSubmit` (3.2) | `GpuStream`: `submit`, `openMarker`/`mark`/`await`, `notifyRetired` (listener only enqueues on the driver thread), `confirmRetired` (ordinary thread, returns the device failure) | `await_marker` ≈ `await`, `mark` ≈ `mark`, `arm_retirement` + `poll_retired` ≈ `notifyRetired` + `confirmRetired` (the owner drains, the callback only enqueues), `raw` ≈ the stream handle a `submit` selects | `mark` returns a new marker from the merged `euhedral-gpu` event ring (`Ok(None)` when the ring is full), where Java re-records a reusable per-stage marker. That is the merged crate's design, which has no busy case in Java. Methods take `&mut self` (one owner). |
+| `LaneIntakes`: own and shared intakes, `deliver` (3.2) | the lake's `publish` (`FrameLake`): a sink per routing hash, each a `QueueIngestSink` with one producer partition ("a sink is like a GPU stream"), so equal hashes keep publish order; publishing only enqueues (`publishFromCallback` is the same call) | A lane's own intake is one `MpscQueue` (`Multi` producers, `Single` consumer), so delivery order is kept per lane. A group's shared intake is one `MpmcQueue` that every source of the group takes from (the `Multi` consumer's CAS claim, the port of the Java queue's). `deliver` only offers. An order key is the hash that binds work to one lane's intake. | Delivery targets a lane or a group by id, not by hash modulo the sink count: a lane's state (a codec session, a recording) is bound to one queue. |
+| item run inside `LaneSource::request` (3.4) | `StageFrame.submit` / `doFinally` | Markers of the item's own lane are skipped (Java's `predecessor.lane == lane`); other lanes' markers are awaited before the work; `mark` after it; a CPU-only item (`Outcome::Finished`) records no marker (Java's `host()`); `retire: true` defers the successors to the retirement, as a deferred stage does; `failed` publishes no successor, as `owner.fail` | The item runs inside its lane's source, not as a frame of its own. A marker of another backend is handed to the item (no Java counterpart: one backend there). |
+| `LaneSource` request/pull/demand/complete (3.3-3.6) | demand and guards: `AbstractIngestSink.Delegate` + `QueueIngestSink.Delegate` (`demand` `PaddedAtomicLong` with `accumulateAndGet(accumulate)`, `COMPLETE`, `DOWNSTREAM`; `request` returns when complete, without a receiver or with `demand <= 0`, drains within `demand.getAcquire()` and subtracts what it pushed; `pull` has the same guards and hands over at most its own demand; `complete` is CAS, then `demand.lazySet(0)`, then `getAndSet(null)` → `onComplete`) | `demand: CachePadded<AtomicU64>` with the same `accumulate` (saturating; a negative step floors at 0) in a `fetch_update(SeqCst, SeqCst)` CAS loop; the same guards; `complete` as Java, with `demand.store(0, Release)` | **The lane is a source** (the user's approved design): its submitter has one owner, so one source per lane runs that lane's items under the interceptor's claim. Java lets any worker submit to any `GpuStream` from a `StageFrame`, relying on the driver's per-call thread safety. The merged `euhedral-gpu` submitter is `&mut` (exclusivity by the borrow checker), so no Rust equivalent of "any thread submits" exists without a lock. The lane's state (submitter, waiting items, ready frames, armed continuations) is plain in a `SourceCell`, as `QueueIngestSink` keeps its consumer side under `draining`. `request` runs device work before it pushes (RE-3). `complete` does not drain queued work, as Java's does not ("Does not clear the queue"): what remains is dropped with the source. |
+| retirement continuations (3.4) | `CudaGpuMemory.Completion` (`announced` `AtomicBoolean`, `volatile callbackStatus`); listener → `publishFromCallback` | `euhedral-gpu`'s retirement queue: the callback only enqueues and the owner drains (merged PR #10) | Not reworked; `LaneSource` pops its continuations from a plain queue in arm order, as the stream's own `PlainQueue` does. |
+| `euhedral-gpu` streams (4.x) | `GpuStream`'s CUDA implementation | Unchanged except the lane array and the priority | The priority has no Java counterpart (Java streams are all normal). |
 
 ## Global Constraints
 
