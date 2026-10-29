@@ -1,11 +1,10 @@
-//! A one-shot hand-off of a value from one thread to another: Java's `CompletableFuture` as a pipeline's outcome uses it,
-//! with one completer and one reader.
+//! A one-shot hand-off of a value from one thread to another: Java's `CompletableFuture` with one completer and one
+//! reader.
 //!
 //! [`one_shot`] makes the two ends. The sender writes the value and then stores `SET` with release ordering: one plain
 //! store, with no read-modify-write and no barrier. A sender dropped without sending stores `ABANDONED`, which the
 //! receiver sees as [`RecvError::Abandoned`]. The receiver never waits: it checks with [`try_take`](OneShotReceiver::try_take)
-//! and [`is_set`](OneShotReceiver::is_set), as the owner of a lattice checks on its work periodically. Nothing here
-//! parks a thread or wakes one.
+//! and [`is_set`](OneShotReceiver::is_set) when it chooses to. Nothing here parks a thread or wakes one.
 
 use super::loom::{AtomicU8, Ordering, UnsafeCell};
 use std::fmt;

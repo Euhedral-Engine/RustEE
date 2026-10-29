@@ -491,7 +491,9 @@ impl<S: LaneSubmit, X: LaneState, W: LaneWork<S, X>> LaneSource<S, X, W> {
                     });
             }
         }
-        self.metrics.ready_depth.record_owned(inner.ready.len() as f64);
+        self.metrics
+            .ready_depth
+            .record_owned(inner.ready.len() as f64);
         self.publish(inner);
         self.metrics.service_ns.record(ns(started.elapsed()));
     }
