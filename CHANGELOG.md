@@ -18,9 +18,14 @@ waits for 32,000,000 completions. The harness thread has a core of its own. The 
 summary of the mean and standard deviation of the measured iterations.
 
 The repeating source's banked demand is state of whichever worker is inside its `request` or `pull` (the lattice
-serializes them), so it changes by a load and a store, not a read-modify-write; the completion counter and the latency
-recorders keep their read-modify-write, because a thread's slot is shared once the process has made more threads than
-slots.
+serializes them), so it changes by a load and a store, not a read-modify-write.
+
+The completion counter has one cell per CPU id (a `PaddedLongAdder` with Java's `(cpus, true, true)` options: checked
+indexes and each cell padded to two cache lines). A worker is pinned to its own CPU, so its cell has one writer and
+finishing a frame is a load and a store; the CPU is read once per worker thread, from its affinity, and cached. A thread
+that shares its CPU with another, runs on no worker CPU, or cannot learn its CPU (a platform that does not pin) takes a
+shared cell by arrival order with a `fetch_add` and says so once on stderr. The latency recorders follow the same
+cells. The harness thread never counts.
 
 **Tests.** The harness-core selection, the worker CPU set, the completion target and its bounded wait, the sources
 default, the output lines, and a smoke run of a fork with a tiny target on a real lattice.

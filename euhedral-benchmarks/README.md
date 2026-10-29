@@ -7,8 +7,8 @@ End-to-end benchmarks of the control plane. Nothing depends on this crate.
 `high_contention_throughput` measures the average time and the throughput of a lattice that many sources feed at once
 (the Java `HighContentionThroughput` benchmark, as a plain binary).
 
-- One repeating source per source, each circulating 2048 no-op frames; finishing a frame bumps a striped completion
-  counter and hands the frame back to its source. The sources are attached to one lattice.
+- One repeating source per source, each circulating 2048 no-op frames; finishing a frame bumps its CPU's cell of a striped completion
+  counter (one writer per cell: a worker is pinned to its CPU) and hands the frame back to its source. The sources are attached to one lattice.
 - The harness thread is pinned to a core of its own (the highest efficiency core, else the highest core), and that
   core's CPUs are left out of the lattice's workers. Where the platform will not pin, or has fewer than two cores, it
   says so and runs unpinned.

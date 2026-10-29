@@ -1,12 +1,12 @@
 //! The high-contention throughput benchmark (`HighContentionThroughput` upstream).
 //!
-//! One [`RepeatingSource`] per source feeds no-op frames into one lattice; finishing a frame bumps a striped counter.
+//! One [`RepeatingSource`] per source feeds no-op frames into one lattice; finishing a frame bumps its CPU's cell of a striped counter.
 //! The harness thread is pinned to a core of its own and waits for the counter to advance by [`TASKS`]: one
 //! invocation. An iteration repeats invocations for a fixed time and reports throughput; a fork builds a lattice,
 //! runs the warm-up iterations, then the measured ones, and tears it down.
 
 use crate::latency::{Histogram, Quantiles, Recorders};
-use crate::no_op::{FRAMES_PER_SOURCE, RepeatingSource};
+use crate::no_op::{FRAMES_PER_SOURCE, RepeatingSource, Tally};
 use euhedral_core::config::LatticeConfig;
 use euhedral_core::control_plane::{ControlPlaneLattice, LatticeError};
 use euhedral_core::impls::DefaultExecutor;
@@ -336,19 +336,23 @@ pub fn run_fork(
         },
     });
 
-    let slots = topology
+    // One counter cell per CPU id; a worker is pinned to its own CPU, so each cell has one writer. A worker that shares
+    // its CPU, or a platform that cannot pin, falls back to shared cells and says so (see `Tally`).
+    let cpus = topology
         .cpu_span()
         .max(std::thread::available_parallelism().map_or(1, usize::from));
-    let counters = Arc::new(PaddedLongAdder::with_options(slots, true, true));
-    let recorders = options.latency.then(|| Arc::new(Recorders::new(slots)));
+    let tally = Arc::new(Tally::new(cpus, isolation.workers.clone()));
+    let counters = tally.adder();
+    let recorders = options
+        .latency
+        .then(|| Arc::new(Recorders::new(tally.cells())));
     let sources: Vec<_> = (0..options.sources)
         .map(|source| {
             RepeatingSource::new(
                 id_hash(),
                 FRAMES_PER_SOURCE,
                 id_hash().wrapping_add((source * FRAMES_PER_SOURCE) as u64),
-                &counters,
-                slots,
+                &tally,
                 recorders.as_ref(),
             )
         })
@@ -371,7 +375,7 @@ pub fn run_fork(
         let mut measured_latency = Histogram::new();
         for index in 1..=options.warmup_iterations {
             let (sample, _) = iterate(
-                &counters,
+                counters,
                 recorders.as_deref(),
                 options.tasks,
                 options.warmup_time,
@@ -383,7 +387,7 @@ pub fn run_fork(
         }
         for index in 1..=options.iterations {
             let (sample, latency) = iterate(
-                &counters,
+                counters,
                 recorders.as_deref(),
                 options.tasks,
                 options.iteration_time,
