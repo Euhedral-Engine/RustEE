@@ -1,5 +1,5 @@
 use super::cache::{CacheDirectory, ControlPlaneCache};
-use super::decision_tree::{BodyCost, DecisionTree, ExecutionPath};
+use super::decision_tree::{BodyCost, BodyCostView, DecisionTree, ExecutionPath};
 use crate::config::{CloneConfig, CloneLivenessRegistry, FragmentConfig};
 use crate::flow_control::{LatticeEdge, LatticeHotSource, UpstreamQueue, UpstreamRegistry};
 use crate::frames::Frame;
@@ -7,7 +7,7 @@ use crate::generics::{CloneableObject, LatticeSource};
 use crate::metrics::{
     ExecutionMetrics, FlowStats, Meter, MeterSource, MetricsRegistry, ServiceTimeSink,
 };
-use crate::utils::{FlowContext, FlowRecorder, StopWatch};
+use crate::utils::{FlowContext, FlowRecorder};
 use euhedral_data_structures::atomics::CachePadded;
 use euhedral_data_structures::sync::{HotScope, LifecycleMutex};
 use euhedral_hardware_utils::affinity::{self, ExecutorError, PinnedThreadExecutor, TaskInterrupt};
@@ -86,7 +86,8 @@ pub struct ControlPlaneFragment {
     registry: Arc<UpstreamRegistry>,
     cache: Arc<ControlPlaneCache>,
     output: Arc<LatticeHotSource>,
-    body_cost: Arc<BodyCost>,
+    /// The body-cost estimate as the worker last published it; the worker owns the estimate itself.
+    body_cost: Arc<BodyCostView>,
     /// This fragment's use of its CPU's executor, which other fragments on the CPU share. Closing
     /// the fragment releases the use; the executor closes with its last one.
     executor: PinnedThreadExecutor,
@@ -157,9 +158,9 @@ impl ControlPlaneFragment {
         if let Some(buddy) = &buddy {
             cache.pair_with(buddy.cache.clone());
         }
-        let body_cost = Arc::new(BodyCost::new());
+        let body_cost = Arc::new(BodyCostView::default());
         let metrics = ExecutionMetrics::new(config.metrics(), clone.core_id(), cpu);
-        let output = Arc::new(timed_output(body_cost.clone()));
+        let output = Arc::new(LatticeHotSource::new());
         let initial_cap = initial_batch_cap(config, &cache);
         let fragment = Arc::new_cyclic(|this| Self {
             name,
@@ -231,6 +232,15 @@ impl ControlPlaneFragment {
     /// The largest batch the worker currently runs: lower the more pressure its CPU is under.
     pub fn batch_cap(&self) -> u64 {
         self.adaptive_batch_cap.load(Ordering::Acquire)
+    }
+
+    /// The cost of one frame body in nanoseconds, as the worker last estimated it: from a sample
+    /// of the bodies it runs, one window at a time. `None` before the first full window and after a
+    /// reset.
+    pub fn body_cost_ns(&self) -> Option<f64> {
+        self.body_cost
+            .has_history()
+            .then(|| self.body_cost.estimate_ns())
     }
 
     /// Waits up to `timeout` for the worker tasks of this fragment and its buddy to end, and to leave
@@ -334,8 +344,10 @@ impl ControlPlaneFragment {
     }
 
     fn run_owner_loop(&self) {
-        let mut policy =
-            DecisionTree::calibrated(self.config.idle_policy().clone(), self.body_cost.clone());
+        let mut policy = DecisionTree::calibrated(
+            self.config.idle_policy().clone(),
+            BodyCost::publishing_to(self.body_cost.clone()),
+        );
         let mut cycle = Cycle::new(self.cpu.wrapping_add(1), self.execution_metrics());
         FlowContext::initialize();
         // The executors this worker pushes to time each frame's execute into its summary.
@@ -370,7 +382,7 @@ impl ControlPlaneFragment {
         let mut run = Run::default();
         let polls = self.config.polls();
         if limit > 0 && !self.cache.is_drained() {
-            let count = self.timed(&mut run, cycle, |output| {
+            let count = self.timed(&mut run, cycle, policy, |output| {
                 if polls {
                     self.cache.poll(output, limit)
                 } else {
@@ -399,7 +411,7 @@ impl ControlPlaneFragment {
         match path {
             ExecutionPath::Direct => {
                 if limit > 0 {
-                    self.timed(&mut run, cycle, |output| {
+                    self.timed(&mut run, cycle, policy, |output| {
                         self.cache.upstream_pull(output, limit)
                     });
                 }
@@ -419,7 +431,7 @@ impl ControlPlaneFragment {
         if run.processed == 0 {
             let cursor = cycle.neighbor_cursor;
             cycle.neighbor_cursor = cursor.wrapping_add(1);
-            self.timed(&mut run, cycle, |output| {
+            self.timed(&mut run, cycle, policy, |output| {
                 if polls {
                     self.cache.work_steal_polled(output, limit, cursor)
                 } else {
@@ -466,16 +478,17 @@ impl ControlPlaneFragment {
     }
 
     /// Runs `execute` with a consumer that pushes frames out, counted as in progress, and adds what
-    /// it ran to `run`.
+    /// it ran to `run`. A sample of the pushes is timed into `policy`'s body-cost estimate.
     fn timed(
         &self,
         run: &mut Run,
         cycle: &mut Cycle,
+        policy: &mut DecisionTree,
         execute: impl FnOnce(&mut dyn FnMut(Box<dyn Frame>)) -> u64,
     ) -> u64 {
         let _in_progress = InProgress::enter(&self.in_progress);
         let start = Instant::now();
-        let count = execute(&mut |frame| self.output.accept(frame));
+        let count = execute(&mut |frame| policy.timed_body(|| self.output.accept(frame)));
         let end = Instant::now();
         if count > 0 {
             run.processed += count;
@@ -753,19 +766,6 @@ fn initial_batch_cap(config: &FragmentConfig, cache: &ControlPlaneCache) -> u64 
         .get()
         .min(cache.frame_quota())
         .max(2)
-}
-
-/// An output that times a sample of the frame bodies it pushes into `body_cost`.
-fn timed_output(body_cost: Arc<BodyCost>) -> LatticeHotSource {
-    let watch = Arc::new(StopWatch::new());
-    let started = watch.clone();
-    LatticeHotSource::new()
-        .before_each(move |_| started.start())
-        .after_each(move || {
-            if let Some(elapsed) = watch.stop() {
-                body_cost.record(elapsed);
-            }
-        })
 }
 
 /// The worker's own state between cycles.
