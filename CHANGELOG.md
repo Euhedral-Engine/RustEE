@@ -17,15 +17,20 @@ flags and `EUHEDRAL_HCT_SOURCES`).
 waits for 32,000,000 completions. The harness thread has a core of its own. The output is one line per iteration and a
 summary of the mean and standard deviation of the measured iterations.
 
-The repeating source's banked demand is state of whichever worker is inside its `request` or `pull` (the lattice
-serializes them), so it changes by a load and a store, not a read-modify-write.
+The repeating source holds its frame queue's consumer and its banked demand in a `SourceCell`: the lattice serializes a
+source's `request` and `pull`, so they are plain state of whoever is inside, and the queue the finished frames return
+to is multi-producer, single-consumer (no per-frame consumer lock; one claim per call). Java's sink re-pushes a fixed
+array and takes nothing back; a Rust frame cannot be aliased, so the return path is a harness cost with no Java
+counterpart.
 
 The completion counter has one cell per CPU id (a `PaddedLongAdder` with Java's `(cpus, true, true)` options: checked
 indexes and each cell padded to two cache lines). A worker is pinned to its own CPU, so its cell has one writer and
 finishing a frame is a load and a store; the CPU is read once per worker thread, from its affinity, and cached. A thread
 that shares its CPU with another, runs on no worker CPU, or cannot learn its CPU (a platform that does not pin) takes a
 shared cell by arrival order with a `fetch_add` and says so once on stderr. The latency recorders follow the same
-cells. The harness thread never counts.
+cells. The harness thread never counts. Java counts with `getAndAdd`; the plain store on a cell with one writer is a
+deviation the user asked for. A claimed cell is never released: a tally lives for one fork. The latency measured is from
+the source handing a frame out to a worker starting it, and excludes the recycle path.
 
 **Tests.** The harness-core selection, the worker CPU set, the completion target and its bounded wait, the sources
 default, the output lines, and a smoke run of a fork with a tiny target on a real lattice.

@@ -6,9 +6,9 @@
 
 use crate::latency::Recorders;
 use euhedral_core::frames::{Frame, FrameHeader};
-use euhedral_core::generics::{DownstreamSlot, LatticeReceiver, LatticeSource};
+use euhedral_core::generics::{DownstreamSlot, LatticeReceiver, LatticeSource, SourceCell};
 use euhedral_data_structures::atomics::PaddedLongAdder;
-use euhedral_data_structures::queues::{Consumer, MpmcQueue, Multi, Producer};
+use euhedral_data_structures::queues::{Consumer, MpscQueue, Multi, Producer, Single};
 use euhedral_hardware_utils::affinity;
 use euhedral_hardware_utils::util::CpuSet;
 use std::cell::Cell;
@@ -44,6 +44,13 @@ pub struct Slot {
 /// harness thread never counts.
 ///
 /// The cells after the first `cpus` are those shared cells. The harness sums all of them with loads.
+///
+/// A claimed cell stays claimed: a tally lives for one fork (one lattice), and its worker threads end with it, so
+/// nothing is released on a worker's exit.
+///
+/// **Where it differs from Java.** Java's `NoOpFrame` counts with `PaddedLongAdder.getAndAdd`, a read-modify-write on a
+/// slot chosen by CPU id. Here a cell with one writer is a load and a store (the user's choice, for a path that takes
+/// no locked instruction); only the shared fallback keeps the add.
 pub struct Tally {
     id: u64,
     adder: PaddedLongAdder,
@@ -231,13 +238,27 @@ pub fn generate(
         .collect()
 }
 
+/// What only a source's `request` and `pull` touch: the queue the finished frames come back to, read by its one
+/// consumer, and the banked demand.
+struct Inner {
+    frames: Consumer<Box<NoOpFrame>, Single>,
+    /// Banked demand; `u64::MAX` is unbounded. The demand a request leaves unmet stays banked for the next one.
+    demand: u64,
+}
+
 /// A source that pushes a fixed set of [`NoOpFrame`]s over and over (`RepeatingSink` upstream): a request or pull takes
-/// the next frames that are back from the lattice, as many as the demand allows. The demand a request leaves unmet
-/// stays banked for the next one.
+/// the next frames that are back from the lattice, as many as the demand allows.
+///
+/// **Where it differs from Java, and why.** Java's sink re-pushes a fixed array of frames and takes nothing back. A
+/// Rust frame is a `Box<dyn Frame>` that the lattice owns while it runs and that cannot be aliased, so the source
+/// gets each frame back through a queue (`recycle`) and pushes it again. That return path, one queue slot claimed per
+/// finished frame, is a harness cost with no Java counterpart (the audit lists it as row 26). Its consumer side is a
+/// single consumer: the lattice serializes a source's `request` and `pull`, and a [`SourceCell`] holds the consumer and
+/// the demand, so the per-frame consumer lock a multi-consumer queue would take is gone and only one claim per call
+/// is left.
 pub struct RepeatingSource {
     downstream: DownstreamSlot,
-    demand: AtomicU64,
-    frames: Consumer<Box<NoOpFrame>, Multi>,
+    inner: SourceCell<Inner>,
     home: Home,
 }
 
@@ -250,49 +271,36 @@ impl RepeatingSource {
         tally: &Arc<Tally>,
         latency: Option<&Arc<Recorders>>,
     ) -> Arc<Self> {
-        let queue = MpmcQueue::new(length.next_power_of_two());
+        // Many workers return frames; the one request or pull in progress takes them.
+        let queue = MpscQueue::new(length.next_power_of_two());
         let home: Home = Box::leak(Box::new(queue.producer()));
         for frame in generate(id_hash, length, seed, tally, latency, home) {
             let _ = home.offer(frame);
         }
         Arc::new(Self {
             downstream: DownstreamSlot::new(),
-            demand: AtomicU64::new(0),
-            frames: queue.consumer(),
+            inner: SourceCell::new(Inner {
+                frames: queue.consumer(),
+                demand: 0,
+            }),
             home,
         })
     }
 
-    /// Banks `demand`; `u64::MAX` is unbounded.
-    ///
-    /// The lattice serializes a source's `request` and `pull`: one worker is inside either at a time, and the
-    /// interceptor's claim orders one worker's exit before the next one's entry. The banked demand is therefore plain
-    /// state of whoever is inside, kept in an atomic only so that the source is `Sync`: it changes by a load and a
-    /// store, never a read-modify-write.
-    fn bank(&self, demand: u64) {
-        if demand == 0 {
-            return;
-        }
-        let banked = self.demand.load(Ordering::Relaxed);
-        self.demand
-            .store(banked.saturating_add(demand), Ordering::Relaxed);
-    }
-
     /// Pushes frames to the receiver while demand is banked and frames are back.
-    fn push_banked(&self) {
+    fn push_banked(&self, inner: &mut Inner) {
         let Some(receiver) = self.downstream.receiver() else {
             return;
         };
         while !self.downstream.is_complete() {
-            let banked = self.demand.load(Ordering::Relaxed);
-            if banked == 0 {
+            if inner.demand == 0 {
                 return;
             }
-            let Some(frame) = self.frames.poll() else {
+            let Some(frame) = inner.frames.poll() else {
                 return;
             };
-            if banked != u64::MAX {
-                self.demand.store(banked - 1, Ordering::Relaxed);
+            if inner.demand != u64::MAX {
+                inner.demand -= 1;
             }
             let mut frame = frame;
             frame.stamp();
@@ -313,9 +321,10 @@ impl LatticeSource for RepeatingSource {
         stop: &mut dyn FnMut(&dyn Frame) -> bool,
         demand: u64,
     ) -> u64 {
+        let mut inner = self.inner.enter();
         let mut taken = 0;
         while taken < demand && !self.downstream.is_complete() {
-            let Some(frame) = self.frames.poll() else {
+            let Some(frame) = inner.frames.poll() else {
                 break;
             };
             if stop(&*frame) {
@@ -332,8 +341,9 @@ impl LatticeSource for RepeatingSource {
     }
 
     fn request(&self, demand: u64) {
-        self.bank(demand);
-        self.push_banked();
+        let mut inner = self.inner.enter();
+        inner.demand = inner.demand.saturating_add(demand);
+        self.push_banked(&mut inner);
     }
 
     fn complete(&self) {
