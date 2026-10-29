@@ -576,6 +576,12 @@ Java `LatticeHotSource`, `ControlPlaneFragment`'s output, `StopWatch`, `Fragment
     generation is stored before the old one is let go, and no reader waits.
   - Deviation (missing Rust equivalent): the release runs from `Drop` of the last holder instead of from the reader
     count reaching the retired value. A reader that stops reading holds its generation until it reads again or exits.
+    The release therefore waits for every worker's next cycle or read (Java: for the last in-flight push); bounded by
+    the cycle and the timed parks.
+  - Deviation (Java bug against the frame-path rule): Java runs a deferred retirement on the last reader, and a
+    retirement that closes a clone waits for its workers (`closeClone` → `awaitTermination`): for the clone's own worker
+    that is a wait on itself until the shutdown timeout, and for any worker a stall of its frames. Here the retirements
+    go to a thread of their own when the last holder is a frame-path thread.
 - **C7** (Java `releaseHandlesWhenQuiescent` under `synchronized(routingUpdateLock)`): rebalance work, run by
   whichever thread lets go of the last `Arc` of a retired generation, as in Java it is run by the last reader. The
   releasing thread leaves its hot scope for the lifecycle lock (once per retired generation).

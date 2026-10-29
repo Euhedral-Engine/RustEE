@@ -122,10 +122,10 @@ impl LatticeEdge {
         self.closed.load(Ordering::Relaxed)
     }
 
-    /// The node above this edge, if it is still alive.
+    /// The node above this edge, if it is still alive. Lifecycle code reads the cell under its lock: it is not on the
+    /// frame path, and it should not become a reader (a reader's mailbox collects every change of the lattice).
     pub fn parent(&self) -> Option<Arc<dyn LatticeNode>> {
-        self.registry
-            .with_view(|view| view.get(&self.parent)?.0.upgrade())
+        self.registry.cell_value(&self.parent)?.0.upgrade()
     }
 
     /// Makes `parent` the node above this edge, or detaches the edge with `None`. The edge holds its

@@ -28,6 +28,7 @@ use std::panic::{self, AssertUnwindSafe};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
+use std::thread;
 
 /// Picks the active downstream for a frame: an index below `state.len()` into
 /// [`RoutingState::mappings`].
@@ -324,7 +325,8 @@ impl LatticeVertex {
 
         {
             let mut book = self.book.lock();
-            if !self.is_draining() || self.is_closed() {
+            // Java's `drain.get()`: a volatile read here, where `serviceable` reads opaque.
+            if !self.edge.drain_flag().load(Ordering::Acquire) || self.is_closed() {
                 return false;
             }
             for handle in table.unique_handles() {
@@ -388,15 +390,34 @@ impl LatticeVertex {
                 log::error!(target: &self.name, "failed to close a retired downstream");
             }
         }
-        for action in retirements.into_iter().chain(close_retirements) {
-            self.run_retirement(action);
+        let deferred: Vec<Retirement> = retirements.into_iter().chain(close_retirements).collect();
+        if deferred.is_empty() {
+            return;
+        }
+        if self.edge.registry().is_full_reader() {
+            // The last holder is a worker (or a producer thread on the frame path): a retirement may close a clone and
+            // wait for its workers, which for this very worker is waiting for itself, and for any other stalls its
+            // frames. Java runs it here, on the last reader of the retired state; here it goes to a thread of its own.
+            let name = self.name.clone();
+            let task = Arc::new(LifecycleMutex::new(Some(deferred)));
+            let spawned = {
+                let (task, name) = (task.clone(), name.clone());
+                thread::Builder::new()
+                    .name(format!("{name}-retire"))
+                    .spawn(move || run_retirements(&name, &task))
+            };
+            if spawned.is_err() {
+                run_retirements(&name, &task);
+            }
+        } else {
+            for action in deferred {
+                run_retirement(&self.name, action);
+            }
         }
     }
 
     fn run_retirement(&self, action: Retirement) {
-        if panic::catch_unwind(AssertUnwindSafe(action)).is_err() {
-            log::error!(target: &self.name, "failed to retire a downstream owner");
-        }
+        run_retirement(&self.name, action);
     }
 
     /// Closes the vertex to routing, then runs `after_routes_retire` once every generation has
@@ -541,6 +562,20 @@ impl LatticeNode for LatticeVertex {
             }
         };
         self.run_retirement(action);
+    }
+}
+
+fn run_retirement(name: &str, action: Retirement) {
+    if panic::catch_unwind(AssertUnwindSafe(action)).is_err() {
+        log::error!(target: name, "failed to retire a downstream owner");
+    }
+}
+
+/// Runs the retirements `task` holds, once.
+fn run_retirements(name: &str, task: &LifecycleMutex<Option<Vec<Retirement>>>) {
+    let actions = task.lock().take();
+    for action in actions.into_iter().flatten() {
+        run_retirement(name, action);
     }
 }
 
@@ -900,7 +935,7 @@ impl UpstreamHandle for UpstreamInterceptor {
         // vertex's count, shared by every worker).
         self.serving_by.store(thread_token(), Ordering::Relaxed);
         self.serving
-            .store(Arc::as_ptr(&vertex).cast_mut(), Ordering::Release);
+            .store(Arc::as_ptr(&vertex).cast_mut(), Ordering::Relaxed);
         let requested = panic::catch_unwind(AssertUnwindSafe(|| upstream.request(demand)));
         self.serving_by.store(0, Ordering::Relaxed);
         self.serving.store(ptr::null_mut(), Ordering::Relaxed);
@@ -938,7 +973,7 @@ impl LatticeReceiver for UpstreamInterceptor {
         let routed = if self.serving_by.load(Ordering::Relaxed) == thread_token() {
             // SAFETY: only the thread that stored its token is inside the call that holds the vertex, and it clears
             // the token before it lets the vertex go.
-            unsafe { &*self.serving.load(Ordering::Acquire) }.try_push(frame)
+            unsafe { &*self.serving.load(Ordering::Relaxed) }.try_push(frame)
         } else {
             match self.vertex.upgrade() {
                 Some(vertex) => vertex.try_push(frame),

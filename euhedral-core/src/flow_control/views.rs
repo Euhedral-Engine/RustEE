@@ -23,7 +23,7 @@ use std::any::Any;
 use std::cell::RefCell;
 use std::marker::PhantomData;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering, fence};
 use std::sync::{Arc, Weak};
 
 type Value = Arc<dyn Any + Send + Sync>;
@@ -32,7 +32,15 @@ type WeakValue = Weak<dyn Any + Send + Sync>;
 /// A slot of lattice state of type `T`, made by [`UpstreamRegistry::cell`].
 pub struct Cell<T> {
     id: usize,
+    views: Arc<Views>,
     _marker: PhantomData<fn() -> T>,
+}
+
+impl<T> Drop for Cell<T> {
+    /// The cell's id goes back to the registry for the next cell, after every reader let go of what it held for it.
+    fn drop(&mut self) {
+        self.views.free(self.id);
+    }
 }
 
 impl<T> std::fmt::Debug for Cell<T> {
@@ -59,13 +67,24 @@ struct Reader {
     id: u64,
     light: bool,
     mailbox: Producer<Update, Multi>,
+    /// Set by the writer when it drops a light reader whose mailbox backed up; the reader registers again at its next
+    /// read.
+    evicted: Arc<AtomicBool>,
 }
+
+/// How many updates a light reader's mailbox may hold before the writer drops the reader. A light reader that stops
+/// reading (a thread that pushed once and went elsewhere) would otherwise collect an update for every change of the
+/// lattice for as long as it lives.
+const LIGHT_BACKLOG: u64 = 1024;
 
 /// The authoritative values, and the mailboxes to keep up to date. Changed under the lock only.
 #[derive(Default)]
 struct Store {
     values: Vec<Option<Value>>,
+    /// Ids of the cells that were dropped, for the next cell.
+    free: Vec<usize>,
     readers: Vec<Reader>,
+    next_reader: u64,
 }
 
 impl Store {
@@ -88,11 +107,21 @@ impl Store {
     /// Stores `value` and sends it to every reader. Returns the value replaced.
     fn replace(&mut self, cell: usize, value: Option<Value>) -> Option<Value> {
         let replaced = std::mem::replace(&mut self.values[cell], value.clone());
+        let mut evicted = false;
         for reader in &self.readers {
+            if reader.light && reader.mailbox.size_long() > LIGHT_BACKLOG {
+                reader.evicted.store(true, Ordering::Release);
+                evicted = true;
+                continue;
+            }
             let _ = reader.mailbox.offer(Update {
                 cell,
                 slot: Self::slot(&value, reader.light),
             });
+        }
+        if evicted {
+            self.readers
+                .retain(|reader| !reader.evicted.load(Ordering::Relaxed));
         }
         replaced
     }
@@ -101,15 +130,42 @@ impl Store {
 /// The lattice's cells and its readers.
 pub(crate) struct Views {
     store: LifecycleMutex<Store>,
-    next_reader: AtomicU64,
 }
 
 impl Views {
     pub(crate) fn new() -> Self {
         Self {
-            store: LifecycleMutex::new(Store::default()),
-            next_reader: AtomicU64::new(1),
+            store: LifecycleMutex::new(Store {
+                next_reader: 1,
+                ..Store::default()
+            }),
         }
+    }
+
+    /// An id for a new cell: a dropped cell's, or a new one.
+    fn allocate(&self) -> usize {
+        let _cold = HotScope::leave();
+        let mut store = self.store.lock();
+        match store.free.pop() {
+            Some(id) => id,
+            None => {
+                store.values.push(None);
+                store.values.len() - 1
+            }
+        }
+    }
+
+    /// Empties the cell `id` for every reader, and keeps the id for the next cell.
+    fn free(&self, id: usize) {
+        let _cold = HotScope::leave();
+        let replaced = {
+            let mut store = self.store.lock();
+            let replaced = store.replace(id, None);
+            store.free.push(id);
+            replaced
+        };
+        // Outside the lock: dropping the last holder of a generation may take lifecycle locks of its own.
+        drop(replaced);
     }
 }
 
@@ -125,6 +181,8 @@ struct ThreadView {
 struct ViewState {
     values: RefCell<Vec<Slot>>,
     mailbox: RefCell<Consumer<Update, Single>>,
+    /// Whether the writer dropped this (light) reader for a mailbox that backed up.
+    evicted: Arc<AtomicBool>,
 }
 
 impl Drop for ThreadView {
@@ -169,11 +227,9 @@ impl ViewState {
 impl UpstreamRegistry {
     /// A cell for a value of type `T`, holding nothing.
     pub fn cell<T: Send + Sync + 'static>(&self) -> Cell<T> {
-        let _cold = HotScope::leave();
-        let mut store = self.views().store.lock();
-        store.values.push(None);
         Cell {
-            id: store.values.len() - 1,
+            id: self.views().allocate(),
+            views: self.views().clone(),
             _marker: PhantomData,
         }
     }
@@ -244,13 +300,16 @@ impl UpstreamRegistry {
             }
             let _cold = HotScope::leave();
             let queue = MpscQueue::new(64);
-            let reader_id = self.views().next_reader.fetch_add(1, Ordering::Relaxed);
+            let evicted = Arc::new(AtomicBool::new(false));
             let mut store = self.views().store.lock();
+            let reader_id = store.next_reader;
+            store.next_reader += 1;
             let slots = store.slots(light);
             store.readers.push(Reader {
                 id: reader_id,
                 light,
                 mailbox: queue.producer(),
+                evicted: evicted.clone(),
             });
             drop(store);
             views.push(ThreadView {
@@ -261,6 +320,7 @@ impl UpstreamRegistry {
                 view: Rc::new(ViewState {
                     values: RefCell::new(slots),
                     mailbox: RefCell::new(queue.consumer()),
+                    evicted,
                 }),
             });
         });
@@ -278,6 +338,12 @@ impl UpstreamRegistry {
             })
             .unwrap_or_default();
         drop(removed);
+    }
+
+    /// Whether the calling thread is a full reader of this registry: a worker, or a thread that registered as a reader
+    /// because it is on the frame path. Such a thread must not wait or run lifecycle work.
+    pub fn is_full_reader(&self) -> bool {
+        matches!(self.local_view_kind(), Some((_, false)))
     }
 
     /// Whether the calling thread is a reader of this registry.
@@ -314,10 +380,20 @@ impl UpstreamRegistry {
     /// Runs `f` with the calling thread's view of the cells. A thread that is not yet a reader becomes a light one
     /// first (its first read takes the lock once to register; every later read is lock-free).
     pub fn with_view<R>(self: &Arc<Self>, f: impl FnOnce(&View<'_>) -> R) -> R {
-        let local = self.local_view_kind().or_else(|| {
-            self.register_as(true);
-            self.local_view_kind()
-        });
+        let local = match self.local_view_kind() {
+            Some((state, true)) if state.evicted.load(Ordering::Acquire) => {
+                // The writer dropped this reader because it had stopped reading: register again, from the current
+                // values.
+                self.remove_reader();
+                self.register_as(true);
+                self.local_view_kind()
+            }
+            Some(local) => Some(local),
+            None => {
+                self.register_as(true);
+                self.local_view_kind()
+            }
+        };
         match local {
             Some((state, false)) => {
                 state.drain();
@@ -331,7 +407,7 @@ impl UpstreamRegistry {
                 f(&View {
                     source: Source::Light {
                         state: &state,
-                        held: RefCell::new(Vec::new()),
+                        held: RefCell::new(Held::new()),
                     },
                 })
             }
@@ -349,13 +425,55 @@ impl UpstreamRegistry {
     }
 }
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "a stack value made once per read; boxing the light variant would allocate on the frame path"
+)]
 enum Source<'a> {
     Full(&'a [Slot]),
     /// A light reader's view: values upgraded during this call, kept until it ends.
     Light {
         state: &'a ViewState,
-        held: RefCell<Vec<(usize, Value)>>,
+        held: RefCell<Held>,
     },
+}
+
+/// The values a light read has upgraded: a handful, kept inline so that the read allocates nothing; a read of more
+/// cells than that spills to a vector.
+const HELD_INLINE: usize = 8;
+
+struct Held {
+    inline: [Option<(usize, Value)>; HELD_INLINE],
+    used: usize,
+    spill: Vec<(usize, Value)>,
+}
+
+impl Held {
+    fn new() -> Self {
+        Self {
+            inline: [const { None }; HELD_INLINE],
+            used: 0,
+            spill: Vec::new(),
+        }
+    }
+
+    fn find(&self, id: usize) -> Option<*const (dyn Any + Send + Sync)> {
+        self.inline[..self.used]
+            .iter()
+            .flatten()
+            .chain(self.spill.iter())
+            .find(|(held, _)| *held == id)
+            .map(|(_, value)| Arc::as_ptr(value))
+    }
+
+    fn push(&mut self, id: usize, value: Value) {
+        if self.used < HELD_INLINE {
+            self.inline[self.used] = Some((id, value));
+            self.used += 1;
+        } else {
+            self.spill.push((id, value));
+        }
+    }
 }
 
 /// The calling thread's view of the cells for one call of [`UpstreamRegistry::with_view`].
@@ -372,46 +490,44 @@ impl View<'_> {
                 Slot::Empty | Slot::Light(_) => None,
             },
             Source::Light { state, held } => {
-                let existing = held
-                    .borrow()
-                    .iter()
-                    .find(|(id, _)| *id == cell.id)
-                    .map(|(_, value)| Arc::as_ptr(value));
+                let existing = held.borrow().find(cell.id);
                 let pointer = match existing {
                     Some(pointer) => pointer,
                     None => {
                         let value = Self::upgrade(state, cell.id)?;
                         let pointer = Arc::as_ptr(&value);
-                        held.borrow_mut().push((cell.id, value));
+                        held.borrow_mut().push(cell.id, value);
                         pointer
                     }
                 };
                 // SAFETY: `held` keeps a clone of the `Arc` for the whole call, so the value lives as long as `self`;
-                // the vector is only pushed to, and a value is an `Arc` allocation, which does not move.
+                // an entry is only ever added, and a value is an `Arc` allocation, which does not move.
                 let value: &(dyn Any + Send + Sync) = unsafe { &*pointer };
                 value.downcast_ref::<T>()
             }
         }
     }
 
-    /// Upgrades the light reader's reference to a cell's value. A reference that has died was replaced after the last
-    /// drain: the update that replaced it was queued before it died, so draining again finds the newer value.
+    /// Upgrades the light reader's reference to a cell's value (one reference-count update, and no copy of the weak
+    /// reference). A reference that has died was replaced after the last drain: the update that replaced it was queued
+    /// before it died, so draining again finds the newer value.
     fn upgrade(state: &ViewState, id: usize) -> Option<Value> {
         loop {
-            let slot = state.values.borrow().get(id)?.clone();
-            match slot {
+            let dead = match state.values.borrow().get(id)? {
                 Slot::Empty | Slot::Full(_) => return None,
-                Slot::Light(weak) => {
-                    if let Some(value) = weak.upgrade() {
-                        return Some(value);
-                    }
-                    state.drain();
-                    let newer = state.values.borrow().get(id).cloned();
-                    match newer {
-                        Some(Slot::Light(now)) if !Weak::ptr_eq(&now, &weak) => {}
-                        _ => return None,
-                    }
-                }
+                Slot::Light(weak) => match weak.upgrade() {
+                    Some(value) => return Some(value),
+                    None => weak.clone(),
+                },
+            };
+            // A failed upgrade is a relaxed load of a count that reached zero. The thread that dropped the last
+            // reference queued the replacement before it did; this fence makes that offer visible to the drain.
+            fence(Ordering::Acquire);
+            state.drain();
+            let newer = state.values.borrow().get(id).cloned();
+            match newer {
+                Some(Slot::Light(now)) if !Weak::ptr_eq(&now, &dead) => {}
+                _ => return None,
             }
         }
     }
@@ -501,6 +617,55 @@ mod tests {
         registry.set_cell(&cell, None);
         assert_eq!(drops.load(Ordering::SeqCst), 2);
         assert!(registry.with_view(|v| v.get(&cell).is_none()));
+    }
+
+    #[test]
+    fn a_dropped_cell_gives_its_id_to_the_next_and_the_readers_forget_what_it_held() {
+        let registry = registry();
+        let first = registry.cell::<u64>();
+        registry.set_cell(&first, Some(Arc::new(5)));
+        registry.register_reader();
+        assert_eq!(registry.with_view(|v| v.get(&first).copied()), Some(5));
+        let id = first.id;
+        drop(first);
+        let second = registry.cell::<u64>();
+        assert_eq!(second.id, id, "the id came back");
+        assert_eq!(
+            registry.with_view(|v| v.get(&second).copied()),
+            None,
+            "the new cell starts empty, not with the old one's value"
+        );
+        // Churn: cells made and dropped do not grow the store.
+        for _ in 0..1_000 {
+            let cell = registry.cell::<u64>();
+            registry.set_cell(&cell, Some(Arc::new(1)));
+        }
+        assert!(registry.views().store.lock().values.len() <= 3);
+        registry.remove_reader();
+    }
+
+    #[test]
+    fn a_light_reader_that_stops_reading_is_dropped_when_its_mailbox_backs_up() {
+        let registry = registry();
+        let cell = registry.cell::<u64>();
+        registry.set_cell(&cell, Some(Arc::new(0)));
+        assert_eq!(registry.with_view(|v| v.get(&cell).copied()), Some(0));
+        assert_eq!(registry.views().store.lock().readers.len(), 1);
+        for value in 1..=(LIGHT_BACKLOG + 10) {
+            registry.set_cell(&cell, Some(Arc::new(value)));
+        }
+        assert_eq!(
+            registry.views().store.lock().readers.len(),
+            0,
+            "the writer stopped feeding a reader that never drains"
+        );
+        // The thread reads again: it registers again and sees the current value.
+        assert_eq!(
+            registry.with_view(|v| v.get(&cell).copied()),
+            Some(LIGHT_BACKLOG + 10)
+        );
+        assert_eq!(registry.views().store.lock().readers.len(), 1);
+        registry.remove_reader();
     }
 
     #[test]

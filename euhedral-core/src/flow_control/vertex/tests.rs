@@ -8,6 +8,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::mpsc;
 use std::sync::{Barrier, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 fn registry() -> Arc<UpstreamRegistry> {
     UpstreamRegistry::with_topology(4, CpuSet::new())
@@ -986,6 +987,65 @@ fn retirement_waits_until_no_generation_routes_to_the_child() {
         1,
         "an unrouted child retires at once"
     );
+}
+
+/// A retirement can close a clone and wait for its workers, and the last holder of a retired generation may be one of
+/// those workers (or any worker): it must not wait there. The retirement goes to a thread of its own, and the worker's
+/// `refresh_view` returns at once.
+#[test]
+fn a_retirement_never_runs_on_the_worker_that_let_go_of_the_generation_last() {
+    const WAIT: Duration = Duration::from_millis(400);
+    let registry = registry();
+    let vertex = Arc::new(LatticeVertex::new(&registry, "retire-worker", 2));
+    let (child, _) = receiving_edge(&registry);
+    let (other, _) = receiving_edge(&registry);
+    assert!(map(&vertex, &[0], &[node(&child)]));
+    let ran_on = Arc::new(Mutex::new(None));
+    let done = Arc::new(AtomicBool::new(false));
+    {
+        let (ran_on, done) = (ran_on.clone(), done.clone());
+        child.defer_retirement(Box::new(move || {
+            *ran_on.lock().unwrap() = thread::current().name().map(str::to_owned);
+            thread::sleep(WAIT);
+            done.store(true, Ordering::Release);
+        }));
+    }
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (go_tx, go_rx) = mpsc::channel::<()>();
+    let worker = {
+        let (registry, vertex) = (registry.clone(), vertex.clone());
+        thread::Builder::new()
+            .name("worker-b".into())
+            .spawn(move || {
+                registry.register();
+                // The worker's view holds the first generation.
+                assert_eq!(vertex.with_routing_state(|state| state.len()), 1);
+                ready_tx.send(()).unwrap();
+                go_rx.recv().unwrap();
+                let started = Instant::now();
+                registry.refresh_view();
+                started.elapsed()
+            })
+            .unwrap()
+    };
+    ready_rx.recv().unwrap();
+    // The new generation no longer routes to the child; the worker's view is the first generation's last holder.
+    assert!(map(&vertex, &[1], &[None, node(&other)]));
+    assert!(!done.load(Ordering::Acquire));
+    go_tx.send(()).unwrap();
+    let refresh = worker.join().unwrap();
+    assert!(
+        refresh < WAIT / 4,
+        "refresh_view took {refresh:?}: the retirement ran on the worker"
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !done.load(Ordering::Acquire) {
+        assert!(Instant::now() < deadline, "the retirement never ran");
+        thread::sleep(Duration::from_millis(1));
+    }
+    let ran_on = ran_on.lock().unwrap().clone();
+    assert_eq!(ran_on.as_deref(), Some("retire-worker-retire"));
+    assert!(child.is_closed());
 }
 
 #[test]

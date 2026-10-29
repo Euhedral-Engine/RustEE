@@ -66,7 +66,7 @@ struct State {
 /// frame and that change only when the lattice is rebuilt. They reach the workers through queues.
 pub struct UpstreamRegistry {
     id: u64,
-    views: Views,
+    views: Arc<Views>,
     upstream_count: Arc<PaddedAtomicLong>,
     thread_count: AtomicUsize,
     /// One past each CPU's rank among the workers' CPUs, or zero for a CPU without workers.
@@ -87,7 +87,7 @@ impl UpstreamRegistry {
     pub fn with_topology(cpu_span: usize, p_cpus: CpuSet) -> Arc<Self> {
         Arc::new(Self {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
-            views: Views::new(),
+            views: Arc::new(Views::new()),
             upstream_count: Arc::new(PaddedAtomicLong::new(0)),
             thread_count: AtomicUsize::new(0),
             ranks: (0..cpu_span).map(|_| AtomicUsize::new(0)).collect(),
@@ -114,7 +114,7 @@ impl UpstreamRegistry {
         self.id
     }
 
-    pub(super) fn views(&self) -> &Views {
+    pub(super) fn views(&self) -> &Arc<Views> {
         &self.views
     }
 
