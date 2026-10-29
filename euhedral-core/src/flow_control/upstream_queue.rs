@@ -31,7 +31,7 @@ fn request_evidence() -> (u64, u64) {
 /// An upstream source as an [`UpstreamQueue`] sees it.
 ///
 /// One handle sits in the queue of every worker that may service it. A worker services a handle
-/// only while it holds the handle's lock, so a handle is serviced by one worker at a time.
+/// only while it holds the handle's claim, so a handle is serviced by one worker at a time.
 pub trait UpstreamHandle: Send + Sync {
     /// The handle's registration order, which [`UpstreamQueue::reset_for_next_trial`] restores.
     fn sequence(&self) -> u64;
@@ -52,13 +52,13 @@ pub trait UpstreamHandle: Send + Sync {
     /// A complete handle is dropped from every queue that comes across it.
     fn is_complete(&self) -> bool;
 
-    /// Takes the handle's lock, or returns false if another worker holds it. The default never
+    /// Takes the handle's claim, or returns false if another worker holds it. The default never
     /// contends.
     fn try_acquire(&self) -> bool {
         true
     }
 
-    /// Releases the lock taken by [`try_acquire`](Self::try_acquire).
+    /// Releases the claim taken by [`try_acquire`](Self::try_acquire).
     fn release(&self) {}
 }
 
@@ -91,7 +91,7 @@ pub enum PullBucketDivisionMode {
 /// One worker's view of the upstream handles feeding a lattice, and the scheduler that spreads
 /// the worker's demand across them.
 ///
-/// Each worker owns its queue, so scheduling needs no coordination beyond each handle's lock. A
+/// Each worker owns its queue, so scheduling needs no coordination beyond each handle's claim. A
 /// demand is split into buckets, each bucket goes to the next handle round-robin, and handles
 /// return to the queue in a shuffled order so that workers do not all visit them in step.
 ///
@@ -574,7 +574,7 @@ struct Pull<'a> {
     stop: &'a mut dyn FnMut(&dyn Frame) -> bool,
 }
 
-/// A handle whose lock this worker holds. Dropping it releases the lock and returns the handle to
+/// A handle whose claim this worker holds. Dropping it releases the claim and returns the handle to
 /// the queue, even if servicing the handle panicked.
 struct Acquired<'a> {
     queue: &'a mut UpstreamQueue,

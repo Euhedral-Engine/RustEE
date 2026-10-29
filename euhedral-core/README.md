@@ -32,7 +32,7 @@ and routing policy, and lets idle workers steal unordered work.
 | Module | Main types |
 |---|---|
 | [`frames`](src/frames/mod.rs) | `Frame`, `FrameHeader`, `FrameError`; stock frames: `RunnableFrame`, `CallbackFrame`, `ArrayFrame`, `CollectionFrame`, `DummyFrame`, `BenchmarkFrame`; typed pipelines: `PipelineFrame`, `PipelineBuilder`, `Outcome`, `Status`. |
-| [`generics`](src/generics/mod.rs) | The interfaces frames flow through: `LatticeSource`, `LatticeReceiver`, `LatticeTerminal`, `LatticeInterceptor`, `FrameSink`, `FramePusher`; `CloneableObject` (what a lattice clones onto each core) and `AbstractExecutor`. |
+| [`generics`](src/generics/mod.rs) | The interfaces frames flow through: `LatticeSource`, `LatticeReceiver` (with `serialize`), `LatticeTerminal`, `LatticeInterceptor`, `FrameSink`, `FramePusher`; `SourceCell` and `SourceGuard` (a source's plain state), `DownstreamSlot` (a source's one receiver); `CloneableObject` (what a lattice clones onto each core) and `AbstractExecutor`. |
 | [`ingest`](src/ingest/mod.rs) | Ready-made `LatticeSource`s behind the `IngestSink` trait: `QueueIngestSink`, `ArrayIngestSink`, `PipelineRunner` (with `PipelineControl`, `AdmissionClosed`); and `SingleUseSource`. |
 | [`control_plane`](src/control_plane/mod.rs) | `ControlPlaneLattice` (with `LatticeError`, `UtilizationSource`), `ControlPlaneShard`, `ControlPlaneFragment`, `ControlPlaneCache`, `CacheDirectory`. |
 | [`config`](src/config/mod.rs) | `LatticeConfig`, `FragmentConfig`, `CacheConfig`, `IdlePolicy` with `FixedTiming` and `IdleTimingFunction` (`TimingProvider`, `TimingModel`), `CloneConfig`, `CloneLivenessRegistry`. |

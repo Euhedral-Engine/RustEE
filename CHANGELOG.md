@@ -3,6 +3,61 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## The source invariant's primitives (2026-10-29)
+
+**What.**
+- `euhedral-data-structures`: `sync::SetOnce<T>`, a cell installed at most once by a compare-and-set (`SeqCst`) and read
+  with an acquire load. Its value lives until the cell drops.
+- `euhedral-core`:
+  - `SourceCell<T>` and `SourceGuard`: a source's plain state under the lattice's single-entry guarantee. `unsafe fn
+    enter(&self)` takes the state; in debug builds a second entry, nested or from another thread, panics.
+  - `DownstreamSlot`: the one receiver a source pushes to. `attach` refuses a second receiver with `on_error`, tells a
+    late receiver of a completed slot `on_complete`, and otherwise installs the receiver, sets `live` and hands the
+    receiver the source through `add_upstream`. `complete` tells a live receiver `on_complete` exactly once, however
+    attach and completion race. `receiver()` reads without a lock.
+  - `LatticeReceiver::serialize(action)`: runs `action` when no `pull` or `request` of the source the receiver serves is
+    in progress, without waiting. The default runs it at once.
+  - `UpstreamInterceptor` implements `serialize`: actions go on an MPSC queue, and whoever holds the claim runs them
+    before it releases. The interceptor holds its source in a `SourceCell`, installs and releases it through
+    `serialize`, and drops it when it finishes.
+- **Breaking** for code that reads the interceptor's source: `UpstreamInterceptor::upstream()` is replaced by
+  `has_upstream(&Arc<dyn LatticeSource>)`, which answers by identity. The interceptor's claim is now a counter (`wip`):
+  `try_acquire` is `fetch_add(1) == 0` and `release` stores 0, where it was a flag swapped with `Acquire`. A source
+  that is completed through its interceptor (a source panic, `complete()`) is now completed when the worker that holds
+  it releases it, not at the call.
+
+**Why.** A source's state is touched by exactly one worker at a time, so it should need no atomics. Its lifecycle
+calls (completion, release) arrive from other threads while a worker may be inside `pull` or `request`, and used to
+need a lock or a flag per field. `serialize` gives them a way to reach that state without waiting, and the claim as a
+counter lets a releasing worker see an action that arrived behind its last look.
+
+**How.** A source keeps its worker-only state in a `SourceCell` and its receiver in a `DownstreamSlot`. Its lifecycle
+calls hand their work to `slot.serialize(action)`, and the action enters the cell. An implementer of
+`LatticeReceiver` that is no lattice needs nothing: the default runs the action at once.
+
+**Semantics.**
+- Every serialized action runs exactly once, in the order it was handed over, never while a `pull` or `request` of the
+  source is in progress, on the worker that holds the claim or on the caller if no worker does.
+- The claim: `try_acquire` is `wip.fetch_add(1, SeqCst) == 0`. `release` runs the pending actions, stores 0 with
+  `Release`, issues a `SeqCst` fence, and takes the claim again if `pending` is set, to run what arrived behind its
+  drain. `serialize` offers the action, sets `pending` (`SeqCst`), then tries the claim.
+- A panicking action is caught and logged; the actions behind it still run.
+- `has_upstream` answers by address and stays true after the interceptor has dropped its source.
+
+**Tests.**
+- `SetOnce`: `set_hands_the_value_back_when_one_is_set`, `a_set_value_is_dropped_exactly_once`,
+  `racing_setters_install_exactly_one`, and the loom model `loom_one_setter_wins_and_every_reader_sees_it`
+  (`RUSTFLAGS="--cfg loom" cargo test -p euhedral-data-structures --release --lib sync::set_once::loom`).
+- `SourceCell`: `a_second_thread_entering_while_one_is_inside_panics_in_debug`, `a_nested_enter_panics_in_debug`,
+  `a_direct_request_racing_the_lattice_is_caught_in_debug`, `entries_in_turn_from_many_threads_are_accepted`.
+- `DownstreamSlot`: `attach_racing_complete_tells_the_receiver_exactly_once` (10 000 rounds), the attach and complete
+  order tests, `serialize_goes_through_the_attached_receiver`.
+- The interceptor (`flow_control::vertex`): `serialize_runs_at_release_when_another_worker_holds_the_source`,
+  `serialize_from_inside_the_sources_own_pull_runs_before_release`,
+  `an_action_never_runs_while_a_pull_or_request_is_in_progress`, `release_races_serialize_and_no_action_is_stranded`,
+  `a_release_and_a_serialize_in_the_same_instant_never_strand_the_action` (removing the post-release fence or re-check
+  makes it fail), `the_interceptor_drops_its_source_when_it_finishes`, `complete_completes_the_source_through_serialize`.
+
 ## `Marker` names its queue (2026-10-28)
 
 **What.** `euhedral-graph`: `Marker` gained `queue: QueueId`, and `Marker::new(queue, lane, value)`. `QueueId` is an opaque,
