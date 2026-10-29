@@ -18,6 +18,7 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
     static THREAD_QUEUES: RefCell<Vec<ThreadQueue>> = const { RefCell::new(Vec::new()) };
+    static THREAD_EPOCHS: RefCell<Vec<ThreadEpoch>> = const { RefCell::new(Vec::new()) };
 }
 
 /// This thread's queue for one registry. Dropping it, when the thread exits or
@@ -29,8 +30,14 @@ struct ThreadQueue {
     cpu: Option<usize>,
     queue: Rc<RefCell<UpstreamQueue>>,
     producer: Producer<Entry, Multi>,
-    /// The thread's announcement in the registry's epoch domain.
-    epoch: Rc<EpochSlot>,
+}
+
+/// This thread's slot in one registry's epoch domain. It lives apart from the queue: a thread that only reads the
+/// lattice's published values (a lifecycle thread, a test) gets a slot and no queue.
+struct ThreadEpoch {
+    registry: Weak<UpstreamRegistry>,
+    registry_id: u64,
+    slot: Rc<EpochSlot>,
 }
 
 impl Drop for ThreadQueue {
@@ -117,11 +124,26 @@ impl UpstreamRegistry {
         &self.epochs
     }
 
-    /// The calling thread's slot in [`epochs`](Self::epochs), created with its queue on first use. A worker keeps
+    /// The calling thread's slot in [`epochs`](Self::epochs), created on first use. A worker keeps
     /// it for its cycles ([`EpochSlot::quiescent`], [`EpochSlot::idle`]); [`with_pinned`](Self::with_pinned) uses
     /// the same slot. `None` while the thread is exiting.
     pub fn thread_epoch(self: &Arc<Self>) -> Option<Rc<EpochSlot>> {
-        self.thread_queue(affinity::current_cpu, |queue| queue.epoch.clone())
+        THREAD_EPOCHS
+            .try_with(|entries| {
+                let mut entries = entries.borrow_mut();
+                if let Some(entry) = entries.iter().find(|entry| entry.registry_id == self.id) {
+                    return entry.slot.clone();
+                }
+                entries.retain(|entry| entry.registry.strong_count() > 0);
+                let slot = Rc::new(self.epochs.register());
+                entries.push(ThreadEpoch {
+                    registry: Arc::downgrade(self),
+                    registry_id: self.id,
+                    slot: slot.clone(),
+                });
+                slot
+            })
+            .ok()
     }
 
     /// Runs `f` with a guard that keeps the values the calling thread loads from the lattice's [`Published`]
@@ -184,6 +206,12 @@ impl UpstreamRegistry {
             })
             .unwrap_or_default();
         drop(removed);
+        // The thread's slot goes back to the domain once nothing else holds it.
+        let _ = THREAD_EPOCHS.try_with(|entries| {
+            entries
+                .borrow_mut()
+                .retain(|entry| entry.registry_id != self.id);
+        });
     }
 
     /// The number of live upstream handles.
@@ -259,7 +287,6 @@ impl UpstreamRegistry {
             cpu,
             queue: Rc::new(RefCell::new(queue)),
             producer: handles.producer(),
-            epoch: Rc::new(self.epochs.register()),
         }
     }
 

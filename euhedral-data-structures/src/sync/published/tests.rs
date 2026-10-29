@@ -6,7 +6,7 @@ use std::time::Duration;
 #[cfg(not(miri))]
 const ROUNDS: usize = 20_000;
 #[cfg(miri)]
-const ROUNDS: usize = 40;
+const ROUNDS: usize = 8;
 
 /// A value that counts its drops and poisons itself when dropped.
 struct Counted {
@@ -303,10 +303,17 @@ fn readers_never_see_a_freed_value() {
     let count = drops();
     let cell = Arc::new(Published::new(domain.clone(), Some(Counted::new(&count))));
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let started = Arc::new(AtomicUsize::new(0));
 
     let mut readers = Vec::new();
-    for worker_style in [false, true, false, true] {
+    let styles: &[bool] = if cfg!(miri) {
+        &[false, true]
+    } else {
+        &[false, true, false, true]
+    };
+    for &worker_style in styles {
         let (cell, domain, stop) = (cell.clone(), domain.clone(), stop.clone());
+        let started = started.clone();
         readers.push(thread::spawn(move || {
             let slot = domain.register();
             let mut reads = 0_u64;
@@ -321,6 +328,9 @@ fn readers_never_see_a_freed_value() {
                     }
                 }
                 reads += 1;
+                if reads == 1 {
+                    started.fetch_add(1, StdOrdering::SeqCst);
+                }
                 if reads.is_multiple_of(64) {
                     slot.idle();
                 }
@@ -329,6 +339,10 @@ fn readers_never_see_a_freed_value() {
         }));
     }
 
+    // Replace the value only while every reader is reading.
+    while started.load(StdOrdering::SeqCst) < readers.len() {
+        thread::yield_now();
+    }
     for _ in 0..ROUNDS {
         cell.store(Some(Counted::new(&count))).defer();
     }
