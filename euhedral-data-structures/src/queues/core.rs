@@ -198,6 +198,7 @@ impl<T> Core<T> {
                 self.mc_lock.load(Ordering::Relaxed) != thread_token(),
                 "clear called from inside a consumer callback of the same queue"
             );
+            #[allow(clippy::disallowed_methods, reason = "LIFECYCLE(D2)")]
             std::hint::spin_loop();
         }
     }
@@ -372,6 +373,7 @@ impl<T> Core<T> {
             let tail = self.tail.load(Ordering::Acquire);
             if tail & RESIZING != 0 {
                 // Another producer is installing a chunk and will clear the flag in a moment.
+                #[allow(clippy::disallowed_methods, reason = "JAVA-BACKOFF")]
                 std::hint::spin_loop();
                 continue;
             }

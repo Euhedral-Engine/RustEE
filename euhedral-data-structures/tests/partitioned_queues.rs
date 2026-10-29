@@ -1,5 +1,10 @@
 //! Partitioned queues: a fixed set of independent queues behind one handle pair. The shared behaviour
 //! is run against all four flavours through the adapter traits below.
+#![allow(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    reason = "test fixtures: the test thread runs peer threads and waits on them and locks its records"
+)]
 
 use euhedral_data_structures::queues::{
     Multi, PartitionedConsumer, PartitionedMpmcQueue, PartitionedMpscQueue, PartitionedProducer,

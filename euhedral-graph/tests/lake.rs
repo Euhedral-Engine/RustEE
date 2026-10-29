@@ -3,7 +3,10 @@
 //! CI runners have two cores, so nothing here assumes more than one: the lattice is given a single
 //! CPU, one the process may run on, and the tests assert structure (order, attachment, counts), not
 //! simultaneity.
-
+#![allow(
+    clippy::disallowed_types,
+    reason = "test fixtures: the test thread locks its records"
+)]
 // The test thread is the harness, not a frame: it polls for what the lattice did, and waits on a
 // latch, with sleeps no frame may make.
 #![allow(clippy::disallowed_methods)]
@@ -232,6 +235,33 @@ fn complete_gracefully_drains_then_completes() {
         "a completed lake takes nothing"
     );
     assert_eq!(ran.load(Ordering::Acquire), FRAMES + 2);
+    lattice.close();
+}
+
+#[test]
+fn a_frame_that_completes_its_sink_does_not_panic() {
+    let lattice = one_cpu_lattice();
+    let lake = Lake::new(lattice.clone(), sinks(2), Duration::ZERO);
+    let unit = Arc::new(Mutex::new(Some(lake.admit().expect("a unit"))));
+    let done = Arc::new(AtomicU64::new(0));
+
+    // The frame ends the lake's last unit on a worker: the sinks complete from inside a frame, which is
+    // lifecycle work done on the hot path's thread.
+    let frame: Box<dyn Frame> = {
+        let (lake, unit, done) = (lake.clone(), unit.clone(), done.clone());
+        Box::new(RunnableFrame::new(
+            1,
+            Arc::new(move || {
+                lake.complete_gracefully();
+                drop(unit.lock().unwrap_or_else(PoisonError::into_inner).take());
+                done.fetch_add(1, Ordering::AcqRel);
+            }),
+        ))
+    };
+    assert!(lake.offer(frame).is_ok());
+    eventually("the frame to run", || done.load(Ordering::Acquire) == 1);
+    eventually("the lake to complete", || lake.is_complete());
+    eventually("the sinks to complete", || !lake.is_attached());
     lattice.close();
 }
 

@@ -1,4 +1,9 @@
 //! Moving elements from one queue straight into another (`drain(receiver, ...)` upstream).
+#![allow(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    reason = "test fixtures: the test thread runs peer threads and waits on them and locks its records"
+)]
 
 use euhedral_data_structures::queues::{MpmcQueue, MpscQueue, Sink, SpscQueue};
 use std::collections::VecDeque;

@@ -16,9 +16,10 @@ mod copier;
 pub use backends::{DeviceMemory, PinnedHost, StreamPool, Vmm, VmmBlock};
 pub use copier::StreamCopier;
 
+use euhedral_data_structures::sync::{HotScope, LifecycleMutex, SetOnce};
 use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
 use std::fmt;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 
 pub type CuResult = c_int;
 pub type CuDevicePtr = u64;
@@ -248,13 +249,21 @@ impl Driver {
     /// is one loaded library and, through [`Device::open`], one primary context. A failed load is not remembered: a
     /// later call tries again.
     pub fn shared() -> Result<Arc<Self>, String> {
-        static SHARED: Mutex<Option<Arc<Driver>>> = Mutex::new(None);
-        let mut shared = SHARED.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(driver) = &*shared {
+        static LOADED: SetOnce<Arc<Driver>> = SetOnce::new();
+        static LOADING: LifecycleMutex<()> = LifecycleMutex::new(());
+        // After the first load every call is one acquire load.
+        if let Some(driver) = LOADED.get() {
+            return Ok(driver.clone());
+        }
+        // The first load is lifecycle work, also when a frame makes it.
+        let _cold = HotScope::leave();
+        let _loading = LOADING.lock();
+        if let Some(driver) = LOADED.get() {
             return Ok(driver.clone());
         }
         let driver = Driver::load()?;
-        *shared = Some(driver.clone());
+        // Under `LOADING` nobody else sets the cell, so the set succeeds.
+        let _ = LOADED.set(driver.clone());
         Ok(driver)
     }
 

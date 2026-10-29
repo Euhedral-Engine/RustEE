@@ -6,6 +6,7 @@ use crate::flow_control::{Claim, LatticeNode, UpstreamHandle};
 use crate::frames::Failure;
 use crate::generics::{LatticeReceiver, LatticeTerminal};
 use crate::metrics::CAP_FACTOR_SUFFIX;
+use euhedral_data_structures::sync::HotScope;
 use euhedral_hardware_utils::monitor::{HardwareUtilization, HardwareUtilizationParts};
 use euhedral_hardware_utils::topology::Topology;
 use euhedral_hardware_utils::topology::source::{CoreKind, LogicalCpu, TopologyInput, normalize};
@@ -124,6 +125,8 @@ struct Gate {
     stop_at: Mutex<Option<u64>>,
     holding: Condvar,
     held: AtomicBool,
+    /// The frames pushed while the pushing thread was inside a hot scope.
+    pushed_hot: AtomicU64,
 }
 
 impl Gate {
@@ -156,6 +159,9 @@ impl LatticeTerminal for Gate {
 impl LatticeReceiver for Gate {
     fn push(&self, frame: Box<dyn Frame>) {
         let id = frame.header().id_hash();
+        if HotScope::active() {
+            self.pushed_hot.fetch_add(1, Ordering::AcqRel);
+        }
         let mut stop_at = lock(&self.stop_at);
         while *stop_at == Some(id) {
             self.held.store(true, Ordering::Release);
@@ -394,6 +400,25 @@ fn started_workers_register_and_run_the_cores_frames() {
     assert!(buddy_ran.iter().all(|id| (id * 7 + 1000) % 2 == 1));
     wait_until("the fragment to drain", || fragment.is_drained());
     assert!(buddy.is_drained());
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn a_worker_cycle_runs_inside_a_hot_scope() {
+    let Some(fixture) = Fixture::single() else {
+        return;
+    };
+    let fixture = fixture.started();
+    for id in 0..50 {
+        fixture.edge.push_downstream(unordered(id, id + 1));
+    }
+    wait_until("every frame to run", || {
+        fixture.receiver.received().len() == 50
+    });
+    // The output receiver is reached on the worker, from inside the cycle.
+    assert_eq!(fixture.receiver.pushed_hot.load(Ordering::Acquire), 50);
+    // This thread is no worker.
+    assert!(!HotScope::active());
 }
 
 #[test]

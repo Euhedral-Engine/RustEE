@@ -3,6 +3,77 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## Hot-path guard rails (2026-10-29)
+
+**What.**
+- `euhedral_data_structures::sync`: `LifecycleMutex<T>` and `LifecycleRwLock<T>` (locks for start, stop and rebalance
+  state; they ignore poison) and `HotScope` (`enter`, `leave`, `active`), the debug check that keeps them off the hot
+  path.
+- A workspace `clippy.toml` (and the same entries in the `euhedral-graph`, `euhedral-io` and `euhedral-gpu`
+  configurations) lists the standard lock types (`Mutex`, `RwLock`, `Condvar`, `Barrier`, the `mpsc` endpoints) and the
+  calls that park, sleep, yield or spin.
+- Every lifecycle lock of the audit (worker slots, fragment and lattice start/stop/close state, the registry, the
+  pinned executors, the monitor's poller, the lake's retiring generations and idle watch, the driver and compiler
+  handles) is a `LifecycleMutex` or `LifecycleRwLock`.
+- Every hot-path lock the audit lists is tagged `HOT-FIX(<id>)` at its field and at each use the lint reports: 57
+  ids (the audit's findings C1-C14, C16-C20, G1-G3, G5-G7, G10-G15, I1-I15, H1-H7, M1, and the source-contract markers
+  S1, S2 and S6a). `euhedral-core/tests/hot_fix_ratchet.rs` lists the ids with the number of places each is used and
+  checks each against a row of the audit. It also checks that every `allow` of a disallowed type or call in the library
+  sources begins its reason with a listed `HOT-FIX(<id>)`, a `LIFECYCLE(<id>)` that is a row of the audit, or (for a
+  call) `JAVA-BACKOFF`, and it refuses a type alias of a lock type. A change that replaces a lock lowers or deletes
+  its entry; a reused or new id fails.
+- The lint list also names `parking_lot`, `spin` and `lock_api` locks (`allow-invalid`, so an absent crate is fine).
+  `Once`, `OnceLock` and `LazyLock` are lifecycle state (C34, H11) and are not listed. CI lints `euhedral-memory` with
+  its `cuda` feature.
+- `euhedral-hardware-utils` depends on `euhedral-data-structures`, so the layers are: data-structures and hashing,
+  hardware-utils, core, graph and io, memory, gpu (`euhedral-gpu/tests/layering.rs`).
+
+**Why.** The hot path (per frame, pull, request, offer, completion and tick) takes no lock. The lint makes a new lock
+on it a build failure, the debug check makes a lifecycle lock reached from a frame end the test run, and the ratchet
+makes the remaining hot locks a visible, shrinking list.
+
+**How.**
+- A new lock for start, stop or rebalance state is a `LifecycleMutex` or `LifecycleRwLock`; `lock()`, `read()` and
+  `write()` return the standard guards directly.
+- A wait, park, sleep or spin that is part of lifecycle work, or of an upstream back-off, carries
+  `#[allow(clippy::disallowed_methods, reason = "LIFECYCLE(<id>)")]` or `reason = "JAVA-BACKOFF"`.
+- A lifecycle step that a frame legitimately reaches (the first attach of a lake, the retirement of a routing
+  generation, a sink's completion, a lattice's `add_upstream`) starts with `let _cold = HotScope::leave();`.
+- Code that runs per frame, pull, request, offer or completion starts with `let _hot = HotScope::enter();`. The worker
+  cycle, the upstream queue's `request` and `pull`, `LatticeVertex::try_push`, the cache's `push`, `greedy_while`,
+  `poll_while` and steals, the ingest queue's `offer*`, `Lake::offer`, `Completions::add`, `Join` arrivals,
+  `Sequencer::register` and `finish`, the stage graph's `arrive`, `run_stage` and `submitted`, `AsyncIo`'s submissions,
+  the memory planner's and tier mover's `wake`, `Reaper::reap` and the CUDA retirement callback are covered.
+- The process-wide compiler and driver handles (`Nvrtc::shared`, `Driver::shared`) read a `SetOnce` after the first
+  load, so a stage that compiles a kernel takes no lock; the first load runs under `HotScope::leave()`.
+
+**Semantics.**
+- Release builds carry none of it: `HotScope` does nothing, `active()` is `false`, and the lifecycle locks are the
+  standard locks.
+- A debug build prints "lifecycle lock taken inside a hot scope, at <file:line>" (the lock call, by `#[track_caller]`)
+  and aborts the process when a lifecycle lock is taken while the thread's hot depth is above zero. It aborts because
+  the frame runners catch panics: a panic would be reported as the frame's failure and could pass unseen. The depth is
+  per thread, scopes nest, and `leave()` suspends all of them until its guard drops. A test that provokes a violation
+  installs `HotScope::install_violation_hook` (debug builds; the returned guard restores the previous hook, also when
+  the test panics). The hook receives the location and the lock then proceeds. The hook is process-wide, so it keeps
+  the locations it expects and forwards the rest to `HotScope::report_default`; the lake test has a test file, and so a
+  process, of its own. The default report is written straight to stderr, because the test harness's output capture
+  would otherwise swallow it when the process aborts.
+  `HotGuard::drop` asserts the depth is above zero.
+- The same locks guard the same state in the same places. The lifecycle locks ignore poison; the upstream
+  registry's state, which took `lock().unwrap()` and so panicked after a panic in a holder, continues instead, as the
+  rest of the lifecycle state already did and as the audit specifies.
+
+**Tests.**
+- `sync::lifecycle::tests` (data-structures): the lock outside a scope, the hook receiving each lock call inside one
+  (debug), the default report aborting even inside `catch_unwind` (a child process, debug on Unix), `leave` and the
+  restored depth, a poisoned lock, `try_lock`.
+- `a_worker_cycle_runs_inside_a_hot_scope` (core fragment tests), `a_frame_that_completes_its_sink_does_not_panic` and
+  `a_frame_taking_a_lifecycle_lock_through_a_lake_reaches_the_violation_hook` (graph `tests/lake.rs`).
+- `hot_fix_ratchet` (core): the tags and their uses equal `HOT_FIX_TAGS` (57 ids), each id is a row of the audit, every
+  disallowed `allow` is explained by a tag at the start of its reason, no type alias hides a lock, and the scan finds
+  library code after an inline test module.
+
 ## GPU lane sources (2026-10-29)
 
 **What.** `euhedral-gpu`:

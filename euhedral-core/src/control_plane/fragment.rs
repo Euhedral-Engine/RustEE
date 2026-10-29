@@ -9,6 +9,7 @@ use crate::metrics::{
 };
 use crate::utils::{FlowContext, FlowRecorder, StopWatch};
 use euhedral_data_structures::atomics::CachePadded;
+use euhedral_data_structures::sync::{HotScope, LifecycleMutex};
 use euhedral_hardware_utils::affinity::{self, ExecutorError, PinnedThreadExecutor, TaskInterrupt};
 use euhedral_hardware_utils::monitor::CoreSnapshot;
 use std::error::Error;
@@ -16,6 +17,7 @@ use std::fmt;
 use std::panic::{self, AssertUnwindSafe};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+#[allow(clippy::disallowed_types, reason = "HOT-FIX(C2)")]
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::thread::{self, Thread};
 use std::time::{Duration, Instant};
@@ -90,17 +92,17 @@ pub struct ControlPlaneFragment {
     /// the fragment releases the use; the executor closes with its last one.
     executor: PinnedThreadExecutor,
     /// Interrupts this fragment's worker task alone; set while a worker has been submitted.
-    task: Mutex<Option<TaskInterrupt>>,
+    task: LifecycleMutex<Option<TaskInterrupt>>,
     buddy: Option<Arc<ControlPlaneFragment>>,
     /// Serializes start, reset and close.
-    lifecycle: Mutex<()>,
+    lifecycle: LifecycleMutex<()>,
     /// The timestamp of the last CPU snapshot the batch cap followed.
     /// [`NO_SNAPSHOT`] until one is followed.
     last_snapshot: AtomicI64,
     running: AtomicBool,
     close_requested: AtomicBool,
     initialized: AtomicBool,
-    worker: Mutex<Option<Thread>>,
+    worker: LifecycleMutex<Option<Thread>>,
     reset_requested: AtomicU64,
     reset_completed: AtomicU64,
     reset_cleared: AtomicU64,
@@ -173,14 +175,14 @@ impl ControlPlaneFragment {
             output,
             body_cost,
             executor,
-            task: Mutex::new(None),
+            task: LifecycleMutex::new(None),
             buddy,
-            lifecycle: Mutex::new(()),
+            lifecycle: LifecycleMutex::new(()),
             last_snapshot: AtomicI64::new(NO_SNAPSHOT),
             running: AtomicBool::new(false),
             close_requested: AtomicBool::new(false),
             initialized: AtomicBool::new(false),
-            worker: Mutex::new(None),
+            worker: LifecycleMutex::new(None),
             reset_requested: AtomicU64::new(0),
             reset_completed: AtomicU64::new(0),
             reset_cleared: AtomicU64::new(0),
@@ -238,7 +240,9 @@ impl ControlPlaneFragment {
     pub(crate) fn await_executors(&self, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         let ended = loop {
-            let ended = lock(&self.task)
+            let ended = self
+                .task
+                .lock()
                 .as_ref()
                 .is_none_or(TaskInterrupt::is_finished);
             if ended || Instant::now() >= deadline {
@@ -253,7 +257,7 @@ impl ControlPlaneFragment {
     }
 
     fn lock_lifecycle(&self) -> MutexGuard<'_, ()> {
-        lock(&self.lifecycle)
+        self.lifecycle.lock()
     }
 
     fn initial_batch_cap(&self) -> u64 {
@@ -269,13 +273,13 @@ impl ControlPlaneFragment {
 
     /// Interrupts this fragment's worker task; no other task on the executor is touched.
     fn interrupt_task(&self) {
-        if let Some(task) = &*lock(&self.task) {
+        if let Some(task) = &*self.task.lock() {
             task.interrupt();
         }
     }
 
     fn unpark_worker(&self) {
-        let worker = lock(&self.worker).clone();
+        let worker = self.worker.lock().clone();
         if let Some(worker) = worker
             && worker.id() != thread::current().id()
         {
@@ -298,7 +302,7 @@ impl ControlPlaneFragment {
         if let Some(slot) = slot {
             slot.enter(thread::current());
         }
-        *lock(&self.worker) = Some(thread::current());
+        *self.worker.lock() = Some(thread::current());
         let mut exit = WorkerExit {
             fragment: &self,
             registered: false,
@@ -344,7 +348,9 @@ impl ControlPlaneFragment {
     }
 
     fn run_cycle(&self, policy: &mut DecisionTree, cycle: &mut Cycle) {
+        // A reset is lifecycle work; the cycle proper is the hot path.
         self.handle_reset_request(policy, cycle);
+        let _hot = HotScope::enter();
 
         let half_life = policy.idle_policy().contention_half_life();
         let (contention, upstreams) = self
@@ -356,6 +362,7 @@ impl ControlPlaneFragment {
             })
             .unwrap_or_default();
         if upstreams == 0 && self.cache.is_drained() {
+            #[allow(clippy::disallowed_methods, reason = "JAVA-BACKOFF")]
             thread::park_timeout(EMPTY_PARK);
             return;
         }
@@ -427,8 +434,10 @@ impl ControlPlaneFragment {
                 let park = self
                     .with_queue(|queue| policy.idle_park(queue, cycle.now, registered, productive))
                     .unwrap_or(policy.idle_policy().idle_park());
+                #[allow(clippy::disallowed_methods, reason = "JAVA-BACKOFF")]
                 thread::park_timeout(park);
                 cycle.now = Instant::now();
+                #[allow(clippy::disallowed_methods, reason = "JAVA-BACKOFF")]
                 thread::yield_now();
                 return;
             }
@@ -436,9 +445,11 @@ impl ControlPlaneFragment {
             if !park.is_zero()
                 && self.with_queue(|queue| queue.productive_handle_count()) == Some(0)
             {
+                #[allow(clippy::disallowed_methods, reason = "JAVA-BACKOFF")]
                 thread::park_timeout(park);
                 cycle.now = Instant::now();
             } else {
+                #[allow(clippy::disallowed_methods, reason = "JAVA-BACKOFF")]
                 thread::yield_now();
             }
             return;
@@ -451,6 +462,7 @@ impl ControlPlaneFragment {
             self.execution_metrics(),
             || self.registry.thread_count(),
         );
+        #[allow(clippy::disallowed_methods, reason = "JAVA-BACKOFF")]
         std::hint::spin_loop();
     }
 
@@ -542,7 +554,7 @@ impl CloneableObject for ControlPlaneFragment {
             .executor
             .submit_interruptible(move || this.run_worker())
         {
-            Ok((_, interrupt)) => *lock(&self.task) = Some(interrupt),
+            Ok((_, interrupt)) => *self.task.lock() = Some(interrupt),
             Err(rejected) => {
                 self.running.store(false, Ordering::Release);
                 panic!(
@@ -642,6 +654,7 @@ impl CloneableObject for ControlPlaneFragment {
                 && self.running.load(Ordering::Acquire)
                 && Instant::now() < deadline
             {
+                #[allow(clippy::disallowed_methods, reason = "LIFECYCLE(C25)")]
                 thread::park_timeout(RESET_POLL);
             }
             assert!(
@@ -744,6 +757,7 @@ fn initial_batch_cap(config: &FragmentConfig, cache: &ControlPlaneCache) -> u64 
 }
 
 /// An output that times a sample of the frame bodies it pushes into `body_cost`.
+#[allow(clippy::disallowed_types, reason = "HOT-FIX(C2)")]
 fn timed_output(body_cost: Arc<BodyCost>) -> LatticeHotSource {
     let watch = Arc::new(Mutex::new(StopWatch::new()));
     let started = watch.clone();
@@ -756,6 +770,7 @@ fn timed_output(body_cost: Arc<BodyCost>) -> LatticeHotSource {
         })
 }
 
+#[allow(clippy::disallowed_types, reason = "HOT-FIX(C2)")]
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -908,7 +923,7 @@ impl Drop for WorkerExit<'_> {
             fragment.registry.remove_thread();
         }
         FlowContext::clear();
-        *lock(&fragment.worker) = None;
+        *fragment.worker.lock() = None;
         fragment.running.store(false, Ordering::Release);
         if let Some(slot) = fragment.liveness.slot(fragment.cpu) {
             slot.exit();

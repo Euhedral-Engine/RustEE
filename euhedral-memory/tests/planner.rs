@@ -1,4 +1,8 @@
 //! The planner's accounting, give-back, admission and leak check, without a device.
+#![allow(
+    clippy::disallowed_types,
+    reason = "test fixtures: the test thread locks its records"
+)]
 
 use euhedral_memory::{
     ClaimResult, LocationKind, LocationSpec, OwnerSpec, Placed, PlanItem, PlanRequest, Planner,

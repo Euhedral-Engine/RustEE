@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test fixtures: the test thread runs peer threads and waits on them"
+)]
 use euhedral_data_structures::atomics::PaddedAtomicLong;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;

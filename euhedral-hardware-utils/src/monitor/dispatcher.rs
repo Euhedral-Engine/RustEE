@@ -5,6 +5,7 @@
 //! is taken.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
+#[allow(clippy::disallowed_types, reason = "HOT-FIX(H5)")]
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, ThreadId};
 
@@ -26,7 +27,9 @@ struct State<T> {
 }
 
 struct Shared<T> {
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(H5)")]
     state: Mutex<State<T>>,
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(H5)")]
     changed: Condvar,
 }
 
@@ -45,6 +48,7 @@ pub(crate) struct LatestValueDispatcher<T> {
 
 impl<T: Send + 'static> LatestValueDispatcher<T> {
     /// Starts the dispatch thread.
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(H5)")]
     pub(crate) fn new(name: &str) -> std::io::Result<Self> {
         let shared = Arc::new(Shared {
             state: Mutex::new(State {

@@ -11,6 +11,7 @@ use crate::generics::LatticeSource;
 use crate::internal::task_pool::TaskPool;
 use crate::metrics::{MetricsRegistry, MetricsSnapshot};
 use crate::utils::spin_wait;
+use euhedral_data_structures::sync::{HotScope, LifecycleMutex};
 use euhedral_hardware_utils::monitor::{
     HardwareUtilization, MonitorError, ResourceMonitor, SocketSnapshot,
 };
@@ -21,6 +22,10 @@ use std::error::Error;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+#[allow(
+    clippy::disallowed_types,
+    reason = "HOT-FIX(C18), HOT-FIX(C17), HOT-FIX(C16)"
+)]
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -139,14 +144,17 @@ pub struct ControlPlaneLattice {
     controller: Arc<LatticeVertex>,
     shards: Vec<Arc<ControlPlaneShard>>,
     pool: TaskPool,
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(C18)")]
     state: Mutex<State>,
     /// Serializes updates.
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(C17)")]
     updating: Mutex<()>,
     /// Held to start: whether the lattice started.
-    started: Mutex<bool>,
+    started: LifecycleMutex<bool>,
     resetting: AtomicBool,
     closed: AtomicBool,
     /// Read-held by every update; closing write-locks it once, so no update outlives the close.
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(C16)")]
     gate: RwLock<()>,
     this: Weak<ControlPlaneLattice>,
 }
@@ -161,6 +169,10 @@ impl ControlPlaneLattice {
 
     /// A lattice over `mapper`'s topology, following `source`. The config's allowed CPUs are
     /// ignored: `mapper` decides which CPUs are allowed.
+    #[allow(
+        clippy::disallowed_types,
+        reason = "HOT-FIX(C18), HOT-FIX(C17), HOT-FIX(C16)"
+    )]
     pub fn with_source(
         config: LatticeConfig,
         mapper: Arc<TopologyMapper>,
@@ -210,7 +222,7 @@ impl ControlPlaneLattice {
             }),
             mapper,
             updating: Mutex::new(()),
-            started: Mutex::new(false),
+            started: LifecycleMutex::new(false),
             resetting: AtomicBool::new(false),
             closed: AtomicBool::new(false),
             gate: RwLock::new(()),
@@ -245,7 +257,7 @@ impl ControlPlaneLattice {
     /// active socket is ready, then starts following the source. Does nothing once started; after a
     /// failure it may be called again.
     pub fn start(&self) -> Result<(), LatticeError> {
-        let mut started = self.started.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut started = self.started.lock();
         if self.closed.load(Ordering::Acquire) {
             return Err(LatticeError::Closed);
         }
@@ -291,6 +303,8 @@ impl ControlPlaneLattice {
         &self,
         source: Arc<dyn LatticeSource>,
     ) -> Result<Arc<UpstreamInterceptor>, LatticeError> {
+        // Attaching a source is rebalance work, also when a frame does it.
+        let _cold = HotScope::leave();
         log::trace!(target: &self.name, "adding an upstream");
         self.start()?;
         self.controller
@@ -493,7 +507,7 @@ impl ControlPlaneLattice {
         if self.closed.load(Ordering::Acquire) {
             return Err(LatticeError::Closed);
         }
-        if !*self.started.lock().unwrap_or_else(PoisonError::into_inner) {
+        if !*self.started.lock() {
             return Ok(CacheReset {
                 cleared_frames: 0,
                 active_workers: 0,
@@ -575,7 +589,7 @@ impl ControlPlaneLattice {
         self.controller.close_after_routes_retire(move || {
             // The last route can retire on a worker mid-push, and closing a shard waits for its
             // workers, so the shards close on a thread of their own.
-            let task = Arc::new(Mutex::new(Some(close_shards)));
+            let task = Arc::new(LifecycleMutex::new(Some(close_shards)));
             let spawned = {
                 let task = task.clone();
                 thread::Builder::new()
@@ -620,8 +634,8 @@ impl Drop for Reopen<'_> {
     }
 }
 
-fn run_once(task: &Mutex<Option<impl FnOnce()>>) {
-    if let Some(task) = task.lock().unwrap_or_else(PoisonError::into_inner).take() {
+fn run_once(task: &LifecycleMutex<Option<impl FnOnce()>>) {
+    if let Some(task) = task.lock().take() {
         task();
     }
 }

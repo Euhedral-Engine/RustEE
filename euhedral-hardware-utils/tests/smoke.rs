@@ -1,4 +1,8 @@
 //! The platform back end on the machine running the tests.
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test fixtures: the test thread runs peer threads and waits on them"
+)]
 
 use euhedral_hardware_utils::affinity::{self, AffinityCapability, PinnedThreadExecutor};
 use euhedral_hardware_utils::monitor::{self, MonitorError, ResourceMonitor};

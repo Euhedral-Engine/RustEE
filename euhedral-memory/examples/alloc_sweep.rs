@@ -5,6 +5,10 @@
 //! Prints CSV tables: per method and size, alloc and free latency p50/p99 (µs) for pairs (alloc then free at
 //! once: churn) and batches (K live, then all freed); the import of a CUDA VMM allocation into Vulkan; copy
 //! throughput; and whether a free or an allocation waits for unrelated busy device work.
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test fixtures: the test thread runs peer threads and waits on them"
+)]
 
 use std::ffi::CStr;
 use std::os::fd::IntoRawFd;

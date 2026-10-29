@@ -1,16 +1,19 @@
 use super::downstream::Downstream;
 use crate::frames::{Frame, FrameError};
 use crate::generics::{LatticeReceiver, LatticeSource};
+#[allow(clippy::disallowed_types, reason = "HOT-FIX(C13)")]
 use std::sync::{Arc, Mutex, PoisonError};
 
 /// A source of one frame. It completes once the frame is taken; completed before that, it cancels
 /// the frame.
 pub struct SingleUseSource {
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(C13)")]
     frame: Mutex<Option<Box<dyn Frame>>>,
     downstream: Downstream,
 }
 
 impl SingleUseSource {
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(C13)")]
     pub fn wrap(frame: Box<dyn Frame>) -> Arc<Self> {
         Arc::new(Self {
             frame: Mutex::new(Some(frame)),

@@ -31,7 +31,14 @@
 // `ThreadUsage` makes system calls and `Join` shares its part slots across threads, each with a
 // `// SAFETY:` comment; nowhere else.
 #![deny(unsafe_code)]
-
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_types,
+        clippy::disallowed_methods,
+        reason = "test fixtures lock their records and run peer threads"
+    )
+)]
 pub mod completions;
 pub mod join;
 pub mod lake;

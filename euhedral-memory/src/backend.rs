@@ -9,6 +9,7 @@
 use std::fmt;
 
 use euhedral_data_structures::queues::{Consumer, MpmcQueue, Multi, Producer};
+use euhedral_data_structures::sync::HotScope;
 
 use crate::planner::{Claim, LocationId};
 
@@ -95,6 +96,7 @@ impl<F: Fn() -> bool + Send> Retired for F {
 /// Frees queued behind the device work that last used them. `push` never waits; `reap` frees what has retired. A
 /// free is ordinary work: run `reap` on the owner's lane (its blocking time counts as that work's service time); only
 /// frees measured to block for much longer than the lattice's ordinary work go to a lattice set aside for them.
+// HOT-FIX(M1): `reap` makes the blocking driver frees (`cuMemFree`, `cuMemFreeHost`) on the worker that calls it.
 pub struct Reaper<T: Send> {
     queue: MpmcQueue<(Box<dyn Retired>, T)>,
     producer: Producer<(Box<dyn Retired>, T), Multi>,
@@ -138,6 +140,7 @@ impl<T: Send> Reaper<T> {
     /// Drops every queued item whose work retired and returns how many; the others stay queued (behind the newer
     /// ones). Another thread reaping at the same moment makes this return early, never wait.
     pub fn reap(&self) -> usize {
+        let _hot = HotScope::enter();
         let mut n = 0;
         let mut keep = Vec::new();
         let limit = self.queue.size_long();

@@ -21,6 +21,15 @@
 //! A frame is owned by whoever holds its `Box`: queues, executors and pools move it rather than
 //! share it, so a frame needs no locking and is never touched by two threads at once.
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_types,
+        clippy::disallowed_methods,
+        reason = "test fixtures lock their records and run peer threads"
+    )
+)]
+
 pub mod config;
 pub mod control_plane;
 pub mod flow_control;

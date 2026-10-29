@@ -89,6 +89,7 @@ dependencies = [
 name = "euhedral-hardware-utils"
 version = "0.1.0"
 dependencies = [
+ "euhedral-data-structures",
  "libc",
  "log",
  "windows-sys",

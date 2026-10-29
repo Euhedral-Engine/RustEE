@@ -6,9 +6,11 @@ use euhedral_data_structures::queues::partitioned::{
     PartitionedConsumer, PartitionedMpscQueue, PartitionedProducer,
 };
 use euhedral_data_structures::queues::queue::{Multi, Single};
+use euhedral_data_structures::sync::HotScope;
 use std::num::NonZeroUsize;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering, fence};
+#[allow(clippy::disallowed_types, reason = "HOT-FIX(C12)")]
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, TryLockError, Weak};
 
 type Consumer = PartitionedConsumer<Box<dyn Frame>, Single>;
@@ -44,6 +46,7 @@ pub(super) struct QueueSource {
     downstream: Downstream,
     queue: PartitionedMpscQueue<Box<dyn Frame>>,
     producer: PartitionedProducer<Box<dyn Frame>, Multi>,
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(C12)")]
     consumer: Mutex<Consumer>,
     /// A request waiting for a drain: a wakeup, not outstanding demand, so an empty queue never
     /// spins.
@@ -55,6 +58,7 @@ pub(super) struct QueueSource {
 }
 
 impl QueueSource {
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(C12)")]
     pub(super) fn new(partitions: NonZeroUsize, chunk_size: usize, ending: Ending) -> Arc<Self> {
         let queue = PartitionedMpscQueue::with_partitions(partitions.get(), chunk_size);
         Arc::new(Self {
@@ -95,6 +99,7 @@ impl QueueSource {
             Box<dyn Frame>,
         ) -> Result<(), Box<dyn Frame>>,
     ) -> Result<(), Box<dyn Frame>> {
+        let _hot = HotScope::enter();
         if self.publication_closed.load(Ordering::Acquire) {
             return Err(frame);
         }
@@ -396,6 +401,8 @@ impl IngestSink for QueueIngestSink {
 
     /// Stops publication and detaches from the lattice; queued frames stay until cleared.
     fn complete(&self) {
+        // Completing is lifecycle work, also when a frame does it.
+        let _cold = HotScope::leave();
         self.source.close();
     }
 

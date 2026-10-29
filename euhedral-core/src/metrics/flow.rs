@@ -93,6 +93,7 @@ impl PublishedFlow {
                 return None;
             }
             if before % 2 == 1 {
+                #[allow(clippy::disallowed_methods, reason = "JAVA-BACKOFF")]
                 std::hint::spin_loop();
                 continue;
             }

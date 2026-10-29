@@ -8,16 +8,17 @@
 
 use std::path::PathBuf;
 
-/// Layer 0 holds the utilities; each layer builds on the ones below it.
+/// Layer 0 holds the lock-free data structures and the hashing; the hardware utilities use the data structures'
+/// lifecycle locks, so they are layer 1. Each layer builds on the ones below it.
 const LAYERS: &[(&str, u8)] = &[
     ("euhedral-data-structures", 0),
     ("euhedral-hashing", 0),
-    ("euhedral-hardware-utils", 0),
-    ("euhedral-core", 1),
-    ("euhedral-graph", 2),
-    ("euhedral-io", 2),
-    ("euhedral-memory", 3),
-    ("euhedral-gpu", 4),
+    ("euhedral-hardware-utils", 1),
+    ("euhedral-core", 2),
+    ("euhedral-graph", 3),
+    ("euhedral-io", 3),
+    ("euhedral-memory", 4),
+    ("euhedral-gpu", 5),
 ];
 
 fn layer(name: &str) -> Option<u8> {

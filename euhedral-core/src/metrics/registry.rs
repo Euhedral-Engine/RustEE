@@ -1,6 +1,7 @@
 use super::{FlowStats, HistogramSnapshot};
+use euhedral_data_structures::sync::LifecycleMutex;
 use std::fmt;
-use std::sync::{Arc, Mutex, PoisonError, Weak};
+use std::sync::{Arc, Weak};
 
 /// Something whose meters a [`MetricsRegistry`] reads: a fragment or a cache.
 pub(crate) trait MeterSource: Send + Sync {
@@ -23,7 +24,7 @@ pub(crate) trait MeterSource: Send + Sync {
 /// Two registries are equal only if they are the same registry.
 #[derive(Default)]
 pub struct MetricsRegistry {
-    sources: Mutex<Vec<Weak<dyn MeterSource>>>,
+    sources: LifecycleMutex<Vec<Weak<dyn MeterSource>>>,
 }
 
 impl MetricsRegistry {
@@ -70,7 +71,7 @@ impl MetricsRegistry {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Weak<dyn MeterSource>>> {
-        self.sources.lock().unwrap_or_else(PoisonError::into_inner)
+        self.sources.lock()
     }
 }
 

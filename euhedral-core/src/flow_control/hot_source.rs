@@ -1,5 +1,6 @@
 use crate::frames::{Frame, FrameError};
 use crate::generics::{LatticeReceiver, LatticeSource};
+#[allow(clippy::disallowed_types, reason = "HOT-FIX(C1), HOT-FIX(C10)")]
 use std::sync::{Arc, Mutex, RwLock};
 
 type BeforeEach = Box<dyn FnMut(&dyn Frame) + Send>;
@@ -18,8 +19,11 @@ struct State {
 /// Optional hooks run around each push, for example to time it.
 #[derive(Default)]
 pub struct LatticeHotSource {
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(C1)")]
     before_each: Option<Mutex<BeforeEach>>,
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(C1)")]
     after_each: Option<Mutex<AfterEach>>,
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(C10)")]
     state: RwLock<State>,
 }
 
@@ -29,12 +33,14 @@ impl LatticeHotSource {
     }
 
     /// Runs `hook` with each frame just before it is pushed.
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(C1)")]
     pub fn before_each(mut self, hook: impl FnMut(&dyn Frame) + Send + 'static) -> Self {
         self.before_each = Some(Mutex::new(Box::new(hook)));
         self
     }
 
     /// Runs `hook` just after each push returns.
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(C1)")]
     pub fn after_each(mut self, hook: impl FnMut() + Send + 'static) -> Self {
         self.after_each = Some(Mutex::new(Box::new(hook)));
         self

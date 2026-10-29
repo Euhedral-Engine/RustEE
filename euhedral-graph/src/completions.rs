@@ -3,12 +3,17 @@
 use std::collections::VecDeque;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+#[allow(
+    clippy::disallowed_types,
+    reason = "HOT-FIX(G1), HOT-FIX(G2), HOT-FIX(G3)"
+)]
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
 use euhedral_core::frames::Frame;
 use euhedral_core::generics::{LatticeReceiver, LatticeSource};
 use euhedral_data_structures::queues::{Consumer, MpscQueue, Multi, Producer, Single};
+use euhedral_data_structures::sync::HotScope;
 
 use euhedral_core::metrics::Histogram;
 
@@ -60,6 +65,7 @@ pub struct Completions {
     /// The lanes polled for markers; released at [`LatticeSource::complete`] (the lattice that
     /// holds this source may outlive the run, and the lanes must not outlive it: they keep the
     /// device alive).
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(G2)")]
     lanes: Mutex<Option<Arc<LanePool>>>,
     /// Registered since the last poll; any thread appends, lock-free. [`LatticeSource::complete`]
     /// appends one [`Slot::Closed`] marker: what is behind it was registered too late.
@@ -67,9 +73,11 @@ pub struct Completions {
     /// The polling thread's side: the queue's consumer and what it drained and has not emitted.
     /// Only the polling thread locks it (`pull` and `request` are called by one thread at a time);
     /// the lock is never contended, except by a late registration's `sweep`, which only tries it.
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(G1)")]
     poll: Mutex<Poll>,
     pending: AtomicUsize,
     demand: AtomicU64,
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(G3)")]
     downstream: Mutex<Option<Arc<dyn LatticeReceiver>>>,
     complete: AtomicBool,
     /// How late each emission was, in µs, since the start (lock-free: polls record, readers copy).
@@ -132,6 +140,10 @@ impl fmt::Debug for Completions {
     }
 }
 
+#[allow(
+    clippy::disallowed_types,
+    reason = "HOT-FIX(G1), HOT-FIX(G2), HOT-FIX(G3)"
+)]
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -141,6 +153,10 @@ const INCOMING_CHUNK: usize = 256;
 
 impl Completions {
     /// Polls of `marker`s use `lanes`.
+    #[allow(
+        clippy::disallowed_types,
+        reason = "HOT-FIX(G2), HOT-FIX(G1), HOT-FIX(G3)"
+    )]
     pub fn new(lanes: Arc<LanePool>) -> Arc<Self> {
         let queue: MpscQueue<Slot> = MpscQueue::with_pool(INCOMING_CHUNK, 2);
         Arc::new(Self {
@@ -162,6 +178,7 @@ impl Completions {
     /// Registers `what`. Exactly one end for its frame, whatever races `complete` (the argument is
     /// on [`LatticeSource::complete`]'s implementation below).
     fn add(&self, what: Waits) {
+        let _hot = HotScope::enter();
         // The fast path of the sequential case: the flag is set and visible (`complete` returned
         // before this call, by any synchronisation), so nothing is queued and the frame ends here.
         // Only a speed-up and the visible failure: a registration that misses the flag takes the

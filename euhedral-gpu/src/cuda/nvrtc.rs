@@ -5,7 +5,9 @@
 
 use std::ffi::{CStr, CString, OsString, c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
+
+use euhedral_data_structures::sync::{HotScope, LifecycleMutex, SetOnce};
 
 use crate::{CompileOptions, GpuError};
 
@@ -216,7 +218,7 @@ fn library_path(address: *mut c_void) -> Option<PathBuf> {
 /// Whether two paths name one file.
 #[allow(
     clippy::disallowed_methods,
-    reason = "module loading is a build-time call; resolving a path blocks by nature"
+    reason = "LIFECYCLE(load): module loading is a build-time call; resolving a path blocks by nature"
 )]
 fn same_file(a: &Path, b: &Path) -> bool {
     match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
@@ -228,7 +230,7 @@ fn same_file(a: &Path, b: &Path) -> bool {
 /// The library's real file name, size and modification time.
 #[allow(
     clippy::disallowed_methods,
-    reason = "module loading is a build-time call; reading a file's metadata blocks by nature"
+    reason = "LIFECYCLE(load): module loading is a build-time call; reading a file's metadata blocks by nature"
 )]
 fn build_name(path: &Path) -> String {
     let real = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
@@ -249,7 +251,10 @@ fn build_name(path: &Path) -> String {
     format!("{name}:{len}:{modified}")
 }
 
-static SHARED: Mutex<Option<Arc<Nvrtc>>> = Mutex::new(None);
+/// The process's compiler once loaded; read with an acquire load.
+static LOADED: SetOnce<Arc<Nvrtc>> = SetOnce::new();
+/// Serializes the first load.
+static LOADING: LifecycleMutex<()> = LifecycleMutex::new(());
 
 impl Nvrtc {
     /// The process's NVRTC: the first successful load, by `explicit` or the search order. Loading blocks (file
@@ -258,27 +263,39 @@ impl Nvrtc {
     /// One compiler serves the process. Asking for a different library file once one is loaded is
     /// `Err(Invalid)`, not a silent use of the loaded one.
     pub fn shared(explicit: Option<&Path>) -> Result<Arc<Self>, GpuError> {
-        let mut shared = SHARED.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(nvrtc) = &*shared {
-            if let (Some(want), Some(have)) = (explicit, &nvrtc.library)
-                && !same_file(want, have)
-            {
-                return Err(GpuError::Invalid(format!(
-                    "NVRTC is already loaded from {}; this process cannot also use {}",
-                    have.display(),
-                    want.display()
-                )));
-            }
-            return Ok(nvrtc.clone());
+        // After the first load every call is one acquire load, so a stage that compiles a kernel takes no lock.
+        if let Some(loaded) = LOADED.get() {
+            return Self::agree(loaded, explicit);
+        }
+        // The first load is lifecycle work, also when a frame makes it.
+        let _cold = HotScope::leave();
+        let _loading = LOADING.lock();
+        if let Some(loaded) = LOADED.get() {
+            return Self::agree(loaded, explicit);
         }
         let nvrtc = Arc::new(Self::find(explicit)?);
-        *shared = Some(nvrtc.clone());
+        // Under `LOADING` nobody else sets the cell, so the set succeeds.
+        let _ = LOADED.set(nvrtc.clone());
         Ok(nvrtc)
+    }
+
+    /// The loaded compiler, unless `explicit` names another library file.
+    fn agree(loaded: &Arc<Self>, explicit: Option<&Path>) -> Result<Arc<Self>, GpuError> {
+        if let (Some(want), Some(have)) = (explicit, &loaded.library)
+            && !same_file(want, have)
+        {
+            return Err(GpuError::Invalid(format!(
+                "NVRTC is already loaded from {}; this process cannot also use {}",
+                have.display(),
+                want.display()
+            )));
+        }
+        Ok(loaded.clone())
     }
 
     #[allow(
         clippy::disallowed_methods,
-        reason = "module loading is a build-time call; listing a directory blocks by nature"
+        reason = "LIFECYCLE(load): module loading is a build-time call; listing a directory blocks by nature"
     )]
     fn find(explicit: Option<&Path>) -> Result<Self, GpuError> {
         let list = |dir: &Path| -> Vec<PathBuf> {

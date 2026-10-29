@@ -1,5 +1,9 @@
 //! Moves between tiers, without a device: three host-memory locations stand for a fast, a middle and a slow tier,
 //! joined by a copier whose copies retire a few checks after they start (as an asynchronous copy does).
+#![allow(
+    clippy::disallowed_types,
+    reason = "test fixtures: the test thread locks its records"
+)]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};

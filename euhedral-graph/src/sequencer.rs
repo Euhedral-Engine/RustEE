@@ -1,10 +1,12 @@
 //! Execute in any order, conclude in admission order (Euhedral-Execution `FrameSequencer` /
 //! `OffsetCollector`).
 
+use euhedral_data_structures::sync::HotScope;
 use std::collections::VecDeque;
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::atomic::{AtomicUsize, Ordering};
+#[allow(clippy::disallowed_types, reason = "HOT-FIX(G6)")]
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 /// Releases values in the order their slots were registered, whatever order they complete in.
@@ -21,6 +23,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 /// A panic in `emit` is its own: the slots behind it are still released, and the panic resumes on
 /// the releasing thread once the release ended (the releaser is never left claimed).
 pub struct Sequencer<T> {
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(G6)")]
     order: Mutex<Order<T>>,
     /// The work-in-progress count: the thread that raises it from 0 releases; the others leave
     /// their slot to it.
@@ -48,6 +51,7 @@ impl<T> fmt::Debug for Sequencer<T> {
 }
 
 impl<T: Send + 'static> Sequencer<T> {
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(G6)")]
     pub fn new(emit: impl Fn(T) + Send + Sync + 'static) -> Arc<Self> {
         Arc::new(Self {
             order: Mutex::new(Order {
@@ -61,6 +65,7 @@ impl<T: Send + 'static> Sequencer<T> {
 
     /// The next slot in admission order.
     pub fn register(self: &Arc<Self>) -> Slot<T> {
+        let _hot = HotScope::enter();
         let mut order = self.lock();
         let seq = order.head + order.slots.len() as u64;
         order.slots.push_back(State::Pending);
@@ -84,6 +89,7 @@ impl<T: Send + 'static> Sequencer<T> {
     }
 
     fn finish(&self, seq: u64, state: State<T>) {
+        let _hot = HotScope::enter();
         {
             let mut order = self.lock();
             let index = usize::try_from(seq - order.head).expect("a slot within the order");

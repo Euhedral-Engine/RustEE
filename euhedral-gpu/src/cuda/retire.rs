@@ -10,6 +10,7 @@
 use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
+use euhedral_data_structures::sync::HotScope;
 use euhedral_memory::cuda::{CuResult, CuStream};
 
 use crate::GpuError;
@@ -18,6 +19,7 @@ use crate::retire::RetireSink;
 use super::stream::CudaStream;
 
 fn tell(user: *mut c_void, status: CuResult) {
+    let _hot = HotScope::enter();
     // SAFETY: `user` is the pointer `arm` made from the stream's `RetireSink`, which the stream's shared queue side
     // owns; the stream's drop waits for every callback before that side can go.
     let sink = unsafe { &*user.cast::<RetireSink>() };

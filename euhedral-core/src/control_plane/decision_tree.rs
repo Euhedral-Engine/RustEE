@@ -7,6 +7,7 @@ use crate::flow_control::UpstreamQueue;
 use crate::utils::ACQUIRE_CONTENTION_SCALE;
 use crate::utils::calibration::benchmark;
 use std::sync::atomic::{AtomicU64, Ordering};
+#[allow(clippy::disallowed_types, reason = "HOT-FIX(C3)")]
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -46,6 +47,7 @@ pub(super) enum ExecutionPath {
 /// is cheap, and only after two windows in a row if it is expensive. The output hooks record
 /// samples on the worker's thread; the policy reads the estimate.
 pub(super) struct BodyCost {
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(C3)")]
     window: Mutex<Window>,
     estimate_ns: AtomicU64,
     samples: AtomicU64,
@@ -59,6 +61,7 @@ struct Window {
 
 impl BodyCost {
     /// An empty estimate that takes no body as expensive until [`calibrate`](Self::calibrate)d.
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(C3)")]
     pub(super) fn new() -> Self {
         Self {
             window: Mutex::new(Window {

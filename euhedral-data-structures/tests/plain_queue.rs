@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_types,
+    reason = "test fixtures: the test thread locks its records"
+)]
 use euhedral_data_structures::queues::{PlainQueue, Sink};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};

@@ -1,3 +1,8 @@
+#![allow(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    reason = "test fixtures: the test thread runs peer threads and waits on them and locks its records"
+)]
 use euhedral_data_structures::queues::{Consumer, MpscQueue, Multi, Producer, Single};
 use std::collections::HashMap;
 use std::sync::mpsc;

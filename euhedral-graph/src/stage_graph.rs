@@ -1,10 +1,15 @@
 //! Static stage DAGs run per quantum, with submission, completion and external edges
 //! (Euhedral-Inference `StageGraph`).
 
+use euhedral_data_structures::sync::HotScope;
 use std::collections::VecDeque;
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+#[allow(
+    clippy::disallowed_types,
+    reason = "HOT-FIX(G11), HOT-FIX(G12), HOT-FIX(G13), HOT-FIX(G14), HOT-FIX(G15), HOT-FIX(G10)"
+)]
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
@@ -346,6 +351,10 @@ impl<Q> fmt::Debug for StageGraph<Q> {
 const UNORDERED: u64 = 0x5747_e6a9_0f10_77a1;
 const NO_LANE: u32 = u32::MAX;
 
+#[allow(
+    clippy::disallowed_types,
+    reason = "HOT-FIX(G11), HOT-FIX(G12), HOT-FIX(G13), HOT-FIX(G14), HOT-FIX(G15)"
+)]
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -551,6 +560,10 @@ impl<Q: Send + Sync + 'static> StageGraph<Q> {
     }
 
     /// Starts `quantum`; its frames share `kill`.
+    #[allow(
+        clippy::disallowed_types,
+        reason = "HOT-FIX(G10), HOT-FIX(G11), HOT-FIX(G12), HOT-FIX(G13), HOT-FIX(G14), HOT-FIX(G15)"
+    )]
     pub fn start(
         self: &Arc<Self>,
         quantum: Q,
@@ -663,6 +676,7 @@ struct Run<Q: Send + Sync + 'static> {
     graph: Arc<StageGraph<Q>>,
     /// Read while stages run (concurrently); taken by the retirement frame, after every stage is
     /// done.
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(G10)")]
     quantum: RwLock<Option<Q>>,
     kill: Arc<AtomicBool>,
     /// Published frames, armed completion edges, external edges not yet arrived, and admission's
@@ -674,11 +688,15 @@ struct Run<Q: Send + Sync + 'static> {
     /// A stage failed, or a frame was refused: nothing more is published.
     stopped: AtomicBool,
     /// The first reason the quantum did not complete.
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(G11)")]
     cause: Mutex<Option<QuantumOutcome>>,
     stages: Box<[StageRun]>,
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(G13)")]
     externals: Mutex<Externals>,
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(G14)")]
     boundary: Mutex<BoundarySet>,
     /// The pins this quantum's external edges hold on earlier quanta, by the stage that uses them.
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(G15)")]
     pins: Mutex<Vec<(StageId, QuantumRef)>>,
 }
 
@@ -686,6 +704,7 @@ struct StageRun {
     /// Incoming edges (and external edges) not yet arrived.
     pending: AtomicUsize,
     /// The markers that arrived with them (latest per lane).
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(G12)")]
     inputs: Mutex<Vec<Marker>>,
     /// The lane it ran on, or `NO_LANE`.
     lane: AtomicU32,
@@ -818,6 +837,7 @@ impl<Q: Send + Sync + 'static> Run<Q> {
 
     /// An edge into `stage` arrived with `markers`; the last one publishes it.
     fn arrive(self: &Arc<Self>, stage: StageId, markers: &[Marker]) {
+        let _hot = HotScope::enter();
         let state = &self.stages[usize::from(stage.0)];
         if !markers.is_empty() {
             let mut inputs = lock(&state.inputs);
@@ -846,6 +866,7 @@ impl<Q: Send + Sync + 'static> Run<Q> {
 
     /// Runs `stage` (in its frame's `execute`), unless the quantum stopped.
     fn run_stage(&self, stage: StageId) -> Option<Result<Submitted, StageError>> {
+        let _hot = HotScope::enter();
         if self.stopped.load(Ordering::Acquire) {
             return None;
         }
@@ -905,6 +926,7 @@ impl<Q: Send + Sync + 'static> Run<Q> {
     /// `stage` submitted: its edges are satisfied (submission edges now, completion edges once its
     /// work completed).
     fn submitted(self: &Arc<Self>, stage: StageId, submitted: Submitted) {
+        let _hot = HotScope::enter();
         let index = usize::from(stage.0);
         let Submitted { marker, completion } = submitted;
         // Device order passes through a stage that queued nothing.

@@ -1,6 +1,7 @@
 use super::Topology;
 use crate::monitor::HardwareUtilization;
 use crate::util::CpuSet;
+#[allow(clippy::disallowed_types, reason = "HOT-FIX(H6), HOT-FIX(H7)")]
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 /// The effective CPUs, cores and core-to-CPU map of one socket.
@@ -48,7 +49,9 @@ impl EffectiveSystemTopology {
 pub struct TopologyMapper {
     topology: Topology,
     allowed_cpus: CpuSet,
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(H6)")]
     publish: Mutex<Vec<u64>>,
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(H7)")]
     current: RwLock<Arc<EffectiveSystemTopology>>,
 }
 
@@ -65,6 +68,7 @@ impl TopologyMapper {
         Self::with_topology(Topology::system().clone(), allowed_cpus)
     }
 
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(H6), HOT-FIX(H7)")]
     pub fn with_topology(topology: Topology, allowed_cpus: &CpuSet) -> Self {
         let allowed_cpus = allowed_cpus.intersection(topology.cpu_set());
         let sockets = topology.socket_count();

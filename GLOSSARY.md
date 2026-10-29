@@ -550,6 +550,22 @@ independent queues behind one handle pair, each on its own cache lines. Producer
 **plain queue** ([`PlainQueue`](euhedral-data-structures/src/queues/plain_queue.rs)): a FIFO for one
 thread with the same batch API as the concurrent queues and no synchronisation.
 
+**lifecycle lock** ([`LifecycleMutex`, `LifecycleRwLock`](euhedral-data-structures/src/sync/lifecycle.rs)): the lock
+types for start, stop and rebalance state. They ignore poison, and in a debug build taking one inside a hot scope
+prints its location and aborts the process. The workspace lint refuses the standard lock types, `Condvar`, channels,
+parks, sleeps and spins elsewhere; the exceptions carry a reason: a `HOT-FIX(<id>)` tag (a hot lock awaiting its
+fix), `LIFECYCLE(<id>)` (a wait that belongs to lifecycle work, such as the pinned executors' state-change signal),
+`JAVA-BACKOFF` (a back-off the upstream design has too), or a test double (test fixtures, the simulated device).
+
+**hot scope** ([`HotScope`](euhedral-data-structures/src/sync/lifecycle.rs)): a per-thread depth that marks the code a
+worker or a producer runs per frame, pull, request, offer or completion. `enter()` opens a scope for its guard's
+lifetime; `leave()` suspends the scopes for a lifecycle step a frame reaches. It does nothing in a release build.
+Tests that provoke a violation on purpose install `HotScope::install_violation_hook`.
+
+**HOT-FIX tag**: `reason = "HOT-FIX(<id>)"` on the `#[allow]` of a hot-path lock the audit lists, `<id>` being the
+audit's finding (`C4`, `G10`, `I7`, ...). `euhedral-core/tests/hot_fix_ratchet.rs` counts the distinct ids, and the
+count only goes down as the locks are replaced.
+
 **padded atomics** ([`atomics`](euhedral-data-structures/src/atomics/mod.rs)): atomics, arrays and
 striped adders with each value alone on a 128-byte block (`CachePadded`), so neighbours never share
 a cache line.

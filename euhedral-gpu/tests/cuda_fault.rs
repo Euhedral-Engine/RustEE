@@ -1,5 +1,9 @@
 //! A deliberate device fault. A sticky fault poisons the context for the whole process, so this file holds one test
 //! and runs as its own process. Skips, passing, when no driver or device is present.
+#![allow(
+    clippy::disallowed_types,
+    reason = "test fixtures: the test thread locks its records"
+)]
 #![cfg(feature = "cuda")]
 #![allow(
     clippy::disallowed_methods,

@@ -9,10 +9,12 @@ use crate::utils::math::ewma;
 use euhedral_data_structures::atomics::CachePadded;
 use euhedral_data_structures::queues::partitioned::{PartitionedMpscQueue, PartitionedProducer};
 use euhedral_data_structures::queues::queue::{Consumer, Multi, Single};
+use euhedral_data_structures::sync::HotScope;
 use euhedral_hardware_utils::monitor::CoreSnapshot;
 use euhedral_hardware_utils::topology::{CpuCacheLayout, Topology};
 use euhedral_hardware_utils::util::CpuSet;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+#[allow(clippy::disallowed_types, reason = "HOT-FIX(C5), HOT-FIX(C4)")]
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, RwLock, TryLockError, Weak};
 use std::{fmt, mem, ptr};
 
@@ -30,6 +32,7 @@ const FIRST_TOUCH_ROUNDS: usize = 3;
 pub struct CacheDirectory {
     registry: Arc<UpstreamRegistry>,
     topology: Topology,
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(C5)")]
     slots: Vec<RwLock<Weak<ControlPlaneCache>>>,
 }
 
@@ -43,6 +46,7 @@ impl fmt::Debug for CacheDirectory {
 
 impl CacheDirectory {
     /// An empty directory with a slot for every CPU of `topology`.
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(C5)")]
     pub fn new(registry: Arc<UpstreamRegistry>, topology: Topology) -> Arc<Self> {
         let slots = (0..topology.cpu_span())
             .map(|_| RwLock::new(Weak::new()))
@@ -127,6 +131,7 @@ pub struct ControlPlaneCache {
     edge: LatticeEdge,
     queue: PartitionedMpscQueue<Box<dyn Frame>>,
     producer: PartitionedProducer<Box<dyn Frame>, Multi>,
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(C4)")]
     partitions: Vec<Mutex<Partition>>,
     chunk_size: usize,
     frame_quota: u64,
@@ -149,6 +154,7 @@ impl ControlPlaneCache {
     /// A cache for the clone `clone` places, run from `cpu`, in `directory`'s lattice.
     /// `smt_enabled` says whether the core's SMT siblings each run a cache, which then share the
     /// core's L1 and L2.
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(C4)")]
     pub fn new(
         config: &CacheConfig,
         clone: &CloneConfig,
@@ -419,6 +425,7 @@ impl ControlPlaneCache {
         mut stop: impl FnMut(&dyn Frame) -> bool,
         limit: u64,
     ) -> u64 {
+        let _hot = HotScope::enter();
         if limit == 0 || self.count.load(Ordering::Acquire) <= 0 {
             return 0;
         }
@@ -474,6 +481,7 @@ impl ControlPlaneCache {
         mut stop: impl FnMut(&dyn Frame) -> bool,
         limit: u64,
     ) -> u64 {
+        let _hot = HotScope::enter();
         if limit == 0 || self.count.load(Ordering::Acquire) <= 0 {
             return 0;
         }
@@ -510,6 +518,7 @@ impl ControlPlaneCache {
         limit: u64,
         cursor: usize,
     ) -> u64 {
+        let _hot = HotScope::enter();
         if !self.config.work_steal() {
             return 0;
         }
@@ -538,6 +547,7 @@ impl ControlPlaneCache {
         limit: u64,
         cursor: usize,
     ) -> u64 {
+        let _hot = HotScope::enter();
         if !self.config.work_steal() {
             return 0;
         }
@@ -630,6 +640,7 @@ impl LatticeNode for ControlPlaneCache {
 
     /// Queues `frame` and counts it toward the calling worker's request.
     fn push(&self, frame: Box<dyn Frame>) {
+        let _hot = HotScope::enter();
         if let Some(lane) = self.offer(frame) {
             lane.count.fetch_add(1, Ordering::AcqRel);
             FlowContext::with(|context| {
@@ -669,6 +680,7 @@ impl Drop for Taken<'_> {
 
 /// The partition, unless another consumer holds it. A consumer that panicked mid-take leaves the
 /// partition intact, so its lock is taken over.
+#[allow(clippy::disallowed_types, reason = "HOT-FIX(C4)")]
 fn try_hold(partition: &Mutex<Partition>) -> Option<MutexGuard<'_, Partition>> {
     match partition.try_lock() {
         Ok(partition) => Some(partition),
@@ -711,6 +723,7 @@ pub(crate) fn locality_allows(
 
 /// The partition's front frame, unless another consumer holds the partition or `stop` matches the
 /// frame; the hold ends before the frame is returned.
+#[allow(clippy::disallowed_types, reason = "HOT-FIX(C4)")]
 fn take_one(
     partition: &Mutex<Partition>,
     stop: &mut impl FnMut(&dyn Frame) -> bool,
@@ -722,6 +735,7 @@ fn take_one(
     partition.poll()
 }
 
+#[allow(clippy::disallowed_types, reason = "HOT-FIX(C4)")]
 fn hold(partition: &Mutex<Partition>) -> MutexGuard<'_, Partition> {
     partition.lock().unwrap_or_else(PoisonError::into_inner)
 }

@@ -1,5 +1,7 @@
 use std::panic::{self, AssertUnwindSafe};
+#[allow(clippy::disallowed_types, reason = "HOT-FIX(C20)")]
 use std::sync::mpsc::{self, Receiver, Sender};
+#[allow(clippy::disallowed_types, reason = "HOT-FIX(C20)")]
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 
@@ -10,11 +12,13 @@ type Task = Box<dyn FnOnce() + Send>;
 /// A panicking task is logged and the thread moves on. [`shutdown`](Self::shutdown) stops taking
 /// tasks and lets the queued ones run.
 pub(crate) struct TaskPool {
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(C20)")]
     sender: Mutex<Option<Sender<Task>>>,
 }
 
 impl TaskPool {
     /// A pool of `threads` threads (at least one) named `name`.
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(C20)")]
     pub(crate) fn new(name: &str, threads: usize) -> Self {
         let (sender, receiver) = mpsc::channel::<Task>();
         let receiver = Arc::new(Mutex::new(receiver));
@@ -63,6 +67,7 @@ impl Drop for TaskPool {
     }
 }
 
+#[allow(clippy::disallowed_types, reason = "HOT-FIX(C20)")]
 fn work(receiver: &Mutex<Receiver<Task>>) {
     loop {
         let task = receiver

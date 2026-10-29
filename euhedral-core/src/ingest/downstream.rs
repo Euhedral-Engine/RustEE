@@ -1,5 +1,6 @@
 use crate::generics::{LatticeReceiver, LatticeSource};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[allow(clippy::disallowed_types, reason = "HOT-FIX(C11)")]
 use std::sync::{Arc, PoisonError, RwLock};
 
 /// The one receiver an ingest source pushes to, its completion, and the demand it asked for.
@@ -7,6 +8,7 @@ use std::sync::{Arc, PoisonError, RwLock};
 /// The receiver hears of completion exactly once, whether it attaches before or after.
 #[derive(Default)]
 pub(super) struct Downstream {
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(C11)")]
     receiver: RwLock<Option<Arc<dyn LatticeReceiver>>>,
     attached: AtomicBool,
     complete: AtomicBool,

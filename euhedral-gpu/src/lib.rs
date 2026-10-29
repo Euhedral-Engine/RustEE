@@ -17,6 +17,15 @@
 //!
 //! Every public type is also re-exported at the crate root. The README has the key concepts and a runnable example.
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_types,
+        clippy::disallowed_methods,
+        reason = "test fixtures lock their records and run peer threads"
+    )
+)]
+
 mod api;
 mod args;
 #[cfg(feature = "cuda")]

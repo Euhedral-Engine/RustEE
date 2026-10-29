@@ -1,4 +1,9 @@
 //! Behaviour shared by the two multi-consumer flavours, run against both.
+#![allow(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    reason = "test fixtures: the test thread runs peer threads and waits on them and locks its records"
+)]
 
 use euhedral_data_structures::queues::{Consumer, MpmcQueue, Multi, Queue, Role, SpmcQueue};
 use std::collections::HashSet;

@@ -6,13 +6,14 @@ use crate::generics::{LatticeReceiver, LatticeSource, LatticeTerminal, SourceCel
 use crate::utils::math::unsigned_multiply_high;
 use euhedral_data_structures::atomics::CachePadded;
 use euhedral_data_structures::queues::{Consumer, MpscQueue, Multi, Producer, Single};
-use euhedral_data_structures::sync::SetOnce;
+use euhedral_data_structures::sync::{HotScope, SetOnce};
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::panic::{self, AssertUnwindSafe};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+#[allow(clippy::disallowed_types, reason = "HOT-FIX(C6), HOT-FIX(C7)")]
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
 /// Picks the active downstream for a frame: an index below `state.len()` into
@@ -104,6 +105,8 @@ impl RoutingState {
 
 impl Drop for RoutingState {
     fn drop(&mut self) {
+        // The last reader of a retired generation retires it: rebalance work on whichever thread that is.
+        let _cold = HotScope::leave();
         if let Some(owner) = self.owner.upgrade() {
             owner.release(self);
         }
@@ -138,7 +141,9 @@ pub struct LatticeVertex {
     name: String,
     downstream_count: usize,
     route: RoutingFunction,
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(C6)")]
     routing: RwLock<Arc<RoutingState>>,
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(C7)")]
     book: Mutex<Book>,
     closed: AtomicBool,
     upstream_sequence: AtomicU64,
@@ -159,6 +164,7 @@ impl LatticeVertex {
     }
 
     /// Like [`new`](Self::new), routing with `route`.
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(C6), HOT-FIX(C7)")]
     pub fn with_routing(
         registry: &Arc<UpstreamRegistry>,
         name: impl Into<String>,
@@ -350,6 +356,7 @@ impl LatticeVertex {
     ///
     /// Panics if the routing function returns an index outside the active downstreams.
     pub fn try_push(&self, frame: Box<dyn Frame>) -> Result<(), Box<dyn Frame>> {
+        let _hot = HotScope::enter();
         let state = self.routing_state();
         if state.is_empty() {
             return Err(frame);

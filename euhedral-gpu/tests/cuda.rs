@@ -1,4 +1,8 @@
 //! The CUDA backend on a real device. Every test skips, passing, when no driver or device is present.
+#![allow(
+    clippy::disallowed_types,
+    reason = "test fixtures: the test thread locks its records"
+)]
 #![cfg(feature = "cuda")]
 #![allow(
     clippy::disallowed_methods,

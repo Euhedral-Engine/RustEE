@@ -7,6 +7,7 @@ readme = "README.md"
 license = "Apache-2.0"
 
 [dependencies]
+euhedral-data-structures = { path = "../euhedral-data-structures" }
 log = "0.4.29"
 
 [target.'cfg(unix)'.dependencies]

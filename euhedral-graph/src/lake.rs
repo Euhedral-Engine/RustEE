@@ -31,13 +31,15 @@ use std::error::Error;
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError, RwLock, Weak};
+#[allow(clippy::disallowed_types, reason = "HOT-FIX(G7)")]
+use std::sync::{Arc, PoisonError, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use euhedral_core::control_plane::{ControlPlaneLattice, LatticeError};
 use euhedral_core::frames::Frame;
 use euhedral_core::generics::{FrameSink, LatticeReceiver, LatticeSource};
 use euhedral_core::ingest::{IngestSink, QueueIngestSink};
+use euhedral_data_structures::sync::{HotScope, LifecycleMutex};
 
 /// Set in the admission word once admission closes; the rest counts the units admitted and not
 /// yet terminated.
@@ -162,11 +164,12 @@ pub struct Lake {
     idle_release: Duration,
     admission: Arc<Admission>,
     /// The sinks attached now with their watch, or `None` while none are.
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(G7)")]
     generation: RwLock<Option<Arc<Generation>>>,
     /// Generations made so far.
     attachments: AtomicU64,
     /// Generations taken out of `generation` whose sinks have not all completed yet: draining.
-    retiring: Mutex<Vec<Arc<Generation>>>,
+    retiring: LifecycleMutex<Vec<Arc<Generation>>>,
     finished: AtomicBool,
     this: Weak<Lake>,
 }
@@ -185,6 +188,7 @@ impl Lake {
     /// A lake of `sinks` ingest sinks. They attach to `lattice` when the first unit is admitted,
     /// not before, and detach once no unit has been admitted for `idle_release`
     /// ([`Duration::ZERO`]: they stay attached).
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(G7)")]
     pub fn new(
         lattice: Arc<ControlPlaneLattice>,
         sinks: NonZeroUsize,
@@ -197,7 +201,7 @@ impl Lake {
             admission: Arc::new(Admission::new()),
             generation: RwLock::new(None),
             attachments: AtomicU64::new(0),
-            retiring: Mutex::new(Vec::new()),
+            retiring: LifecycleMutex::new(Vec::new()),
             finished: AtomicBool::new(false),
             this: this.clone(),
         })
@@ -227,6 +231,7 @@ impl Lake {
     /// Queues `frame` in the sink its routing hash selects, or hands it back when no unit is
     /// admitted or the lake has completed.
     pub fn offer(&self, frame: Box<dyn Frame>) -> Result<(), Box<dyn Frame>> {
+        let _hot = HotScope::enter();
         let mut frame = frame;
         let Ok(mut generation) = self.attach_for_offer() else {
             return Err(frame);
@@ -283,15 +288,17 @@ impl Lake {
         {
             return true;
         }
-        let mut retiring = self.retiring.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut retiring = self.retiring.lock();
         retiring.retain(|generation| live(generation));
         !retiring.is_empty()
     }
 
     /// Finishes a generation taken out of the lake, and keeps track of it until its sinks complete.
     fn retire(&self, generation: Arc<Generation>) {
+        // Retiring is rebalance work, also when the idle watch's poll or a frame ends the last unit.
+        let _cold = HotScope::leave();
         generation.finish();
-        let mut retiring = self.retiring.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut retiring = self.retiring.lock();
         retiring.retain(|generation| generation.sinks.iter().any(|sink| !sink.is_complete()));
         retiring.push(generation);
     }
@@ -320,6 +327,8 @@ impl Lake {
         {
             return Ok(current);
         }
+        // The first attach of a busy period is rebalance work, also when an offer starts it.
+        let _cold = HotScope::leave();
         let (generation, fresh) = {
             let mut slot = self
                 .generation
@@ -369,7 +378,7 @@ impl Lake {
                     admission: self.admission.clone(),
                     idle: self.idle_release,
                     generation: id,
-                    downstream: Mutex::new(None),
+                    downstream: LifecycleMutex::new(None),
                     complete: AtomicBool::new(false),
                 })
             }),
@@ -410,6 +419,8 @@ impl Lake {
 
     /// Detaches generation `id` when no unit is admitted: its watch found the lake idle.
     fn detach(&self, id: u64) {
+        // The idle watch detaches from a poll: rebalance work on a worker's thread.
+        let _cold = HotScope::leave();
         let detached = {
             let mut slot = self
                 .generation
@@ -433,6 +444,8 @@ impl Lake {
 
     /// Admission is closed and no unit is left: the sinks drain and complete.
     fn complete(&self) {
+        // The last unit ending completes the lake, from whichever thread ends it.
+        let _cold = HotScope::leave();
         if self.finished.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -504,7 +517,7 @@ struct IdleWatch {
     admission: Arc<Admission>,
     idle: Duration,
     generation: u64,
-    downstream: Mutex<Option<Arc<dyn LatticeReceiver>>>,
+    downstream: LifecycleMutex<Option<Arc<dyn LatticeReceiver>>>,
     complete: AtomicBool,
 }
 
@@ -527,10 +540,7 @@ impl LatticeSource for IdleWatch {
             downstream.on_complete();
             return;
         }
-        *self
-            .downstream
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(downstream.clone());
+        *self.downstream.lock() = Some(downstream.clone());
         downstream.add_upstream(self);
     }
 
@@ -550,14 +560,12 @@ impl LatticeSource for IdleWatch {
     }
 
     fn complete(&self) {
+        // Completing is lifecycle work, also when a frame does it.
+        let _cold = HotScope::leave();
         if self.complete.swap(true, Ordering::AcqRel) {
             return;
         }
-        let downstream = self
-            .downstream
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
+        let downstream = self.downstream.lock().take();
         if let Some(downstream) = downstream {
             downstream.on_complete();
         }

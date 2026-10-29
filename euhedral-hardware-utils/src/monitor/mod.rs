@@ -21,12 +21,17 @@ use crate::topology::TopologyMapper;
 use compat::LegacyAdapter;
 use dispatcher::LatestValueDispatcher;
 use engine::SampleStateEngine;
+use euhedral_data_structures::sync::LifecycleMutex;
 use pressure::PressureState;
 use sampling::{DetailedSnapshotProvider, SystemSnapshotProvider};
 use std::cell::RefCell;
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicU64, Ordering};
+#[allow(
+    clippy::disallowed_types,
+    reason = "HOT-FIX(H1), HOT-FIX(H2), HOT-FIX(H3), HOT-FIX(H4)"
+)]
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread::{self, JoinHandle, ThreadId};
 use std::time::{Duration, Instant};
@@ -62,6 +67,7 @@ pub fn monotonic_now_ns() -> i64 {
 ///
 /// The provider is shared by every caller, so its cumulative counters are the caller's to difference;
 /// monitors never share it.
+#[allow(clippy::disallowed_types, reason = "HOT-FIX(H4)")]
 pub fn system_snapshot() -> Option<SystemSnapshot> {
     static PROVIDER: OnceLock<Option<Mutex<Box<dyn SystemSnapshotProvider>>>> = OnceLock::new();
     let provider = PROVIDER
@@ -156,9 +162,13 @@ struct Shared {
     /// without waiting.
     paced: bool,
     update_topology: TopologyUpdate,
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(H1)")]
     lifecycle: Mutex<Lifecycle>,
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(H1)")]
     changed: Condvar,
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(H2)")]
     evaluation: Mutex<Evaluation>,
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(H3)")]
     last: Mutex<Option<Arc<HardwareUtilization>>>,
     dispatcher: LatestValueDispatcher<Arc<HardwareUtilization>>,
 }
@@ -169,6 +179,10 @@ thread_local! {
     static EVALUATING: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
 }
 
+#[allow(
+    clippy::disallowed_types,
+    reason = "HOT-FIX(H1), HOT-FIX(H2), HOT-FIX(H3)"
+)]
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     // Every critical section here leaves its data consistent, and user code runs under a lock only
     // inside `catch_unwind`, so a poisoned lock carries nothing to distrust.
@@ -316,7 +330,7 @@ impl Shared {
 /// [`TopologyMapper`]. Each monitor owns its provider, so monitors never share counter intervals.
 pub struct ResourceMonitor {
     shared: Arc<Shared>,
-    poller: Mutex<Option<JoinHandle<()>>>,
+    poller: LifecycleMutex<Option<JoinHandle<()>>>,
 }
 
 impl ResourceMonitor {
@@ -357,6 +371,10 @@ impl ResourceMonitor {
         Self::with_provider(mapper, period, Box::new(LegacyAdapter::new(provider)))
     }
 
+    #[allow(
+        clippy::disallowed_types,
+        reason = "HOT-FIX(H1), HOT-FIX(H2), HOT-FIX(H3)"
+    )]
     fn build(
         span: usize,
         period: Duration,
@@ -398,7 +416,7 @@ impl ResourceMonitor {
                 last: Mutex::new(None),
                 dispatcher,
             }),
-            poller: Mutex::new(None),
+            poller: LifecycleMutex::new(None),
         })
     }
 
@@ -431,7 +449,7 @@ impl ResourceMonitor {
                 match spawned {
                     Ok(handle) => {
                         life.poller = Some(handle.thread().id());
-                        *lock(&self.poller) = Some(handle);
+                        *self.poller.lock() = Some(handle);
                         Ok(())
                     }
                     Err(error) => {
@@ -499,7 +517,7 @@ impl ResourceMonitor {
             };
         }
         drop(life);
-        if let Some(handle) = lock(&self.poller).take() {
+        if let Some(handle) = self.poller.lock().take() {
             let _ = handle.join();
         }
         true
