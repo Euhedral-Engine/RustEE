@@ -265,6 +265,52 @@ fn a_frame_that_completes_its_sink_does_not_panic() {
     lattice.close();
 }
 
+/// A lifecycle lock taken by a frame that runs through a lake reaches the violation hook, whatever the frame runners
+/// do with panics: the report is not a panic.
+#[cfg(debug_assertions)]
+#[test]
+fn a_frame_taking_a_lifecycle_lock_through_a_lake_reaches_the_violation_hook() {
+    use euhedral_data_structures::sync::{HotScope, LifecycleMutex};
+    use std::panic::Location;
+
+    static PLACES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    fn record(at: &'static Location<'static>) {
+        PLACES
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(at.to_string());
+    }
+
+    let lattice = one_cpu_lattice();
+    let lake = Lake::new(lattice.clone(), sinks(1), Duration::ZERO);
+    let unit = lake.admit().expect("a unit");
+    let lifecycle = Arc::new(LifecycleMutex::new(0_u32));
+    let done = Arc::new(AtomicU64::new(0));
+    let previous = HotScope::set_violation_hook(Some(record));
+    let frame: Box<dyn Frame> = {
+        let (lifecycle, done) = (lifecycle.clone(), done.clone());
+        Box::new(RunnableFrame::new(
+            1,
+            Arc::new(move || {
+                *lifecycle.lock() += 1;
+                done.fetch_add(1, Ordering::AcqRel);
+            }),
+        ))
+    };
+    assert!(lake.offer(frame).is_ok());
+    eventually("the frame to run", || done.load(Ordering::Acquire) == 1);
+    HotScope::set_violation_hook(previous);
+
+    let places = PLACES.lock().unwrap_or_else(PoisonError::into_inner);
+    assert_eq!(places.len(), 1, "{places:?}");
+    assert!(places[0].contains("tests/lake.rs"), "{}", places[0]);
+    assert_eq!(*lifecycle.lock(), 1, "the lock proceeds after the report");
+    drop(places);
+    drop(unit);
+    lake.complete_gracefully();
+    lattice.close();
+}
+
 /// A frame that sets a latch when it runs.
 struct SetLatch {
     header: FrameHeader,

@@ -2,9 +2,14 @@
 //!
 //! The hot path of the runtime takes no lock. Locks remain for lifecycle work only: start, stop (shutdown, drop,
 //! complete, close) and rebalance (attaching and detaching sources and receivers, lattice resizing, shard moves).
-//! [`LifecycleMutex`] and [`LifecycleRwLock`] are the only lock types the workspace lints allow, and each checks, in
-//! debug builds, that it is not taken inside a [`HotScope`]. A worker's cycle and a producer's offer run inside one,
-//! so a lifecycle lock that a frame reaches panics in the tests instead of costing a stall in production.
+//! [`LifecycleMutex`] and [`LifecycleRwLock`] are the lock types the workspace lints allow without a tag, and each
+//! checks, in debug builds, that it is not taken inside a [`HotScope`]. A worker's cycle and a producer's offer run
+//! inside one, so a lifecycle lock that a frame reaches ends the test run instead of costing a stall in production.
+//!
+//! A violation prints "lifecycle lock taken inside a hot scope" with the location of the lock call and aborts the
+//! process. A panic would unwind into the frame runners, which catch panics and report them as a frame's failure, so
+//! the violation could pass unseen. A test that provokes a violation on purpose installs a hook
+//! ([`HotScope::set_violation_hook`], debug builds only); the hook receives the location, and the lock then proceeds.
 //!
 //! Release builds carry none of it: the scope is a no-op and the locks are the standard ones. A poisoned lock is
 //! used as it stands, as the runtime's other lifecycle state is.
@@ -19,12 +24,22 @@ use std::sync::{
 #[cfg(debug_assertions)]
 use std::cell::Cell;
 use std::marker::PhantomData;
+#[cfg(debug_assertions)]
+use std::panic::Location;
 
 #[cfg(debug_assertions)]
 thread_local! {
     /// How many hot scopes the current thread is inside.
     static DEPTH: Cell<u32> = const { Cell::new(0) };
 }
+
+/// The installed violation hook, or `None` for the default (print and abort). Read only when a violation happens.
+#[cfg(debug_assertions)]
+static VIOLATION_HOOK: Mutex<Option<ViolationHook>> = Mutex::new(None);
+
+/// What a debug build calls when a lifecycle lock is taken inside a hot scope, instead of aborting.
+#[cfg(debug_assertions)]
+pub type ViolationHook = fn(&'static Location<'static>);
 
 /// Marks the code a thread runs per frame, per pull, per request, per offer or per completion.
 ///
@@ -52,6 +67,7 @@ pub struct ColdGuard {
 
 impl HotScope {
     /// Opens a hot scope on this thread.
+    #[inline]
     pub fn enter() -> HotGuard {
         #[cfg(debug_assertions)]
         DEPTH.with(|depth| depth.set(depth.get() + 1));
@@ -61,6 +77,7 @@ impl HotScope {
     }
 
     /// Suspends every open hot scope of this thread for a lifecycle step.
+    #[inline]
     pub fn leave() -> ColdGuard {
         ColdGuard {
             #[cfg(debug_assertions)]
@@ -70,6 +87,7 @@ impl HotScope {
     }
 
     /// Whether this thread is inside a hot scope. Always `false` in a release build.
+    #[inline]
     pub fn active() -> bool {
         #[cfg(debug_assertions)]
         {
@@ -81,31 +99,68 @@ impl HotScope {
         }
     }
 
-    /// Panics when a lifecycle lock is taken inside a hot scope.
+    /// Installs `hook` to receive violations instead of the abort, or restores the abort with `None`; returns the
+    /// hook it replaces. The hook is process-wide, so a test that installs one runs its violation alone.
+    #[cfg(debug_assertions)]
+    pub fn set_violation_hook(hook: Option<ViolationHook>) -> Option<ViolationHook> {
+        std::mem::replace(
+            &mut *VIOLATION_HOOK
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+            hook,
+        )
+    }
+
+    /// Reports a lifecycle lock taken inside a hot scope: to the hook, or by printing and aborting.
+    #[cfg(debug_assertions)]
+    #[cold]
+    #[track_caller]
+    fn violation() {
+        let at = Location::caller();
+        let hook = *VIOLATION_HOOK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        match hook {
+            Some(hook) => hook(at),
+            None => {
+                eprintln!("lifecycle lock taken inside a hot scope, at {at}");
+                std::process::abort();
+            }
+        }
+    }
+
+    /// Reports a violation when a lifecycle lock is taken inside a hot scope.
     #[inline]
+    #[track_caller]
     fn check_lifecycle_lock() {
         #[cfg(debug_assertions)]
         if Self::active() {
-            panic!("lifecycle lock taken inside a hot scope");
+            Self::violation();
         }
     }
 }
 
 impl Drop for HotGuard {
+    #[inline]
     fn drop(&mut self) {
         #[cfg(debug_assertions)]
-        DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+        DEPTH.with(|depth| {
+            debug_assert!(depth.get() > 0, "a hot scope closed twice");
+            depth.set(depth.get().saturating_sub(1));
+        });
     }
 }
 
 impl Drop for ColdGuard {
+    #[inline]
     fn drop(&mut self) {
         #[cfg(debug_assertions)]
         DEPTH.with(|depth| depth.set(self.saved));
     }
 }
 
-/// A mutex for lifecycle state. Poison is ignored, and in debug builds taking it inside a [`HotScope`] panics.
+/// A mutex for lifecycle state. Poison is ignored, and in debug builds taking it inside a [`HotScope`] is a
+/// violation.
 pub struct LifecycleMutex<T>(Mutex<T>);
 
 impl<T> LifecycleMutex<T> {
@@ -114,13 +169,15 @@ impl<T> LifecycleMutex<T> {
         Self(Mutex::new(value))
     }
 
-    /// Locks, waiting for the holder. Debug builds panic inside a hot scope.
+    /// Locks, waiting for the holder. Debug builds report a violation inside a hot scope.
+    #[track_caller]
     pub fn lock(&self) -> MutexGuard<'_, T> {
         HotScope::check_lifecycle_lock();
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Locks if the mutex is free. Debug builds panic inside a hot scope.
+    /// Locks if the mutex is free. Debug builds report a violation inside a hot scope.
+    #[track_caller]
     pub fn try_lock(&self) -> Option<MutexGuard<'_, T>> {
         HotScope::check_lifecycle_lock();
         match self.0.try_lock() {
@@ -153,8 +210,8 @@ impl<T: std::fmt::Debug> std::fmt::Debug for LifecycleMutex<T> {
     }
 }
 
-/// A read-write lock for lifecycle state. Poison is ignored, and in debug builds taking it inside a [`HotScope`]
-/// panics.
+/// A read-write lock for lifecycle state. Poison is ignored, and in debug builds taking it inside a [`HotScope`] is
+/// a violation.
 pub struct LifecycleRwLock<T>(RwLock<T>);
 
 impl<T> LifecycleRwLock<T> {
@@ -163,13 +220,15 @@ impl<T> LifecycleRwLock<T> {
         Self(RwLock::new(value))
     }
 
-    /// Locks for reading, waiting for a writer. Debug builds panic inside a hot scope.
+    /// Locks for reading, waiting for a writer. Debug builds report a violation inside a hot scope.
+    #[track_caller]
     pub fn read(&self) -> RwLockReadGuard<'_, T> {
         HotScope::check_lifecycle_lock();
         self.0.read().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Locks for writing, waiting for the holders. Debug builds panic inside a hot scope.
+    /// Locks for writing, waiting for the holders. Debug builds report a violation inside a hot scope.
+    #[track_caller]
     pub fn write(&self) -> RwLockWriteGuard<'_, T> {
         HotScope::check_lifecycle_lock();
         self.0.write().unwrap_or_else(PoisonError::into_inner)
@@ -214,31 +273,112 @@ mod tests {
         assert!(!HotScope::active());
     }
 
+    /// Violations a test provoked, and the places they were reported at.
     #[cfg(debug_assertions)]
-    #[test]
-    #[should_panic(expected = "inside a hot scope")]
-    fn a_lifecycle_lock_inside_a_hot_scope_panics() {
-        let mutex = LifecycleMutex::new(());
-        let _hot = HotScope::enter();
-        drop(mutex.lock());
+    mod violations {
+        use super::*;
+
+        static PLACES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        /// The hook is process-wide, so the tests that install it take turns.
+        static TURN: Mutex<()> = Mutex::new(());
+
+        fn record(at: &'static Location<'static>) {
+            PLACES.lock().unwrap().push(at.to_string());
+        }
+
+        /// Runs `provoke` with the recorder installed and returns the places it was reported at.
+        pub(super) fn recorded(provoke: impl FnOnce()) -> Vec<String> {
+            let _turn = TURN.lock().unwrap_or_else(PoisonError::into_inner);
+            PLACES.lock().unwrap().clear();
+            let before = HotScope::set_violation_hook(Some(record));
+            provoke();
+            HotScope::set_violation_hook(before);
+            std::mem::take(&mut *PLACES.lock().unwrap())
+        }
     }
 
     #[cfg(debug_assertions)]
     #[test]
-    #[should_panic(expected = "inside a hot scope")]
-    fn a_lifecycle_read_write_lock_inside_a_hot_scope_panics() {
-        let lock = LifecycleRwLock::new(());
-        let _hot = HotScope::enter();
-        drop(lock.read());
+    fn a_lifecycle_lock_inside_a_hot_scope_reaches_the_hook_and_then_locks() {
+        let mutex = LifecycleMutex::new(3);
+        let places = violations::recorded(|| {
+            let _hot = HotScope::enter();
+            assert_eq!(*mutex.lock(), 3, "the lock proceeds after the report");
+        });
+        assert_eq!(places.len(), 1, "{places:?}");
+        // The place is the lock call, in this file.
+        assert!(places[0].contains("lifecycle.rs"), "{}", places[0]);
     }
 
     #[cfg(debug_assertions)]
     #[test]
-    #[should_panic(expected = "inside a hot scope")]
-    fn a_try_lock_inside_a_hot_scope_panics() {
+    fn every_lock_call_reports_inside_a_hot_scope() {
         let mutex = LifecycleMutex::new(());
-        let _hot = HotScope::enter();
-        drop(mutex.try_lock());
+        let rw = LifecycleRwLock::new(());
+        let places = violations::recorded(|| {
+            let _hot = HotScope::enter();
+            drop(rw.read());
+            drop(rw.write());
+            drop(mutex.try_lock());
+        });
+        assert_eq!(places.len(), 3, "{places:?}");
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn no_report_outside_a_hot_scope_or_while_left() {
+        let mutex = LifecycleMutex::new(());
+        let places = violations::recorded(|| {
+            drop(mutex.lock());
+            let _hot = HotScope::enter();
+            let _cold = HotScope::leave();
+            drop(mutex.lock());
+        });
+        assert!(places.is_empty(), "{places:?}");
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn the_hook_is_restored_to_the_previous_one() {
+        let places = violations::recorded(|| {
+            let seen = HotScope::set_violation_hook(None);
+            assert!(seen.is_some(), "the recorder was installed");
+            HotScope::set_violation_hook(seen);
+        });
+        assert!(places.is_empty());
+    }
+
+    /// The default report cannot be caught: the frame runners catch panics, so a panic could pass unseen.
+    #[cfg(all(debug_assertions, unix, not(miri)))]
+    #[test]
+    fn the_default_report_aborts_even_inside_catch_unwind() {
+        use std::os::unix::process::ExitStatusExt;
+        const CHILD: &str = "EUHEDRAL_LIFECYCLE_ABORT_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let mutex = LifecycleMutex::new(());
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _hot = HotScope::enter();
+                drop(mutex.lock());
+            }));
+            // Reached only when the report was caught.
+            std::process::exit(0);
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "sync::lifecycle::tests::the_default_report_aborts_even_inside_catch_unwind",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.signal(), Some(6), "{stderr}");
+        assert!(
+            stderr.contains("lifecycle lock taken inside a hot scope, at ")
+                && stderr.contains("lifecycle.rs"),
+            "{stderr}"
+        );
     }
 
     #[test]
