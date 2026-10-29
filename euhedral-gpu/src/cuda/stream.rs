@@ -389,6 +389,14 @@ impl CudaStream {
         })
     }
 
+    /// Whether `marker` names a lane this stream's opening call made, under that lane's queue.
+    pub(crate) fn owns_marker_lane(&self, marker: Marker) -> bool {
+        self.lanes
+            .get(usize::from(marker.lane.0))
+            .and_then(Option::as_ref)
+            .is_some_and(|ring| ring.id == marker.queue)
+    }
+
     /// Arms a retirement: the callback is enqueued first, and registered once the driver accepted it.
     fn arm(&mut self, listener: Option<Box<dyn RetireListener>>) -> Result<(), GpuError> {
         self.gpu.poison.check()?;

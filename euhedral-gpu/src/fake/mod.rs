@@ -24,7 +24,7 @@ use crate::retire::RetireSink;
 
 use crate::{
     Args, Fingerprint, Gpu, GpuError, Kernel, Launch, POISONED_STATUS, Poison, Rerecorded,
-    StreamOptions,
+    StreamOptions, StreamPriority,
 };
 
 pub use enqueue::FakeEnqueue;
@@ -171,6 +171,7 @@ pub(crate) struct Lane {
     pub(crate) marks_enqueued: u64,
     pub(crate) marks_run: u64,
     pub(crate) markers: u32,
+    priority: StreamPriority,
 }
 
 #[derive(Default)]
@@ -231,6 +232,18 @@ impl FakeGpu {
             .unwrap_or_else(PoisonError::into_inner)
             .get(name)
             .cloned()
+    }
+
+    /// The priority the stream with this identity was opened with, as [`FakeStream::priority`] reports it.
+    pub fn lane_priority(&self, id: QueueId) -> Option<i32> {
+        self.lock()
+            .lanes
+            .iter()
+            .find(|lane| lane.id == id)
+            .map(|lane| match lane.priority {
+                StreamPriority::Normal => FAKE_NORMAL_PRIORITY,
+                StreamPriority::High => FAKE_GREATEST_PRIORITY,
+            })
     }
 
     /// Zeroed device memory of `bytes`, 256-aligned, never at 0.
@@ -450,6 +463,7 @@ impl Gpu for FakeGpu {
                     marks_enqueued: 0,
                     marks_run: 0,
                     markers: o.markers,
+                    priority: o.priority,
                 });
             }
             base

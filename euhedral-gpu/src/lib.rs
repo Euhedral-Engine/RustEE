@@ -25,6 +25,7 @@ mod error;
 pub mod fake;
 #[cfg(any(feature = "fake", feature = "cuda"))]
 mod kept;
+mod lanes;
 mod module_cache;
 mod poison;
 mod retire;
@@ -36,6 +37,7 @@ pub use api::{
 };
 pub use args::{Args, Dim3, KernelArg, Launch};
 pub use error::GpuError;
+pub use lanes::{LaneSpec, OpenedLanes, open_lane_sources};
 pub use module_cache::{CacheKey, KeyMaterial, ModuleCache, cache_key};
 pub use poison::Poison;
 pub use retire::{OnceFrame, RetireError, UNPOLLED_RETIREMENTS, retire_into, retire_into_with};

@@ -121,6 +121,15 @@ impl FakeStream {
         }
     }
 
+    /// Whether `marker` names a lane this stream's opening call made, under that lane's queue.
+    pub(crate) fn owns_marker_lane(&self, marker: Marker) -> bool {
+        let Some(offset) = marker.lane.0.checked_sub(self.first) else {
+            return false;
+        };
+        let offset = usize::from(offset);
+        offset < self.count && self.gpu.lock().lanes[self.base + offset].id == marker.queue
+    }
+
     fn global(&self) -> usize {
         self.base + self.index
     }
