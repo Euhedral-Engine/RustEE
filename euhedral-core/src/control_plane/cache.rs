@@ -1,21 +1,21 @@
 use crate::config::{CacheConfig, CloneConfig};
 use crate::flow_control::{
-    LatticeEdge, LatticeNode, RoutingPolicy, UpstreamRegistry, route_by_hash,
+    Cell, LatticeEdge, LatticeNode, RoutingPolicy, UpstreamRegistry, route_by_hash,
 };
 use crate::frames::{DummyFrame, Failure, Frame, FrameError};
 use crate::metrics::{CacheMetrics, Meter, MeterSource};
 use crate::utils::FlowContext;
 use crate::utils::math::ewma;
+use crate::utils::spin_wait;
 use euhedral_data_structures::atomics::CachePadded;
 use euhedral_data_structures::queues::partitioned::{PartitionedMpscQueue, PartitionedProducer};
 use euhedral_data_structures::queues::queue::{Consumer, Multi, Single};
-use euhedral_data_structures::sync::HotScope;
+use euhedral_data_structures::sync::{ClaimCell, ClaimGuard, HotScope};
 use euhedral_hardware_utils::monitor::CoreSnapshot;
 use euhedral_hardware_utils::topology::{CpuCacheLayout, Topology};
 use euhedral_hardware_utils::util::CpuSet;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-#[allow(clippy::disallowed_types, reason = "HOT-FIX(C5), HOT-FIX(C4)")]
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, RwLock, TryLockError, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 use std::{fmt, mem, ptr};
 
 type Partition = Consumer<Box<dyn Frame>, Single>;
@@ -29,12 +29,19 @@ const FIRST_TOUCH_ROUNDS: usize = 3;
 
 /// The [`ControlPlaneCache`]s of one lattice by the CPU they run on, which work stealing visits,
 /// with the upstream registry and topology they share.
+///
+/// Each CPU's slot is a weak reference to its cache in a cell of the registry: a cache publishes itself when it is
+/// built and withdraws when it closes, both lifecycle work, and a steal reads the slot from the worker's own view,
+/// which a change reaches through a queue. The directory does not own the caches: a cache lives as long as its owner
+/// holds it, and a stealer that found one holds it for the steal.
 pub struct CacheDirectory {
     registry: Arc<UpstreamRegistry>,
     topology: Topology,
-    #[allow(clippy::disallowed_types, reason = "HOT-FIX(C5)")]
-    slots: Vec<RwLock<Weak<ControlPlaneCache>>>,
+    slots: Box<[Cell<CacheRef>]>,
 }
+
+/// A cache, as a slot of the directory holds it.
+struct CacheRef(Weak<ControlPlaneCache>);
 
 impl fmt::Debug for CacheDirectory {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -46,11 +53,8 @@ impl fmt::Debug for CacheDirectory {
 
 impl CacheDirectory {
     /// An empty directory with a slot for every CPU of `topology`.
-    #[allow(clippy::disallowed_types, reason = "HOT-FIX(C5)")]
     pub fn new(registry: Arc<UpstreamRegistry>, topology: Topology) -> Arc<Self> {
-        let slots = (0..topology.cpu_span())
-            .map(|_| RwLock::new(Weak::new()))
-            .collect();
+        let slots = (0..topology.cpu_span()).map(|_| registry.cell()).collect();
         Arc::new(Self {
             registry,
             topology,
@@ -66,30 +70,33 @@ impl CacheDirectory {
         &self.topology
     }
 
-    /// The live cache at `cursor`, wrapped over the CPU slots.
+    /// The live cache at `cursor`, wrapped over the CPU slots: a read of the calling thread's view and an upgrade of
+    /// the weak reference.
     fn cache_at(&self, cursor: usize) -> Option<Arc<ControlPlaneCache>> {
         if self.slots.is_empty() {
             return None;
         }
         let slot = &self.slots[cursor % self.slots.len()];
-        slot.read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .upgrade()
+        self.registry.with_view(|view| view.get(slot)?.0.upgrade())
     }
 
+    /// Publishes `cache` at `cpu`, replacing the cache that was there.
     fn claim(&self, cpu: usize, cache: Weak<ControlPlaneCache>) {
         if let Some(slot) = self.slots.get(cpu) {
-            *slot.write().unwrap_or_else(PoisonError::into_inner) = cache;
+            self.registry
+                .set_cell(slot, Some(Arc::new(CacheRef(cache))));
         }
     }
 
-    /// Empties `cpu`'s slot if `cache` still holds it.
+    /// Empties `cpu`'s slot if `cache` still holds it (Java's compare-and-set to null). A slot that holds another
+    /// cache stays.
     fn withdraw(&self, cpu: usize, cache: &Weak<ControlPlaneCache>) {
         if let Some(slot) = self.slots.get(cpu) {
-            let mut slot = slot.write().unwrap_or_else(PoisonError::into_inner);
-            if Weak::ptr_eq(&slot, cache) {
-                *slot = Weak::new();
-            }
+            self.registry.set_cell_if(
+                slot,
+                |held| held.is_some_and(|held| Weak::ptr_eq(&held.0, cache)),
+                None,
+            );
         }
     }
 }
@@ -131,8 +138,9 @@ pub struct ControlPlaneCache {
     edge: LatticeEdge,
     queue: PartitionedMpscQueue<Box<dyn Frame>>,
     producer: PartitionedProducer<Box<dyn Frame>, Multi>,
-    #[allow(clippy::disallowed_types, reason = "HOT-FIX(C4)")]
-    partitions: Vec<Mutex<Partition>>,
+    /// One claim per partition, as Java's `pLocks`: a consumer holds a partition while it takes from it, and
+    /// another that finds it held passes it over.
+    partitions: Box<[CachePadded<ClaimCell<Partition>>]>,
     chunk_size: usize,
     frame_quota: u64,
     pull_multiplier: u64,
@@ -154,7 +162,6 @@ impl ControlPlaneCache {
     /// A cache for the clone `clone` places, run from `cpu`, in `directory`'s lattice.
     /// `smt_enabled` says whether the core's SMT siblings each run a cache, which then share the
     /// core's L1 and L2.
-    #[allow(clippy::disallowed_types, reason = "HOT-FIX(C4)")]
     pub fn new(
         config: &CacheConfig,
         clone: &CloneConfig,
@@ -201,7 +208,9 @@ impl ControlPlaneCache {
                 edge: LatticeEdge::for_node(directory.registry(), Default::default(), node),
                 producer: queue.producer(),
                 partitions: (0..partitions)
-                    .map(|partition| Mutex::new(queue.partition(partition).consumer()))
+                    .map(|partition| {
+                        CachePadded::new(ClaimCell::new(queue.partition(partition).consumer()))
+                    })
                     .collect(),
                 chunk_size,
                 frame_quota: (chunk_size * partitions) as u64,
@@ -678,15 +687,10 @@ impl Drop for Taken<'_> {
     }
 }
 
-/// The partition, unless another consumer holds it. A consumer that panicked mid-take leaves the
-/// partition intact, so its lock is taken over.
-#[allow(clippy::disallowed_types, reason = "HOT-FIX(C4)")]
-fn try_hold(partition: &Mutex<Partition>) -> Option<MutexGuard<'_, Partition>> {
-    match partition.try_lock() {
-        Ok(partition) => Some(partition),
-        Err(TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
-        Err(TryLockError::WouldBlock) => None,
-    }
+/// The partition, unless another consumer holds it. A consumer that panicked mid-take released its claim as it
+/// unwound and left the partition intact.
+fn try_hold(partition: &ClaimCell<Partition>) -> Option<ClaimGuard<'_, Partition>> {
+    partition.try_claim()
 }
 
 /// Whether a worker on core `here.0` of socket `here.1` may run `frame`, which waits in the queue of
@@ -723,9 +727,8 @@ pub(crate) fn locality_allows(
 
 /// The partition's front frame, unless another consumer holds the partition or `stop` matches the
 /// frame; the hold ends before the frame is returned.
-#[allow(clippy::disallowed_types, reason = "HOT-FIX(C4)")]
 fn take_one(
-    partition: &Mutex<Partition>,
+    partition: &ClaimCell<Partition>,
     stop: &mut impl FnMut(&dyn Frame) -> bool,
 ) -> Option<Box<dyn Frame>> {
     let mut partition = try_hold(partition)?;
@@ -735,9 +738,15 @@ fn take_one(
     partition.poll()
 }
 
-#[allow(clippy::disallowed_types, reason = "HOT-FIX(C4)")]
-fn hold(partition: &Mutex<Partition>) -> MutexGuard<'_, Partition> {
-    partition.lock().unwrap_or_else(PoisonError::into_inner)
+/// The partition, waiting for its holder to let go: for start and reset, which are lifecycle work (a hot-path
+/// consumer passes a held partition over).
+fn hold(partition: &ClaimCell<Partition>) -> ClaimGuard<'_, Partition> {
+    loop {
+        if let Some(guard) = partition.try_claim() {
+            return guard;
+        }
+        spin_wait::await_while(|| partition.is_claimed());
+    }
 }
 
 /// Frames per chunk: the configured share of the L1 and L2 the cache gets, split over the

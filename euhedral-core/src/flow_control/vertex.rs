@@ -1,20 +1,33 @@
+//! Routing vertices, and the interceptor that feeds sources into them.
+//!
+//! A vertex publishes its routing table as a [`RoutingState`], one generation at a time, as Java's `LatticeVertex`
+//! publishes its `routingState`. The generation lives in a cell of the lattice's registry (see
+//! [`Cell`](super::views::Cell)): a remap builds the next one under the rebalance lock and sends it, through a queue,
+//! to every worker, which applies it to its own view at the start of its next cycle or read. A push reads its
+//! worker's view: no atomic and no reference count, where Java's reader count (`admission`) is a compare-and-set up
+//! and a decrement down on a line every pusher shares.
+//!
+//! Java's collector keeps a retired state alive for the readers that loaded its pointer just before the swap. Here
+//! the readers hold an `Arc`: the last holder of a generation to let go of it, the store or a worker's view, drops
+//! it, and the drop releases the downstreams no later generation routes to.
+
 use super::edge::{LatticeEdge, LatticeNode, Retirement};
 use super::registry::UpstreamRegistry;
 use super::upstream_queue::{Claim, UpstreamHandle, note_routed_push};
+use super::views::Cell;
 use crate::frames::{Failure, Frame, FrameError};
 use crate::generics::{LatticeReceiver, LatticeSource, LatticeTerminal, SourceCell};
 use crate::utils::math::unsigned_multiply_high;
 use euhedral_data_structures::atomics::CachePadded;
 use euhedral_data_structures::queues::{Consumer, MpscQueue, Multi, Producer, Single};
-use euhedral_data_structures::sync::{HotScope, SetOnce};
+use euhedral_data_structures::sync::{HotScope, LifecycleMutex, SetOnce};
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::panic::{self, AssertUnwindSafe};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
-#[allow(clippy::disallowed_types, reason = "HOT-FIX(C6), HOT-FIX(C7)")]
-use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::sync::{Arc, Weak};
 
 /// Picks the active downstream for a frame: an index below `state.len()` into
 /// [`RoutingState::mappings`].
@@ -43,50 +56,21 @@ fn key(edge: &LatticeEdge) -> usize {
     edge as *const LatticeEdge as usize
 }
 
-/// One generation of a vertex's routing table: which downstreams are active, in what order.
-///
-/// A generation is immutable. Remapping publishes a new one, and a push routes with the generation
-/// that was current when it began. Holding a generation keeps its downstreams open: a downstream
-/// that a remap drops is closed once no generation that routes to it is held any more.
-pub struct RoutingState {
+/// What a generation holds: the routing table and the downstreams it routes to.
+#[derive(Default)]
+struct Table {
     mappings: Vec<usize>,
     active_indexes: Vec<Option<usize>>,
     handles: Vec<Option<Arc<dyn LatticeNode>>>,
-    owner: Weak<LatticeVertex>,
 }
 
-impl RoutingState {
-    fn empty(downstream_count: usize, owner: Weak<LatticeVertex>) -> Self {
+impl Table {
+    fn empty(downstream_count: usize) -> Self {
         Self {
             mappings: Vec::new(),
             active_indexes: vec![None; downstream_count],
             handles: vec![None; downstream_count],
-            owner,
         }
-    }
-
-    /// The number of active downstreams.
-    pub fn len(&self) -> usize {
-        self.mappings.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.mappings.is_empty()
-    }
-
-    /// The ids of the active downstreams, in ascending order: a routing index selects one.
-    pub fn mappings(&self) -> &[usize] {
-        &self.mappings
-    }
-
-    /// The routing index of downstream `downstream_id`, or `None` if it is inactive.
-    pub fn active_index(&self, downstream_id: usize) -> Option<usize> {
-        self.active_indexes.get(downstream_id).copied().flatten()
-    }
-
-    /// Downstream `downstream_id`, if it is active.
-    pub fn downstream(&self, downstream_id: usize) -> Option<&Arc<dyn LatticeNode>> {
-        self.handles.get(downstream_id)?.as_ref()
     }
 
     /// Each active downstream once, however many ids map to it.
@@ -103,12 +87,57 @@ impl RoutingState {
     }
 }
 
+/// One generation of a vertex's routing table: which downstreams are active, in what order.
+///
+/// A generation is immutable. Remapping publishes a new one, and a push routes with the generation in its worker's
+/// view. A downstream that a remap drops is closed once the last holder of every generation that routes to it has let
+/// go.
+pub struct RoutingState {
+    table: Table,
+    vertex: Weak<LatticeVertex>,
+}
+
+impl RoutingState {
+    fn table(&self) -> &Table {
+        &self.table
+    }
+
+    /// The number of active downstreams.
+    pub fn len(&self) -> usize {
+        self.table.mappings.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.table.mappings.is_empty()
+    }
+
+    /// The ids of the active downstreams, in ascending order: a routing index selects one.
+    pub fn mappings(&self) -> &[usize] {
+        &self.table.mappings
+    }
+
+    /// The routing index of downstream `downstream_id`, or `None` if it is inactive.
+    pub fn active_index(&self, downstream_id: usize) -> Option<usize> {
+        self.table
+            .active_indexes
+            .get(downstream_id)
+            .copied()
+            .flatten()
+    }
+
+    /// Downstream `downstream_id`, if it is active.
+    pub fn downstream(&self, downstream_id: usize) -> Option<&Arc<dyn LatticeNode>> {
+        self.table.handles.get(downstream_id)?.as_ref()
+    }
+}
+
 impl Drop for RoutingState {
+    /// The last holder of a generation lets go of it: Java's `releaseHandlesWhenQuiescent`, run by whoever drops last.
     fn drop(&mut self) {
-        // The last reader of a retired generation retires it: rebalance work on whichever thread that is.
-        let _cold = HotScope::leave();
-        if let Some(owner) = self.owner.upgrade() {
-            owner.release(self);
+        let table = std::mem::take(&mut self.table);
+        match self.vertex.upgrade() {
+            Some(vertex) => vertex.release_generation(table),
+            None => drop(table),
         }
     }
 }
@@ -119,7 +148,7 @@ struct Reference {
     retirements: Vec<Retirement>,
 }
 
-#[derive(Default)]
+/// The rebalance state, under the vertex's lifecycle lock (Java's `routingUpdateLock`).
 struct Book {
     references: HashMap<usize, Reference>,
     routing_closed: bool,
@@ -141,10 +170,10 @@ pub struct LatticeVertex {
     name: String,
     downstream_count: usize,
     route: RoutingFunction,
-    #[allow(clippy::disallowed_types, reason = "HOT-FIX(C6)")]
-    routing: RwLock<Arc<RoutingState>>,
-    #[allow(clippy::disallowed_types, reason = "HOT-FIX(C7)")]
-    book: Mutex<Book>,
+    /// Java's `routingState`: the published generation, a cell of the registry that each worker reads from its view.
+    routing: Cell<RoutingState>,
+    /// Java's `routingUpdateLock` and the state it guards.
+    book: LifecycleMutex<Book>,
     closed: AtomicBool,
     upstream_sequence: AtomicU64,
     this: Weak<LatticeVertex>,
@@ -164,7 +193,6 @@ impl LatticeVertex {
     }
 
     /// Like [`new`](Self::new), routing with `route`.
-    #[allow(clippy::disallowed_types, reason = "HOT-FIX(C6), HOT-FIX(C7)")]
     pub fn with_routing(
         registry: &Arc<UpstreamRegistry>,
         name: impl Into<String>,
@@ -172,20 +200,24 @@ impl LatticeVertex {
         route: impl Fn(&dyn Frame, &RoutingState) -> usize + Send + Sync + 'static,
     ) -> Arc<Self> {
         let name = name.into();
-        Arc::new_cyclic(|this: &Weak<Self>| Self {
+        let routing = registry.cell::<RoutingState>();
+        let vertex = Arc::new_cyclic(|this: &Weak<Self>| Self {
             edge: LatticeEdge::for_node(registry, Arc::new(AtomicBool::new(false)), this.clone()),
             name,
             downstream_count,
             route: Arc::new(route),
-            routing: RwLock::new(Arc::new(RoutingState::empty(
-                downstream_count,
-                this.clone(),
-            ))),
-            book: Mutex::new(Book::default()),
+            routing,
+            book: LifecycleMutex::new(Book {
+                references: HashMap::new(),
+                routing_closed: false,
+                close_retirements: Vec::new(),
+            }),
             closed: AtomicBool::new(false),
             upstream_sequence: AtomicU64::new(0),
             this: this.clone(),
-        })
+        });
+        vertex.publish(Table::empty(downstream_count));
+        vertex
     }
 
     pub fn name(&self) -> &str {
@@ -202,23 +234,50 @@ impl LatticeVertex {
         self.edge.drain_flag().store(drain, Ordering::Release);
     }
 
+    /// Java's `drain.getOpaque()` in `serviceable`.
     fn is_draining(&self) -> bool {
-        self.edge.drain_flag().load(Ordering::Acquire)
+        self.edge.drain_flag().load(Ordering::Relaxed)
     }
 
-    /// The current routing generation. Holding it keeps the downstreams it routes to open.
-    pub fn routing_state(&self) -> Arc<RoutingState> {
-        self.routing.read().unwrap().clone()
+    /// Runs `f` on the current routing generation as the calling thread sees it: a worker's view as of its last drain.
+    pub fn with_routing_state<R>(&self, f: impl FnOnce(&RoutingState) -> R) -> R {
+        self.edge.registry().with_view(|view| {
+            let state = view
+                .get(&self.routing)
+                .expect("a vertex has a routing generation from its construction until it drops");
+            f(state)
+        })
     }
 
     /// The routing index of downstream `downstream_id` in the current generation.
     pub fn active_downstream_index(&self, downstream_id: usize) -> Option<usize> {
-        self.routing_state().active_index(downstream_id)
+        self.with_routing_state(|state| state.active_index(downstream_id))
     }
 
     /// Downstream `downstream_id`, if it is active in the current generation.
     pub fn downstream(&self, downstream_id: usize) -> Option<Arc<dyn LatticeNode>> {
-        self.routing_state().downstream(downstream_id).cloned()
+        self.with_routing_state(|state| state.downstream(downstream_id).cloned())
+    }
+
+    /// The current generation, held by the caller: it keeps the generation's downstreams open until it drops.
+    #[cfg(test)]
+    pub(crate) fn hold_routing(&self) -> Arc<RoutingState> {
+        self.edge
+            .registry()
+            .cell_value(&self.routing)
+            .expect("a vertex has a routing generation")
+    }
+
+    /// Runs `f` on the published generation, unless the vertex is closed. Java's `acquireRoutingState`, with the
+    /// worker's view in the place of the count: one acquire load of the closed flag and a read of the view.
+    #[inline]
+    fn with_route<R>(&self, f: impl FnOnce(&RoutingState) -> R) -> Option<R> {
+        if self.closed.load(Ordering::Acquire) {
+            return None;
+        }
+        self.edge
+            .registry()
+            .with_view(|view| view.get(&self.routing).map(f))
     }
 
     /// Publishes a new routing generation in which the downstreams with ids in `active` are
@@ -256,19 +315,19 @@ impl LatticeVertex {
             );
         }
 
-        let mut next = RoutingState::empty(self.downstream_count, self.this.clone());
+        let mut table = Table::empty(self.downstream_count);
         for (index, &id) in mappings.iter().enumerate() {
-            next.active_indexes[id] = Some(index);
-            next.handles[id] = handles[id].clone();
+            table.active_indexes[id] = Some(index);
+            table.handles[id] = handles[id].clone();
         }
-        next.mappings = mappings;
+        table.mappings = mappings;
 
-        let retired = {
-            let mut book = self.book.lock().unwrap();
+        {
+            let mut book = self.book.lock();
             if !self.is_draining() || self.is_closed() {
                 return false;
             }
-            for handle in next.unique_handles() {
+            for handle in table.unique_handles() {
                 handle.edge().set_parent(Some(&this));
                 book.references
                     .entry(key(handle.edge()))
@@ -278,22 +337,34 @@ impl LatticeVertex {
                     })
                     .generations += 1;
             }
-            std::mem::replace(&mut *self.routing.write().unwrap(), Arc::new(next))
-        };
-        drop(retired);
+        }
+        // Not under the book: the replaced generation's last holder releases it, and the release takes the book.
+        self.publish(table);
         true
     }
 
-    /// Releases `state`'s hold on its downstreams once no push routes with it any more: closes
-    /// those no other generation routes to and runs their retirements, then, once the vertex is
-    /// closed and nothing routes anywhere, the close retirements.
-    fn release(&self, state: &RoutingState) {
+    /// Sends a generation with `table` to every worker, and lets go of the one it replaces. Java retires the old state
+    /// first and publishes second, so a reader that finds the retired state waits for the writer between the two;
+    /// here the new one is published first and no reader waits.
+    fn publish(&self, table: Table) {
+        let next = Arc::new(RoutingState {
+            table,
+            vertex: self.this.clone(),
+        });
+        self.edge.registry().set_cell(&self.routing, Some(next));
+    }
+
+    /// Java's `releaseHandlesWhenQuiescent`: a generation has no holder left. Closes the downstreams no other
+    /// generation routes to and runs their retirements, then, once the vertex is closed and nothing routes anywhere,
+    /// the close retirements. Rebalance work, run once per generation by whichever thread let go of it last.
+    fn release_generation(&self, table: Table) {
+        let _cold = HotScope::leave();
         let mut closing = Vec::new();
         let mut retirements = Vec::new();
         let mut close_retirements = Vec::new();
         {
-            let mut book = self.book.lock().unwrap();
-            for handle in state.unique_handles() {
+            let mut book = self.book.lock();
+            for handle in table.unique_handles() {
                 let key = key(handle.edge());
                 let Some(reference) = book.references.get_mut(&key) else {
                     continue;
@@ -310,6 +381,8 @@ impl LatticeVertex {
                 close_retirements = std::mem::take(&mut book.close_retirements);
             }
         }
+        // The generation's handles go with it, outside the lock.
+        drop(table);
         for handle in closing {
             if panic::catch_unwind(AssertUnwindSafe(|| handle.close())).is_err() {
                 log::error!(target: &self.name, "failed to close a retired downstream");
@@ -330,8 +403,8 @@ impl LatticeVertex {
     /// been released and every downstream closed; at once if that has already happened.
     pub fn close_after_routes_retire(&self, after_routes_retire: impl FnOnce() + Send + 'static) {
         let after_routes_retire: Retirement = Box::new(after_routes_retire);
-        let retired = {
-            let mut book = self.book.lock().unwrap();
+        {
+            let mut book = self.book.lock();
             if self.closed.load(Ordering::Acquire) {
                 if !book.routing_closed {
                     book.close_retirements.push(after_routes_retire);
@@ -341,13 +414,11 @@ impl LatticeVertex {
                 self.run_retirement(after_routes_retire);
                 return;
             }
-            self.closed.store(true, Ordering::Release);
+            self.closed.store(true, Ordering::SeqCst);
             book.close_retirements.push(after_routes_retire);
-            let empty = RoutingState::empty(self.downstream_count, self.this.clone());
-            std::mem::replace(&mut *self.routing.write().unwrap(), Arc::new(empty))
-        };
+        }
+        self.publish(Table::empty(self.downstream_count));
         self.edge.close_edge();
-        drop(retired);
     }
 
     /// Routes `frame` to one active downstream, or hands it back if none is active.
@@ -357,21 +428,30 @@ impl LatticeVertex {
     /// Panics if the routing function returns an index outside the active downstreams.
     pub fn try_push(&self, frame: Box<dyn Frame>) -> Result<(), Box<dyn Frame>> {
         let _hot = HotScope::enter();
-        let state = self.routing_state();
-        if state.is_empty() {
-            return Err(frame);
+        // The frame moves into the closure, and comes back out if the vertex is closed or nothing is active.
+        let mut slot = Some(frame);
+        let routed = self.with_route(|state| {
+            let frame = slot.take().expect("routed once");
+            if state.is_empty() {
+                return Err(frame);
+            }
+            let index = (self.route)(&*frame, state);
+            assert!(
+                index < state.len(),
+                "the routing function chose index {index} of {} active downstreams",
+                state.len()
+            );
+            let table = state.table();
+            let downstream = table.handles[table.mappings[index]]
+                .as_ref()
+                .expect("an active downstream has a handle");
+            downstream.push(frame);
+            Ok(())
+        });
+        match routed {
+            Some(result) => result,
+            None => Err(slot.take().expect("the closure did not run")),
         }
-        let index = (self.route)(&*frame, &state);
-        assert!(
-            index < state.len(),
-            "the routing function chose index {index} of {} active downstreams",
-            state.len()
-        );
-        let downstream = state.handles[state.mappings[index]]
-            .as_ref()
-            .expect("an active downstream has a handle");
-        downstream.push(frame);
-        Ok(())
     }
 
     /// Wraps `source` in an [`UpstreamInterceptor`] that feeds this vertex, and adds it to the
@@ -404,6 +484,13 @@ impl LatticeVertex {
     }
 }
 
+impl Drop for LatticeVertex {
+    fn drop(&mut self) {
+        // The registry holds the generation, and the generation holds the downstreams: let go of it with the vertex.
+        self.edge.registry().set_cell(&self.routing, None);
+    }
+}
+
 impl LatticeNode for LatticeVertex {
     fn edge(&self) -> &LatticeEdge {
         &self.edge
@@ -418,18 +505,19 @@ impl LatticeNode for LatticeVertex {
 
     /// Passes `error` to every active downstream once.
     fn on_error(&self, error: Failure) {
-        let state = self.routing_state();
-        let targets: Vec<_> = state.unique_handles().collect();
-        match targets.as_slice() {
-            [] => {}
-            [only] => only.on_error(error),
-            _ => {
-                let shared: Arc<dyn Error + Send + Sync> = Arc::from(error);
-                for target in targets {
-                    target.on_error(Box::new(SharedFailure(shared.clone())));
+        let _ = self.with_route(|state| {
+            let targets: Vec<_> = state.table().unique_handles().collect();
+            match targets.as_slice() {
+                [] => {}
+                [only] => only.on_error(error),
+                _ => {
+                    let shared: Arc<dyn Error + Send + Sync> = Arc::from(error);
+                    for target in targets {
+                        target.on_error(Box::new(SharedFailure(shared.clone())));
+                    }
                 }
             }
-        }
+        });
     }
 
     fn close(&self) {
@@ -443,7 +531,7 @@ impl LatticeNode for LatticeVertex {
     /// Runs `action` once no generation routes to `child`: at once if none does now.
     fn defer_child_retirement(&self, child: &LatticeEdge, action: Retirement) {
         let action = {
-            let mut book = self.book.lock().unwrap();
+            let mut book = self.book.lock();
             match book.references.get_mut(&key(child)) {
                 Some(reference) => {
                     reference.retirements.push(action);
@@ -454,6 +542,15 @@ impl LatticeNode for LatticeVertex {
         };
         self.run_retirement(action);
     }
+}
+
+/// A token for the calling thread: nonzero, and different from every other thread's.
+fn thread_token() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    thread_local! {
+        static TOKEN: u64 = NEXT.fetch_add(1, Ordering::Relaxed);
+    }
+    TOKEN.with(|token| *token)
 }
 
 fn unroutable() -> FrameError {
@@ -595,6 +692,10 @@ pub struct UpstreamInterceptor {
     /// The id a [`Claim`] taken from this interceptor carries.
     claim_id: u64,
     wip: CachePadded<AtomicU64>,
+    /// The vertex, while a `request` on this interceptor runs: written by the claim holder, read by its pushes.
+    serving: AtomicPtr<LatticeVertex>,
+    /// The token of the thread inside that `request`, or zero.
+    serving_by: AtomicU64,
     pending: AtomicBool,
     actions: Producer<Action, Multi>,
     drain: SourceCell<Consumer<Action, Single>>,
@@ -615,6 +716,8 @@ impl UpstreamInterceptor {
             sequence: vertex.upstream_sequence.fetch_add(1, Ordering::Relaxed),
             claim_id: CLAIM_IDS.fetch_add(1, Ordering::Relaxed),
             wip: CachePadded::new(AtomicU64::new(0)),
+            serving: AtomicPtr::new(ptr::null_mut()),
+            serving_by: AtomicU64::new(0),
             pending: AtomicBool::new(false),
             actions: actions.producer(),
             drain: SourceCell::new(actions.consumer()),
@@ -698,14 +801,14 @@ impl UpstreamInterceptor {
         }));
     }
 
-    /// Whether a worker may service the source now.
-    fn serviceable(&self, demand: u64) -> bool {
+    /// The vertex, if a worker may service the source now.
+    fn serviceable(&self, demand: u64) -> Option<Arc<LatticeVertex>> {
         if demand == 0 || self.is_complete() {
-            return false;
+            return None;
         }
         self.vertex
             .upgrade()
-            .is_some_and(|vertex| !vertex.is_closed() && !vertex.is_draining())
+            .filter(|vertex| !vertex.closed.load(Ordering::Relaxed) && !vertex.is_draining())
     }
 
     /// Checks that `claim` was taken from this interceptor.
@@ -769,9 +872,7 @@ impl UpstreamHandle for UpstreamInterceptor {
         demand: u64,
     ) -> Option<u64> {
         self.assert_own(claim);
-        if !self.serviceable(demand) {
-            return None;
-        }
+        self.serviceable(demand)?;
         // SAFETY: `claim` proves this caller holds the claim: it is the only one, so no action
         // runs and no other `pull` or `request` is in progress.
         let upstream = unsafe { self.upstream.get() }?;
@@ -787,14 +888,24 @@ impl UpstreamHandle for UpstreamInterceptor {
 
     fn request(&self, claim: &mut Claim, demand: u64) {
         self.assert_own(claim);
-        if !self.serviceable(demand) {
+        let Some(vertex) = self.serviceable(demand) else {
             return;
-        }
+        };
         // SAFETY: as in `pull`.
         let Some(upstream) = (unsafe { self.upstream.get() }) else {
             return;
         };
-        if panic::catch_unwind(AssertUnwindSafe(|| upstream.request(demand))).is_err() {
+        // The source pushes its frames into this interceptor from inside the call, on this thread. Naming the vertex
+        // for the call lets each push use it without taking a reference of its own (a read-modify-write on the
+        // vertex's count, shared by every worker).
+        self.serving_by.store(thread_token(), Ordering::Relaxed);
+        self.serving
+            .store(Arc::as_ptr(&vertex).cast_mut(), Ordering::Release);
+        let requested = panic::catch_unwind(AssertUnwindSafe(|| upstream.request(demand)));
+        self.serving_by.store(0, Ordering::Relaxed);
+        self.serving.store(ptr::null_mut(), Ordering::Relaxed);
+        drop(vertex);
+        if requested.is_err() {
             log::error!(target: &self.log_target, "an upstream panicked during a request");
             self.complete();
         }
@@ -823,9 +934,16 @@ impl LatticeTerminal for UpstreamInterceptor {
 impl LatticeReceiver for UpstreamInterceptor {
     /// Routes `frame` through the vertex, or finishes it with an error if it cannot be routed.
     fn push(&self, frame: Box<dyn Frame>) {
-        let routed = match self.vertex.upgrade() {
-            Some(vertex) => vertex.try_push(frame),
-            None => Err(frame),
+        // Inside this thread's own `request` the vertex is named and kept alive for the call.
+        let routed = if self.serving_by.load(Ordering::Relaxed) == thread_token() {
+            // SAFETY: only the thread that stored its token is inside the call that holds the vertex, and it clears
+            // the token before it lets the vertex go.
+            unsafe { &*self.serving.load(Ordering::Acquire) }.try_push(frame)
+        } else {
+            match self.vertex.upgrade() {
+                Some(vertex) => vertex.try_push(frame),
+                None => Err(frame),
+            }
         };
         match routed {
             Ok(()) => note_routed_push(),

@@ -9,6 +9,7 @@ use euhedral_hardware_utils::topology::source::{
 use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 use std::panic::{self, AssertUnwindSafe};
+use std::sync::Mutex;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -679,7 +680,7 @@ fn a_held_partition_is_passed_over() {
     let victim = cache_on(&directory, &config(1), 1);
     victim.push(unordered(1, 5));
 
-    let held = victim.partitions[0].lock().unwrap();
+    let held = victim.partitions[0].try_claim().unwrap();
     assert_eq!(
         thief.work_steal(|_| panic!("the partition is held"), 10, victim.cpu()),
         0
@@ -688,6 +689,99 @@ fn a_held_partition_is_passed_over() {
     drop(held);
 
     assert_eq!(thief.work_steal(drop, 10, victim.cpu()), 1);
+}
+
+#[test]
+fn a_stealer_skips_a_claimed_partition_without_waiting() {
+    let directory = directory();
+    let thief = cache_on(&directory, &config(2), 0);
+    let victim = cache_on(&directory, &config(2), 1);
+    // Routing hash 0 lands in partition 0, the top of the range in partition 1.
+    victim.push(unordered(1, 0));
+    victim.push(unordered(2, u64::MAX));
+    victim.push(unordered(3, 0));
+
+    let held = victim.partitions[0].try_claim().unwrap();
+    let cpu = victim.cpu();
+    let (done, finished) = mpsc::channel();
+    let stealing = thread::spawn(move || {
+        let mut stolen = Vec::new();
+        let count = thief.work_steal(|frame| stolen.push(frame), 10, cpu);
+        done.send(()).unwrap();
+        (count, ids(&stolen))
+    });
+    // The steal returns while the claim is still held.
+    finished
+        .recv_timeout(Duration::from_secs(5))
+        .expect("a steal waited for a claimed partition");
+    let (count, stolen) = stealing.join().unwrap();
+    assert_eq!((count, stolen), (1, vec![2]));
+    assert_eq!(victim.local_cache_count(), 2);
+    drop(held);
+    assert_eq!(victim.greedy(drop, 10), 2);
+}
+
+/// The frames the steal race pushes, one tenth of them ordered.
+#[cfg(not(miri))]
+const STEAL_FRAMES: u64 = 100_000;
+#[cfg(miri)]
+const STEAL_FRAMES: u64 = 160;
+
+#[test]
+fn stealers_racing_a_greedy_owner_never_take_an_ordered_frame() {
+    use std::collections::BTreeSet;
+    use std::sync::atomic::AtomicUsize;
+    let directory = directory();
+    let owner = cache_on(&directory, &config(4), 0);
+    let thieves: Vec<_> = (1..=7)
+        .map(|core| cache_on(&directory, &config(4), core))
+        .collect();
+    let is_ordered = |id: u64| id.is_multiple_of(10);
+    for id in 0..STEAL_FRAMES {
+        owner.push(if is_ordered(id) {
+            ordered(id)
+        } else {
+            unordered(id, id.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+        });
+    }
+    let done = Arc::new(AtomicUsize::new(0));
+    let total = STEAL_FRAMES as usize;
+    let workers: Vec<_> = std::iter::once(None)
+        .chain(thieves.into_iter().map(Some))
+        .map(|thief| {
+            let (owner, done) = (owner.clone(), done.clone());
+            thread::spawn(move || {
+                let mut ran = Vec::new();
+                while done.load(Ordering::SeqCst) < total {
+                    let before = ran.len();
+                    let mut take = |frame: Box<dyn Frame>| ran.push(frame.header().id_hash());
+                    match &thief {
+                        None => {
+                            owner.greedy(&mut take, 64);
+                        }
+                        Some(thief) => {
+                            thief.work_steal(&mut take, 64, owner.cpu());
+                        }
+                    }
+                    done.fetch_add(ran.len() - before, Ordering::SeqCst);
+                }
+                (thief.is_none(), ran)
+            })
+        })
+        .collect();
+    let mut seen = BTreeSet::new();
+    for worker in workers {
+        let (is_owner, ran) = worker.join().unwrap();
+        for id in ran {
+            assert!(seen.insert(id), "frame {id} ran twice");
+            assert!(
+                is_owner || !is_ordered(id),
+                "a stealer ran the ordered frame {id}"
+            );
+        }
+    }
+    assert_eq!(seen.len(), total, "every frame ran");
+    assert!(owner.is_drained());
 }
 
 #[test]
@@ -867,6 +961,50 @@ fn closing_does_not_wait_for_a_thief_mid_take() {
     release.send(()).unwrap();
     assert_eq!(stealing.join().unwrap(), 1);
     assert_eq!(victim.local_cache_count(), 1);
+}
+
+#[test]
+fn a_cache_closed_while_stolen_from_lives_for_the_steal_and_its_slot_reference_is_reclaimed() {
+    let directory = directory();
+    let thief = cache_on(&directory, &config(1), 0);
+    let victim = cache_on(&directory, &config(1), 1);
+    victim.push(unordered(1, 5));
+    victim.push(unordered(2, 6));
+    let cpu = victim.cpu();
+    let weak = Arc::downgrade(&victim);
+    let (entered, inside) = mpsc::channel();
+    let (release, released) = mpsc::channel::<()>();
+    let stealing = thread::spawn(move || {
+        thief.work_steal(
+            |_| {
+                entered.send(()).unwrap();
+                released.recv().unwrap();
+            },
+            1,
+            cpu,
+        )
+    });
+    inside.recv().unwrap();
+
+    // The owner closes and lets go while the stealer runs a stolen frame.
+    victim.close();
+    drop(victim);
+    assert!(directory.cache_at(cpu).is_none(), "withdrawn at once");
+    assert!(weak.upgrade().is_some(), "the steal keeps the cache alive");
+
+    release.send(()).unwrap();
+    assert_eq!(stealing.join().unwrap(), 1);
+    assert!(weak.upgrade().is_none(), "freed when the steal ended");
+}
+
+#[test]
+fn a_cache_never_closed_is_freed_with_its_owner() {
+    let directory = directory();
+    let cache = cache_on(&directory, &config(1), 1);
+    let weak = Arc::downgrade(&cache);
+    drop(cache);
+    assert!(weak.upgrade().is_none());
+    assert!(directory.cache_at(2).is_none());
 }
 
 #[test]

@@ -53,6 +53,9 @@ jobs:
           cargo test --release -p euhedral-core --lib ingest::
           cargo test --release -p euhedral-core --lib flow_control::hot_source
           cargo test --release -p euhedral-core --lib utils::stop_watch
+          cargo test --release -p euhedral-core --lib flow_control::edge
+          cargo test --release -p euhedral-core --lib control_plane::cache
+          cargo test --release -p euhedral-core --lib flow_control::views
           cargo test --release -p euhedral-graph --lib completions::
 
       - name: Loom models
@@ -96,3 +99,8 @@ jobs:
       - name: Hot source, stop watch, body cost
         run: |
           cargo +nightly miri test -p euhedral-core --lib -- flow_control::hot_source utils::stop_watch control_plane::decision_tree::tests::the_estimate control_plane::decision_tree::tests::recalibrating
+
+      - name: Cells and views, routing generations, vertex and edge races
+        run: |
+          cargo +nightly miri test -p euhedral-core --lib -- flow_control::views
+          cargo +nightly miri test -p euhedral-core --lib -- flow_control::vertex::tests::pushes_racing flow_control::vertex::tests::the_last_reader flow_control::vertex::tests::a_panicking_routing_function flow_control::vertex::tests::close_retirements flow_control::edge::tests::close_while_pushing flow_control::edge::tests::a_closed_edge_refuses flow_control::edge::tests::a_receiver_refused flow_control::edge::tests::attaches_racing flow_control::edge::tests::racing_attaches flow_control::edge::tests::pushes_and_set_parent

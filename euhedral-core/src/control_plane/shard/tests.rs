@@ -660,7 +660,7 @@ fn a_removed_clone_closes_only_after_the_routes_to_it_return() {
     let fixture = Fixture::started(&[0, 2]);
     let removed = fixture.clone_on(2);
     let distributor = fixture.shard.lock().distributor.clone().unwrap();
-    let held = distributor.routing_state();
+    let held = distributor.hold_routing();
 
     fixture.rebalance(2, &[0]);
     thread::sleep(Duration::from_millis(10));

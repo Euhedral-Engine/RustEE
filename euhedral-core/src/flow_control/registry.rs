@@ -1,4 +1,5 @@
 use super::upstream_queue::{Entry, UpstreamHandle, UpstreamQueue};
+use super::views::Views;
 use euhedral_data_structures::atomics::PaddedAtomicLong;
 use euhedral_data_structures::queues::{MpscQueue, Multi, Producer};
 use euhedral_data_structures::sync::LifecycleMutex;
@@ -60,8 +61,12 @@ struct State {
 /// added before it registered included. The queue of a thread that never registers stays empty.
 ///
 /// The edges of one lattice share its registry.
+///
+/// The registry also owns the lattice's cells (see [`Cell`](super::views::Cell)): the values its workers read on every
+/// frame and that change only when the lattice is rebuilt. They reach the workers through queues.
 pub struct UpstreamRegistry {
     id: u64,
+    views: Views,
     upstream_count: Arc<PaddedAtomicLong>,
     thread_count: AtomicUsize,
     /// One past each CPU's rank among the workers' CPUs, or zero for a CPU without workers.
@@ -82,6 +87,7 @@ impl UpstreamRegistry {
     pub fn with_topology(cpu_span: usize, p_cpus: CpuSet) -> Arc<Self> {
         Arc::new(Self {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            views: Views::new(),
             upstream_count: Arc::new(PaddedAtomicLong::new(0)),
             thread_count: AtomicUsize::new(0),
             ranks: (0..cpu_span).map(|_| AtomicUsize::new(0)).collect(),
@@ -104,6 +110,14 @@ impl UpstreamRegistry {
         Some(f(&mut queue))
     }
 
+    pub(super) fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub(super) fn views(&self) -> &Views {
+        &self.views
+    }
+
     /// Makes the calling thread a worker. Does nothing if it already is one.
     pub fn register(self: &Arc<Self>) {
         self.register_with(affinity::current_cpu);
@@ -119,6 +133,8 @@ impl UpstreamRegistry {
         let Some(worker) = worker else {
             return;
         };
+        // A worker reads the lattice's cells from a view of its own.
+        self.register_reader();
         let mut state = self.state.lock();
         if state
             .workers
@@ -151,6 +167,7 @@ impl UpstreamRegistry {
             })
             .unwrap_or_default();
         drop(removed);
+        self.remove_reader();
     }
 
     /// The number of live upstream handles.

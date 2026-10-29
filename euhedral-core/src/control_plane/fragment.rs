@@ -362,6 +362,10 @@ impl ControlPlaneFragment {
         // A reset is lifecycle work; the cycle proper is the hot path.
         self.handle_reset_request(policy, cycle);
         let _hot = HotScope::enter();
+        // The cycle's drain: what the lattice's cells changed to since the last cycle (a new routing generation, a
+        // parent, a cache) reaches this worker's view now, and the values it replaced are let go of. One load when
+        // nothing changed.
+        self.registry.refresh_view();
 
         let half_life = policy.idle_policy().contention_half_life();
         let (contention, upstreams) = self
