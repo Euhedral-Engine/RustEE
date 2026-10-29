@@ -298,6 +298,12 @@ impl ControlPlaneLattice {
             .all(|&socket| self.shards[socket].is_started())
     }
 
+    /// The lattice's upstream registry: its workers' queues and the epoch domain its published values are read
+    /// under (see [`UpstreamRegistry::with_pinned`]).
+    pub fn registry(&self) -> &Arc<UpstreamRegistry> {
+        self.controller.edge().registry()
+    }
+
     /// Starts the lattice if needed, then feeds it from `source`.
     pub fn add_upstream(
         &self,
