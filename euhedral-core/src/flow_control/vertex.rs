@@ -1,3 +1,25 @@
+//! Routing vertices, and the interceptor that feeds sources into them.
+//!
+//! A vertex publishes its routing table as a [`RoutingState`], one generation at a time, as Java's `LatticeVertex`
+//! publishes its `routingState`. Each state carries an admission count: a reader takes a count by compare-and-set
+//! while the state is not retired, re-checks that the state is still the published one, routes, and releases. A
+//! remap builds the next generation under the rebalance lock, publishes it and retires the old one; the release
+//! that leaves a retired state without readers closes the downstreams no generation routes to, on whichever thread
+//! that is.
+//!
+//! Java's collector keeps a retired state alive for the readers that loaded its pointer just before the swap. Here
+//! the vertex owns every state it allocated until it drops, and recycles a retired state for the next generation
+//! once its readers are gone and its handles are released, so a stale reader's compare-and-set always lands on a
+//! live `RoutingState`; the re-check against the published pointer keeps it from using a state that is no longer
+//! current.
+
+// States are allocated once, owned by the vertex's arena and freed when the vertex drops, so a reader that loaded
+// a state's address may compare-and-set its admission count whatever the state has become since.
+#![allow(
+    unsafe_code,
+    reason = "routing states live until the vertex drops, so a stale reader's pointer stays valid"
+)]
+
 use super::edge::{LatticeEdge, LatticeNode, Retirement};
 use super::registry::UpstreamRegistry;
 use super::upstream_queue::{Claim, UpstreamHandle, note_routed_push};
@@ -6,15 +28,16 @@ use crate::generics::{LatticeReceiver, LatticeSource, LatticeTerminal, SourceCel
 use crate::utils::math::unsigned_multiply_high;
 use euhedral_data_structures::atomics::CachePadded;
 use euhedral_data_structures::queues::{Consumer, MpscQueue, Multi, Producer, Single};
-use euhedral_data_structures::sync::{HotScope, SetOnce};
+use euhedral_data_structures::sync::{Admission, HotScope, LifecycleMutex, SetOnce};
+use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
+use std::ops::Deref;
 use std::panic::{self, AssertUnwindSafe};
-use std::ptr;
+use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
-#[allow(clippy::disallowed_types, reason = "HOT-FIX(C6), HOT-FIX(C7)")]
-use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::sync::{Arc, Weak};
 
 /// Picks the active downstream for a frame: an index below `state.len()` into
 /// [`RoutingState::mappings`].
@@ -43,50 +66,21 @@ fn key(edge: &LatticeEdge) -> usize {
     edge as *const LatticeEdge as usize
 }
 
-/// One generation of a vertex's routing table: which downstreams are active, in what order.
-///
-/// A generation is immutable. Remapping publishes a new one, and a push routes with the generation
-/// that was current when it began. Holding a generation keeps its downstreams open: a downstream
-/// that a remap drops is closed once no generation that routes to it is held any more.
-pub struct RoutingState {
+/// What a generation holds: the routing table and the downstreams it routes to.
+#[derive(Default)]
+struct Table {
     mappings: Vec<usize>,
     active_indexes: Vec<Option<usize>>,
     handles: Vec<Option<Arc<dyn LatticeNode>>>,
-    owner: Weak<LatticeVertex>,
 }
 
-impl RoutingState {
-    fn empty(downstream_count: usize, owner: Weak<LatticeVertex>) -> Self {
+impl Table {
+    fn empty(downstream_count: usize) -> Self {
         Self {
             mappings: Vec::new(),
             active_indexes: vec![None; downstream_count],
             handles: vec![None; downstream_count],
-            owner,
         }
-    }
-
-    /// The number of active downstreams.
-    pub fn len(&self) -> usize {
-        self.mappings.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.mappings.is_empty()
-    }
-
-    /// The ids of the active downstreams, in ascending order: a routing index selects one.
-    pub fn mappings(&self) -> &[usize] {
-        &self.mappings
-    }
-
-    /// The routing index of downstream `downstream_id`, or `None` if it is inactive.
-    pub fn active_index(&self, downstream_id: usize) -> Option<usize> {
-        self.active_indexes.get(downstream_id).copied().flatten()
-    }
-
-    /// Downstream `downstream_id`, if it is active.
-    pub fn downstream(&self, downstream_id: usize) -> Option<&Arc<dyn LatticeNode>> {
-        self.handles.get(downstream_id)?.as_ref()
     }
 
     /// Each active downstream once, however many ids map to it.
@@ -103,12 +97,148 @@ impl RoutingState {
     }
 }
 
-impl Drop for RoutingState {
+/// One generation of a vertex's routing table: which downstreams are active, in what order.
+///
+/// A generation is immutable while it is published or read. Remapping publishes a new one, and a push routes with
+/// the generation it took a count on. Holding a generation keeps its downstreams open: a downstream that a remap
+/// drops is closed once no generation that routes to it is held any more.
+///
+/// A state is never freed before its vertex drops; once it is retired, has no readers and has released its
+/// handles, a remap may rewrite it as the next generation (see the module documentation).
+pub struct RoutingState {
+    /// Java's `admission`: the readers' count, with the retired bit set once the state is no longer the one to read.
+    admission: CachePadded<Admission>,
+    /// Java's `handlesReleased`: taken by the one thread that releases the state's handles.
+    handles_released: AtomicBool,
+    /// Set, under the vertex's book, once the handles are released: the state may be rewritten.
+    handles_done: AtomicBool,
+    /// Rewritten only by a remap, while the state is retired and idle and `handles_done` is set, and read by a
+    /// thread that holds a count or, to release the handles, by the one that took `handles_released`.
+    table: UnsafeCell<Table>,
+}
+
+// SAFETY: `table` is written only while no thread can read it (see its documentation) and read only by threads
+// that hold a count or the release; every other field is atomic.
+unsafe impl Sync for RoutingState {}
+
+impl RoutingState {
+    fn new(table: Table) -> Self {
+        Self {
+            admission: CachePadded::new(Admission::new()),
+            handles_released: AtomicBool::new(false),
+            handles_done: AtomicBool::new(false),
+            table: UnsafeCell::new(table),
+        }
+    }
+
+    fn table(&self) -> &Table {
+        // SAFETY: a `&RoutingState` reaches a reader only through a guard that holds a count, which keeps the
+        // state from being rewritten; the release path reads it under its exclusive claim.
+        unsafe { &*self.table.get() }
+    }
+
+    /// The number of active downstreams.
+    pub fn len(&self) -> usize {
+        self.table().mappings.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.table().mappings.is_empty()
+    }
+
+    /// The ids of the active downstreams, in ascending order: a routing index selects one.
+    pub fn mappings(&self) -> &[usize] {
+        &self.table().mappings
+    }
+
+    /// The routing index of downstream `downstream_id`, or `None` if it is inactive.
+    pub fn active_index(&self, downstream_id: usize) -> Option<usize> {
+        self.table()
+            .active_indexes
+            .get(downstream_id)
+            .copied()
+            .flatten()
+    }
+
+    /// Downstream `downstream_id`, if it is active.
+    pub fn downstream(&self, downstream_id: usize) -> Option<&Arc<dyn LatticeNode>> {
+        self.table().handles.get(downstream_id)?.as_ref()
+    }
+}
+
+/// A reader's count on a [`RoutingState`], given back when dropped, also when the reader panics. Holding it keeps
+/// the generation's downstreams open.
+pub struct RouteGuard<'a> {
+    vertex: &'a LatticeVertex,
+    state: &'a RoutingState,
+}
+
+impl Deref for RouteGuard<'_> {
+    type Target = RoutingState;
+
+    fn deref(&self) -> &RoutingState {
+        self.state
+    }
+}
+
+impl Drop for RouteGuard<'_> {
     fn drop(&mut self) {
-        // The last reader of a retired generation retires it: rebalance work on whichever thread that is.
-        let _cold = HotScope::leave();
-        if let Some(owner) = self.owner.upgrade() {
-            owner.release(self);
+        self.vertex.release_route(self.state);
+    }
+}
+
+/// The routing states a vertex allocated. They are freed when the vertex drops and not before: the address of one
+/// may sit in a reader's hands for as long as the vertex lives.
+#[derive(Default)]
+struct Arena {
+    states: Vec<NonNull<RoutingState>>,
+}
+
+// SAFETY: the states are `Sync`, and the arena frees them only when it drops, with exclusive access.
+unsafe impl Send for Arena {}
+
+impl Arena {
+    fn alloc(&mut self, table: Table) -> NonNull<RoutingState> {
+        let state = NonNull::from(Box::leak(Box::new(RoutingState::new(table))));
+        self.states.push(state);
+        state
+    }
+
+    /// A state that may be rewritten, if one is: retired, with no readers, and with its handles released.
+    fn reusable(&self) -> Option<NonNull<RoutingState>> {
+        self.states.iter().copied().find(|state| {
+            // SAFETY: states live as long as the arena.
+            let state = unsafe { state.as_ref() };
+            state.admission.is_retired_and_idle() && state.handles_done.load(Ordering::Acquire)
+        })
+    }
+
+    /// The next generation, closed to readers until it is published: a recycled state rewritten with `table`, or
+    /// a new one. The state stays valid until the arena drops.
+    fn next_state(&mut self, table: Table) -> NonNull<RoutingState> {
+        let Some(found) = self.reusable() else {
+            return self.alloc(table);
+        };
+        // SAFETY: states live as long as the arena.
+        let state = unsafe { found.as_ref() };
+        // SAFETY: the state is retired and idle (no reader, and every `try_acquire` refuses) and the handles are
+        // released, so no thread reads the table; the caller holds the vertex's book, which keeps the other
+        // writers out.
+        unsafe { *state.table.get() = table };
+        state.handles_released.store(false, Ordering::Relaxed);
+        state.handles_done.store(false, Ordering::Relaxed);
+        // Opens the state to readers: the rewrite above is visible to whoever acquires a count.
+        state.admission.reopen();
+        found
+    }
+}
+
+impl Drop for Arena {
+    fn drop(&mut self) {
+        for state in self.states.drain(..) {
+            // SAFETY: each state came from `Box::leak` in `alloc`, is freed only here, and the vertex that
+            // owns the arena is gone, so no reader holds it.
+            drop(unsafe { Box::from_raw(state.as_ptr()) });
         }
     }
 }
@@ -119,11 +249,12 @@ struct Reference {
     retirements: Vec<Retirement>,
 }
 
-#[derive(Default)]
+/// The rebalance state, under the vertex's lifecycle lock (Java's `routingUpdateLock`).
 struct Book {
     references: HashMap<usize, Reference>,
     routing_closed: bool,
     close_retirements: Vec<Retirement>,
+    arena: Arena,
 }
 
 /// A node that routes each frame to exactly one of a fixed number of downstream nodes.
@@ -141,10 +272,10 @@ pub struct LatticeVertex {
     name: String,
     downstream_count: usize,
     route: RoutingFunction,
-    #[allow(clippy::disallowed_types, reason = "HOT-FIX(C6)")]
-    routing: RwLock<Arc<RoutingState>>,
-    #[allow(clippy::disallowed_types, reason = "HOT-FIX(C7)")]
-    book: Mutex<Book>,
+    /// Java's `routingState`: the published generation, set with release ordering after it is built.
+    routing: AtomicPtr<RoutingState>,
+    /// Java's `routingUpdateLock` and the state it guards.
+    book: LifecycleMutex<Book>,
     closed: AtomicBool,
     upstream_sequence: AtomicU64,
     this: Weak<LatticeVertex>,
@@ -164,7 +295,6 @@ impl LatticeVertex {
     }
 
     /// Like [`new`](Self::new), routing with `route`.
-    #[allow(clippy::disallowed_types, reason = "HOT-FIX(C6), HOT-FIX(C7)")]
     pub fn with_routing(
         registry: &Arc<UpstreamRegistry>,
         name: impl Into<String>,
@@ -172,16 +302,20 @@ impl LatticeVertex {
         route: impl Fn(&dyn Frame, &RoutingState) -> usize + Send + Sync + 'static,
     ) -> Arc<Self> {
         let name = name.into();
+        let mut arena = Arena::default();
+        let first = arena.alloc(Table::empty(downstream_count));
         Arc::new_cyclic(|this: &Weak<Self>| Self {
             edge: LatticeEdge::for_node(registry, Arc::new(AtomicBool::new(false)), this.clone()),
             name,
             downstream_count,
             route: Arc::new(route),
-            routing: RwLock::new(Arc::new(RoutingState::empty(
-                downstream_count,
-                this.clone(),
-            ))),
-            book: Mutex::new(Book::default()),
+            routing: AtomicPtr::new(first.as_ptr()),
+            book: LifecycleMutex::new(Book {
+                references: HashMap::new(),
+                routing_closed: false,
+                close_retirements: Vec::new(),
+                arena,
+            }),
             closed: AtomicBool::new(false),
             upstream_sequence: AtomicU64::new(0),
             this: this.clone(),
@@ -206,9 +340,14 @@ impl LatticeVertex {
         self.edge.drain_flag().load(Ordering::Acquire)
     }
 
-    /// The current routing generation. Holding it keeps the downstreams it routes to open.
-    pub fn routing_state(&self) -> Arc<RoutingState> {
-        self.routing.read().unwrap().clone()
+    /// The current routing generation, with a reader's count on it: holding the guard keeps the downstreams it
+    /// routes to open. A closed vertex's generation routes nowhere.
+    pub fn routing_state(&self) -> RouteGuard<'_> {
+        loop {
+            if let Some(guard) = self.try_acquire_current() {
+                return guard;
+            }
+        }
     }
 
     /// The routing index of downstream `downstream_id` in the current generation.
@@ -219,6 +358,46 @@ impl LatticeVertex {
     /// Downstream `downstream_id`, if it is active in the current generation.
     pub fn downstream(&self, downstream_id: usize) -> Option<Arc<dyn LatticeNode>> {
         self.routing_state().downstream(downstream_id).cloned()
+    }
+
+    /// Java's `acquireRoutingState`: a count on the published generation, or `None` once the vertex is closed.
+    /// Each retry follows a change of the published generation, so a reader never waits for the writer.
+    fn acquire_routing(&self) -> Option<RouteGuard<'_>> {
+        while !self.closed.load(Ordering::Acquire) {
+            if let Some(guard) = self.try_acquire_current() {
+                if self.closed.load(Ordering::Acquire) {
+                    drop(guard);
+                    return None;
+                }
+                return Some(guard);
+            }
+        }
+        None
+    }
+
+    /// Java's `tryAcquireRoutingState`: loads the published pointer, takes a count, and checks the pointer again.
+    /// A state that was recycled since the load is either the published one now, and right to use, or is not, and
+    /// the count is given back.
+    fn try_acquire_current(&self) -> Option<RouteGuard<'_>> {
+        let pointer = self.routing.load(Ordering::Acquire);
+        // SAFETY: states are freed only when the vertex drops, which the borrow of `self` rules out.
+        let state = unsafe { &*pointer };
+        if !state.admission.try_acquire() {
+            return None;
+        }
+        let guard = RouteGuard {
+            vertex: self,
+            state,
+        };
+        // Dropping the guard of a state that is no longer published gives the count back.
+        (ptr::eq(pointer, self.routing.load(Ordering::Acquire))).then_some(guard)
+    }
+
+    /// Java's `releaseRoute`: gives a count back; the last reader of a retired state releases its handles.
+    fn release_route(&self, state: &RoutingState) {
+        if state.admission.release() {
+            self.release_handles_when_quiescent(state);
+        }
     }
 
     /// Publishes a new routing generation in which the downstreams with ids in `active` are
@@ -256,19 +435,23 @@ impl LatticeVertex {
             );
         }
 
-        let mut next = RoutingState::empty(self.downstream_count, self.this.clone());
+        let mut table = Table::empty(self.downstream_count);
         for (index, &id) in mappings.iter().enumerate() {
-            next.active_indexes[id] = Some(index);
-            next.handles[id] = handles[id].clone();
+            table.active_indexes[id] = Some(index);
+            table.handles[id] = handles[id].clone();
         }
-        next.mappings = mappings;
+        table.mappings = mappings;
 
         let retired = {
-            let mut book = self.book.lock().unwrap();
+            let mut book = self.book.lock();
             if !self.is_draining() || self.is_closed() {
                 return false;
             }
-            for handle in next.unique_handles() {
+            let next = book.arena.next_state(table);
+            // SAFETY: states live until the vertex drops; the next one is closed to readers until it is
+            // published below.
+            let next_ref = unsafe { next.as_ref() };
+            for handle in next_ref.table().unique_handles() {
                 handle.edge().set_parent(Some(&this));
                 book.references
                     .entry(key(handle.edge()))
@@ -278,22 +461,52 @@ impl LatticeVertex {
                     })
                     .generations += 1;
             }
-            std::mem::replace(&mut *self.routing.write().unwrap(), Arc::new(next))
+            self.publish(next)
         };
-        drop(retired);
+        self.release_handles_when_quiescent(retired);
         true
     }
 
-    /// Releases `state`'s hold on its downstreams once no push routes with it any more: closes
-    /// those no other generation routes to and runs their retirements, then, once the vertex is
-    /// closed and nothing routes anywhere, the close retirements.
-    fn release(&self, state: &RoutingState) {
+    /// Publishes `next` and retires the generation it replaces, which it returns. The caller holds the book.
+    ///
+    /// Java retires the old state first and publishes second, so a reader that finds the retired state waits for
+    /// the writer between the two. Here the new state is published first: a reader that loaded the old pointer
+    /// either takes a count before the retirement and finds the pointer changed, or fails the count and loads the
+    /// new pointer, and neither waits.
+    fn publish(&self, next: NonNull<RoutingState>) -> &RoutingState {
+        let old = self.routing.swap(next.as_ptr(), Ordering::AcqRel);
+        // SAFETY: states live until the vertex drops.
+        let old = unsafe { &*old };
+        old.admission.retire();
+        old
+    }
+
+    /// Java's `releaseHandlesWhenQuiescent`: once `state` is retired and its last reader has gone, closes the
+    /// downstreams no other generation routes to and runs their retirements, then, once the vertex is closed and
+    /// nothing routes anywhere, the close retirements. Rebalance work, run by whichever thread gets here first,
+    /// once per generation.
+    fn release_handles_when_quiescent(&self, state: &RoutingState) {
+        if !state.admission.is_retired()
+            || state.admission.has_readers()
+            || state
+                .handles_released
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+        {
+            return;
+        }
+        // The last reader of a retired generation retires it: rebalance work on whichever thread that is.
+        let _cold = HotScope::leave();
         let mut closing = Vec::new();
         let mut retirements = Vec::new();
         let mut close_retirements = Vec::new();
+        let finished;
         {
-            let mut book = self.book.lock().unwrap();
-            for handle in state.unique_handles() {
+            let mut book = self.book.lock();
+            // SAFETY: the state is retired with no readers, and this thread took `handles_released`, so no one
+            // else reads or rewrites the table until `handles_done` is set below.
+            let table = unsafe { &mut *state.table.get() };
+            for handle in table.unique_handles() {
                 let key = key(handle.edge());
                 let Some(reference) = book.references.get_mut(&key) else {
                     continue;
@@ -305,11 +518,16 @@ impl LatticeVertex {
                     retirements.extend(reference.retirements);
                 }
             }
+            // The generation is over: let go of its handles (dropped below, outside the lock), and let a remap
+            // reuse the state.
+            finished = std::mem::take(table);
+            state.handles_done.store(true, Ordering::Release);
             if self.is_closed() && book.references.is_empty() && !book.routing_closed {
                 book.routing_closed = true;
                 close_retirements = std::mem::take(&mut book.close_retirements);
             }
         }
+        drop(finished);
         for handle in closing {
             if panic::catch_unwind(AssertUnwindSafe(|| handle.close())).is_err() {
                 log::error!(target: &self.name, "failed to close a retired downstream");
@@ -331,7 +549,7 @@ impl LatticeVertex {
     pub fn close_after_routes_retire(&self, after_routes_retire: impl FnOnce() + Send + 'static) {
         let after_routes_retire: Retirement = Box::new(after_routes_retire);
         let retired = {
-            let mut book = self.book.lock().unwrap();
+            let mut book = self.book.lock();
             if self.closed.load(Ordering::Acquire) {
                 if !book.routing_closed {
                     book.close_retirements.push(after_routes_retire);
@@ -341,13 +559,13 @@ impl LatticeVertex {
                 self.run_retirement(after_routes_retire);
                 return;
             }
-            self.closed.store(true, Ordering::Release);
+            self.closed.store(true, Ordering::SeqCst);
             book.close_retirements.push(after_routes_retire);
-            let empty = RoutingState::empty(self.downstream_count, self.this.clone());
-            std::mem::replace(&mut *self.routing.write().unwrap(), Arc::new(empty))
+            let empty = book.arena.next_state(Table::empty(self.downstream_count));
+            self.publish(empty)
         };
         self.edge.close_edge();
-        drop(retired);
+        self.release_handles_when_quiescent(retired);
     }
 
     /// Routes `frame` to one active downstream, or hands it back if none is active.
@@ -357,7 +575,9 @@ impl LatticeVertex {
     /// Panics if the routing function returns an index outside the active downstreams.
     pub fn try_push(&self, frame: Box<dyn Frame>) -> Result<(), Box<dyn Frame>> {
         let _hot = HotScope::enter();
-        let state = self.routing_state();
+        let Some(state) = self.acquire_routing() else {
+            return Err(frame);
+        };
         if state.is_empty() {
             return Err(frame);
         }
@@ -367,7 +587,8 @@ impl LatticeVertex {
             "the routing function chose index {index} of {} active downstreams",
             state.len()
         );
-        let downstream = state.handles[state.mappings[index]]
+        let table = state.table();
+        let downstream = table.handles[table.mappings[index]]
             .as_ref()
             .expect("an active downstream has a handle");
         downstream.push(frame);
@@ -418,8 +639,10 @@ impl LatticeNode for LatticeVertex {
 
     /// Passes `error` to every active downstream once.
     fn on_error(&self, error: Failure) {
-        let state = self.routing_state();
-        let targets: Vec<_> = state.unique_handles().collect();
+        let Some(state) = self.acquire_routing() else {
+            return;
+        };
+        let targets: Vec<_> = state.table().unique_handles().collect();
         match targets.as_slice() {
             [] => {}
             [only] => only.on_error(error),
@@ -443,7 +666,7 @@ impl LatticeNode for LatticeVertex {
     /// Runs `action` once no generation routes to `child`: at once if none does now.
     fn defer_child_retirement(&self, child: &LatticeEdge, action: Retirement) {
         let action = {
-            let mut book = self.book.lock().unwrap();
+            let mut book = self.book.lock();
             match book.references.get_mut(&key(child)) {
                 Some(reference) => {
                     reference.retirements.push(action);

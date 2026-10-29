@@ -2,11 +2,11 @@ use super::*;
 use crate::flow_control::LatticeHotSource;
 use crate::flow_control::testing::{Fate, Fates, TestReceiver, Tracked, frame};
 use crate::frames::BenchmarkFrame;
-use crate::generics::{DownstreamSlot, SourceCell};
+use crate::generics::{DownstreamSlot, LatticeTerminal, SourceCell};
 use euhedral_hardware_utils::util::CpuSet;
-use std::sync::Barrier;
 use std::sync::atomic::AtomicUsize;
 use std::sync::mpsc;
+use std::sync::{Barrier, Mutex};
 use std::thread;
 
 fn registry() -> Arc<UpstreamRegistry> {
@@ -553,7 +553,7 @@ fn a_held_generation_keeps_its_downstreams_open() {
     assert!(map(&vertex, &[2, 4], &handles));
     let current = vertex.routing_state();
 
-    assert!(!Arc::ptr_eq(&previous, &current));
+    assert!(!ptr::eq(&*previous, &*current));
     assert_eq!(current.mappings(), [2, 4]);
     assert_eq!(current.active_index(1), None);
     assert_eq!(current.active_index(2), Some(0));
@@ -707,6 +707,279 @@ fn pushes_racing_remaps_always_reach_an_open_downstream() {
     assert!(current > 0);
 }
 
+/// Counts what reaches it, and what reaches it after it was told the edge above completed.
+#[derive(Default)]
+struct Counting {
+    pushed: AtomicUsize,
+    completions: AtomicUsize,
+    late: AtomicUsize,
+}
+
+impl LatticeTerminal for Counting {
+    fn add_upstream(&self, _upstream: Arc<dyn LatticeSource>) {}
+}
+
+impl LatticeReceiver for Counting {
+    fn push(&self, _frame: Box<dyn Frame>) {
+        if self.completions.load(Ordering::SeqCst) > 0 {
+            self.late.fetch_add(1, Ordering::SeqCst);
+        }
+        self.pushed.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn on_complete(&self) {
+        self.completions.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn on_error(&self, _error: Failure) {}
+}
+
+fn counting_edge(registry: &Arc<UpstreamRegistry>) -> (Arc<LatticeEdge>, Arc<Counting>) {
+    let edge = LatticeEdge::new(registry, Arc::new(AtomicBool::new(false)));
+    let receiver = Arc::new(Counting::default());
+    edge.add_downstream(receiver.clone());
+    (edge, receiver)
+}
+
+#[cfg(not(miri))]
+const REMAPS: usize = 1_000;
+#[cfg(miri)]
+const REMAPS: usize = 12;
+/// How many times the remap race runs in one test.
+#[cfg(not(miri))]
+const RACES: usize = 20;
+#[cfg(miri)]
+const RACES: usize = 1;
+#[cfg(not(miri))]
+const PUSHERS: u64 = 8;
+#[cfg(miri)]
+const PUSHERS: u64 = 3;
+
+/// What `pushers` threads pushing through a two-way vertex saw while it was remapped `remaps` times, each time to
+/// two fresh downstreams.
+struct RemapRace {
+    sent: u64,
+    receivers: Vec<Arc<Counting>>,
+    edges: Vec<Arc<LatticeEdge>>,
+    fates: Fates,
+    states: usize,
+}
+
+fn race_remaps(pushers: u64, remaps: usize) -> RemapRace {
+    let registry = registry();
+    let vertex = LatticeVertex::new(&registry, "validated", 2);
+    let fates = Fates::default();
+    let stop = Arc::new(AtomicBool::new(false));
+    let started = Arc::new(AtomicUsize::new(0));
+    let mut receivers = Vec::new();
+    let mut edges = Vec::new();
+    let mut remap = |vertex: &LatticeVertex| {
+        let pair: Vec<_> = (0..2).map(|_| counting_edge(&registry)).collect();
+        let handles: Vec<_> = pair.iter().map(|(edge, _)| node(edge)).collect();
+        assert!(map(vertex, &[0, 1], &handles));
+        for (edge, receiver) in pair {
+            edges.push(edge);
+            receivers.push(receiver);
+        }
+    };
+    remap(&vertex);
+
+    let producers: Vec<_> = (0..pushers)
+        .map(|producer| {
+            let (vertex, fates, stop) = (vertex.clone(), fates.clone(), stop.clone());
+            let started = started.clone();
+            thread::spawn(move || {
+                let mut sent = 0_u64;
+                while !stop.load(Ordering::Acquire) {
+                    if sent == 1 {
+                        started.fetch_add(1, Ordering::SeqCst);
+                    }
+                    let id = producer * 1_000_000 + sent;
+                    let mut frame = Tracked::new(id, &fates);
+                    frame
+                        .header_mut()
+                        .set_routing_hash(id.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+                    vertex.push(frame);
+                    sent += 1;
+                }
+                sent
+            })
+        })
+        .collect();
+    // Remap only once every pusher is pushing, and keep pushing until the last remap is done.
+    while started.load(Ordering::SeqCst) < pushers as usize {
+        thread::yield_now();
+    }
+    for _ in 0..remaps {
+        remap(&vertex);
+    }
+    stop.store(true, Ordering::Release);
+    let sent = producers
+        .into_iter()
+        .map(|producer| producer.join().unwrap())
+        .sum();
+    let states = vertex.book.lock().arena.states.len();
+    RemapRace {
+        sent,
+        receivers,
+        edges,
+        fates,
+        states,
+    }
+}
+
+#[test]
+fn pushes_racing_remaps_reach_only_validated_downstreams() {
+    for _ in 0..RACES {
+        pushes_racing_remaps_reach_only_validated_downstreams_once();
+    }
+}
+
+fn pushes_racing_remaps_reach_only_validated_downstreams_once() {
+    let race = race_remaps(PUSHERS, REMAPS);
+    assert!(race.sent >= PUSHERS, "every pusher pushed");
+    assert!(
+        race.fates.lock().unwrap().is_empty(),
+        "no frame was refused"
+    );
+    let delivered: usize = race
+        .receivers
+        .iter()
+        .map(|receiver| receiver.pushed.load(Ordering::SeqCst))
+        .sum();
+    assert_eq!(delivered as u64, race.sent, "no frame is lost or doubled");
+    let late: usize = race
+        .receivers
+        .iter()
+        .map(|receiver| receiver.late.load(Ordering::SeqCst))
+        .sum();
+    assert_eq!(late, 0, "a frame reached a downstream a remap had closed");
+}
+
+#[test]
+fn the_last_reader_of_a_retired_generation_closes_its_dropped_downstreams_once() {
+    for _ in 0..RACES {
+        the_last_reader_closes_its_dropped_downstreams_once();
+    }
+}
+
+fn the_last_reader_closes_its_dropped_downstreams_once() {
+    let race = race_remaps(PUSHERS, REMAPS);
+    let (last, dropped) = race.receivers.split_at(race.receivers.len() - 2);
+    for receiver in last {
+        assert_eq!(
+            receiver.completions.load(Ordering::SeqCst),
+            1,
+            "a dropped downstream is closed exactly once"
+        );
+    }
+    for receiver in dropped {
+        assert_eq!(receiver.completions.load(Ordering::SeqCst), 0);
+    }
+    assert!(
+        race.edges[..race.edges.len() - 2]
+            .iter()
+            .all(|edge| edge.is_closed())
+    );
+    assert!(
+        race.edges[race.edges.len() - 2..]
+            .iter()
+            .all(|edge| !edge.is_closed())
+    );
+}
+
+#[test]
+fn the_states_stay_few_however_many_remaps_race_the_pushers() {
+    let race = race_remaps(PUSHERS, REMAPS);
+    // A state is rewritten once its readers have left, so the arena holds the generations pushers still read, not
+    // one per remap.
+    assert!(
+        race.states < (REMAPS / 2).max(PUSHERS as usize + 4),
+        "{} states for {REMAPS} remaps",
+        race.states
+    );
+}
+
+#[test]
+fn a_remap_reuses_a_retired_state_once_its_readers_left() {
+    let registry = registry();
+    let vertex = LatticeVertex::new(&registry, "recycled", 2);
+    let (edge, _) = receiving_edge(&registry);
+    for round in 0..100 {
+        assert!(map(&vertex, &[round % 2], &[node(&edge), node(&edge)]));
+        assert!(
+            vertex.book.lock().arena.states.len() <= 2,
+            "round {round}: a retired idle state is rewritten"
+        );
+    }
+    assert!(!edge.is_closed(), "the generations all route to it");
+    assert_eq!(vertex.routing_state().mappings(), [1]);
+}
+
+#[test]
+fn a_held_generation_is_not_rewritten_and_the_pool_shrinks_back_to_use() {
+    let registry = registry();
+    let vertex = LatticeVertex::new(&registry, "held", 2);
+    let (edge, _) = receiving_edge(&registry);
+    let handles = [node(&edge), node(&edge)];
+    assert!(map(&vertex, &[0], &handles));
+    let held = vertex.routing_state();
+    for _ in 0..20 {
+        assert!(map(&vertex, &[1], &handles));
+        assert_eq!(held.mappings(), [0], "a held generation never changes");
+    }
+    assert_eq!(vertex.book.lock().arena.states.len(), 3);
+    drop(held);
+    for _ in 0..20 {
+        assert!(map(&vertex, &[1], &handles));
+    }
+    assert_eq!(
+        vertex.book.lock().arena.states.len(),
+        3,
+        "the freed state is reused, not added to"
+    );
+}
+
+#[test]
+fn a_panicking_routing_function_gives_its_count_back() {
+    let registry = registry();
+    let vertex = LatticeVertex::with_routing(&registry, "route-panic", 1, |_, _| {
+        panic!("the routing function broke")
+    });
+    let (edge, receiver) = receiving_edge(&registry);
+    assert!(map(&vertex, &[0], &[node(&edge)]));
+
+    let pushed = panic::catch_unwind(AssertUnwindSafe(|| vertex.try_push(frame(1))));
+    assert!(pushed.is_err());
+    assert!(receiver.received().is_empty());
+
+    // A leaked count would keep the retired generation from releasing its downstream.
+    assert!(map(&vertex, &[], &[]));
+    assert!(
+        edge.is_closed(),
+        "the generation's last reader gave its count back"
+    );
+}
+
+#[test]
+fn releasing_the_last_reader_inside_a_hot_scope_takes_the_book_off_it() {
+    let registry = registry();
+    let vertex = LatticeVertex::new(&registry, "hot-release", 1);
+    let (edge, receiver) = receiving_edge(&registry);
+    assert!(map(&vertex, &[0], &[node(&edge)]));
+    let held = vertex.routing_state();
+    assert!(map(&vertex, &[], &[]));
+    assert!(!edge.is_closed());
+
+    // The thread that drops the last count may be a worker mid-push; the book is lifecycle state, and a debug build
+    // aborts when it is taken inside a hot scope.
+    let _hot = HotScope::enter();
+    drop(held);
+
+    assert!(edge.is_closed());
+    assert!(receiver.is_completed());
+}
+
 #[test]
 fn closing_publishes_no_active_downstreams() {
     let registry = registry();
@@ -821,10 +1094,8 @@ fn a_dropped_vertex_leaves_its_downstreams_alone() {
     let vertex = LatticeVertex::new(&registry, "dropped", 1);
     let (child, receiver) = receiving_edge(&registry);
     assert!(map(&vertex, &[0], &[node(&child)]));
-    let held = vertex.routing_state();
 
     drop(vertex);
-    drop(held);
 
     assert!(!child.is_closed());
     assert!(!receiver.is_completed());
