@@ -31,7 +31,7 @@ use euhedral_core::frames::Frame;
 
 use crate::lanes::{DeviceQueue, LaneId, Marker, QueueId};
 
-pub use intake::{Deliver, GroupId, LaneInputs, LaneIntakes};
+pub use intake::{Deliver, GroupId, LaneClosed, LaneInputs, LaneIntakes};
 pub use metrics::LaneMetrics;
 pub use source::LaneSource;
 
@@ -72,9 +72,10 @@ pub trait LaneSubmit: Send + 'static {
     /// full). Never waits.
     fn mark(&mut self) -> Result<Option<Marker>, Self::Error>;
 
-    /// Arms a retirement after the work submitted so far. Retirements come back from
-    /// [`poll_retired`](Self::poll_retired) in the order they were armed.
-    fn arm_retirement(&mut self) -> Result<(), Self::Error>;
+    /// Arms a retirement after the work submitted so far and returns its sequence number, which
+    /// [`poll_retired`](Self::poll_retired) reports in [`Retired::seq`]. Retirements come back in
+    /// the order they were armed; the lane source pairs each with its item by this number.
+    fn arm_retirement(&mut self) -> Result<u64, Self::Error>;
 
     /// The next retirement that arrived, settled: the backend has released what it kept for it.
     fn poll_retired(&mut self) -> Option<Retired<Self::Error>>;
@@ -203,9 +204,9 @@ impl<S: LaneSubmit, X, W: Send + 'static> LaneCx<'_, S, X, W> {
     }
 
     /// Delivers `work` to a lane or a group. Delivery only enqueues: it spends no demand and runs
-    /// nothing.
-    pub fn deliver(&self, work: W, to: Deliver) {
-        self.intakes.deliver(work, to);
+    /// nothing. A lane that completed or was dropped refuses the work and hands it back.
+    pub fn deliver(&self, work: W, to: Deliver) -> Result<(), LaneClosed<W>> {
+        self.intakes.deliver(work, to)
     }
 
     /// Queues `frame`; the lane pushes it within the demand it has banked.

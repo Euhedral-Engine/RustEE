@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use euhedral_core::frames::{Failure, Frame, FrameError, FrameHeader};
 use euhedral_core::generics::{LatticeReceiver, LatticeSource, LatticeTerminal};
+use euhedral_graph::LaneSubmit as _;
 use euhedral_graph::testing::{FakeLane, FakeLaneError, FakeLanes};
 use euhedral_graph::{
     Deliver, LaneCx, LaneId, LaneIntakes, LanePool, LanePoolBuilder, LaneSource, LaneState,
@@ -64,6 +65,11 @@ pub struct Probe {
     pub errored: Arc<AtomicUsize>,
     /// Per-tag counts of frames made, for tests that count.
     pub counts: Mutex<Vec<u64>>,
+    /// The fake lanes whose lane 0 submitter the drop-order counts look at.
+    pub fake: Mutex<Option<FakeLanes>>,
+    /// Items dropped before / after lane 0's submitter was dropped.
+    pub dropped_before_submitter: AtomicUsize,
+    pub dropped_after_submitter: AtomicUsize,
 }
 
 impl Probe {
@@ -113,6 +119,8 @@ pub struct Job {
     pub retired_deliver: Option<(Box<Job>, Deliver)>,
     /// `run` requests this source (a re-entry the debug check must refuse).
     pub reenter: Option<Arc<dyn LatticeSource>>,
+    /// `run` arms a retirement of its own through the submitter (a stray call).
+    pub stray_arm: bool,
     /// `run` blocks on these barriers (a long item).
     pub hold: Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
 }
@@ -130,6 +138,7 @@ impl Job {
             then_deliver: None,
             retired_deliver: None,
             reenter: None,
+            stray_arm: false,
             hold: None,
         }
     }
@@ -169,6 +178,11 @@ impl Job {
         self
     }
 
+    pub fn stray_arm(mut self) -> Self {
+        self.stray_arm = true;
+        self
+    }
+
     pub fn hold(mut self, a: &Arc<std::sync::Barrier>, b: &Arc<std::sync::Barrier>) -> Self {
         self.hold = Some((a.clone(), b.clone()));
         self
@@ -178,6 +192,14 @@ impl Job {
 impl Drop for Job {
     fn drop(&mut self) {
         self.probe.dropped.fetch_add(1, Ordering::SeqCst);
+        if let Some(fake) = lock(&self.probe.fake).as_ref() {
+            let counter = if fake.dropped(LaneId(0)) {
+                &self.probe.dropped_after_submitter
+            } else {
+                &self.probe.dropped_before_submitter
+            };
+            counter.fetch_add(1, Ordering::SeqCst);
+        }
     }
 }
 
@@ -210,7 +232,12 @@ impl LaneWork<FakeLane, Gate> for Job {
                 lock(&self.probe.bridged).push((self.tag, marker));
             }
         }
+        if self.stray_arm {
+            let _ = cx.submitter().arm_retirement().unwrap();
+        }
         if let Some(source) = &self.reenter {
+            // The claim is taken: a pull hands over nothing, a request banks its demand.
+            assert_eq!(source.pull(&mut |_| {}, &mut |_| false, 5), 0);
             source.request(1);
         }
         if let Some((a, b)) = &self.hold {
@@ -229,14 +256,14 @@ impl LaneWork<FakeLane, Gate> for Job {
             cx.ready(Tag::frame(self.tag, &self.probe.errored));
         }
         if let Some((job, to)) = self.then_deliver.take() {
-            cx.deliver(*job, to);
+            cx.deliver(*job, to).unwrap();
         }
     }
 
     fn retired(mut self, _marker: Marker, failure: Option<FakeLaneError>, cx: &mut Cx<'_>) {
         lock(&self.probe.retired).push((self.tag, failure));
         if let Some((job, to)) = self.retired_deliver.take() {
-            cx.deliver(*job, to);
+            cx.deliver(*job, to).unwrap();
         }
     }
 
@@ -319,6 +346,8 @@ impl Rig {
             receivers.push(receiver);
             gates.push(gate);
         }
+        let probe = Probe::new();
+        *lock(&probe.fake) = Some(fake.clone());
         Self {
             fake,
             pool,
@@ -326,7 +355,7 @@ impl Rig {
             sources,
             receivers,
             gates,
-            probe: Probe::new(),
+            probe,
         }
     }
 
@@ -335,7 +364,7 @@ impl Rig {
     }
 
     pub fn deliver(&self, job: Job, to: Deliver) {
-        self.intakes.deliver(job, to);
+        self.intakes.deliver(job, to).unwrap();
     }
 
     pub fn lane(&self, lane: u16) -> Deliver {

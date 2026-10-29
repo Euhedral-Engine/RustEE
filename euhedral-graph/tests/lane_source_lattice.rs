@@ -2,8 +2,9 @@
 //! 4 workers. Every delivered item makes one frame, whether it ends at once or after a retirement,
 //! and every frame executes exactly once.
 //!
-//! `EUHEDRAL_TEST_CPUS` (default 0,1,2,3) picks the lattice's CPUs; as in the other lattice tests, the
-//! test passes without checking anything when this process may not run on all of them.
+//! `EUHEDRAL_TEST_CPUS` (default 0,1,2,3) picks the lattice's CPUs. The test runs on the ones this
+//! process may use, and on the first four it may use when none of them is allowed: it never passes
+//! without running.
 
 #![cfg(target_os = "linux")]
 #![allow(
@@ -143,11 +144,15 @@ fn lattice(cpus: &[usize]) -> Arc<ControlPlaneLattice> {
 
 #[test]
 fn lane_sources_on_a_real_lattice_deliver_every_frame_once() {
-    let cpus = cpus();
-    if !cpus.iter().all(|&cpu| affinity::base_mask().contains(cpu)) {
-        eprintln!("skipped: this process may not run on CPUs {cpus:?}");
-        return;
+    let allowed = affinity::base_mask();
+    let mut cpus: Vec<usize> = cpus()
+        .into_iter()
+        .filter(|&c| allowed.contains(c))
+        .collect();
+    if cpus.is_empty() {
+        cpus = allowed.iter().take(4).collect();
     }
+    assert!(!cpus.is_empty(), "this process may run on some CPU");
     let lattice = lattice(&cpus);
 
     let lanes = GROUP_SOURCES + 1;
@@ -201,7 +206,7 @@ fn lane_sources_on_a_real_lattice_deliver_every_frame_once() {
         } else {
             Deliver::Group(GroupId(0))
         };
-        intakes.deliver(item, to);
+        intakes.deliver(item, to).unwrap();
         if index % 512 == 0 {
             std::thread::sleep(Duration::from_micros(100));
         }

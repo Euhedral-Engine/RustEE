@@ -97,10 +97,10 @@ State that only those calls touch is plain, in a `SourceCell`, with no atomics a
 is always called; `pull` may never be.
 
 **SourceCell, SourceGuard** ([`SourceCell`](euhedral-core/src/generics/source_cell.rs)): a source's
-plain state under the source invariant. `enter` is `unsafe`, because the compiler cannot see the
-lattice's guarantee; the caller is inside `pull` or `request`, or in an action `serialize` runs. A
-source's lifecycle calls from other threads set atomics, and the source applies them there. In
-debug builds a second entry, nested or from another thread, panics. Release builds carry no check.
+plain state under the source invariant. Entry takes a claim with one compare-and-set in every build, so
+two guards never exist: `try_enter` hands a refusal back (a nested entry, or a direct call racing the lattice),
+`enter` panics. Under the lattice the claim is always free. A source's lifecycle calls from other threads set
+atomics, and the source applies them in `pull` or `request`.
 
 **`serialize`** ([`LatticeReceiver::serialize`](euhedral-core/src/generics/lattice.rs)): runs an action
 when no `pull` or `request` of the receiver's source is in progress, without waiting: at once if none
@@ -368,7 +368,7 @@ is in at most one group, and a group may hold lanes of several backends.
 
 **banked demand** ([`LaneSource::banked`](euhedral-graph/src/lane_source/source.rs)): the demand a lane source has
 been asked for and has not yet spent on a push. `request` always adds to it, even with nothing ready, and a push
-subtracts what it pushed; `pull` never touches it. `u64::MAX` is unbounded and is never subtracted from.
+subtracts what it pushed; `pull` never touches it. `u64::MAX` saturates the bank; a spend floors at zero.
 
 **lane item** ([`LaneWork`](euhedral-graph/src/lane_source/mod.rs)): one unit of work on a lane. It runs on the
 lane's submitter, answers `Submitted`, `Finished` or `Wait`, delivers its successors after the lane marked it, and

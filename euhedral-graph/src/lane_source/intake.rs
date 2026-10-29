@@ -4,7 +4,9 @@
 //! order is kept per lane. A lane group's shared intake is an MPMC queue every source of the group
 //! takes from, one item at a time. Delivery is an `offer` and nothing more.
 
+use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 use euhedral_data_structures::queues::{Consumer, MpmcQueue, MpscQueue, Multi, Producer, Single};
@@ -29,6 +31,25 @@ pub enum Deliver {
     Group(GroupId),
 }
 
+static NEXT_INTAKES: AtomicU64 = AtomicU64::new(1);
+
+/// Work refused because its lane completed or was dropped, handed back to the deliverer.
+pub struct LaneClosed<W>(pub W);
+
+impl<W> fmt::Debug for LaneClosed<W> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("LaneClosed(..)")
+    }
+}
+
+impl<W> fmt::Display for LaneClosed<W> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("the lane completed or was dropped, so it takes no more work")
+    }
+}
+
+impl<W> std::error::Error for LaneClosed<W> {}
+
 /// Delivered work and when it was delivered.
 pub(crate) struct Envelope<W> {
     pub(crate) work: W,
@@ -37,7 +58,11 @@ pub(crate) struct Envelope<W> {
 
 /// The delivery side of every lane's intakes.
 pub struct LaneIntakes<W> {
+    /// Tells this set of intakes from another, for `LaneInputs`.
+    id: u64,
     pool: Arc<LanePool>,
+    /// Per lane: set when the lane's source completes or is dropped.
+    closed: Box<[AtomicBool]>,
     own: Box<[Producer<Envelope<W>, Multi>]>,
     shared: Box<[Producer<Envelope<W>, Multi>]>,
     group_of: Box<[Option<GroupId>]>,
@@ -58,6 +83,8 @@ impl<W> std::fmt::Debug for LaneIntakes<W> {
 /// The taking side of one lane's intakes, for its [`LaneSource`](super::LaneSource).
 pub struct LaneInputs<W> {
     lane: LaneId,
+    /// The `LaneIntakes` these inputs belong to.
+    intakes: u64,
     pub(crate) own: Consumer<Envelope<W>, Single>,
     pub(crate) shared: Option<Consumer<Envelope<W>, Multi>>,
 }
@@ -74,6 +101,27 @@ impl<W> std::fmt::Debug for LaneInputs<W> {
 impl<W> LaneInputs<W> {
     pub fn lane(&self) -> LaneId {
         self.lane
+    }
+
+    /// The identity of the `LaneIntakes` these inputs were made with.
+    pub(crate) fn intakes_id(&self) -> u64 {
+        self.intakes
+    }
+}
+
+impl<W> LaneIntakes<W> {
+    /// Whether `lane`'s source completed or was dropped.
+    pub fn is_closed(&self, lane: LaneId) -> bool {
+        self.closed[usize::from(lane.0)].load(Ordering::SeqCst)
+    }
+
+    /// Closes `lane`: later deliveries to it are refused.
+    pub(crate) fn close(&self, lane: LaneId) {
+        self.closed[usize::from(lane.0)].store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn id(&self) -> u64 {
+        self.id
     }
 }
 
@@ -102,6 +150,7 @@ impl<W: Send + 'static> LaneIntakes<W> {
             shared.push(queue.producer());
             shared_queues.push(queue);
         }
+        let id = NEXT_INTAKES.fetch_add(1, Ordering::Relaxed);
         let mut own = Vec::with_capacity(lanes);
         let mut inputs = Vec::with_capacity(lanes);
         for (i, group) in group_of.iter().enumerate() {
@@ -109,11 +158,14 @@ impl<W: Send + 'static> LaneIntakes<W> {
             own.push(queue.producer());
             inputs.push(LaneInputs {
                 lane: LaneId(u16::try_from(i).expect("at most 64 lanes")),
+                intakes: id,
                 own: queue.consumer(),
                 shared: group.map(|g| shared_queues[usize::from(g.0)].consumer()),
             });
         }
         let intakes = Arc::new(Self {
+            id,
+            closed: (0..lanes).map(|_| AtomicBool::new(false)).collect(),
             pool,
             own: own.into_boxed_slice(),
             shared: shared.into_boxed_slice(),
@@ -127,15 +179,25 @@ impl<W: Send + 'static> LaneIntakes<W> {
     /// Queues `work` in a lane's own intake or a group's shared intake. It never runs the work and
     /// never waits.
     ///
+    /// A lane that completed or was dropped refuses the work: it comes back as `Err`, so the
+    /// deliverer ends it with an error. A delivery that races the lane's closing can still land in
+    /// the intake just after the lane drained it; that item is dropped with the intakes.
+    ///
     /// # Panics
     ///
     /// On a lane or group the pool lacks.
-    pub fn deliver(&self, work: W, to: Deliver) {
+    pub fn deliver(&self, work: W, to: Deliver) -> Result<(), LaneClosed<W>> {
         let producer = match to {
-            Deliver::Lane(lane) => self
-                .own
-                .get(usize::from(lane.0))
-                .unwrap_or_else(|| panic!("lane {} is not a lane of the pool", lane.0)),
+            Deliver::Lane(lane) => {
+                let producer = self
+                    .own
+                    .get(usize::from(lane.0))
+                    .unwrap_or_else(|| panic!("lane {} is not a lane of the pool", lane.0));
+                if self.is_closed(lane) {
+                    return Err(LaneClosed(work));
+                }
+                producer
+            }
             Deliver::Group(group) => self
                 .shared
                 .get(usize::from(group.0))
@@ -148,6 +210,7 @@ impl<W: Send + 'static> LaneIntakes<W> {
         if producer.offer(envelope).is_err() {
             unreachable!("an unbounded intake takes every offer");
         }
+        Ok(())
     }
 
     pub fn pool(&self) -> &Arc<LanePool> {

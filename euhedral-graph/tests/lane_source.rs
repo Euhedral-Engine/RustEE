@@ -179,7 +179,9 @@ fn nothing_is_pulled_before_a_receiver_is_attached() {
         intakes.clone(),
     );
     let probe = common::Probe::new();
-    intakes.deliver(Job::new(&probe, 1).frame(), Deliver::Lane(first));
+    intakes
+        .deliver(Job::new(&probe, 1).frame(), Deliver::Lane(first))
+        .unwrap();
     source.request(10);
     assert!(probe.ran().is_empty(), "no receiver: request does nothing");
     assert_eq!(source.banked(), 0);
@@ -388,10 +390,12 @@ fn a_foreign_marker_is_handed_to_the_item_not_awaited() {
     );
     source.clone().add_downstream(common::Collect::new());
     let probe = common::Probe::new();
-    intakes.deliver(
-        Job::new(&probe, 1).waits(&[foreign]).submit(false),
-        Deliver::Lane(a),
-    );
+    intakes
+        .deliver(
+            Job::new(&probe, 1).waits(&[foreign]).submit(false),
+            Deliver::Lane(a),
+        )
+        .unwrap();
     source.request(1);
     assert_eq!(probe.ran(), vec![1]);
     assert_eq!(
@@ -545,15 +549,273 @@ fn a_failed_await_ends_the_item_with_failed() {
     );
 }
 
-#[cfg(debug_assertions)]
 #[test]
-#[should_panic(expected = "nested entry")]
-fn an_item_that_requests_its_own_source_panics_in_debug() {
+fn an_item_that_requests_its_own_source_banks_the_demand_and_is_served_after_it() {
+    // The cell's claim is taken in every build: the nested request leaves a wakeup, the nested pull
+    // hands over nothing, and the outer call serves the wakeup when the item is done.
     let rig = Rig::new(1, &[]);
-    let mut job = rig.job(1);
+    let mut job = rig.job(1).frame();
     job.reenter = Some(rig.sources[0].clone());
     rig.deliver(job, rig.lane(0));
     rig.sources[0].request(1);
+    assert_eq!(rig.received(0), vec![1]);
+    assert_eq!(
+        rig.sources[0].banked(),
+        1,
+        "the nested demand is banked, not lost"
+    );
+    assert_eq!(
+        rig.gates[0].checks.load(Ordering::SeqCst),
+        2,
+        "a second pass served the wakeup"
+    );
+}
+
+#[test]
+fn a_direct_request_while_the_lane_is_busy_is_served_when_it_lets_go() {
+    let rig = Rig::new(1, &[]);
+    let (a, b) = (Arc::new(Barrier::new(2)), Arc::new(Barrier::new(2)));
+    rig.deliver(rig.job(1).frame().hold(&a, &b), rig.lane(0));
+    let source = rig.sources[0].clone();
+    std::thread::scope(|scope| {
+        let inside = scope.spawn(move || source.request(1));
+        a.wait();
+        // The lane is inside an item: a second caller banks and leaves, and a pull hands nothing.
+        rig.sources[0].request(5);
+        assert_eq!(rig.sources[0].pull(&mut |_| {}, &mut |_| false, 5), 0);
+        assert_eq!(rig.sources[0].banked(), 6);
+        b.wait();
+        inside.join().unwrap();
+    });
+    assert_eq!(rig.received(0), vec![1]);
+    assert_eq!(
+        rig.sources[0].banked(),
+        5,
+        "the extra demand waits for work"
+    );
+    assert_eq!(
+        rig.gates[0].checks.load(Ordering::SeqCst),
+        2,
+        "the holder served the wakeup"
+    );
+}
+
+#[test]
+fn a_retirement_armed_from_inside_an_item_is_not_paired_with_a_continuation() {
+    let rig = Rig::new(1, &[]);
+    rig.deliver(rig.job(1).stray_arm().submit(true), rig.lane(0));
+    rig.deliver(rig.job(2).submit(true), rig.lane(0));
+    rig.sources[0].request(1);
+    // Armed in order: 0 (item 1's stray call), 1 (item 1), 2 (item 2). The stray one arrives first.
+    rig.fake.retire_next(LaneId(0), 1);
+    rig.sources[0].request(1);
+    assert!(
+        lock(&rig.probe.retired).is_empty(),
+        "the stray arrival is no item's"
+    );
+    rig.fake.retire_next(LaneId(0), 1);
+    rig.sources[0].request(1);
+    let tags: Vec<u64> = lock(&rig.probe.retired).iter().map(|(t, _)| *t).collect();
+    assert_eq!(tags, vec![1], "seq 1 is item 1's");
+    rig.fake.retire_all();
+    rig.sources[0].request(1);
+    let tags: Vec<u64> = lock(&rig.probe.retired).iter().map(|(t, _)| *t).collect();
+    assert_eq!(tags, vec![1, 2]);
+}
+
+#[test]
+fn a_failed_mark_ends_the_item_with_failed_and_the_lane_goes_on() {
+    let rig = Rig::new(1, &[]);
+    rig.fake.fail_marks(LaneId(0), 1);
+    rig.deliver(rig.job(1).submit(false).frame(), rig.lane(0));
+    rig.deliver(rig.job(2).submit(false).frame(), rig.lane(0));
+    rig.sources[0].request(5);
+    assert_eq!(*lock(&rig.probe.failed), vec![1]);
+    assert_eq!(rig.probe.ran(), vec![1, 2]);
+    assert_eq!(rig.received(0), vec![2], "the failed item made no frame");
+}
+
+#[test]
+fn a_failed_retry_of_the_mark_ends_the_unmarked_item() {
+    let rig = Rig::new(1, &[]);
+    rig.fake.busy_marks(LaneId(0), 1);
+    rig.deliver(rig.job(1).submit(false), rig.lane(0));
+    rig.sources[0].request(1);
+    assert!(lock(&rig.probe.failed).is_empty(), "stalled, not failed");
+    rig.fake.fail_marks(LaneId(0), 1);
+    rig.sources[0].request(1);
+    assert_eq!(*lock(&rig.probe.failed), vec![1]);
+}
+
+#[test]
+fn a_failed_arm_ends_the_item_with_failed_and_arms_nothing() {
+    let rig = Rig::new(1, &[]);
+    rig.fake.fail_arms(LaneId(0), 1);
+    rig.deliver(rig.job(1).submit(true), rig.lane(0));
+    rig.deliver(rig.job(2).submit(true), rig.lane(0));
+    rig.sources[0].request(1);
+    assert_eq!(*lock(&rig.probe.failed), vec![1]);
+    assert_eq!(rig.fake.armed(LaneId(0)), 1, "only item 2 armed");
+    rig.fake.retire_all();
+    rig.sources[0].request(1);
+    let tags: Vec<u64> = lock(&rig.probe.retired).iter().map(|(t, _)| *t).collect();
+    assert_eq!(tags, vec![2]);
+}
+
+#[test]
+fn a_stall_in_the_waiting_pass_keeps_the_items_behind_it_in_order() {
+    let rig = Rig::new(1, &[]);
+    // All four wait for the gate; 3 and 4 share a key, and 4 has no wait of its own.
+    rig.deliver(rig.job(1).need(1).submit(false), rig.lane(0));
+    rig.deliver(rig.job(2).need(1).key(7).submit(false), rig.lane(0));
+    rig.deliver(rig.job(3).key(7).submit(false), rig.lane(0));
+    rig.deliver(rig.job(4).need(1).key(8).submit(false), rig.lane(0));
+    rig.sources[0].request(1);
+    assert!(rig.probe.ran().is_empty());
+    rig.gates[0].value.store(1, Ordering::SeqCst);
+    rig.fake.busy_marks(LaneId(0), 1);
+    rig.sources[0].request(1);
+    assert_eq!(
+        rig.probe.ran(),
+        vec![1],
+        "item 1 ran and could not be marked: the lane stalls"
+    );
+    assert_eq!(marks(&rig, 0), 0);
+    rig.sources[0].request(1);
+    assert_eq!(
+        rig.probe.ran(),
+        vec![1, 2, 3, 4],
+        "in delivery order, same keys behind their head"
+    );
+    assert_eq!(marks(&rig, 0), 4);
+}
+
+#[test]
+fn a_group_item_that_waits_stays_bound_to_the_lane_that_took_it() {
+    let rig = Rig::new(2, &[&[0, 1]]);
+    rig.deliver(rig.job(1).need(1).submit(false), Deliver::Group(GroupId(0)));
+    rig.sources[0].request(1);
+    rig.gates[1].value.store(1, Ordering::SeqCst);
+    rig.sources[1].request(1);
+    assert!(
+        rig.probe.ran().is_empty(),
+        "lane 1's gate is no concern of the item lane 0 holds"
+    );
+    rig.gates[0].value.store(1, Ordering::SeqCst);
+    rig.sources[0].request(1);
+    assert_eq!(rig.probe.ran(), vec![1]);
+    assert_eq!(marks(&rig, 0), 1);
+    assert_eq!(marks(&rig, 1), 0);
+}
+
+#[test]
+fn complete_while_a_request_is_inside_an_item_completes_once_and_pushes_nothing() {
+    let rig = Rig::new(1, &[]);
+    let (a, b) = (Arc::new(Barrier::new(2)), Arc::new(Barrier::new(2)));
+    rig.deliver(rig.job(1).frame().hold(&a, &b), rig.lane(0));
+    let source = rig.sources[0].clone();
+    std::thread::scope(|scope| {
+        let inside = scope.spawn(move || source.request(1));
+        a.wait();
+        rig.sources[0].complete();
+        assert!(rig.sources[0].is_complete());
+        b.wait();
+        inside.join().unwrap();
+    });
+    assert_eq!(rig.receivers[0].completes.load(Ordering::SeqCst), 1);
+    assert!(
+        rig.received(0).is_empty(),
+        "nothing is pushed to a receiver told the source is done"
+    );
+    assert_eq!(rig.sources[0].banked(), 0);
+    let probe = rig.probe.clone();
+    drop(rig);
+    assert_eq!(
+        probe.errored.load(Ordering::SeqCst),
+        1,
+        "the unpushed frame was ended"
+    );
+}
+
+#[test]
+fn a_delivery_to_a_completed_or_dropped_lane_is_refused_and_handed_back() {
+    let mut rig = Rig::new(2, &[]);
+    rig.sources[0].complete();
+    let refused = rig.intakes.deliver(rig.job(1), rig.lane(0));
+    assert_eq!(refused.expect_err("lane 0 completed").0.tag, 1);
+    assert!(
+        rig.intakes.deliver(rig.job(2), rig.lane(1)).is_ok(),
+        "other lanes take work"
+    );
+    let dropped = rig.sources.remove(1);
+    drop(dropped);
+    let refused = rig.intakes.deliver(rig.job(3), rig.lane(1));
+    assert_eq!(refused.expect_err("lane 1 was dropped").0.tag, 3);
+}
+
+#[test]
+fn dropping_the_source_drops_the_submitter_before_the_items_it_holds() {
+    let rig = Rig::new(1, &[]);
+    let probe = rig.probe.clone();
+    rig.deliver(rig.job(1).submit(true), rig.lane(0));
+    rig.deliver(rig.job(2).need(9), rig.lane(0));
+    rig.sources[0].request(1);
+    rig.deliver(rig.job(3), rig.lane(0));
+    // Item 1 is armed, item 2 waits and item 3 is queued in the intake. Item 4 is refused by the
+    // completed lane and dropped at once, while the submitter is alive.
+    rig.sources[0].complete();
+    drop(
+        rig.intakes
+            .deliver(rig.job(4), rig.lane(0))
+            .expect_err("the lane completed"),
+    );
+    drop(rig);
+    assert_eq!(probe.dropped_before_submitter.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        probe.dropped_after_submitter.load(Ordering::SeqCst),
+        3,
+        "the armed, the waiting and the queued item were dropped after the submitter"
+    );
+}
+
+#[test]
+fn a_panicking_submitter_shutdown_still_ends_the_items_and_ready_frames() {
+    let rig = Rig::new(1, &[]);
+    let probe = rig.probe.clone();
+    rig.deliver(rig.job(1).frame(), rig.lane(0));
+    rig.deliver(rig.job(2).frame(), rig.lane(0));
+    rig.deliver(rig.job(3).need(9), rig.lane(0));
+    rig.sources[0].request(1);
+    assert_eq!(rig.sources[0].ready_len(), 1);
+    rig.fake.panic_on_drop(LaneId(0));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(rig)));
+    assert!(result.is_err(), "the shutdown's panic still surfaces");
+    assert_eq!(
+        probe.errored.load(Ordering::SeqCst),
+        1,
+        "the ready frame was ended"
+    );
+    assert_eq!(
+        probe.dropped.load(Ordering::SeqCst),
+        3,
+        "every item was dropped"
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "inputs of the intakes")]
+fn inputs_of_other_intakes_are_refused_in_debug() {
+    let a = Rig::new(1, &[]);
+    let b = Rig::new(1, &[]);
+    let (_intakes, mut inputs) = LaneIntakes::<Job>::new(a.pool.clone(), &[]);
+    let (_fake, mut lanes, _queues) = FakeLanes::open(LaneId(0), 1);
+    let _ = euhedral_graph::LaneSource::new(
+        lanes.remove(0),
+        common::Gate::default(),
+        inputs.remove(0),
+        b.intakes.clone(),
+    );
 }
 
 // ---- groups --------------------------------------------------------------------------------

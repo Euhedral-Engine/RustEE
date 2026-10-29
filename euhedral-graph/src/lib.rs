@@ -48,8 +48,8 @@ pub use completions::{Completions, Pending, Ready};
 pub use join::{Join, Round};
 pub use lake::{Lake, LakeClosed, UnitGuard};
 pub use lane_source::{
-    Deliver, GroupId, LaneCx, LaneInputs, LaneIntakes, LaneMetrics, LaneSource, LaneState,
-    LaneSubmit, LaneWork, Outcome, Retired,
+    Deliver, GroupId, LaneClosed, LaneCx, LaneInputs, LaneIntakes, LaneMetrics, LaneSource,
+    LaneState, LaneSubmit, LaneWork, Outcome, Retired,
 };
 pub use lanes::{DeviceQueue, LaneId, LanePool, LanePoolBuilder, Marker, QueueId};
 pub use latch::{Latch, LatchSetter, LatchWaiter};

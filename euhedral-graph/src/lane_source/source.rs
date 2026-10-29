@@ -9,6 +9,7 @@
 
 use std::collections::VecDeque;
 use std::mem::ManuallyDrop;
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
@@ -58,27 +59,38 @@ struct Inner<S: LaneSubmit, X: LaneState, W> {
     waiting: VecDeque<Waiting<W, X::Wait>>,
     /// The waiting pass's scratch, swapped with `waiting`; it keeps its capacity.
     keep: VecDeque<Waiting<W, X::Wait>>,
-    /// Items with a retirement armed, in arm order.
-    armed: VecDeque<(W, Marker)>,
+    /// Items with a retirement armed, in arm order, with the sequence number the submitter gave it.
+    /// A retirement is paired with its item by that number, never by position: a retirement armed
+    /// from inside an item is not the lane's.
+    armed: VecDeque<(u64, W, Marker)>,
     /// An item whose work was submitted but could not be marked (the lane's ring was full), and
     /// whether it asked for a retirement.
     unmarked: Option<(W, bool)>,
     /// Order keys held back in this request (reused: no allocation after warm-up).
     blocked_keys: Vec<u64>,
-    #[cfg(debug_assertions)]
-    last_retired: Option<u64>,
 }
 
 impl<S: LaneSubmit, X: LaneState, W> Drop for Inner<S, X, W> {
     fn drop(&mut self) {
+        // The submitter goes first: its shutdown waits for the device work the items still hold.
+        // If that panics, everything else is still released before the panic goes on.
         // SAFETY: `submitter` is dropped here only, and no field is used again.
-        unsafe { ManuallyDrop::drop(&mut self.submitter) };
+        let shutdown = panic::catch_unwind(AssertUnwindSafe(|| unsafe {
+            ManuallyDrop::drop(&mut self.submitter);
+        }));
         self.armed.clear();
         self.unmarked = None;
         self.waiting.clear();
         self.keep.clear();
+        // Work still in the lane's own intake: the lane is closed, so nothing more arrives.
+        while self.own.poll().is_some() {}
         while let Some(frame) = self.ready.pop_front() {
             frame.do_finally_with_error(FrameError::failed("the lane source was dropped"));
+        }
+        if let Err(payload) = shutdown
+            && !std::thread::panicking()
+        {
+            panic::resume_unwind(payload);
         }
     }
 }
@@ -92,7 +104,13 @@ impl<S: LaneSubmit, X: LaneState, W> Drop for Inner<S, X, W> {
 /// does nothing else.
 ///
 /// Everything the lane keeps is plain state in a `SourceCell`, entered inside `request` and `pull`,
-/// which the lattice serializes. The lifecycle (`complete`) touches atomics only.
+/// which the lattice serializes. The cell's claim is checked in every build: a `request` that finds
+/// it taken (a direct call racing the lattice, or a call from inside an item) has banked its demand
+/// and left a wakeup, and the holder serves it when it lets go; a `pull` that finds it taken hands
+/// over nothing. The lifecycle (`complete`) touches atomics only.
+///
+/// Work an item answers `Wait` for stays in this source, even when it came from the group's shared
+/// intake: it runs when this lane's state meets the wait.
 pub struct LaneSource<S: LaneSubmit, X: LaneState, W> {
     lane: LaneId,
     complete: AtomicBool,
@@ -101,6 +119,9 @@ pub struct LaneSource<S: LaneSubmit, X: LaneState, W> {
     downstream: DownstreamSlot,
     /// The depth of `ready`, published at the end of each call.
     ready_len: AtomicUsize,
+    /// A `request` happened that no pass has served yet: a wakeup, as the ingest sinks'
+    /// `requestPending`. A caller that cannot enter the cell leaves it set for whoever is inside.
+    pending: AtomicBool,
     intakes: Arc<LaneIntakes<W>>,
     metrics: LaneMetrics,
     cell: SourceCell<Inner<S, X, W>>,
@@ -111,7 +132,8 @@ impl<S: LaneSubmit, X: LaneState, W: LaneWork<S, X>> LaneSource<S, X, W> {
     ///
     /// # Panics
     ///
-    /// If `inputs` belongs to another lane than the submitter's.
+    /// If `inputs` belongs to another lane than the submitter's. In debug builds also if `intakes`
+    /// is not the set `inputs` came from, or the pool's queue at the lane is not the submitter's.
     pub fn new(
         submitter: S,
         state: X,
@@ -125,12 +147,23 @@ impl<S: LaneSubmit, X: LaneState, W: LaneWork<S, X>> LaneSource<S, X, W> {
             "a lane source takes the inputs of its own lane"
         );
         let queue_id = submitter.id();
+        debug_assert_eq!(
+            inputs.intakes_id(),
+            intakes.id(),
+            "a lane source takes the inputs of the intakes it delivers through"
+        );
+        debug_assert_eq!(
+            intakes.pool().lane(lane).id(),
+            queue_id,
+            "the pool's queue at the lane is the submitter's"
+        );
         Arc::new(Self {
             lane,
             complete: AtomicBool::new(false),
             demand: CachePadded::new(AtomicU64::new(0)),
             downstream: DownstreamSlot::new(),
             ready_len: AtomicUsize::new(0),
+            pending: AtomicBool::new(false),
             intakes,
             metrics: LaneMetrics::new(W::KINDS.len()),
             cell: SourceCell::new(Inner {
@@ -145,8 +178,6 @@ impl<S: LaneSubmit, X: LaneState, W: LaneWork<S, X>> LaneSource<S, X, W> {
                 armed: VecDeque::new(),
                 unmarked: None,
                 blocked_keys: Vec::new(),
-                #[cfg(debug_assertions)]
-                last_retired: None,
             }),
         })
     }
@@ -174,6 +205,7 @@ impl<S: LaneSubmit, X: LaneState, W: LaneWork<S, X>> LaneSource<S, X, W> {
         &self,
         inner: &mut Inner<S, X, W>,
         now: Instant,
+        clock: &mut Instant,
         mut item: Waiting<W, X::Wait>,
     ) -> Flow<W, X::Wait> {
         if !item.awaited {
@@ -194,17 +226,18 @@ impl<S: LaneSubmit, X: LaneState, W: LaneWork<S, X>> LaneSource<S, X, W> {
             }
             self.metrics
                 .intake_to_run_ns
-                .record(ns(Instant::now().saturating_duration_since(item.delivered)));
+                .record(ns(clock.saturating_duration_since(item.delivered)));
         }
         item.wait = None;
-        let started = Instant::now();
+        // One clock read per item: the end of the previous item is the start of this one.
+        let started = *clock;
         let outcome = {
             let mut cx = self.cx(inner, now);
             item.work.run(&mut cx)
         };
-        let finished = Instant::now();
+        *clock = Instant::now();
         if let Some(histogram) = self.metrics.item_ns.get(item.work.kind()) {
-            histogram.record(ns(finished.saturating_duration_since(started)));
+            histogram.record(ns(clock.saturating_duration_since(started)));
         }
         match outcome {
             Outcome::Submitted { retire } => match inner.submitter.mark() {
@@ -261,7 +294,7 @@ impl<S: LaneSubmit, X: LaneState, W: LaneWork<S, X>> LaneSource<S, X, W> {
             return;
         }
         match inner.submitter.arm_retirement() {
-            Ok(()) => inner.armed.push_back((work, marker)),
+            Ok(seq) => inner.armed.push_back((seq, work, marker)),
             Err(error) => self.fail(inner, now, work, error),
         }
     }
@@ -271,19 +304,20 @@ impl<S: LaneSubmit, X: LaneState, W: LaneWork<S, X>> LaneSource<S, X, W> {
         work.failed(error, &mut cx);
     }
 
-    /// Step 1: the retirements that arrived, in arm order.
+    /// Step 1: the retirements that arrived. Each is paired with the item that armed it by its
+    /// sequence number. One the lane did not arm (an item armed it itself) pairs with nothing.
     fn drain_retirements(&self, inner: &mut Inner<S, X, W>, now: Instant) {
         while let Some(retired) = inner.submitter.poll_retired() {
-            #[cfg(debug_assertions)]
+            let position = if inner
+                .armed
+                .front()
+                .is_some_and(|armed| armed.0 == retired.seq)
             {
-                debug_assert!(
-                    inner.last_retired.is_none_or(|last| retired.seq > last),
-                    "retirements arrive in the order they were armed"
-                );
-                inner.last_retired = Some(retired.seq);
-            }
-            let Some((work, marker)) = inner.armed.pop_front() else {
-                debug_assert!(false, "a retirement arrived that no item armed");
+                Some(0)
+            } else {
+                inner.armed.iter().position(|armed| armed.0 == retired.seq)
+            };
+            let Some((_, work, marker)) = position.and_then(|at| inner.armed.remove(at)) else {
                 continue;
             };
             let mut cx = self.cx(inner, now);
@@ -315,7 +349,7 @@ impl<S: LaneSubmit, X: LaneState, W: LaneWork<S, X>> LaneSource<S, X, W> {
 
     /// Step 4: the waiting items, in order. An item behind a held-back key stays; an item whose
     /// wait is unmet stays and holds back its key.
-    fn run_waiting(&self, inner: &mut Inner<S, X, W>, now: Instant) -> bool {
+    fn run_waiting(&self, inner: &mut Inner<S, X, W>, now: Instant, clock: &mut Instant) -> bool {
         let mut stalled = false;
         debug_assert!(inner.keep.is_empty());
         while let Some(item) = inner.waiting.pop_front() {
@@ -333,7 +367,7 @@ impl<S: LaneSubmit, X: LaneState, W: LaneWork<S, X>> LaneSource<S, X, W> {
                 inner.keep.push_back(item);
                 continue;
             }
-            match self.run_one(inner, now, item) {
+            match self.run_one(inner, now, clock, item) {
                 Flow::Done => {}
                 Flow::Stalled => stalled = true,
                 Flow::Waits(item) => {
@@ -350,7 +384,13 @@ impl<S: LaneSubmit, X: LaneState, W: LaneWork<S, X>> LaneSource<S, X, W> {
 
     /// Runs, or parks behind its key, an envelope just taken from an intake. Returns whether the
     /// lane stalled.
-    fn admit(&self, inner: &mut Inner<S, X, W>, now: Instant, envelope: Envelope<W>) -> bool {
+    fn admit(
+        &self,
+        inner: &mut Inner<S, X, W>,
+        now: Instant,
+        clock: &mut Instant,
+        envelope: Envelope<W>,
+    ) -> bool {
         let item = Waiting {
             work: envelope.work,
             wait: None,
@@ -365,7 +405,7 @@ impl<S: LaneSubmit, X: LaneState, W: LaneWork<S, X>> LaneSource<S, X, W> {
             inner.waiting.push_back(item);
             return false;
         }
-        match self.run_one(inner, now, item) {
+        match self.run_one(inner, now, clock, item) {
             Flow::Done => false,
             Flow::Stalled => true,
             Flow::Waits(item) => {
@@ -376,6 +416,76 @@ impl<S: LaneSubmit, X: LaneState, W: LaneWork<S, X>> LaneSource<S, X, W> {
                 false
             }
         }
+    }
+
+    /// Serves the requests that arrived, one pass per claim. A caller that cannot take the claim
+    /// leaves `pending` set for the holder, which looks again after it lets go.
+    fn drain_requests(&self) {
+        while self.pending.load(Ordering::SeqCst) {
+            let Some(mut guard) = self.cell.try_enter() else {
+                return;
+            };
+            // One swap reads and clears the flag, so a request after it keeps the flag set.
+            if self.pending.swap(false, Ordering::SeqCst) {
+                self.serve(&mut guard);
+            }
+            drop(guard);
+        }
+    }
+
+    /// One pass of `request`, with the claim held.
+    fn serve(&self, inner: &mut Inner<S, X, W>) {
+        if self.is_complete() || self.downstream.receiver().is_none() {
+            return;
+        }
+        let started = Instant::now();
+        let now = started;
+        let mut clock = started;
+        self.drain_retirements(inner, now);
+        inner.state.check(now);
+        inner.blocked_keys.clear();
+        let mut stalled = self.retry_mark(inner, now);
+        if !stalled {
+            stalled = self.run_waiting(inner, now, &mut clock);
+        }
+        while !stalled {
+            let Some(envelope) = inner.own.poll() else {
+                break;
+            };
+            stalled = self.admit(inner, now, &mut clock, envelope);
+        }
+        while !stalled {
+            let Some(envelope) = inner.shared.as_ref().and_then(|shared| shared.poll()) else {
+                break;
+            };
+            debug_assert!(
+                envelope.work.order().is_none(),
+                "work in a shared intake is not bound to a lane"
+            );
+            stalled = self.admit(inner, now, &mut clock, envelope);
+        }
+        // Push at most the banked demand of ready frames.
+        if let Some(receiver) = self.downstream.receiver() {
+            let banked = self.demand.load(Ordering::Acquire);
+            let n = banked.min(inner.ready.len() as u64);
+            for _ in 0..n {
+                let frame = inner
+                    .ready
+                    .pop_front()
+                    .expect("n is at most the queue's length");
+                receiver.push(frame);
+            }
+            if n > 0 {
+                let _ = self
+                    .demand
+                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                        Some(spend(current, n))
+                    });
+            }
+        }
+        self.metrics.ready_depth.record(inner.ready.len() as f64);
+        self.publish(inner);
+        self.metrics.service_ns.record(ns(started.elapsed()));
     }
 
     /// Publishes the ready depth for [`ready_len`](Self::ready_len).
@@ -393,12 +503,15 @@ fn bank(current: u64, add: u64) -> u64 {
     current.saturating_add(add)
 }
 
-/// Spends banked demand: floors at zero; unbounded demand is never spent.
+/// Spends banked demand: floors at zero.
 fn spend(current: u64, spent: u64) -> u64 {
-    if current == u64::MAX {
-        current
-    } else {
-        current.saturating_sub(spent)
+    current.saturating_sub(spent)
+}
+
+impl<S: LaneSubmit, X: LaneState, W> Drop for LaneSource<S, X, W> {
+    fn drop(&mut self) {
+        // Refuse deliveries first; the cell's drop then ends what the lane still holds.
+        self.intakes.close(self.lane);
     }
 }
 
@@ -429,9 +542,12 @@ impl<S: LaneSubmit, X: LaneState, W: LaneWork<S, X>> LatticeSource for LaneSourc
             return 0;
         }
         let started = Instant::now();
-        // SAFETY: the lattice serializes `pull` and `request` of a source, and a caller of either
-        // holds no guard of this cell.
-        let mut inner = unsafe { self.cell.enter() };
+        // The lattice serializes `pull` and `request`, so the claim is free. A caller that finds it
+        // taken (a direct call racing the lattice, or a call from inside an item) hands over
+        // nothing, as the ingest sinks' `pull` does when their drain is taken.
+        let Some(mut inner) = self.cell.try_enter() else {
+            return 0;
+        };
         let mut pulled = 0;
         while pulled < demand {
             let Some(front) = inner.ready.front() else {
@@ -454,62 +570,16 @@ impl<S: LaneSubmit, X: LaneState, W: LaneWork<S, X>> LatticeSource for LaneSourc
         if self.is_complete() || demand == 0 || self.downstream.receiver().is_none() {
             return;
         }
-        let started = Instant::now();
         let _ = self
             .demand
             .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
                 Some(bank(current, demand))
             });
-        // SAFETY: as in `pull`.
-        let mut guard = unsafe { self.cell.enter() };
-        let inner = &mut *guard;
-        let now = started;
-        self.drain_retirements(inner, now);
-        inner.state.check(now);
-        inner.blocked_keys.clear();
-        let mut stalled = self.retry_mark(inner, now);
-        if !stalled {
-            stalled = self.run_waiting(inner, now);
-        }
-        while !stalled {
-            let Some(envelope) = inner.own.poll() else {
-                break;
-            };
-            stalled = self.admit(inner, now, envelope);
-        }
-        while !stalled {
-            let Some(envelope) = inner.shared.as_ref().and_then(|shared| shared.poll()) else {
-                break;
-            };
-            debug_assert!(
-                envelope.work.order().is_none(),
-                "work in a shared intake is not bound to a lane"
-            );
-            stalled = self.admit(inner, now, envelope);
-        }
-        // Push at most the banked demand of ready frames.
-        if let Some(receiver) = self.downstream.receiver() {
-            let banked = self.demand.load(Ordering::Acquire);
-            let n = banked.min(inner.ready.len() as u64);
-            for _ in 0..n {
-                let frame = inner
-                    .ready
-                    .pop_front()
-                    .expect("n is at most the queue's length");
-                receiver.push(frame);
-            }
-            if n > 0 {
-                let _ = self
-                    .demand
-                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
-                        Some(spend(current, n))
-                    });
-            }
-        }
-        self.metrics.ready_depth.record(inner.ready.len() as f64);
-        self.publish(inner);
-        drop(guard);
-        self.metrics.service_ns.record(ns(started.elapsed()));
+        // The wakeup is published before the claim is tried: the holder either sees it when it
+        // lets go, or this caller gets the claim itself. Nothing waits, and the demand is banked
+        // either way.
+        self.pending.store(true, Ordering::SeqCst);
+        self.drain_requests();
     }
 
     fn complete(&self) {
@@ -521,6 +591,7 @@ impl<S: LaneSubmit, X: LaneState, W: LaneWork<S, X>> LatticeSource for LaneSourc
             return;
         }
         self.demand.store(0, Ordering::Release);
+        self.intakes.close(self.lane);
         self.downstream.complete();
     }
 

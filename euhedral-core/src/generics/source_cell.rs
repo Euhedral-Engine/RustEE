@@ -328,7 +328,10 @@ mod tests {
     fn try_enter_hands_back_the_refusal_and_the_claim_frees_on_drop() {
         let cell = SourceCell::new(5u32);
         let first = cell.try_enter().expect("free");
-        assert!(cell.try_enter().is_none(), "nested: refused, never two guards");
+        assert!(
+            cell.try_enter().is_none(),
+            "nested: refused, never two guards"
+        );
         drop(first);
         assert_eq!(*cell.try_enter().expect("freed by the drop"), 5);
     }

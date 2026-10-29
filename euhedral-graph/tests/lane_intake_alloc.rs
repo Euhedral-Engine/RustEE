@@ -128,7 +128,7 @@ fn steady_state_delivery_and_requests_allocate_nothing() {
             } else {
                 Deliver::Lane(LaneId(0))
             };
-            intakes.deliver(item, to);
+            intakes.deliver(item, to).unwrap();
         }
         sources[0].request(1);
         sources[1].request(1);
