@@ -87,11 +87,7 @@ fn a_frame_taking_a_lifecycle_lock_through_a_lake_reaches_the_violation_hook() {
 
     let places = PLACES.lock().unwrap_or_else(PoisonError::into_inner);
     assert_eq!(places.len(), 1, "{places:?}");
-    assert!(
-        places[0].contains("tests/lake_violation.rs"),
-        "{}",
-        places[0]
-    );
+    assert!(places[0].contains(file!()), "{}", places[0]);
     assert_eq!(*lifecycle.lock(), 1, "the lock proceeds after the report");
     drop(places);
     drop(unit);
