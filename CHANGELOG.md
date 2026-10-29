@@ -30,7 +30,8 @@ and `register` returning `None` are gone.
   are recycled).
 - The entry is the caller's own object and carries `Entry::ready`; the sequencer allocates nothing for it. `Progress` is
   the readiness word an entry embeds (pending, ready or abandoned; an abandoned entry is ready and concludes with
-  nothing, so one that is killed or dropped never stalls the order). A caller that pools its entries allocates nothing
+  nothing; its owner abandons it when it dies, or the order waits for it, and only a `Slot` does that by itself when it
+  is dropped). A caller that pools its entries allocates nothing
   on the whole path (`tests/sequencer_alloc.rs`: 0 allocations over 20 000 rounds after warm-up).
 - `drain()` is unchanged: the work-in-progress count, the `missed` loop, and a panic in the conclusion is the entry's own
   (the entries behind it still conclude; the first panic resumes on the draining thread once the drain ended). The

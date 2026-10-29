@@ -11,7 +11,8 @@
 //! - **The entry is the caller's own object** and carries its readiness, so the sequencer allocates nothing for it
 //!   (the queue recycles its chunks). A caller that pools its entries makes the whole path allocation-free.
 //! - [`Progress`] is the readiness word an entry embeds: pending, ready or abandoned. An abandoned entry is ready
-//!   (it concludes with nothing), so an entry that is dropped or killed never stalls the order.
+//!   (it concludes with nothing). Whoever owns an entry abandons it when it dies, or the order waits for it: only a
+//!   [`Slot`] does that by itself, when it is dropped.
 //! - [`Ticket`] is an entry that carries a value and [`Slot`] the holder's handle to one, for callers that do not need
 //!   their own entry type.
 
@@ -145,7 +146,8 @@ impl<E: Entry + Send + 'static> Sequencer<E> {
         })
     }
 
-    /// Appends `entry` to the order.
+    /// Appends `entry` to the order. An entry that is already ready when it is offered concludes at the next
+    /// [`drain`](Self::drain): offering does not drain, so call it after the offer.
     pub fn offer(&self, entry: E) {
         if self.producer.offer(entry).is_err() {
             // The order is unbounded: this does not happen.
@@ -171,7 +173,9 @@ impl<E: Entry + Send + 'static> Sequencer<E> {
             return;
         }
         // The count went from 0 to 1 on this thread, so no other thread is in this function until the count returns
-        // to 0 below; the consumer belongs to this thread meanwhile.
+        // to 0 below; the consumer belongs to this thread meanwhile. Everything the entries run (`ready`, the conclusion,
+        // the drop of an entry) is inside `catch_unwind`: a panic there is the entry's own and must not leave the count
+        // raised, which would stop every later drain.
         let mut panic = None;
         let mut missed = 1;
         loop {
@@ -179,7 +183,21 @@ impl<E: Entry + Send + 'static> Sequencer<E> {
             self.consumer.with_mut(|consumer| {
                 // SAFETY: as above.
                 let consumer = unsafe { &mut *consumer };
-                while consumer.peek().is_some_and(|head| head.ready()) {
+                loop {
+                    let head_ready = catch_unwind(AssertUnwindSafe(|| {
+                        consumer.peek().map(|head| head.ready())
+                    }));
+                    let ready = match head_ready {
+                        Ok(ready) => ready.unwrap_or(false),
+                        Err(payload) => {
+                            // An entry whose `ready` panics is concluded and removed: it would stall the order for good.
+                            panic.get_or_insert(payload);
+                            true
+                        }
+                    };
+                    if !ready {
+                        break;
+                    }
                     // The entry stays in the order while it concludes, as Java's `finally` polls it afterwards.
                     if let Err(payload) = catch_unwind(AssertUnwindSafe(|| {
                         if let Some(head) = consumer.peek() {
@@ -188,7 +206,9 @@ impl<E: Entry + Send + 'static> Sequencer<E> {
                     })) {
                         panic.get_or_insert(payload);
                     }
-                    drop(consumer.poll());
+                    if let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(consumer.poll()))) {
+                        panic.get_or_insert(payload);
+                    }
                 }
             });
             missed = self.wip.fetch_sub(missed, Ordering::AcqRel) - missed;
@@ -197,7 +217,12 @@ impl<E: Entry + Send + 'static> Sequencer<E> {
             }
         }
         if let Some(payload) = panic {
-            resume_unwind(payload);
+            if std::thread::panicking() {
+                // A `Slot` dropped while its thread unwinds drains here, and a second panic would abort the process.
+                log::error!("an entry failed to conclude while the thread was already panicking");
+            } else {
+                resume_unwind(payload);
+            }
         }
     }
 }
@@ -300,7 +325,7 @@ impl<T: Send + 'static> Sequencer<Arc<Ticket<T>>> {
 type TicketOrder<T> = Sequencer<Arc<Ticket<T>>>;
 
 /// The holder's handle to a [`Ticket`] in a sequencer's order. Complete it or abandon it; dropping it abandons it, so
-/// a frame that dies holding one can never stall the order.
+/// a frame that dies holding one does not stall the order (an entry of the caller's own type has no such guarantee).
 ///
 /// A slot keeps its sequencer alive (an `Arc`): without a collector, a completion on another thread must not outlive
 /// the order it writes to.
@@ -550,6 +575,48 @@ mod tests {
         assert!(sequencer.is_empty());
     }
 
+    /// A `Slot` dropped while its thread unwinds drains, and a conclusion that panics must not resume then: a second
+    /// panic would abort the process.
+    #[test]
+    fn a_slot_dropped_during_a_panic_whose_conclusion_panics_does_not_abort() {
+        let sequencer = Sequencer::new(|_: &Arc<Ticket<u64>>| panic!("injected"));
+        let outer = catch_unwind(AssertUnwindSafe(|| {
+            let _slot = sequencer.register();
+            panic!("outer");
+        }));
+        assert!(outer.is_err(), "the outer panic is the one that propagates");
+        assert!(
+            sequencer.is_empty(),
+            "the entry concluded and left the order"
+        );
+    }
+
+    /// An entry whose `ready` panics is concluded and removed, and the count is not left raised.
+    #[test]
+    fn a_ready_that_panics_does_not_leave_the_sequencer_claimed() {
+        struct Flaky(StdAtomicUsize);
+        impl Entry for Flaky {
+            fn ready(&self) -> bool {
+                if self.0.fetch_add(1, StdOrdering::Relaxed) == 0 {
+                    panic!("injected");
+                }
+                true
+            }
+        }
+        let concluded = Arc::new(StdAtomicUsize::new(0));
+        let counted = concluded.clone();
+        let sequencer = Sequencer::new(move |_: &Flaky| {
+            counted.fetch_add(1, StdOrdering::Relaxed);
+        });
+        sequencer.offer(Flaky(StdAtomicUsize::new(0)));
+        assert!(catch_unwind(AssertUnwindSafe(|| sequencer.drain())).is_err());
+        assert!(sequencer.is_empty());
+        sequencer.offer(Flaky(StdAtomicUsize::new(1)));
+        sequencer.drain();
+        assert!(sequencer.is_empty(), "a later drain still runs");
+        assert_eq!(concluded.load(StdOrdering::Relaxed), 2);
+    }
+
     /// Java's order queue grows: there is no capacity, and an offer is never refused.
     #[test]
     fn the_order_grows_without_a_capacity() {
@@ -642,7 +709,9 @@ mod tests {
 }
 
 /// Offers racing a drain, and completions racing each other, under every interleaving the memory model allows. The
-/// order queue is not modelled: it runs as one step between the model's own atomics.
+/// order queue is not modelled: its core (`euhedral-data-structures` `queues/core.rs`) uses `std` atomics, so an offer or a
+/// poll runs as one step between the model's own atomics, and the model assumes the queue is a linearizable
+/// multi-producer queue (its own tests cover that).
 #[cfg(all(loom, test))]
 mod loom_tests {
     use super::*;

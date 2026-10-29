@@ -92,6 +92,7 @@ dependencies = [
  "euhedral-hardware-utils",
  "euhedral-hashing",
  "libc",
+ "log",
  "loom",
 ]
 

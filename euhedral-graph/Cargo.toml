@@ -14,6 +14,8 @@ testing = []
 euhedral-core = { path = "../euhedral-core" }
 # `MpscQueue`: any thread registers, the polling thread drains.
 euhedral-data-structures = { path = "../euhedral-data-structures" }
+# A panic in a conclusion that cannot be resumed (the draining thread is already unwinding) is logged.
+log = "0.4.29"
 
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 libc = "0.2.174"

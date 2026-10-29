@@ -289,8 +289,9 @@ complete in. `offer(entry)` appends to the order from any thread (the order is a
 offer is never refused); an entry is the caller's own object, and `Entry::ready` says whether it finished. The thread
 that finishes an entry calls `drain()`: one drainer at a time (a work-in-progress counter) concludes the prefix of
 ready entries, on its own thread, through the function given to `Sequencer::new`, which must not wait (it offers the
-next frame). An entry embeds a `Progress` (pending, ready or abandoned; an abandoned entry concludes with nothing, so
-one that is killed never stalls the order), and a caller that pools its entries allocates nothing on the whole path.
+next frame). An entry embeds a `Progress` (pending, ready or abandoned; an abandoned entry concludes with nothing; the owner of
+an entry abandons it when it dies, or the order waits for it, and only a `Slot` does that by itself), and a caller that
+pools its entries allocates nothing on the whole path.
 For callers without an entry type of their own, `Sequencer::ordered(emit)` makes a sequencer of `Ticket`s that carry a
 value, and `register()` offers a ticket and returns its `Slot`: complete it with a value or abandon it (dropping it
 abandons it), from any thread. `register` allocates the ticket.
