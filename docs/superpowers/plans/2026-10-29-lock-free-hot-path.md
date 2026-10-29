@@ -67,7 +67,7 @@ The coordinator gives the checkout paths.
 - **PRs.** One draft PR per chunk, stacked on the newest open PR: `gh pr create --draft --base <that PR's branch>`
   (`main` once the stack below it has merged). No agent marks a PR ready. Commits end with the session line the
   coordinator gives.
-- **Ratchet.** Each PR deletes from `HOT_FIX_IDS` in `euhedral-core/tests/hot_fix_ratchet.rs` exactly the ids whose
+- **Ratchet.** Each PR lowers or deletes in `HOT_FIX_TAGS` (`euhedral-core/tests/hot_fix_ratchet.rs`) exactly the entries whose
   tags it removes.
 
 ## Ordering with the lane-source plan
@@ -150,7 +150,7 @@ pub struct LifecycleMutex<T>(std::sync::Mutex<T>);
 impl<T> LifecycleMutex<T> {
     pub const fn new(value: T) -> Self;
     /// Debug: prints "lifecycle lock taken inside a hot scope, at <location>" and aborts when `HotScope::active()`
-    /// (a panic would be caught by the frame runners); `HotScope::set_violation_hook` replaces the abort in tests.
+    /// (a panic would be caught by the frame runners); `HotScope::install_violation_hook` replaces the abort in tests.
     /// Poison is ignored.
     pub fn lock(&self) -> std::sync::MutexGuard<'_, T>;
     pub fn get_mut(&mut self) -> &mut T;
@@ -168,7 +168,7 @@ impl HotScope {
 - [ ] **Step 1: Write the failing tests** in `lifecycle.rs`.
   - `a_lifecycle_lock_outside_a_hot_scope_locks`.
   - `#[cfg(debug_assertions)] a_lifecycle_lock_inside_a_hot_scope_reaches_the_hook_and_then_locks` (a recorder installed
-    with `HotScope::set_violation_hook`), and `the_default_report_aborts_even_inside_catch_unwind` (a child process).
+    with `HotScope::install_violation_hook`), and `the_default_report_aborts_even_inside_catch_unwind` (a child process).
   - `leaving_the_hot_scope_allows_the_lock_and_restores_the_depth`: enter, enter, `leave` → `!active()`, lock;
     drop → `active()`.
   - `a_poisoned_lifecycle_lock_still_locks`.
@@ -254,14 +254,14 @@ impl HotScope {
   `euhedral-data-structures/README.md`
 
 **Interfaces:**
-- `const HOT_FIX_IDS: &[&str]`: the 57 ids. Each PR deletes the ids whose tags it removes.
+- `const HOT_FIX_TAGS: &[(&str, usize)]`: the 57 ids with the number of places each is used. Each PR lowers or deletes the entries whose tags it removes.
 - `fn tags() -> BTreeSet<String>`:
   - walks `<workspace>/*/src/**/*.rs`, the workspace being `CARGO_MANIFEST_DIR/..`;
   - skips `tests.rs`, `testing.rs` and any `tests/` directory;
   - collects the distinct ids of `HOT-FIX(<id>)`.
 
 - [ ] **Step 1: Write the tests.**
-  - `the_hot_fix_tags_are_exactly_the_listed_ids`: `tags()` equals `HOT_FIX_IDS`.
+  - `the_hot_fix_tags_and_their_uses_are_exactly_the_listed_ones`: `uses()` equals `HOT_FIX_TAGS`.
   - `every_listed_id_is_a_finding_of_the_audit`: each id is a row of the audit's tables.
   - `every_disallowed_allow_is_explained_and_no_alias_hides_a_lock`: every `allow` of a disallowed type or call in the
     library sources carries a `HOT-FIX(`, `LIFECYCLE(` or `JAVA-BACKOFF` reason (or is a test-only `cfg_attr`, or a

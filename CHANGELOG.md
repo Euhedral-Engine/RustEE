@@ -17,9 +17,11 @@ semantics and the tests that pin it.
   handles) is a `LifecycleMutex` or `LifecycleRwLock`.
 - Every hot-path lock the audit lists is tagged `HOT-FIX(<id>)` at its field and at each use the lint reports: 57
   ids (the audit's findings C1-C14, C16-C20, G1-G3, G5-G7, G10-G15, I1-I15, H1-H7, M1, and the source-contract markers
-  S1, S2 and S6a). `euhedral-core/tests/hot_fix_ratchet.rs` lists the ids, checks each against a row of the audit,
-  checks that every `allow` of a disallowed type or call in the library sources carries a `HOT-FIX`, `LIFECYCLE` or
-  `JAVA-BACKOFF` reason, and refuses a type alias of a lock type. A change that replaces a lock deletes its id.
+  S1, S2 and S6a). `euhedral-core/tests/hot_fix_ratchet.rs` lists the ids with the number of places each is used and
+  checks each against a row of the audit. It also checks that every `allow` of a disallowed type or call in the library
+  sources begins its reason with a listed `HOT-FIX(<id>)`, a `LIFECYCLE(<id>)` that is a row of the audit, or (for a
+  call) `JAVA-BACKOFF`, and it refuses a type alias of a lock type. A change that replaces a lock lowers or deletes
+  its entry; a reused or new id fails.
 - The lint list also names `parking_lot`, `spin` and `lock_api` locks (`allow-invalid`, so an absent crate is fine).
   `Once`, `OnceLock` and `LazyLock` are lifecycle state (C34, H11) and are not listed. CI lints `euhedral-memory` with
   its `cuda` feature.
@@ -52,7 +54,11 @@ makes the remaining hot locks a visible, shrinking list.
   and aborts the process when a lifecycle lock is taken while the thread's hot depth is above zero. It aborts because
   the frame runners catch panics: a panic would be reported as the frame's failure and could pass unseen. The depth is
   per thread, scopes nest, and `leave()` suspends all of them until its guard drops. A test that provokes a violation
-  installs `HotScope::set_violation_hook` (debug builds), which receives the location; the lock then proceeds.
+  installs `HotScope::install_violation_hook` (debug builds; the returned guard restores the previous hook, also when
+  the test panics). The hook receives the location and the lock then proceeds. The hook is process-wide, so it keeps
+  the locations it expects and forwards the rest to `HotScope::report_default`; the lake test has a test file, and so a
+  process, of its own. The default report is written straight to stderr, because the test harness's output capture
+  would otherwise swallow it when the process aborts.
   `HotGuard::drop` asserts the depth is above zero.
 - The same locks guard the same state in the same places. The lifecycle locks ignore poison; the upstream
   registry's state, which took `lock().unwrap()` and so panicked after a panic in a holder, continues instead, as the
@@ -64,8 +70,9 @@ makes the remaining hot locks a visible, shrinking list.
   restored depth, a poisoned lock, `try_lock`.
 - `a_worker_cycle_runs_inside_a_hot_scope` (core fragment tests), `a_frame_that_completes_its_sink_does_not_panic` and
   `a_frame_taking_a_lifecycle_lock_through_a_lake_reaches_the_violation_hook` (graph `tests/lake.rs`).
-- `hot_fix_ratchet` (core): the tags equal `HOT_FIX_IDS` (57), each id is a row of the audit, every disallowed `allow`
-  is explained, and no type alias hides a lock.
+- `hot_fix_ratchet` (core): the tags and their uses equal `HOT_FIX_TAGS` (57 ids), each id is a row of the audit, every
+  disallowed `allow` is explained by a tag at the start of its reason, no type alias hides a lock, and the scan finds
+  library code after an inline test module.
 
 ## GPU lane sources (2026-10-29)
 

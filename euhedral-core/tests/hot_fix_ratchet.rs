@@ -1,28 +1,85 @@
-//! The hot-path lock ratchet. Every hot-path lock the audit lists carries a `HOT-FIX(<id>)` tag; the set of ids only
-//! shrinks; and no other `allow` of a disallowed lock type or blocking call enters the library sources unexplained.
+//! The hot-path lock ratchet. Every hot-path lock the audit lists carries a `HOT-FIX(<id>)` tag; the set of ids, and
+//! the number of places each id is used, only shrink; and no other `allow` of a disallowed type or blocking call
+//! enters the library sources unexplained.
 //!
-//! - A change that replaces a lock deletes its tag and its id from [`HOT_FIX_IDS`].
+//! - A change that replaces a lock deletes its tags and lowers or deletes its entry in [`HOT_FIX_TAGS`]. A tag used
+//!   in one more place, or an id that appears anew, fails until the list says so on purpose.
 //! - A change that adds a lock for start, stop or rebalance state uses `LifecycleMutex` or `LifecycleRwLock`; the
 //!   workspace lint (`clippy.toml`) refuses the standard lock types everywhere else.
-//! - Every `allow(clippy::disallowed_types)` or `allow(clippy::disallowed_methods)` in the library sources carries a
-//!   `HOT-FIX(`, `LIFECYCLE(` or `JAVA-BACKOFF` reason, is a test-only `cfg_attr`, or is a file-level allow of a file
-//!   on [`EXEMPT_FILES`].
+//! - Every `allow(clippy::disallowed_types)` or `allow(clippy::disallowed_methods)` in the library sources begins its
+//!   reason with `HOT-FIX(<id>)` (one or more, comma separated, each listed), `LIFECYCLE(<id>)` (a row of the audit)
+//!   or, for a call, `JAVA-BACKOFF`; or it is a test-only `cfg_attr`, or a file-level allow of a file on
+//!   [`EXEMPT_FILES`].
 //! - A type alias may not name a lock type: the lint reports the alias, not its uses, so an alias would hide the lock
 //!   from every site that uses it.
 
 // The test reads the workspace's sources.
 #![allow(clippy::disallowed_methods)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// The `HOT-FIX(<id>)` ids that the library sources carry today, one per finding of the audit.
-const HOT_FIX_IDS: &[&str] = &[
-    "C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8", "C9", "C10", "C11", "C12", "C13", "C14", "C16",
-    "C17", "C18", "C19", "C20", "G1", "G2", "G3", "G5", "G6", "G7", "G10", "G11", "G12", "G13",
-    "G14", "G15", "I1", "I2", "I3", "I4", "I5", "I6", "I7", "I8", "I9", "I10", "I11", "I12", "I13",
-    "I14", "I15", "H1", "H2", "H3", "H4", "H5", "H6", "H7", "M1", "S1", "S2", "S6a",
+/// The `HOT-FIX(<id>)` ids that the library sources carry today, one per finding of the audit, and the number of
+/// places each is used (its field, each use the lint reports, its marker comment).
+const HOT_FIX_TAGS: &[(&str, usize)] = &[
+    ("C1", 5),
+    ("C2", 3),
+    ("C3", 3),
+    ("C4", 6),
+    ("C5", 3),
+    ("C6", 3),
+    ("C7", 3),
+    ("C8", 3),
+    ("C9", 3),
+    ("C10", 2),
+    ("C11", 2),
+    ("C12", 3),
+    ("C13", 3),
+    ("C14", 5),
+    ("C16", 3),
+    ("C17", 3),
+    ("C18", 3),
+    ("C19", 3),
+    ("C20", 5),
+    ("G1", 4),
+    ("G2", 4),
+    ("G3", 4),
+    ("G5", 3),
+    ("G6", 3),
+    ("G7", 3),
+    ("G10", 3),
+    ("G11", 4),
+    ("G12", 4),
+    ("G13", 4),
+    ("G14", 4),
+    ("G15", 4),
+    ("H1", 5),
+    ("H2", 4),
+    ("H3", 4),
+    ("H4", 2),
+    ("H5", 4),
+    ("H6", 3),
+    ("H7", 3),
+    ("I1", 4),
+    ("I2", 4),
+    ("I3", 3),
+    ("I4", 3),
+    ("I5", 3),
+    ("I6", 3),
+    ("I7", 3),
+    ("I8", 3),
+    ("I9", 3),
+    ("I10", 3),
+    ("I11", 3),
+    ("I12", 3),
+    ("I13", 3),
+    ("I14", 3),
+    ("I15", 3),
+    ("M1", 1),
+    ("S1", 1),
+    ("S2", 1),
+    ("S6a", 1),
 ];
 
 /// Files whose file-level `allow` of a disallowed type is part of their design.
@@ -36,10 +93,9 @@ const EXEMPT_FILES: &[&str] = &[
 /// The audit the ids are findings of.
 const AUDIT: &str = "docs/superpowers/specs/2026-10-28-lock-free-hot-path-audit.md";
 
-const MARKER: &str = "HOT-FIX(";
-
-/// Reasons that explain an `allow` of a disallowed type or call.
-const REASONS: &[&str] = &["HOT-FIX(", "LIFECYCLE(", "JAVA-BACKOFF"];
+const HOT_FIX: &str = "HOT-FIX(";
+const LIFECYCLE: &str = "LIFECYCLE(";
+const JAVA_BACKOFF: &str = "JAVA-BACKOFF";
 
 /// Types that make a lock, a wait or a channel.
 const LOCK_TYPES: &[&str] = &[
@@ -102,28 +158,38 @@ fn test_modules(text: &str) -> Vec<String> {
     modules
 }
 
-/// The text before the first inline test module: a test-only `cfg`, any attributes and comments, and `mod name {` at
-/// the left margin.
-fn library_part(text: &str) -> &str {
+/// `text` without its inline test modules (a test-only `cfg`, any attributes and comments, `mod name {` at the left
+/// margin, and the body up to the closing brace at the left margin). The removed lines stay as blank lines, so line
+/// numbers hold, and the library code after a test module is still there.
+fn library_part(text: &str) -> String {
     let lines: Vec<&str> = text.lines().collect();
-    let mut offset = 0;
-    for (at, line) in lines.iter().enumerate() {
-        if is_test_only_cfg(line) {
-            let module = lines[at + 1..]
-                .iter()
-                .find(|next| !(next.starts_with("#[") || next.starts_with("//")));
-            if module.is_some_and(|next| next.starts_with("mod ") && next.trim_end().ends_with('{'))
+    let mut kept = String::new();
+    let mut at = 0;
+    while at < lines.len() {
+        if is_test_only_cfg(lines[at]) {
+            let module = (at + 1..lines.len())
+                .find(|&next| !(lines[next].starts_with("#[") || lines[next].starts_with("//")));
+            if let Some(module) = module
+                && lines[module].starts_with("mod ")
+                && lines[module].trim_end().ends_with('{')
             {
-                return &text[..offset];
+                let end = (module..lines.len())
+                    .find(|&next| lines[next] == "}")
+                    .unwrap_or(lines.len() - 1);
+                kept.extend((at..=end).map(|_| '\n'));
+                at = end + 1;
+                continue;
             }
         }
-        offset += line.len() + 1;
+        kept.push_str(lines[at]);
+        kept.push('\n');
+        at += 1;
     }
-    text
+    kept
 }
 
 /// Every library source: `<workspace>/*/src/**/*.rs` except the modules declared for test builds, as (path from the
-/// workspace root, text up to the first inline test module).
+/// workspace root, text without its inline test modules).
 fn sources() -> Vec<(String, String)> {
     let mut crates: Vec<PathBuf> = fs::read_dir(workspace())
         .expect("the workspace directory")
@@ -163,27 +229,27 @@ fn sources() -> Vec<(String, String)> {
                 .expect("under the workspace")
                 .to_string_lossy()
                 .replace('\\', "/");
-            (relative, library_part(&text).to_owned())
+            (relative, library_part(&text))
         })
         .collect()
 }
 
-/// The distinct ids of every `HOT-FIX(<id>)` in `text`.
-fn ids_in(text: &str, ids: &mut BTreeSet<String>) {
+/// How many times each `HOT-FIX(<id>)` appears in `text`, added to `uses`.
+fn count_uses(text: &str, uses: &mut BTreeMap<String, usize>) {
     let mut rest = text;
-    while let Some(at) = rest.find(MARKER) {
-        rest = &rest[at + MARKER.len()..];
+    while let Some(at) = rest.find(HOT_FIX) {
+        rest = &rest[at + HOT_FIX.len()..];
         let end = rest.find(')').unwrap_or(rest.len());
-        ids.insert(rest[..end].to_owned());
+        *uses.entry(rest[..end].to_owned()).or_default() += 1;
     }
 }
 
-fn tags() -> BTreeSet<String> {
-    let mut ids = BTreeSet::new();
+fn uses() -> BTreeMap<String, usize> {
+    let mut uses = BTreeMap::new();
     for (_, text) in sources() {
-        ids_in(&text, &mut ids);
+        count_uses(&text, &mut uses);
     }
-    ids
+    uses
 }
 
 /// The text between the parenthesis that opens at `open` and its match.
@@ -204,33 +270,76 @@ fn balanced(text: &str, open: usize) -> &str {
     &text[open + 1..]
 }
 
+/// The text of `reason = "..."` in the body of an attribute.
+fn reason_of(body: &str) -> Option<&str> {
+    let after = &body[body.find("reason")? + "reason".len()..];
+    let after = after.trim_start().strip_prefix('=')?.trim_start();
+    let after = after.strip_prefix('"')?;
+    Some(&after[..after.find('"')?])
+}
+
+/// What is wrong with a reason that must begin with an explanation, if anything. `methods_only` says the allow names
+/// no disallowed type; `listed` holds the `HOT-FIX` ids; `audit` is the audit's text.
+fn reason_problem(
+    reason: &str,
+    methods_only: bool,
+    listed: &BTreeSet<&str>,
+    audit: &str,
+) -> Option<String> {
+    let id_of = |rest: &str| rest.split_once(')').map(|(id, _)| id.to_owned());
+    if reason.starts_with(HOT_FIX) {
+        let mut rest = reason;
+        while let Some(tagged) = rest.strip_prefix(HOT_FIX) {
+            let id = id_of(tagged).unwrap_or_default();
+            if !listed.contains(id.as_str()) {
+                return Some(format!("`HOT-FIX({id})` is no listed id"));
+            }
+            rest = &tagged[id.len() + 1..];
+            match rest.strip_prefix(", ") {
+                Some(more) => rest = more,
+                None => break,
+            }
+        }
+        None
+    } else if let Some(tagged) = reason.strip_prefix(LIFECYCLE) {
+        let id = id_of(tagged).unwrap_or_default();
+        (!is_a_finding(audit, &id)).then(|| format!("`LIFECYCLE({id})` is no row of the audit"))
+    } else if reason.starts_with(JAVA_BACKOFF) {
+        (!methods_only).then(|| "`JAVA-BACKOFF` explains a call, not a type".to_owned())
+    } else {
+        Some(format!(
+            "the reason `{reason}` begins with no HOT-FIX, LIFECYCLE or JAVA-BACKOFF tag"
+        ))
+    }
+}
+
 /// The problems in one library source: an `allow` of a disallowed type or call with no explanation, and a type alias
 /// of a lock type.
-fn problems(path: &str, text: &str) -> Vec<String> {
+fn problems(path: &str, text: &str, listed: &BTreeSet<&str>, audit: &str) -> Vec<String> {
     let mut found = Vec::new();
     let mut from = 0;
     while let Some(at) = text[from..].find("allow(") {
         let start = from + at;
         from = start + "allow(".len();
         let body = balanced(text, start + "allow".len());
-        if !(body.contains("clippy::disallowed_types")
-            || body.contains("clippy::disallowed_methods"))
-        {
+        let types = body.contains("clippy::disallowed_types");
+        if !(types || body.contains("clippy::disallowed_methods")) {
             continue;
         }
         let before = text[..start].trim_end();
         let file_level = before.ends_with("#![");
         let test_only = before.ends_with("test,") && before.contains("cfg_attr(");
         let line = text[..start].matches('\n').count() + 1;
-        if test_only
-            || REASONS.iter().any(|reason| body.contains(reason))
-            || (file_level && EXEMPT_FILES.contains(&path))
-        {
+        if test_only || (file_level && EXEMPT_FILES.contains(&path)) {
             continue;
         }
-        found.push(format!(
-            "{path}:{line}: an allow of a disallowed type or call with no HOT-FIX, LIFECYCLE or JAVA-BACKOFF reason"
-        ));
+        let problem = match reason_of(body) {
+            None => Some("an allow of a disallowed type or call has no reason".to_owned()),
+            Some(reason) => reason_problem(reason, !types, listed, audit),
+        };
+        if let Some(problem) = problem {
+            found.push(format!("{path}:{line}: {problem}"));
+        }
     }
     for (index, line) in text.lines().enumerate() {
         let line = line.trim_start();
@@ -260,62 +369,130 @@ fn problems(path: &str, text: &str) -> Vec<String> {
 
 /// Whether `id` is a row of one of the audit's tables.
 fn is_a_finding(audit: &str, id: &str) -> bool {
-    audit
-        .lines()
-        .any(|line| line.starts_with(&format!("| {id} |")))
+    !id.is_empty()
+        && audit
+            .lines()
+            .any(|line| line.starts_with(&format!("| {id} |")))
+}
+
+fn audit() -> String {
+    fs::read_to_string(workspace().join(AUDIT)).expect("the audit")
 }
 
 #[test]
-fn the_hot_fix_tags_are_exactly_the_listed_ids() {
-    let found = tags();
-    let listed: BTreeSet<String> = HOT_FIX_IDS.iter().map(|id| (*id).to_owned()).collect();
-    assert_eq!(listed.len(), HOT_FIX_IDS.len(), "an id is listed twice");
-    let removed: Vec<_> = listed.difference(&found).collect();
-    let added: Vec<_> = found.difference(&listed).collect();
+fn the_hot_fix_tags_and_their_uses_are_exactly_the_listed_ones() {
+    let found = uses();
+    let listed: BTreeMap<String, usize> = HOT_FIX_TAGS
+        .iter()
+        .map(|(id, uses)| ((*id).to_owned(), *uses))
+        .collect();
+    assert_eq!(listed.len(), HOT_FIX_TAGS.len(), "an id is listed twice");
+    let differing: Vec<String> = listed
+        .keys()
+        .chain(found.keys())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter(|id| listed.get(*id) != found.get(*id))
+        .map(|id| {
+            format!(
+                "{id}: listed {:?}, found {:?}",
+                listed.get(id),
+                found.get(id)
+            )
+        })
+        .collect();
     assert!(
-        removed.is_empty() && added.is_empty(),
-        "delete the ids this change removed from HOT_FIX_IDS (tags gone from the sources: {removed:?}); a new id \
-         is a new hot lock (tags the list lacks: {added:?})"
+        differing.is_empty(),
+        "lower or delete the entries of HOT_FIX_TAGS for the tags this change removed; an id or a use that is new is a \
+         new hot lock:\n{}",
+        differing.join("\n")
     );
 }
 
 #[test]
 fn every_listed_id_is_a_finding_of_the_audit() {
-    let audit = fs::read_to_string(workspace().join(AUDIT)).expect("the audit");
-    for id in HOT_FIX_IDS {
+    let audit = audit();
+    for (id, _) in HOT_FIX_TAGS {
         assert!(is_a_finding(&audit, id), "`{id}` is no row of {AUDIT}");
     }
 }
 
 #[test]
 fn every_disallowed_allow_is_explained_and_no_alias_hides_a_lock() {
+    let audit = audit();
+    let listed: BTreeSet<&str> = HOT_FIX_TAGS.iter().map(|(id, _)| *id).collect();
     let mut found = Vec::new();
     for (path, text) in sources() {
-        found.extend(problems(&path, &text));
+        found.extend(problems(&path, &text, &listed, &audit));
     }
     assert!(found.is_empty(), "{}", found.join("\n"));
 }
 
 #[test]
 fn the_scan_finds_what_it_looks_for() {
-    let tagged = "#[allow(clippy::disallowed_types, reason = \"HOT-FIX(C4)\")]\nstruct A;\n\
-                  #[allow(\n    clippy::disallowed_methods,\n    reason = \"JAVA-BACKOFF\"\n)]\nfn b() {}\n\
-                  #![cfg_attr(\n    test,\n    allow(clippy::disallowed_types, reason = \"fixtures\")\n)]\n";
-    assert!(problems("a.rs", tagged).is_empty());
+    let audit = "| C25 | `x` |\n| load | `y` |\n";
+    let listed: BTreeSet<&str> = ["C4", "C5"].into();
+    let check = |path: &str, text: &str| problems(path, text, &listed, audit);
 
-    let bare = "#[allow(clippy::disallowed_types)]\nstruct A;\n";
-    assert_eq!(problems("a.rs", bare).len(), 1);
-    let reasoned = "#[allow(clippy::disallowed_types, reason = \"it is fine\")]\nstruct A;\n";
-    assert_eq!(problems("a.rs", reasoned).len(), 1);
+    let tagged = "#[allow(clippy::disallowed_types, reason = \"HOT-FIX(C4), HOT-FIX(C5)\")]\nstruct A;\n\
+                  #[allow(\n    clippy::disallowed_methods,\n    reason = \"JAVA-BACKOFF\"\n)]\nfn b() {}\n\
+                  #[allow(clippy::disallowed_methods, reason = \"LIFECYCLE(load): it loads\")]\nfn c() {}\n\
+                  #![cfg_attr(\n    test,\n    allow(clippy::disallowed_types, reason = \"fixtures\")\n)]\n";
+    assert!(check("a.rs", tagged).is_empty());
+
+    for bad in [
+        "#[allow(clippy::disallowed_types)]\nstruct A;\n",
+        "#[allow(clippy::disallowed_types, reason = \"it is fine\")]\nstruct A;\n",
+        // The tag must open the reason.
+        "#[allow(clippy::disallowed_types, reason = \"see HOT-FIX(C4)\")]\nstruct A;\n",
+        // An id the list lacks, and one the audit lacks.
+        "#[allow(clippy::disallowed_types, reason = \"HOT-FIX(C9)\")]\nstruct A;\n",
+        "#[allow(clippy::disallowed_methods, reason = \"LIFECYCLE(C99)\")]\nfn a() {}\n",
+        // A back-off explains a call, not a type.
+        "#[allow(clippy::disallowed_types, reason = \"JAVA-BACKOFF\")]\nstruct A;\n",
+        "#[allow(clippy::disallowed_types, clippy::disallowed_methods, reason = \"JAVA-BACKOFF\")]\nfn a() {}\n",
+    ] {
+        assert_eq!(check("a.rs", bad).len(), 1, "{bad}");
+    }
 
     let file_level = "#![allow(clippy::disallowed_types, reason = \"a double\")]\n";
-    assert_eq!(problems("a.rs", file_level).len(), 1);
-    assert!(problems("euhedral-gpu/src/fake/mod.rs", file_level).is_empty());
+    assert_eq!(check("a.rs", file_level).len(), 1);
+    assert!(check("euhedral-gpu/src/fake/mod.rs", file_level).is_empty());
 
     let alias = "type Queue = Arc<Mutex<Vec<u8>>>;\npub(crate) type Rx = Receiver<u8>;\ntype Fine = Vec<u8>;\n";
-    assert_eq!(problems("a.rs", alias).len(), 2);
+    assert_eq!(check("a.rs", alias).len(), 2);
     let other = "#[allow(clippy::needless_range_loop)]\ntype Mutexes = Vec<u8>;\n";
-    assert!(problems("a.rs", other).is_empty());
+    assert!(check("a.rs", other).is_empty());
+}
+
+#[test]
+fn uses_are_counted_per_id() {
+    let mut counted = BTreeMap::new();
+    count_uses(
+        "// HOT-FIX(M1)\nreason = \"HOT-FIX(C4), HOT-FIX(C5)\"\nreason = \"HOT-FIX(C4)\"",
+        &mut counted,
+    );
+    assert_eq!(counted.get("C4"), Some(&2));
+    assert_eq!(counted.get("C5"), Some(&1));
+    assert_eq!(counted.get("M1"), Some(&1));
+}
+
+#[test]
+fn library_code_after_an_inline_test_module_is_still_scanned() {
+    let text = "fn a() {}\n#[cfg(test)]\n#[allow(clippy::disallowed_types)]\nmod tests {\n    use super::*;\n}\n\
+                #[allow(clippy::disallowed_types)]\nstruct Late;\n";
+    let kept = library_part(text);
+    assert_eq!(
+        kept.lines().count(),
+        text.lines().count(),
+        "line numbers hold"
+    );
+    assert!(!kept.contains("mod tests") && kept.contains("struct Late"));
+    let audit = "";
+    let listed = BTreeSet::new();
+    let found = problems("a.rs", &kept, &listed, audit);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].starts_with("a.rs:7:"), "{found:?}");
 }
 
 #[test]
@@ -325,4 +502,5 @@ fn the_audit_names_findings_by_row() {
     assert!(is_a_finding(audit, "S6a"));
     assert!(!is_a_finding(audit, "C5"));
     assert!(!is_a_finding(audit, "C"));
+    assert!(!is_a_finding(audit, ""));
 }

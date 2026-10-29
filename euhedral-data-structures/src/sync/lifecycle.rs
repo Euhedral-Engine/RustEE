@@ -9,7 +9,8 @@
 //! A violation prints "lifecycle lock taken inside a hot scope" with the location of the lock call and aborts the
 //! process. A panic would unwind into the frame runners, which catch panics and report them as a frame's failure, so
 //! the violation could pass unseen. A test that provokes a violation on purpose installs a hook
-//! ([`HotScope::set_violation_hook`], debug builds only); the hook receives the location, and the lock then proceeds.
+//! ([`HotScope::install_violation_hook`], debug builds only); the hook receives the location, and the lock then
+//! proceeds. A hook that is not meant for a location forwards it to [`HotScope::report_default`].
 //!
 //! Release builds carry none of it: the scope is a no-op and the locks are the standard ones. A poisoned lock is
 //! used as it stands, as the runtime's other lifecycle state is.
@@ -23,6 +24,8 @@ use std::sync::{
 
 #[cfg(debug_assertions)]
 use std::cell::Cell;
+#[cfg(debug_assertions)]
+use std::io::Write;
 use std::marker::PhantomData;
 #[cfg(debug_assertions)]
 use std::panic::Location;
@@ -40,6 +43,22 @@ static VIOLATION_HOOK: Mutex<Option<ViolationHook>> = Mutex::new(None);
 /// What a debug build calls when a lifecycle lock is taken inside a hot scope, instead of aborting.
 #[cfg(debug_assertions)]
 pub type ViolationHook = fn(&'static Location<'static>);
+
+/// Restores the previous violation hook when dropped.
+#[cfg(debug_assertions)]
+#[must_use = "the hook is removed when the guard drops"]
+pub struct ViolationHookGuard {
+    previous: Option<ViolationHook>,
+}
+
+#[cfg(debug_assertions)]
+impl Drop for ViolationHookGuard {
+    fn drop(&mut self) {
+        *VIOLATION_HOOK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = self.previous;
+    }
+}
 
 /// Marks the code a thread runs per frame, per pull, per request, per offer or per completion.
 ///
@@ -99,16 +118,28 @@ impl HotScope {
         }
     }
 
-    /// Installs `hook` to receive violations instead of the abort, or restores the abort with `None`; returns the
-    /// hook it replaces. The hook is process-wide, so a test that installs one runs its violation alone.
+    /// Installs `hook` to receive violations instead of the abort, until the returned guard drops (also when the
+    /// test panics). The hook is process-wide: it receives the violations of every thread, so a hook keeps the
+    /// locations it expects and passes the rest to [`report_default`](Self::report_default).
     #[cfg(debug_assertions)]
-    pub fn set_violation_hook(hook: Option<ViolationHook>) -> Option<ViolationHook> {
-        std::mem::replace(
-            &mut *VIOLATION_HOOK
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner),
-            hook,
-        )
+    pub fn install_violation_hook(hook: ViolationHook) -> ViolationHookGuard {
+        let previous = VIOLATION_HOOK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .replace(hook);
+        ViolationHookGuard { previous }
+    }
+
+    /// The default report: prints the location straight to stderr (a test harness's output capture would swallow
+    /// it, and the abort discards what the capture holds) and aborts the process.
+    #[cfg(debug_assertions)]
+    pub fn report_default(at: &'static Location<'static>) -> ! {
+        let _ = writeln!(
+            std::io::stderr(),
+            "lifecycle lock taken inside a hot scope, at {at} (thread {:?})",
+            std::thread::current().name()
+        );
+        std::process::abort();
     }
 
     /// Reports a lifecycle lock taken inside a hot scope: to the hook, or by printing and aborting.
@@ -122,10 +153,7 @@ impl HotScope {
             .unwrap_or_else(PoisonError::into_inner);
         match hook {
             Some(hook) => hook(at),
-            None => {
-                eprintln!("lifecycle lock taken inside a hot scope, at {at}");
-                std::process::abort();
-            }
+            None => Self::report_default(at),
         }
     }
 
@@ -282,18 +310,28 @@ mod tests {
         /// The hook is process-wide, so the tests that install it take turns.
         static TURN: Mutex<()> = Mutex::new(());
 
+        fn places() -> std::sync::MutexGuard<'static, Vec<String>> {
+            PLACES.lock().unwrap_or_else(PoisonError::into_inner)
+        }
+
+        /// Keeps the locations in this file; any other location is not a test's to swallow.
         fn record(at: &'static Location<'static>) {
-            PLACES.lock().unwrap().push(at.to_string());
+            if at.file() == file!() {
+                places().push(at.to_string());
+            } else {
+                HotScope::report_default(at);
+            }
         }
 
         /// Runs `provoke` with the recorder installed and returns the places it was reported at.
         pub(super) fn recorded(provoke: impl FnOnce()) -> Vec<String> {
             let _turn = TURN.lock().unwrap_or_else(PoisonError::into_inner);
-            PLACES.lock().unwrap().clear();
-            let before = HotScope::set_violation_hook(Some(record));
-            provoke();
-            HotScope::set_violation_hook(before);
-            std::mem::take(&mut *PLACES.lock().unwrap())
+            places().clear();
+            {
+                let _hook = HotScope::install_violation_hook(record);
+                provoke();
+            }
+            std::mem::take(&mut *places())
         }
     }
 
@@ -339,13 +377,21 @@ mod tests {
 
     #[cfg(debug_assertions)]
     #[test]
-    fn the_hook_is_restored_to_the_previous_one() {
+    fn the_hook_is_restored_when_its_guard_drops_even_in_a_panic() {
+        let mutex = LifecycleMutex::new(());
         let places = violations::recorded(|| {
-            let seen = HotScope::set_violation_hook(None);
-            assert!(seen.is_some(), "the recorder was installed");
-            HotScope::set_violation_hook(seen);
+            // An inner hook for a test that fails: its guard drops while the panic unwinds.
+            fn other(_: &'static Location<'static>) {}
+            let unwound = std::panic::catch_unwind(|| {
+                let _inner = HotScope::install_violation_hook(other);
+                panic!("a test fails while its hook is installed");
+            });
+            assert!(unwound.is_err());
+            // The recorder is back: this violation reaches it.
+            let _hot = HotScope::enter();
+            drop(mutex.lock());
         });
-        assert!(places.is_empty());
+        assert_eq!(places.len(), 1, "{places:?}");
     }
 
     /// The default report cannot be caught: the frame runners catch panics, so a panic could pass unseen.
@@ -364,10 +410,10 @@ mod tests {
             std::process::exit(0);
         }
         let output = std::process::Command::new(std::env::current_exe().unwrap())
+            // Under the harness's output capture, as an ordinary `cargo test` runs it.
             .args([
                 "--exact",
                 "sync::lifecycle::tests::the_default_report_aborts_even_inside_catch_unwind",
-                "--nocapture",
             ])
             .env(CHILD, "1")
             .output()
@@ -376,7 +422,8 @@ mod tests {
         assert_eq!(output.status.signal(), Some(6), "{stderr}");
         assert!(
             stderr.contains("lifecycle lock taken inside a hot scope, at ")
-                && stderr.contains("lifecycle.rs"),
+                && stderr.contains("lifecycle.rs")
+                && stderr.contains("(thread "),
             "{stderr}"
         );
     }

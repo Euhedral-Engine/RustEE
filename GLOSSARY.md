@@ -560,7 +560,7 @@ fix), `LIFECYCLE(<id>)` (a wait that belongs to lifecycle work, such as the pinn
 **hot scope** ([`HotScope`](euhedral-data-structures/src/sync/lifecycle.rs)): a per-thread depth that marks the code a
 worker or a producer runs per frame, pull, request, offer or completion. `enter()` opens a scope for its guard's
 lifetime; `leave()` suspends the scopes for a lifecycle step a frame reaches. It does nothing in a release build.
-Tests that provoke a violation on purpose install `HotScope::set_violation_hook`.
+Tests that provoke a violation on purpose install `HotScope::install_violation_hook`.
 
 **HOT-FIX tag**: `reason = "HOT-FIX(<id>)"` on the `#[allow]` of a hot-path lock the audit lists, `<id>` being the
 audit's finding (`C4`, `G10`, `I7`, ...). `euhedral-core/tests/hot_fix_ratchet.rs` counts the distinct ids, and the

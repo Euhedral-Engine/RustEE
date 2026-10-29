@@ -70,10 +70,6 @@ pub struct ModuleCache {
 
 static STORES: AtomicU64 = AtomicU64::new(0);
 
-#[allow(
-    clippy::disallowed_methods,
-    reason = "LIFECYCLE(load): module loading is a build-time call; it blocks by nature (compile, driver load)"
-)]
 impl ModuleCache {
     pub fn new(dir: impl Into<PathBuf>) -> Self {
         Self { dir: dir.into() }
@@ -85,6 +81,10 @@ impl ModuleCache {
     }
 
     /// The entry, or `None` when there is none (or it cannot be read).
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "LIFECYCLE(load): module loading is a build-time call; reading an entry blocks by nature"
+    )]
     pub fn load(&self, key: CacheKey, ext: &str) -> Option<Vec<u8>> {
         std::fs::read(self.path(key, ext)).ok()
     }

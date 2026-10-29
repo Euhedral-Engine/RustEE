@@ -364,6 +364,7 @@ request-side drain may also run after its `pull` releases the queue, as Java's `
 | I16 | `euhedral-io/src/win/real.rs:274`, `:278` | `OnceLock` statics: the IoRing API and the socket extension functions | Loaded when an engine opens. |
 | M2 | `euhedral-memory/src/cuda/copier.rs:41`, `cuda/backends.rs:175` | `cuStreamSynchronize` | `Drop` of the copier and of the stream pool. |
 | M3 | `euhedral-memory/src/planner.rs:1206`, `tiers.rs:1063` | set-once downstream (`OnceLock`) | Set at attach; `get` per request is a lock-free load. |
+| load | `euhedral-gpu/src/cuda/nvrtc.rs`, `euhedral-gpu/src/module_cache.rs` (`euhedral-gpu` is outside the audit's scope) | blocking file reads, directory listings and path resolution of kernel module loading | Build-time calls (compiler and cache loading), not reached per frame; their `allow`s say `LIFECYCLE(load)`. |
 
 `cuCtxSynchronize` and `cuEventSynchronize` are loaded (`euhedral-memory/src/cuda/mod.rs:145`, `:177`) but the
 library calls neither.
