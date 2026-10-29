@@ -2,7 +2,8 @@
 //!
 //! Nothing runs until a test steps the device: [`FakeGpu::step`] runs the oldest runnable operation of any stream, so
 //! a test decides the interleaving and every run is the same. Fake kernels are host closures registered by name that
-//! run on a bounds-checked fake memory; a kernel fault poisons the device as a CUDA fault does.
+//! run on a bounds-checked fake memory; a kernel fault poisons the device once the host observes it (a marker query, a retirement's status, a submission),
+//! as a CUDA fault does; work behind it never runs and its markers never complete.
 //!
 //! The streams of the fake follow the same ownership rules as any backend's: a shared queue and a single-owner
 //! submitter, with no lock in the submitter. The simulated *device* (its memory, its per-lane operation logs and its
@@ -107,11 +108,29 @@ impl FakeMemory {
 /// What ran, in the order it ran.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FakeOp {
-    Launch { lane: u16, kernel: String },
-    Copy { lane: u16 },
-    Memset { lane: u16 },
-    Mark { lane: u16, value: u64 },
-    Retire { lane: u16, seq: u64 },
+    Launch {
+        lane: u16,
+        kernel: String,
+    },
+    Copy {
+        lane: u16,
+    },
+    Memset {
+        lane: u16,
+    },
+    Mark {
+        lane: u16,
+        value: u64,
+    },
+    /// The lane's later work waited for marker `value` of another lane, and it was reached.
+    Await {
+        lane: u16,
+        value: u64,
+    },
+    Retire {
+        lane: u16,
+        seq: u64,
+    },
 }
 
 /// A queued operation.
@@ -181,6 +200,9 @@ pub(crate) struct State {
     seq: u64,
     pub(crate) lanes: Vec<Lane>,
     log: Vec<FakeOp>,
+    /// The device's fault, as the hardware has it: work behind it never runs and its markers never complete. The
+    /// host does not know until something observes it (see [`FakeGpu::observe_fault`]), as with a driver.
+    pub(crate) faulted: Option<GpuError>,
 }
 
 /// The fake device.
@@ -284,20 +306,35 @@ impl FakeGpu {
         self.lock().log.clone()
     }
 
+    /// What a host call that reaches the driver learns: if the device faulted, the device is poisoned with the fault.
+    /// Every call that asks the device (a submission, a marker query, a retirement's status) does this; a test calls it
+    /// to stand for such a call.
+    pub fn observe_fault(&self) {
+        let faulted = self.lock().faulted.clone();
+        if let Some(fault) = faulted {
+            self.poison.set(fault);
+        }
+    }
+
+    /// `Err` once the device is poisoned, after observing a fault the device has.
+    pub(crate) fn alive(&self) -> Result<(), GpuError> {
+        self.observe_fault();
+        self.poison.check()
+    }
+
     /// Runs the oldest runnable operation of any stream; false when none is runnable.
     pub fn step(&self) -> bool {
-        let fault = self.poison.get();
         let retire = {
             let mut st = self.lock();
+            let fault = st.faulted.clone();
             let mut best: Option<(u64, usize)> = None;
             for (index, lane) in st.lanes.iter().enumerate() {
                 let Some(head) = lane.queue.front() else {
                     continue;
                 };
                 let runnable = match &head.op {
-                    QOp::Await { lane, value } => {
-                        fault.is_some() || st.lanes[*lane].marks_run >= *value
-                    }
+                    // A mark behind a fault never completes, so a wait for it never ends.
+                    QOp::Await { lane, value } => st.lanes[*lane].marks_run >= *value,
                     _ => true,
                 };
                 if runnable && best.is_none_or(|(seq, _)| head.seq < seq) {
@@ -333,12 +370,9 @@ impl FakeGpu {
             None => 0,
         };
         if fault.is_some() {
-            // A faulted device runs no work: its marks are still reached and its retirements still told.
+            // A faulted device runs no work and its markers never complete (a query of one reports the fault); the
+            // callbacks of the stream that faulted are still told, with the fault's code.
             return match op {
-                QOp::Mark { value } => {
-                    st.lanes[index].marks_run = value;
-                    None
-                }
                 QOp::Retire { seq, sink } => {
                     st.log.push(FakeOp::Retire { lane, seq });
                     Some((sink, status))
@@ -394,14 +428,17 @@ impl FakeGpu {
                 st.lanes[index].marks_run = value;
                 Ok(())
             }
-            QOp::Await { .. } => Ok(()),
+            QOp::Await { value, .. } => {
+                st.log.push(FakeOp::Await { lane, value });
+                Ok(())
+            }
             QOp::Retire { seq, sink } => {
                 st.log.push(FakeOp::Retire { lane, seq });
                 return Some((sink, 0));
             }
         };
         if let Err(fault) = outcome {
-            self.poison.set(fault.error());
+            st.faulted.get_or_insert(fault.error());
         }
         None
     }
@@ -451,7 +488,7 @@ impl Gpu for FakeGpu {
         if options.iter().any(|o| o.markers == 0) {
             return Err(GpuError::Invalid("a lane needs at least one marker".into()));
         }
-        self.poison.check()?;
+        self.alive()?;
         let ids: Vec<QueueId> = names.iter().map(|_| QueueId::next()).collect();
         let base = {
             let mut st = self.lock();

@@ -262,7 +262,6 @@ impl Retirements {
     }
 
     /// Retirements armed and not yet reported, listeners and tickets together.
-    #[cfg(test)]
     pub(crate) fn outstanding(&self) -> usize {
         usize::try_from(self.armed.size_long()).unwrap_or(usize::MAX)
     }

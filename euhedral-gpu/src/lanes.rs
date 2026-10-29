@@ -142,8 +142,21 @@ macro_rules! lane_submit {
                 Ok(seq)
             }
 
+            /// When no callback has arrived and retirements are outstanding, the stream looks at the device once: a
+            /// retirement behind a lane that faulted never gets its callback, and the look is what poisons the
+            /// device so the rest are reported. A retirement that arrived with status 0 is confirmed with the same
+            /// look, as Java's `confirmRetired` queries the completion event.
             fn poll_retired(&mut self) -> Option<Retired<GpuError>> {
-                let ticket = Stream::poll_retired(self)?;
+                let ticket = match Stream::poll_retired(self) {
+                    Some(ticket) => ticket,
+                    None => {
+                        self.probe_fault(true);
+                        Stream::poll_retired(self)?
+                    }
+                };
+                if ticket.ok() {
+                    self.probe_fault(false);
+                }
                 let failure = Stream::confirm_retired(self, ticket);
                 Some(Retired {
                     seq: ticket.seq(),
@@ -151,6 +164,11 @@ macro_rules! lane_submit {
                 })
             }
 
+            /// # Safety
+            ///
+            /// As [`LaneSubmit::raw`]: the caller enqueues only from inside an item of this lane, a mark afterwards
+            /// covers the work, and the caller makes the backend's context current (for CUDA, `Device::enter`)
+            /// before it calls driver functions with the handle.
             unsafe fn raw(&mut self) -> $raw {
                 let $s = self;
                 $raw_of

@@ -63,8 +63,9 @@ pub trait Gpu: Send + Sync + fmt::Debug + Sized + 'static {
     /// markers name those lanes; the caller sets each stream's [`queue`](Stream::queue) into the builder at its lane.
     ///
     /// A marker of a lane that this call did not open is refused by [`Stream::await_marker`] (`Err(Invalid)`), as a
-    /// marker of any other queue is: a pool of several backends, or of several calls, orders across them by handing
-    /// the marker to the item that bridges it.
+    /// marker of any other queue is: a pool of several backends orders across them by handing the marker to the item
+    /// that bridges it. Lanes of two calls on one device therefore cannot order on the device; open the lanes that must
+    /// order each other in one call.
     ///
     /// `Err(Invalid)` for no names, a different number of options, or lanes past 63.
     fn open_lanes_at(

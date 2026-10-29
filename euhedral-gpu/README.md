@@ -247,7 +247,7 @@ impl LaneWork<FakeStream, ()> for Fill {
         &self.waits
     }
 
-    fn run(&mut self, cx: &mut LaneCx<'_, FakeStream, (), Self>) -> Outcome<Infallible> {
+    fn run(&mut self, cx: &mut LaneCx<'_, FakeStream, (), Self>) -> Outcome<Infallible, GpuError> {
         let at = self.at;
         // SAFETY: `at` is a live allocation of 4 bytes that only this item touches.
         cx.submitter().submit(|q| unsafe { q.memset(at, 7, 4) }).unwrap();
@@ -277,7 +277,12 @@ opened
 A pool of several backends is built by hand: `LanePoolBuilder::reserve` a range per backend, `Gpu::open_lanes_at` at the
 range's first lane, `LanePoolBuilder::set` each stream's `queue()`, then `LaneIntakes::new` and one `LaneSource::new`
 per lane. A stream refuses (`Err(Invalid)`) a marker of a lane its own opening call did not make; the lane source hands
-such a marker to the item (`LaneCx::bridges`) instead of awaiting it.
+such a marker to the item (`LaneCx::bridges`) instead of awaiting it. So lanes of two `open_lanes_at` calls on one
+device cannot order on the device: open the lanes that must order each other in one call.
+
+A retirement armed behind a lane that faulted may never get its callback. `poll_retired` therefore looks at the device
+once when it finds nothing and retirements are outstanding (one event query, at most every millisecond), which poisons
+the device and has the next drain report the rest as poisoned.
 
 Code that imports both `Stream` and `LaneSubmit` names the one it means with a path (`Stream::mark(&mut s)`), as both
 have `mark`, `id` and `await_marker`.

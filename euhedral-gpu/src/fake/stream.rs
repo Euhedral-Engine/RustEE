@@ -29,13 +29,19 @@ impl DeviceQueue for FakeQueue {
     }
 
     fn completed(&self) -> u64 {
-        let poisoned = self.gpu.poison.get().is_some();
-        let st = self.gpu.lock();
-        let lane = &st.lanes[self.global];
-        if poisoned {
-            lane.marks_enqueued
+        let (run, enqueued) = {
+            let st = self.gpu.lock();
+            let lane = &st.lanes[self.global];
+            (lane.marks_run, lane.marks_enqueued)
+        };
+        if run < enqueued {
+            // A query of a marker that has not completed reaches the device: a fault it has is learned here.
+            self.gpu.observe_fault();
+        }
+        if self.gpu.poison.get().is_some() {
+            enqueued
         } else {
-            lane.marks_run
+            run
         }
     }
 
@@ -113,11 +119,19 @@ impl FakeStream {
     }
 
     /// The priority the stream was opened with, as a driver reports it: [`FAKE_NORMAL_PRIORITY`] or
-    /// [`FAKE_GREATEST_PRIORITY`].
-    pub fn priority(&self) -> i32 {
-        match self.priority {
+    /// [`FAKE_GREATEST_PRIORITY`]. The signature is `CudaStream::priority`'s.
+    pub fn priority(&self) -> Result<i32, GpuError> {
+        Ok(match self.priority {
             StreamPriority::Normal => FAKE_NORMAL_PRIORITY,
             StreamPriority::High => FAKE_GREATEST_PRIORITY,
+        })
+    }
+
+    /// One look at the device on behalf of a stream with retirements outstanding: the fake's queue query, which learns
+    /// a fault the device has. `CudaStream` queries its latest marker's event the same way.
+    pub(crate) fn probe_fault(&mut self, _throttled: bool) {
+        if self.retire.outstanding() > 0 {
+            let _ = self.queue.completed();
         }
     }
 
@@ -143,7 +157,7 @@ impl FakeStream {
     }
 
     fn arm(&mut self, listener: Option<Box<dyn RetireListener>>) -> Result<(), GpuError> {
-        self.gpu.poison.check()?;
+        self.gpu.alive()?;
         self.push(QOp::Retire {
             seq: self.retire.next_seq(),
             sink: self.queue.sink.clone(),
@@ -154,7 +168,7 @@ impl FakeStream {
 
     /// A marker after the work enqueued so far.
     pub(crate) fn mark_now(&self) -> Result<Marker, GpuError> {
-        self.gpu.poison.check()?;
+        self.gpu.alive()?;
         let value = {
             let st = self.gpu.lock();
             let lane = &st.lanes[self.global()];
@@ -169,7 +183,7 @@ impl FakeStream {
 
     /// Later work on this stream waits for `marker`.
     pub(crate) fn await_now(&self, marker: Marker) -> Result<(), GpuError> {
-        self.gpu.poison.check()?;
+        self.gpu.alive()?;
         let offset = match marker.lane.0.checked_sub(self.first) {
             Some(offset) if usize::from(offset) < self.count => usize::from(offset),
             _ => {
@@ -232,7 +246,7 @@ impl Stream for FakeStream {
         &mut self,
         f: impl FnOnce(&mut FakeEnqueue<'_>) -> Result<R, GpuError>,
     ) -> Result<R, GpuError> {
-        self.gpu.poison.check()?;
+        self.gpu.alive()?;
         f(&mut FakeEnqueue {
             target: Some(self),
             rec: None,
@@ -284,6 +298,8 @@ impl Stream for FakeStream {
         }
         self.kept.release_through(ticket.seq());
         if ticket.status() != 0 {
+            // The status is the device's own report of the fault.
+            self.gpu.observe_fault();
             return self.gpu.poisoned();
         }
         self.gpu

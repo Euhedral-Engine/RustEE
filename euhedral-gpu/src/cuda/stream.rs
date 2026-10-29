@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use euhedral_graph::{DeviceQueue, LaneId, Marker, QueueId};
 use euhedral_memory::cuda::{CuEvent, CuStream, Device, STREAM_NON_BLOCKING};
@@ -13,6 +14,9 @@ use crate::{
 };
 
 use super::{CudaEnqueue, CudaGpu, from_cuda};
+
+/// How often a stream with retirements outstanding looks at the device while no callback arrives: one event query.
+const PROBE_EVERY: Duration = Duration::from_millis(1);
 
 /// `CU_EVENT_DISABLE_TIMING`: the events only mark completion.
 const EVENT_DISABLE_TIMING: u32 = 2;
@@ -232,6 +236,8 @@ pub struct CudaStream {
     /// The owner's end of the retirement queue, and the retirements armed.
     pub(crate) retire: Retirements,
     pub(crate) kept: Kept,
+    /// When the stream last queried its marker events for a fault with retirements outstanding.
+    last_probe: Option<Instant>,
 }
 
 // SAFETY: the stream belongs to the primary context and is usable from any thread with it current. A submitter has
@@ -311,6 +317,7 @@ impl CudaStream {
                 shadow: None,
                 retire,
                 kept: Kept::default(),
+                last_probe: None,
             });
         }
         Ok(streams)
@@ -387,6 +394,31 @@ impl CudaStream {
         self.gpu.check("cuStreamWaitEvent", unsafe {
             (self.gpu.fns.stream_wait_event)(target, other.slot(marker.value), 0)
         })
+    }
+
+    /// One look at the device on behalf of a stream with retirements outstanding: a query of its marker events, which
+    /// poisons the device when the query fails for any reason but "not ready". A retirement armed behind a lane that
+    /// faulted may never get its callback (the work it follows never completes), and nothing else would notice; this
+    /// is how Java's `confirmRetired` learns of it, from the completion event. It costs one `cuEventQuery`, and nothing
+    /// when every marker completed. With `throttled`, no more often than every [`PROBE_EVERY`].
+    pub(crate) fn probe_fault(&mut self, throttled: bool) {
+        if self.retire.outstanding() == 0 {
+            return;
+        }
+        if self.ring.done.load(Ordering::Acquire) >= self.ring.marked.load(Ordering::Acquire) {
+            return;
+        }
+        if throttled {
+            let now = Instant::now();
+            if self
+                .last_probe
+                .is_some_and(|last| now.duration_since(last) < PROBE_EVERY)
+            {
+                return;
+            }
+            self.last_probe = Some(now);
+        }
+        let _ = DeviceQueue::completed(&*self.queue);
     }
 
     /// Whether `marker` names a lane this stream's opening call made, under that lane's queue.
