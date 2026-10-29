@@ -478,7 +478,7 @@ impl UpstreamRegistry {
                 let values = state.values.borrow();
                 f(&View {
                     source: Source::Full(&values),
-                    cold: RefCell::new(Vec::new()),
+                    cold: std::cell::Cell::new(None),
                 })
             }
             Some((state, true)) => {
@@ -491,7 +491,7 @@ impl UpstreamRegistry {
                         state: &state,
                         held: RefCell::new(Held::new()),
                     },
-                    cold: RefCell::new(Vec::new()),
+                    cold: std::cell::Cell::new(None),
                 })
             }
             None => {
@@ -502,7 +502,7 @@ impl UpstreamRegistry {
                 };
                 f(&View {
                     source: Source::Full(&snapshot),
-                    cold: RefCell::new(Vec::new()),
+                    cold: std::cell::Cell::new(None),
                 })
             }
         }
@@ -563,10 +563,13 @@ impl Held {
 /// The calling thread's view of the cells for one call of [`UpstreamRegistry::with_view`].
 pub struct View<'a> {
     source: Source<'a>,
-    /// Values read under the lock for this call, where the view could not answer (see [`get`](Self::get)). Empty, and
-    /// so unallocated, on every read that stays on the view.
-    cold: RefCell<Vec<(usize, Value)>>,
+    /// Values read under the lock for this call, where the view could not answer (see [`get`](Self::get)). One null
+    /// word, and nothing allocated, on every read that stays on the view.
+    cold: std::cell::Cell<Option<ColdValues>>,
 }
+
+/// Values a read took under the lock; boxed so that the view holds one word for them.
+type ColdValues = Box<Vec<(usize, Value)>>;
 
 /// What a light read found for a cell.
 enum Found {
@@ -615,24 +618,23 @@ impl View<'_> {
 
     /// The cell's current value under the lock, kept for the rest of the call.
     fn cold_get<T: Send + Sync + 'static>(&self, cell: &Cell<T>) -> Option<&T> {
-        let existing = self
-            .cold
-            .borrow()
+        let mut cold = self.cold.take().unwrap_or_default();
+        let existing = cold
             .iter()
             .find(|(id, _)| *id == cell.id)
             .map(|(_, value)| Arc::as_ptr(value));
         let pointer = match existing {
-            Some(pointer) => pointer,
-            None => {
-                let value = cell.views.value(cell.id, cell.epoch)?;
+            Some(pointer) => Some(pointer),
+            None => cell.views.value(cell.id, cell.epoch).map(|value| {
                 let pointer = Arc::as_ptr(&value);
-                self.cold.borrow_mut().push((cell.id, value));
+                cold.push((cell.id, value));
                 pointer
-            }
+            }),
         };
+        self.cold.set(Some(cold));
         // SAFETY: `cold` keeps a clone of the `Arc` for the whole call, so the value lives as long as `self`; an entry
-        // is only ever added, and a value is an `Arc` allocation, which does not move.
-        let value: &(dyn Any + Send + Sync) = unsafe { &*pointer };
+        // is only ever added, and a value is an `Arc` allocation, which does not move (the vector may).
+        let value: &(dyn Any + Send + Sync) = unsafe { &*pointer? };
         value.downcast_ref::<T>()
     }
 
