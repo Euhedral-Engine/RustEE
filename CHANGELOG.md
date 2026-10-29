@@ -3,6 +3,27 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## Routing without a reader count (2026-10-29)
+
+**What.**
+- `LatticeVertex` reads its routing generation with one acquire load inside a pin of the lattice's epoch domain; Java's
+  reader count (`admission`) is gone, and so is `euhedral_data_structures::sync::Admission` (**breaking**). `routing_state()`
+  and `RouteGuard` are replaced by `with_routing_state(|state| ..)`.
+- A remap publishes the next generation, takes an epoch (`EpochDomain::advance`, now public with `EpochDomain::passed`)
+  and queues the old generation's release with `UpstreamRegistry::defer_after_readers`; `run_due` runs what the readers
+  have passed (a worker at the start of each cycle, the queuing lifecycle call, `ControlPlaneLattice::close` while it
+  waits). `has_due` is one load.
+- `UpstreamInterceptor::request` names its vertex for the call, so the source's pushes inside it take no reference of
+  their own.
+- The drain flag and the edge's closed flag on the request and pull path are `Relaxed` (Java `getOpaque`).
+
+**Why.** Every pusher took a compare-and-set and a decrement on one shared line per frame, and a strong-count increment
+and decrement on the vertex; the compare-and-set retry loop under 23 pushers is the spread HCT showed (± 30 M ops/s).
+
+**Semantics.** A reader that stays pinned holds back the release of every generation retired after it began (the arena
+holds one state per remap meanwhile). Deferred releases never run from the unpin path (a lifecycle thread that holds the
+vertex's lock would deadlock on its own release).
+
 ## High-contention throughput benchmark (2026-10-29)
 
 **What.** A new workspace member, `euhedral-benchmarks`, with the binary `high_contention_throughput`: the average time

@@ -103,13 +103,20 @@ impl LatticeEdge {
         &self.drain
     }
 
+    /// Java's `drain.getOpaque()`: a hint that decides whether to start a request or a pull; the flag's writer
+    /// publishes nothing through it.
     fn is_draining(&self) -> bool {
-        self.drain.load(Ordering::Acquire)
+        self.drain.load(Ordering::Relaxed)
     }
 
     /// Whether [`close_edge`](Self::close_edge) has run.
     pub fn is_edge_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
+    }
+
+    /// Java's `CLOSED.getOpaque` on the request and pull path: a hint that decides whether to start.
+    fn closed_hint(&self) -> bool {
+        self.closed.load(Ordering::Relaxed)
     }
 
     /// The node above this edge, if it is still alive.
@@ -159,7 +166,7 @@ impl LatticeEdge {
             let mut next = self.parent.load(guard).and_then(Weak::upgrade);
             while let Some(node) = next {
                 let edge = node.edge();
-                if edge.is_edge_closed() || edge.is_draining() {
+                if edge.closed_hint() || edge.is_draining() {
                     return None;
                 }
                 next = edge.parent.load(guard).and_then(Weak::upgrade);
@@ -171,7 +178,7 @@ impl LatticeEdge {
 
     /// Signals demand for `demand` frames to the upstream handles, through the parents.
     pub fn request(&self, demand: u64) {
-        if demand == 0 || self.is_edge_closed() || self.is_draining() {
+        if demand == 0 || self.closed_hint() || self.is_draining() {
             return;
         }
         if self.climb().is_some() {
@@ -188,7 +195,7 @@ impl LatticeEdge {
         stop: &mut dyn FnMut(&dyn Frame) -> bool,
         demand: u64,
     ) -> u64 {
-        if demand == 0 || self.is_edge_closed() || self.is_draining() || self.climb().is_none() {
+        if demand == 0 || self.closed_hint() || self.is_draining() || self.climb().is_none() {
             return 0;
         }
         self.registry

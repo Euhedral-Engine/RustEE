@@ -163,8 +163,10 @@ impl RoutingState {
 pub(crate) struct RouteHold<'a> {
     vertex: &'a LatticeVertex,
     state: &'a RoutingState,
-    guard: Option<euhedral_data_structures::sync::EpochGuard<'static>>,
-    slot: Option<Box<euhedral_data_structures::sync::EpochSlot>>,
+    /// Initialized until `drop`; a `MaybeUninit` so that the borrow of the slot it holds is not a field the type
+    /// asserts to be valid while the slot is freed.
+    guard: std::mem::MaybeUninit<euhedral_data_structures::sync::EpochGuard<'static>>,
+    slot: *mut euhedral_data_structures::sync::EpochSlot,
 }
 
 #[cfg(test)]
@@ -179,8 +181,10 @@ impl std::ops::Deref for RouteHold<'_> {
 #[cfg(test)]
 impl Drop for RouteHold<'_> {
     fn drop(&mut self) {
-        drop(self.guard.take());
-        drop(self.slot.take());
+        // SAFETY: initialized in `hold_routing`, dropped once, here.
+        unsafe { self.guard.assume_init_drop() };
+        // SAFETY: from `Box::into_raw` in `hold_routing`, freed once, after its guard.
+        drop(unsafe { Box::from_raw(self.slot) });
         self.vertex.edge.registry().run_due();
     }
 }
@@ -332,8 +336,9 @@ impl LatticeVertex {
         self.edge.drain_flag().store(drain, Ordering::Release);
     }
 
+    /// Java's `drain.getOpaque()` in `serviceable`.
     fn is_draining(&self) -> bool {
-        self.edge.drain_flag().load(Ordering::Acquire)
+        self.edge.drain_flag().load(Ordering::Relaxed)
     }
 
     /// Runs `f` on the current routing generation, which stays unchanged and open for the call. A closed vertex's
@@ -360,21 +365,22 @@ impl LatticeVertex {
     /// in the middle of a push.
     #[cfg(test)]
     pub(crate) fn hold_routing(&self) -> RouteHold<'_> {
-        let slot = Box::new(self.edge.registry().epochs().register());
-        // SAFETY: the guard is dropped before the slot it borrows (`RouteHold::drop`).
+        let slot = Box::into_raw(Box::new(self.edge.registry().epochs().register()));
+        // SAFETY: the slot is freed in `RouteHold::drop`, after the guard that borrows it; the raw pointer keeps the
+        // allocation free of the uniqueness a moved `Box` asserts.
         let guard = unsafe {
             std::mem::transmute::<
                 euhedral_data_structures::sync::EpochGuard<'_>,
                 euhedral_data_structures::sync::EpochGuard<'static>,
-            >(slot.pin())
+            >((*slot).pin())
         };
         // SAFETY: states live until the vertex drops, and the pin keeps this one from being rewritten.
         let state = unsafe { &*self.routing.load(Ordering::Acquire) };
         RouteHold {
             vertex: self,
             state,
-            guard: Some(guard),
-            slot: Some(slot),
+            guard: std::mem::MaybeUninit::new(guard),
+            slot,
         }
     }
 
@@ -951,7 +957,7 @@ impl UpstreamInterceptor {
         }
         self.vertex
             .upgrade()
-            .filter(|vertex| !vertex.is_closed() && !vertex.is_draining())
+            .filter(|vertex| !vertex.closed.load(Ordering::Relaxed) && !vertex.is_draining())
     }
 
     /// Checks that `claim` was taken from this interceptor.
