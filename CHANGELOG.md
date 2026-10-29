@@ -57,8 +57,8 @@ default, the output lines, and a smoke run of a fork with a tiny target on a rea
   `fetch_add` (and spends unbounded demand with none) and sets its wake flag with a release store, where it did
   three sequentially consistent read-modify-writes per call. A `Join` arrival is one `fetch_sub(AcqRel)`; the check
   that a part ends once is made in debug builds only, so **a part that ends twice in a release build is a data race
-  on its slot** (Java has no check either). New: `Join::arm_owned` (unsafe, for a cell its owner knows is quiet,
-  including one whose round was cut short by a kill) and `Join::is_idle`. `Join::reset` keeps its check. **Breaking
+  on its slot** (Java has no check either). New: `Join::discard_round(&mut self)` (safe: exclusive access proves no part is outstanding, for a unit whose frames
+  were killed), `Join::arm_owned` (unsafe, the same for an owner that cannot borrow exclusively) and `Join::is_idle`. `Join::reset` keeps its check. **Breaking
   for the lane-source consumers' expectations:** a double arrival no longer panics in a release build, and
   `euhedral-data-structures` now builds the loom crate as a dependency under `--cfg loom` (the graph's join
   models run again).
