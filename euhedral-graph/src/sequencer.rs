@@ -106,7 +106,12 @@ impl fmt::Debug for Progress {
 ///   `drained`, which runs on the draining thread and must not wait.
 ///
 /// A panic in `drained` is the entry's own: the entries behind it still conclude, and the panic resumes on the
-/// draining thread once the drain ended (the sequencer is never left claimed).
+/// draining thread once the drain ended (the sequencer is never left claimed). Every panic is logged; the first is the
+/// one resumed (unless the thread is already unwinding). Java logs each and swallows it.
+///
+/// An entry whose [`ready`](Entry::ready) panics concludes as if it were ready and leaves the order: left in place it
+/// would stall every entry behind it for good. Java lets the exception out of `drain` with the count raised and the
+/// entry still at the head, which wedges the sequencer (**Java bug**).
 pub struct Sequencer<E: Entry + Send + 'static> {
     producer: Producer<E, Multi>,
     /// The order's consumer side: used by the thread that holds the work-in-progress count only.
@@ -191,7 +196,7 @@ impl<E: Entry + Send + 'static> Sequencer<E> {
                         Ok(ready) => ready.unwrap_or(false),
                         Err(payload) => {
                             // An entry whose `ready` panics is concluded and removed: it would stall the order for good.
-                            panic.get_or_insert(payload);
+                            record(&mut panic, payload);
                             true
                         }
                     };
@@ -204,10 +209,10 @@ impl<E: Entry + Send + 'static> Sequencer<E> {
                             (self.drained)(head);
                         }
                     })) {
-                        panic.get_or_insert(payload);
+                        record(&mut panic, payload);
                     }
                     if let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(consumer.poll()))) {
-                        panic.get_or_insert(payload);
+                        record(&mut panic, payload);
                     }
                 }
             });
@@ -225,6 +230,20 @@ impl<E: Entry + Send + 'static> Sequencer<E> {
             }
         }
     }
+}
+
+/// Keeps the first panic of a drain to resume, and logs every one: the later ones would otherwise vanish.
+fn record(
+    first: &mut Option<Box<dyn std::any::Any + Send>>,
+    payload: Box<dyn std::any::Any + Send>,
+) {
+    let message = payload
+        .downcast_ref::<&str>()
+        .map(|message| (*message).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "a panic with a payload that is not a string".to_owned());
+    log::error!("an entry failed to conclude: {message}");
+    first.get_or_insert(payload);
 }
 
 /// An entry that carries a value from the thread that completes it to the function that concludes it.
