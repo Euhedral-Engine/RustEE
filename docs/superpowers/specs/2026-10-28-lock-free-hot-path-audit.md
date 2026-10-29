@@ -31,7 +31,8 @@ on a path that runs per frame, per pull, per offer, per completion or per reques
    collector), and §3.12 records it.
 
 **Decisions taken.** The tick paths count as hot and become lock-free, last. `PipelineRunner::submit*` returns a
-lock-free one-shot. A lake's sinks stay attached for the lake's lifetime. Long calls run on the worker that needs them
+lock-free one-shot. A lake has two modes, attached for life and idle detach (detach when idle, re-attach on the next
+offer), as Java's lake. Long calls run on the worker that needs them
 (principle 6). A `loom` dev-dependency and Miri on a nightly toolchain are approved. `SourceCell` is approved. Every
 place mirrors its Java counterpart (principle 7); the hot source and receiver are Java's. The source primitives and the
 re-armable `Join` come from the lane-source plan (§3.11). Decision 6 (I/O submission in the poll) is superseded by
@@ -91,8 +92,8 @@ counterpart):
 |---|---|---:|
 | SOURCE | C11, G3, I1, I2, I5, I10 | 6 |
 | CLAIM | C4, C12, G1 | 3 |
-| PUBLISH | C5, C6, C8, C9, C10 | 5 |
-| CONST | C1, G2, G7 | 3 |
+| PUBLISH | C5, C6, C8, C9, C10, G7 | 6 |
+| CONST | C1, G2 | 2 |
 | ATOMIC | C2, C3, C13 | 3 |
 | FAN-IN | C14, G5, G6, G10, G11, G12, G13, G14, G15 | 9 |
 | THREAD | I4, I14, I15 | 3 |
@@ -106,8 +107,8 @@ counterpart):
 One finding is one lock (a field or a static) or one blocking call site, with all its acquisitions.
 
 **Source-contract findings** (§2.5): the `pull`/demand audit of every source, re-checked against Java, leaves 3
-findings (S1, S2 in `euhedral-memory`; S6 in `euhedral-io` and the lake, split S6a and S6b). S3, S4 and S5 of the third
-revision are Java's own design and are dropped. They are not locks, so they are not in the counts above.
+findings (S1, S2 in `euhedral-memory`; S6a in `euhedral-io`). S3, S4, S5 and S6b (the lake's idle watch) are Java's own
+design and are dropped. They are not locks, so they are not in the counts above.
 
 **Changes from the earlier revisions.** D1 (multi-producer queue offers spinning on the tail's `RESIZING` flag while
 another producer links a chunk, `queues/core.rs:371-378`) is a CAS loop inside the queue and is fine by point 2; it
@@ -193,19 +194,22 @@ same source: `QueueSource::drain_requests`, `Completions::emit`, `Front::reap` a
 **The primitives that encode the invariant** are built by the lane-source plan (Part 1), in the Java runtime's shapes;
 this plan consumes them and does not redefine them:
 
-- **`SourceCell<T>`** (approved; `euhedral-core::generics`): state that only a source's `pull` and `request`, and the
-  actions `serialize` runs, touch. Java keeps the same state in plain fields. `unsafe fn enter` returns a guard; debug
+- **`SourceCell<T>`** (approved; `euhedral-core::generics`): state that only a source's `pull` and `request` (and its
+  `Drop`) touch. Java keeps the same state in plain fields. `unsafe fn enter` returns a guard; debug
   builds panic on a second thread or a nested entry.
 - **`DownstreamSlot`** (`euhedral-core::generics`): Java `AbstractIngestSink.Delegate`'s `attached`, `complete` and
   `live` flags around a `SetOnce` receiver. `receiver()` is an acquire load with no lock and no `Arc` clone. The
   receiver stays allocated until the slot drops, because a worker may still hold it (Rust has no garbage collector).
 - **The interceptor's `wip` claim** (Java `UpstreamInterceptor.wip`): `fetch_add(1) == 0` acquires, `store(0,
   Release)` releases. It replaces today's `swap(true, Acquire)`.
-- **`LatticeReceiver::serialize`**: a lifecycle call that must touch a source's state (cancel queued frames, drop a
-  receiver) offers an action and sets a pending flag; whoever holds the claim runs it before releasing and looks again
-  after (Java `QueueIngestSink.Delegate.drainRequests`'s protocol). Nobody waits. The default runs the action at once.
-- **The interceptor drops its source when it finishes**, through `serialize`: Java's garbage collector breaks the
-  source ↔ interceptor cycle, Rust has to.
+- **Lifecycle calls set atomics** (lane-source Part 1 as merged, PR #11 at `29c97af`, the Java way). A source's
+  `complete`, `clear` and kill touch only atomic state (and, where Java does, a try-claim that fails instead of
+  waiting); the source applies that state in its next `request` or `pull`, where it is the only user, and its `Drop`
+  (`&mut self`) applies whatever is left. `DownstreamSlot` has no `serialize`, and no source uses one.
+- **The interceptor's `Claim`**: `try_acquire` returns a `Claim` token that the interceptor's `pull`, `request` and
+  `release` require; `release` is `wip.swap(0, AcqRel)` and drains only when the swap returns more than 1.
+- **`LatticeReceiver::serialize`** stays, for the interceptor's own finish only: it drops its source when it finishes
+  (Java's garbage collector breaks the source ↔ interceptor cycle; Rust has to).
 - **`SetOnce<T>`** (`euhedral-data-structures::sync`): a reference installed once by CAS and read with acquire.
 
 **What the contract adds to the invariant** (principles 4 and 5). Banked demand is Java's `demand` padded atomic
@@ -238,7 +242,7 @@ request-side drain may also run after its `pull` releases the queue, as Java's `
 | C6 | MIXED | PUBLISH | Java `LatticeVertex`: the routing state is published with `setRelease`; each push takes a reader count on it by CAS and re-checks the pointer. |
 | C8 | MIXED | PUBLISH | Java `LatticeEdge.DOWNSTREAM`: CAS at attach, `getOpaque` per push, nulled at close. |
 | C9 | MIXED | PUBLISH | Java `LatticeEdge.PARENT`: `setRelease`, `getOpaque`. |
-| G7 | MIXED | CONST | Java's lake (the `FrameLake` implementation) with idle detach off (decision 3): its generation is attached once, at first use, then read with one volatile load. |
+| G7 | MIXED | PUBLISH | Java's lake (the `FrameLake` implementation): the generation is a volatile field read once per offer; attach (first use, or the first offer after an idle detach) and detach set it under the attach lock, which is rebalance work. |
 | C14 | HOT | FAN-IN | Java `PipelineRunner.submit` returns a `CompletableFuture` the chain completes: a one-shot. |
 | G4 | HOT | LANE-SOURCE | The lane-source plan's Part 2 rebuilds `Join` on Java's `Join` (`pending` count, per-part slots). |
 | G5 | HOT | FAN-IN | No Java graph counterpart; Java waits for a result with a `CompletableFuture`: a one-shot. |
@@ -346,7 +350,7 @@ request-side drain may also run after its `pull` releases the queue, as Java's `
 | C28 | `euhedral-core/src/control_plane/countdown.rs:9` | the rebalance continuation | `tick` (`:31`) as each retired shard shuts down. |
 | C29 | `euhedral-core/src/config/liveness.rs:76` (and `thread::sleep` at `:55`) | a worker slot's `Thread`; polling for termination | `enter`/`exit` at worker start and exit; `await_termination` on clone close. |
 | C30 | `euhedral-core/src/metrics/registry.rs:26` | registered meter sources | `register`/`remove` at worker and cache build and close; `snapshot` and `len` are observer queries, never taken by a worker. |
-| C31 | `euhedral-core/src/flow_control/edge.rs:164` | `add_upstream_handle` spin-waits (`await_while`) while the edge drains | Attaching a source during a rebalance. Reached from `Lake::offer` only for the lake's first unit; its sinks then stay attached for the lake's life. |
+| C31 | `euhedral-core/src/flow_control/edge.rs:164` | `add_upstream_handle` spin-waits (`await_while`) while the edge drains | Attaching a source during a rebalance. Reached from `Lake::offer` only when no set is attached (the first unit, or the first offer after an idle detach): rebalance work. |
 | C32 | `euhedral-core/src/control_plane/shard.rs:445`, `:539`, `:605` | waiting for clones to drain; waiting for a rebalance before a reset | Rebalance, shut-down, reset (task-pool threads and the resetting thread). |
 | C33 | `euhedral-core/src/control_plane/lattice.rs:264`, `:508` | waiting for readiness; waiting for a rebalance before a reset | `start`, `clear`. |
 | C34 | `euhedral-core/src/control_plane/cache.rs:142`, `ingest/queue.rs:54`, `flow_control/vertex.rs:480` | set-once cells (`OnceLock`): SMT sibling, ingest owner, interceptor upstream | Set once at build or attach by one setter; `get` on hot paths is a lock-free load. |
@@ -355,8 +359,8 @@ request-side drain may also run after its `pull` releases the queue, as Java's `
 | H9 | `euhedral-hardware-utils/src/affinity/executor.rs:245` | the per-CPU executor registry | `get_or_create`, `get`, `close_all`, unregister. |
 | H10 | `euhedral-hardware-utils/src/monitor/mod.rs:319` | the poller's `JoinHandle` | `start`, `close_within`. |
 | H11 | `affinity/executor.rs:286`, `affinity/mod.rs:76`, `topology/mod.rs:242`, `monitor/mod.rs:55` (all in `euhedral-hardware-utils/src`) | process-wide `OnceLock` statics: executor registry, affinity controller, system topology, monotonic epoch | First use, which lattice construction and worker start reach before any frame. |
-| G8 | `euhedral-graph/src/lake.rs:169` | generations being retired | `retire` (`:294`) on detach and complete; `is_attached` (`:286`) is a query. Goes with S6b: one generation per lake, completed at `complete`. |
-| G9 | `euhedral-graph/src/lake.rs:507` | the idle watch's downstream | `add_downstream` (`:532`), `complete` (`:558`). Goes with S6b: no idle watch. |
+| G8 | `euhedral-graph/src/lake.rs:169` | generations being retired | `retire` (`:294`) on detach and complete; `is_attached` (`:286`) is a query. Stays (rebalance): it holds a detached generation's retirement until its sinks completed. |
+| G9 | `euhedral-graph/src/lake.rs:507` | the idle watch's downstream | `add_downstream` (`:532`), `complete` (`:558`). Becomes a `DownstreamSlot` with the watch (chunk 5). |
 | I16 | `euhedral-io/src/win/real.rs:274`, `:278` | `OnceLock` statics: the IoRing API and the socket extension functions | Loaded when an engine opens. |
 | M2 | `euhedral-memory/src/cuda/copier.rs:41`, `cuda/backends.rs:175` | `cuStreamSynchronize` | `Drop` of the copier and of the stream pool. |
 | M3 | `euhedral-memory/src/planner.rs:1206`, `tiers.rs:1063` | set-once downstream (`OnceLock`) | Set at attach; `get` per request is a lock-free load. |
@@ -377,7 +381,7 @@ findings of the third revision are Java's own design and are dropped (S3, S4, S5
 | `LatticeHotSource` | `LatticeHotSource` | no | yes, by design ("Pushes without demand") | no |
 | `Completions` | none (nearest `QueueIngestSink`) | no | no | no: the add-side sweep is Java's `onPublishedAfterClose` |
 | `AsyncIo` (io_uring, Windows) | `AsyncReads` | no | no | yes (S6a) |
-| `IdleWatch` (lake) | the Java lake's watch, idle-detach mode | n/a | n/a | the whole source (S6b) |
+| `IdleWatch` (lake) | the Java lake's watch | n/a (pushes nothing) | n/a | no: Java's watch polls atomics in `request`/`pull` |
 | `GiveBacks` (memory planner) | none (nearest `QueueIngestSink`) | no | producers push outside `request` | yes (S1) |
 | `Moves` (memory tiers) | none (nearest `QueueIngestSink`) | yes (S2) | producers push outside `request` | yes (S2) |
 
@@ -386,7 +390,6 @@ findings of the third revision are Java's own design and are dropped (S3, S4, S5
 | S1 | `euhedral-memory/src/planner.rs:733` → `GiveBacks::wake` (`:1266`) | A producer pushes give-back frames to the downstream itself, outside `request`, running `emit` concurrently with the source's own `request`/`pull`: a wake path that breaks the single-consumer invariant. Java publishers only enqueue (`QueueIngestSink.offer`, `publishFromCallback`). | Delete `wake`. `request` banks demand (Java's `demand` atomic) and pushes ready orders within it; `pull` hands over its own demand. The order consumer goes into a `SourceCell`. |
 | S2 | `euhedral-memory/src/tiers.rs:914` → `Moves::wake` (`:1119`); `pump` only in `Moves::emit` (`:1102`) | The same producer wake. `Mover::pump` runs only on the `pull` path, so a lattice that only requests never advances a move. | Delete `wake`. `request` pumps, then pushes finished moves within the banked demand; `pull` pumps and hands over at most its own demand. |
 | S6a | `euhedral-io/src/uring.rs:66` (`waiting`), `:280-376` (`queue`/`flush_waiting`), `euhedral-io/src/lib.rs:536` (`pending() == 0` gate); the Windows ring's `inner` hand-off | The `waiting` flag tells the `sq` holder that another thread queued entries; Java has one submitter per ring, so there is nothing to hand over. Java's `reap` has no "anything pending" gate. | With the ring's thread as its only submitter (I4), `incoming`, `waiting`, `flush_waiting` and the backlog go. The gate goes; `pending()` stays as the public count. |
-| S6b | `euhedral-graph/src/lake.rs:502-569` (`IdleWatch`), `:75`, `:107`, `:117` (`idle_since`, `idle_for`) | A source that pushes nothing; it exists to detach idle sinks. Java's lake runs no detach when idle detach is off (`idleDetachNanos <= 0`), the mode decision 3 picks. | `IdleWatch`, `detach`, idle tracking, the re-attach loop in `offer` and `retiring` (G8) go. |
 
 Dropped, with their Java reason:
 
@@ -395,6 +398,8 @@ Dropped, with their Java reason:
 - **S4** (`request_pending`, the drain retry loop, `pull` calling `drain_requests`, producers draining after close):
   all four are Java `QueueIngestSink`'s (`requestPending`, `drainRequests`, `hookOnPull`'s `finally`,
   `onPublishedAfterClose`). They stay, with the claim made lock-free (C12).
+- **S6b** (the lake's idle watch): Java's lake detaches idle sinks the same way, with a watch source whose
+  `request`/`pull` read the idle state; the user keeps the idle-detach mode to cut idle CPU. It stays (G7, G9).
 - **S5** (`Completions::add` sweeping after `complete`): Java's late publisher discards through the same try-claim
   (`onPublishedAfterClose` → `discardQueued`). It stays, through the `ClaimCell` (G1).
 
@@ -410,8 +415,9 @@ map to Rust as the lane-source plan's table does: plain → plain or `Relaxed`, 
 
 ### 3.0 Building blocks
 
-**Consumed from the lane-source plan** (§2.0, §3.11): `SetOnce<T>`, `SourceCell<T>`, `DownstreamSlot`,
-`LatticeReceiver::serialize` on the interceptor's `wip` claim (Part 1), and the re-armable `Join` (Part 2).
+**Consumed from the lane-source plan** (§2.0, §3.11): `SetOnce<T>`, `SourceCell<T>`, `DownstreamSlot` and the
+interceptor's `wip` claim with its `Claim` token (Part 1), and the re-armable `Join` (Part 2). No source here uses
+`serialize`: lifecycle calls set atomics and the source applies them.
 
 **Built here**, in `euhedral-data-structures::sync` (the module Part 1 creates), each because nothing in the
 workspace offers it:
@@ -454,6 +460,12 @@ workspace offers it:
 
 **Ingest** (Java `AbstractIngestSink`, `QueueIngestSink`, `SingleUseSource`, `PipelineRunner`).
 
+Lifecycle calls set atomics, as Java's and as lane-source Part 1 now requires: `complete` sets `publication_closed` and
+completes the `DownstreamSlot`; kill sets the kill switch; `clear` sets `clear_requested`. Each then tries Java's
+`draining` claim once (`discard_queued`); when a worker holds it, the holder applies the flags in `on_drain_finished`,
+and the next `request` or `pull` otherwise. `Drop` (`&mut self`) finishes whatever is still queued. No call goes
+through `serialize`.
+
 - **C11**: `Downstream` becomes `DownstreamSlot`. `demand` stays Java's padded atomic with `accumulate`, a
   `fetch_update(SeqCst, SeqCst)` loop.
 - **C12**: `consumer: ClaimCell<PartitionedConsumer<_, Single>>` is Java's `draining` flag and the queue's consumer
@@ -479,7 +491,8 @@ workspace offers it:
 `QueueIngestSink`, mirrored:
 
 - **G1**: `poll: ClaimCell<Poll>`, claimed by `emit` (from `pull`/`request`) and by a registration that lands after
-  `complete` (today's add-side `sweep`; Java's `onPublishedAfterClose` → `discardQueued`). The losing side relies on
+  `complete` (today's add-side `sweep`; Java's `onPublishedAfterClose` → `discardQueued`). `complete` sets the closed
+  flag and completes the `DownstreamSlot`; the next poll, the sweep or `Drop` cancels what is left. The losing side relies on
   the holder, which re-checks after it releases. Registrations still arrive through the `incoming` MPSC queue.
 - **G2**: the lane pool is an immutable `Arc<LanePool>` field, as Java's `final LanePool`; it is dropped with the
   source.
@@ -571,13 +584,29 @@ Java `LatticeHotSource`, `ControlPlaneFragment`'s output, `StopWatch`, `Fragment
     emit it and pop it; `missed = wip.fetch_sub(missed, SeqCst) - missed`; return at 0. The order consumer is owned
     by the `wip` winner (an `UnsafeCell`, `// SAFETY:` the `wip` count), as Java's `peek`/`poll`.
   - A failing emit is logged and the drain continues (Java's catch).
-- **G7 and S6b** (Java's lake (the `FrameLake` implementation) with idle detach off, decision 3):
-  - `generation: SetOnce<Generation>`. `offer` and `admit` read it with one acquire load; the first `admit` or
-    `offer` attaches the sinks under a `LifecycleMutex` (start), as Java's `attach()` does under its lock.
-  - `accepted` (the `CLOSED` sign bit and the count) and `finished` (CAS) as Java's; `complete_gracefully` closes
-    admission; the last `terminated` completes the sinks.
-  - `IdleWatch`, `idle_since`/`idle_for`, `detach`, the re-attach loop in `offer`, `discard` and `retiring` (G8, G9)
-    go. Deviation: none in the mode used; the idle-detach mode is not offered (decision 3).
+- **G7, G8, G9: the lake's two modes** (Java's lake, the `FrameLake` implementation). `idle_release` stays:
+  `Duration::ZERO` keeps the sinks attached for life (Java `idleDetachNanos <= 0`); a positive value detaches them once
+  no unit has been active for that long, and the next offer re-attaches a fresh set. The hot side is Java's:
+  - `generation: Published<Generation>` (Java `volatile Generation generation`). `offer` and `admit` read it with one
+    pinned `load()`: no lock and no `Arc` clone. Deviation: `Published` stands in for the collector, because an
+    offering thread may hold a set that is being detached.
+  - `offer` (Java `publish`): read the set; offer to the sink its routing hash picks; a detached set's sinks refuse
+    (publication closed), and the offer then calls `attach` and tries the set attached since, as Java's loop; a lake
+    that finished, or an `attach` that returns the same set, refuses.
+  - `admit` (Java `admit`): count first (`accepted` CAS, the `CLOSED` sign bit as Java), then `attach`, so a watch that
+    finds the lake idle afterwards cannot detach the set it returns.
+  - `attach` and `detach` (Java's, under `synchronized(attachedSources)`): rebalance work under `attach_lock:
+    LifecycleMutex<()>`, taken after `HotScope::leave()`. `attach` returns the current set without the lock when one is
+    attached (the per-offer fast path); otherwise it builds and attaches a set and its watch, counts `attachments`, and
+    stores it. `detach(from)` returns unless `from` is current, the lake is not finished and no unit is active; it
+    stores `None`, hands the retirement to `retiring` (G8, lifecycle) and finishes `from`'s sinks gracefully.
+  - Idleness (Java `idleSince`): `idle_since_ns: AtomicU64`, stored (`SeqCst`) by the `terminated` that brings the
+    active count to zero; `idle_for` reads it.
+  - The watch (Java's `Generation.watch`, an ingest delegate): its `request` and `pull` poll: return when idle detach
+    is off, a unit is active, or the lake has been idle for less than `idle_release`; otherwise `detach(owner)`. Its
+    downstream is a `DownstreamSlot` (G9). As Java, the watch is attached in both modes.
+  - `complete_gracefully`, `terminated` and `finished` as Java's.
+  - Public API unchanged: `attach`, `detach`, `idle_release`, `attachments`, `is_attached` stay.
 
 ### 3.5 Stage graph (chunk 6)
 
@@ -724,10 +753,10 @@ Java shapes, and this plan consumes them; neither plan builds one twice:
 
 | Primitive | Lane-source part | Java counterpart | Consumed here by |
 |---|---|---|---|
-| `SetOnce<T>` | Part 1 (Task 1.1) | a reference set by `compareAndSet(null, v)`, read by `getAcquire` | C8, G7, G11, I3, I13 |
+| `SetOnce<T>` | Part 1 (Task 1.1) | a reference set by `compareAndSet(null, v)`, read by `getAcquire` | C8, G11, I3, I13 |
 | `SourceCell<T>` (approved) | Part 1 (Task 1.2) | plain fields under the interceptor's `wip` | I1, I5, I10, S1, S2 |
 | `DownstreamSlot` | Part 1 (Task 1.3) | `AbstractIngestSink.Delegate` (`attached`, `complete`, `live`) | C11, G3, I2 |
-| `LatticeReceiver::serialize`, `wip` claim | Part 1 (Task 1.4) | `UpstreamInterceptor.wip`, `drainRequests`'s protocol | ingest kill and clear paths, `Completions::complete` |
+| `wip` claim and `Claim` token; `serialize` for the interceptor's own finish | Part 1 (Task 1.4, PR #11 at `29c97af`) | `UpstreamInterceptor.wip` | every source, through the lattice; no source calls `serialize` |
 | Re-armable `Join` | Part 2 (Tasks 2.1-2.2) | `Join` (graph runtime) | G4 (done there) |
 
 The blocking-work facility of the third revision is dropped (principle 6); neither plan builds it.
@@ -760,7 +789,7 @@ runtime" is the Java runtime `euhedral-graph` is derived from (its `runtime/grap
 | G4 join | graph runtime `Join` | In the lane-source plan. |
 | G5 latch | none; `CompletableFuture` | — |
 | G6 sequencer | graph runtime `Sequencer` | None. |
-| G7 lake | graph runtime `FrameLake` implementation (idle detach off) | Idle-detach mode not offered (decision 3). |
+| G7-G9 lake | graph runtime `FrameLake` implementation (both modes) | `Published` for the generation (no GC); retirements held in `retiring`. |
 | G10-G15 stage graph | graph runtime `StageGraph`, `StageFrame`, `AbstractQuantum` | Wider-than-64-lane masks. |
 | I1-I6 io_uring | graph runtime `AsyncReads`, `UringBackend` | Operations written in place behind a reserve step (no allocation per operation). |
 | I7-I15 Windows | graph runtime `CompletionPortBackend`, `IoRingBackend` | `register` for sockets (Java reads files only); pool-job results have no counterpart. |
@@ -774,11 +803,11 @@ tasks, one draft PR per chunk. In outline:
 
 | Chunk | Fixes | Ratchet | Waits for |
 |---|---|---:|---|
-| 1. Guard rails | `LifecycleMutex`, `HotScope`, clippy config, `HOT-FIX(<id>)` tags, the ratchet test | sets 58 | lane-source Parts 1 and 2 merged |
+| 1. Guard rails | `LifecycleMutex`, `HotScope`, clippy config, `HOT-FIX(<id>)` tags, the ratchet test | sets 57 | lane-source Parts 1 and 2 merged |
 | 2. Sources and claims | C11, C12, C13, G1, G2, G3, I1, I2; adds `ClaimCell` | -8 | chunk 1 |
 | 3. Hot source | C1, C2, C3, C10 | -4 | chunk 1 |
 | 4. Cache, vertex, edges | C4-C9; adds `Published` | -6 | chunk 2 (`ClaimCell`) |
-| 5. Fan-in and lake | C14, G5, G6, G7, S6b; adds `OneShot` | -5 | chunk 1 |
+| 5. Fan-in and lake | C14, G5, G6, G7; adds `OneShot` | -4 | chunk 4 (`Published`) |
 | 6. Stage graph | G10-G15; adds `TakeAllStack` | -6 | chunk 1 |
 | 7. io_uring | I3, I4, I5, I6, S6a | -5 | chunk 2 (the front) |
 | 8. Windows engine | I7-I15 | -9 | chunk 7 (the shared slots and refusal API) |
@@ -786,8 +815,8 @@ tasks, one draft PR per chunk. In outline:
 | 10. Tick path | C16-C20, H1-H7 | -12 | chunk 4 (`Published`, `ClaimCell`) |
 | 11. Lock the door | the ratchet becomes "no `HOT-FIX(` tag" | to 0 | chunks 2-10 |
 
-The 58 tags are the 54 HOT and MIXED lock sites left once lane-source Part 2 has fixed G4 and without C15 (Java's
-back-off, kept), plus five non-lock markers: M1, S1, S2, S6a, S6b.
+The 57 tags are the 54 HOT and MIXED findings left once lane-source Part 2 has fixed G4 and without C15 (Java's
+back-off, kept; M1 is tagged by a comment), plus three source-contract markers: S1, S2, S6a.
 
 **Lane-source ordering.** Lane-source Part 1 changes `euhedral-data-structures` (`sync/`, `lib.rs`, `Cargo.toml`),
 `euhedral-core/src/generics/` and `flow_control/vertex.rs`; Part 2 changes `euhedral-graph/src/join.rs`, `src/sync.rs`,
@@ -806,9 +835,9 @@ gate, keep or discard).
 - **The invariant is load-bearing for memory safety.** `SourceCell::enter` is `unsafe`; a source driven from two
   threads at once without a lattice is undefined behaviour in release builds. Mitigations: the glossary contract, the
   debug check in `SourceCell`, the interceptor's `wip` claim as the only lattice-side mechanism.
-- **Lifecycle calls on a source take effect when its holder releases.** `clear`, kill and `complete` may return
-  before their effect when a worker holds the claim; the holder runs them before it lets go (Java's `drainRequests`
-  protocol). Waiting instead would deadlock when the call comes from a frame the source's own `pull` runs.
+- **Lifecycle calls on a source take effect when its holder releases.** `clear`, kill and `complete` set atomics and
+  may return before their effect when a worker holds the claim; the holder applies them before it lets go, or the next
+  `request`/`pull` does, or `Drop` (Java's `drainRequests` and `onDrainFinished` protocol). Waiting instead would deadlock when the call comes from a frame the source's own `pull` runs.
 - **Recycled routing states (C6).** A stale reader may CAS a recycled state's count; the re-check against the current
   pointer makes that safe. Mitigations: a loom model of reader, writer and recycler; drop-counted handles in the remap
   tests.
@@ -822,8 +851,7 @@ gate, keep or discard).
 - **Long frees on a worker (M1)** hold that worker for up to about 350 ms when the device is busy; the pinned pool and
   per-frame stream or VMM frees keep them off per-frame paths, and the other workers keep serving.
 - **Public API changes**: hot-source hooks take `Fn` (C1); `PipelineRunner::submit*` returns a one-shot (C14);
-  `AsyncIo::submit*` may refuse (I4); `Lake` loses `attach`/`detach`/`idle_release`/`attachments` (S6b); sockets made
-  outside the Windows engine need `register` (I11); `LatticeReceiver::serialize` (lane-source).
+  `AsyncIo::submit*` may refuse (I4); sockets made outside the Windows engine need `register` (I11).
 - **Windows slab rewrite (I7)** with the `OVERLAPPED`-to-tag arithmetic: the simulated tests run on every platform,
   the live ones only on the Windows workflow.
 - **Performance**: chunks 3 and 4 carry paired benchmarks; a change that does not beat what it replaces on the
@@ -832,7 +860,7 @@ gate, keep or discard).
 ## 6. Decisions and questions
 
 Answers applied: ticks are hot and fixed last (chunk 10); `PipelineRunner::submit*` returns a lock-free one-shot
-(C14); a lake keeps its sinks attached for its life (G7, Java's idle-detach-off mode); long calls run on the worker
+(C14); a lake keeps both of Java's modes, attached for life and idle detach (G7); long calls run on the worker
 that needs them, with no blocking-work facility (principle 6, M1); `loom` and Miri on nightly are approved; every
 place mirrors its Java counterpart (principle 7, §3.12); the hot source and receiver are Java's (S3 dropped, C15
 kept); the source primitives and `Join` come from the lane-source plan (§3.11).

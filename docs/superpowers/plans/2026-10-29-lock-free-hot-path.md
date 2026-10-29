@@ -8,7 +8,10 @@
 
 **Architecture:**
 - Every place mirrors its Java counterpart's fields, atomics and orderings (audit principle 7, §3.12).
-- Source state uses the lane-source plan's `SourceCell`, `DownstreamSlot` and `serialize`.
+- Source state uses the lane-source plan's `SourceCell` and `DownstreamSlot`. A source's lifecycle calls (`complete`,
+  `clear`, kill) set atomics, and the source applies them in its next `request` or `pull`, or in `Drop`, as Java's
+  (lane-source Part 1 as merged, PR #11 at `29c97af`). No source uses `serialize`; only the interceptor keeps it, for
+  its own finish.
 - This plan adds four primitives to `euhedral-data-structures::sync`: `ClaimCell` (Java's try-claims), `Published` (the
   stand-in for Java's garbage collector), `OneShot` (`CompletableFuture`) and `TakeAllStack` (`StageFrame.externals`).
 - A clippy configuration, a debug-only hot-scope check and a ratchet test keep new locks out.
@@ -69,7 +72,7 @@ The coordinator gives the checkout paths.
 
 | This plan | Waits for | Why |
 |---|---|---|
-| Chunk 1 (and so every chunk) | lane-source Part 1 **and** Part 2 merged to `main` | Chunk 1 edits `euhedral-data-structures/src/sync/mod.rs`, `src/lib.rs`, `Cargo.toml` and `euhedral-core/src/flow_control/vertex.rs` (Part 1), and tags sites in `euhedral-graph` after `join.rs` lost its `Mutex` (Part 2). |
+| Chunk 1 (and so every chunk) | lane-source Part 1 (PR #11, at `29c97af` or later) **and** Part 2 merged to `main` | Chunk 1 edits `euhedral-data-structures/src/sync/mod.rs`, `src/lib.rs`, `Cargo.toml` and `euhedral-core/src/flow_control/vertex.rs` (Part 1), and tags sites in `euhedral-graph` after `join.rs` lost its `Mutex` (Part 2). |
 | Chunks 2-11 | chunk 1, then the dependencies below | — |
 | Every chunk's docs task | no open lane-source PR editing `CHANGELOG.md`, `GLOSSARY.md` or the same crate README | Parts 3 and 4 edit those files. |
 
@@ -81,7 +84,8 @@ The coordinator gives the checkout paths.
   - chunk 7 needs chunk 2 (the `AsyncIo` front);
   - chunk 8 needs chunk 7 (shared slots and the refusal API);
   - chunk 10 needs chunk 4 (`Published`);
-  - chunks 3, 5, 6 and 9 need only chunk 1;
+  - chunk 5 needs chunk 4 (`Published`, for the lake's generation);
+  - chunks 3, 6 and 9 need only chunk 1;
   - chunk 11 needs all.
 - Chunks that may run in parallel rebase the ratchet constant when the other lands.
 
@@ -117,7 +121,7 @@ The coordinator gives the checkout paths.
 | `euhedral-data-structures/src/sync/published.rs`, `euhedral-core/src/flow_control/registry.rs` | 4 | `Published`, epoch slots |
 | `euhedral-core/src/control_plane/cache.rs`, `flow_control/{vertex.rs,edge.rs}` | 4 | C4-C9 |
 | `euhedral-data-structures/src/sync/one_shot.rs` | 5 | `OneShot` |
-| `euhedral-core/src/ingest/pipeline_runner.rs`, `euhedral-graph/src/{latch.rs,sequencer.rs,lake.rs}` | 5 | C14, G5, G6, G7, S6b |
+| `euhedral-core/src/ingest/pipeline_runner.rs`, `euhedral-graph/src/{latch.rs,sequencer.rs,lake.rs}` | 5 | C14, G5, G6, G7 (G8, G9 lifecycle) |
 | `euhedral-data-structures/src/sync/take_all.rs`, `euhedral-graph/src/stage_graph.rs` | 6 | `TakeAllStack`, G10-G15 |
 | `euhedral-io/src/uring.rs` | 7 | I3-I6, S6a |
 | `euhedral-io/src/slots.rs` (new) | 7, 8 | tag-indexed operation slots shared by both engines |
@@ -224,11 +228,10 @@ impl HotScope {
   - **Source-contract markers**, as `// HOT-FIX(<id>)` comments:
     - `S1` at `planner.rs:1266`;
     - `S2` at `tiers.rs:1119`;
-    - `S6a` at `uring.rs:66`;
-    - `S6b` at `lake.rs:502`.
+    - `S6a` at `uring.rs:66`.
   - **Java's own back-offs:** `utils/spin_wait.rs` (C15's back-off), the queues' CAS loops and the idle policy's
     parks get `reason = "JAVA-BACKOFF"`.
-- Distinct `HOT-FIX` ids: 54 lock findings + M1 + S1 + S2 + S6a + S6b = 58. M1 is counted inside the 54.
+- Distinct `HOT-FIX` ids: 54 lock findings (M1 among them) + S1 + S2 + S6a = 57.
 
 - [ ] **Step 1: Add `clippy.toml`.** Run `mise exec -- cargo clippy --workspace --all-targets -- -D warnings`. It fails
   at every lock site: that list is the work.
@@ -246,7 +249,7 @@ impl HotScope {
   `euhedral-data-structures/README.md`
 
 **Interfaces:**
-- `const HOT_FIX_TAGS: usize = 58;`
+- `const HOT_FIX_TAGS: usize = 57;`
 - `fn tags() -> BTreeSet<String>`:
   - walks `<workspace>/*/src/**/*.rs`, the workspace being `CARGO_MANIFEST_DIR/..`;
   - skips `tests.rs`, `testing.rs` and any `tests/` directory;
@@ -255,8 +258,8 @@ impl HotScope {
 - [ ] **Step 1: Write the tests.**
   - `the_hot_fix_tags_are_exactly_the_ratchet`: `assert_eq!(tags().len(), HOT_FIX_TAGS, "lower HOT_FIX_TAGS by the
     tags this change removed: {:?}", tags())`.
-  - `every_tag_names_a_finding_of_the_audit`: each id matches `^(C|G|I|H|M)\d+$|^S(1|2|6a|6b)$`.
-- [ ] **Step 2: Run.** `mise exec -- cargo test -p euhedral-core --test hot_fix_ratchet`. PASS at 58.
+  - `every_tag_names_a_finding_of_the_audit`: each id matches `^(C|G|I|H|M)\d+$|^S(1|2|6a)$`.
+- [ ] **Step 2: Run.** `mise exec -- cargo test -p euhedral-core --test hot_fix_ratchet`. PASS at 57.
 - [ ] **Step 3: Write the docs and run the gate** (Global Constraints).
 - [ ] **Step 4: Commit, push, open the draft PR.** `git commit -m "Ratchet test for hot-path lock tags"`; `gh pr create
   --draft --base main --title "Hot-path guard rails: lifecycle locks, hot scopes, lint, ratchet"`.
@@ -309,7 +312,8 @@ unsafe impl<T: Send> Sync for ClaimCell<T> {}
 - Test: `euhedral-core/src/ingest/queue/tests.rs`
 
 **Interfaces:**
-- Consumes: `DownstreamSlot` (lane-source Part 1: `attach`, `receiver`, `complete`, `is_complete`, `serialize`).
+- Consumes: `DownstreamSlot` (lane-source Part 1: `attach`, `receiver`, `complete`, `is_complete`; it has no
+  `serialize`, and every method touches atomics only).
 - `Downstream` is replaced by `DownstreamSlot` plus `demand: CachePadded<AtomicU64>`.
   - `fn add_demand(&self, d: i64) -> u64` is Java's `accumulate`, a `fetch_update(SeqCst, SeqCst)`: saturating, and
     a negative step floors at 0.
@@ -341,6 +345,10 @@ unsafe impl<T: Send> Sync for ClaimCell<T> {}
   - `drain_requests` (`drainRequests`): subtract before releasing; release with `release_seq_cst`;
   - `discard_queued` (`discardQueued`);
   - `publish` (`afterPublish`: `fence(SeqCst)` after the offer, then `on_published_after_close` when closed).
+- Lifecycle calls set atomics, then try the claim once: `complete` sets `publication_closed` and completes the slot;
+  kill sets the kill switch (`PipelineRunner`). The holder applies them in `on_drain_finished`, and the next
+  `request`/`pull` otherwise.
+- `impl Drop for QueueSource` finishes every frame still queued (`&mut self`, through `ClaimCell::get_mut`).
 
 - [ ] **Step 1: Write the failing tests.**
   - `a_request_while_a_pull_holds_the_queue_is_served_when_the_pull_releases`: thread A pulls with a consumer that
@@ -351,6 +359,7 @@ unsafe impl<T: Send> Sync for ClaimCell<T> {}
     only `request(1)` in a loop; all 1000 arrive, each once.
   - `a_publish_after_close_is_discarded_by_someone`: close the sink, offer from 4 threads racing a pulling thread;
     every frame is finished exactly once (drop counter).
+  - `frames_queued_when_the_source_drops_are_finished`: queue 10, complete, drop the last `Arc`; all 10 finished.
 - [ ] **Step 2: Run them and see them fail.** The first fails today: the `Mutex` blocks.
 - [ ] **Step 3: Implement.** Delete `HOT-FIX(C12)`; lower the ratchet by 1.
 - [ ] **Step 4: Run** `mise exec -- cargo test -p euhedral-core ingest` and `mise exec -- cargo test -p
@@ -403,6 +412,8 @@ unsafe impl<T: Send> Sync for ClaimCell<T> {}
   `release_seq_cst` and claims again, as `drain_requests` does.
 - `lanes: Arc<LanePool>` is a plain field.
 - `downstream: DownstreamSlot`.
+- `complete` sets `closed` (`SeqCst`) and completes the slot; it touches no poll state. The next poll, the sweep or
+  `Drop` cancels what remains.
 
 - [ ] **Step 1: Write the failing tests.**
   - `registrations_racing_complete_are_each_cancelled_or_emitted_once`: 4 threads `after_marker` while a fifth calls
@@ -435,7 +446,7 @@ unsafe impl<T: Send> Sync for ClaimCell<T> {}
   - CHANGELOG "Lock-free sources and claims".
   - GLOSSARY **ClaimCell**.
   - READMEs of `euhedral-data-structures`, `euhedral-core`, `euhedral-graph`, `euhedral-io`.
-- [ ] **Step 2: Run the gate.** Ratchet test PASS at 50.
+- [ ] **Step 2: Run the gate.** Ratchet test PASS at 49.
 - [ ] **Step 3: Push and open the draft PR** "Sources and claims: ingest, Completions, AsyncIo front".
 
 ---
@@ -506,8 +517,8 @@ unsafe impl<T: Send> Sync for ClaimCell<T> {}
 - [ ] **Step 1: Benchmark.** Run the paired benchmark (profile, hypothesis, paired gate) of frames per second and p99
   service time on short frames, `main` against this branch, on a quiet machine, in the machine's whole-system benchmark slot. Keep the change only if it
   is no slower at p99 within the gate's noise. Record the numbers in the PR body.
-- [ ] **Step 2: Write the docs** (CHANGELOG: the hooks' `Fn` change is breaking) and run the gate. Ratchet at 46
-  (chunk 2 merged), or 54 rebased alone.
+- [ ] **Step 2: Write the docs** (CHANGELOG: the hooks' `Fn` change is breaking) and run the gate. Ratchet at 45
+  (chunk 2 merged), or 53 rebased alone.
 - [ ] **Step 3: Push and open the draft PR** "Hot source: Java's final hooks and atomic downstream".
 
 ---
@@ -675,7 +686,7 @@ reset) loops on `try_claim` with `spin_wait` (lifecycle; allowed by its reason t
 
 ---
 
-## Chunk 5 (draft PR, `hot-path-5-fan-in`): one-shot, latch, sequencer, lake (C14, G5, G6, G7, S6b)
+## Chunk 5 (draft PR, `hot-path-5-fan-in`): one-shot, latch, sequencer, lake (C14, G5, G6, G7)
 
 ### Task 5.1: `OneShot<T>`
 
@@ -751,31 +762,44 @@ consumer")`).
   `mise exec -- cargo test -p euhedral-graph sequencer`.
 - [ ] **Step 5: Commit.** `git commit -m "Sequencer: Java's MPSC order and wip drain (G6)"`
 
-### Task 5.5: The lake attaches once and stays attached (G7, S6b, G8, G9)
+### Task 5.5: The lake's two modes on Java's hot side (G7, G8, G9)
 
 **Files:** `euhedral-graph/src/lake.rs`, `euhedral-graph/tests/lake.rs`.
 
-**Interfaces:**
-- `generation: SetOnce<Generation>`; `attach_lock: LifecycleMutex<()>` for the first attach (taken after
-  `HotScope::leave()`).
-- `accepted` and `finished` as the Java lake's.
-- Removed: `IdleWatch`, `idle_since`, `idle_for`, `detach`, `discard`, `retiring`, the `idle_release` parameter of
-  `Lake::new`, `attachments`. `is_attached` reads the set-once generation.
+**Interfaces** (spec §3.4, G7-G9; Java's `FrameLake` implementation):
+- The public API is unchanged: `Lake::new(.., idle_release: Duration)` (`Duration::ZERO` = attached for life),
+  `admit`, `offer`, `complete_gracefully`, `active`, `is_attached`, `attachments`, `sinks`.
+- `generation: Published<Generation>` (Consumes: `Published`, Task 4.1). `offer` and `admit` read it with one pinned
+  `load()`.
+- `attach_lock: LifecycleMutex<()>` around `attach` and `detach`, taken after `HotScope::leave()` and only when no set
+  is attached (first use, or after a detach) or the watch detaches.
+- `retiring: LifecycleMutex<Vec<Retired<Generation>>>` (G8) holds detached generations until their sinks complete.
+- `idle_since_ns: AtomicU64`, stored (`SeqCst`) by the `terminated` that brings the count to 0.
+- `accepted` (the `CLOSED` sign bit) and `finished` as Java's.
+- The watch's `downstream: DownstreamSlot` (G9). The watch is attached in both modes; its `request`/`pull` return at
+  once when `idle_release` is zero, a unit is active, or the lake has been idle for less than `idle_release`.
+- `offer` follows Java's `publish` loop: a detached set's sinks refuse, `attach` gives the set attached since, and a
+  finished lake or an unchanged set refuses.
 
-- [ ] **Step 1: Update `tests/lake.rs`.** Delete the detach and re-attach tests. Add:
-  - `offers_from_8_threads_racing_complete_finish_every_admitted_unit`: every admitted unit terminates, and the sinks
-    complete once;
-  - `the_first_offer_attaches_and_later_offers_take_no_lock`: debug hot scope around later offers, no panic.
-- [ ] **Step 2: Run them and see them fail; Step 3: implement.** Delete `HOT-FIX(G7)` and the `S6b` marker; ratchet
-  -2.
+- [ ] **Step 1: Write the failing tests** in `tests/lake.rs`. Keep the existing detach and re-attach tests. Add:
+  - `offers_racing_an_idle_detach_land_in_exactly_one_set`: `idle_release` 1 ms; 8 threads `admit`, `offer` and
+    terminate in bursts with idle gaps; every offered frame runs once; `attachments() > 1`.
+  - `offers_on_an_attached_set_take_no_lock`: inside `HotScope::enter()`, 10 000 offers to an attached lake; no
+    debug panic.
+  - `an_attached_for_life_lake_never_detaches`: `Duration::ZERO`; idle 50 ms; `is_attached()` stays true and
+    `attachments() == 1`.
+  - `offers_from_8_threads_racing_complete_finish_every_admitted_unit`.
+- [ ] **Step 2: Run them and see the second fail** (the generation `RwLock` read is a std lock inside a hot scope
+  once Task 1.3 tagged it, and the `Arc` clone remains).
+- [ ] **Step 3: Implement.** Delete `HOT-FIX(G7)`; ratchet -1.
 - [ ] **Step 4: Run** `mise exec -- cargo test -p euhedral-graph`. PASS.
-- [ ] **Step 5: Commit.** `git commit -m "Lake: attached once for its life, Java's idle-detach-off mode (G7, S6b)"`
+- [ ] **Step 5: Commit.** `git commit -m "Lake: Java's published generation; attach and detach as rebalance work (G7-G9)"`
 
 ### Task 5.6: Chunk 5 docs and the draft PR
 
-- [ ] **Step 1: Write the docs.** CHANGELOG: `submit*` and `Lake::new` are breaking. GLOSSARY: **OneShot**. Run the
+- [ ] **Step 1: Write the docs.** CHANGELOG: `submit*` is breaking. GLOSSARY: **OneShot**, **idle detach**. Run the
   gate.
-- [ ] **Step 2: Push and open the draft PR** "Fan-in: one-shot, latch, Java's sequencer, lake attached for life".
+- [ ] **Step 2: Push and open the draft PR** "Fan-in: one-shot, latch, Java's sequencer, lake on Java's hot side".
 
 ---
 
