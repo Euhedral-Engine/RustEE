@@ -3,7 +3,9 @@
 //! The lattice serializes a source's `pull` and `request`: one worker is inside either at a time,
 //! and the interceptor's claim orders one worker's exit before the next worker's entry. State that
 //! only those calls touch (and the actions [`LatticeReceiver::serialize`] runs in their place)
-//! therefore needs no atomics and no lock. A [`SourceCell`] holds such state and says so in the
+//! therefore needs no atomics and no lock. A source's lifecycle calls, which may arrive from any
+//! thread, set atomics instead, and the source applies them to its cell in its next `request` or
+//! `pull`. A [`SourceCell`] holds such state and says so in the
 //! type: entering it is `unsafe`, because the compiler cannot see the lattice's guarantee.
 //!
 //! [`LatticeReceiver::serialize`]: super::LatticeReceiver::serialize

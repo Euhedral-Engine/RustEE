@@ -2,7 +2,9 @@ use super::*;
 use crate::flow_control::LatticeHotSource;
 use crate::flow_control::testing::{Fate, Fates, TestReceiver, Tracked, frame};
 use crate::frames::BenchmarkFrame;
+use crate::generics::{DownstreamSlot, SourceCell};
 use euhedral_hardware_utils::util::CpuSet;
+use std::sync::Barrier;
 use std::sync::atomic::AtomicUsize;
 use std::sync::mpsc;
 use std::thread;
@@ -1498,4 +1500,123 @@ fn a_claim_taken_from_another_handle_is_refused() {
     assert!(refused.is_err());
     first.release(claim);
     assert!(given_back(&second), "the other handle was left alone");
+}
+
+/// A source whose plain state is in a `SourceCell`, and whose lifecycle calls set atomics only.
+struct Stateful {
+    slot: DownstreamSlot,
+    state: SourceCell<Vec<u32>>,
+    cleared: AtomicBool,
+    /// Makes the next `request` stop inside its state until the test lets it go.
+    block: AtomicBool,
+    inside: Barrier,
+    hold: Barrier,
+    applied: AtomicUsize,
+}
+
+impl Stateful {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            slot: DownstreamSlot::new(),
+            state: SourceCell::new(Vec::new()),
+            cleared: AtomicBool::new(false),
+            block: AtomicBool::new(false),
+            inside: Barrier::new(2),
+            hold: Barrier::new(2),
+            applied: AtomicUsize::new(0),
+        })
+    }
+
+    /// A lifecycle call from any thread: it sets an atomic and nothing else.
+    fn clear(&self) {
+        self.cleared.store(true, Ordering::SeqCst);
+    }
+}
+
+impl LatticeSource for Stateful {
+    fn add_downstream(self: Arc<Self>, downstream: Arc<dyn LatticeReceiver>) {
+        let source: Arc<dyn LatticeSource> = self.clone();
+        self.slot.attach(source, downstream);
+    }
+
+    fn pull(
+        &self,
+        _consumer: &mut dyn FnMut(Box<dyn Frame>),
+        _stop: &mut dyn FnMut(&dyn Frame) -> bool,
+        _demand: u64,
+    ) -> u64 {
+        0
+    }
+
+    fn request(&self, demand: u64) {
+        // SAFETY: the interceptor calls `request` under its claim.
+        let mut state = unsafe { self.state.enter() };
+        if self.cleared.swap(false, Ordering::SeqCst) {
+            self.applied.fetch_add(state.len(), Ordering::SeqCst);
+            state.clear();
+        }
+        state.push(demand as u32);
+        if self.block.swap(false, Ordering::SeqCst) {
+            self.inside.wait();
+            self.hold.wait();
+        }
+    }
+
+    fn complete(&self) {
+        self.slot.complete();
+    }
+
+    fn is_complete(&self) -> bool {
+        self.slot.is_complete()
+    }
+}
+
+#[test]
+fn lifecycle_calls_from_another_thread_touch_only_atomics_and_take_effect_on_the_next_request() {
+    let vertex = LatticeVertex::new(&registry(), "lifecycle", 1);
+    let source = Stateful::new();
+    let interceptor = vertex.ingest(source.clone()).unwrap();
+    let worker = |interceptor: Arc<UpstreamInterceptor>, requests: usize| {
+        thread::spawn(move || {
+            let mut claim = interceptor.try_acquire().expect("the handle is free");
+            for _ in 0..requests {
+                interceptor.request(&mut claim, 1);
+            }
+            interceptor.release(claim);
+        })
+    };
+
+    // A clear while a worker is inside `request` waits for the next `request`.
+    source.block.store(true, Ordering::SeqCst);
+    let first = worker(interceptor.clone(), 2);
+    source.inside.wait();
+    source.clear();
+    assert_eq!(
+        source.applied.load(Ordering::SeqCst),
+        0,
+        "not applied from this thread"
+    );
+    source.hold.wait();
+    first.join().unwrap();
+    assert_eq!(
+        source.applied.load(Ordering::SeqCst),
+        1,
+        "applied by the next request"
+    );
+
+    // A completion while a worker is inside `request` reaches the receiver at once; the source is
+    // let go only after the worker has released it.
+    source.block.store(true, Ordering::SeqCst);
+    let second = worker(interceptor.clone(), 1);
+    source.inside.wait();
+    source.complete();
+    assert!(interceptor.is_complete());
+    assert_eq!(
+        Arc::strong_count(&source),
+        2,
+        "the interceptor still holds the source"
+    );
+    source.hold.wait();
+    second.join().unwrap();
+    assert_eq!(Arc::strong_count(&source), 1, "released with the claim");
 }

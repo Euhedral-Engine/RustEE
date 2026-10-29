@@ -510,11 +510,12 @@ impl UpstreamSlot {
     ///
     /// # Safety
     ///
-    /// The caller holds the interceptor's claim, which keeps `take` from running.
+    /// The caller holds the interceptor's claim, which keeps `take` from running, and does not use
+    /// the reference after it releases the claim.
     unsafe fn get(&self) -> Option<&Arc<dyn LatticeSource>> {
         // SAFETY: a non-null pointer was published by `install` from a `Box`, and is freed only by
-        // `take` or by the drop of the slot, neither of which runs while the caller holds the claim
-        // or borrows the slot.
+        // `take` or by the drop of the slot. `take` runs under the claim, which the caller holds for
+        // as long as it uses the reference, and the borrow of the slot rules out the drop.
         unsafe { self.source.load(Ordering::Acquire).as_ref() }
     }
 
@@ -566,14 +567,12 @@ impl Drop for UpstreamSlot {
 ///
 /// 1. `serialize` offers the action to a queue, then publishes `pending`, then tries the claim
 ///    (`fetch_add`).
-/// 2. A holder runs the queued actions before it releases, clearing `pending` with one swap.
-/// 3. The holder releases with one swap of `wip` to zero. If the swap returns 1, no caller tried
-///    the claim while it was held, so no `serialize` is waiting on it: such a caller's `fetch_add`
-///    follows the swap, finds zero and runs its own action. If the swap returns more, some
-///    caller's `fetch_add` preceded it; the swap acquires from that `fetch_add`, which follows
-///    that caller's `pending` store, so the holder then sees `pending` and takes the claim back to
-///    run what arrived behind its drain. A caller that only tried the claim (a worker that lost)
-///    leaves `pending` clear and the holder simply returns.
+/// 2. A caller that takes the claim to run an action, and a holder that takes it back, run the
+///    queued actions, clearing `pending` with one swap.
+/// 3. A holder releases with one swap of `wip` to zero, and only a swap that returns more than 1
+///    means a caller tried the claim meanwhile: then it takes the claim back and runs the actions.
+///    The argument is on `release_claim`. A release nobody contended is the `fetch_add` and one
+///    swap.
 ///
 /// # The source
 ///
@@ -728,17 +727,24 @@ impl UpstreamInterceptor {
         }
     }
 
-    /// Runs the pending actions and gives the claim back. The caller holds the claim.
+    /// Gives the claim back, and runs the actions that arrived while it was held. The caller holds
+    /// the claim.
+    ///
+    /// The release is one swap of `wip` to zero. If it returns 1, no caller tried the claim while it
+    /// was held, so no `serialize` is waiting on it: a `serialize` whose `fetch_add` follows the
+    /// swap finds zero and runs its own action. If it returns more, some caller's `fetch_add`
+    /// preceded the swap, and the swap acquires from it. A `serialize` publishes `pending` before its
+    /// `fetch_add`, so the holder now sees `pending` and takes the claim again to run the actions;
+    /// a caller that only tried the claim (a worker that lost) leaves `pending` clear and the holder
+    /// returns. When the holder cannot take the claim again, whoever holds it received that failed
+    /// attempt in its own swap, sees more than 1, and runs the actions.
     fn release_claim(&self) {
-        loop {
-            self.run_actions();
-            if self.wip.swap(0, Ordering::AcqRel) == 1 {
-                return;
-            }
+        while self.wip.swap(0, Ordering::AcqRel) != 1 {
             if !self.pending.load(Ordering::SeqCst) || self.wip.fetch_add(1, Ordering::SeqCst) != 0
             {
                 return;
             }
+            self.run_actions();
         }
     }
 }
@@ -841,6 +847,7 @@ impl LatticeReceiver for UpstreamInterceptor {
         }
         self.pending.store(true, Ordering::SeqCst);
         if self.wip.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.run_actions();
             self.release_claim();
         }
     }

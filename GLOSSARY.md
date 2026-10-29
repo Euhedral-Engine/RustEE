@@ -98,19 +98,20 @@ is always called; `pull` may never be.
 
 **SourceCell, SourceGuard** ([`SourceCell`](euhedral-core/src/generics/source_cell.rs)): a source's
 plain state under the source invariant. `enter` is `unsafe`, because the compiler cannot see the
-lattice's guarantee; the caller is inside `pull` or `request`, or in an action `serialize` runs. In
+lattice's guarantee; the caller is inside `pull` or `request`, or in an action `serialize` runs. A
+source's lifecycle calls from other threads set atomics, and the source applies them there. In
 debug builds a second entry, nested or from another thread, panics. Release builds carry no check.
 
 **`serialize`** ([`LatticeReceiver::serialize`](euhedral-core/src/generics/lattice.rs)): runs an action
 when no `pull` or `request` of the receiver's source is in progress, without waiting: at once if none
-is, otherwise on the worker that holds the source, before that worker releases it. Actions run one at
-a time, in order, each exactly once. A source's lifecycle calls (completion, release of what it
-holds) reach its `SourceCell` through it. The default runs the action at once.
+is, otherwise on the worker that holds the source, once that worker has let go of its `pull` or
+`request`. Actions run one at a time, in order, each exactly once. The interceptor uses it to release
+the source it holds. The default runs the action at once.
 
 **DownstreamSlot** ([`DownstreamSlot`](euhedral-core/src/generics/downstream_slot.rs)): the one receiver
 a source pushes to, read without a lock. A second attach is told `on_error`; the receiver hears
 `on_complete` exactly once however attach and completion race; the receiver's `Arc` stays in the slot
-until the slot drops, and a `live` flag ends its use. `serialize` goes through the attached receiver.
+until the slot drops, and a `live` flag ends its use. Every method touches atomics only.
 
 **SetOnce** ([`SetOnce`](euhedral-data-structures/src/sync/set_once.rs)): a cell installed at most once
 by a compare-and-set and read with an acquire load; the value lives until the cell drops.

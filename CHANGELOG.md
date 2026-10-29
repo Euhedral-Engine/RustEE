@@ -16,7 +16,8 @@ semantics and the tests that pin it.
     receiver the source through `add_upstream`. `complete` tells a live receiver `on_complete` exactly once, however
     attach and completion race. `receiver()` reads without a lock.
   - `LatticeReceiver::serialize(action)`: runs `action` when no `pull` or `request` of the source the receiver serves is
-    in progress, without waiting. The default runs it at once.
+    in progress, without waiting. The default runs it at once. It is the interceptor's own hand-off; a source's
+    lifecycle calls do not use it.
   - `UpstreamInterceptor` implements `serialize`: actions go on an MPSC queue, and whoever holds the claim runs them
     before it releases. The interceptor installs its source before it is registered and drops it, through
     `serialize`, when it finishes.
@@ -32,33 +33,34 @@ semantics and the tests that pin it.
   - The interceptor's claim is a counter (`wip`): `try_acquire` is `fetch_add(1) == 0`, and release is one swap to zero.
     A source completed through its interceptor (a source panic, `complete()`) is now completed when the worker that
     holds it releases it, not at the call.
-  - `DownstreamSlot::new` is no longer `const` (it holds a small queue for actions that arrive during an attach).
 
 **Why.** A source's state is touched by exactly one worker at a time, so it should need no atomics. Its lifecycle
 calls (completion, release) arrive from other threads while a worker may be inside `pull` or `request`, and used to
-need a lock or a flag per field. `serialize` gives them a way to reach that state without waiting, and the claim as a
-counter lets a releasing worker see an action that arrived behind its last look.
+need a lock or a flag per field. A source's lifecycle calls now set atomics only and the source applies them in its next
+`request` or `pull`, where its state is single-consumer. The interceptor's claim as a counter lets a releasing worker
+see an action that arrived while it held the claim, with no fence on the uncontended path.
 
 **How.** A source keeps its worker-only state in a `SourceCell` and its receiver in a `DownstreamSlot`. Its lifecycle
-calls hand their work to `slot.serialize(action)`, and the action enters the cell. An implementer of
+calls (`complete`, and any clear or kill it offers) set atomics; its `request` and `pull` read them and apply the change
+to the cell. The interceptor releases the source it holds through its own `serialize`. An implementer of
 `LatticeReceiver` that is no lattice needs nothing: the default runs the action at once.
 
 **Semantics.**
 - Every serialized action runs exactly once, in the order it was handed over, never while a `pull` or `request` of the
   source is in progress, on the worker that holds the claim or on the caller if no worker does.
 - The claim: `try_acquire` is `wip.fetch_add(1, SeqCst) == 0`. `serialize` offers the action, sets `pending`
-  (`SeqCst`), then tries the claim. `release` runs the pending actions (clearing `pending` with one swap), then swaps
-  `wip` to zero (`AcqRel`). If the swap returns 1, no caller tried the claim meanwhile; a later `serialize` finds zero
-  and runs its own action. If it returns more, the swap has acquired from a caller's `fetch_add`, which follows that
-  caller's `pending` store, so the holder sees `pending` and takes the claim again to run what arrived behind its drain.
+  (`SeqCst`), then tries the claim; if it gets it, it runs the actions (clearing `pending` with one swap) and releases.
+  `release` is one swap of `wip` to zero (`AcqRel`). If the swap returns 1, no caller tried the claim meanwhile; a later
+  `serialize` finds zero and runs its own action. If it returns more, the swap has acquired from a caller's
+  `fetch_add`, which follows that caller's `pending` store, so the holder sees `pending`, takes the claim again and runs
+  the actions. An uncontended service is the `fetch_add` and one swap.
 - The source is installed (compare-and-set, once) before the interceptor is registered, so a worker that finds the
   handle finds the source. The interceptor's `complete` flag is checked again after the install, and the source is
   released through `serialize`.
-- `DownstreamSlot::serialize` goes straight to an installed receiver. While an attach is in flight, before the
-  receiver is installed, the action waits in the slot and the attach forwards it; with no attach begun it runs at once.
+- `DownstreamSlot` touches atomics only. A lifecycle call from another thread never enters the source's `SourceCell`.
 - `SourceGuard` is `Send` when `T` is and `Sync` only when `T` is.
 - A panicking action is caught and logged; the actions behind it still run.
-- `has_upstream` answers by address and stays true after the interceptor has dropped its source.
+- `has_upstream` answers by identity (a weak reference, whose allocation is not reused while the interceptor lives) and stays true after the interceptor has dropped its source.
 
 **Tests.**
 - `SetOnce`: `set_hands_the_value_back_when_one_is_set`, `a_set_value_is_dropped_exactly_once`,
@@ -67,7 +69,7 @@ calls hand their work to `slot.serialize(action)`, and the action enters the cel
 - `SourceCell`: `a_second_thread_entering_while_one_is_inside_panics_in_debug`, `a_nested_enter_panics_in_debug`,
   `a_direct_request_racing_the_lattice_is_caught_in_debug`, `entries_in_turn_from_many_threads_are_accepted`.
 - `DownstreamSlot`: `attach_racing_complete_tells_the_receiver_exactly_once` (10 000 rounds), the attach and complete
-  order tests, `serialize_goes_through_the_attached_receiver`.
+  order tests.
 - The interceptor (`flow_control::vertex`): `serialize_runs_at_release_when_another_worker_holds_the_source`,
   `serialize_from_inside_the_sources_own_pull_runs_before_release`,
   `an_action_never_runs_while_a_pull_or_request_is_in_progress`, `release_races_serialize_and_no_action_is_stranded`,
@@ -76,8 +78,8 @@ calls hand their work to `slot.serialize(action)`, and the action enters the cel
   both fail), `the_source_is_in_place_before_a_worker_can_find_the_handle`,
   `a_new_source_is_never_taken_for_a_dropped_one_at_the_same_address`, `a_claim_taken_from_another_handle_is_refused`,
   `the_interceptor_drops_its_source_when_it_finishes`, `complete_completes_the_source_through_serialize`.
-  `serialize_racing_attach_runs_every_action_exactly_once` (`DownstreamSlot`) and the compile-fail doctest on
-  `SourceGuard`. CI runs the stress tests in release and the loom model. The `SetOnce` loom model carries a loom
+  `lifecycle_calls_from_another_thread_touch_only_atomics_and_take_effect_on_the_next_request`, and the compile-fail
+  doctest on `SourceGuard`. CI runs the stress tests in release and the loom model. The `SetOnce` loom model carries a loom
   `UnsafeCell` payload, so a `get` weaker than `Acquire` fails it.
 
 ## `Marker` names its queue (2026-10-28)

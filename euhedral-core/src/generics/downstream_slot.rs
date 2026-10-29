@@ -1,16 +1,12 @@
 //! The one receiver a source pushes to.
 
-use super::SourceCell;
 use super::{LatticeReceiver, LatticeSource};
 use crate::frames::Failure;
-use euhedral_data_structures::queues::{Consumer, MpscQueue, Multi, Producer, Single};
 use euhedral_data_structures::sync::SetOnce;
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering, fence};
-
-type Action = Box<dyn FnOnce() + Send>;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Returned to a receiver that attaches to a source that already has one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,29 +31,25 @@ impl Error for AlreadyAttached {}
 /// The receiver's `Arc` stays in the slot until the slot drops. A worker may be reading it through
 /// [`receiver`](Self::receiver) when the source completes, and clearing it under that reader would
 /// need reclamation; `live` is what ends its use.
+///
+/// Every method touches atomics only. A source's lifecycle calls (`complete`, and any clear or kill
+/// it offers) may arrive from any thread while a worker is inside its `request` or `pull`, so they
+/// set atomic state, and the work that needs the source's plain state ([`SourceCell`](super::SourceCell))
+/// happens in the source's next `request` or `pull`, where it is the only user.
 pub struct DownstreamSlot {
     attached: AtomicBool,
     complete: AtomicBool,
     live: AtomicBool,
     receiver: SetOnce<Arc<dyn LatticeReceiver>>,
-    /// Actions handed to [`serialize`](Self::serialize) while a receiver is attaching, before it is
-    /// installed. Whoever finds the receiver installed forwards them to it.
-    deferred: Producer<Action, Multi>,
-    forward: SourceCell<Consumer<Action, Single>>,
-    forwarding: AtomicBool,
 }
 
 impl DownstreamSlot {
-    pub fn new() -> Self {
-        let deferred = MpscQueue::new(8);
+    pub const fn new() -> Self {
         Self {
             attached: AtomicBool::new(false),
             complete: AtomicBool::new(false),
             live: AtomicBool::new(false),
             receiver: SetOnce::new(),
-            deferred: deferred.producer(),
-            forward: SourceCell::new(deferred.consumer()),
-            forwarding: AtomicBool::new(false),
         }
     }
 
@@ -79,14 +71,12 @@ impl DownstreamSlot {
             receiver.on_error(Failure::from(AlreadyAttached));
             return;
         }
-        let installed = self.receiver.set(receiver.clone());
-        debug_assert!(installed.is_ok(), "the attach flag admits one receiver");
         if self.is_complete() {
-            // Nothing will push, but lifecycle actions still go through the receiver.
-            self.forward_deferred();
             receiver.on_complete();
             return;
         }
+        let installed = self.receiver.set(receiver.clone());
+        debug_assert!(installed.is_ok(), "the attach flag admits one receiver");
         self.live.store(true, Ordering::SeqCst);
         // `complete` may have run between the check above and the store. Whichever side clears
         // `live` owns the notification.
@@ -99,41 +89,6 @@ impl DownstreamSlot {
             receiver.on_complete();
         }
         receiver.add_upstream(source);
-        self.forward_deferred();
-    }
-
-    /// Hands the actions deferred during an attach to the receiver, if it is installed.
-    ///
-    /// Exactly one caller forwards at a time (the `forwarding` flag), and a caller that finds the
-    /// flag taken relies on the forwarder, which looks at the queue again after clearing it. A
-    /// fence on each side orders an offer before the look at the flag, and the clear before the
-    /// look at the queue, so one of the two always sees the other.
-    fn forward_deferred(&self) {
-        fence(Ordering::SeqCst);
-        let Some(receiver) = self.receiver.get() else {
-            return;
-        };
-        loop {
-            if self
-                .forwarding
-                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                .is_err()
-            {
-                return;
-            }
-            {
-                // SAFETY: the `forwarding` flag admits one thread at a time.
-                let mut forward = unsafe { self.forward.enter() };
-                while let Some(action) = forward.poll() {
-                    receiver.serialize(action);
-                }
-            }
-            self.forwarding.store(false, Ordering::SeqCst);
-            fence(Ordering::SeqCst);
-            if self.deferred.is_empty() {
-                return;
-            }
-        }
     }
 
     /// The receiver while the slot is live: installed and not completed.
@@ -165,26 +120,6 @@ impl DownstreamSlot {
 
     pub fn is_complete(&self) -> bool {
         self.complete.load(Ordering::Acquire)
-    }
-
-    /// Hands `action` to the attached receiver's [`serialize`](LatticeReceiver::serialize), which
-    /// runs it when no `pull` or `request` of the source is in progress.
-    ///
-    /// - With a receiver installed, the action goes straight to it.
-    /// - While a receiver is attaching and not yet installed, the action waits in the slot and the
-    ///   attach forwards it, so it never runs beside the attach.
-    /// - With no attach begun there is no lattice to wait for, and it runs at once.
-    pub fn serialize(&self, action: Box<dyn FnOnce() + Send>) {
-        if let Some(receiver) = self.receiver.get() {
-            receiver.serialize(action);
-        } else if self.attached.load(Ordering::SeqCst) {
-            if self.deferred.offer(action).is_err() {
-                unreachable!("the deferred queue is unbounded");
-            }
-            self.forward_deferred();
-        } else {
-            action();
-        }
     }
 }
 
@@ -237,13 +172,12 @@ mod tests {
         Arc::new(Nothing)
     }
 
-    /// Counts what it is told and records `serialize` calls.
+    /// Counts what it is told.
     #[derive(Default)]
     struct Counting {
         completes: AtomicUsize,
         errors: Mutex<Vec<String>>,
         upstreams: AtomicUsize,
-        serialized: AtomicUsize,
     }
 
     impl LatticeTerminal for Counting {
@@ -261,11 +195,6 @@ mod tests {
 
         fn on_error(&self, error: Failure) {
             self.errors.lock().unwrap().push(error.to_string());
-        }
-
-        fn serialize(&self, action: Box<dyn FnOnce() + Send>) {
-            self.serialized.fetch_add(1, SeqCst);
-            action();
         }
     }
 
@@ -355,154 +284,5 @@ mod tests {
         );
         drop(slot);
         assert_eq!(Arc::strong_count(&receiver), 1);
-    }
-
-    #[test]
-    fn serialize_without_a_receiver_runs_at_once() {
-        let slot = DownstreamSlot::new();
-        let ran = Arc::new(AtomicUsize::new(0));
-        let counted = ran.clone();
-        slot.serialize(Box::new(move || {
-            counted.fetch_add(1, SeqCst);
-        }));
-        assert_eq!(ran.load(SeqCst), 1);
-    }
-
-    #[test]
-    fn serialize_goes_through_the_attached_receiver() {
-        let slot = DownstreamSlot::new();
-        let receiver = Arc::new(Counting::default());
-        slot.attach(source(), receiver.clone());
-        let ran = Arc::new(AtomicUsize::new(0));
-        for _ in 0..3 {
-            let counted = ran.clone();
-            slot.serialize(Box::new(move || {
-                counted.fetch_add(1, SeqCst);
-            }));
-        }
-        assert_eq!(receiver.serialized.load(SeqCst), 3);
-        assert_eq!(ran.load(SeqCst), 3);
-        slot.complete();
-        let counted = ran.clone();
-        slot.serialize(Box::new(move || {
-            counted.fetch_add(1, SeqCst);
-        }));
-        assert_eq!(
-            receiver.serialized.load(SeqCst),
-            4,
-            "lifecycle actions still reach a completed slot's receiver"
-        );
-    }
-
-    #[test]
-    fn serialize_racing_attach_runs_every_action_exactly_once() {
-        const ROUNDS: usize = 5_000;
-        let slots: Arc<Vec<DownstreamSlot>> =
-            Arc::new((0..ROUNDS).map(|_| DownstreamSlot::new()).collect());
-        let receivers: Arc<Vec<Arc<Counting>>> =
-            Arc::new((0..ROUNDS).map(|_| Arc::new(Counting::default())).collect());
-        let ran: Arc<Vec<AtomicUsize>> =
-            Arc::new((0..ROUNDS).map(|_| AtomicUsize::new(0)).collect());
-        let start = Arc::new(AtomicUsize::new(0));
-        let finished = Arc::new(AtomicUsize::new(0));
-        let spin_until = |flag: &AtomicUsize, value: usize| {
-            while flag.load(SeqCst) < value {
-                std::hint::spin_loop();
-            }
-        };
-        let attacher = {
-            let (slots, receivers, start, finished) = (
-                slots.clone(),
-                receivers.clone(),
-                start.clone(),
-                finished.clone(),
-            );
-            thread::spawn(move || {
-                for round in 0..ROUNDS {
-                    spin_until(&start, round + 1);
-                    slots[round].attach(source(), receivers[round].clone());
-                    finished.fetch_add(1, SeqCst);
-                }
-            })
-        };
-        let serializers: Vec<_> = (0..2)
-            .map(|_| {
-                let (slots, ran, start, finished) =
-                    (slots.clone(), ran.clone(), start.clone(), finished.clone());
-                thread::spawn(move || {
-                    for round in 0..ROUNDS {
-                        spin_until(&start, round + 1);
-                        let counted = ran.clone();
-                        slots[round].serialize(Box::new(move || {
-                            counted[round].fetch_add(1, SeqCst);
-                        }));
-                        finished.fetch_add(1, SeqCst);
-                    }
-                })
-            })
-            .collect();
-        for round in 0..ROUNDS {
-            start.store(round + 1, SeqCst);
-            spin_until(&finished, (round + 1) * 3);
-            assert_eq!(ran[round].load(SeqCst), 2, "round {round}");
-        }
-        attacher.join().unwrap();
-        for serializer in serializers {
-            serializer.join().unwrap();
-        }
-    }
-
-    #[test]
-    fn an_action_waits_for_an_attach_in_flight_and_goes_through_its_receiver() {
-        /// Holds the attach inside `add_upstream` until the test lets go.
-        struct Gate {
-            entered: std::sync::mpsc::SyncSender<()>,
-            go: Mutex<std::sync::mpsc::Receiver<()>>,
-            serialized: AtomicUsize,
-        }
-        impl LatticeTerminal for Gate {
-            fn add_upstream(&self, _upstream: Arc<dyn LatticeSource>) {
-                self.entered.send(()).unwrap();
-                self.go.lock().unwrap().recv().unwrap();
-            }
-        }
-        impl LatticeReceiver for Gate {
-            fn push(&self, _frame: Box<dyn Frame>) {}
-            fn on_complete(&self) {}
-            fn on_error(&self, _error: Failure) {}
-            fn serialize(&self, action: Box<dyn FnOnce() + Send>) {
-                self.serialized.fetch_add(1, SeqCst);
-                action();
-            }
-        }
-
-        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(0);
-        let (go_tx, go_rx) = std::sync::mpsc::channel();
-        let gate = Arc::new(Gate {
-            entered: entered_tx,
-            go: Mutex::new(go_rx),
-            serialized: AtomicUsize::new(0),
-        });
-        let slot = Arc::new(DownstreamSlot::new());
-        let attach = {
-            let (slot, gate) = (slot.clone(), gate.clone());
-            thread::spawn(move || slot.attach(source(), gate))
-        };
-        entered_rx.recv().unwrap();
-
-        let ran = Arc::new(AtomicUsize::new(0));
-        let counted = ran.clone();
-        slot.serialize(Box::new(move || {
-            counted.fetch_add(1, SeqCst);
-        }));
-        assert_eq!(
-            gate.serialized.load(SeqCst),
-            1,
-            "it went through the receiver"
-        );
-        assert_eq!(ran.load(SeqCst), 1);
-
-        go_tx.send(()).unwrap();
-        attach.join().unwrap();
     }
 }

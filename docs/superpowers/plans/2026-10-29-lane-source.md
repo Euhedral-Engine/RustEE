@@ -11,7 +11,8 @@ builds the cell that makes that source's state lock-free, the re-armable fan-in 
 - `euhedral-core` gains:
   - `SourceCell`, the state behind the lattice's single-entry guarantee;
   - `DownstreamSlot`, a source's one receiver;
-  - `LatticeReceiver::serialize`, the way lifecycle calls reach source state without waiting.
+  - `LatticeReceiver::serialize`, the interceptor's own hand-off for releasing the source it holds. A source's
+    lifecycle calls set atomics, and the source applies them in its next `request` or `pull`.
 - `euhedral-graph` gains:
   - the backend-neutral `LaneSubmit` trait;
   - `LaneSource`;
@@ -37,7 +38,7 @@ The requirements, restated:
 
 | # | Crate | Requirement |
 |---|---|---|
-| RE-1 | core | `SourceCell<T>` in the audit's shape. `unsafe fn enter(&self) -> SourceGuard<'_, T>`. In debug builds `enter` panics on a second thread or a nested entry. Lifecycle calls reach the state through the receiver's `serialize`. |
+| RE-1 | core | `SourceCell<T>` in the audit's shape. `unsafe fn enter(&self) -> SourceGuard<'_, T>`. In debug builds `enter` panics on a second thread or a nested entry. A source's lifecycle calls set atomics only, and the state they concern is applied inside the source's next `request` or `pull`, where it is single-consumer. |
 | RE-2 | graph | `LaneSubmit`: the trait a lane source drives. It has `lane`, `queue`, `await_marker` and `mark`, arms a retirement, has `poll_retired`, and lends the queue's raw handle to an item. |
 | RE-3 | graph | `LaneSource<S, X, W>`, a `LatticeSource` per lane. **Each `request(demand)`:**<br>1. banks the demand;<br>2. drains retirements and runs their continuations;<br>3. calls `X::check`, one read of each hardware state;<br>4. runs the released waiting items, then its intake, then the shared intake. It runs every item whose dependencies are met, with no budget. It awaits input markers, and hands another backend's markers to the item. On "done" it marks, delivers successors, queues frames and arms a retirement if asked. "Waits for X" keeps the item in the source, and same-key items wait behind it;<br>5. pushes at most the banked demand of ready frames.<br>**`pull(demand)`** hands over at most `demand` ready frames, never banks demand and never submits work. **Metrics:** service time per call and per item kind, intake-to-run latency, ready-queue depth. |
 | RE-4 | graph | Delivery into intakes at the top. A lane's own intake is MPSC; a lane group's shared intake is MPMC, lock-free, with pooled chunks. There is no lane choice: unbound work runs on whichever source of its group a worker enters first. Delivery is not a lattice push and spends no demand. A pool may hold lanes of several backends. |
@@ -50,7 +51,7 @@ The requirements, restated:
    - `SetOnce`;
    - `SourceCell`;
    - `DownstreamSlot`;
-   - `LatticeReceiver::serialize` with its implementation on `UpstreamInterceptor`.
+   - `LatticeReceiver::serialize` with its implementation on `UpstreamInterceptor`, used by the interceptor itself.
    The conversions of the existing sources stay in the audit's own chunk 2, which consumes these primitives: ingest
    (C11-C13), `Completions` (G1-G3), `AsyncIo` (I1, I2, I5), C15, S4 and S5. Nothing in this plan changes them.
 2. **The audit's blocking-work facility is not built.** The user corrected the audit: "A worker is a cpu… long calls run
@@ -61,7 +62,11 @@ The requirements, restated:
    - **`DownstreamSlot`** follows `AbstractIngestSink.Delegate`: the flags `attached`, `complete` and `live`. It does
      not use the audit's four-state `AtomicU8`.
    - **The interceptor's claim** stays Java's `wip` counter. The audit's owner token is not needed: a `serialize` from
-     the holder's own thread loses the claim like any other caller, and the holder runs the action before it releases.
+     the holder's own thread loses the claim like any other caller, and the holder runs the action when it takes the
+     claim back after its release.
+   - **A source's lifecycle calls touch atomics only**, as Java's `complete`, `clear` and `kill` do: the source applies
+     them on its next `request` or `pull`, under the lattice's serialization. `DownstreamSlot` therefore has no
+     `serialize`.
    - **`LaneSource`'s banked demand** is Java's `demand` atomic, not a plain field in the cell.
 4. **Delivery lives on a new `LaneIntakes<W>`, not on `LanePool`.** `LanePool` stays non-generic, because
    `Completions`, `StageGraph`, `euhedral-memory` and `euhedral-gpu`'s `Lanes` use it. `LaneIntakes::deliver(work, to)`
@@ -138,10 +143,10 @@ orderings, and deviate only for a genuine Java bug or a missing Rust equivalent.
 |---|---|---|---|
 | `SetOnce<T>` (1.1) | a reference field set by `VarHandle.compareAndSet(null, v)` and read by `getAcquire` (`AbstractIngestSink.Delegate.getDownstream`) | set: CAS null → value, `SeqCst`; get: `Acquire` | The value is boxed and freed at drop. Rust has no GC. |
 | `SourceCell<T>` (1.2) | the plain fields a Java source touches only while its interceptor's `wip` is held (`QueueIngestSink.Delegate`'s consumer side) | plain access, with no atomics | A debug-only entry check, which Java has no counterpart for. Rust needs `UnsafeCell` to express "plain, guarded by the claim". |
-| `DownstreamSlot` (1.3) | `AbstractIngestSink.Delegate`: `attached` (`AtomicBoolean`), `COMPLETE`, `DOWNSTREAM`, `addDownstream`, `complete`, `getDownstream` | `attached.compareAndSet(false, true)`; `setVolatile(terminal)` then `getVolatile(COMPLETE)` and `compareAndSet(terminal, null)`; complete is `COMPLETE.compareAndSet(false, true)` then `getAndSet(null)`; `getAcquire` reads | "Downstream non-null" becomes a `live` flag. The receiver `Arc` stays in a `SetOnce` until the slot drops. Clearing it while a worker may be reading it needs reclamation, and Rust has no GC. The source ↔ interceptor cycle that Java's GC collects is broken by the interceptor dropping its source (1.4). `attach` also calls `receiver.add_upstream(source)`, because Rust's `LatticeSource` contract has a source announce itself. |
-| `UpstreamInterceptor` claim (1.4) | `LatticeVertex.UpstreamInterceptor.wip` (`PaddedAtomicLong`): `acquireLock` is `wip.getAndIncrement() == 0`, `releaseLock` is `wip.setRelease(0)`, and service checks `wip.getOpaque() == 0` | `CachePadded<AtomicU64>`: `fetch_add(1, SeqCst) == 0`, `store(0, Release)` and a `Relaxed` check | None. Today's Rust `swap(true, Acquire)` deviates from Java and is replaced. |
-| `LatticeReceiver::serialize` on the interceptor (1.4) | `QueueIngestSink.Delegate.drainRequests` and `QueueIngestSink.discardQueued`: publish a pending flag, then try the claim; the releasing owner re-checks; `afterPublish`'s `VarHandle.fullFence()` | actions go on an `MpscQueue`; `pending.store(true, SeqCst)`; the claim is tried with `wip.fetch_add(1, SeqCst)`; release is `wip.store(0, Release)`, then `fence(SeqCst)`, then `while pending.load(SeqCst) && claim { run; release }` | New method. Java has no lifecycle hand-off to a source, and its nearest structure is the one mirrored here. |
-| interceptor `complete` / `on_complete` / `on_error` (1.4) | `UpstreamInterceptor.COMPLETE.compareAndSet(false, true)`, then `upstream.complete()` and `removeUpstream()` | the same | The interceptor also drops its source, through `serialize`, when it finishes. Rust has no GC to collect the cycle. |
+| `DownstreamSlot` (1.3) | `AbstractIngestSink.Delegate`: `attached` (`AtomicBoolean`), `COMPLETE`, `DOWNSTREAM`, `addDownstream`, `complete`, `getDownstream` | `attached.compareAndSet(false, true)`; `setVolatile(terminal)` then `getVolatile(COMPLETE)` and `compareAndSet(terminal, null)`; complete is `COMPLETE.compareAndSet(false, true)` then `getAndSet(null)`; `getAcquire` reads; every method touches atomics only | "Downstream non-null" becomes a `live` flag. The receiver `Arc` stays in a `SetOnce` until the slot drops. Clearing it while a worker may be reading it needs reclamation, and Rust has no GC. `attach` also calls `receiver.add_upstream(source)`, because Rust's `LatticeSource` contract has a source announce itself. **No `serialize` on the slot** (it had one in the first draft): Java's lifecycle calls never run source-state work outside `request`/`pull`, and a slot-level hand-off raced an attach and needed a queue with a spin. |
+| `UpstreamInterceptor` claim (1.4) | `LatticeVertex.UpstreamInterceptor.wip` (`PaddedAtomicLong`): `acquireLock` is `wip.getAndIncrement() == 0`, `releaseLock` is `wip.setRelease(0)`, and service checks `wip.getOpaque() == 0` | `CachePadded<AtomicU64>`: `try_acquire` is `fetch_add(1, SeqCst) == 0`; the service check is `Relaxed`. Today's Rust `swap(true, Acquire)` flag is replaced | **Release is `wip.swap(0, AcqRel)`, where Java does `setRelease(0)`.** The swap's result is the information Java gets from its separate re-check: 1 means no caller tried the claim while it was held; more means one did, and the holder drains. This keeps an uncontended service to two read-modify-writes (`fetch_add` and the swap) with no fence. **A `Claim` token** (`try_acquire` returns `Option<Claim>`; `pull` and `request` borrow it; `release` consumes it) replaces Java's convention that only a holder calls `pull`/`request`/`releaseLock`: Rust's safe `pub` trait would otherwise let any caller release a claim it does not hold or `pull` while an action runs, and the `unsafe` entry into the source's state would be unsound. The token is not constructible outside the crate and names its handle by a unique id. |
+| `LatticeReceiver::serialize` on the interceptor (1.4) | `QueueIngestSink.Delegate.drainRequests` and `QueueIngestSink.discardQueued`: publish a pending flag, then try the claim; the releasing owner re-checks | actions go on an `MpscQueue`; `pending.store(true, SeqCst)`; the claim is tried with `wip.fetch_add(1, SeqCst)`; the holder clears `pending` with `pending.swap(false, SeqCst)` and drains; the release swap (above) says whether to look at `pending` and take the claim back | New method. Java has no lifecycle hand-off to a source, and its nearest structure is the one mirrored here. **`pending` is cleared with one swap, where Java reads it and then sets it false:** Java volatiles have one total order; Rust `SeqCst` loads and stores of separate operations give no such guarantee on every architecture, so the read-and-clear must be one read-modify-write. The release's proof (a serializer's `fetch_add` before the swap makes it return more than 1 and synchronizes with the serializer's earlier `pending` store; one after it finds zero and runs its own action) is a comment on `release_claim`. |
+| interceptor `complete` / `on_complete` / `on_error` (1.4) | `UpstreamInterceptor.COMPLETE.compareAndSet(false, true)`, then `upstream.complete()` and `removeUpstream()` | the same | The interceptor also drops its source, through its own `serialize`, when it finishes. Rust has no GC to collect the source/interceptor cycle. The source is installed (compare-and-set, once) before the interceptor is registered, as Java's `addUpstream` sets `upstream` before registering, and `complete` is checked again after the install. A source is identified by a `Weak` (its allocation outlives it while the interceptor lives), so a reused address never matches: Java compares references, which the GC keeps unique. |
 | `UpstreamQueue` (none) | `UpstreamQueue` | — | Not touched. |
 | `Join` (2.1) | `Join` (Java graph package): `pending` (`AtomicInteger`), `failure` (`AtomicReference`, first wins), a fixed continuation; `expect(n)` is `failure.set(null)` then `pending.set(n)`; `arrive` is `decrementAndGet() == 0`; per-part values as in `StageFrame.arrive` (`ARRIVALS.getAndAdd`, then plain reads of the predecessors' `marker`) | `pending: AtomicUsize`; `reset` stores `SeqCst`; arrivals `fetch_sub(1, SeqCst)`; the last runs the continuation. Values are written plainly before the read-modify-write and read plainly by the last arrival. | Per-part value slots instead of one failure (decision 8). A debug-only `ended` flag per part, and a debug-only "round complete" check on `reset`. The continuation is a stored `Fn` that delivers work, where Java's is a frame published to the lake: same effect, with no allocation per round. |
 | `Sequencer`, `Latch`, `Completions`, `StageGraph`, `Lake` (none) | `Sequencer` (`wip` drain over an `MpscQueue`), `FrameLake` and its lake implementation, `StageGraph` | — | Not touched. They are the audit's chunks 5-6 and G1-G3. |
@@ -187,8 +192,8 @@ orderings, and deviate only for a genuine Java bug or a missing Rust equivalent.
 | `euhedral-data-structures/Cargo.toml`, `src/lib.rs` | 1 | `pub mod sync`; `[target.'cfg(loom)'.dev-dependencies] loom = "0.7"`; `check-cfg` for `loom` |
 | `euhedral-core/src/generics/source_cell.rs` | 1 | `SourceCell`, `SourceGuard` |
 | `euhedral-core/src/generics/downstream_slot.rs` | 1 | `DownstreamSlot` |
-| `euhedral-core/src/generics/lattice.rs` | 1 | `LatticeReceiver::serialize` (default: run at once) |
-| `euhedral-core/src/flow_control/vertex.rs`, `vertex/tests.rs` | 1 | the interceptor's `wip` claim, action queue, `serialize`, and dropping its source |
+| `euhedral-core/src/generics/lattice.rs` | 1 | `LatticeReceiver::serialize` (default: run at once), used by the interceptor |
+| `euhedral-core/src/flow_control/vertex.rs`, `vertex/tests.rs` | 1 | the `Claim` token, the `wip` claim, action queue, `serialize`, installing and dropping its source |
 | `euhedral-graph/src/join.rs`, `src/sync.rs`, `tests/join_alloc.rs` | 2 | the re-armable `Join`; the loom shim; the allocation count |
 | `euhedral-graph/src/lanes.rs` | 3 | `LanePoolBuilder` |
 | `euhedral-graph/src/lane_source/mod.rs` | 3 | `LaneSubmit`, `Retired`, `LaneState`, `LaneWork`, `Outcome`, `LaneCx` |
@@ -297,7 +302,7 @@ unsafe impl<T: Send> Sync for SourceCell<T> {}
   - `mise exec -- cargo test -p euhedral-core --release generics::source_cell`: PASS, with the debug-only tests compiled out.
 - [ ] **Step 5: Commit.** `git commit -m "euhedral-core: SourceCell, a source's state under the lattice's single-entry guarantee"`
 
-### Task 1.3: `DownstreamSlot` and `LatticeReceiver::serialize`'s default
+### Task 1.3: `DownstreamSlot` and `LatticeReceiver::serialize`'s default (as built: no `serialize` on the slot)
 
 **Files:**
 - Create: `euhedral-core/src/generics/downstream_slot.rs`
@@ -327,9 +332,9 @@ impl DownstreamSlot {
     /// it was live, tells the receiver `on_complete`. Returns whether this call completed the slot.
     pub fn complete(&self) -> bool;
     pub fn is_complete(&self) -> bool; // Acquire
-    /// Through the attached receiver's `serialize`; with none attached, runs at once.
-    pub fn serialize(&self, action: Box<dyn FnOnce() + Send>);
 }
+// No `serialize` on the slot: a source's lifecycle calls set atomics, and the source applies them in its next
+// `request` or `pull`.
 ```
 
 - [ ] **Step 1: Write the failing tests.**
@@ -338,8 +343,6 @@ impl DownstreamSlot {
   - `a_second_attach_is_refused_with_an_error`: the second receiver gets `on_error`, and the first is unaffected.
   - `attach_racing_complete_tells_the_receiver_exactly_once`: 2 threads × 10 000 rounds; `on_complete` count == 1 per round.
   - `receiver_is_none_after_complete_and_the_arc_lives_until_the_slot_drops`: `Arc::strong_count` before and after.
-  - `serialize_without_a_receiver_runs_at_once`.
-  - `serialize_goes_through_the_attached_receiver`: a receiver that records `serialize` calls.
 - [ ] **Step 2: Run them and see them fail.** `mise exec -- cargo test -p euhedral-core generics::downstream_slot`.
 - [ ] **Step 3: Implement** with the orderings in the interface block.
 - [ ] **Step 4: Run them.** PASS. Also run `mise exec -- cargo test -p euhedral-core`: every existing `LatticeReceiver` implementation still compiles, because of the default.
@@ -348,27 +351,27 @@ impl DownstreamSlot {
 ### Task 1.4: The interceptor's `wip` claim, `serialize`, and the source it lets go
 
 **Files:**
-- Modify: `euhedral-core/src/flow_control/vertex.rs` (`UpstreamInterceptor`), `vertex/tests.rs`
+- Modify: `euhedral-core/src/flow_control/vertex.rs` (`UpstreamInterceptor`), `flow_control/upstream_queue.rs` (`Claim`; `UpstreamHandle` takes it), `vertex/tests.rs`
 
 **Interfaces:**
-- Consumes: `SourceCell` (1.2), `LatticeReceiver::serialize` (1.3), `MpscQueue`.
+- Consumes: `SourceCell` (1.2), `SetOnce` (1.1), `LatticeReceiver::serialize` (1.3), `MpscQueue`.
 - Produces:
   - **The claim** (Java `wip`): field `wip: CachePadded<AtomicU64>`. It replaces `lock`.
     - `try_acquire` is `wip.fetch_add(1, SeqCst) == 0`.
-    - `release` runs the pending actions, then `wip.store(0, Release)`, then `fence(SeqCst)`, then the re-check loop below.
-    - `serviceable` checks `wip.load(Relaxed) != 0`.
+    - `try_acquire` returns `Option<Claim>`; `pull`/`request` take `&mut Claim`; `release` takes the `Claim`. A claim carries the unique id of its handle and a handle refuses another's.
+    - `release` is `while wip.swap(0, AcqRel) != 1 { if !pending.load(SeqCst) || wip.fetch_add(1, SeqCst) != 0 { return } run_actions() }`: only a swap that returns more than 1 looks at `pending` and drains.
   - **Actions:**
     - fields `actions: Producer<Box<dyn FnOnce() + Send>, Multi>`, `drain: SourceCell<Consumer<.., Single>>` and `pending: AtomicBool`;
     - `serialize(action)`:
       1. offer the action;
       2. `pending.store(true, SeqCst)`;
-      3. if `wip.fetch_add(1, SeqCst) == 0`, it holds the claim: run the actions, then `release()`;
-      4. otherwise return. The holder runs the action before it releases.
-    - **The re-check after release** (Java's `drainRequests`): `while pending.load(SeqCst) && wip.fetch_add(1, SeqCst) == 0 { pending.store(false, SeqCst); drain and run every action; wip.store(0, Release); fence(SeqCst) }`.
+      3. if `wip.fetch_add(1, SeqCst) == 0`, it holds the claim: run the actions, then release as above;
+      4. otherwise return. The holder runs the action when its release swap returns more than 1.
+    - `run_actions` is `if pending.swap(false, SeqCst) { drain and run every action }`, run by a `serialize` that took the claim and by a holder that took it back.
   - **The upstream:**
-    - `upstream: SourceCell<Option<Arc<dyn LatticeSource>>>`, set in `attach` before the handle is registered. `// SAFETY:` no worker can see the handle yet;
-    - `source_addr: AtomicUsize`: the source's address, for identity only and never dereferenced. `pub fn has_upstream(&self, source: &Arc<dyn LatticeSource>) -> bool` replaces `upstream()`, whose only users are two tests;
-    - when the interceptor finishes (`complete`, `on_complete`, `on_error`, after the existing `COMPLETE` CAS), it `serialize`s an action that takes the source out of the cell. For `complete`, the action also calls `source.complete()` before the drop.
+    - `upstream`: an install-once pointer slot, installed by compare-and-set in `attach` before the handle is registered (so a worker that finds the handle finds the source); `get` and `take` need the claim. `complete` is checked again after the install;
+    - `identity: SetOnce<Weak<dyn LatticeSource>>`: the source's identity, never dereferenced. `pub fn has_upstream(&self, source: &Arc<dyn LatticeSource>) -> bool` replaces `upstream()`, whose only users are two tests;
+    - when the interceptor finishes (`complete`, `on_complete`, `on_error`, after the existing `COMPLETE` CAS), it `serialize`s an action that takes the source out of the slot. For `complete`, the action also calls `source.complete()` before the drop.
 
 - [ ] **Step 1: Write the failing tests** in `vertex/tests.rs`.
   - `serialize_runs_at_once_when_no_worker_holds_the_source`.
@@ -384,6 +387,7 @@ impl DownstreamSlot {
   - **`release_races_serialize_and_no_action_is_stranded`:** as above with empty `request`s; the action count == 10 000 after all threads join.
   - `the_interceptor_drops_its_source_when_it_finishes`: a drop-counting source; `on_complete` while a worker holds the claim → not dropped yet; `release` → dropped once.
   - `complete_completes_the_source_through_serialize`.
+  - `lifecycle_calls_from_another_thread_touch_only_atomics_and_take_effect_on_the_next_request`: a source with a `SourceCell` and a `DownstreamSlot`; a `clear()` and a `complete()` from another thread while a worker is inside `request` do not enter the cell, a clear is applied by the next `request`, and the source is dropped only after the worker releases.
   - The existing tests at `vertex/tests.rs:373` and `:420` switch to `has_upstream`.
 - [ ] **Step 2: Run them and see them fail.** `mise exec -- cargo test -p euhedral-core flow_control::vertex`.
 - [ ] **Step 3: Implement.** Keep `catch_unwind` around `pull`/`request` as today. A panicking action is caught, logged and dropped (`log::error!`), and the drain continues.
