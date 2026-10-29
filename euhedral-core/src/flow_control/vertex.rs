@@ -717,9 +717,9 @@ impl UpstreamInterceptor {
         if !self.pending.swap(false, Ordering::SeqCst) {
             return;
         }
-        // SAFETY: the caller holds the claim, which admits one thread at a time, and no `pull` or
-        // `request` is in progress while the claim is held by a caller of this method.
-        let mut drain = unsafe { self.drain.enter() };
+        // The caller holds the interceptor's claim, so no `pull` or `request` is in progress and
+        // the cell's own claim is free.
+        let mut drain = self.drain.enter();
         while let Some(action) = drain.poll() {
             if panic::catch_unwind(AssertUnwindSafe(action)).is_err() {
                 log::error!(target: &self.log_target, "a serialized action panicked");

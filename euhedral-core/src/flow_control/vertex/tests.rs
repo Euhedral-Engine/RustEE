@@ -1549,8 +1549,7 @@ impl LatticeSource for Stateful {
     }
 
     fn request(&self, demand: u64) {
-        // SAFETY: the interceptor calls `request` under its claim.
-        let mut state = unsafe { self.state.enter() };
+        let mut state = self.state.enter();
         if self.cleared.swap(false, Ordering::SeqCst) {
             self.applied.fetch_add(state.len(), Ordering::SeqCst);
             state.clear();
