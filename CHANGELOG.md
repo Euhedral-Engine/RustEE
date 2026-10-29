@@ -8,6 +8,13 @@ semantics and the tests that pin it.
 **What.** `mp_reserve` reads the producer's tail chunk with a relaxed load (Java reads it plain); the acquire load of the
 tail that precedes it already orders it after the resizing producer's store. The field-by-field audit of the queues
 against Java is in the pull request; the remaining rows are not changed here.
+- `ChunkPool` is a wait-free single-producer single-consumer ring of chunk pointers (Java's `ChunkAllocator`), where it was
+  a try-lock stack: the queue's consumer retires chunks into it, the growing producer takes them out, and neither waits.
+- `StopWatch` counts its skipped pairs down instead of dividing a running count by the interval: the common start is a
+  compare and a decrement.
+- Benchmark: `--pooled` frames come from, and return to, the pool of the thread that runs them, the nearest Rust has to
+  Java's sink re-pushing one array (a frame crosses no core between two uses).
+- Other repos' names are gone from doc comments and READMEs; the behaviour is described instead.
 
 ## High-contention throughput benchmark (2026-10-29)
 

@@ -206,6 +206,9 @@ pub struct Options {
     pub pin_harness: bool,
     /// Sample the latency of one frame in 64.
     pub latency: bool,
+    /// Frames come from, and return to, the pool of the thread that runs them, instead of circulating through each
+    /// source's return queue (see [`RepeatingSource::pooled`]).
+    pub pooled_frames: bool,
 }
 
 impl Options {
@@ -220,6 +223,7 @@ impl Options {
             tasks: TASKS,
             pin_harness: true,
             latency: true,
+            pooled_frames: false,
         }
     }
 }
@@ -348,13 +352,18 @@ pub fn run_fork(
         .then(|| Arc::new(Recorders::new(tally.cells())));
     let sources: Vec<_> = (0..options.sources)
         .map(|source| {
-            RepeatingSource::new(
-                id_hash(),
-                FRAMES_PER_SOURCE,
-                id_hash().wrapping_add((source * FRAMES_PER_SOURCE) as u64),
-                &tally,
-                recorders.as_ref(),
-            )
+            let seed = id_hash().wrapping_add((source * FRAMES_PER_SOURCE) as u64);
+            if options.pooled_frames {
+                RepeatingSource::pooled(id_hash(), seed, &tally, recorders.as_ref())
+            } else {
+                RepeatingSource::new(
+                    id_hash(),
+                    FRAMES_PER_SOURCE,
+                    seed,
+                    &tally,
+                    recorders.as_ref(),
+                )
+            }
         })
         .collect();
 

@@ -11,8 +11,9 @@ pub struct StopWatch {
     interval: NonZeroU64,
     /// The start of the running measurement, if one is running.
     started: Option<Instant>,
-    /// Pairs completed or skipped since the last timed one began.
-    ticks: u64,
+    /// Pairs to skip before the next timed one: counted down, so the common start is a compare and a decrement and
+    /// not a division.
+    skip: u64,
 }
 
 impl StopWatch {
@@ -29,7 +30,7 @@ impl StopWatch {
         Self {
             interval,
             started: None,
-            ticks: 0,
+            skip: 0,
         }
     }
 
@@ -43,17 +44,17 @@ impl StopWatch {
         if self.started.is_some() {
             return;
         }
-        if self.ticks % self.interval == 0 {
+        if self.skip == 0 {
             self.started = Some(Instant::now());
         } else {
-            self.ticks = self.ticks.wrapping_add(1);
+            self.skip -= 1;
         }
     }
 
     /// The time since the matching [`start`](Self::start), if that start began a measurement.
     pub fn stop(&mut self) -> Option<Duration> {
         let started = self.started.take()?;
-        self.ticks = self.ticks.wrapping_add(1);
+        self.skip = self.interval.get() - 1;
         Some(started.elapsed())
     }
 }

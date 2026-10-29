@@ -162,7 +162,9 @@ type Home = &'static Producer<Box<NoOpFrame>, Multi>;
 pub struct NoOpFrame {
     header: FrameHeader,
     tally: Arc<Tally>,
-    home: Home,
+    /// The source's queue, or `None` for a frame of a pooled source, which goes back to the pool of the thread that
+    /// finished it.
+    home: Option<Home>,
     /// Where the latency of a sampled frame is recorded; `None` for a frame that is not sampled.
     latency: Option<Arc<Recorders>>,
     /// When the source handed the frame out, if it is being sampled.
@@ -206,9 +208,63 @@ impl Frame for NoOpFrame {
     }
 
     fn recycle(self: Box<Self>) {
-        let home = self.home;
-        // The queue is unbounded: a frame always fits.
-        let _ = home.offer(self);
+        match self.home {
+            // The queue is unbounded: a frame always fits.
+            Some(home) => {
+                let _ = home.offer(self);
+            }
+            None => pool_put(self),
+        }
+    }
+}
+
+/// The finished frames of a pooled source, per thread: a frame goes back to the pool of the thread that finished it
+/// and the next request on that thread takes it, so a frame crosses no core between two uses unless the work moved.
+const POOL_CAP: usize = 4096;
+
+thread_local! {
+    #[allow(clippy::vec_box, reason = "the frames are pushed as boxes and come back as boxes")]
+    static POOL: std::cell::RefCell<Vec<Box<NoOpFrame>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn pool_put(frame: Box<NoOpFrame>) {
+    let _ = POOL.try_with(|pool| {
+        let mut pool = pool.borrow_mut();
+        if pool.len() < POOL_CAP {
+            pool.push(frame);
+        }
+    });
+}
+
+fn pool_take() -> Option<Box<NoOpFrame>> {
+    POOL.try_with(|pool| pool.borrow_mut().pop()).ok().flatten()
+}
+
+/// Makes frames for a pooled source when its thread's pool is empty.
+struct Maker {
+    id_hash: u64,
+    seed: u64,
+    made: std::sync::atomic::AtomicU64,
+    tally: Arc<Tally>,
+    latency: Option<Arc<Recorders>>,
+}
+
+impl Maker {
+    fn fresh(&self) -> Box<NoOpFrame> {
+        let index = self.made.fetch_add(1, Ordering::Relaxed);
+        let mut header = FrameHeader::new(self.id_hash);
+        header.randomize_hash(self.seed.wrapping_add(index));
+        Box::new(NoOpFrame {
+            header,
+            tally: self.tally.clone(),
+            home: None,
+            latency: self
+                .latency
+                .as_ref()
+                .filter(|_| index.is_multiple_of(SAMPLE_EVERY))
+                .cloned(),
+            stamp: None,
+        })
     }
 }
 
@@ -229,7 +285,7 @@ pub fn generate(
             Box::new(NoOpFrame {
                 header,
                 tally: tally.clone(),
-                home,
+                home: Some(home),
                 // One frame in `SAMPLE_EVERY` is sampled, every time it circulates.
                 latency: latency.filter(|_| index % SAMPLE_EVERY == 0).cloned(),
                 stamp: None,
@@ -241,7 +297,8 @@ pub fn generate(
 /// What only a source's `request` and `pull` touch: the queue the finished frames come back to, read by its one
 /// consumer, and the banked demand.
 struct Inner {
-    frames: Consumer<Box<NoOpFrame>, Single>,
+    /// The queue the finished frames come back to; `None` for a pooled source.
+    frames: Option<Consumer<Box<NoOpFrame>, Single>>,
     /// Banked demand; `u64::MAX` is unbounded. The demand a request leaves unmet stays banked for the next one.
     demand: u64,
 }
@@ -259,7 +316,8 @@ struct Inner {
 pub struct RepeatingSource {
     downstream: DownstreamSlot,
     inner: SourceCell<Inner>,
-    home: Home,
+    home: Option<Home>,
+    maker: Option<Maker>,
 }
 
 impl RepeatingSource {
@@ -280,11 +338,58 @@ impl RepeatingSource {
         Arc::new(Self {
             downstream: DownstreamSlot::new(),
             inner: SourceCell::new(Inner {
-                frames: queue.consumer(),
+                frames: Some(queue.consumer()),
                 demand: 0,
             }),
-            home,
+            home: Some(home),
+            maker: None,
         })
+    }
+
+    /// A source that keeps no frames of its own: each frame it pushes comes from the pool of the thread that runs the
+    /// request (or is made when that pool is empty), and goes back to the pool of the thread that finishes it. This is
+    /// the nearest Rust has to Java's sink re-pushing one array: no frame travels from the worker that finished it to
+    /// the worker that pushes it again. The number of frames made is bounded by the demand the lattice grants.
+    pub fn pooled(
+        id_hash: u64,
+        seed: u64,
+        tally: &Arc<Tally>,
+        latency: Option<&Arc<Recorders>>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            downstream: DownstreamSlot::new(),
+            inner: SourceCell::new(Inner {
+                frames: None,
+                demand: 0,
+            }),
+            home: None,
+            maker: Some(Maker {
+                id_hash,
+                seed,
+                made: std::sync::atomic::AtomicU64::new(0),
+                tally: tally.clone(),
+                latency: latency.cloned(),
+            }),
+        })
+    }
+
+    /// The next frame to push, if there is one.
+    fn next_frame(&self, inner: &mut Inner) -> Option<Box<NoOpFrame>> {
+        match (&mut inner.frames, &self.maker) {
+            (Some(frames), _) => frames.poll(),
+            (None, Some(maker)) => Some(pool_take().unwrap_or_else(|| maker.fresh())),
+            (None, None) => None,
+        }
+    }
+
+    /// Gives back a frame the source took and did not push.
+    fn give_back(&self, frame: Box<NoOpFrame>) {
+        match self.home {
+            Some(home) => {
+                let _ = home.offer(frame);
+            }
+            None => pool_put(frame),
+        }
     }
 
     /// Pushes frames to the receiver while demand is banked and frames are back.
@@ -296,7 +401,7 @@ impl RepeatingSource {
             if inner.demand == 0 {
                 return;
             }
-            let Some(frame) = inner.frames.poll() else {
+            let Some(frame) = self.next_frame(inner) else {
                 return;
             };
             if inner.demand != u64::MAX {
@@ -324,12 +429,12 @@ impl LatticeSource for RepeatingSource {
         let mut inner = self.inner.enter();
         let mut taken = 0;
         while taken < demand && !self.downstream.is_complete() {
-            let Some(frame) = inner.frames.poll() else {
+            let Some(frame) = self.next_frame(&mut inner) else {
                 break;
             };
             if stop(&*frame) {
                 // Left in the source, behind the others: the frames of this source are interchangeable.
-                let _ = self.home.offer(frame);
+                self.give_back(frame);
                 break;
             }
             let mut frame = frame;
