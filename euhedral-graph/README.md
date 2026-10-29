@@ -83,7 +83,7 @@ let (lanes, _devices) = FakeDevice::pool(&["compute"]);
 let completions = Completions::new(lanes);
 
 let released = Arc::new(Mutex::new(Vec::new()));
-let sequencer = Sequencer::new({
+let (sequencer, mut registrar) = Sequencer::new(8, {
     let released = released.clone();
     move |seq: u32| released.lock().unwrap().push(seq)
 });
@@ -92,7 +92,7 @@ let sequencer = Sequencer::new({
 let fired = Arc::new(Mutex::new(Vec::new()));
 let now = Instant::now();
 for (seq, after_ms) in [(0u32, 6), (1, 0), (2, 3)] {
-    let slot = Mutex::new(Some(sequencer.register()));
+    let slot = Mutex::new(registrar.register());
     let fired = fired.clone();
     let task = Arc::new(move || {
         fired.lock().unwrap().push(seq);
@@ -285,15 +285,17 @@ A frame hands a result back to the main thread with a `one_shot` (`euhedral_data
 
 ### Sequencer and Join
 
-A `Sequencer<T>` hands values out in admission order. `register()` takes a slot, in the order the
-caller admits work; the slot is completed with a value, or abandoned (dropping it abandons it),
-from any thread. One releaser at a time (a work-in-progress counter) releases the prefix of
+A `Sequencer<T>` hands values out in admission order. `Sequencer::new(capacity, emit)` returns it with
+its one `Registrar`; `registrar.register()` takes a slot, in the order the caller admits work (and
+returns `None` while `capacity` slots are unreleased); the slot is completed with a value, or abandoned
+(dropping it abandons it), from any thread. A registration allocates nothing and takes no
+read-modify-write. One releaser at a time (a work-in-progress counter) releases the prefix of
 finished slots to `emit`, on its own thread, and `emit` must not wait: it offers the next frame.
 
 A `Join<T>` is a continuation that runs on the thread of its last arrival, after `parts` parts
-arrived or were abandoned. Neither is a queue, and neither blocks. `Join::new` makes a join of one
-round. `Join::with_capacity` makes a cell for a pooled unit: `reset(parts)` arms a round, and the
-continuation receives a `Round` of the values and calls `rearm(parts)` for the next one. Arming and
+arrived or were abandoned. Neither is a queue, and neither blocks. `Join::once` makes a join of one
+round and hands out its `Part`s. A `Part` is a token moved to its branch: `arrive(value)` or `abandon()` consumes it, so a part ends once (a second arrival does not compile), and dropping it abandons. `Join::with_capacity` makes a cell (an `Arc<Join>`) for a pooled unit: `reset(parts)` arms a round and returns its parts, and the
+continuation receives a `Round` of the values and calls `rearm(parts)` for the next one (it returns the next round's parts). Arming and
 arriving take no lock and allocate nothing.
 
 ## Build and test

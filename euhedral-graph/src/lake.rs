@@ -392,7 +392,9 @@ impl Lake {
     }
 
     fn generation_of_sinks(&self) -> Generation {
-        let id = self.attachments.fetch_add(1, Ordering::AcqRel);
+        // Called under the attach lock, which makes this the only writer: a load and a store, and `attachments()` reads it.
+        let id = self.attachments.load(Ordering::Relaxed);
+        self.attachments.store(id + 1, Ordering::Release);
         Generation {
             id,
             sinks: (0..self.sinks.get())

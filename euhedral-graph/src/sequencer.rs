@@ -1,29 +1,39 @@
-//! Execute in any order, conclude in admission order (Euhedral-Execution `FrameSequencer` /
-//! `OffsetCollector`; Euhedral-Inference `Sequencer`).
+//! Execute in any order, conclude in admission order.
 //!
-//! Java's design, without a lock: a multi-producer queue holds the entries in the order they were offered, each entry
-//! has a `ready` flag, and a work-in-progress count makes the thread that raises it from zero conclude the ready
-//! prefix. A completion that arrives while a drain runs raises the count, and the drain looks again before it
-//! returns.
+//! A ring of cells indexed by sequence number holds the values in the order their slots were registered. Each cell has
+//! a state word (pending, ready, abandoned) that the finishing thread stores with release ordering after writing the
+//! value and the releaser loads with acquire ordering. A work-in-progress count makes the thread that raises it from
+//! zero conclude the ready prefix. A completion that arrives while a drain runs raises the count, and the drain looks
+//! again before it returns.
+//!
+//! One thread at a time registers, through the [`Registrar`] that [`Sequencer::new`] returns with the sequencer (it is
+//! not `Clone`, and registering takes `&mut self`). The order of registration is therefore the order of the sequence
+//! numbers, and a registration is two plain stores and a release store, with no allocation and no read-modify-write.
 
 #![allow(
     unsafe_code,
-    reason = "the thread that wins the work-in-progress count owns the order's consumer; an entry's value is written before its ready flag and read after it"
+    reason = "the thread that wins the work-in-progress count owns the ring's consumer side; a cell's value is written before its state word and read after it"
 )]
 
 use euhedral_data_structures::atomics::CachePadded;
-use euhedral_data_structures::queues::{Consumer, MpscQueue, Multi, Producer, Single};
 use euhedral_data_structures::sync::HotScope;
 use std::cell::UnsafeCell;
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
+
+/// The cell is free, or its slot is registered and not finished.
+const PENDING: u8 = 0;
+/// The slot finished with a value in the cell.
+const READY: u8 = 1;
+/// The slot finished with nothing to release.
+const ABANDONED: u8 = 2;
 
 /// Releases values in the order their slots were registered, whatever order they complete in.
 ///
-/// - [`register`](Self::register) takes a slot, in the order the registrations reach the order queue. Any thread may
-///   register; the order is the order of the offers, so the owner of the order registers from one chain of work.
+/// - [`Registrar::register`] takes a slot, in the order of the calls. The ring has a fixed capacity: registering fails
+///   while that many slots are registered and not released.
 /// - A slot is completed with a value, or abandoned (a killed frame), from any thread. Dropping a
 ///   slot abandons it, so a frame that dies holding one can never stall the sequence.
 /// - One releaser at a time (a work-in-progress counter: whoever finds it busy leaves its work to
@@ -34,91 +44,93 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 /// A panic in `emit` is its own: the slots behind it are still released, and the panic resumes on
 /// the releasing thread once the release ended (the releaser is never left claimed).
 pub struct Sequencer<T> {
-    /// The entries in offer order (Java's `order`).
-    order: Producer<Arc<Entry<T>>, Multi>,
-    /// Peeked and polled by the thread that holds `wip`, and by no other.
-    consumer: UnsafeCell<Consumer<Arc<Entry<T>>, Single>>,
+    cells: Box<[Cell<T>]>,
+    mask: u64,
+    /// The next sequence number to register. Written by the one registrar (a plain store: its only writer), read by
+    /// the releaser.
+    tail: CachePadded<AtomicU64>,
+    /// The next sequence number to release. Written by the thread that holds `wip` (a plain store: its only writer
+    /// at a time), read by the registrar to see whether the ring is full.
+    head: CachePadded<AtomicU64>,
     /// The work-in-progress count: the thread that raises it from 0 releases; the others leave
     /// their slot to it.
     wip: CachePadded<AtomicU32>,
-    /// The order queue, for its length: slots registered and not yet released, with no counter of its own to update.
-    queue: MpscQueue<Arc<Entry<T>>>,
     emit: Box<dyn Fn(T) + Send + Sync>,
 }
 
-// SAFETY: the consumer is used only under the work-in-progress count, which admits one thread at a time; the
-// emitter is `Send + Sync`; the entries are `Send` when `T` is.
+/// One position of the ring.
+struct Cell<T> {
+    /// [`PENDING`], [`READY`] or [`ABANDONED`]: the finishing thread stores it (release) after writing `value`; the
+    /// releaser loads it (acquire) and resets it when the cell is free again.
+    state: AtomicU8,
+    /// Written once by the slot's holder before `state` is stored, taken by the releaser after it loads `state`.
+    value: UnsafeCell<Option<T>>,
+}
+
+// SAFETY: the value is written before the state word (release) and read after it (acquire), by one thread each; the
+// emitter is `Send + Sync`.
 unsafe impl<T: Send> Send for Sequencer<T> {}
 // SAFETY: as above.
 unsafe impl<T: Send> Sync for Sequencer<T> {}
 
-/// One position of the order.
-struct Entry<T> {
-    /// Java's `ready()`: the finishing thread stores it (release) after writing `state`; the releaser loads it (acquire).
-    ready: AtomicBool,
-    /// Written once by the slot's holder before `ready` is stored, taken by the releaser after it loads `ready`.
-    state: UnsafeCell<State<T>>,
-}
-
-// SAFETY: `state` is written before the ready flag (sequentially consistent) and read after it, by one thread each.
-unsafe impl<T: Send> Send for Entry<T> {}
-// SAFETY: as above.
-unsafe impl<T: Send> Sync for Entry<T> {}
-
-enum State<T> {
-    Pending,
-    Ready(T),
-    Abandoned,
-}
-
 impl<T> fmt::Debug for Sequencer<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Sequencer").finish_non_exhaustive()
+        f.debug_struct("Sequencer")
+            .field("capacity", &self.cells.len())
+            .finish_non_exhaustive()
     }
 }
 
 impl<T: Send + 'static> Sequencer<T> {
-    pub fn new(emit: impl Fn(T) + Send + Sync + 'static) -> Arc<Self> {
-        let queue = MpscQueue::new(16);
-        Arc::new(Self {
-            order: queue.producer(),
-            consumer: UnsafeCell::new(queue.consumer()),
+    /// A sequencer with room for `capacity` unreleased slots (rounded up to a power of two, at least two), and the
+    /// registrar that takes its slots.
+    pub fn new(
+        capacity: usize,
+        emit: impl Fn(T) + Send + Sync + 'static,
+    ) -> (Arc<Self>, Registrar<T>) {
+        let capacity = capacity.max(2).next_power_of_two();
+        let sequencer = Arc::new(Self {
+            cells: (0..capacity)
+                .map(|_| Cell {
+                    state: AtomicU8::new(PENDING),
+                    value: UnsafeCell::new(None),
+                })
+                .collect(),
+            mask: capacity as u64 - 1,
+            tail: CachePadded::new(AtomicU64::new(0)),
+            head: CachePadded::new(AtomicU64::new(0)),
             wip: CachePadded::new(AtomicU32::new(0)),
-            queue,
             emit: Box::new(emit),
-        })
-    }
-
-    /// The next slot in admission order.
-    pub fn register(self: &Arc<Self>) -> Slot<T> {
-        let _hot = HotScope::enter();
-        let entry = Arc::new(Entry {
-            ready: AtomicBool::new(false),
-            state: UnsafeCell::new(State::Pending),
         });
-        if self.order.offer(entry.clone()).is_err() {
-            unreachable!("the order queue is unbounded");
-        }
-        Slot {
-            sequencer: Some(self.clone()),
-            entry,
-        }
+        let registrar = Registrar {
+            sequencer: sequencer.clone(),
+        };
+        (sequencer, registrar)
     }
 
     /// Slots registered and not yet released.
     pub fn len(&self) -> usize {
-        usize::try_from(self.queue.size_long()).unwrap_or(usize::MAX)
+        let tail = self.tail.load(Ordering::Acquire);
+        let head = self.head.load(Ordering::Acquire);
+        usize::try_from(tail.saturating_sub(head)).unwrap_or(usize::MAX)
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    fn finish(&self, entry: &Entry<T>, state: State<T>) {
+    /// The most unreleased slots the ring holds.
+    pub fn capacity(&self) -> usize {
+        self.cells.len()
+    }
+
+    fn finish(&self, seq: u64, value: Option<T>) {
         let _hot = HotScope::enter();
-        // SAFETY: the slot's holder is the only writer, and the releaser reads the state only after it sees `ready`.
-        unsafe { entry.state.get().write(state) };
-        entry.ready.store(true, Ordering::Release);
+        let cell = &self.cells[(seq & self.mask) as usize];
+        let state = if value.is_some() { READY } else { ABANDONED };
+        // SAFETY: the slot's holder is the only writer, and the releaser reads the value only after it sees the state.
+        unsafe { *cell.value.get() = value };
+        cell.state.store(state, Ordering::Release);
         self.drain();
     }
 
@@ -128,27 +140,32 @@ impl<T: Send + 'static> Sequencer<T> {
         if self.wip.fetch_add(1, Ordering::AcqRel) != 0 {
             return;
         }
-        // SAFETY: the count went from 0 to 1 on this thread, so no other thread is in this function until the
-        // count returns to 0 below; the consumer belongs to this thread meanwhile.
-        let consumer = unsafe { &mut *self.consumer.get() };
+        // The count went from 0 to 1 on this thread, so no other thread is in this function until the count returns
+        // to 0 below; the head belongs to this thread meanwhile.
         let mut panic = None;
         let mut missed = 1;
         loop {
             loop {
-                let state = match consumer.peek() {
-                    Some(head) if head.ready.load(Ordering::Acquire) => {
-                        // SAFETY: `ready` was stored after the state was written, and nothing writes it again.
-                        unsafe { std::mem::replace(&mut *head.state.get(), State::Abandoned) }
-                    }
-                    _ => break,
-                };
-                if let State::Ready(value) = state
+                let head = self.head.load(Ordering::Relaxed);
+                if head == self.tail.load(Ordering::Acquire) {
+                    break;
+                }
+                let cell = &self.cells[(head & self.mask) as usize];
+                let state = cell.state.load(Ordering::Acquire);
+                if state == PENDING {
+                    break;
+                }
+                // SAFETY: the state was stored after the value was written, and nothing writes the cell again until
+                // the head moves past it.
+                let value = unsafe { (*cell.value.get()).take() };
+                if let Some(value) = value
                     && let Err(payload) = catch_unwind(AssertUnwindSafe(|| (self.emit)(value)))
                 {
                     panic.get_or_insert(payload);
                 }
-                // Polled after the emit, as Java's `finally`: the entry stays in the order while it concludes.
-                drop(consumer.poll());
+                // Freed after the emit, as Java's `finally`: the position stays in the order while it concludes.
+                cell.state.store(PENDING, Ordering::Relaxed);
+                self.head.store(head + 1, Ordering::Release);
             }
             missed = self.wip.fetch_sub(missed, Ordering::AcqRel) - missed;
             if missed == 0 {
@@ -161,15 +178,57 @@ impl<T: Send + 'static> Sequencer<T> {
     }
 }
 
+/// The one handle that registers slots of a [`Sequencer`]. It is not `Clone`, and registering takes `&mut self`, so
+/// registrations are ordered by the caller's own sequence.
+pub struct Registrar<T: Send + 'static> {
+    sequencer: Arc<Sequencer<T>>,
+}
+
+impl<T: Send + 'static> fmt::Debug for Registrar<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Registrar").finish_non_exhaustive()
+    }
+}
+
+impl<T: Send + 'static> Registrar<T> {
+    /// The next slot in admission order, or `None` while the ring holds [`capacity`](Sequencer::capacity) slots that are
+    /// not released.
+    pub fn register(&mut self) -> Option<Slot<T>> {
+        let _hot = HotScope::enter();
+        let sequencer = &*self.sequencer;
+        let tail = sequencer.tail.load(Ordering::Relaxed);
+        // Pairs with the releaser's release store of the head: the cell is free and its value taken.
+        if tail - sequencer.head.load(Ordering::Acquire) == sequencer.cells.len() as u64 {
+            return None;
+        }
+        // The cell's state is `PENDING` already (the releaser reset it); the tail publishes the registration.
+        sequencer.tail.store(tail + 1, Ordering::Release);
+        Some(Slot {
+            sequencer: Some(self.sequencer.clone()),
+            seq: tail,
+        })
+    }
+
+    /// The sequencer this registrar takes slots of.
+    pub fn sequencer(&self) -> &Arc<Sequencer<T>> {
+        &self.sequencer
+    }
+}
+
 /// One position in a [`Sequencer`]. Complete it or abandon it; dropping it abandons it.
+///
+/// A slot keeps its sequencer alive (an `Arc`): without a collector, a completion on another thread must not outlive
+/// the ring it writes to.
 pub struct Slot<T: Send + 'static> {
     sequencer: Option<Arc<Sequencer<T>>>,
-    entry: Arc<Entry<T>>,
+    seq: u64,
 }
 
 impl<T: Send + 'static> fmt::Debug for Slot<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Slot").finish_non_exhaustive()
+        f.debug_struct("Slot")
+            .field("seq", &self.seq)
+            .finish_non_exhaustive()
     }
 }
 
@@ -177,14 +236,14 @@ impl<T: Send + 'static> Slot<T> {
     /// The value for this position; released once every earlier slot finished.
     pub fn complete(mut self, value: T) {
         if let Some(sequencer) = self.sequencer.take() {
-            sequencer.finish(&self.entry, State::Ready(value));
+            sequencer.finish(self.seq, Some(value));
         }
     }
 
     /// This position has nothing to release (its frame was killed).
     pub fn abandon(mut self) {
         if let Some(sequencer) = self.sequencer.take() {
-            sequencer.finish(&self.entry, State::Abandoned);
+            sequencer.finish(self.seq, None);
         }
     }
 }
@@ -192,36 +251,41 @@ impl<T: Send + 'static> Slot<T> {
 impl<T: Send + 'static> Drop for Slot<T> {
     fn drop(&mut self) {
         if let Some(sequencer) = self.sequencer.take() {
-            sequencer.finish(&self.entry, State::Abandoned);
+            sequencer.finish(self.seq, None);
         }
     }
 }
 
-/// The ports of Euhedral-Execution's `FrameSequencerTest` and `OffsetCollectorTest`, and of
-/// Euhedral-Inference's `SequencerTest` (the same pattern). The Kafka-specific parts (commit
-/// policy, commit retries, passwords) have no counterpart here.
+/// Ports of the reference tests of the in-order release: results emitted in input order after out-of-order
+/// execution, a completion waiting for the lowest outstanding one, killed frames passed, a release that never
+/// recurses, a failing emit that does not stop the release, and completions from many threads.
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Mutex;
     use std::sync::atomic::AtomicUsize;
 
-    fn recording() -> (Arc<Sequencer<u64>>, Arc<Mutex<Vec<u64>>>) {
+    type Recording = (Arc<Sequencer<u64>>, Registrar<u64>, Arc<Mutex<Vec<u64>>>);
+
+    fn recording() -> Recording {
         let out = Arc::new(Mutex::new(Vec::new()));
         let sink = out.clone();
-        (
-            Sequencer::new(move |value| sink.lock().unwrap().push(value)),
-            out,
-        )
+        let (sequencer, registrar) =
+            Sequencer::new(4096, move |value| sink.lock().unwrap().push(value));
+        (sequencer, registrar, out)
+    }
+
+    fn take(registrar: &mut Registrar<u64>) -> Slot<u64> {
+        registrar.register().expect("the ring has room")
     }
 
     /// FrameSequencerTest.emitsResultsInInputOrderAfterOutOfOrderExecution
     #[test]
     fn values_are_released_in_registration_order_after_out_of_order_completion() {
-        let (sequencer, out) = recording();
-        let first = sequencer.register();
-        let second = sequencer.register();
-        let third = sequencer.register();
+        let (sequencer, mut registrar, out) = recording();
+        let first = take(&mut registrar);
+        let second = take(&mut registrar);
+        let third = take(&mut registrar);
         third.complete(3);
         second.complete(2);
         assert!(out.lock().unwrap().is_empty(), "the head is not ready");
@@ -236,9 +300,9 @@ mod tests {
     /// ready releases at once.
     #[test]
     fn a_completion_waits_for_the_lowest_outstanding_slot() {
-        let (sequencer, out) = recording();
-        let lower = sequencer.register();
-        let higher = sequencer.register();
+        let (sequencer, mut registrar, out) = recording();
+        let lower = take(&mut registrar);
+        let higher = take(&mut registrar);
         higher.complete(11);
         assert!(out.lock().unwrap().is_empty());
         lower.complete(10);
@@ -249,8 +313,8 @@ mod tests {
     /// OffsetCollectorTest.firstRegisteredFrameCommitsOnceAfterSuccessfulAcknowledgement
     #[test]
     fn the_first_slot_releases_once_when_it_completes() {
-        let (sequencer, out) = recording();
-        sequencer.register().complete(4);
+        let (sequencer, mut registrar, out) = recording();
+        take(&mut registrar).complete(4);
         assert_eq!(*out.lock().unwrap(), [4]);
         assert!(sequencer.is_empty());
     }
@@ -260,11 +324,11 @@ mod tests {
     /// passes them.
     #[test]
     fn abandoned_and_dropped_slots_are_passed() {
-        let (sequencer, out) = recording();
-        let a = sequencer.register();
-        let b = sequencer.register();
-        let c = sequencer.register();
-        let d = sequencer.register();
+        let (sequencer, mut registrar, out) = recording();
+        let a = take(&mut registrar);
+        let b = take(&mut registrar);
+        let c = take(&mut registrar);
+        let d = take(&mut registrar);
         d.complete(4);
         b.abandon();
         a.complete(1);
@@ -281,7 +345,7 @@ mod tests {
         let out = Arc::new(Mutex::new(Vec::new()));
         let pending: Arc<Mutex<Option<Slot<u64>>>> = Arc::new(Mutex::new(None));
         let (sink, next) = (out.clone(), pending.clone());
-        let sequencer = Sequencer::new(move |value: u64| {
+        let (sequencer, mut registrar) = Sequencer::new(8, move |value: u64| {
             sink.lock().unwrap().push(value);
             let slot = next.lock().unwrap().take();
             if let Some(slot) = slot {
@@ -293,8 +357,8 @@ mod tests {
                 );
             }
         });
-        let first = sequencer.register();
-        *pending.lock().unwrap() = Some(sequencer.register());
+        let first = take(&mut registrar);
+        *pending.lock().unwrap() = Some(take(&mut registrar));
         first.complete(0);
         assert_eq!(*out.lock().unwrap(), [0, 1]);
         assert!(sequencer.is_empty());
@@ -305,22 +369,23 @@ mod tests {
     fn a_panicking_emit_does_not_stop_the_release_or_leave_it_claimed() {
         let out = Arc::new(Mutex::new(Vec::new()));
         let sink = out.clone();
-        let sequencer = Sequencer::new(move |value: u64| {
+        let (sequencer, mut registrar) = Sequencer::new(8, move |value: u64| {
             sink.lock().unwrap().push(value);
             assert_ne!(value, 0, "injected");
         });
-        let first = sequencer.register();
-        let second = sequencer.register();
+        let first = take(&mut registrar);
+        let second = take(&mut registrar);
         second.complete(1);
         let panicked = catch_unwind(AssertUnwindSafe(|| first.complete(0)));
         assert!(panicked.is_err(), "the panic resumes after the release");
         assert_eq!(*out.lock().unwrap(), [0, 1]);
-        sequencer.register().complete(2);
+        take(&mut registrar).complete(2);
         assert_eq!(
             *out.lock().unwrap(),
             [0, 1, 2],
             "the releaser is not left claimed"
         );
+        assert!(sequencer.is_empty());
     }
 
     /// SequencerTest.entriesCompletingOnManyThreadsDrainOnceEachInOfferOrderOnOneThreadAtATime
@@ -332,7 +397,7 @@ mod tests {
             let releasing = Arc::new(AtomicUsize::new(0));
             let overlaps = Arc::new(AtomicUsize::new(0));
             let (sink, busy, overlap) = (out.clone(), releasing.clone(), overlaps.clone());
-            let sequencer = Sequencer::new(move |value: u64| {
+            let (sequencer, mut registrar) = Sequencer::new(4096, move |value: u64| {
                 if busy.fetch_add(1, Ordering::AcqRel) != 0 {
                     overlap.fetch_add(1, Ordering::Relaxed);
                 }
@@ -341,7 +406,7 @@ mod tests {
             });
             let count = 2_000u64;
             let mut slots: Vec<(u64, Slot<u64>)> =
-                (0..count).map(|i| (i, sequencer.register())).collect();
+                (0..count).map(|i| (i, take(&mut registrar))).collect();
             // A deterministic shuffle (xorshift), so a failure reproduces.
             let mut state = 0x9e37_79b9_7f4a_7c15 ^ round;
             for i in (1..slots.len()).rev() {
@@ -376,90 +441,16 @@ mod tests {
         }
     }
 
-    /// Registrations from 4 threads, each in order, completed in reverse from 4 threads: whatever the interleaving of
-    /// the registrations, each thread's values are emitted in the order that thread registered them, each once, and
-    /// one thread at a time.
-    #[test]
-    fn registrations_from_4_threads_complete_in_reverse_and_emit_in_order() {
-        #[cfg(not(miri))]
-        const PER_THREAD: u64 = 250;
-        #[cfg(miri)]
-        const PER_THREAD: u64 = 6;
-        #[cfg(not(miri))]
-        const ROUNDS: u64 = 20;
-        #[cfg(miri)]
-        const ROUNDS: u64 = 1;
-        for _ in 0..ROUNDS {
-            let out = Arc::new(Mutex::new(Vec::new()));
-            let releasing = Arc::new(AtomicUsize::new(0));
-            let overlaps = Arc::new(AtomicUsize::new(0));
-            let (sink, busy, overlap) = (out.clone(), releasing.clone(), overlaps.clone());
-            let sequencer = Sequencer::new(move |value: u64| {
-                if busy.fetch_add(1, Ordering::SeqCst) != 0 {
-                    overlap.fetch_add(1, Ordering::SeqCst);
-                }
-                sink.lock().unwrap().push(value);
-                busy.fetch_sub(1, Ordering::SeqCst);
-            });
-            let barrier = Arc::new(std::sync::Barrier::new(4));
-            let registrants: Vec<_> = (0..4u64)
-                .map(|thread| {
-                    let (sequencer, barrier) = (sequencer.clone(), barrier.clone());
-                    std::thread::spawn(move || {
-                        barrier.wait();
-                        (0..PER_THREAD)
-                            .map(|index| (thread * PER_THREAD + index, sequencer.register()))
-                            .collect::<Vec<_>>()
-                    })
-                })
-                .collect();
-            let mut batches: Vec<Vec<(u64, Slot<u64>)>> = registrants
-                .into_iter()
-                .map(|registrant| registrant.join().unwrap())
-                .collect();
-            // Complete each thread's slots newest first, from its own thread.
-            let completers: Vec<_> = batches
-                .drain(..)
-                .map(|batch| {
-                    std::thread::spawn(move || {
-                        for (value, slot) in batch.into_iter().rev() {
-                            slot.complete(value);
-                        }
-                    })
-                })
-                .collect();
-            for completer in completers {
-                completer.join().unwrap();
-            }
-            let emitted = out.lock().unwrap().clone();
-            assert_eq!(emitted.len() as u64, 4 * PER_THREAD, "each once");
-            for thread in 0..4u64 {
-                let own: Vec<u64> = emitted
-                    .iter()
-                    .copied()
-                    .filter(|value| value / PER_THREAD == thread)
-                    .collect();
-                assert_eq!(
-                    own,
-                    (thread * PER_THREAD..(thread + 1) * PER_THREAD).collect::<Vec<_>>(),
-                    "thread {thread}'s registration order"
-                );
-            }
-            assert_eq!(overlaps.load(Ordering::SeqCst), 0, "two releasers at once");
-            assert!(sequencer.is_empty());
-        }
-    }
-
     /// An emit that panics does not stop the slots behind it, from a drain another thread left to this one.
     #[test]
     fn an_emit_that_panics_does_not_stop_the_ones_behind_it() {
         let out = Arc::new(Mutex::new(Vec::new()));
         let sink = out.clone();
-        let sequencer = Sequencer::new(move |value: u64| {
+        let (sequencer, mut registrar) = Sequencer::new(8, move |value: u64| {
             sink.lock().unwrap().push(value);
             assert_ne!(value % 2, 0, "injected");
         });
-        let slots: Vec<_> = (0..6).map(|_| sequencer.register()).collect();
+        let slots: Vec<_> = (0..6).map(|_| take(&mut registrar)).collect();
         let mut panics = 0;
         for (value, slot) in slots.into_iter().enumerate().rev() {
             if catch_unwind(AssertUnwindSafe(|| slot.complete(value as u64))).is_err() {
@@ -471,6 +462,47 @@ mod tests {
             "the panic of the releasing completion resumes once"
         );
         assert_eq!(*out.lock().unwrap(), [0, 1, 2, 3, 4, 5]);
+        assert!(sequencer.is_empty());
+    }
+
+    #[test]
+    fn a_full_ring_refuses_registration_until_a_slot_is_released() {
+        let (sequencer, mut registrar, out) = recording();
+        let (small, mut small_registrar) = Sequencer::new(3, |_: u64| {});
+        assert_eq!(small.capacity(), 4, "rounded up to a power of two");
+        let slots: Vec<_> = (0..4)
+            .map(|_| small_registrar.register().unwrap())
+            .collect();
+        assert!(small_registrar.register().is_none());
+        let mut slots = slots.into_iter();
+        slots.next().unwrap().complete(0);
+        assert!(
+            small_registrar.register().is_some(),
+            "the head slot was released"
+        );
+        drop(slots);
+        assert!(sequencer.is_empty() && out.lock().unwrap().is_empty());
+        let _ = take(&mut registrar);
+    }
+
+    #[test]
+    fn the_ring_wraps_many_times_in_order() {
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let sink = out.clone();
+        let (sequencer, mut registrar) =
+            Sequencer::new(4, move |value: u64| sink.lock().unwrap().push(value));
+        let mut next = 0u64;
+        for _ in 0..1000 {
+            let slots: Vec<_> = (0..3).map(|_| registrar.register().unwrap()).collect();
+            for slot in slots.into_iter().rev() {
+                slot.complete(next);
+                next += 1;
+            }
+        }
+        // Each round completed its slots newest first: three values per round, the round's last number first.
+        let emitted = out.lock().unwrap().clone();
+        assert_eq!(emitted.len(), 3000);
+        assert!(emitted.chunks(3).all(|c| c[0] > c[1] && c[1] > c[2]));
         assert!(sequencer.is_empty());
     }
 }

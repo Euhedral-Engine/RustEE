@@ -113,4 +113,4 @@ jobs:
       - name: One-shot, sequencer
         run: |
           cargo +nightly miri test -p euhedral-data-structures --lib -- sync::one_shot
-          cargo +nightly miri test -p euhedral-graph --lib -- sequencer::tests::values_are sequencer::tests::a_completion sequencer::tests::the_first sequencer::tests::abandoned sequencer::tests::a_slot_registered sequencer::tests::a_panicking_emit sequencer::tests::registrations_from_4 sequencer::tests::an_emit_that_panics join::tests
+          cargo +nightly miri test -p euhedral-graph --lib -- sequencer::tests::values_are sequencer::tests::a_completion sequencer::tests::the_first sequencer::tests::abandoned sequencer::tests::a_slot_registered sequencer::tests::a_panicking_emit sequencer::tests::a_full_ring sequencer::tests::the_ring_wraps sequencer::tests::an_emit_that_panics join::tests

@@ -5,9 +5,9 @@ Java `euhedral-data-structures`, padded the same way: where Java pads with dead 
 `#[repr(align(128))]` wrapper ([`CachePadded`](src/atomics/padding.rs)) pads the same groups of
 fields in the same order.
 
-**Where it sits.** No dependencies. `euhedral-core` builds on it: each partition of a
-`ControlPlaneCache`, the upstream registry's per-worker handle queues, the `QueueIngestSink` and
-the `FrameManager`'s recycle queue are queues from this crate.
+**Where it sits.** No dependencies except `loom` under `--cfg loom`. It holds the padded atomics, the chunked
+queues in the four producer/consumer role pairs (single or multiple on each side), partitioned queues, and the
+cells and claims that threads meet at (`sync`).
 
 ## Modules
 
@@ -47,9 +47,7 @@ A consumer can `poll` one element, `peek` at it, `drain` up to a limit into a cl
 up to the first element a `stop` predicate matches (leaving it queued), or `drain_to` another
 queue's producer or a `Vec`. A `Multi` consumer takes a consumer lock for each call: `poll` returns
 `None` and `drain` stops early if another consumer holds it. `with_max_consume_batch` caps how many
-elements one consumer takes per lock hold. Here `drain*` means taking items out of a container;
-in `euhedral-core`, "drain" means stopping work and finishing what is in flight (see
-[`GLOSSARY.md`](../GLOSSARY.md)).
+elements one consumer takes per lock hold. Here `drain*` means taking items out of a container.
 
 ### Partitioned queues
 

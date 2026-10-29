@@ -1,12 +1,16 @@
 //! A re-armed `Join` allocates nothing. This binary counts every allocation of the process, so it holds one
 //! test and runs alone.
 #![cfg(not(loom))]
+#![allow(
+    clippy::disallowed_types,
+    reason = "test fixture: hands the next round's parts from the continuation to the test thread"
+)]
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
-use euhedral_graph::Join;
+use euhedral_graph::{Join, Part};
 
 static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
 
@@ -50,23 +54,29 @@ fn a_join_rearmed_10_000_times_allocates_nothing_after_construction() {
 
     let rounds = Arc::new(AtomicUsize::new(0));
     let sum = Arc::new(AtomicUsize::new(0));
-    let (counted, summed) = (rounds.clone(), sum.clone());
+    // The parts of the next round, handed from the continuation (which re-arms) to the arrivals; the vector has room
+    // for them, so pushing allocates nothing.
+    let next: Arc<Mutex<Vec<Part<usize>>>> = Arc::new(Mutex::new(Vec::with_capacity(PARTS)));
+    let (counted, summed, stash) = (rounds.clone(), sum.clone(), next.clone());
     let join = Join::<usize>::with_capacity(PARTS, move |mut round| {
         let round_no = counted.fetch_add(1, Ordering::AcqRel);
         let total: usize = (0..round.len()).filter_map(|part| round.take(part)).sum();
         summed.fetch_add(total, Ordering::AcqRel);
         if round_no + 1 < ROUNDS {
-            round.rearm(PARTS);
+            stash.lock().unwrap().extend(round.rearm(PARTS));
         }
     });
-    join.reset(PARTS);
+    let mut parts: Vec<Part<usize>> = Vec::with_capacity(PARTS);
+    parts.extend(join.reset(PARTS));
 
     let before = ALLOCATIONS.load(Ordering::Relaxed);
     for round in 0..ROUNDS {
-        for part in 0..PARTS {
-            // The last arrival of the round runs the continuation, which arms the next.
-            join.arrive(part, round + part);
+        // The last arrival of the round runs the continuation, which arms the next.
+        for part in parts.drain(..) {
+            let value = round + part.index();
+            part.arrive(value);
         }
+        std::mem::swap(&mut parts, &mut *next.lock().unwrap());
     }
     let after = ALLOCATIONS.load(Ordering::Relaxed);
 
@@ -88,9 +98,9 @@ fn a_join_rearmed_10_000_times_allocates_nothing_after_construction() {
     let built = ALLOCATIONS.load(Ordering::Relaxed);
     assert!(built > before, "construction allocates the slots");
     for round in 0..ROUNDS {
-        join.reset(1 + round % PARTS);
-        for part in 0..1 + round % PARTS {
-            join.arrive(part, part);
+        for part in join.reset(1 + round % PARTS) {
+            let index = part.index();
+            part.arrive(index);
         }
     }
     assert_eq!(ALLOCATIONS.load(Ordering::Relaxed), built);

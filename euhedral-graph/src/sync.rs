@@ -1,12 +1,8 @@
 //! The atomics and cells the crate's lock-free pieces are built from. A build with `--cfg loom` swaps
 //! them for the `loom` model checker's, which explores every interleaving the memory model allows.
 
-#[cfg(all(loom, debug_assertions))]
-pub(crate) use loom::sync::atomic::AtomicBool;
 #[cfg(loom)]
 pub(crate) use loom::sync::atomic::{AtomicUsize, Ordering};
-#[cfg(all(not(loom), debug_assertions))]
-pub(crate) use std::sync::atomic::AtomicBool;
 #[cfg(not(loom))]
 pub(crate) use std::sync::atomic::{AtomicUsize, Ordering};
 

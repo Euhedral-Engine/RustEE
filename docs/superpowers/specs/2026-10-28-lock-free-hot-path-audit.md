@@ -616,15 +616,17 @@ Java `LatticeHotSource`, `ControlPlaneFragment`'s output, `StopWatch`, `Fragment
   after its sequentially consistent release of the claim and takes it with `swap(false, SeqCst)`. Unbounded demand
   is never spent, so serving it takes no read-modify-write; spending is one `AcqRel` compare-and-set.
   Deviation (Java bug against the frame-path rule): Java's volatile bank and volatile flag store are full barriers.
-- **G17** `Join` (Java `Join`): an arrival writes its slot and does one `fetch_sub(AcqRel)`; the check that a part
-  ends once is made in debug builds only (Java has none), and a part outside the round is refused in every build.
-  `Join::arm_owned` is Java's `expect` for a cell its owner knows is quiet: a release store of the count, after the
-  values a cut-short round left are dropped; `is_idle` says whether a round is armed. Java's design implies the owner-only
-  force: `expect` is unconditional and a killed frame simply never arrives, so a killed picture's join is re-armed
-  by its owner rather than made to `abandon` every unended part. `reset` keeps its check (one `AcqRel` compare-and-set).
-  `Join::discard_round(&mut self)` is the safe form for an owner with exclusive access (a concluded picture): the
-  borrow proves that no frame holds a part. Deviation (missing Rust equivalent): `arm_owned` is `unsafe`, because a
-  Rust join has no collector to prove that no frame still holds a part.
+- **G17** `Join` (Java `Join`): an arrival writes its slot and does one `fetch_sub(AcqRel)`. Java has no check that a part
+  ends once; here a part is a **move-only token** (`Part`, handed out by `reset`, `Round::rearm`, `Join::once` and
+  `arm_owned`), consumed by `arrive` or `abandon`, and dropping it abandons. A double arrival does not compile, there is
+  no range check and no debug-only flag, and a killed unit drops its tokens so its round completes with `None`s.
+  Deviation (missing Rust equivalent): Java's `Join` is a shared object whose parts are bare indexes, safe only by the
+  caller's contract; in Rust that contract is undefined behaviour from safe code, so ending is by ownership, and a
+  part holds the join (an `Arc`) because there is no collector to keep it alive. `Join::arm_owned` is Java's `expect`
+  for a cell whose owner proved the previous round over: a release store of the count after the values a cut-short
+  round left are dropped; `unsafe`, because only the caller knows that no token of the old round will end.
+  `Join::discard_round(&mut self)` is the safe form for an owner with exclusive access (`Arc::get_mut`): no token
+  exists then. `is_idle` says whether a round is armed. `reset` keeps its check (one `AcqRel` compare-and-set).
 - **G7, G8, G9: the lake's two modes** (Java's lake, the `FrameLake` implementation). `idle_release` stays:
   `Duration::ZERO` keeps the sinks attached for life (Java `idleDetachNanos <= 0`); a positive value detaches them once
   no unit has been active for that long, and the next offer re-attaches a fresh set. The hot side is Java's:
