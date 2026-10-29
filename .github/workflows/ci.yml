@@ -60,5 +60,6 @@ jobs:
       - name: CUDA backend (built and linted; its tests skip with no device)
         if: runner.os == 'Linux'
         run: |
+          cargo clippy -p euhedral-memory --all-targets --features cuda -- -D warnings
           cargo clippy -p euhedral-gpu --all-targets --features cuda -- -D warnings
           cargo test -p euhedral-gpu --features cuda

@@ -235,12 +235,10 @@ struct PoolDone {
     result: io::Result<usize>,
 }
 
-#[allow(clippy::disallowed_types, reason = "HOT-FIX(I9)")]
-type PoolQueue = Arc<Mutex<VecDeque<PoolDone>>>;
-
 /// Delivers a pool job's result, or, if the job is dropped or panics first, an error.
 struct Delivery {
-    queue: PoolQueue,
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(I9)")]
+    queue: Arc<Mutex<VecDeque<PoolDone>>>,
     slot: u32,
     generation: u32,
     result: Option<io::Result<usize>>,
@@ -373,7 +371,8 @@ pub(super) struct Engine {
     #[allow(clippy::disallowed_types, reason = "HOT-FIX(I8)")]
     ready: Mutex<VecDeque<Failed>>,
     /// What open and rename jobs left.
-    pool_done: PoolQueue,
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(I9)")]
+    pool_done: Arc<Mutex<VecDeque<PoolDone>>>,
     /// Packets taken from the port and not yet handled (a poll stops when the caller has room for
     /// no more, and leaves the packets of slots whose call is still returning); only the polling
     /// thread touches it.

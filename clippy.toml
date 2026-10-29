@@ -8,6 +8,9 @@
 # - `JAVA-BACKOFF`: a back-off the upstream design has too (idle parks, the spin-wait of the hot receiver);
 # - a test fixture.
 #
+# `Once`, `OnceLock` and `LazyLock` are lifecycle state (the audit's C34 and H11): they are set at build or attach time
+# or on first use before any frame, and a read of an initialised cell is one acquire load. They are not listed.
+#
 # A crate with a `clippy.toml` of its own repeats the entries (`euhedral-graph`, `euhedral-io`, `euhedral-gpu`).
 disallowed-types = [
     { path = "std::sync::Mutex", reason = "no locks on the hot path: use LifecycleMutex for start, stop and rebalance" },
@@ -17,6 +20,17 @@ disallowed-types = [
     { path = "std::sync::mpsc::Sender", reason = "no channels on the hot path" },
     { path = "std::sync::mpsc::SyncSender", reason = "no channels on the hot path" },
     { path = "std::sync::mpsc::Receiver", reason = "no channels on the hot path" },
+    # Lock crates the workspace does not use today; listed so adding one meets the lint (`allow-invalid`: the crate may be absent).
+    { path = "parking_lot::Mutex", reason = "no locks on the hot path", allow-invalid = true },
+    { path = "parking_lot::RwLock", reason = "no locks on the hot path", allow-invalid = true },
+    { path = "parking_lot::FairMutex", reason = "no locks on the hot path", allow-invalid = true },
+    { path = "parking_lot::ReentrantMutex", reason = "no locks on the hot path", allow-invalid = true },
+    { path = "parking_lot::Condvar", reason = "nothing on the hot path waits", allow-invalid = true },
+    { path = "spin::Mutex", reason = "no locks or spin locks on the hot path", allow-invalid = true },
+    { path = "spin::RwLock", reason = "no locks or spin locks on the hot path", allow-invalid = true },
+    { path = "lock_api::Mutex", reason = "no locks on the hot path", allow-invalid = true },
+    { path = "lock_api::RwLock", reason = "no locks on the hot path", allow-invalid = true },
+    { path = "lock_api::ReentrantMutex", reason = "no locks on the hot path", allow-invalid = true },
 ]
 disallowed-methods = [
     { path = "std::thread::park", reason = "nothing on the hot path parks" },
