@@ -7,3 +7,9 @@ readme = "README.md"
 license = "Apache-2.0"
 
 [dependencies]
+
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
