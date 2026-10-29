@@ -3,6 +3,25 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## `Join` removed: fan-in is a count on the shared object (2026-10-29)
+
+**What.** `euhedral-graph`'s `Join`, `Part`, `Parts` and `Round` are gone (**breaking**), with `tests/join_alloc.rs` and
+the `join::loom` CI step.
+
+**Why.** A fan-in needs nothing more than a counter the branches share. Java's `Join` is 49 lines (`pending`, the first
+failure, a continuation); the Rust one had grown to 578 lines of value slots, move-only part tokens, rounds and re-arming.
+Each of those is already given elsewhere: the frame lifecycle runs `do_finally` exactly once whether the frame finished
+or was killed, so it is the arrival and needs no token; results belong in fields of the object the branches share;
+re-arming is one store of the count before the branches are published.
+
+**How to use it.** Put `pending: AtomicU32` and the result fields on the shared object (a picture, a pair, a lease).
+Store the branch count before publishing the branches. Each branch writes its field, then
+`if pending.fetch_sub(1, Ordering::AcqRel) == 1 { /* run the next step */ }` where its frame ends. The read-modify-write
+chain makes every branch's write visible to the last one, as an `Arc`'s last drop sees every earlier write.
+
+**Tests.** `tests/credit_graph.rs`' pool lease is now such a count (`Lease`: the item's drop is its retirement end, the
+staged item's drop its sent-or-dropped end), and the test no longer takes a `Mutex` around the lease's parts.
+
 ## Sequencer on Java's terms: any thread offers, the order grows, the entry is the caller's (2026-10-29)
 
 **What.** `Sequencer<E: Entry>` is Java's `Sequencer` again. **Breaking:** `Registrar`, the fixed ring with its capacity

@@ -7,8 +7,9 @@
 //!   -submission-> compute (unordered, either compute queue). The compute's submission completes
 //!   the item's `Sequencer` slot, whose in-order release offers the pack (ordered), whose
 //!   completion sends (ordered), whose completion puts the packet on the wire.
-//! - **The pool lease** of an item is a `Join` of its retirement (boundary reached) and its
-//!   sent-or-dropped end; its continuation frees the pool slot, which may admit the next item.
+//! - **The pool lease** of an item is a count of two ends shared by the item and what it hands on:
+//!   its retirement (boundary reached) and its sent-or-dropped end. The end that brings the count to
+//!   zero frees the pool slot, which may admit the next item.
 //! - **Admission** = credit horizon and pool (16), from the control lane (credits, seeks) and from
 //!   lease releases.
 //! - **The fake consumer** (the harness, on the test thread) plays 120 items a second, credits 1 s
@@ -36,7 +37,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
@@ -49,9 +50,9 @@ use euhedral_core::impls::BaseCloneableObject;
 use euhedral_core::ingest::{IngestSink, QueueIngestSink};
 use euhedral_graph::testing::FakeDevice;
 use euhedral_graph::{
-    Completions, DEFAULT_RETRY_BACKSTOP, EdgeKind, GraphRuntime, Join, Lake, LaneId, LanePool,
-    Marker, Part, QuantumOutcome, Sequencer, Slot, Stage, StageCx, StageError, StageGraph,
-    StageGraphSpec, StageSpec, Submitted, Ticket,
+    Completions, DEFAULT_RETRY_BACKSTOP, EdgeKind, GraphRuntime, Lake, LaneId, LanePool, Marker,
+    QuantumOutcome, Sequencer, Slot, Stage, StageCx, StageError, StageGraph, StageGraphSpec,
+    StageSpec, Submitted, Ticket,
 };
 use euhedral_hardware_utils::affinity;
 
@@ -214,8 +215,41 @@ struct Staged {
     seq: u64,
     kill: Arc<AtomicBool>,
     marker: Marker,
-    /// Part 1 of the item's lease: the item was sent.
-    sent: Part<()>,
+    /// The item's lease. Dropping the staged item is its sent-or-dropped end.
+    lease: Arc<Lease>,
+}
+
+impl Drop for Staged {
+    fn drop(&mut self) {
+        self.lease.end();
+    }
+}
+
+/// The pool lease of an item: two ends, its retirement and its sent-or-dropped end. Whichever ends
+/// last frees the pool slot.
+struct Lease {
+    pending: AtomicU32,
+    /// Stored by the send before its end; read by the last end after its `fetch_sub`.
+    sent: AtomicBool,
+    ctx: Weak<Ctx>,
+}
+
+impl Lease {
+    fn new(ctx: Weak<Ctx>) -> Arc<Self> {
+        Arc::new(Self {
+            pending: AtomicU32::new(2),
+            sent: AtomicBool::new(false),
+            ctx,
+        })
+    }
+
+    fn end(&self) {
+        if self.pending.fetch_sub(1, Ordering::AcqRel) == 1
+            && let Some(ctx) = self.ctx.upgrade()
+        {
+            ctx.release(self.sent.load(Ordering::Relaxed));
+        }
+    }
 }
 
 /// The quantum: one item of one generation.
@@ -224,21 +258,26 @@ struct Item {
     seq: u64,
     kill: Arc<AtomicBool>,
     slot: Mutex<Option<Slot<Staged>>>,
-    /// Part 0 of the lease: the quantum retired.
-    retired: Mutex<Option<Part<()>>>,
-    /// Part 1: the item was sent (a value) or dropped after admission (none).
-    sent: Mutex<Option<Part<()>>>,
+    /// The lease. Dropping the item is its retirement end; while the item holds its slot, the
+    /// sent-or-dropped end is the item's too.
+    lease: Arc<Lease>,
 }
 
 impl Item {
-    /// The item will never reach the sequencer: its slot is abandoned and its sent part ends empty.
+    /// The item will never reach the sequencer: its slot is abandoned and its sent-or-dropped end
+    /// ends unsent.
     fn drop_slot(&self) {
         if let Some(slot) = lock(&self.slot).take() {
             slot.abandon();
-            if let Some(sent) = lock(&self.sent).take() {
-                sent.abandon();
-            }
+            self.lease.end();
         }
+    }
+}
+
+impl Drop for Item {
+    fn drop(&mut self) {
+        self.drop_slot();
+        self.lease.end();
     }
 }
 
@@ -291,13 +330,12 @@ impl Stage<Item> for Compute {
                 ref kill,
                 ..
             } = *item;
-            let sent = lock(&item.sent).take().expect("the item was not sent yet");
             slot.complete(Staged {
                 generation,
                 seq,
                 kill: kill.clone(),
                 marker,
-                sent,
+                lease: item.lease.clone(),
             });
         }
         Ok(Submitted::marker(marker))
@@ -445,10 +483,7 @@ impl Ctx {
                         _ = ctx.counts.failed_outcomes.fetch_add(1, Ordering::Relaxed)
                     }
                 }
-                item.drop_slot();
-                if let Some(retired) = lock(&item.retired).take() {
-                    retired.arrive(());
-                }
+                drop(item);
             },
         )
         .expect("a valid graph");
@@ -495,21 +530,13 @@ impl Ctx {
         self.counts
             .max_in_flight
             .fetch_max(link.in_flight, Ordering::Relaxed);
-        let me = self.me.clone();
-        let mut lease = Join::once(2, move |parts: Vec<Option<()>>| {
-            if let Some(ctx) = me.upgrade() {
-                ctx.release(parts[1].is_some());
-            }
-        });
-        let (retired, sent) = (lease.next(), lease.next());
         let slot = self.sequencer.get().expect("the sequencer").register();
         let item = Item {
             generation: link.generation,
             seq,
             kill: link.kill.clone(),
             slot: Mutex::new(Some(slot)),
-            retired: Mutex::new(retired),
-            sent: Mutex::new(sent),
+            lease: Lease::new(self.me.clone()),
         };
         Some((item, link.kill.clone()))
     }
@@ -590,7 +617,7 @@ impl Frame for Pack {
     fn do_finally(mut self: Box<Self>) {
         let ready = self.ready.take().expect("once");
         if !self.header.is_alive() {
-            return ready.sent.abandon();
+            return;
         }
         hop(3, ready.generation, ready.seq);
         let marker = self
@@ -619,7 +646,7 @@ impl Frame for Dispatch {
     fn do_finally(mut self: Box<Self>) {
         let ready = self.ready.take().expect("once");
         if !self.header.is_alive() {
-            return ready.sent.abandon();
+            return;
         }
         hop(4, ready.generation, ready.seq);
         let marker = self.ctx.device.submit(NIC, SEND, &[]);
@@ -644,11 +671,11 @@ impl Frame for Sent {
     fn do_finally(mut self: Box<Self>) {
         let ready = self.ready.take().expect("once");
         hop(5, ready.generation, ready.seq);
+        ready.lease.sent.store(true, Ordering::Relaxed);
         lock(&self.ctx.wire).push_back(Msg::Packet {
             generation: ready.generation,
             seq: ready.seq,
         });
-        ready.sent.arrive(());
     }
 }
 

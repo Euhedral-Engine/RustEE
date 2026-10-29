@@ -447,12 +447,10 @@ the prefix of ready entries, in order, on its own thread. `Progress` is an entry
 abandoned: an abandoned entry concludes with nothing); a `Ticket` is an entry that carries a value, and a `Slot` its
 holder's handle (completing it or dropping it).
 
-**Join, fan-in cell, join part, Round** ([`Join`](euhedral-graph/src/join.rs)): a fan-in that waits
-for no one. A round is armed with its part count (`reset`); each part arrives with a value or is
-abandoned, from any thread, and the last arrival runs the continuation once with every part's value
-(`None` for an abandoned part). The cell has a fixed capacity and is armed again without allocating,
-so it can live inside a pooled object. The continuation receives a `Round`, which lends the values and
-whose `rearm` starts the next round.
+**fan-in**: branches that meet. No type of its own: the object the branches share carries a `pending` count and plain
+result fields, armed with one store of the branch count before the branches are published; each branch writes its field
+and ends with one `fetch_sub(1, AcqRel)` where its frame ends (`do_finally`), and the branch that reads 1 runs the next
+step.
 
 **lake, sink, unit, UnitGuard** ([`Lake`](euhedral-graph/src/lake.rs),
 [`UnitGuard`](euhedral-graph/src/lake.rs)): the pool of ready work of one kind (stage frames, host

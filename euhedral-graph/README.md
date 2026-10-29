@@ -19,7 +19,6 @@ so it needs no thread of its own. It does not re-export `euhedral-core`: import 
 |---|---|
 | [`completions`](src/completions.rs) | `Completions`, a `LatticeSource` of continuation frames behind completions: markers, timers, `Ready` tokens and `Pending` operations. |
 | [`sequencer`](src/sequencer.rs) | `Sequencer`, `Entry`, `Progress`, `Ticket` and `Slot`: execute in any order, conclude in offer order (Java's order queue and work-in-progress drain; any thread offers, no lock, no refusal). |
-| [`join`](src/join.rs) | `Join`, `Round`: a re-armable fan-in cell; the continuation runs when its last part arrives. |
 | [`lake`](src/lake.rs) | `Lake`, `UnitGuard` and `LakeClosed`: the pool of ready work of one kind, as several ingest sinks that attach to the lattice for a busy period; offering reads the attached set with no lock. A `FrameSink`. |
 | [`lanes`](src/lanes.rs) | `LanePool`, `LanePoolBuilder`, `LaneId`, `Marker` and the trait `DeviceQueue`: device timelines that are queried, never waited on. |
 | [`lane_source`](src/lane_source/mod.rs) | `LaneSource`, a `LatticeSource` per device lane; the traits it drives (`LaneSubmit`, `LaneState`, `LaneWork` with `Outcome` and `LaneCx`); `LaneIntakes`, `LaneInputs`, `Deliver` and `GroupId` for delivery; `LaneMetrics`. |
@@ -283,7 +282,7 @@ lattice.close();
 A frame hands a result back to the main thread with a `one_shot` (`euhedral_data_structures::sync`): the frame
 `send`s, and the main thread checks `is_set` or `try_take` periodically. Nothing in the crate blocks.
 
-### Sequencer and Join
+### Sequencer and fan-in
 
 A `Sequencer<E: Entry>` (Java's `Sequencer`) concludes entries in the order they were offered, whatever order they
 complete in. `offer(entry)` appends to the order from any thread (the order is a growing multi-producer queue, so an
@@ -296,11 +295,11 @@ For callers without an entry type of their own, `Sequencer::ordered(emit)` makes
 value, and `register()` offers a ticket and returns its `Slot`: complete it with a value or abandon it (dropping it
 abandons it), from any thread. `register` allocates the ticket.
 
-A `Join<T>` is a continuation that runs on the thread of its last arrival, after `parts` parts
-arrived or were abandoned. Neither is a queue, and neither blocks. `Join::once` makes a join of one
-round and hands out its `Part`s. A `Part` is a token moved to its branch: `arrive(value)` or `abandon()` consumes it, so a part ends once (a second arrival does not compile), and dropping it abandons. `Join::with_capacity` makes a cell (an `Arc<Join>`) for a pooled unit: `reset(parts)` arms a round and returns its parts, and the
-continuation receives a `Round` of the values and calls `rearm(parts)` for the next one (it returns the next round's parts). Arming and
-arriving take no lock and allocate nothing.
+Fan-in needs no type of its own. The object the branches share (a picture, a pair) carries a `pending` count and
+plain result fields: arming is one store of the branch count before the branches are published, each branch writes
+its field and ends with one `fetch_sub(1, AcqRel)` where its frame ends (`do_finally`, which runs once whether the
+frame finished or was killed), and the branch that reads 1 runs the next step. The read-modify-write chain makes every
+branch's field visible to that last one, as an `Arc`'s last drop sees every earlier write.
 
 ## Build and test
 
@@ -313,7 +312,7 @@ Windows.
 
 The tests are unit tests in each module (the stage graph's drives its sources by hand), the fake
 device's, and `tests/credit_graph.rs`: one lattice of 4 workers, with a per-item
-stage graph, a `Sequencer`, a `Join` as the pool lease, credit-bounded admission, a seek and a
+stage graph, a `Sequencer`, a two-end count as the pool lease, credit-bounded admission, a seek and a
 pause, and a timing executor that fails the test if any frame callback runs over 200 µs without
 the OS preempting it. It takes a few seconds and runs on the CPUs in `EUHEDRAL_TEST_CPUS` (default
 `0,1,2,3`); as with `euhedral-core`'s tests that need particular hardware, it passes without

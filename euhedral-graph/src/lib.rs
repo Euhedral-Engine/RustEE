@@ -16,7 +16,6 @@
 //! |---|---|---|
 //! | [`Completions`] | [`completions`] | completions found by polls |
 //! | [`Sequencer`] | [`sequencer`] | execute in any order, conclude in offer order |
-//! | [`Join`], [`Part`], [`Parts`], [`Round`] | [`join`] | re-armable run-time fan-in: the last arrival runs the continuation |
 //! | [`LanePool`], [`Marker`], [`DeviceQueue`] | [`lanes`] | device lanes and markers |
 //! | [`StageGraph`] | [`stage_graph`] | static stage DAGs run per quantum |
 //! | [`Lake`], [`UnitGuard`] | [`lake`] | the pool of ready work of one kind |
@@ -27,7 +26,7 @@
 //! Feature: `testing` adds `testing::FakeDevice`. Asynchronous file and socket I/O (`AsyncIo`) is in
 //! `euhedral-io`.
 
-// `ThreadUsage` makes system calls and `Join` shares its part slots across threads, each with a
+// `ThreadUsage` makes system calls and `Sequencer` shares its entries across threads, each with a
 // `// SAFETY:` comment; nowhere else.
 #![deny(unsafe_code)]
 #![cfg_attr(
@@ -39,7 +38,6 @@
     )
 )]
 pub mod completions;
-pub mod join;
 pub mod lake;
 pub mod lane_source;
 pub mod lanes;
@@ -50,7 +48,6 @@ pub(crate) mod sync;
 pub mod testing;
 
 pub use completions::{Completions, Pending, Ready};
-pub use join::{Join, Part, Parts, Round};
 pub use lake::{Lake, LakeClosed, UnitGuard};
 pub use lane_source::{
     Deliver, GroupId, LaneClosed, LaneCx, LaneInputs, LaneIntakes, LaneMetrics, LaneSource,
