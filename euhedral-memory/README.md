@@ -8,8 +8,10 @@ A location-agnostic memory and residency planner for the RustEE control plane, a
 
 **Where it sits.** It builds on [`euhedral-core`](../euhedral-core) (`LatticeSource`, `RunnableFrame`: give-back orders are
 frames), [`euhedral-data-structures`](../euhedral-data-structures) (lock-free queues) and
-[`euhedral-hashing`](../euhedral-hashing). Nothing in the workspace depends on it. Feature `cuda` adds the CUDA backends,
-with `libcuda.so.1` loaded by `dlopen` at run time (no toolkit, no link-time dependency).
+[`euhedral-hashing`](../euhedral-hashing), and [`euhedral-graph`](../euhedral-graph) for markers. [`euhedral-gpu`](../euhedral-gpu)
+builds on it: it takes this crate's shared `cuda::Driver` and `Device`, so both share one loaded driver and one primary
+context. Feature `cuda` adds the CUDA backends, with `libcuda.so.1` loaded by `dlopen` at run time (no toolkit, no
+link-time dependency).
 
 ## Modules
 
@@ -20,7 +22,7 @@ with `libcuda.so.1` loaded by `dlopen` at run time (no toolkit, no link-time dep
 | [`arena`](src/arena.rs) | `SlotArena` / `SlotLease`, `ScratchArena` / `ScratchLease`, `BackendCalls`. |
 | [`tiers`](src/tiers.rs) | `TierPool`, `Mover` and the `Moves` lattice source, `ResidentId`, `MoveDone`, the `Copier` trait, `HostCopier`, `MarkerRetired`. |
 | [`backend`](src/backend.rs) | The `Backend` trait, `Block`, `Allocation`, `Reaper` and `Retired`. |
-| [`cuda`](src/cuda/mod.rs) (feature `cuda`) | `Driver`, `Device` (primary context, `import_fd` for Vulkan-exported memory), `DeviceMemory`, `StreamPool`, `Vmm` (POSIX-fd export), `PinnedHost`, `StreamCopier` (the tiers' device copies). |
+| [`cuda`](src/cuda/mod.rs) (feature `cuda`) | `Driver` (`Driver::shared()`: the process's one loaded driver; `Driver::symbol`: entry points beyond its table), `Device` (primary context, `import_fd` for Vulkan-exported memory), `DeviceMemory`, `StreamPool`, `Vmm` (POSIX-fd export), `PinnedHost`, `StreamCopier` (the tiers' device copies). |
 
 ## Key concepts
 

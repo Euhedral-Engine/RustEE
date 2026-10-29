@@ -3,6 +3,65 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## `Marker` names its queue (2026-10-28)
+
+**What.** `euhedral-graph`: `Marker` gained `queue: QueueId`, and `Marker::new(queue, lane, value)`. `QueueId` is an opaque,
+non-zero identity drawn with `QueueId::next()` from one process-wide counter. `DeviceQueue` gained `fn id(&self) -> QueueId`.
+**Breaking** for code that builds a marker with a struct literal (`Marker { lane, value }`) or implements `DeviceQueue`:
+draw an id once per queue, return it from `id()`, and stamp it on the markers the queue makes (`Marker::new`).
+`LanePool::reached` is false for a marker whose queue is not the lane's (or whose lane the pool does not have);
+`FakeDevice` and `MarkerRetired` check the same. `euhedral-gpu`'s `await_marker` refuses a marker of another pool with
+`Err(Invalid)`, and its `RetireTicket` carries the stream's `QueueId`.
+
+**Why.** A marker named only a lane and a value, so a marker of another pool, with a lane in range and a value already
+done, looked like one of this pool and could be treated as done.
+
+**Tests.** `a_marker_of_another_queue_or_lane_is_never_reached`, `queue_ids_are_unique_and_non_zero` (`euhedral-graph`);
+`a_marker_of_another_pool_is_refused_not_treated_as_done` (`euhedral-gpu`, fake and CUDA).
+
+## GPU access: `euhedral-gpu` (2026-10-28)
+
+**What.**
+- A new workspace member, `euhedral-gpu`: backend-neutral, asynchronous GPU access on the lattice, with a stepped fake
+  backend (feature `fake`) and a CUDA backend (feature `cuda`).
+  - A stream is a shared, `Sync` queue (`DeviceQueue`, held by the `LanePool`) and a single-owner submitter (`Stream`:
+    `Send`, not `Sync`). `submit`, `mark`, `await_marker`, `notify_retired`, `confirm_retired` and `Graph::replay`
+    take `&mut`, so ownership replaces locking: `euhedral-gpu`'s own submission, marker, retirement and replay paths take no lock (the lock-free chunk pool's try-lock and `Completions`' internal locks are tracked by the separate lock audit). `submit` enqueues launches, copies and
+    memsets; `mark` and `await_marker` order work across streams on the device.
+  - `notify_retired` arms a completion point with the stream callback (`cuStreamAddCallback`, required at load; it reports
+    the device status exactly once, even after a fault). The driver's callback only pushes the outcome onto the stream's
+    unbounded, lock-free MPSC queue (pooled chunks, no allocation or free in steady state); the owner drains it with
+    `poll_retired` and tells the listeners inside the owning source's `request` or `pull`. `arm_retirement` is the listener-free form. `retire_into` takes the
+    submitter by value, turns the retirement into a frame of a `Completions`, and hands the submitter back to the
+    continuation with the ticket; `OnceFrame` runs an `FnOnce` that owns it. `confirm_retired` is a submitter method.
+  - A `Module` loads from source (NVRTC, loaded at run time, cached under a content hash) or from a prebuilt image
+    (PTX, cubin, fatbin). `Args` packs typed arguments; the driver's parameter sizes are checked before a launch.
+  - `Gpu::record`, `fingerprint`, `update` and `rerecord` record a recurring sequence on shadow streams, probe its
+    shape, set new argument values in place and re-record it; `Graph::replay` launches it on any stream.
+  - A device fault poisons the device; later calls fail fast with the cause.
+- `euhedral-memory`: `cuda::Driver::shared()` (one library and one primary context per process) and
+  `Driver::symbol(name)` (an entry point beyond the loaded table).
+- The workspace layering is a test (`euhedral-gpu/tests/layering.rs`): a crate depends only on lower layers, through
+  any dependency table. CI builds, lints and tests the `cuda` feature on Linux.
+
+**Why.** Programs on the lattice drive a GPU without a frame ever blocking on it. Each application would otherwise
+write its own submission, completion and interop layer.
+
+**Use.** Open a device (`CudaGpu::open(0)`), load kernels with `CudaModule::from_source` or `from_image` at start-up,
+open streams with `open_lanes`, and submit from any worker. See the [crate README](euhedral-gpu/README.md) and the
+program `examples/graph_replay.rs`.
+
+**Tests.**
+- `cargo test -p euhedral-gpu` (no device): unit tests; `tests/layering.rs`; `tests/fake_streams.rs` (ordering,
+  markers across streams, retirement once and in order, kept values, contiguous concurrent submissions, faults and
+  poisoning, `retire_into` on a poisoned device); `tests/fake_graph.rs` (record, probe, update, re-record, replay).
+- `--features cuda`, with a device: `tests/cuda.rs` (streams, retirement, NVRTC, modules and the cache, launches
+  against the CPU bit for bit, cross-stream markers, the marker ring), `tests/cuda_graph.rs` (record, replay, updates
+  in flight, re-record, a failed capture), and `tests/cuda_fault.rs` (a deliberate fault, in its own process). Without
+  a device they skip, passing.
+- The example `graph_replay` replays a recorded graph 100 times with changing arguments and checks each result against
+  a CPU reference.
+
 ## `AsyncIo` moves to its own crate, `euhedral-io` (2026-10-28)
 
 **What.** `euhedral-graph`'s `io` module (the `AsyncIo` API, the io_uring engine, the Windows IoRing and completion

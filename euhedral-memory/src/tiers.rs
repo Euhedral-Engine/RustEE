@@ -107,7 +107,8 @@ impl Copier for HostCopier {
     }
 }
 
-/// A lane's marker as a completion test: retired once the lane's queue completed it.
+/// A lane's marker as a completion test: retired once the lane's queue completed it. A marker of another queue is
+/// never retired.
 pub struct MarkerRetired {
     pub queue: Arc<dyn DeviceQueue>,
     pub marker: Marker,
@@ -123,7 +124,7 @@ impl fmt::Debug for MarkerRetired {
 
 impl Retired for MarkerRetired {
     fn retired(&self) -> bool {
-        self.queue.completed() >= self.marker.value
+        self.queue.id() == self.marker.queue && self.queue.completed() >= self.marker.value
     }
 }
 

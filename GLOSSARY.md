@@ -312,8 +312,9 @@ runs its submissions in order and whose progress is one cheap read (`completed`)
 with a timeline semaphore, a CUDA stream with events, a hardware codec engine, or a fake
 ([`FakeDevice`](euhedral-graph/src/testing.rs)).
 
-**marker** ([`Marker`](euhedral-graph/src/lanes.rs)): a lane and a value on its timeline: the lane's
-work up to that value. Copyable; querying it never blocks. A successor on another lane orders itself
+**marker** ([`Marker`](euhedral-graph/src/lanes.rs)): a queue ([`QueueId`](euhedral-graph/src/lanes.rs), an opaque
+identity unique in the process), a lane and a value on its timeline: the lane's work up to that value. A marker of
+another queue is never reached by a `LanePool` and is refused by a backend's await. Copyable; querying it never blocks. A successor on another lane orders itself
 behind a marker on the device.
 
 **LanePool** ([`LanePool`](euhedral-graph/src/lanes.rs), [`LaneId`](euhedral-graph/src/lanes.rs)):
@@ -564,3 +565,48 @@ what allocates at a location. The CUDA backends (feature `cuda`, the driver load
 
 **reaper** ([`Reaper`](euhedral-memory/src/backend.rs)): frees queued behind the device work that
 last used the memory (a `Retired` test, such as a lane's marker), freed by `reap` on the owner's lane.
+
+## GPU
+
+**GPU stream** ([`Stream`](euhedral-gpu/src/api.rs), [`CudaStream`](euhedral-gpu/src/cuda/stream.rs)): an ordered
+queue of device work and a lane of a `LanePool`, split in two. Its **queue** (`DeviceQueue`, shared and `Sync`) is what
+the pool and `Completions` hold. Its **submitter** (`Stream`) is `Send`, not `Sync`, and has one owner: `submit`,
+`mark`, `await_marker`, `notify_retired`, `confirm_retired` and a graph's `replay` take `&mut`, so ownership replaces
+locking. `submit` runs a closure that enqueues launches, copies and memsets; one submission's operations are contiguous
+on the stream. `mark` and `await_marker` order work across streams on the device. Work for a stream from another thread
+goes to its owner, or to another lane.
+
+**retirement** ([`notify_retired`, `confirm_retired`, `RetireTicket`](euhedral-gpu/src/api.rs),
+[`retire_into`](euhedral-gpu/src/retire.rs)): the device reaching a point after the work submitted so far. The
+driver's callback only pushes the outcome onto the stream's unbounded lock-free MPSC queue (no allocation, free or
+lock); the owning source drains it with `poll_retired` (in its `request` or `pull`) and tells the listeners, in order;
+`confirm_retired` settles the ticket (a submitter method) and returns the device failure, or none; `retire_into` makes the retirement a frame of a
+`Completions`, and the submitter travels with its continuation. A stage finishing its submission is never completion.
+
+**poisoned device** ([`Poison`](euhedral-gpu/src/poison.rs), [`GpuError::Poisoned`](euhedral-gpu/src/error.rs)): a
+device that faulted (an illegal address, a launch failure). The first fault is kept; later submissions fail fast with
+it, and every marker reads as reached so no continuation is stranded.
+
+**module** ([`Module`](euhedral-gpu/src/api.rs), [`ModuleCache`](euhedral-gpu/src/module_cache.rs)): kernels the
+application brings, loaded at run time by `from_source` (compiled with the run-time compiler, cached under a hash of
+the source, options, headers, include paths, target and compiler version) or `from_image` (PTX, cubin or fatbin).
+Loading blocks: it is a build-time call.
+
+**kernel arguments** ([`Args`, `KernelArg`](euhedral-gpu/src/args.rs)): a typed builder that packs a launch's
+arguments, each at its own alignment. A launch whose arguments do not fit the kernel's parameter sizes is refused
+before the driver sees it.
+
+**sequence** ([`Sequence`](euhedral-gpu/src/api.rs)): a recurring set of submissions over fixed streams, written once
+as a closure and run in three passes: record (for real, and captured), probe (its fingerprint only) and update (new
+argument values, launch *n* to launch *n*).
+
+**graph** ([`Graph`](euhedral-gpu/src/api.rs), [`CudaGraph`](euhedral-gpu/src/cuda/graph.rs)): a recorded sequence.
+`replay` launches it as one submission on any stream; `Gpu::update` sets new argument values in place;
+`Gpu::rerecord` records it again, in place when the driver can update the executable and otherwise as a new one.
+
+**shape and fingerprint** ([`ShapeHasher`, `Fingerprint`](euhedral-gpu/src/shape.rs)): the shape of a sequence is its
+operations in order with their streams, order edges, kernels, geometry, argument layouts and copy parameters; the
+fingerprint is 128 bits of it. A changed shape is `GpuError::ShapeChanged`.
+
+**shadow stream** ([`CudaSequence`](euhedral-gpu/src/cuda/graph.rs)): the stream a recording captures a stream's work
+on, so the real stream is never in capture mode and a failed capture never disturbs the work.

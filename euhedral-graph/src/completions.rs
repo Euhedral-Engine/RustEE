@@ -258,7 +258,8 @@ impl Completions {
         self.add(Waits::Ready(ready, frame));
     }
 
-    /// Emits `frame` once `marker`'s work completed (a completion edge on a device lane).
+    /// Emits `frame` once `marker`'s work completed (a completion edge on a device lane). A marker of a queue that
+    /// is not in this source's pool is never reached, so its frame is never emitted.
     pub fn after_marker(&self, marker: Marker, frame: Box<dyn Frame>) {
         self.add(Waits::Marker(marker, frame));
     }
@@ -491,15 +492,29 @@ mod tests {
     use euhedral_core::frames::FrameHeader;
 
     use super::*;
-    use crate::{DeviceQueue, LaneId};
+    use crate::{DeviceQueue, LaneId, QueueId};
 
     /// A lane whose completed value a test sets by hand.
-    #[derive(Debug, Default)]
+    #[derive(Debug)]
     struct HandLane {
+        id: QueueId,
         completed: AtomicU64,
     }
 
+    impl Default for HandLane {
+        fn default() -> Self {
+            Self {
+                id: QueueId::next(),
+                completed: AtomicU64::new(0),
+            }
+        }
+    }
+
     impl DeviceQueue for HandLane {
+        fn id(&self) -> QueueId {
+            self.id
+        }
+
         fn completed(&self) -> u64 {
             self.completed.load(Ordering::Acquire)
         }
@@ -593,21 +608,9 @@ mod tests {
     fn completed_operations_are_emitted_in_registration_order() {
         let (completions, lane) = setup();
         let late = Token::default();
-        completions.after_marker(
-            Marker {
-                lane: LaneId(0),
-                value: 2,
-            },
-            tagged(10),
-        );
+        completions.after_marker(Marker::new(lane.id, LaneId(0), 2), tagged(10));
         completions.after(Box::new(late.clone()), tagged(11));
-        completions.after_marker(
-            Marker {
-                lane: LaneId(0),
-                value: 1,
-            },
-            tagged(12),
-        );
+        completions.after_marker(Marker::new(lane.id, LaneId(0), 1), tagged(12));
         completions.at(Instant::now(), tagged(13));
         assert_eq!(poll(&completions), [13]);
         lane.completed.store(2, Ordering::Release);

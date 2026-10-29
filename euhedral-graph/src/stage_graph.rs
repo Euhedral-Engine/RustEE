@@ -350,10 +350,13 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Adds `marker` to `markers`, keeping the latest per lane (a lane runs in order, so it covers the
-/// earlier ones).
+/// Adds `marker` to `markers`, keeping the latest per queue and lane (a lane runs in order, so it covers
+/// the earlier ones).
 fn merge(markers: &mut Vec<Marker>, marker: Marker) {
-    match markers.iter_mut().find(|m| m.lane == marker.lane) {
+    match markers
+        .iter_mut()
+        .find(|m| m.queue == marker.queue && m.lane == marker.lane)
+    {
         Some(m) => m.value = m.value.max(marker.value),
         None => markers.push(marker),
     }
@@ -1283,13 +1286,24 @@ mod tests {
     use euhedral_core::ingest::{IngestSink, QueueIngestSink};
 
     use super::*;
-    use crate::DeviceQueue;
+    use crate::{DeviceQueue, QueueId};
 
     /// A lane whose work completes when the test says so.
-    #[derive(Debug, Default)]
+    #[derive(Debug)]
     struct HandLane {
+        id: QueueId,
         submitted: AtomicU64,
         completed: AtomicU64,
+    }
+
+    impl Default for HandLane {
+        fn default() -> Self {
+            Self {
+                id: QueueId::next(),
+                submitted: AtomicU64::new(0),
+                completed: AtomicU64::new(0),
+            }
+        }
     }
 
     impl HandLane {
@@ -1304,6 +1318,10 @@ mod tests {
     }
 
     impl DeviceQueue for HandLane {
+        fn id(&self) -> QueueId {
+            self.id
+        }
+
         fn completed(&self) -> u64 {
             self.completed.load(Ordering::Acquire)
         }
@@ -1377,9 +1395,9 @@ mod tests {
             {
                 return Err(StageError::Retry);
             }
-            let marker = cx.lane.map(|lane| Marker {
-                lane,
-                value: self.hands[usize::from(lane.0)].submit(),
+            let marker = cx.lane.map(|lane| {
+                let hand = &self.hands[usize::from(lane.0)];
+                Marker::new(hand.id, lane, hand.submit())
             });
             match &self.act {
                 Act::Submit | Act::Retry(_) => Ok(Submitted {

@@ -3,13 +3,14 @@
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use crate::lanes::{DeviceQueue, LaneId, LanePool, Marker};
+use crate::lanes::{DeviceQueue, LaneId, LanePool, Marker, QueueId};
 
 /// A fake device queue: submissions run in order, each after the queue's earlier work and after the
 /// markers it waits for (on any lane of its pool), taking its given cost. A query is one comparison
 /// with the wall clock; nothing waits.
 #[derive(Debug)]
 pub struct FakeDevice {
+    id: QueueId,
     name: String,
     lane: LaneId,
     timelines: Arc<Timelines>,
@@ -18,6 +19,8 @@ pub struct FakeDevice {
 #[derive(Debug)]
 struct Timelines {
     start: Instant,
+    /// Each lane's queue identity: a marker of another queue is no lane of this pool.
+    ids: Vec<QueueId>,
     /// Per lane: when each submitted value completes (value k at index k − 1), in ns from `start`.
     done_at: Mutex<Vec<Vec<u64>>>,
 }
@@ -26,8 +29,10 @@ impl FakeDevice {
     /// A pool of fake lanes named `names` (lane i is `names[i]`), sharing one timeline so that
     /// cross-lane waits work.
     pub fn pool(names: &[&str]) -> (Arc<LanePool>, Vec<Arc<FakeDevice>>) {
+        let ids: Vec<QueueId> = names.iter().map(|_| QueueId::next()).collect();
         let timelines = Arc::new(Timelines {
             start: Instant::now(),
+            ids: ids.clone(),
             done_at: Mutex::new(vec![Vec::new(); names.len()]),
         });
         let devices: Vec<Arc<FakeDevice>> = names
@@ -35,6 +40,7 @@ impl FakeDevice {
             .enumerate()
             .map(|(i, name)| {
                 Arc::new(FakeDevice {
+                    id: ids[i],
                     name: (*name).to_owned(),
                     lane: LaneId(u16::try_from(i).expect("at most 64 lanes")),
                     timelines: timelines.clone(),
@@ -68,6 +74,10 @@ impl FakeDevice {
         let lane = usize::from(self.lane.0);
         let mut start = now.max(done_at[lane].last().copied().unwrap_or(0));
         for wait in waits {
+            // A marker of another pool names no lane here: it orders nothing.
+            if self.timelines.ids.get(usize::from(wait.lane.0)) != Some(&wait.queue) {
+                continue;
+            }
             let index = usize::try_from(wait.value).unwrap_or(usize::MAX);
             if let Some(&at) = index
                 .checked_sub(1)
@@ -78,10 +88,7 @@ impl FakeDevice {
         }
         let done = start.saturating_add(u64::try_from(cost.as_nanos()).unwrap_or(u64::MAX));
         done_at[lane].push(done);
-        Marker {
-            lane: self.lane,
-            value: done_at[lane].len() as u64,
-        }
+        Marker::new(self.id, self.lane, done_at[lane].len() as u64)
     }
 
     /// How long until `marker` completes (zero once it has; for a fake of a blocking wait).
@@ -95,6 +102,9 @@ impl FakeDevice {
 
     /// When `marker` completes, in ns from the pool's start (for tests).
     pub fn done_at_ns(&self, marker: Marker) -> Option<u64> {
+        if self.timelines.ids.get(usize::from(marker.lane.0)) != Some(&marker.queue) {
+            return None;
+        }
         let done_at = self
             .timelines
             .done_at
@@ -106,6 +116,10 @@ impl FakeDevice {
 }
 
 impl DeviceQueue for FakeDevice {
+    fn id(&self) -> QueueId {
+        self.id
+    }
+
     fn completed(&self) -> u64 {
         let now = self.now_ns();
         let done_at = self
