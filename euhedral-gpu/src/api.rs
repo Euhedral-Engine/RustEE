@@ -151,6 +151,10 @@ pub trait Stream: Send + Sized + 'static {
         f: impl FnOnce(&mut Self::Enqueue<'_>) -> Result<R, GpuError>,
     ) -> Result<R, GpuError>;
 
+    /// Waits for the work submitted so far, and the callbacks armed for it, to end. A shutdown aid: the default does
+    /// nothing, for a stream whose drop already waits and that has no state made against it to release first.
+    fn quiesce(&mut self) {}
+
     /// A marker after the work submitted so far. `Err(Busy)` (retry; this never waits) when the marker ring is full of
     /// markers that have not completed, or when the slot the marker would reuse is pinned by an awaiter on another
     /// lane.

@@ -52,9 +52,14 @@ pub struct Retired<E> {
 pub trait LaneSubmit: Send + 'static {
     type Error: std::error::Error + Send + Sync + 'static;
     /// The queue's raw handle, lent to an item that enqueues work of its own.
-    type Raw: Copy;
+    type Raw: Copy + 'static;
 
     fn lane(&self) -> LaneId;
+
+    /// Waits for the device work submitted so far, and what the backend still owes for it (callbacks), to end. The
+    /// lane source calls it once, when it is dropped, before the state's [`close`](LaneState::close); the default does
+    /// nothing, for a backend whose drop already waits.
+    fn quiesce(&mut self) {}
 
     /// The identity stamped on this lane's markers.
     fn id(&self) -> QueueId;
@@ -103,6 +108,15 @@ pub trait LaneState: Send + 'static {
 
     /// Whether `wait` is met. Asked once per request for each waiting head.
     fn met(&mut self, wait: &Self::Wait, now: Instant) -> bool;
+
+    /// Called once, when the lane source is dropped: after the device work submitted on the lane has ended
+    /// ([`LaneSubmit::quiesce`]) and before the state is dropped, which is before the submitter (and the queue it
+    /// owns) is destroyed. For state that was made against the queue and must be released against it: a session whose
+    /// IO streams are the lane's stream, say. `raw` is the submitter's [`Raw`](LaneSubmit::Raw) handle (the state does
+    /// not know its submitter's type, so it downcasts: `raw.downcast_ref::<CuStream>()`). The default does nothing.
+    fn close(&mut self, raw: &dyn std::any::Any) {
+        let _ = raw;
+    }
 }
 
 /// A lane with no state of its own: nothing to wait for.
