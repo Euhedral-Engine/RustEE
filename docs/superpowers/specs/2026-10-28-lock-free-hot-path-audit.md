@@ -63,7 +63,10 @@ counterpart):
   hold it. Rust has no garbage collector, so the old value is kept alive by a stand-in: `Published` (epochs), a
   recycled allocation, or keeping it until its owner drops.
 - **CONST**: written once (at construction or at first use) and never again: a plain field or a `SetOnce`.
-- **ATOMIC**: Java plain fields touched by one thread, shared in Rust between two closures: relaxed atomics.
+- **ATOMIC**: a Java atomic or CAS that stays one in Rust (the `COMPLETE` compare-and-set of a one-use source).
+- **OWNED**: Java plain fields touched by one thread. In Rust they are plain fields of the one thread's state, changed
+  through `&mut self`, with no atomic: another thread reads only a snapshot the owner publishes once per window or cycle,
+  never one per frame.
 - **FAN-IN**: written by many producers (completions and arrivals from any worker): Java's counts, set-once cells,
   one-shots and CAS stacks.
 - **THREAD**: state Java confines to one thread (a ring's submission side belongs to its submitting thread).
@@ -94,7 +97,8 @@ counterpart):
 | CLAIM | C4, C12, G1 | 3 |
 | PUBLISH | C5, C6, C8, C9, C10, G7 | 6 |
 | CONST | C1, G2 | 2 |
-| ATOMIC | C2, C3, C13 | 3 |
+| ATOMIC | C13 | 1 |
+| OWNED | C2, C3 | 2 |
 | FAN-IN | C14, G5, G6, G10, G11, G12, G13, G14, G15 | 9 |
 | THREAD | I4, I14, I15 | 3 |
 | SPLIT | I3, I6, I7, I8, I9, I13 | 6 |
@@ -224,8 +228,8 @@ request-side drain may also run after its `pull` releases the queue, as Java's `
 | ID | Class | Route | Reason |
 |---|---|---|---|
 | C1 | HOT | CONST | Java `LatticeHotSource` keeps its hooks in final fields and calls them without a lock; Rust hooks become `Fn + Send + Sync`, set at construction. |
-| C2 | HOT | ATOMIC | Java `StopWatch` is plain fields used by the fragment's one worker; in Rust the two hooks share it, so its fields become relaxed atomics (Java plain access ↔ `Relaxed`). |
-| C3 | MIXED | ATOMIC | Java `FragmentDecisionTree`'s body-cost window is plain fields on the worker; the same relaxed atomics. |
+| C2 | HOT | OWNED | Java `StopWatch` is plain fields used by the fragment's one worker; in Rust the worker times its own pushes (`BodyCost::timed`), so the watch is a plain field and `start` and `stop` take `&mut self`. |
+| C3 | MIXED | OWNED | Java `FragmentDecisionTree`'s body-cost window is plain fields on the worker; the decision tree owns it. Other threads read a snapshot (`BodyCostView`) published once per completed window. |
 | C10 | MIXED | PUBLISH | Java reads the downstream with `getOpaque` per push and nulls it at `complete`; Rust keeps a replaced receiver until the source drops. |
 | C11 | MIXED | SOURCE | Java `AbstractIngestSink.Delegate`'s downstream: `DownstreamSlot`. |
 | C12 | MIXED | CLAIM | Java `QueueIngestSink.Delegate.draining`: the queue's consumer is claimed by `pull`, the request drain and `discardQueued` (a kill, a late publisher), each with a CAS that fails instead of waiting. |
@@ -511,26 +515,28 @@ Java `LatticeHotSource`, `ControlPlaneFragment`'s output, `StopWatch`, `Fragment
 
 - **C1**: the hooks are final fields, `Option<Box<dyn Fn(&dyn Frame) + Send + Sync>>` and `Option<Box<dyn Fn() + Send
   + Sync>>`, called without a lock. The builder methods take `Fn` instead of `FnMut` (a public API change).
-- **C10**: `downstream: AtomicPtr<Arc<dyn LatticeReceiver>>`, `complete: AtomicBool`.
-  - `accept`: return when there is no downstream or the source is complete (Java `getOpaque` of both → `Relaxed` for
-    `complete`, `Acquire` for the pointer); before-hook; push; after-hook.
-  - `add_downstream`: Java's sequence with `SeqCst`: reopen a complete source (`complete` CAS true → false), else
-    install by CAS null → receiver, else `on_error`; then CAS observed → receiver; then `receiver.add_upstream`.
-  - `complete`: `complete.store(true, SeqCst)`, `downstream.swap(null, SeqCst)`.
+- **C10**: one word, `downstream: AtomicPtr<Link>` (a link holds the receiver's `Arc`): null is open with no receiver,
+  a link is attached, and a `COMPLETE` tag is completed (Java's two words, folded; see §3.12).
+  - `accept`: load (`Acquire`); return a failed frame when it is null or `COMPLETE`; before-hook; load again; push;
+    after-hook.
+  - `add_downstream`: a `SeqCst` CAS loop that installs over null or `COMPLETE` and refuses (`on_error`) over a link;
+    then `receiver.add_upstream`.
+  - `complete`: `downstream.swap(COMPLETE, SeqCst)`; a removed link is retired, and its receiver told `on_complete`.
   - Deviations: the pointer load is `Acquire`, not opaque (Java's final-field publication has no Rust equivalent).
-    A swapped-out receiver is kept on a retired list (a `LifecycleMutex<Vec<_>>`, touched only at attach and
-    complete) until the source drops, because the pusher may still hold the pointer (no garbage collector).
+    A swapped-out receiver is kept on a retired list (an intrusive push-only stack of links, touched only by
+    `complete`) until the source drops, because the pusher may still hold the pointer (no garbage collector).
     `complete` tells the old receiver `on_complete`, which Java does not: Rust's interceptor drops its source on
     `on_complete` (lane-source Part 1) to break the cycle Java's collector breaks. `accept` without a downstream
     finishes the frame with an error (a genuine Java bug: Java's `accept` returns without finishing the frame, so its
     completion never runs).
   - `request` stays a no-op and `pull` returns 0 (S3 dropped).
-- **C2**: `StopWatch` keeps Java's fields and logic. The two hooks share it through an `Arc`, so `started`, `ticks` and
-  `last` become `AtomicBool`/`AtomicU64` with `Relaxed` loads and stores, no read-modify-write (Java plain access by
-  one thread).
-- **C3**: `BodyCost`'s window becomes relaxed atomics (`samples: [AtomicU64; WINDOW]` holding `f64` bits,
-  `confirmations: AtomicU32`, `expensive_threshold_ns: AtomicU64`); the `Mutex` goes. All accesses are on the worker
-  (`record` from the after-hook, `calibrate` and `reset` from its decision tree), as Java's plain fields.
+- **C2**: `StopWatch` keeps Java's fields and logic as plain fields, `start` and `stop` taking `&mut self`. The worker
+  owns it (inside `BodyCost`) and times its own pushes with `BodyCost::timed`, a guard that also stops the watch when
+  the push panics, so the two output hooks no longer share it.
+- **C3**: `BodyCost`'s window is plain fields owned by the worker's decision tree: `record`, `calibrate` and `reset`
+  take `&mut self`, as Java's plain fields. Another thread reads a `BodyCostView` (the estimate and whether a window
+  has been recorded), which the owner publishes once per completed window and on reset (`ControlPlaneFragment::
+  body_cost_ns`).
 
 ### 3.3 Cache, vertex and edges (chunk 4)
 
@@ -769,9 +775,9 @@ runtime" is the Java runtime `euhedral-graph` is derived from (its `runtime/grap
 
 | Place | Java counterpart | Deviation and why |
 |---|---|---|
-| C1, C10 hot source | core `flow_control/LatticeHotSource` | Acquire pointer load (no final-field rule); retired receivers kept until drop (no GC); `on_complete` at complete (the interceptor drops its source on it: no GC); `accept` finishes an unsent frame (Java bug: it drops it unfinished). |
-| C2 stop watch | core `utils/StopWatch` | Relaxed atomics: Rust closures sharing it must be `Sync`. |
-| C3 body cost | core `control_plane/FragmentDecisionTree` | Relaxed atomics, as C2. |
+| C1, C10 hot source | core `flow_control/LatticeHotSource` | **One word, not Java's two.** `downstream` is null (open, no receiver), a link, or a `COMPLETE` tag, so `complete` is one `swap(COMPLETE)` and `add_downstream` one CAS loop that installs over null or `COMPLETE` and refuses over a link. Java sets `complete` and `downstream` in two steps; racing `complete` and `add_downstream` can then leave an attached receiver never told (the attach lands between the two steps) or tell a live receiver the source completed (a reopen between them). Here Rust has `on_complete` and no GC, and a receiver that is not told leaks the interceptor's source cycle, so the one word makes `complete` linearizable, as the lock the base held made it. Acquire pointer load (no final-field rule). Retired receivers are kept until drop (no GC), on an intrusive push-only stack of links rather than a lifecycle-locked list, so `add_downstream` and `complete` set atomics only; a source attached `k` times holds `k` retired receivers until it drops (a bounded scheme, counting the pushes in flight and freeing a retired link at zero, is possible if a reattach-heavy user appears; not built). `on_complete` at complete (the interceptor drops its source on it: no GC). `accept` finishes an unsent frame (Java bug: it drops it unfinished), finishes the frame when the before-hook panics, and runs the after-hook after every before-hook that returned, also when the push panics. |
+| C2 stop watch | core `utils/StopWatch` | **Plain fields, not atomics.** Java's watch is plain state of one thread, and the Rust worker times its own pushes, so no closure shares it. The first Rust design shared it between the output's two hooks as relaxed atomics (deviation category: missing Rust equivalent of a plain field shared by two closures); owning it on the worker removes that need. |
+| C3 body cost | core `control_plane/FragmentDecisionTree` | Plain fields owned by the decision tree, as C2; a snapshot for other threads, published per window. |
 | C4 cache partitions | core `ControlPlaneCache.pLocks` | Always claimed (no safe unguarded form). |
 | C5 cache directory | core `ControlPlaneCache.WORK_STEAL` | `Published` (no GC). |
 | C6 routing | core `LatticeVertex.ROUTING_STATE`, `RoutingState.admission` | Retired states recycled until the vertex drops (no GC). |

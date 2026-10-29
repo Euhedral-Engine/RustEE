@@ -5,10 +5,10 @@ use super::participation;
 use crate::config::IdlePolicy;
 use crate::flow_control::UpstreamQueue;
 use crate::utils::ACQUIRE_CONTENTION_SCALE;
+use crate::utils::StopWatch;
 use crate::utils::calibration::benchmark;
-use std::sync::atomic::{AtomicU64, Ordering};
-#[allow(clippy::disallowed_types, reason = "HOT-FIX(C3)")]
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// Contention, scaled by [`ACQUIRE_CONTENTION_SCALE`], above which costly bodies are staged: 85%.
@@ -44,83 +44,131 @@ pub(super) enum ExecutionPath {
 /// An estimate of what one frame body costs, from timed samples.
 ///
 /// Each window of 32 samples yields its second-smallest, which replaces the estimate at once if it
-/// is cheap, and only after two windows in a row if it is expensive. The output hooks record
-/// samples on the worker's thread; the policy reads the estimate.
+/// is cheap, and only after two windows in a row if it is expensive.
+///
+/// The owner, one worker, records and reads in turn, so the window is plain state and every method
+/// takes `&mut self` or `&self`. Only a snapshot is shared: the estimate and whether a full window
+/// has been recorded, published through a [`BodyCostView`] once per completed window and on reset,
+/// never per sample.
 pub(super) struct BodyCost {
-    #[allow(clippy::disallowed_types, reason = "HOT-FIX(C3)")]
-    window: Mutex<Window>,
-    estimate_ns: AtomicU64,
-    samples: AtomicU64,
-}
-
-struct Window {
+    /// The window's samples, in nanoseconds.
     samples: [f64; WINDOW],
+    /// The cost from which a body counts as expensive.
     expensive_threshold_ns: f64,
     confirmations: u32,
+    estimate_ns: f64,
+    recorded: u64,
+    /// Times one in every [`StopWatch::DEFAULT_INTERVAL`] bodies for [`timed`](Self::timed).
+    watch: StopWatch,
+    view: Arc<BodyCostView>,
+}
+
+/// What another thread reads of a [`BodyCost`]: the snapshot its owner publishes.
+#[derive(Debug, Default)]
+pub(super) struct BodyCostView {
+    /// The estimate, as `f64` bits.
+    estimate_ns: AtomicU64,
+    history: AtomicBool,
+}
+
+impl BodyCostView {
+    /// The estimated body cost in nanoseconds as of the last published window; zero before the
+    /// first full window.
+    pub(super) fn estimate_ns(&self) -> f64 {
+        f64::from_bits(self.estimate_ns.load(Ordering::Acquire))
+    }
+
+    /// Whether a full window has been recorded since the last reset.
+    pub(super) fn has_history(&self) -> bool {
+        self.history.load(Ordering::Acquire)
+    }
+
+    fn publish(&self, estimate_ns: f64, history: bool) {
+        self.estimate_ns
+            .store(estimate_ns.to_bits(), Ordering::Release);
+        self.history.store(history, Ordering::Release);
+    }
 }
 
 impl BodyCost {
     /// An empty estimate that takes no body as expensive until [`calibrate`](Self::calibrate)d.
-    #[allow(clippy::disallowed_types, reason = "HOT-FIX(C3)")]
+    #[cfg(test)]
     pub(super) fn new() -> Self {
-        Self {
-            window: Mutex::new(Window {
-                samples: [0.0; WINDOW],
-                expensive_threshold_ns: f64::INFINITY,
-                confirmations: 0,
-            }),
-            estimate_ns: AtomicU64::new(0f64.to_bits()),
-            samples: AtomicU64::new(0),
-        }
+        Self::publishing_to(Arc::new(BodyCostView::default()))
+    }
+
+    /// An empty estimate that publishes its snapshot to `view`.
+    pub(super) fn publishing_to(view: Arc<BodyCostView>) -> Self {
+        let cost = Self {
+            samples: [0.0; WINDOW],
+            expensive_threshold_ns: f64::INFINITY,
+            confirmations: 0,
+            estimate_ns: 0.0,
+            recorded: 0,
+            watch: StopWatch::new(),
+            view,
+        };
+        cost.view.publish(0.0, false);
+        cost
     }
 
     /// Takes bodies costing at least `expensive_threshold` as expensive, and starts over.
-    pub(super) fn calibrate(&self, expensive_threshold: Duration) {
-        self.window().expensive_threshold_ns = expensive_threshold.as_nanos() as f64;
+    pub(super) fn calibrate(&mut self, expensive_threshold: Duration) {
+        self.expensive_threshold_ns = expensive_threshold.as_nanos() as f64;
         self.reset();
     }
 
+    /// Runs `body`, which is one body's execution, and records its time when the watch times this
+    /// one. The time is taken also when `body` panics.
+    pub(super) fn timed<R>(&mut self, body: impl FnOnce() -> R) -> R {
+        struct Stop<'a>(&'a mut BodyCost);
+        impl Drop for Stop<'_> {
+            fn drop(&mut self) {
+                if let Some(elapsed) = self.0.watch.stop() {
+                    self.0.record(elapsed);
+                }
+            }
+        }
+        self.watch.start();
+        let _stop = Stop(self);
+        body()
+    }
+
     /// Records one timed body.
-    pub(super) fn record(&self, elapsed: Duration) {
+    pub(super) fn record(&mut self, elapsed: Duration) {
         if elapsed.is_zero() {
             return;
         }
-        let mut window = self.window();
-        let samples = self.samples.load(Ordering::Relaxed);
-        let index = (samples % WINDOW as u64) as usize;
-        window.samples[index] = elapsed.as_nanos() as f64;
-        self.samples
-            .store(samples.saturating_add(1), Ordering::Release);
+        let index = (self.recorded % WINDOW as u64) as usize;
+        self.samples[index] = elapsed.as_nanos() as f64;
+        self.recorded = self.recorded.saturating_add(1);
         if index == WINDOW - 1 {
-            self.update(&mut window);
+            self.update();
+            self.view.publish(self.estimate_ns, true);
         }
     }
 
     /// The estimated body cost in nanoseconds; zero before the first full window.
     pub(super) fn estimate_ns(&self) -> f64 {
-        f64::from_bits(self.estimate_ns.load(Ordering::Acquire))
+        self.estimate_ns
     }
 
     /// Whether a full window has been recorded.
     pub(super) fn has_history(&self) -> bool {
-        self.samples.load(Ordering::Acquire) >= WINDOW as u64
+        self.recorded >= WINDOW as u64
     }
 
     /// Forgets every sample and the estimate, keeping the calibration.
-    pub(super) fn reset(&self) {
-        let mut window = self.window();
-        window.confirmations = 0;
-        self.samples.store(0, Ordering::Release);
-        self.estimate_ns.store(0f64.to_bits(), Ordering::Release);
+    pub(super) fn reset(&mut self) {
+        self.confirmations = 0;
+        self.recorded = 0;
+        self.estimate_ns = 0.0;
+        self.view.publish(0.0, false);
     }
 
-    fn window(&self) -> MutexGuard<'_, Window> {
-        self.window.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    fn update(&self, window: &mut Window) {
+    fn update(&mut self) {
         let (mut minimum, mut second) = (f64::INFINITY, f64::INFINITY);
-        for &sample in &window.samples {
+        for &sample in &self.samples {
             if sample < minimum {
                 second = minimum;
                 minimum = sample;
@@ -128,15 +176,15 @@ impl BodyCost {
                 second = sample;
             }
         }
-        if second >= window.expensive_threshold_ns {
-            window.confirmations = (window.confirmations + 1).min(EXPENSIVE_CONFIRMATION_WINDOWS);
-            if window.confirmations < EXPENSIVE_CONFIRMATION_WINDOWS {
+        if second >= self.expensive_threshold_ns {
+            self.confirmations = (self.confirmations + 1).min(EXPENSIVE_CONFIRMATION_WINDOWS);
+            if self.confirmations < EXPENSIVE_CONFIRMATION_WINDOWS {
                 return;
             }
         } else {
-            window.confirmations = 0;
+            self.confirmations = 0;
         }
-        self.estimate_ns.store(second.to_bits(), Ordering::Release);
+        self.estimate_ns = second;
     }
 }
 
@@ -144,7 +192,7 @@ impl BodyCost {
 pub(super) struct DecisionTree {
     idle_policy: IdlePolicy,
     direct_threshold_ns: f64,
-    body_cost: Arc<BodyCost>,
+    body_cost: BodyCost,
     path: ExecutionPath,
     batch_size: u64,
     service_time_ns: f64,
@@ -152,17 +200,17 @@ pub(super) struct DecisionTree {
 
 impl DecisionTree {
     /// A policy with thresholds measured on the calling thread's CPU: call it from the worker.
-    pub(super) fn calibrated(idle_policy: IdlePolicy, body_cost: Arc<BodyCost>) -> Self {
+    pub(super) fn calibrated(idle_policy: IdlePolicy, body_cost: BodyCost) -> Self {
         let expensive = benchmark(EXPENSIVE_BODY_WEIGHT);
         let direct = benchmark(DIRECT_EXECUTION_BODY_WEIGHT);
         Self::with_thresholds(idle_policy, body_cost, expensive, direct)
     }
 
     /// A policy that takes bodies costing at least `expensive` as expensive, and runs bodies costing
-    /// at most `direct` straight from upstream under contention. Resets `body_cost`.
+    /// at most `direct` straight from upstream under contention. Calibrates and resets `body_cost`.
     pub(super) fn with_thresholds(
         idle_policy: IdlePolicy,
-        body_cost: Arc<BodyCost>,
+        mut body_cost: BodyCost,
         expensive: Duration,
         direct: Duration,
     ) -> Self {
@@ -322,6 +370,22 @@ impl DecisionTree {
     #[cfg(test)]
     pub(super) fn service_time_ns(&self) -> f64 {
         self.service_time_ns
+    }
+
+    /// The estimate of what one frame body costs.
+    #[cfg(test)]
+    pub(super) fn body_cost(&self) -> &BodyCost {
+        &self.body_cost
+    }
+
+    #[cfg(test)]
+    pub(super) fn body_cost_mut(&mut self) -> &mut BodyCost {
+        &mut self.body_cost
+    }
+
+    /// Runs `body`, one frame body's execution, timing a sample of them into the cost estimate.
+    pub(super) fn timed_body<R>(&mut self, body: impl FnOnce() -> R) -> R {
+        self.body_cost.timed(body)
     }
 
     pub(super) fn idle_policy(&self) -> &IdlePolicy {

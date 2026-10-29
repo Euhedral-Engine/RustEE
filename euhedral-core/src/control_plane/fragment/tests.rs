@@ -6,6 +6,7 @@ use crate::flow_control::{Claim, LatticeNode, UpstreamHandle};
 use crate::frames::Failure;
 use crate::generics::{LatticeReceiver, LatticeTerminal};
 use crate::metrics::CAP_FACTOR_SUFFIX;
+use crate::utils::StopWatch;
 use euhedral_data_structures::sync::HotScope;
 use euhedral_hardware_utils::monitor::{HardwareUtilization, HardwareUtilizationParts};
 use euhedral_hardware_utils::topology::Topology;
@@ -14,6 +15,11 @@ use euhedral_hardware_utils::util::CpuSet;
 use std::collections::VecDeque;
 use std::sync::Condvar;
 use std::sync::mpsc;
+use std::sync::{Mutex, PoisonError};
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 fn directory() -> Arc<CacheDirectory> {
     CacheDirectory::new(UpstreamRegistry::new(), Topology::system().clone())
@@ -744,19 +750,20 @@ fn drain_mode_and_first_touch_reach_both_workers() {
 }
 
 #[test]
-fn the_output_times_a_sample_of_bodies() {
-    let body_cost = Arc::new(BodyCost::new());
-    let output = Arc::new(timed_output(body_cost.clone()));
+fn the_policy_times_a_sample_of_bodies() {
+    let view = Arc::new(BodyCostView::default());
+    let mut cost = BodyCost::publishing_to(view.clone());
+    let output = Arc::new(LatticeHotSource::new());
     let receiver = TestReceiver::new();
     output.clone().add_downstream(receiver.clone());
     // The first push of every interval is timed: the 32nd sample is push 31 · interval.
     let interval = StopWatch::DEFAULT_INTERVAL.get();
     for id in 0..31 * interval {
-        output.accept(frame(id));
+        cost.timed(|| output.accept(frame(id)));
     }
-    assert!(!body_cost.has_history());
-    output.accept(frame(0));
-    assert!(body_cost.has_history());
+    assert!(!view.has_history());
+    cost.timed(|| output.accept(frame(0)));
+    assert!(view.has_history());
     assert_eq!(receiver.received().len() as u64, 31 * interval + 1);
 }
 
@@ -865,18 +872,18 @@ fn a_running_reset_restarts_the_policy() {
     fixture
         .registry()
         .add_handle(Source::with((0..frames).map(|id| unordered(id, id + 1))));
-    wait_until("a body-cost history", || fragment.body_cost.has_history());
+    wait_until("a body-cost history", || fragment.body_cost_ns().is_some());
 
     fragment.reset(Instant::now() + PATIENCE);
 
-    assert!(!fragment.body_cost.has_history());
+    assert!(!fragment.body_cost_ns().is_some());
 }
 
 #[test]
 fn cycles_size_the_next_batch_at_the_end_of_each() {
     let mut policy = DecisionTree::with_thresholds(
         crate::config::IdlePolicy::default(),
-        Arc::new(BodyCost::new()),
+        BodyCost::new(),
         Duration::from_micros(1),
         Duration::from_micros(1),
     );
@@ -1089,7 +1096,7 @@ fn cycles_count_frames_and_report_the_flow_at_the_end_of_each_batch() {
     let metrics = ExecutionMetrics::new(&config, 1, 2).unwrap();
     let mut policy = DecisionTree::with_thresholds(
         crate::config::IdlePolicy::default(),
-        Arc::new(BodyCost::new()),
+        BodyCost::new(),
         Duration::from_micros(1),
         Duration::from_micros(1),
     );
@@ -1172,7 +1179,7 @@ fn metrics_cost_per_cycle() {
         for metered in [false, true, false, true] {
             let mut policy = DecisionTree::with_thresholds(
                 crate::config::IdlePolicy::default(),
-                Arc::new(BodyCost::new()),
+                BodyCost::new(),
                 Duration::from_micros(1),
                 Duration::from_micros(1),
             );

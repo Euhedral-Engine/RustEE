@@ -51,6 +51,8 @@ jobs:
           cargo test --release -p euhedral-core --lib flow_control::vertex
           cargo test --release -p euhedral-core --lib generics::
           cargo test --release -p euhedral-core --lib ingest::
+          cargo test --release -p euhedral-core --lib flow_control::hot_source
+          cargo test --release -p euhedral-core --lib utils::stop_watch
           cargo test --release -p euhedral-graph --lib completions::
 
       - name: Loom models
@@ -90,3 +92,7 @@ jobs:
           cargo +nightly miri test -p euhedral-core --lib -- metrics::histogram::tests::an_owner metrics::histogram::tests::a_reader
           cargo +nightly miri test -p euhedral-core --lib -- ingest::queue::tests::a_request_while ingest::queue::tests::a_request_refused ingest::queue::tests::request_pushes ingest::queue::tests::a_source_driven ingest::queue::tests::a_publish_after ingest::queue::tests::clear_racing ingest::queue::tests::a_panicking ingest::queue::tests::concurrent_publishers ingest::queue::tests::frames_queued
           cargo +nightly miri test -p euhedral-graph --lib -- completions::tests::registrations_racing completions::tests::a_request_while completions::tests::a_sweep_that completions::tests::a_consumer_that completions::tests::a_panicking completions::tests::a_late_registration completions::tests::a_marker_registration completions::tests::dropping_
+
+      - name: Hot source, stop watch, body cost
+        run: |
+          cargo +nightly miri test -p euhedral-core --lib -- flow_control::hot_source utils::stop_watch control_plane::decision_tree::tests::the_estimate control_plane::decision_tree::tests::recalibrating

@@ -198,7 +198,7 @@ The ingest sinks, all ready-made `LatticeSource`s:
 - **`SingleUseSource`**: one frame.
 - **`PipelineRunner`**: runs typed `PipelineFrame` chains (below).
 
-`LatticeHotSource` is a simpler source its owner pushes into by hand, without waiting for demand.
+`LatticeHotSource` is a simpler source its owner pushes into by hand, without waiting for demand. Its hooks are `Fn + Send + Sync`, and it takes no lock: the downstream is an atomic pointer to a receiver the source keeps until it drops.
 
 ### Graphs: frames chained through lifecycle events
 

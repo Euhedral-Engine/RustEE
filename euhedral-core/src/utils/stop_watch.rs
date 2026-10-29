@@ -3,11 +3,16 @@ use std::time::{Duration, Instant};
 
 /// A sampling timer: of every `interval` start/stop pairs, only the first is timed, which keeps the
 /// clock reads off the hot path.
+///
+/// One thread uses a watch, start and stop in turn, so its state is plain and the calls take
+/// `&mut self`.
 #[derive(Clone, Debug)]
 pub struct StopWatch {
     interval: NonZeroU64,
-    ticks: u64,
+    /// The start of the running measurement, if one is running.
     started: Option<Instant>,
+    /// Pairs completed or skipped since the last timed one began.
+    ticks: u64,
 }
 
 impl StopWatch {
@@ -23,8 +28,8 @@ impl StopWatch {
     pub fn with_interval(interval: NonZeroU64) -> Self {
         Self {
             interval,
-            ticks: 0,
             started: None,
+            ticks: 0,
         }
     }
 
@@ -116,6 +121,29 @@ mod tests {
         thread::sleep(Duration::from_millis(5));
         watch.start();
         assert!(watch.stop().unwrap() >= Duration::from_millis(5));
+        assert_eq!(watch.stop(), None);
+    }
+
+    #[test]
+    fn a_stop_watch_times_one_call_in_256() {
+        let mut watch = StopWatch::new();
+        let timed = (0..1024)
+            .filter(|_| {
+                watch.start();
+                watch.stop().is_some()
+            })
+            .count();
+        assert_eq!(timed, 4);
+    }
+
+    #[test]
+    fn a_clone_keeps_the_count_and_the_running_clock() {
+        let mut watch = every(2);
+        watch.start();
+        let mut copy = watch.clone();
+        assert!(copy.stop().is_some());
+        assert!(watch.stop().is_some());
+        watch.start();
         assert_eq!(watch.stop(), None);
     }
 

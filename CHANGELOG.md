@@ -3,6 +3,63 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## The hot source and the fragment's output without locks (2026-10-29)
+
+**What.**
+- `LatticeHotSource` (audit C1, C10):
+  - `before_each` and `after_each` take `Fn + Send + Sync` hooks, set when the source is built and called without a lock
+    (**breaking**: they took `FnMut + Send`);
+  - the downstream is one atomic word (Java keeps two, `complete` and `downstream`): null while open with no receiver,
+    a link while one is attached, and a `COMPLETE` tag once completed. `accept` reads it (`Acquire`), runs the
+    before-hook, reads it again, pushes and runs the after-hook;
+  - `add_downstream` is a `SeqCst` compare-and-set loop that installs over null or `COMPLETE` and refuses over a
+    link, `complete` is `swap(COMPLETE)`, and the receiver it removed hears `on_complete` once. Racing `complete`
+    and `add_downstream` therefore never leave a receiver untold or tell a live one;
+  - the after-hook follows every before-hook that returned, also when the push panics; a before-hook that panics
+    finishes the frame with an error.
+- `StopWatch` (C2): plain fields, `start` and `stop` take `&mut self`, as Java's watch is plain state of one thread.
+  `StopWatch` is still `Clone`.
+- `BodyCost` (C3): plain fields owned by the worker's decision tree; `record`, `calibrate`, `reset` and the new
+  `timed` take `&mut self`. The worker times its own pushes with `BodyCost::timed` (a guard that records also when the
+  push panics) instead of a pair of hooks sharing an `Arc<StopWatch>`, so the fragment's output carries no hooks.
+  Another thread reads a snapshot, `BodyCostView`, that the owner publishes once per completed window of 32 samples
+  and on reset; `ControlPlaneFragment::body_cost_ns()` returns it (`None` before the first full window).
+- `HOT_FIX_TAGS` loses C1, C2, C3 and C10 and lists 45.
+
+**Why.** The fragment's output runs for every frame its worker runs. Its two hooks shared a `StopWatch` behind a
+mutex, took a second mutex per sampled frame for the body cost, and the source read its downstream under a read lock.
+Java has none of that: the hooks are final fields, the stop watch and cost window are plain fields of the one worker,
+and the downstream is read with an opaque load. The first Rust design kept the watch and window as relaxed atomics
+because two hooks shared them; the worker times its own pushes instead, so both are plain.
+
+**How.**
+- Build a hot source with `LatticeHotSource::new().before_each(|frame| ..).after_each(|| ..)`; hooks that count or time
+  use atomics (a hot source may have several pushers).
+- State one thread owns needs no hook: the fragment's worker times its pushes with `BodyCost::timed`.
+
+**Semantics.**
+- Every receiver a source installed stays alive until the source drops (Java's collector keeps a detached receiver for
+  a pusher still holding it). The source holds each in a link; a removed link is pushed onto a stack that only grows
+  and is freed with the source. A source attached `k` times holds `k` retired receivers, and what they own, until it
+  drops. No lifecycle call takes a lock.
+- `accept` finishes the frame with an error when the source is complete or has no downstream, also when the
+  before-hook completes it; the after-hook runs whenever the before-hook returned.
+- A reopened source (`complete` then `add_downstream`) takes the new receiver; a second `add_downstream` on a live
+  source is told `AlreadyAttached` and the first is kept. Racing attaches install exactly one.
+- A `StopWatch` serves one thread, as Java's does; `&mut self` says so.
+- `BodyCostView::publish` runs once per window (every 8192 frames at the default interval) and on reset, never per
+  sample.
+
+**Tests.** `hooks_run_around_each_push_from_one_pusher`, `complete_while_accepting_never_frees_the_receiver_in_use`,
+`a_complete_source_reopens_with_a_new_receiver`, `complete_tells_the_old_receiver_on_complete_once`,
+`racing_attaches_install_one_receiver_and_refuse_the_rest`,
+`attaching_and_completing_from_many_threads_leaves_every_receiver_told_at_most_once`,
+`dropping_the_source_drops_every_receiver_it_kept`,
+`a_source_completed_by_its_before_hook_fails_the_frame_and_runs_the_after_hook`,
+`attach_racing_complete_tells_every_receiver_exactly_once`, `the_after_hook_runs_when_the_push_panics`,
+`a_panicking_before_hook_fails_the_frame_and_the_panic_goes_on`, `a_stop_watch_times_one_call_in_256`,
+`the_estimate_follows_expensive_and_cheap_windows`, `the_policy_times_a_sample_of_bodies`. They run under Miri with many seeds (the `miri` CI job).
+
 ## Lock-free sources and claims (2026-10-29)
 
 **What.**
