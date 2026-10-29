@@ -51,6 +51,24 @@ impl fmt::Display for CopyError {
 
 impl std::error::Error for CopyError {}
 
+/// A copy of `rows` rows of `row_bytes` bytes each between two layouts that have their own row pitches (the distance in
+/// bytes between the starts of consecutive rows), such as a picture with padded rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PitchedCopy {
+    /// The first byte of the first source row.
+    pub src: u64,
+    /// The source's row pitch in bytes, at least `row_bytes`.
+    pub src_pitch: u64,
+    /// The first byte of the first destination row.
+    pub dst: u64,
+    /// The destination's row pitch in bytes, at least `row_bytes`.
+    pub dst_pitch: u64,
+    /// The bytes copied from each row.
+    pub row_bytes: u64,
+    /// The number of rows.
+    pub rows: u64,
+}
+
 /// Copies bytes between two locations without waiting: `start` queues the copy and returns the test of its
 /// completion.
 pub trait Copier: Send + Sync + fmt::Debug {
@@ -70,6 +88,23 @@ pub trait Copier: Send + Sync + fmt::Debug {
         dst: u64,
         bytes: u64,
     ) -> Result<Box<dyn Retired>, CopyError>;
+
+    /// Starts a pitched copy (rows with their own pitches) from `from` to `to`. A copier that has no such copy refuses.
+    ///
+    /// # Safety
+    /// Every row range of both layouts is valid at its location, the two layouts do not overlap, and nothing else
+    /// writes the destination rows or frees either layout until the returned test says the copy retired.
+    unsafe fn start_pitched(
+        &self,
+        from: LocationId,
+        to: LocationId,
+        copy: PitchedCopy,
+    ) -> Result<Box<dyn Retired>, CopyError> {
+        let _ = (from, to, copy);
+        Err(CopyError {
+            what: "pitched copies: not this copier's".into(),
+        })
+    }
 }
 
 /// Copies between host locations (pinned and pageable host memory) with `memcpy`, at once.
@@ -103,6 +138,31 @@ impl Copier for HostCopier {
         // SAFETY: the caller's contract: valid, non-overlapping host ranges nobody else touches meanwhile.
         unsafe {
             std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, bytes as usize);
+        }
+        Ok(Box::new(|| true))
+    }
+
+    unsafe fn start_pitched(
+        &self,
+        _from: LocationId,
+        _to: LocationId,
+        copy: PitchedCopy,
+    ) -> Result<Box<dyn Retired>, CopyError> {
+        if copy.src_pitch < copy.row_bytes || copy.dst_pitch < copy.row_bytes {
+            return Err(CopyError {
+                what: "a row pitch is shorter than the row".into(),
+            });
+        }
+        for row in 0..copy.rows {
+            // SAFETY: the caller's contract: every row range is valid, the layouts do not overlap, and nobody else
+            // touches the destination rows meanwhile.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    (copy.src + row * copy.src_pitch) as *const u8,
+                    (copy.dst + row * copy.dst_pitch) as *mut u8,
+                    copy.row_bytes as usize,
+                );
+            }
         }
         Ok(Box::new(|| true))
     }

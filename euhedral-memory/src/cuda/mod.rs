@@ -59,6 +59,73 @@ pub struct AccessDesc {
     pub flags: c_int,
 }
 
+/// `CUDA_MEMCPY2D`: a copy of `height` rows of `width_in_bytes` bytes between host and device layouts with their own
+/// pitches. Arrays are not used here; their fields stay null.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct Memcpy2D {
+    pub src_x_in_bytes: usize,
+    pub src_y: usize,
+    pub src_memory_type: c_int,
+    pub src_host: *const c_void,
+    pub src_device: CuDevicePtr,
+    pub src_array: *mut c_void,
+    pub src_pitch: usize,
+    pub dst_x_in_bytes: usize,
+    pub dst_y: usize,
+    pub dst_memory_type: c_int,
+    pub dst_host: *mut c_void,
+    pub dst_device: CuDevicePtr,
+    pub dst_array: *mut c_void,
+    pub dst_pitch: usize,
+    pub width_in_bytes: usize,
+    pub height: usize,
+}
+
+/// `CU_MEMORYTYPE_HOST` and `CU_MEMORYTYPE_DEVICE`.
+pub const MEMORYTYPE_HOST: c_int = 1;
+pub const MEMORYTYPE_DEVICE: c_int = 2;
+
+impl Memcpy2D {
+    /// A copy that reads host memory when `from_device` is false and device memory when it is true, and writes the
+    /// other kind according to `to_device`.
+    pub fn pitched(from_device: bool, to_device: bool, copy: &crate::PitchedCopy) -> Self {
+        let kind = |device| {
+            if device {
+                MEMORYTYPE_DEVICE
+            } else {
+                MEMORYTYPE_HOST
+            }
+        };
+        Memcpy2D {
+            src_x_in_bytes: 0,
+            src_y: 0,
+            src_memory_type: kind(from_device),
+            src_host: if from_device {
+                std::ptr::null()
+            } else {
+                copy.src as *const c_void
+            },
+            src_device: if from_device { copy.src } else { 0 },
+            src_array: std::ptr::null_mut(),
+            src_pitch: copy.src_pitch as usize,
+            dst_x_in_bytes: 0,
+            dst_y: 0,
+            dst_memory_type: kind(to_device),
+            dst_host: if to_device {
+                std::ptr::null_mut()
+            } else {
+                copy.dst as *mut c_void
+            },
+            dst_device: if to_device { copy.dst } else { 0 },
+            dst_array: std::ptr::null_mut(),
+            dst_pitch: copy.dst_pitch as usize,
+            width_in_bytes: copy.row_bytes as usize,
+            height: copy.rows as usize,
+        }
+    }
+}
+
 /// The fd or Win32 handle of `CUDA_EXTERNAL_MEMORY_HANDLE_DESC`.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -171,6 +238,7 @@ driver_fns! {
     memcpy_htod_async: "cuMemcpyHtoDAsync_v2" => fn(CuDevicePtr, *const c_void, usize, CuStream);
     memcpy_dtoh_async: "cuMemcpyDtoHAsync_v2" => fn(*mut c_void, CuDevicePtr, usize, CuStream);
     memcpy_dtod_async: "cuMemcpyDtoDAsync_v2" => fn(CuDevicePtr, CuDevicePtr, usize, CuStream);
+    memcpy_2d_async: "cuMemcpy2DAsync_v2" => fn(*const Memcpy2D, CuStream);
     memset_d8_async: "cuMemsetD8Async" => fn(CuDevicePtr, u8, usize, CuStream);
     event_create: "cuEventCreate" => fn(*mut CuEvent, c_uint);
     event_record: "cuEventRecord" => fn(CuEvent, CuStream);

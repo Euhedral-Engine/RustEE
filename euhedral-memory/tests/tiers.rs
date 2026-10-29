@@ -433,3 +433,59 @@ fn many_owners_move_at_once_without_locks() {
     }
     assert!(r.mover.moves_started() > 100);
 }
+
+#[test]
+fn a_host_copier_copies_rows_between_layouts_with_their_own_pitches() {
+    use euhedral_memory::{HostCopier, PitchedCopy};
+    const ROW: usize = 6;
+    const ROWS: usize = 4;
+    let source: Vec<u8> = (0..(10 * ROWS) as u8).collect();
+    let mut target = vec![0xEEu8; 8 * ROWS];
+    let l = LocationId(0);
+    let copier = HostCopier::new([l]);
+    // SAFETY: both layouts are live vectors long enough for every row, and they do not overlap.
+    let test = unsafe {
+        copier.start_pitched(
+            l,
+            l,
+            PitchedCopy {
+                src: source.as_ptr() as u64,
+                src_pitch: 10,
+                dst: target.as_mut_ptr() as u64,
+                dst_pitch: 8,
+                row_bytes: ROW as u64,
+                rows: ROWS as u64,
+            },
+        )
+    }
+    .unwrap();
+    assert!(test.retired(), "a host copy is done when it returns");
+    for row in 0..ROWS {
+        assert_eq!(
+            &target[row * 8..row * 8 + ROW],
+            &source[row * 10..row * 10 + ROW]
+        );
+        assert!(
+            target[row * 8 + ROW..(row + 1) * 8]
+                .iter()
+                .all(|&b| b == 0xEE)
+        );
+    }
+    // A pitch shorter than the row is refused.
+    // SAFETY: refused before any range is used.
+    let refused = unsafe {
+        copier.start_pitched(
+            l,
+            l,
+            PitchedCopy {
+                src: 0,
+                src_pitch: 2,
+                dst: 0,
+                dst_pitch: 8,
+                row_bytes: ROW as u64,
+                rows: 1,
+            },
+        )
+    };
+    assert!(refused.is_err());
+}

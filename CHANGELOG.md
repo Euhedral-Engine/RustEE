@@ -3,6 +3,26 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## Lane source gaps from the first consumer (2026-10-29)
+
+**What.**
+- Teardown order. `LaneSubmit::quiesce` (default empty; the CUDA stream synchronizes) and `LaneState::close(&mut self,
+  raw: &dyn Any)` (default empty) run when a lane source drops: quiesce the submitter, close the state against the
+  submitter's raw handle (`LaneSubmit::Raw` is now `Copy + 'static`), drop the state, then drop the submitter. A state
+  that holds device resources releases them while the stream still exists.
+- `LaneSource::request` no longer allocates: `LaneSource::with_bound` sizes the waiting, armed, ready and scratch queues
+  for a bound (`new` uses `DEFAULT_BOUND`, 1024).
+- `euhedral_memory::cuda::StreamCopier::on_stream` (unsafe) queues its copies on a stream the caller made, so they order
+  with the caller's other work on it; the copier never synchronizes or destroys that stream.
+- Pitched copies: `Copier::start_pitched(from, to, PitchedCopy { src, src_pitch, dst, dst_pitch, row_bytes, rows })`
+  copies rows between layouts with their own row pitches (padded pictures). The default refuses; `HostCopier` copies
+  row by row; `StreamCopier` issues one `cuMemcpy2DAsync`.
+
+**Why.** The first consumer of lane sources dropped a state that owned device memory after its stream was gone, grew
+the source's queues on the request path, and had to copy padded pictures row by row.
+
+**Semantics.** A pitch shorter than the row is refused before any copy starts.
+
 ## Queue fidelity, step 1: the audit and the first weakening (2026-10-29)
 
 **What.** `mp_reserve` reads the producer's tail chunk with a relaxed load (Java reads it plain); the acquire load of the
