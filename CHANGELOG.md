@@ -15,6 +15,10 @@ against Java is in the pull request; the remaining rows are not changed here.
 - Benchmark: `--pooled` frames come from, and return to, the pool of the thread that runs them, the nearest Rust has to
   Java's sink re-pushing one array (a frame crosses no core between two uses).
 - Other repos' names are gone from doc comments and READMEs; the behaviour is described instead.
+- Benchmark: `--poll-spins N` sets how many spins the harness thread makes between two sums of the completion counter
+  (default 32, upstream's). Each sum reads every worker's counter line (`perf c2c`: the harness thread is the loader of
+  the hottest shared lines, 95 to 97% of their loads); at 1024 spins or more throughput is 5% higher (447, 443, 449 M
+  against 424, 422, 424 M at 32, interleaved, same session).
 - A loom model of the `ChunkPool` ring: one freeing side and one allocating side lose and duplicate no chunk, and the freeing
   side's writes are visible to the taker (weakening the tail store to `Relaxed` makes it fail).
 

@@ -64,6 +64,7 @@ fn a_fork_with_a_tiny_target_completes_and_reports_every_iteration() {
         pin_harness: false,
         latency: true,
         pooled_frames: false,
+        poll_spins: 32,
     };
     let mut announced = 0;
     let mut reported = 0;
@@ -100,6 +101,7 @@ fn a_fork_without_latency_reports_no_quantiles() {
         pin_harness: false,
         latency: false,
         pooled_frames: false,
+        poll_spins: 32,
     };
     let outcome = run_fork(&options, |_| {}, |_| {}).unwrap_or_else(|e| panic!("{} {e}", file!()));
     assert!(outcome.samples[0].latency.is_none());
@@ -119,6 +121,7 @@ fn a_fork_with_pooled_frames_completes_and_records_latency() {
         pin_harness: false,
         latency: true,
         pooled_frames: true,
+        poll_spins: 32,
     };
     let outcome = run_fork(&options, |_| {}, |_| {}).unwrap_or_else(|e| panic!("{} {e}", file!()));
     assert!(outcome.samples[0].invocations >= 1);

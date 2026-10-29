@@ -18,7 +18,7 @@ End-to-end benchmarks of the control plane. Nothing depends on this crate.
 - One frame in 64 is stamped when its source hands it out, and the worker that executes it records the time since in
   a histogram of its own (relaxed atomic increments, no lock; fixed log-linear buckets, 0.8% relative error). Each
   iteration reports the latency quantiles P0, P25, P50, P90, P99 and P100 in nanoseconds; the summary reports them over
-  every measured iteration of every fork. `--no-latency` turns the sampling off. Per-iteration P0 and P100 are the
+  every measured iteration of every fork. `--no-latency` turns the sampling off. `--poll-spins N` sets the spins between two sums of the completion counter (upstream: 32, the default): each sum reads every worker's counter line, and 1024 or more measured 5% higher throughput. Per-iteration P0 and P100 are the
   edges of the lowest and highest occupied buckets.
 - The output is one line per iteration, and a `summary` line with the mean and standard deviation of the measured
   iterations' throughput (operations per second) and time per operation (nanoseconds), the sources and the worker CPUs.
