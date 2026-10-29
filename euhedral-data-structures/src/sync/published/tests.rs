@@ -96,10 +96,12 @@ fn wait_never_returns_before_every_slot_passed_the_epoch() {
     let reader = domain.register();
     reader.quiescent();
 
+    let stored = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let waiter = {
-        let (cell, count) = (cell.clone(), count.clone());
+        let (cell, count, stored) = (cell.clone(), count.clone(), stored.clone());
         thread::spawn(move || {
             let retired = cell.store(Some(Counted::new(&count)));
+            stored.store(true, StdOrdering::SeqCst);
             retired
                 .wait(Instant::now() + Duration::from_secs(3600))
                 .unwrap_or_else(|_| panic!("the reader announced a later epoch"));
@@ -107,8 +109,16 @@ fn wait_never_returns_before_every_slot_passed_the_epoch() {
         })
     };
     // The waiter cannot finish: the reader's announcement is older than its store.
-    for _ in 0..if cfg!(miri) { 50 } else { 500 } {
-        thread::sleep(Duration::from_micros(100));
+    while !stored.load(StdOrdering::SeqCst) {
+        thread::yield_now();
+    }
+    for _ in 0..if cfg!(miri) { 30 } else { 500 } {
+        if cfg!(miri) {
+            // Miri's clock moves with the steps it takes, which a spinning waiter slows: yield instead.
+            thread::yield_now();
+        } else {
+            thread::sleep(Duration::from_micros(100));
+        }
     }
     assert!(!waiter.is_finished());
     assert_eq!(count.load(StdOrdering::SeqCst), 0);
