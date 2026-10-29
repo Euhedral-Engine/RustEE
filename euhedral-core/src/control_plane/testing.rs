@@ -44,25 +44,33 @@ impl Drop for PinnedTurn {
             .flatten()
             .chain(SINGLE_CORE.map(|(_, cpu)| cpu));
         for cpu in cpus {
-            let deadline = Instant::now() + PATIENCE;
-            loop {
-                match affinity::PinnedThreadExecutor::get_or_create(cpu, "settle") {
-                    // A closed executor still has tasks winding down: wait for them.
-                    Err(affinity::ExecutorError::ClosedWithActiveTasks(_))
-                        if Instant::now() < deadline =>
-                    {
-                        thread::sleep(Duration::from_millis(1));
-                    }
-                    Ok(executor) => {
-                        executor.release();
-                        break;
-                    }
-                    Err(_) => break,
-                }
-            }
+            settle(cpu);
         }
     }
 }
+
+/// Waits until `cpu` accepts an executor again. A clone that has just closed winds down in a moment; one that takes
+/// longer than [`SETTLE_LOG`] is reported, so that a stall in a close is not absorbed by the wait, and one that never
+/// does fails the test.
+fn settle(cpu: usize) {
+    let started = Instant::now();
+    let settled = affinity::PinnedThreadExecutor::get_or_create_within(cpu, "settle", SETTLE_FAIL)
+        .map(|executor| executor.release());
+    let waited = started.elapsed();
+    if waited > SETTLE_LOG {
+        eprintln!("the executor of CPU {cpu} took {waited:?} to wind down");
+    }
+    if let Err(error) = settled
+        && !thread::panicking()
+    {
+        panic!("the executor of CPU {cpu} did not wind down in {SETTLE_FAIL:?}: {error}");
+    }
+}
+
+/// How long the wind-down of an executor may take before the wait is reported.
+const SETTLE_LOG: Duration = Duration::from_millis(100);
+/// How long it may take before the test fails.
+const SETTLE_FAIL: Duration = Duration::from_secs(5);
 
 /// Waits for `condition`, failing the test after [`PATIENCE`].
 pub(crate) fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
