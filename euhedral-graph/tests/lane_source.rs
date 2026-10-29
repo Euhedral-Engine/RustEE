@@ -1023,3 +1023,22 @@ fn the_shared_intake_is_free_while_an_item_runs() {
         long.join().unwrap();
     });
 }
+
+// ---- teardown ----------------------------------------------------------------------------
+
+#[test]
+fn dropping_a_lane_source_closes_its_state_against_the_raw_handle_before_the_submitter_goes() {
+    let mut rig = Rig::new(1, &[]);
+    let gate = rig.gates[0].clone();
+    *lock(&gate.watch) = Some((rig.fake.clone(), LaneId(0)));
+    rig.sources.clear();
+    rig.receivers.clear();
+    let closed = lock(&gate.closed).clone();
+    assert_eq!(closed.len(), 1, "closed once");
+    assert!(!closed[0].0, "the submitter was still alive");
+    assert!(closed[0].1.is_some(), "the submitter's raw handle was lent");
+    assert!(
+        rig.fake.dropped(LaneId(0)),
+        "the submitter was dropped after"
+    );
+}

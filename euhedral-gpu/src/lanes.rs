@@ -124,6 +124,10 @@ macro_rules! lane_submit {
                 Stream::lane(self)
             }
 
+            fn quiesce(&mut self) {
+                Stream::quiesce(self)
+            }
+
             fn id(&self) -> euhedral_graph::QueueId {
                 Stream::id(self)
             }
