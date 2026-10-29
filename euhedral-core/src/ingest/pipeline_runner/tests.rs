@@ -4,7 +4,7 @@ use crate::flow_control::testing::TestReceiver;
 use crate::frames::{Failure, Status};
 use crate::generics::{AbstractExecutor, CloneableObject, LatticeReceiver, LatticeTerminal};
 use crate::impls::DefaultExecutor;
-use std::sync::mpsc::TryRecvError;
+use euhedral_data_structures::sync::RecvError;
 use std::sync::{Barrier, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -59,12 +59,35 @@ fn hold(source: &Arc<dyn LatticeSource>) -> Box<dyn Frame> {
     held.unwrap()
 }
 
-fn status(outcome: &Receiver<Outcome>) -> Status {
-    outcome.recv_timeout(PATIENCE).expect("an outcome").status()
+/// Checks `outcome` until the chain has ended or been dropped, or fails after [`PATIENCE`]: nothing waits on a
+/// one-shot.
+fn resolve(mut outcome: OneShotReceiver<Outcome>) -> Result<Outcome, RecvError> {
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        match outcome.try_take() {
+            Ok(Some(outcome)) => return Ok(outcome),
+            Ok(None) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for an outcome"
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
-fn pending(outcome: &Receiver<Outcome>) -> bool {
-    matches!(outcome.try_recv(), Err(TryRecvError::Empty))
+fn outcome_of(outcome: OneShotReceiver<Outcome>) -> Outcome {
+    resolve(outcome).expect("an outcome")
+}
+
+fn status(outcome: OneShotReceiver<Outcome>) -> Status {
+    outcome_of(outcome).status()
+}
+
+fn pending(outcome: &mut OneShotReceiver<Outcome>) -> bool {
+    matches!(outcome.try_take(), Ok(None))
 }
 
 fn refused<I, T>(result: Result<T, AdmissionClosed<I>>) -> I {
@@ -128,17 +151,17 @@ fn submissions_report_success_once_the_consumer_takes_the_output() {
         true,
     );
     let source = executed(&runner);
-    let first = runner.submit(3).unwrap();
+    let mut first = runner.submit(3).unwrap();
     runner.run(4).unwrap();
-    assert!(pending(&first));
+    assert!(pending(&mut first));
     drive(&runner, &source);
-    assert_eq!(status(&first), Status::Success);
+    assert_eq!(status(first), Status::Success);
     assert_eq!(sorted(&output), [7, 9]);
     assert_eq!(runner.manager.recycle_queue_size(), 2);
 
     let again = runner.submit(5).unwrap();
     drive(&runner, &source);
-    assert_eq!(status(&again), Status::Success);
+    assert_eq!(status(again), Status::Success);
     assert_eq!(sorted(&output), [7, 9, 11]);
     assert!(!runner.is_complete());
 }
@@ -157,8 +180,8 @@ fn a_filtered_chain_never_reaches_the_consumer() {
     let odd = runner.submit(1).unwrap();
     let even = runner.submit(2).unwrap();
     drive(&runner, &source);
-    assert_eq!(status(&odd), Status::Filtered);
-    assert_eq!(status(&even), Status::Success);
+    assert_eq!(status(odd), Status::Filtered);
+    assert_eq!(status(even), Status::Success);
     assert_eq!(*output.lock().unwrap(), [2]);
 }
 
@@ -180,8 +203,8 @@ fn a_cancelling_stage_cancels_its_chain() {
     let cancelled = runner.submit(0).unwrap();
     let kept = runner.submit(1).unwrap();
     drive(&runner, &source);
-    assert_eq!(status(&cancelled), Status::Cancelled);
-    assert_eq!(status(&kept), Status::Success);
+    assert_eq!(status(cancelled), Status::Cancelled);
+    assert_eq!(status(kept), Status::Success);
     assert_eq!(*output.lock().unwrap(), [1]);
 }
 
@@ -202,10 +225,10 @@ fn a_failing_stage_or_consumer_reports_its_failure() {
     let stage = runner.submit(0).unwrap();
     let consumer = runner.submit(1).unwrap();
     drive(&runner, &source);
-    let outcome = stage.recv_timeout(PATIENCE).unwrap();
+    let outcome = outcome_of(stage);
     assert_eq!(outcome.status(), Status::Failed);
     assert_eq!(outcome.failure().unwrap().to_string(), "stage failed");
-    let outcome = consumer.recv_timeout(PATIENCE).unwrap();
+    let outcome = outcome_of(consumer);
     assert_eq!(outcome.status(), Status::Failed);
     assert!(
         outcome
@@ -256,7 +279,7 @@ fn graceful_completion_waits_for_accepted_chains_and_refuses_new_ones() {
     );
 
     drive(&runner, &source);
-    assert_eq!(status(&accepted), Status::Success);
+    assert_eq!(status(accepted), Status::Success);
     assert_eq!(*output.lock().unwrap(), [2]);
     assert!(runner.is_complete());
 }
@@ -293,19 +316,19 @@ fn completing_cancels_queued_chains_and_held_ones_when_they_return() {
             true,
         );
         let source = recorded(&runner);
-        let active = runner.submit(1).unwrap();
+        let mut active = runner.submit(1).unwrap();
         let stage = hold(&source);
         let queued = runner.submit(2).unwrap();
 
         complete(&runner, &source);
         assert!(runner.is_complete());
         assert!(!stage.is_alive());
-        assert_eq!(status(&queued), Status::Cancelled);
-        assert!(pending(&active));
+        assert_eq!(status(queued), Status::Cancelled);
+        assert!(pending(&mut active));
         assert_eq!(runner.size(), 0);
 
         DefaultExecutor::new().run(stage);
-        assert_eq!(status(&active), Status::Cancelled);
+        assert_eq!(status(active), Status::Cancelled);
         assert!(output.lock().unwrap().is_empty());
         assert_eq!(refused(runner.submit(3)), 3);
         assert_eq!(runner.manager.recycle_queue_size(), 2);
@@ -316,21 +339,21 @@ fn completing_cancels_queued_chains_and_held_ones_when_they_return() {
 fn completing_inside_a_pull_cancels_once_the_pull_lets_go() {
     let mut runner = PipelineRunner::new(&PipelineFrame::<i32>::builder(), drop, true);
     let source = recorded(&runner);
-    let outcome = runner.submit(1).unwrap();
+    let mut outcome = runner.submit(1).unwrap();
     let control = runner.control();
     let mut cancelled_inside = None;
     let pulled = source.pull(
         &mut |_| panic!("the pull should stop"),
         &mut |_| {
             control.complete();
-            cancelled_inside = Some(!pending(&outcome));
+            cancelled_inside = Some(!pending(&mut outcome));
             true
         },
         1,
     );
     assert_eq!(pulled, 0);
     assert_eq!(cancelled_inside, Some(false));
-    assert_eq!(status(&outcome), Status::Cancelled);
+    assert_eq!(status(outcome), Status::Cancelled);
     assert_eq!(runner.size(), 0);
 }
 
@@ -355,7 +378,7 @@ fn every_submission_mode_reaches_the_partitions() {
     ];
     assert_eq!(runner.size(), 6);
     drive(&runner, &source);
-    for outcome in &outcomes {
+    for outcome in outcomes {
         assert_eq!(status(outcome), Status::Success);
     }
     assert_eq!(sorted(&output), [0, 1, 2, 3, 4, 5]);
@@ -389,7 +412,7 @@ fn completion_during_a_request_leaves_no_demand() {
     let outcome = runner.submit(1).unwrap();
     runner.complete_gracefully();
     source.request(1);
-    assert_eq!(status(&outcome), Status::Success);
+    assert_eq!(status(outcome), Status::Success);
     assert!(runner.is_complete());
     assert_eq!(runner.demand(), 0);
 }
@@ -419,7 +442,7 @@ fn a_failing_downstream_completion_still_cancels_queued_chains() {
         .add_downstream(Arc::new(FailingCompletion));
     let outcome = runner.submit(1).unwrap();
     assert!(panic::catch_unwind(AssertUnwindSafe(|| runner.complete())).is_err());
-    assert_eq!(status(&outcome), Status::Cancelled);
+    assert_eq!(status(outcome), Status::Cancelled);
     assert_eq!(runner.size(), 0);
     assert!(runner.is_complete());
 }
@@ -439,7 +462,7 @@ fn admission_racing_completion_never_strands_a_submission() {
             runner.submit(iteration)
         });
         if let Ok(outcome) = outcome {
-            assert_eq!(status(&outcome), Status::Cancelled);
+            assert_eq!(status(outcome), Status::Cancelled);
         }
         assert_eq!(runner.size(), 0);
         assert!(runner.is_complete());
@@ -459,20 +482,20 @@ fn completing_while_a_stage_runs_cancels_its_chain_when_it_returns() {
         true,
     );
     let source = executed(&runner);
-    let active = runner.submit(1).unwrap();
-    let queued = runner.submit(2).unwrap();
+    let mut active = runner.submit(1).unwrap();
+    let mut queued = runner.submit(2).unwrap();
     thread::scope(|scope| {
         let source = source.clone();
         let requesting = scope.spawn(move || source.request(1));
         gate.await_entered();
         runner.complete();
-        assert!(pending(&active));
-        assert!(pending(&queued));
+        assert!(pending(&mut active));
+        assert!(pending(&mut queued));
         gate.release();
         requesting.join().unwrap();
     });
-    assert_eq!(status(&active), Status::Cancelled);
-    assert_eq!(status(&queued), Status::Cancelled);
+    assert_eq!(status(active), Status::Cancelled);
+    assert_eq!(status(queued), Status::Cancelled);
     assert_eq!(runner.size(), 0);
 }
 
@@ -503,7 +526,7 @@ fn graceful_completion_while_a_stage_runs_still_publishes_its_successor() {
         requesting.join().unwrap();
     });
     drive(&runner, &source);
-    assert_eq!(status(&accepted), Status::Success);
+    assert_eq!(status(accepted), Status::Success);
     assert_eq!(*output.lock().unwrap(), [40]);
     wait_until("the runner to complete", || runner.is_complete());
 }
@@ -536,11 +559,8 @@ fn chains_finish_on_many_threads_and_graceful_completion_waits_for_all() {
             .map(|value| runner.submit(value).unwrap())
             .collect();
         runner.complete_gracefully();
-        let deadline = Instant::now() + PATIENCE;
-        for outcome in &outcomes {
-            let left = deadline.saturating_duration_since(Instant::now());
-            let outcome = outcome.recv_timeout(left).expect("an outcome");
-            assert_eq!(outcome.status(), Status::Success);
+        for outcome in outcomes {
+            assert_eq!(status(outcome), Status::Success);
         }
         wait_until("the runner to complete", || runner.is_complete());
     });
@@ -549,6 +569,58 @@ fn chains_finish_on_many_threads_and_graceful_completion_waits_for_all() {
         (0..CHAINS).map(|value| (value + 1) * 2).collect::<Vec<_>>()
     );
     assert_eq!(runner.size(), 0);
+}
+
+#[test]
+fn outcomes_of_1000_chains_from_4_submitters_each_arrive_once() {
+    const PER_SUBMITTER: i32 = 250;
+    let output = values();
+    let runner = Mutex::new(PipelineRunner::with_partitions(
+        &PipelineFrame::<i32>::builder()
+            .fan_out(|value| value + 1)
+            .fan_in(|value| value * 2),
+        collect(&output),
+        true,
+        NonZeroUsize::new(4).unwrap(),
+    ));
+    let source = executed(&runner.lock().unwrap());
+    let done = AtomicBool::new(false);
+    let arrived = thread::scope(|scope| {
+        let _stop = SetOnDrop(&done);
+        for _ in 0..2 {
+            scope.spawn(|| {
+                while !done.load(Ordering::Acquire) {
+                    source.request(1);
+                    thread::yield_now();
+                }
+            });
+        }
+        let submitters: Vec<_> = (0..4)
+            .map(|submitter| {
+                let runner = &runner;
+                scope.spawn(move || {
+                    let mut arrived = 0;
+                    for value in submitter * PER_SUBMITTER..(submitter + 1) * PER_SUBMITTER {
+                        let outcome = runner.lock().unwrap().submit(value).unwrap();
+                        assert_eq!(status(outcome), Status::Success);
+                        arrived += 1;
+                    }
+                    arrived
+                })
+            })
+            .collect();
+        submitters
+            .into_iter()
+            .map(|submitter| submitter.join().unwrap())
+            .sum::<i32>()
+    });
+    assert_eq!(arrived, 4 * PER_SUBMITTER);
+    assert_eq!(
+        sorted(&output),
+        (0..4 * PER_SUBMITTER)
+            .map(|value| (value + 1) * 2)
+            .collect::<Vec<_>>()
+    );
 }
 
 /// Kills its runner, then fails, while a drain pushes to it.
@@ -579,8 +651,8 @@ fn a_drain_that_fails_after_a_kill_still_cancels_the_chains_behind_it() {
     let pushed = runner.submit(1).unwrap();
     let behind = runner.submit(2).unwrap();
     assert!(panic::catch_unwind(AssertUnwindSafe(|| source.request(2))).is_err());
-    assert!(pushed.recv_timeout(PATIENCE).is_err());
-    assert_eq!(status(&behind), Status::Cancelled);
+    assert!(resolve(pushed).is_err());
+    assert_eq!(status(behind), Status::Cancelled);
     assert_eq!(runner.size(), 0);
     assert!(runner.is_complete());
 }
