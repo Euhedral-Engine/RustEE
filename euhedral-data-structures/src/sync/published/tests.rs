@@ -606,3 +606,38 @@ mod loom {
         });
     }
 }
+
+/// Retirements that one barrier already covers issue none of their own: a wait that polls many times, and many cells
+/// of one domain, share the barrier of the first.
+#[cfg(not(any(loom, miri)))]
+#[test]
+fn one_heavy_barrier_covers_the_retirements_made_before_it() {
+    let domain = EpochDomain::with_barrier(2, true);
+    if !domain.asymmetric {
+        return;
+    }
+    let cells: Vec<_> = (0..8)
+        .map(|n| Published::new(domain.clone(), Some(Arc::new(n))))
+        .collect();
+    // A reader that began before the retirements holds the domain back, so nothing is freed and every check scans.
+    let slot = domain.register();
+    let guard = slot.pin();
+    let retired: Vec<_> = cells.iter().map(|cell| cell.store(None)).collect();
+    for retirement in &retired {
+        assert!(!retirement.is_free());
+    }
+    assert_eq!(domain.heavy_barriers(), 1, "one barrier for eight cells");
+    for _ in 0..100 {
+        let _ = retired[0].is_free();
+    }
+    assert_eq!(domain.heavy_barriers(), 1, "a poll issues none");
+    drop(guard);
+    let fresh = Published::new(domain.clone(), Some(Arc::new(9)));
+    let more = fresh.store(None);
+    let _ = more.is_free();
+    assert_eq!(
+        domain.heavy_barriers(),
+        2,
+        "a newer retirement needs its own"
+    );
+}

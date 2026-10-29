@@ -43,6 +43,11 @@ pub struct EpochDomain {
     head: AtomicPtr<SlotNode>,
     /// Whether readers skip their fence because the writer's scan forces a barrier.
     asymmetric: bool,
+    /// The newest epoch whose swaps a heavy barrier already covers: every swap that preceded the barrier has an epoch
+    /// at most this. A scan for a retirement at or below it needs no barrier of its own.
+    barriered: AtomicU64,
+    /// The heavy barriers issued; for tests and metrics.
+    issued: AtomicU64,
 }
 
 // SAFETY: the nodes are reached through atomics only; a node's `next` is written once before publication, and the
@@ -64,6 +69,8 @@ impl EpochDomain {
             epoch: CachePadded::new(AtomicU64::new(1)),
             head: AtomicPtr::new(ptr::null_mut()),
             asymmetric: asymmetric && barrier::asymmetric(),
+            barriered: AtomicU64::new(0),
+            issued: AtomicU64::new(0),
         });
         for _ in 0..slots {
             domain.push_node(false);
@@ -109,6 +116,11 @@ impl EpochDomain {
         EpochSlot::new(self.clone(), self.push_node(true))
     }
 
+    /// The heavy barriers this domain has issued. Zero where readers keep the symmetric fence.
+    pub fn heavy_barriers(&self) -> u64 {
+        self.issued.load(Ordering::Relaxed)
+    }
+
     /// The number of slots, taken or free.
     pub fn slot_count(&self) -> usize {
         let mut count = 0;
@@ -127,14 +139,23 @@ impl EpochDomain {
         self.epoch.fetch_add(1, Ordering::SeqCst) + 1
     }
 
-    /// The oldest announcement of a thread in a read section, or `None` when every thread is idle.
-    fn floor(&self) -> Option<u64> {
+    /// The oldest announcement of a thread in a read section, or `None` when every thread is idle. `upto` is the
+    /// newest retirement epoch the answer is used for. `Some(0)` means "no reader may be taken as having passed" (a
+    /// heavy barrier that failed).
+    fn floor(&self, upto: u64) -> Option<u64> {
         // Pairs with the barrier a thread issues when it leaves idle: either its announcement is seen here, or its
-        // reads see what was published before this call. Readers that skip their fence are covered by the heavy
-        // barrier, which also orders this thread's own earlier store (the pointer swap) before the loads below.
+        // reads see what was published before this call. Readers that skip their fence are covered by a heavy
+        // barrier issued after the swap; it is issued only when no earlier one covers `upto`, so the retirements of
+        // many cells, or the iterations of a wait, share one.
         fence(Ordering::SeqCst);
-        if self.asymmetric {
-            barrier::heavy();
+        if self.asymmetric && self.barriered.load(Ordering::Acquire) < upto {
+            // Every swap with an epoch up to `covered` happened before this load, so before the barrier below.
+            let covered = self.epoch.load(Ordering::SeqCst);
+            if !barrier::heavy() {
+                return Some(0);
+            }
+            self.issued.fetch_add(1, Ordering::Relaxed);
+            self.barriered.fetch_max(covered, Ordering::Release);
         }
         let mut floor: Option<u64> = None;
         let mut node = self.head.load(Ordering::Acquire);
@@ -151,7 +172,7 @@ impl EpochDomain {
 
     /// Whether every thread is idle or has announced epoch `target` or later.
     fn passed(&self, target: u64) -> bool {
-        self.floor().is_none_or(|floor| floor >= target)
+        self.floor(target).is_none_or(|floor| floor >= target)
     }
 }
 
@@ -449,7 +470,14 @@ impl<T: Send + Sync> Published<T> {
         if list.is_null() {
             return;
         }
-        let floor = self.domain.floor();
+        let mut newest = 0;
+        let mut node = list;
+        // SAFETY: the swap above took the whole list, so its nodes are ours.
+        while let Some(current) = unsafe { node.as_ref() } {
+            newest = newest.max(current.target);
+            node = current.next;
+        }
+        let floor = self.domain.floor(newest);
         let mut kept: *mut Deferred<T> = ptr::null_mut();
         let mut kept_last: *mut Deferred<T> = ptr::null_mut();
         while !list.is_null() {

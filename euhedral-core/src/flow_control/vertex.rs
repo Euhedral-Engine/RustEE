@@ -489,6 +489,9 @@ impl LatticeVertex {
     /// The callers are the remapper and the reader whose release left the state retired and idle; either may be
     /// late, and the state may have been released, rewritten and published again by then. The lock settles it: a
     /// state is released only while it is retired, idle and not released.
+    ///
+    /// The loom `Model` in `euhedral-data-structures`' `sync::admission` tests copies this protocol (the book, the
+    /// `released` flag, the retire-then-release order) and checks it exhaustively; a change here changes the model.
     fn release_handles_when_quiescent(&self, state: &RoutingState) {
         if !state.admission.is_retired() || state.admission.has_readers() {
             return;

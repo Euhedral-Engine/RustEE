@@ -151,8 +151,8 @@ impl UpstreamRegistry {
     ///
     /// The cost is a thread-local lookup of the thread's slot (a borrow of the thread's list and a search for this
     /// registry), a reference-count update on the slot, and the pin: inside a worker's cycle the pin is one load
-    /// of the slot, and on any other thread it announces the thread for the call (two stores and a fence) and
-    /// withdraws it. Pin once around a series of loads, as the edges' climb does. A thread that is exiting, and
+    /// of the slot, and on any other thread it announces the thread for the call (two stores, and a fence only where the process cannot issue the
+    /// writer's heavy barrier) and withdraws it. Pin once around a series of loads, as the edges' climb does. A thread that is exiting, and
     /// has no slot of its own any more, uses a temporary one.
     ///
     /// [`Published`]: euhedral_data_structures::sync::Published
