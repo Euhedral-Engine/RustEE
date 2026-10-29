@@ -25,11 +25,12 @@ arm64 (Linux, macOS and Windows back ends) and is untested on mobile.
 The crates form layers, and a crate builds only on lower ones. No cycles: nothing below `euhedral-gpu` depends on it,
 not even through a dev-dependency or a feature (`euhedral-gpu/tests/layering.rs` checks every manifest).
 
-1. Utilities: `euhedral-data-structures`, `euhedral-hashing`, `euhedral-hardware-utils`.
-2. `euhedral-core`, on the utilities.
-3. `euhedral-graph` and `euhedral-io`, on `euhedral-core` (and the utilities they use).
-4. `euhedral-memory`, on `euhedral-core`, `euhedral-graph` and the utilities.
-5. `euhedral-gpu`, on `euhedral-core`, `euhedral-graph`, `euhedral-memory` and `euhedral-hashing`.
+1. Utilities: `euhedral-data-structures` and `euhedral-hashing`.
+2. `euhedral-hardware-utils`, on `euhedral-data-structures` (its lifecycle locks).
+3. `euhedral-core`, on the utilities.
+4. `euhedral-graph` and `euhedral-io`, on `euhedral-core` (and the utilities they use).
+5. `euhedral-memory`, on `euhedral-core`, `euhedral-graph` and the utilities.
+6. `euhedral-gpu`, on `euhedral-core`, `euhedral-graph`, `euhedral-memory` and `euhedral-hashing`.
 
 - [`GLOSSARY.md`](GLOSSARY.md): every term a user of RustEE meets, with links to the code.
 - [`CHANGELOG.md`](CHANGELOG.md): changes to the lattice's execution model, newest first.

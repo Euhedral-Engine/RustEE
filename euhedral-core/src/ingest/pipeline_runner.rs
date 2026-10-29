@@ -8,6 +8,7 @@ use std::fmt;
 use std::num::NonZeroUsize;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[allow(clippy::disallowed_types, reason = "HOT-FIX(C14)")]
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Weak};
 
@@ -35,6 +36,7 @@ impl<I> Error for AdmissionClosed<I> {}
 type Observer = Box<dyn FnOnce(Outcome) + Send>;
 
 /// A channel that hears how a chain ended, and the observer that tells it.
+#[allow(clippy::disallowed_types, reason = "HOT-FIX(C14)")]
 fn observed() -> (Receiver<Outcome>, Observer) {
     let (sender, outcome) = mpsc::sync_channel(1);
     let observer = Box::new(move |result| {
@@ -201,6 +203,7 @@ impl<I: Send + 'static> PipelineRunner<I> {
     }
 
     /// Like [`run`](Self::run), and reports how the chain ended.
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(C14)")]
     pub fn submit(&mut self, data: I) -> Result<Receiver<Outcome>, AdmissionClosed<I>> {
         let (outcome, observer) = observed();
         let root = self.checkout(data, Some(observer))?;
@@ -209,6 +212,7 @@ impl<I: Send + 'static> PipelineRunner<I> {
     }
 
     /// Like [`run_seeded`](Self::run_seeded), and reports how the chain ended.
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(C14)")]
     pub fn submit_seeded(
         &mut self,
         seed: u64,
@@ -225,6 +229,7 @@ impl<I: Send + 'static> PipelineRunner<I> {
     /// # Panics
     ///
     /// If `partition` is not below the partition count; no chain is checked out then.
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(C14)")]
     pub fn submit_on(
         &mut self,
         partition: usize,

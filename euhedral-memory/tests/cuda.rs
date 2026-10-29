@@ -1,4 +1,8 @@
 //! The CUDA backends on a real device (skipped, passing, when no driver or device is present).
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test fixtures: the test thread runs peer threads and waits on them"
+)]
 #![cfg(feature = "cuda")]
 
 use euhedral_memory::cuda::{Device, DeviceMemory, Driver, PinnedHost, StreamPool, Vmm};

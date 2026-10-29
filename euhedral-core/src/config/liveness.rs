@@ -1,5 +1,5 @@
+use euhedral_data_structures::sync::LifecycleMutex;
 use euhedral_hardware_utils::util::CpuSet;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, Thread};
 use std::time::{Duration, Instant};
@@ -52,6 +52,7 @@ impl CloneLivenessRegistry {
                 if now >= deadline {
                     return false;
                 }
+                #[allow(clippy::disallowed_methods, reason = "LIFECYCLE(C29)")]
                 thread::sleep(POLL.min(deadline - now));
             }
         }
@@ -73,7 +74,7 @@ pub struct Worker {
 /// Where one worker publishes its entry and exit.
 #[derive(Debug, Default)]
 pub struct WorkerSlot {
-    thread: Mutex<Option<Thread>>,
+    thread: LifecycleMutex<Option<Thread>>,
     running: AtomicBool,
 }
 
@@ -110,9 +111,7 @@ impl WorkerSlot {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Option<Thread>> {
-        self.thread
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.thread.lock()
     }
 }
 

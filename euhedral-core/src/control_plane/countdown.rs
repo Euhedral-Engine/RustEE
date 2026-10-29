@@ -1,12 +1,13 @@
+use euhedral_data_structures::sync::LifecycleMutex;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
 
 pub(super) type Done = Box<dyn FnOnce() + Send>;
 
 /// Calls its action once `count` ticks have arrived; at once for a count of zero.
 pub(super) struct Countdown {
     remaining: AtomicUsize,
-    done: Mutex<Option<Done>>,
+    done: LifecycleMutex<Option<Done>>,
 }
 
 impl Countdown {
@@ -15,22 +16,18 @@ impl Countdown {
             done();
             return Arc::new(Self {
                 remaining: AtomicUsize::new(0),
-                done: Mutex::new(None),
+                done: LifecycleMutex::new(None),
             });
         }
         Arc::new(Self {
             remaining: AtomicUsize::new(count),
-            done: Mutex::new(Some(done)),
+            done: LifecycleMutex::new(Some(done)),
         })
     }
 
     pub(super) fn tick(&self) {
         if self.remaining.fetch_sub(1, Ordering::AcqRel) == 1
-            && let Some(done) = self
-                .done
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .take()
+            && let Some(done) = self.done.lock().take()
         {
             done();
         }

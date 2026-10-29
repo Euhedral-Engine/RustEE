@@ -1,0 +1,27 @@
+# The hot path takes no lock, waits on nothing and does not park: locks are for start, stop and rebalance, and they
+# are `LifecycleMutex` and `LifecycleRwLock` (`euhedral_data_structures::sync`), which a debug build refuses inside a
+# hot scope. A listed type or call stays only under an `#[allow]` whose reason says why:
+#
+# - `LIFECYCLE(<id>)`: start, stop or rebalance work that still uses a standard blocking primitive;
+# - `HOT-FIX(<id>)`: a hot-path lock the audit lists, awaiting its fix (`euhedral-core/tests/hot_fix_ratchet.rs`
+#   counts the ids);
+# - `JAVA-BACKOFF`: a back-off the upstream design has too (idle parks, the spin-wait of the hot receiver);
+# - a test fixture.
+#
+# A crate with a `clippy.toml` of its own repeats the entries (`euhedral-graph`, `euhedral-io`, `euhedral-gpu`).
+disallowed-types = [
+    { path = "std::sync::Mutex", reason = "no locks on the hot path: use LifecycleMutex for start, stop and rebalance" },
+    { path = "std::sync::RwLock", reason = "no locks on the hot path: use LifecycleRwLock for start, stop and rebalance" },
+    { path = "std::sync::Condvar", reason = "nothing on the hot path waits" },
+    { path = "std::sync::Barrier", reason = "nothing on the hot path waits" },
+    { path = "std::sync::mpsc::Sender", reason = "no channels on the hot path" },
+    { path = "std::sync::mpsc::SyncSender", reason = "no channels on the hot path" },
+    { path = "std::sync::mpsc::Receiver", reason = "no channels on the hot path" },
+]
+disallowed-methods = [
+    { path = "std::thread::park", reason = "nothing on the hot path parks" },
+    { path = "std::thread::park_timeout", reason = "nothing on the hot path parks" },
+    { path = "std::thread::sleep", reason = "nothing on the hot path sleeps" },
+    { path = "std::thread::yield_now", reason = "nothing on the hot path yields" },
+    { path = "std::hint::spin_loop", reason = "nothing on the hot path spins" },
+]

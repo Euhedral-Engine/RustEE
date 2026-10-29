@@ -17,6 +17,15 @@
 //! Values upstream marks "not available" with `null` are `Option`s here, and sparse logical CPU ids
 //! are kept as the platform reports them: a span is the highest id plus one.
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_types,
+        clippy::disallowed_methods,
+        reason = "test fixtures lock their records and run peer threads"
+    )
+)]
+
 pub mod affinity;
 pub mod monitor;
 mod platform;

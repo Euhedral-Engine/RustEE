@@ -10,6 +10,10 @@ use std::ffi::CString;
 use std::io;
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+#[allow(
+    clippy::disallowed_types,
+    reason = "HOT-FIX(I3), HOT-FIX(I4), HOT-FIX(I5), HOT-FIX(I6)"
+)]
 use std::sync::{Arc, Mutex, Weak};
 
 use euhedral_core::frames::Frame;
@@ -36,6 +40,7 @@ type Enter = dyn Fn(&Submitter<'_>) -> io::Result<usize> + Send + Sync;
 /// The io_uring engine: a ring per submitting thread.
 pub(super) struct Uring {
     id: usize,
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(I3)")]
     rings: Mutex<Vec<Arc<Ring>>>,
     enter: Box<Enter>,
     /// The most bytes one read, write or send hands the kernel; a test's stand-in lowers it to
@@ -55,6 +60,7 @@ struct Ring {
     uring: IoUring,
     /// Pushing entries and entering the kernel: the owning thread, and a poll that resubmits the
     /// rest of a short read or hands over entries the kernel refused or had no room for.
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(I4)")]
     sq: Mutex<Queue>,
     /// Entries queued while another thread held `sq` (a poll chaining a read's pieces, each copied
     /// inside its enter: a lane's small read waited 1.4 ms for the lock). Lock-free: any thread
@@ -63,9 +69,12 @@ struct Ring {
     incoming: Producer<squeue::Entry, Multi>,
     /// Set after a push to `incoming`, once the entry is published; the `sq` holder clears it
     /// before it drains, and looks again after it lets go.
+    // HOT-FIX(S6a): the flag hands entries from a second submitter to the `sq` holder.
     waiting: AtomicBool,
     /// Reaping: one poll at a time (the lattice's guarantee; the lock makes it a fact).
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(I5)")]
     cq: Mutex<()>,
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(I6)")]
     ops: Mutex<Ops>,
     /// Entries handed to the submission queue and not yet reaped; at most the completion queue's
     /// size, so the completion queue never overflows.
@@ -255,6 +264,10 @@ enum Reaped {
 }
 
 impl Ring {
+    #[allow(
+        clippy::disallowed_types,
+        reason = "HOT-FIX(I4), HOT-FIX(I5), HOT-FIX(I6)"
+    )]
     fn new() -> io::Result<Self> {
         let uring = IoUring::builder().setup_clamp().build(RING_ENTRIES)?;
         let capacity = uring.params().cq_entries() as usize;
@@ -488,6 +501,7 @@ fn socket_address(to: std::net::SocketAddr) -> (Box<libc::sockaddr_storage>, lib
 impl Uring {
     /// An engine with `enter` in place of `io_uring_enter` and pieces of at most `max_piece` bytes
     /// (tests: the stand-in backend).
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(I3)")]
     fn with(enter: Box<Enter>, max_piece: usize) -> io::Result<Self> {
         // A ring proves the kernel allows io_uring before anything relies on it.
         drop(Ring::new()?);

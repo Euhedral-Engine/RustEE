@@ -16,20 +16,17 @@
 //!   set a flag the task reads with [`is_interrupted`] and unpark the task's thread.
 //! - A CPU that is a hole in a sparse topology is rejected up front.
 
+use euhedral_data_structures::sync::LifecycleMutex;
 use std::any::Any;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
+#[allow(clippy::disallowed_types, reason = "LIFECYCLE(H8)")]
+use std::sync::{Arc, Condvar, MutexGuard, OnceLock, PoisonError, Weak};
 use std::thread::{self, JoinHandle, Thread};
 use std::time::{Duration, Instant};
-
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    // No user code runs under these locks.
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}
 
 thread_local! {
     static INTERRUPTED: RefCell<Option<Arc<AtomicBool>>> = const { RefCell::new(None) };
@@ -167,13 +164,14 @@ struct ControlState {
 
 /// One executor's lifecycle and its running tasks (upstream `LifecycleControl`).
 struct Control {
-    state: Mutex<ControlState>,
+    state: LifecycleMutex<ControlState>,
+    #[allow(clippy::disallowed_types, reason = "LIFECYCLE(H8)")]
     changed: Condvar,
 }
 
 impl Control {
     fn lock(&self) -> MutexGuard<'_, ControlState> {
-        lock(&self.state)
+        self.state.lock()
     }
 
     fn state(&self) -> State {
@@ -219,6 +217,7 @@ impl Control {
         Self::close_locked(&self.changed, &mut self.lock())
     }
 
+    #[allow(clippy::disallowed_types, reason = "LIFECYCLE(H8)")]
     fn close_locked(changed: &Condvar, control: &mut ControlState) -> bool {
         control.state = State::Closed;
         control.tasks.values().for_each(TaskInterrupt::interrupt);
@@ -242,7 +241,7 @@ struct Entry {
 }
 
 struct RegistryShared {
-    entries: Mutex<HashMap<usize, Entry>>,
+    entries: LifecycleMutex<HashMap<usize, Entry>>,
     binding: Arc<dyn TaskBinding>,
     validator: Box<dyn Fn(usize) -> bool + Send + Sync>,
 }
@@ -250,7 +249,7 @@ struct RegistryShared {
 impl RegistryShared {
     /// Removes the entry for `cpu` if it is still entry `id` and has no running task.
     fn remove_exact(&self, cpu: usize, id: u64) {
-        let mut entries = lock(&self.entries);
+        let mut entries = self.entries.lock();
         if entries
             .get(&cpu)
             .is_some_and(|entry| entry.id == id && entry.control.is_empty())
@@ -275,7 +274,7 @@ impl Registry {
     ) -> Self {
         Self {
             shared: Arc::new(RegistryShared {
-                entries: Mutex::new(HashMap::new()),
+                entries: LifecycleMutex::new(HashMap::new()),
                 binding,
                 validator: Box::new(validator),
             }),
@@ -312,7 +311,7 @@ impl Registry {
         // lock.
         let mut stale = None;
         let result = {
-            let mut entries = lock(&self.shared.entries);
+            let mut entries = self.shared.entries.lock();
             let reuse = match entries.get(&cpu) {
                 Some(entry) => match entry.executor.upgrade() {
                     Some(inner) if inner.control.join(Some(name)) => {
@@ -332,8 +331,9 @@ impl Registry {
             };
             reuse.unwrap_or_else(|| {
                 let id = NEXT_ENTRY.fetch_add(1, Ordering::Relaxed);
+                #[allow(clippy::disallowed_types, reason = "LIFECYCLE(H8)")]
                 let control = Arc::new(Control {
-                    state: Mutex::new(ControlState {
+                    state: LifecycleMutex::new(ControlState {
                         state: State::Running,
                         name: name.to_owned(),
                         users: 1,
@@ -369,7 +369,7 @@ impl Registry {
         self.validate(cpu)?;
         let live;
         let found = {
-            let mut entries = lock(&self.shared.entries);
+            let mut entries = self.shared.entries.lock();
             let Some(entry) = entries.get(&cpu) else {
                 return Ok(None);
             };
@@ -395,12 +395,15 @@ impl Registry {
     /// Closes every executor; later acquisitions create new ones.
     pub(crate) fn close_all(&self) {
         // An executor with running tasks keeps its entry until the last task exits.
-        lock(&self.shared.entries).retain(|_, entry| !entry.control.close());
+        self.shared
+            .entries
+            .lock()
+            .retain(|_, entry| !entry.control.close());
     }
 
     #[cfg(test)]
     pub(crate) fn entry_count(&self) -> usize {
-        lock(&self.shared.entries).len()
+        self.shared.entries.lock().len()
     }
 }
 
@@ -725,7 +728,11 @@ fn run_pinned<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::mpsc;
+    use std::sync::{Mutex, mpsc};
+
+    fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+        mutex.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 
     #[derive(Default)]
     struct Recording {

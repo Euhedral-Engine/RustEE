@@ -17,6 +17,14 @@
 //! the [`IoMemory`] contract that lets an operation read into memory the caller owns (`// SAFETY:` on
 //! every block).
 #![allow(unsafe_code)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_types,
+        clippy::disallowed_methods,
+        reason = "test fixtures lock their records and run peer threads"
+    )
+)]
 #![cfg(all(
     feature = "async-io",
     any(target_os = "linux", target_os = "android", windows)
@@ -27,6 +35,7 @@ use std::fmt;
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+#[allow(clippy::disallowed_types, reason = "HOT-FIX(I1), HOT-FIX(I2)")]
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use euhedral_core::frames::Frame;
@@ -504,14 +513,17 @@ pub struct AsyncIo {
 pub(crate) struct Front {
     /// Continuations reaped while a pull's `stop` matched them, the oldest first; only the polling
     /// thread touches it.
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(I1)")]
     held: Mutex<VecDeque<Box<dyn Frame>>>,
     pending: AtomicUsize,
     demand: AtomicU64,
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(I2)")]
     downstream: Mutex<Option<Arc<dyn LatticeReceiver>>>,
     complete: AtomicBool,
 }
 
 impl Front {
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(I1), HOT-FIX(I2)")]
     pub(crate) fn new() -> Self {
         Self {
             held: Mutex::new(VecDeque::new()),
@@ -576,6 +588,7 @@ impl fmt::Debug for AsyncIo {
     }
 }
 
+#[allow(clippy::disallowed_types, reason = "HOT-FIX(I1), HOT-FIX(I2)")]
 pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }

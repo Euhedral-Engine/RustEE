@@ -16,9 +16,10 @@ mod copier;
 pub use backends::{DeviceMemory, PinnedHost, StreamPool, Vmm, VmmBlock};
 pub use copier::StreamCopier;
 
+use euhedral_data_structures::sync::LifecycleMutex;
 use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
 use std::fmt;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 
 pub type CuResult = c_int;
 pub type CuDevicePtr = u64;
@@ -248,8 +249,8 @@ impl Driver {
     /// is one loaded library and, through [`Device::open`], one primary context. A failed load is not remembered: a
     /// later call tries again.
     pub fn shared() -> Result<Arc<Self>, String> {
-        static SHARED: Mutex<Option<Arc<Driver>>> = Mutex::new(None);
-        let mut shared = SHARED.lock().unwrap_or_else(PoisonError::into_inner);
+        static SHARED: LifecycleMutex<Option<Arc<Driver>>> = LifecycleMutex::new(None);
+        let mut shared = SHARED.lock();
         if let Some(driver) = &*shared {
             return Ok(driver.clone());
         }

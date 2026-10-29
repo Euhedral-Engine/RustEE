@@ -1263,6 +1263,7 @@ impl GiveBacks {
     }
 
     /// An order was queued: push it downstream if the lattice asked for frames.
+    // HOT-FIX(S1): a producer pushes to the downstream itself, outside `request`.
     fn wake(&self) {
         let Some(downstream) = self.downstream.get() else {
             return;

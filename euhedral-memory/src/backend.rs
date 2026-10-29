@@ -95,6 +95,7 @@ impl<F: Fn() -> bool + Send> Retired for F {
 /// Frees queued behind the device work that last used them. `push` never waits; `reap` frees what has retired. A
 /// free is ordinary work: run `reap` on the owner's lane (its blocking time counts as that work's service time); only
 /// frees measured to block for much longer than the lattice's ordinary work go to a lattice set aside for them.
+// HOT-FIX(M1): `reap` makes the blocking driver frees (`cuMemFree`, `cuMemFreeHost`) on the worker that calls it.
 pub struct Reaper<T: Send> {
     queue: MpmcQueue<(Box<dyn Retired>, T)>,
     producer: Producer<(Box<dyn Retired>, T), Multi>,

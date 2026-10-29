@@ -42,6 +42,10 @@ use std::io;
 use std::path::PathBuf;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+#[allow(
+    clippy::disallowed_types,
+    reason = "HOT-FIX(I9), HOT-FIX(I14), HOT-FIX(I15), HOT-FIX(I7), HOT-FIX(I8), HOT-FIX(I10), HOT-FIX(I11), HOT-FIX(I12), HOT-FIX(I13)"
+)]
 use std::sync::{Arc, Mutex, Weak};
 
 use euhedral_core::frames::Frame;
@@ -231,6 +235,7 @@ struct PoolDone {
     result: io::Result<usize>,
 }
 
+#[allow(clippy::disallowed_types, reason = "HOT-FIX(I9)")]
 type PoolQueue = Arc<Mutex<VecDeque<PoolDone>>>;
 
 /// Delivers a pool job's result, or, if the job is dropped or panics first, an error.
@@ -318,9 +323,11 @@ struct Ring {
     handle: Handle,
     /// Building entries and submitting: one thread at a time, and a thread that finds it taken
     /// leaves its entry in the backlog for the holder or the next poll.
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(I14)")]
     inner: Mutex<RingInner>,
     /// Entries waiting for room in the kernel's queues, the oldest first. Its own lock, held only
     /// to push or take, so a submission never waits behind a submit.
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(I15)")]
     backlog: Mutex<VecDeque<Entry>>,
     /// Entries built and not yet popped; at most the completion queue's size, so it never
     /// overflows.
@@ -360,22 +367,28 @@ pub(super) struct Engine {
     id: usize,
     sys: Arc<dyn Sys>,
     port: Port,
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(I7)")]
     table: Mutex<Table>,
     /// Operations whose call failed at once, to end with that error at the next poll.
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(I8)")]
     ready: Mutex<VecDeque<Failed>>,
     /// What open and rename jobs left.
     pool_done: PoolQueue,
     /// Packets taken from the port and not yet handled (a poll stops when the caller has room for
     /// no more, and leaves the packets of slots whose call is still returning); only the polling
     /// thread touches it.
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(I10)")]
     inbox: Mutex<VecDeque<Packet>>,
     /// The handles this engine joined to its port.
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(I11)")]
     associated: Mutex<HashSet<Handle>>,
     /// File reads and writes go through rings (only where the OS has both: a handle that a ring
     /// serves must not belong to a port, and a write has to follow its reads there).
     ring_files: bool,
     /// The file handles a ring serves.
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(I12)")]
     ringed: Mutex<HashSet<Handle>>,
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(I13)")]
     rings: Mutex<Vec<Arc<Ring>>>,
     max_piece: usize,
     /// Packets and completions of no operation (ignored), for tests.
@@ -394,6 +407,10 @@ enum Taken {
 
 impl Engine {
     /// An engine over `sys`. Fails if there is no completion port.
+    #[allow(
+        clippy::disallowed_types,
+        reason = "HOT-FIX(I7), HOT-FIX(I8), HOT-FIX(I10), HOT-FIX(I11), HOT-FIX(I12), HOT-FIX(I13)"
+    )]
     pub(super) fn new(
         sys: Arc<dyn Sys>,
         options: AsyncIoOptions,
@@ -652,6 +669,7 @@ impl Engine {
     // ---- rings
 
     /// The calling thread's ring, made on first use; `None` if there is none to be had.
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(I14), HOT-FIX(I15)")]
     fn ring(&self) -> Option<Arc<Ring>> {
         MINE.with_borrow_mut(|mine| {
             mine.retain(|(_, ring)| ring.strong_count() > 0);

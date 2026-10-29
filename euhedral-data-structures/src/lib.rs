@@ -8,6 +8,15 @@
 //! out producer and consumer handles, a *single* role has at most one live handle and takes `&mut self`,
 //! and a *multi* role is `Clone`. The public API is entirely safe.
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_types,
+        clippy::disallowed_methods,
+        reason = "test fixtures lock their records and run peer threads"
+    )
+)]
+
 pub mod atomics;
 pub mod queues;
 pub mod sync;

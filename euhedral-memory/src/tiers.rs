@@ -1117,6 +1117,7 @@ impl Moves {
         n
     }
 
+    // HOT-FIX(S2): a producer pushes to the downstream itself, outside `request`.
     fn wake(&self) {
         let Some(downstream) = self.downstream.get() else {
             return;

@@ -5,7 +5,9 @@
 
 use std::ffi::{CStr, CString, OsString, c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
+
+use euhedral_data_structures::sync::LifecycleMutex;
 
 use crate::{CompileOptions, GpuError};
 
@@ -249,7 +251,7 @@ fn build_name(path: &Path) -> String {
     format!("{name}:{len}:{modified}")
 }
 
-static SHARED: Mutex<Option<Arc<Nvrtc>>> = Mutex::new(None);
+static SHARED: LifecycleMutex<Option<Arc<Nvrtc>>> = LifecycleMutex::new(None);
 
 impl Nvrtc {
     /// The process's NVRTC: the first successful load, by `explicit` or the search order. Loading blocks (file
@@ -258,7 +260,7 @@ impl Nvrtc {
     /// One compiler serves the process. Asking for a different library file once one is loaded is
     /// `Err(Invalid)`, not a silent use of the loaded one.
     pub fn shared(explicit: Option<&Path>) -> Result<Arc<Self>, GpuError> {
-        let mut shared = SHARED.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut shared = SHARED.lock();
         if let Some(nvrtc) = &*shared {
             if let (Some(want), Some(have)) = (explicit, &nvrtc.library)
                 && !same_file(want, have)

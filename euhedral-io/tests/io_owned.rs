@@ -3,7 +3,10 @@
 //!
 //! The files are opened by `AsyncIo::open_path` (overlapped on Windows). The tests drive the source
 //! by hand, as a lattice worker's polls do, and assume nothing about the number of cores.
-
+#![allow(
+    clippy::disallowed_types,
+    reason = "test fixtures: the test thread locks its records"
+)]
 #![cfg(all(
     feature = "async-io",
     any(target_os = "linux", target_os = "android", windows)

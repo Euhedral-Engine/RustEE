@@ -8,6 +8,7 @@
 //! (or a test) only. Nothing on the lattice waits.
 
 use std::fmt;
+#[allow(clippy::disallowed_types, reason = "HOT-FIX(G5)")]
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, Thread};
 
@@ -24,6 +25,7 @@ struct State<T> {
 ///
 /// The type only makes the ends: `Latch::<T>::new()`.
 pub struct Latch<T> {
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(G5)")]
     state: Mutex<State<T>>,
 }
 
@@ -37,6 +39,7 @@ impl<T> Latch<T> {
     /// A latch with nothing set: the end that sets it and the end that waits for it.
     // A constructor of its two ends, not of a `Latch`: the shared state is private.
     #[allow(clippy::new_ret_no_self)]
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(G5)")]
     pub fn new() -> (LatchSetter<T>, LatchWaiter<T>) {
         let latch = Arc::new(Self {
             state: Mutex::new(State {

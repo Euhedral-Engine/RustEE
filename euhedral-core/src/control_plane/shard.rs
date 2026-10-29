@@ -13,6 +13,7 @@ use euhedral_hardware_utils::util::CpuSet;
 use std::error::Error;
 use std::fmt;
 use std::panic::{self, AssertUnwindSafe};
+#[allow(clippy::disallowed_types, reason = "HOT-FIX(C19)")]
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
@@ -74,6 +75,7 @@ pub struct ControlPlaneShard {
     shutdown_timeout: Duration,
     directory: Arc<CacheDirectory>,
     core_span: usize,
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(C19)")]
     state: Mutex<State>,
     this: Weak<ControlPlaneShard>,
 }
@@ -81,6 +83,7 @@ pub struct ControlPlaneShard {
 impl ControlPlaneShard {
     /// A shard for `socket` of `directory`'s lattice that clones `cloneable` onto cores with ids
     /// below `core_span`. Clones get `shutdown_timeout` to drain before they are closed.
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(C19)")]
     pub fn new(
         directory: &Arc<CacheDirectory>,
         socket: usize,

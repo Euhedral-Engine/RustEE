@@ -2,6 +2,10 @@
 //! decides when the queue's work completes and when a retirement arrives.
 
 #![allow(unsafe_code, reason = "it implements the unsafe `raw` of `LaneSubmit`")]
+#![allow(
+    clippy::disallowed_types,
+    reason = "a test double: its records are locked by the test thread and the code under test"
+)]
 
 use std::collections::VecDeque;
 use std::fmt;

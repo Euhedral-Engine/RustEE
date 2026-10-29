@@ -4,6 +4,7 @@ use crate::frames::{Failure, Frame, FrameError};
 use crate::generics::LatticeReceiver;
 use crate::utils::spin_wait;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[allow(clippy::disallowed_types, reason = "HOT-FIX(C9), HOT-FIX(C8)")]
 use std::sync::{Arc, RwLock, Weak};
 
 /// Work to run once a retiring edge can no longer receive frames.
@@ -59,7 +60,9 @@ pub struct LatticeEdge {
     drain: Arc<AtomicBool>,
     /// The node built on this edge, handed to children as their parent.
     node: Weak<dyn LatticeNode>,
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(C9)")]
     parent: RwLock<Option<Weak<dyn LatticeNode>>>,
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(C8)")]
     downstream: RwLock<Option<Downstream>>,
     closed: AtomicBool,
 }
@@ -71,6 +74,7 @@ impl LatticeEdge {
     }
 
     /// The edge of the node `node` will point to once constructed.
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(C9), HOT-FIX(C8)")]
     pub(crate) fn for_node(
         registry: &Arc<UpstreamRegistry>,
         drain: Arc<AtomicBool>,

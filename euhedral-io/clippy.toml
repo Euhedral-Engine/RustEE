@@ -1,4 +1,5 @@
-# The no-thread, no-wait rules of this crate: nothing here blocks or spins, and the threads belong to the lattice.
+# The workspace's lock rules (see the root `clippy.toml`: a `HOT-FIX(<id>)`, `LIFECYCLE(<id>)` or `JAVA-BACKOFF` reason
+# on every allow) and the no-thread, no-wait rules of this crate: nothing here blocks or spins, and the threads belong to the lattice.
 # A listed call is allowed only in a test fixture (peer threads, arrival races) or where a call has no non-blocking
 # form, under an `#[allow(clippy::disallowed_methods)]` that says why.
 disallowed-methods = [
@@ -29,6 +30,8 @@ disallowed-methods = [
     { path = "std::process::Child::wait", reason = "waits for a child process" },
 ]
 disallowed-types = [
+    { path = "std::sync::Mutex", reason = "no locks on the hot path: use LifecycleMutex for start, stop and rebalance" },
+    { path = "std::sync::RwLock", reason = "no locks on the hot path: use LifecycleRwLock for start, stop and rebalance" },
     { path = "std::sync::mpsc::Sender", reason = "no channels" },
     { path = "std::sync::mpsc::SyncSender", reason = "no channels" },
     { path = "std::sync::mpsc::Receiver", reason = "no channels" },

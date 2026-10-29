@@ -3,7 +3,10 @@
 //! CI runners have two cores, so nothing here assumes more than one: the lattice is given a single
 //! CPU, one the process may run on, and the tests assert structure (order, attachment, counts), not
 //! simultaneity.
-
+#![allow(
+    clippy::disallowed_types,
+    reason = "test fixtures: the test thread locks its records"
+)]
 // The test thread is the harness, not a frame: it polls for what the lattice did, and waits on a
 // latch, with sleeps no frame may make.
 #![allow(clippy::disallowed_methods)]

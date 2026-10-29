@@ -1,6 +1,7 @@
 use super::upstream_queue::{Entry, UpstreamHandle, UpstreamQueue};
 use euhedral_data_structures::atomics::PaddedAtomicLong;
 use euhedral_data_structures::queues::{MpscQueue, Multi, Producer};
+use euhedral_data_structures::sync::LifecycleMutex;
 use euhedral_hardware_utils::affinity;
 use euhedral_hardware_utils::topology::Topology;
 use euhedral_hardware_utils::util::CpuSet;
@@ -8,7 +9,7 @@ use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Weak};
 
 /// Chunk size of each worker's handle queue.
 const HANDLE_QUEUE_CHUNK: usize = 256;
@@ -67,7 +68,7 @@ pub struct UpstreamRegistry {
     ranks: Box<[AtomicUsize]>,
     p_cpus: CpuSet,
     shuffle_window: usize,
-    state: Mutex<State>,
+    state: LifecycleMutex<State>,
 }
 
 impl UpstreamRegistry {
@@ -86,7 +87,7 @@ impl UpstreamRegistry {
             ranks: (0..cpu_span).map(|_| AtomicUsize::new(0)).collect(),
             p_cpus,
             shuffle_window: cpu_span.max(1),
-            state: Mutex::new(State::default()),
+            state: LifecycleMutex::new(State::default()),
         })
     }
 
@@ -118,7 +119,7 @@ impl UpstreamRegistry {
         let Some(worker) = worker else {
             return;
         };
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         if state
             .workers
             .iter()
@@ -172,7 +173,7 @@ impl UpstreamRegistry {
     /// Adds `handle`: every worker's queue receives it, and it counts as live until
     /// [`remove_handle`](Self::remove_handle) reports it complete.
     pub fn add_handle(&self, handle: Arc<dyn UpstreamHandle>) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         state.handles.retain(|handle| !handle.is_complete());
         for worker in &state.workers {
             offer(&worker.producer, &handle);
@@ -229,7 +230,7 @@ impl UpstreamRegistry {
     }
 
     fn unregister(&self, queue_id: u64) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         let Some(index) = state
             .workers
             .iter()
@@ -449,7 +450,7 @@ mod tests {
 
         assert_eq!(registry.upstream_handle_count(), 0);
         assert_eq!(registry.thread_count(), 1);
-        assert!(registry.state.lock().unwrap().handles.is_empty());
+        assert!(registry.state.lock().handles.is_empty());
         let queued = registry.with_thread_queue(|queue| queue.cached_upstream_count());
         assert_eq!(queued, Some(0));
     }

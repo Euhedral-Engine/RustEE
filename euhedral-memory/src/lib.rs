@@ -22,6 +22,15 @@
 //! reserved, what spills to pinned host memory is decided up front, and what cannot fit is refused; released pinned
 //! buffers stay in a capacity cache.
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_types,
+        clippy::disallowed_methods,
+        reason = "test fixtures lock their records and run peer threads"
+    )
+)]
+
 pub mod admission;
 pub mod arena;
 pub mod backend;

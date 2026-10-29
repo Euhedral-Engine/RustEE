@@ -1,6 +1,11 @@
 //! Fakes for tests of code that submits to device lanes (feature `testing`): [`FakeDevice`], an in-order fake
 //! device queue on a timeline, and [`FakeLanes`], a stepped fake lane submitter.
 
+#![allow(
+    clippy::disallowed_types,
+    reason = "a test double: its records are locked by the test thread and the code under test"
+)]
+
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 

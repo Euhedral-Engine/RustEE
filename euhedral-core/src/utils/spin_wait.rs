@@ -14,10 +14,13 @@ pub fn await_while(mut condition: impl FnMut() -> bool) {
     let mut checks: u32 = 0;
     while condition() {
         if checks < SPINS {
+            #[allow(clippy::disallowed_methods, reason = "JAVA-BACKOFF")]
             hint::spin_loop();
         } else if checks < YIELDS {
+            #[allow(clippy::disallowed_methods, reason = "JAVA-BACKOFF")]
             thread::yield_now();
         } else {
+            #[allow(clippy::disallowed_methods, reason = "JAVA-BACKOFF")]
             thread::park_timeout(PARK);
         }
         checks = checks.saturating_add(1);

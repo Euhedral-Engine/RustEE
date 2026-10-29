@@ -15,6 +15,11 @@
 //! kernel registry) is one state behind a mutex: it stands for hardware in tests, not for a submission path, and a real
 //! backend has no such state in the host.
 
+#![allow(
+    clippy::disallowed_types,
+    reason = "the simulated device is one state behind a mutex: it stands for hardware, not for a submission path"
+)]
+
 mod enqueue;
 mod graph;
 mod module;

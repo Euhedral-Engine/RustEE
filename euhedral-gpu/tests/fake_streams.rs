@@ -1,4 +1,8 @@
 //! Ordering, markers, retirement and poisoning on the fake backend. No GPU, no wall clock.
+#![allow(
+    clippy::disallowed_types,
+    reason = "test fixtures: the test thread locks its records"
+)]
 #![cfg(feature = "fake")]
 #![allow(
     clippy::disallowed_methods,

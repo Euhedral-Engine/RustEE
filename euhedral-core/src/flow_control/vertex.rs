@@ -13,6 +13,7 @@ use std::fmt;
 use std::panic::{self, AssertUnwindSafe};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+#[allow(clippy::disallowed_types, reason = "HOT-FIX(C6), HOT-FIX(C7)")]
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
 /// Picks the active downstream for a frame: an index below `state.len()` into
@@ -140,7 +141,9 @@ pub struct LatticeVertex {
     name: String,
     downstream_count: usize,
     route: RoutingFunction,
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(C6)")]
     routing: RwLock<Arc<RoutingState>>,
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(C7)")]
     book: Mutex<Book>,
     closed: AtomicBool,
     upstream_sequence: AtomicU64,
@@ -161,6 +164,7 @@ impl LatticeVertex {
     }
 
     /// Like [`new`](Self::new), routing with `route`.
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(C6), HOT-FIX(C7)")]
     pub fn with_routing(
         registry: &Arc<UpstreamRegistry>,
         name: impl Into<String>,
