@@ -218,8 +218,36 @@ mod tests {
 #[cfg(loom)]
 mod loom_tests {
     use super::*;
+    use loom::cell::UnsafeCell;
     use loom::sync::Arc;
     use loom::thread;
+
+    /// A value written plainly before it is installed. Loom tracks the plain accesses, so a `get`
+    /// that did not acquire what `set` released shows up as a data race on this cell.
+    struct Payload {
+        written: UnsafeCell<u32>,
+    }
+
+    // SAFETY: the payload is written once, before `set` publishes it, and only read after `get`.
+    unsafe impl Send for Payload {}
+    // SAFETY: as above; `SetOnce` hands out only shared references to a published payload.
+    unsafe impl Sync for Payload {}
+
+    impl Payload {
+        fn new(value: u32) -> Self {
+            let payload = Self {
+                written: UnsafeCell::new(0),
+            };
+            // SAFETY: the payload is not shared yet.
+            payload.written.with_mut(|slot| unsafe { *slot = value });
+            payload
+        }
+
+        fn read(&self) -> u32 {
+            // SAFETY: a published payload is never written again.
+            self.written.with(|slot| unsafe { *slot })
+        }
+    }
 
     #[test]
     fn loom_one_setter_wins_and_every_reader_sees_it() {
@@ -229,18 +257,18 @@ mod loom_tests {
                 .into_iter()
                 .map(|value| {
                     let cell = cell.clone();
-                    thread::spawn(move || cell.set(value).is_ok())
+                    thread::spawn(move || cell.set(Payload::new(value)).is_ok())
                 })
                 .collect();
             let reader = {
                 let cell = cell.clone();
-                thread::spawn(move || cell.get().copied())
+                thread::spawn(move || cell.get().map(Payload::read))
             };
             let wins: Vec<bool> = setters.into_iter().map(|t| t.join().unwrap()).collect();
             let seen = reader.join().unwrap();
             assert_eq!(wins.iter().filter(|&&won| won).count(), 1);
             let winner = if wins[0] { 1 } else { 2 };
-            assert_eq!(cell.get(), Some(&winner));
+            assert_eq!(cell.get().map(Payload::read), Some(winner));
             if let Some(seen) = seen {
                 assert_eq!(seen, winner);
             }

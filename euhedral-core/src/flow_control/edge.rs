@@ -285,6 +285,7 @@ fn already_attached() -> Failure {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::flow_control::Claim;
     use crate::flow_control::testing::{Fate, Fates, TestReceiver, Tracked, frame};
     use euhedral_hardware_utils::util::CpuSet;
     use std::sync::Mutex;
@@ -305,6 +306,7 @@ mod tests {
 
         fn pull(
             &self,
+            _claim: &mut Claim,
             _consumer: &mut dyn FnMut(Box<dyn Frame>),
             _stop: &mut dyn FnMut(&dyn Frame) -> bool,
             demand: u64,
@@ -313,7 +315,7 @@ mod tests {
             Some(demand)
         }
 
-        fn request(&self, demand: u64) {
+        fn request(&self, _claim: &mut Claim, demand: u64) {
             self.requested.fetch_add(demand, Ordering::Relaxed);
         }
 

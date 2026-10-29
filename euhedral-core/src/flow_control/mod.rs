@@ -23,7 +23,9 @@ pub use edge::{LatticeEdge, LatticeNode, Retirement};
 pub use hot_receiver::{LatticeHotReceiver, PushHook, Response};
 pub use hot_source::LatticeHotSource;
 pub use registry::UpstreamRegistry;
-pub use upstream_queue::{PullBucketDivisionMode, UpstreamHandle, UpstreamQueue, decay_contention};
+pub use upstream_queue::{
+    Claim, PullBucketDivisionMode, UpstreamHandle, UpstreamQueue, decay_contention,
+};
 pub use vertex::{
     LatticeClosed, LatticeVertex, RoutingFunction, RoutingState, UpstreamInterceptor, route_by_hash,
 };

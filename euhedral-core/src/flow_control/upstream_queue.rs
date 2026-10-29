@@ -28,38 +28,69 @@ fn request_evidence() -> (u64, u64) {
     (satisfied, ROUTED_PUSHES.with(Cell::get))
 }
 
+/// The proof that a worker holds a handle's claim.
+///
+/// [`UpstreamHandle::try_acquire`] returns one when it takes the claim. [`pull`](UpstreamHandle::pull)
+/// and [`request`](UpstreamHandle::request) borrow it, and [`release`](UpstreamHandle::release)
+/// consumes it, so a handle's source is entered only by the worker that holds the claim, and the
+/// claim is given back only by that worker. Code outside this crate cannot make one, and a claim
+/// names the handle it was taken from: another handle refuses it.
+///
+/// A claim that is dropped without `release` leaves its handle claimed for good.
+#[derive(Debug)]
+#[must_use = "a claim that is not released leaves the handle claimed"]
+pub struct Claim {
+    owner: u64,
+}
+
+impl Claim {
+    /// A claim on the handle that calls itself `owner`.
+    pub(crate) fn new(owner: u64) -> Self {
+        Self { owner }
+    }
+
+    /// The identity of the handle this claim was taken from.
+    pub(crate) fn owner(&self) -> u64 {
+        self.owner
+    }
+}
+
 /// An upstream source as an [`UpstreamQueue`] sees it.
 ///
 /// One handle sits in the queue of every worker that may service it. A worker services a handle
-/// only while it holds the handle's claim, so a handle is serviced by one worker at a time.
+/// only while it holds the handle's [`Claim`], so a handle is serviced by one worker at a time.
 pub trait UpstreamHandle: Send + Sync {
     /// The handle's registration order, which [`UpstreamQueue::reset_for_next_trial`] restores.
     fn sequence(&self) -> u64;
 
     /// Hands up to `demand` frames to `consumer`, stopping before the first frame `stop` matches,
     /// and returns how many. `None` means the handle did not look at its source, so the pull says
-    /// nothing about whether the source has work.
+    /// nothing about whether the source has work. `claim` is the one taken from this handle.
     fn pull(
         &self,
+        claim: &mut Claim,
         consumer: &mut dyn FnMut(Box<dyn Frame>),
         stop: &mut dyn FnMut(&dyn Frame) -> bool,
         demand: u64,
     ) -> Option<u64>;
 
-    /// Passes demand for `demand` frames on to the source.
-    fn request(&self, demand: u64);
+    /// Passes demand for `demand` frames on to the source. `claim` is the one taken from this
+    /// handle.
+    fn request(&self, claim: &mut Claim, demand: u64);
 
     /// A complete handle is dropped from every queue that comes across it.
     fn is_complete(&self) -> bool;
 
-    /// Takes the handle's claim, or returns false if another worker holds it. The default never
+    /// Takes the handle's claim, or returns `None` if another worker holds it. The default never
     /// contends.
-    fn try_acquire(&self) -> bool {
-        true
+    fn try_acquire(&self) -> Option<Claim> {
+        Some(Claim::new(0))
     }
 
-    /// Releases the claim taken by [`try_acquire`](Self::try_acquire).
-    fn release(&self) {}
+    /// Gives back the claim taken by [`try_acquire`](Self::try_acquire).
+    fn release(&self, claim: Claim) {
+        let _ = claim;
+    }
 }
 
 /// A handle in one worker's queue, with that worker's latest view of whether the handle produces
@@ -402,16 +433,16 @@ impl UpstreamQueue {
             }
 
             attempts += 1;
-            if !entry.handle.try_acquire() {
+            let Some(claim) = entry.handle.try_acquire() else {
                 failed += 1;
                 self.buffer_for_requeue(entry);
                 cycles += 1;
                 continue;
-            }
+            };
 
             let request = limit.min(bucket);
             limit -= request;
-            total += Acquired::new(self, entry).service(pull.as_mut(), request);
+            total += Acquired::new(self, entry, claim).service(pull.as_mut(), request);
             cycles = 0;
         }
         self.record_acquisition_cycle(attempts, failed);
@@ -579,14 +610,16 @@ struct Pull<'a> {
 struct Acquired<'a> {
     queue: &'a mut UpstreamQueue,
     entry: Option<Entry>,
+    claim: Option<Claim>,
     hold_for_request: bool,
 }
 
 impl<'a> Acquired<'a> {
-    fn new(queue: &'a mut UpstreamQueue, entry: Entry) -> Self {
+    fn new(queue: &'a mut UpstreamQueue, entry: Entry, claim: Claim) -> Self {
         Self {
             queue,
             entry: Some(entry),
+            claim: Some(claim),
             hold_for_request: false,
         }
     }
@@ -597,9 +630,11 @@ impl<'a> Acquired<'a> {
         let Self {
             queue,
             entry,
+            claim,
             hold_for_request,
         } = &mut self;
         let entry = entry.as_mut().expect("the entry is held until dropped");
+        let claim = claim.as_mut().expect("the claim is held until dropped");
         let was_productive = entry.productive;
         let (pulled, productive) = match pull {
             Some(Pull { consumer, stop }) => {
@@ -609,7 +644,9 @@ impl<'a> Acquired<'a> {
                     stopped |= matched;
                     matched
                 };
-                let result = entry.handle.pull(&mut **consumer, &mut watch, demand);
+                let result = entry
+                    .handle
+                    .pull(claim, &mut **consumer, &mut watch, demand);
                 *hold_for_request = stopped;
                 let productive = match result {
                     Some(0) if !stopped => false,
@@ -620,7 +657,7 @@ impl<'a> Acquired<'a> {
             }
             None => {
                 let before = request_evidence();
-                entry.handle.request(demand);
+                entry.handle.request(claim, demand);
                 (0, was_productive || request_evidence() != before)
             }
         };
@@ -639,7 +676,9 @@ impl Drop for Acquired<'_> {
         let Some(entry) = self.entry.take() else {
             return;
         };
-        entry.handle.release();
+        if let Some(claim) = self.claim.take() {
+            entry.handle.release(claim);
+        }
         if self.hold_for_request {
             self.queue.hold_for_request(entry);
         } else {

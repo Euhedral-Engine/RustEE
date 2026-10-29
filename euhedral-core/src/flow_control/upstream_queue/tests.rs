@@ -56,6 +56,7 @@ impl UpstreamHandle for TestHandle {
 
     fn pull(
         &self,
+        _claim: &mut Claim,
         _consumer: &mut dyn FnMut(Box<dyn Frame>),
         _stop: &mut dyn FnMut(&dyn Frame) -> bool,
         demand: u64,
@@ -66,7 +67,7 @@ impl UpstreamHandle for TestHandle {
         Some(result.map_or(demand, |result| result.min(demand)))
     }
 
-    fn request(&self, demand: u64) {
+    fn request(&self, _claim: &mut Claim, demand: u64) {
         self.requested.fetch_add(demand, Ordering::Relaxed);
     }
 
@@ -74,16 +75,16 @@ impl UpstreamHandle for TestHandle {
         self.complete.load(Ordering::Relaxed)
     }
 
-    fn try_acquire(&self) -> bool {
+    fn try_acquire(&self) -> Option<Claim> {
         self.acquisition_attempts.fetch_add(1, Ordering::Relaxed);
         if self.unavailable.load(Ordering::Relaxed) {
-            return false;
+            return None;
         }
         self.locked.store(true, Ordering::Relaxed);
-        true
+        Some(Claim::new(0))
     }
 
-    fn release(&self) {
+    fn release(&self, _claim: Claim) {
         self.locked.store(false, Ordering::Relaxed);
         self.releases.fetch_add(1, Ordering::Relaxed);
     }
@@ -130,6 +131,7 @@ impl UpstreamHandle for SourceHandle {
 
     fn pull(
         &self,
+        _claim: &mut Claim,
         consumer: &mut dyn FnMut(Box<dyn Frame>),
         stop: &mut dyn FnMut(&dyn Frame) -> bool,
         demand: u64,
@@ -149,7 +151,7 @@ impl UpstreamHandle for SourceHandle {
         Some(pulled)
     }
 
-    fn request(&self, demand: u64) {
+    fn request(&self, _claim: &mut Claim, demand: u64) {
         for _ in 0..demand {
             let Some(frame) = self.frames.lock().unwrap().pop_front() else {
                 return;
@@ -168,11 +170,11 @@ impl UpstreamHandle for SourceHandle {
         self.complete.load(Ordering::Relaxed)
     }
 
-    fn try_acquire(&self) -> bool {
-        !self.lock.swap(true, Ordering::Acquire)
+    fn try_acquire(&self) -> Option<Claim> {
+        (!self.lock.swap(true, Ordering::Acquire)).then(|| Claim::new(0))
     }
 
-    fn release(&self) {
+    fn release(&self, _claim: Claim) {
         self.lock.store(false, Ordering::Release);
     }
 }
@@ -478,7 +480,7 @@ fn a_held_back_handle_honours_demand_and_its_lock() {
     fixture.queue.request(0);
     assert_eq!(ready.len(), 2);
 
-    assert!(ready.try_acquire());
+    let claim = ready.try_acquire().expect("the handle is free");
     fixture.queue.request(1);
     assert_eq!(ready.len(), 2, "another worker holds the source");
     assert_eq!(
@@ -487,7 +489,7 @@ fn a_held_back_handle_honours_demand_and_its_lock() {
         "a contended handle lets the next one progress"
     );
     assert_eq!(fixture.held(), 2);
-    ready.release();
+    ready.release(claim);
 
     fixture.pull_until_ordered(1);
     fixture.queue.request(1);
@@ -1235,13 +1237,14 @@ fn a_handle_that_did_not_look_keeps_the_worker_view() {
         }
         fn pull(
             &self,
+            _claim: &mut Claim,
             _consumer: &mut dyn FnMut(Box<dyn Frame>),
             _stop: &mut dyn FnMut(&dyn Frame) -> bool,
             _demand: u64,
         ) -> Option<u64> {
             None
         }
-        fn request(&self, _demand: u64) {}
+        fn request(&self, _claim: &mut Claim, _demand: u64) {}
         fn is_complete(&self) -> bool {
             false
         }

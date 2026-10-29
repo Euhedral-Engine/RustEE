@@ -9,6 +9,7 @@
 //! [`LatticeReceiver::serialize`]: super::LatticeReceiver::serialize
 
 use std::cell::UnsafeCell;
+use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 #[cfg(debug_assertions)]
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -63,7 +64,10 @@ impl<T> SourceCell<T> {
                 panic!("SourceCell entered from another thread while one is inside");
             }
         }
-        SourceGuard { cell: self }
+        SourceGuard {
+            cell: self,
+            marker: PhantomData,
+        }
     }
 
     /// The state, for the cell's exclusive owner.
@@ -84,9 +88,43 @@ impl<T: Default> Default for SourceCell<T> {
 }
 
 /// The state of a [`SourceCell`], borrowed until the guard drops.
+///
+/// Like a mutex guard, it is `Send` when `T` is and `Sync` only when `T` is: a shared reference to
+/// the guard hands out `&T`, so it must not let two threads at a `!Sync` value such as a `Cell`.
+///
+/// ```compile_fail
+/// use euhedral_core::generics::SourceCell;
+/// use std::cell::Cell;
+///
+/// fn needs_sync<T: Sync>(_: &T) {}
+///
+/// let cell = SourceCell::new(Cell::new(0));
+/// // SAFETY: a doctest on one thread.
+/// let guard = unsafe { cell.enter() };
+/// needs_sync(&guard); // a guard over a `Cell` is not `Sync`
+/// ```
+///
+/// ```
+/// use euhedral_core::generics::SourceCell;
+///
+/// fn needs_send_sync<T: Send + Sync>(_: &T) {}
+///
+/// let cell = SourceCell::new(0u64);
+/// // SAFETY: a doctest on one thread.
+/// let guard = unsafe { cell.enter() };
+/// needs_send_sync(&guard);
+/// ```
 pub struct SourceGuard<'a, T> {
     cell: &'a SourceCell<T>,
+    /// Keeps the auto traits off; the impls below say exactly when the guard is `Send` and `Sync`.
+    marker: PhantomData<*const ()>,
 }
+
+// SAFETY: the guard is the cell's one access to a `T`, so moving it moves `&mut T`, which is
+// `Send` exactly when `T` is.
+unsafe impl<T: Send> Send for SourceGuard<'_, T> {}
+// SAFETY: a shared reference to the guard gives `&T`, which is `Send` exactly when `T` is `Sync`.
+unsafe impl<T: Sync> Sync for SourceGuard<'_, T> {}
 
 impl<T> Deref for SourceGuard<'_, T> {
     type Target = T;

@@ -18,13 +18,21 @@ semantics and the tests that pin it.
   - `LatticeReceiver::serialize(action)`: runs `action` when no `pull` or `request` of the source the receiver serves is
     in progress, without waiting. The default runs it at once.
   - `UpstreamInterceptor` implements `serialize`: actions go on an MPSC queue, and whoever holds the claim runs them
-    before it releases. The interceptor holds its source in a `SourceCell`, installs and releases it through
-    `serialize`, and drops it when it finishes.
-- **Breaking** for code that reads the interceptor's source: `UpstreamInterceptor::upstream()` is replaced by
-  `has_upstream(&Arc<dyn LatticeSource>)`, which answers by identity. The interceptor's claim is now a counter (`wip`):
-  `try_acquire` is `fetch_add(1) == 0` and `release` stores 0, where it was a flag swapped with `Acquire`. A source
-  that is completed through its interceptor (a source panic, `complete()`) is now completed when the worker that holds
-  it releases it, not at the call.
+    before it releases. The interceptor installs its source before it is registered and drops it, through
+    `serialize`, when it finishes.
+- **Breaking** for code that implements or drives `UpstreamHandle`:
+  - `try_acquire` returns `Option<Claim>` where it returned `bool`. A `Claim` is the proof that the caller holds the
+    handle's claim. Code outside `euhedral-core` cannot make one; the default `try_acquire` still never contends.
+  - `pull` and `request` take `&mut Claim` first, and `release` takes the `Claim` by value. A handle refuses a claim
+    taken from another handle. This makes the interceptor's `unsafe` entry into its source sound for safe callers: a
+    spurious `release`, or a `pull` while a serialized action runs, cannot be written.
+  - `UpstreamInterceptor::upstream()` is replaced by `has_upstream(&Arc<dyn LatticeSource>)`. The source is identified
+    by a weak reference whose allocation outlives the source, so an address reused after the source is dropped never
+    matches.
+  - The interceptor's claim is a counter (`wip`): `try_acquire` is `fetch_add(1) == 0`, and release is one swap to zero.
+    A source completed through its interceptor (a source panic, `complete()`) is now completed when the worker that
+    holds it releases it, not at the call.
+  - `DownstreamSlot::new` is no longer `const` (it holds a small queue for actions that arrive during an attach).
 
 **Why.** A source's state is touched by exactly one worker at a time, so it should need no atomics. Its lifecycle
 calls (completion, release) arrive from other threads while a worker may be inside `pull` or `request`, and used to
@@ -38,9 +46,17 @@ calls hand their work to `slot.serialize(action)`, and the action enters the cel
 **Semantics.**
 - Every serialized action runs exactly once, in the order it was handed over, never while a `pull` or `request` of the
   source is in progress, on the worker that holds the claim or on the caller if no worker does.
-- The claim: `try_acquire` is `wip.fetch_add(1, SeqCst) == 0`. `release` runs the pending actions, stores 0 with
-  `Release`, issues a `SeqCst` fence, and takes the claim again if `pending` is set, to run what arrived behind its
-  drain. `serialize` offers the action, sets `pending` (`SeqCst`), then tries the claim.
+- The claim: `try_acquire` is `wip.fetch_add(1, SeqCst) == 0`. `serialize` offers the action, sets `pending`
+  (`SeqCst`), then tries the claim. `release` runs the pending actions (clearing `pending` with one swap), then swaps
+  `wip` to zero (`AcqRel`). If the swap returns 1, no caller tried the claim meanwhile; a later `serialize` finds zero
+  and runs its own action. If it returns more, the swap has acquired from a caller's `fetch_add`, which follows that
+  caller's `pending` store, so the holder sees `pending` and takes the claim again to run what arrived behind its drain.
+- The source is installed (compare-and-set, once) before the interceptor is registered, so a worker that finds the
+  handle finds the source. The interceptor's `complete` flag is checked again after the install, and the source is
+  released through `serialize`.
+- `DownstreamSlot::serialize` goes straight to an installed receiver. While an attach is in flight, before the
+  receiver is installed, the action waits in the slot and the attach forwards it; with no attach begun it runs at once.
+- `SourceGuard` is `Send` when `T` is and `Sync` only when `T` is.
 - A panicking action is caught and logged; the actions behind it still run.
 - `has_upstream` answers by address and stays true after the interceptor has dropped its source.
 
@@ -55,8 +71,14 @@ calls hand their work to `slot.serialize(action)`, and the action enters the cel
 - The interceptor (`flow_control::vertex`): `serialize_runs_at_release_when_another_worker_holds_the_source`,
   `serialize_from_inside_the_sources_own_pull_runs_before_release`,
   `an_action_never_runs_while_a_pull_or_request_is_in_progress`, `release_races_serialize_and_no_action_is_stranded`,
-  `a_release_and_a_serialize_in_the_same_instant_never_strand_the_action` (removing the post-release fence or re-check
-  makes it fail), `the_interceptor_drops_its_source_when_it_finishes`, `complete_completes_the_source_through_serialize`.
+  `a_release_and_a_serialize_in_the_same_instant_never_strand_the_action` and
+  `two_serializers_and_a_release_in_the_same_instant_never_strand_an_action` (ignoring the release swap's result makes
+  both fail), `the_source_is_in_place_before_a_worker_can_find_the_handle`,
+  `a_new_source_is_never_taken_for_a_dropped_one_at_the_same_address`, `a_claim_taken_from_another_handle_is_refused`,
+  `the_interceptor_drops_its_source_when_it_finishes`, `complete_completes_the_source_through_serialize`.
+  `serialize_racing_attach_runs_every_action_exactly_once` (`DownstreamSlot`) and the compile-fail doctest on
+  `SourceGuard`. CI runs the stress tests in release and the loom model. The `SetOnce` loom model carries a loom
+  `UnsafeCell` payload, so a `get` weaker than `Acquire` fails it.
 
 ## `Marker` names its queue (2026-10-28)
 

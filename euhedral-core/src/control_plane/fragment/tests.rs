@@ -2,7 +2,7 @@ use super::*;
 use crate::config::CacheConfig;
 use crate::control_plane::testing::{PATIENCE, SINGLE_CORE, SMT_CORE, pinned_turn, wait_until};
 use crate::flow_control::testing::{TestReceiver, frame};
-use crate::flow_control::{LatticeNode, UpstreamHandle};
+use crate::flow_control::{Claim, LatticeNode, UpstreamHandle};
 use crate::frames::Failure;
 use crate::generics::{LatticeReceiver, LatticeTerminal};
 use crate::metrics::CAP_FACTOR_SUFFIX;
@@ -197,6 +197,7 @@ impl UpstreamHandle for Source {
 
     fn pull(
         &self,
+        _claim: &mut Claim,
         consumer: &mut dyn FnMut(Box<dyn Frame>),
         stop: &mut dyn FnMut(&dyn Frame) -> bool,
         demand: u64,
@@ -219,7 +220,7 @@ impl UpstreamHandle for Source {
         Some(pulled)
     }
 
-    fn request(&self, demand: u64) {
+    fn request(&self, _claim: &mut Claim, demand: u64) {
         self.requested.fetch_add(demand, Ordering::AcqRel);
     }
 

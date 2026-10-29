@@ -207,8 +207,9 @@ edge and demand climbs up it; a vertex is a node that routes each frame to one o
 ([`UpstreamHandle`](euhedral-core/src/flow_control/upstream_queue.rs),
 [`UpstreamInterceptor`](euhedral-core/src/flow_control/vertex.rs)): a source fed into the lattice,
 as the workers see it. A worker services a handle only while it holds the handle's claim, a counter
-(`wip`) moved from zero by `fetch_add`, so the source sees one worker at a time. The interceptor
-holds its source in a `SourceCell` and lets it go when it finishes.
+(`wip`) moved from zero by `fetch_add`, so the source sees one worker at a time. `try_acquire` returns
+a `Claim`, the proof that `pull`, `request` and `release` require. The interceptor installs its source
+before it is registered and lets it go, through `serialize`, when it finishes.
 
 **UpstreamRegistry, UpstreamQueue** ([`registry`](euhedral-core/src/flow_control/registry.rs),
 [`upstream_queue`](euhedral-core/src/flow_control/upstream_queue.rs)): the registry holds a lattice's
