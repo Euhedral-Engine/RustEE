@@ -4,10 +4,12 @@
 mod cloneable;
 mod executor;
 mod lattice;
+mod source_cell;
 
 pub use cloneable::CloneableObject;
 pub use executor::AbstractExecutor;
 pub use lattice::{LatticeInterceptor, LatticeReceiver, LatticeSource, LatticeTerminal};
+pub use source_cell::{SourceCell, SourceGuard};
 
 use crate::frames::Frame;
 
