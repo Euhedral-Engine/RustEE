@@ -19,7 +19,7 @@ so it needs no thread of its own. It does not re-export `euhedral-core`: import 
 |---|---|
 | [`completions`](src/completions.rs) | `Completions`, a `LatticeSource` of continuation frames behind completions: markers, timers, `Ready` tokens and `Pending` operations. |
 | [`sequencer`](src/sequencer.rs) | `Sequencer` and `Slot`: execute in any order, release in admission order. |
-| [`join`](src/join.rs) | `Join`: a continuation that runs when its last part arrives. |
+| [`join`](src/join.rs) | `Join`, `Round`: a re-armable fan-in cell; the continuation runs when its last part arrives. |
 | [`lake`](src/lake.rs) | `Lake`, `UnitGuard` and `LakeClosed`: the pool of ready work of one kind, as several ingest sinks that attach to the lattice for a busy period. A `FrameSink`. |
 | [`latch`](src/latch.rs) | `Latch`, `LatchSetter` and `LatchWaiter`: a frame hands one value to the main thread, which parks until it arrives. |
 | [`lanes`](src/lanes.rs) | `LanePool`, `LaneId`, `Marker` and the trait `DeviceQueue`: device timelines that are queried, never waited on. |
@@ -209,7 +209,10 @@ from any thread. One releaser at a time (a work-in-progress counter) releases th
 finished slots to `emit`, on its own thread, and `emit` must not wait: it offers the next frame.
 
 A `Join<T>` is a continuation that runs on the thread of its last arrival, after `parts` parts
-arrived or were abandoned. Neither is a queue, and neither blocks.
+arrived or were abandoned. Neither is a queue, and neither blocks. `Join::new` makes a join of one
+round. `Join::with_capacity` makes a cell for a pooled unit: `reset(parts)` arms a round, and the
+continuation receives a `Round` of the values and calls `rearm(parts)` for the next one. Arming and
+arriving take no lock and allocate nothing.
 
 ## Build and test
 

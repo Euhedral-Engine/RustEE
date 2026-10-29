@@ -16,7 +16,7 @@
 //! |---|---|---|
 //! | [`Completions`] | [`completions`] | completions found by polls |
 //! | [`Sequencer`] | [`sequencer`] | execute in any order, conclude in admission order |
-//! | [`Join`] | [`join`] | run-time fan-in: the last arrival publishes the continuation |
+//! | [`Join`], [`Round`] | [`join`] | re-armable run-time fan-in: the last arrival runs the continuation |
 //! | [`LanePool`], [`Marker`], [`DeviceQueue`] | [`lanes`] | device lanes and markers |
 //! | [`StageGraph`] | [`stage_graph`] | static stage DAGs run per quantum |
 //! | [`Lake`], [`UnitGuard`] | [`lake`] | the pool of ready work of one kind |
@@ -28,7 +28,8 @@
 //! Feature: `testing` adds `testing::FakeDevice`. Asynchronous file and socket I/O (`AsyncIo`) is in
 //! `euhedral-io`.
 
-// `ThreadUsage` makes system calls, each with a `// SAFETY:` comment; nowhere else.
+// `ThreadUsage` makes system calls and `Join` shares its part slots across threads, each with a
+// `// SAFETY:` comment; nowhere else.
 #![deny(unsafe_code)]
 
 pub mod completions;
@@ -38,11 +39,12 @@ pub mod lanes;
 pub mod latch;
 pub mod sequencer;
 pub mod stage_graph;
+pub(crate) mod sync;
 #[cfg(feature = "testing")]
 pub mod testing;
 
 pub use completions::{Completions, Pending, Ready};
-pub use join::Join;
+pub use join::{Join, Round};
 pub use lake::{Lake, LakeClosed, UnitGuard};
 pub use lanes::{DeviceQueue, LaneId, LanePool, Marker, QueueId};
 pub use latch::{Latch, LatchSetter, LatchWaiter};

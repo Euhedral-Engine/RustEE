@@ -388,9 +388,12 @@ resource outside the pool. Set it longer than any one pass on your devices.
 it abandons it). The **releaser** is the one thread at a time (a work-in-progress counter) that
 passes the prefix of finished slots to `emit`, in order, on its own thread.
 
-**Join, join part** ([`Join`](euhedral-graph/src/join.rs)): a fan-in that waits for no one. Each
-part arrives with a value or is abandoned, from any thread, and the last arrival runs the
-continuation once with every part's value (`None` for an abandoned part).
+**Join, fan-in cell, join part, Round** ([`Join`](euhedral-graph/src/join.rs)): a fan-in that waits
+for no one. A round is armed with its part count (`reset`); each part arrives with a value or is
+abandoned, from any thread, and the last arrival runs the continuation once with every part's value
+(`None` for an abandoned part). The cell has a fixed capacity and is armed again without allocating,
+so it can live inside a pooled object. The continuation receives a `Round`, which lends the values and
+whose `rearm` starts the next round.
 
 **lake, sink, unit, UnitGuard** ([`Lake`](euhedral-graph/src/lake.rs),
 [`UnitGuard`](euhedral-graph/src/lake.rs)): the pool of ready work of one kind (stage frames, host
