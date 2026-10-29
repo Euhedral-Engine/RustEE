@@ -1,3 +1,4 @@
+use super::barrier;
 use super::loom::{AtomicBool, AtomicPtr, AtomicU64, Ordering, fence};
 use crate::atomics::CachePadded;
 use std::cell::Cell;
@@ -5,6 +6,7 @@ use std::fmt;
 use std::mem::ManuallyDrop;
 use std::ptr;
 use std::sync::Arc;
+use std::sync::atomic::compiler_fence;
 use std::time::Instant;
 
 /// A slot value: not inside a read section, so it holds no reference.
@@ -29,9 +31,18 @@ struct SlotNode {
 ///
 /// The slots form a push-only list. A slot a thread gave back is reused by the next [`register`](Self::register);
 /// nodes are freed when the domain drops.
+///
+/// **The barrier.** A thread that leaves idle announces itself and then loads a pointer, and a writer swaps the
+/// pointer and then scans the announcements: each must see the other's store. When the process can issue heavy
+/// barriers (`membarrier` on Linux, `FlushProcessWriteBuffers` on Windows; see the `barrier` module) the reader pays
+/// none: a release store and a compiler fence, and the writer forces the barrier on every running thread before it
+/// scans. Elsewhere the reader keeps the symmetric form, a sequentially consistent store and fence (the OS offers no
+/// equivalent to ask for).
 pub struct EpochDomain {
     epoch: CachePadded<AtomicU64>,
     head: AtomicPtr<SlotNode>,
+    /// Whether readers skip their fence because the writer's scan forces a barrier.
+    asymmetric: bool,
 }
 
 // SAFETY: the nodes are reached through atomics only; a node's `next` is written once before publication, and the
@@ -43,9 +54,16 @@ unsafe impl Sync for EpochDomain {}
 impl EpochDomain {
     /// A domain with room for `slots` threads at the start; it grows when more register.
     pub fn new(slots: usize) -> Arc<Self> {
+        Self::with_barrier(slots, barrier::asymmetric())
+    }
+
+    /// Like [`new`](Self::new), with the barrier chosen: `asymmetric` is honoured only where the process can issue
+    /// heavy barriers.
+    pub fn with_barrier(slots: usize, asymmetric: bool) -> Arc<Self> {
         let domain = Arc::new(Self {
             epoch: CachePadded::new(AtomicU64::new(1)),
             head: AtomicPtr::new(ptr::null_mut()),
+            asymmetric: asymmetric && barrier::asymmetric(),
         });
         for _ in 0..slots {
             domain.push_node(false);
@@ -111,9 +129,13 @@ impl EpochDomain {
 
     /// The oldest announcement of a thread in a read section, or `None` when every thread is idle.
     fn floor(&self) -> Option<u64> {
-        // Pairs with the fence a thread issues when it leaves idle: either its announcement is seen here, or its
-        // reads see what was published before this call.
+        // Pairs with the barrier a thread issues when it leaves idle: either its announcement is seen here, or its
+        // reads see what was published before this call. Readers that skip their fence are covered by the heavy
+        // barrier, which also orders this thread's own earlier store (the pointer swap) before the loads below.
         fence(Ordering::SeqCst);
+        if self.asymmetric {
+            barrier::heavy();
+        }
         let mut floor: Option<u64> = None;
         let mut node = self.head.load(Ordering::Acquire);
         // SAFETY: as in `register`.
@@ -211,12 +233,18 @@ impl EpochSlot {
         self.active.get()
     }
 
-    /// Announces the current epoch from idle, with the fence that keeps the loads that follow from passing the
-    /// announcement.
+    /// Announces the current epoch from idle. Where the writer forces a barrier on the readers (see
+    /// [`EpochDomain`]) this is a release store and a compiler fence, with no barrier instruction; otherwise a
+    /// sequentially consistent store and fence keep the loads that follow from passing the announcement.
     fn announce_from_idle(&self) {
         let epoch = self.domain.epoch.load(Ordering::Acquire);
-        self.state().store(epoch, Ordering::SeqCst);
-        fence(Ordering::SeqCst);
+        if self.domain.asymmetric {
+            self.state().store(epoch, Ordering::Release);
+            compiler_fence(Ordering::SeqCst);
+        } else {
+            self.state().store(epoch, Ordering::SeqCst);
+            fence(Ordering::SeqCst);
+        }
         self.active.set(true);
     }
 
@@ -230,8 +258,8 @@ impl EpochSlot {
     /// [`idle`](Self::idle).
     ///
     /// For an active slot this is a load of the epoch and a release store: a writer that reads the older
-    /// announcement waits, which is safe. Leaving idle also fences, so that the loads that follow cannot pass the
-    /// announcement. While a guard is alive the call changes nothing: the guard's values were loaded before it.
+    /// announcement waits, which is safe. Leaving idle also orders the announcement before the loads that follow (see
+    /// [`EpochDomain`]). While a guard is alive the call changes nothing: the guard's values were loaded before it.
     pub fn quiescent(&self) {
         if self.pins.get() > 0 {
             return;

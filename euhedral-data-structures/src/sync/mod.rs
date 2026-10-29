@@ -15,6 +15,7 @@
 //!   debug builds.
 
 mod admission;
+mod barrier;
 mod claim_cell;
 mod lifecycle;
 mod loom;

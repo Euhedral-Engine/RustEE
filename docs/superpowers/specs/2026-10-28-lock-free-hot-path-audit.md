@@ -451,6 +451,11 @@ workspace offers it:
      threads; spins) drops the old value once every slot is idle or past the new epoch. `defer` keeps it in the cell's
      single pending slot until a later `store`, `try_reclaim` or `Drop` finds it reclaimable. A store with a
      still-pending retirement waits (lifecycle) or, as `try_store`, hands the value back.
+   - **No barrier on the reader's side.** A thread that leaves idle announces itself with a release store and a compiler
+     fence; the writer forces a full barrier on every running thread (`membarrier(PRIVATE_EXPEDITED)` on Linux,
+     `FlushProcessWriteBuffers` on Windows) between its pointer swap and its scan of the announcements. Where the OS
+     offers neither (or registration fails) the readers keep the sequentially consistent store and fence: a missing
+     OS equivalent. Loom models the symmetric form.
 3. **`OneShot<T>`** (chunk 5): Java's `CompletableFuture` as `PipelineRunner.submit` uses it. `state: AtomicU8`
    (empty, waiting, set, abandoned), the value in an `UnsafeCell`, and a `SetOnce<Thread>` waiter. The setter writes,
    swaps the state (`SeqCst`) and unparks a waiter it finds (a wake, never a wait). `try_recv`, and a parking `recv`

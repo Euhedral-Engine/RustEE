@@ -46,6 +46,7 @@ downstream with an opaque load and the parent with an acquire load, and claims a
   retired state waits for the writer; here no reader waits.
 - The downstream of an edge stays allocated until the edge drops. A cache stays published until it closes, and a
   stealer that found one holds it for the steal, so a closed cache lives until its last stealer lets go.
+- Readers of a `Published` cell pay no barrier instruction where the process can issue heavy barriers (Linux `membarrier` registered once at domain creation, Windows `FlushProcessWriteBuffers`): a thread that leaves idle stores its announcement with release ordering and a compiler fence, and a writer forces a barrier on every running thread before it scans the announcements (userspace RCU's "memb" flavour). Elsewhere, and where registration fails, readers keep the sequentially consistent store and fence: the OS offers no equivalent. Under loom and Miri the symmetric form is the one modelled.
 - A `Published` store never waits and never fails; the retirements a cell cannot free yet chain on a list, which
   each store, deferral and `try_reclaim` sweeps. A worker that parks, or whose loop ends by a panic, holds nothing
   back. While an `EpochGuard` is alive its slot keeps its announcement: a quiescent point or an idle requested

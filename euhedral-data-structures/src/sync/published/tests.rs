@@ -362,7 +362,16 @@ fn a_guard_of_another_domain_is_refused() {
 /// value and reclaims: no reader ever sees a dropped value.
 #[test]
 fn readers_never_see_a_freed_value() {
-    let domain = EpochDomain::new(4);
+    readers_never_see_a_freed_value_in(EpochDomain::new(4));
+}
+
+/// The same with the symmetric fence on the readers' side, the form used where no heavy barrier is available.
+#[test]
+fn readers_never_see_a_freed_value_with_the_symmetric_barrier() {
+    readers_never_see_a_freed_value_in(EpochDomain::with_barrier(4, false));
+}
+
+fn readers_never_see_a_freed_value_in(domain: Arc<EpochDomain>) {
     let count = drops();
     let cell = Arc::new(Published::new(domain.clone(), Some(Counted::new(&count))));
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
