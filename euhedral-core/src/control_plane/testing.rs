@@ -70,7 +70,7 @@ fn settle(cpu: usize) {
 /// How long the wind-down of an executor may take before the wait is reported.
 const SETTLE_LOG: Duration = Duration::from_millis(100);
 /// How long it may take before the test fails.
-const SETTLE_FAIL: Duration = Duration::from_secs(5);
+const SETTLE_FAIL: Duration = Duration::from_secs(1);
 
 /// Waits for `condition`, failing the test after [`PATIENCE`].
 pub(crate) fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {

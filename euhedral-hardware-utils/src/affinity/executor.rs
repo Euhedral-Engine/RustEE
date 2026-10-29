@@ -400,8 +400,17 @@ impl Registry {
                         .get(&cpu)
                         .map(|entry| entry.control.clone());
                     match control {
-                        Some(control) if control.wait_empty(deadline) => {}
-                        _ => return Err(ExecutorError::ClosedWithActiveTasks(busy)),
+                        // Wait only for the closed executor `acquire` refused. If another executor has replaced it
+                        // since, or it ended, the next `acquire` decides; do not wait on a running one's tasks.
+                        Some(control) if control.state() == State::Closed => {
+                            if !control.wait_empty(deadline) {
+                                return Err(ExecutorError::ClosedWithActiveTasks(busy));
+                            }
+                        }
+                        _ if Instant::now() >= deadline => {
+                            return Err(ExecutorError::ClosedWithActiveTasks(busy));
+                        }
+                        _ => {}
                     }
                 }
                 other => return other,
@@ -1052,6 +1061,39 @@ mod tests {
         );
         release.send(()).unwrap();
         blocked.join().unwrap();
+    }
+
+    #[test]
+    fn acquiring_within_a_timeout_returns_as_soon_as_the_closed_executors_tasks_end() {
+        let (registry, _) = registry();
+        let executor = registry.acquire(1, "a").unwrap();
+        let (started, started_rx) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel::<()>();
+        let old = executor
+            .submit(move || {
+                started.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })
+            .unwrap();
+        started_rx.recv().unwrap();
+        executor.close();
+        // The closed executor winds down in a moment; a replacement is running by the time the waiter looks again.
+        let waiter = {
+            let registry = &registry;
+            thread::scope(|scope| {
+                let waiting = scope.spawn(|| {
+                    let started = Instant::now();
+                    let got = registry.acquire_within(1, "b", Duration::from_secs(10));
+                    (got.is_ok(), started.elapsed())
+                });
+                thread::sleep(Duration::from_millis(30));
+                release.send(()).unwrap();
+                old.join().unwrap();
+                waiting.join().unwrap()
+            })
+        };
+        assert!(waiter.0, "the CPU was free once the old tasks ended");
+        assert!(waiter.1 < Duration::from_secs(5));
     }
 
     #[test]

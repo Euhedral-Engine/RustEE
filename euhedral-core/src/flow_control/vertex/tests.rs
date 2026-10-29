@@ -1048,6 +1048,65 @@ fn a_retirement_never_runs_on_the_worker_that_let_go_of_the_generation_last() {
     assert!(child.is_closed());
 }
 
+/// A light reader (a producer thread, another lattice's worker) can be the last holder too: the generation it upgraded
+/// for a read outlives the writer's own hold, and its release at the end of the read must not run the retirement there.
+#[test]
+fn a_retirement_never_runs_on_a_light_reader_that_let_go_of_the_generation_last() {
+    const WAIT: Duration = Duration::from_millis(400);
+    let registry = registry();
+    let vertex = Arc::new(LatticeVertex::new(&registry, "retire-light", 2));
+    let (child, _) = receiving_edge(&registry);
+    let (other, _) = receiving_edge(&registry);
+    assert!(map(&vertex, &[0], &[node(&child)]));
+    let ran_on = Arc::new(Mutex::new(None));
+    let done = Arc::new(AtomicBool::new(false));
+    {
+        let (ran_on, done) = (ran_on.clone(), done.clone());
+        child.defer_retirement(Box::new(move || {
+            *ran_on.lock().unwrap() = thread::current().name().map(str::to_owned);
+            thread::sleep(WAIT);
+            done.store(true, Ordering::Release);
+        }));
+    }
+    let (reading_tx, reading_rx) = mpsc::channel();
+    let (go_tx, go_rx) = mpsc::channel::<()>();
+    let reader = {
+        let vertex = vertex.clone();
+        thread::Builder::new()
+            .name("producer".into())
+            .spawn(move || {
+                // Not a worker: a light reader. It holds the first generation for the length of this read.
+                let started = vertex.with_routing_state(|state| {
+                    assert_eq!(state.len(), 1);
+                    reading_tx.send(()).unwrap();
+                    go_rx.recv().unwrap();
+                    Instant::now()
+                });
+                started.elapsed()
+            })
+            .unwrap()
+    };
+    reading_rx.recv().unwrap();
+    // The remap replaces the generation; the reader's upgrade is now the last hold on it.
+    assert!(map(&vertex, &[1], &[None, node(&other)]));
+    assert!(!done.load(Ordering::Acquire));
+    go_tx.send(()).unwrap();
+    let leaving = reader.join().unwrap();
+    assert!(
+        leaving < WAIT / 4,
+        "the end of the read took {leaving:?}: the retirement ran on the reader"
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !done.load(Ordering::Acquire) {
+        assert!(Instant::now() < deadline, "the retirement never ran");
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(
+        ran_on.lock().unwrap().as_deref(),
+        Some("retire-light-retire")
+    );
+}
+
 #[test]
 fn a_panicking_retirement_does_not_stop_the_rest() {
     let registry = registry();

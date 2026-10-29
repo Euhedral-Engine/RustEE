@@ -32,6 +32,9 @@ type WeakValue = Weak<dyn Any + Send + Sync>;
 /// A slot of lattice state of type `T`, made by [`UpstreamRegistry::cell`].
 pub struct Cell<T> {
     id: usize,
+    /// How many times the id was freed before this cell got it: a view whose entry for the id has another epoch holds
+    /// a dead cell's value, not this one's.
+    epoch: u64,
     views: Arc<Views>,
     _marker: PhantomData<fn() -> T>,
 }
@@ -60,7 +63,22 @@ enum Slot {
 /// One value sent to a reader.
 struct Update {
     cell: usize,
+    epoch: u64,
     slot: Slot,
+}
+
+/// What a view holds for one cell id: the value, and the epoch of the cell that value belongs to.
+#[derive(Clone)]
+struct Entry {
+    epoch: u64,
+    slot: Slot,
+}
+
+impl Entry {
+    const EMPTY: Entry = Entry {
+        epoch: 0,
+        slot: Slot::Empty,
+    };
 }
 
 struct Reader {
@@ -81,6 +99,8 @@ const LIGHT_BACKLOG: u64 = 1024;
 #[derive(Default)]
 struct Store {
     values: Vec<Option<Value>>,
+    /// The epoch of each id: how many cells have freed it.
+    epochs: Vec<u64>,
     /// Ids of the cells that were dropped, for the next cell.
     free: Vec<usize>,
     readers: Vec<Reader>,
@@ -97,16 +117,21 @@ impl Store {
         }
     }
 
-    fn slots(&self, light: bool) -> Vec<Slot> {
+    fn slots(&self, light: bool) -> Vec<Entry> {
         self.values
             .iter()
-            .map(|value| Self::slot(value, light))
+            .zip(&self.epochs)
+            .map(|(value, &epoch)| Entry {
+                epoch,
+                slot: Self::slot(value, light),
+            })
             .collect()
     }
 
     /// Stores `value` and sends it to every reader. Returns the value replaced.
     fn replace(&mut self, cell: usize, value: Option<Value>) -> Option<Value> {
         let replaced = std::mem::replace(&mut self.values[cell], value.clone());
+        let epoch = self.epochs[cell];
         let mut evicted = false;
         for reader in &self.readers {
             if reader.light && reader.mailbox.size_long() > LIGHT_BACKLOG {
@@ -116,6 +141,7 @@ impl Store {
             }
             let _ = reader.mailbox.offer(Update {
                 cell,
+                epoch,
                 slot: Self::slot(&value, reader.light),
             });
         }
@@ -142,17 +168,29 @@ impl Views {
         }
     }
 
-    /// An id for a new cell: a dropped cell's, or a new one.
-    fn allocate(&self) -> usize {
+    /// An id for a new cell, and its epoch: a dropped cell's id (its epoch is one more than the dead cell's), or a new
+    /// one.
+    fn allocate(&self) -> (usize, u64) {
         let _cold = HotScope::leave();
         let mut store = self.store.lock();
         match store.free.pop() {
-            Some(id) => id,
+            Some(id) => (id, store.epochs[id]),
             None => {
                 store.values.push(None);
-                store.values.len() - 1
+                store.epochs.push(0);
+                (store.values.len() - 1, 0)
             }
         }
+    }
+
+    /// The current value of cell `id` if it is still the cell of `epoch`, read under the lock.
+    fn value(&self, id: usize, epoch: u64) -> Option<Value> {
+        let _cold = HotScope::leave();
+        let store = self.store.lock();
+        if store.epochs.get(id) != Some(&epoch) {
+            return None;
+        }
+        store.values.get(id)?.clone()
     }
 
     /// Empties the cell `id` for every reader, and keeps the id for the next cell.
@@ -160,6 +198,9 @@ impl Views {
         let _cold = HotScope::leave();
         let replaced = {
             let mut store = self.store.lock();
+            // The next cell of this id has the next epoch: a view that still holds the dead cell's value for the id
+            // (it cannot drain inside a read) sees that the epoch is not the new cell's.
+            store.epochs[id] += 1;
             let replaced = store.replace(id, None);
             store.free.push(id);
             replaced
@@ -179,7 +220,7 @@ struct ThreadView {
 }
 
 struct ViewState {
-    values: RefCell<Vec<Slot>>,
+    values: RefCell<Vec<Entry>>,
     mailbox: RefCell<Consumer<Update, Single>>,
     /// Whether the writer dropped this (light) reader for a mailbox that backed up.
     evicted: Arc<AtomicBool>,
@@ -187,6 +228,15 @@ struct ViewState {
 
 impl Drop for ThreadView {
     fn drop(&mut self) {
+        // The thread's last hold on a generation goes here, as a reader: a retirement must not wait on this thread.
+        {
+            let _reader = ReaderContext::enter();
+            if let Ok(mut values) = self.view.values.try_borrow_mut() {
+                let old = std::mem::take(&mut *values);
+                drop(values);
+                drop(old);
+            }
+        }
         if let Some(registry) = self.registry.upgrade() {
             let _cold = HotScope::leave();
             let mut store = registry.views().store.lock();
@@ -197,6 +247,24 @@ impl Drop for ThreadView {
 
 thread_local! {
     static THREAD_VIEWS: RefCell<Vec<ThreadView>> = const { RefCell::new(Vec::new()) };
+    static READER_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Marks the code a reader runs while it lets go of values it held: the last holder of a replaced generation releases
+/// it there, and that release must not wait.
+struct ReaderContext;
+
+impl ReaderContext {
+    fn enter() -> Self {
+        let _ = READER_DEPTH.try_with(|depth| depth.set(depth.get() + 1));
+        Self
+    }
+}
+
+impl Drop for ReaderContext {
+    fn drop(&mut self) {
+        let _ = READER_DEPTH.try_with(|depth| depth.set(depth.get() - 1));
+    }
 }
 
 impl ViewState {
@@ -213,13 +281,18 @@ impl ViewState {
             };
             while let Some(update) = mailbox.poll() {
                 if values.len() <= update.cell {
-                    values.resize(update.cell + 1, Slot::Empty);
+                    values.resize(update.cell + 1, Entry::EMPTY);
                 }
-                replaced.push(std::mem::replace(&mut values[update.cell], update.slot));
+                let entry = Entry {
+                    epoch: update.epoch,
+                    slot: update.slot,
+                };
+                replaced.push(std::mem::replace(&mut values[update.cell], entry).slot);
             }
         }
         // The replaced values drop with no borrow held: the last holder of a generation ends it, and that may read
-        // this view again.
+        // this view again. It does so as a reader: whatever that release runs must not wait here.
+        let _reader = ReaderContext::enter();
         drop(replaced);
     }
 }
@@ -227,8 +300,10 @@ impl ViewState {
 impl UpstreamRegistry {
     /// A cell for a value of type `T`, holding nothing.
     pub fn cell<T: Send + Sync + 'static>(&self) -> Cell<T> {
+        let (id, epoch) = self.views().allocate();
         Cell {
-            id: self.views().allocate(),
+            id,
+            epoch,
             views: self.views().clone(),
             _marker: PhantomData,
         }
@@ -340,10 +415,13 @@ impl UpstreamRegistry {
         drop(removed);
     }
 
-    /// Whether the calling thread is a full reader of this registry: a worker, or a thread that registered as a reader
-    /// because it is on the frame path. Such a thread must not wait or run lifecycle work.
-    pub fn is_full_reader(&self) -> bool {
-        matches!(self.local_view_kind(), Some((_, false)))
+    /// Whether the calling thread is letting go of values it read as a reader: draining its mailbox, or ending a light
+    /// read. A release that runs there is on a frame path (a worker's, or a producer's) and must not wait or run
+    /// lifecycle work; the writer's own drop of a replaced value is not.
+    pub(crate) fn in_reader_context() -> bool {
+        READER_DEPTH
+            .try_with(|depth| depth.get() > 0)
+            .unwrap_or(false)
     }
 
     /// Whether the calling thread is a reader of this registry.
@@ -400,15 +478,20 @@ impl UpstreamRegistry {
                 let values = state.values.borrow();
                 f(&View {
                     source: Source::Full(&values),
+                    cold: RefCell::new(Vec::new()),
                 })
             }
             Some((state, true)) => {
                 state.drain();
+                // Declared first, so it ends after the view: the values this read upgraded are let go of in a reader
+                // context.
+                let _reader = ReaderContext::enter();
                 f(&View {
                     source: Source::Light {
                         state: &state,
                         held: RefCell::new(Held::new()),
                     },
+                    cold: RefCell::new(Vec::new()),
                 })
             }
             None => {
@@ -419,6 +502,7 @@ impl UpstreamRegistry {
                 };
                 f(&View {
                     source: Source::Full(&snapshot),
+                    cold: RefCell::new(Vec::new()),
                 })
             }
         }
@@ -430,7 +514,7 @@ impl UpstreamRegistry {
     reason = "a stack value made once per read; boxing the light variant would allocate on the frame path"
 )]
 enum Source<'a> {
-    Full(&'a [Slot]),
+    Full(&'a [Entry]),
     /// A light reader's view: values upgraded during this call, kept until it ends.
     Light {
         state: &'a ViewState,
@@ -479,26 +563,47 @@ impl Held {
 /// The calling thread's view of the cells for one call of [`UpstreamRegistry::with_view`].
 pub struct View<'a> {
     source: Source<'a>,
+    /// Values read under the lock for this call, where the view could not answer (see [`get`](Self::get)). Empty, and
+    /// so unallocated, on every read that stays on the view.
+    cold: RefCell<Vec<(usize, Value)>>,
+}
+
+/// What a light read found for a cell.
+enum Found {
+    Value(Value),
+    /// The view cannot tell: read the cell under the lock.
+    Cold,
+    Nothing,
 }
 
 impl View<'_> {
-    /// The value in `cell` as of the reader's last drain.
+    /// The value in `cell` as of the reader's last drain. Where the view cannot answer, the value is read under the
+    /// lock instead: the id was freed and given to this cell after the view's last drain (a read in progress does not
+    /// drain, and the view still holds the dead cell's value), or the writer dropped this light reader for a mailbox
+    /// that backed up and skipped the offer that this read needs.
     pub fn get<T: Send + Sync + 'static>(&self, cell: &Cell<T>) -> Option<&T> {
         match &self.source {
-            Source::Full(slots) => match slots.get(cell.id)? {
-                Slot::Full(value) => value.downcast_ref::<T>(),
-                Slot::Empty | Slot::Light(_) => None,
+            Source::Full(entries) => match entries.get(cell.id) {
+                Some(entry) if entry.epoch == cell.epoch => match &entry.slot {
+                    Slot::Full(value) => value.downcast_ref::<T>(),
+                    Slot::Empty | Slot::Light(_) => None,
+                },
+                None if cell.epoch == 0 => None,
+                _ => self.cold_get(cell),
             },
             Source::Light { state, held } => {
                 let existing = held.borrow().find(cell.id);
                 let pointer = match existing {
                     Some(pointer) => pointer,
-                    None => {
-                        let value = Self::upgrade(state, cell.id)?;
-                        let pointer = Arc::as_ptr(&value);
-                        held.borrow_mut().push(cell.id, value);
-                        pointer
-                    }
+                    None => match Self::upgrade(state, cell) {
+                        Found::Value(value) => {
+                            let pointer = Arc::as_ptr(&value);
+                            held.borrow_mut().push(cell.id, value);
+                            pointer
+                        }
+                        Found::Cold => return self.cold_get(cell),
+                        Found::Nothing => return None,
+                    },
                 };
                 // SAFETY: `held` keeps a clone of the `Arc` for the whole call, so the value lives as long as `self`;
                 // an entry is only ever added, and a value is an `Arc` allocation, which does not move.
@@ -508,26 +613,61 @@ impl View<'_> {
         }
     }
 
+    /// The cell's current value under the lock, kept for the rest of the call.
+    fn cold_get<T: Send + Sync + 'static>(&self, cell: &Cell<T>) -> Option<&T> {
+        let existing = self
+            .cold
+            .borrow()
+            .iter()
+            .find(|(id, _)| *id == cell.id)
+            .map(|(_, value)| Arc::as_ptr(value));
+        let pointer = match existing {
+            Some(pointer) => pointer,
+            None => {
+                let value = cell.views.value(cell.id, cell.epoch)?;
+                let pointer = Arc::as_ptr(&value);
+                self.cold.borrow_mut().push((cell.id, value));
+                pointer
+            }
+        };
+        // SAFETY: `cold` keeps a clone of the `Arc` for the whole call, so the value lives as long as `self`; an entry
+        // is only ever added, and a value is an `Arc` allocation, which does not move.
+        let value: &(dyn Any + Send + Sync) = unsafe { &*pointer };
+        value.downcast_ref::<T>()
+    }
+
     /// Upgrades the light reader's reference to a cell's value (one reference-count update, and no copy of the weak
     /// reference). A reference that has died was replaced after the last drain: the update that replaced it was queued
     /// before it died, so draining again finds the newer value.
-    fn upgrade(state: &ViewState, id: usize) -> Option<Value> {
+    fn upgrade<T>(state: &ViewState, cell: &Cell<T>) -> Found {
         loop {
-            let dead = match state.values.borrow().get(id)? {
-                Slot::Empty | Slot::Full(_) => return None,
-                Slot::Light(weak) => match weak.upgrade() {
-                    Some(value) => return Some(value),
-                    None => weak.clone(),
+            let dead = match state.values.borrow().get(cell.id) {
+                None if cell.epoch == 0 => return Found::Nothing,
+                Some(entry) if entry.epoch == cell.epoch => match &entry.slot {
+                    Slot::Empty | Slot::Full(_) => return Found::Nothing,
+                    Slot::Light(weak) => match weak.upgrade() {
+                        Some(value) => return Found::Value(value),
+                        None => weak.clone(),
+                    },
                 },
+                _ => return Found::Cold,
             };
             // A failed upgrade is a relaxed load of a count that reached zero. The thread that dropped the last
             // reference queued the replacement before it did; this fence makes that offer visible to the drain.
             fence(Ordering::Acquire);
             state.drain();
-            let newer = state.values.borrow().get(id).cloned();
+            let newer = state.values.borrow().get(cell.id).cloned();
             match newer {
-                Some(Slot::Light(now)) if !Weak::ptr_eq(&now, &dead) => {}
-                _ => return None,
+                Some(Entry {
+                    epoch,
+                    slot: Slot::Light(now),
+                }) if epoch == cell.epoch && !Weak::ptr_eq(&now, &dead) => {}
+                _ if state.evicted.load(Ordering::Acquire) => {
+                    // The writer dropped this reader and skipped the offer that replaced the value.
+                    return Found::Cold;
+                }
+                Some(entry) if entry.epoch != cell.epoch => return Found::Cold,
+                _ => return Found::Nothing,
             }
         }
     }
@@ -665,6 +805,60 @@ mod tests {
             Some(LIGHT_BACKLOG + 10)
         );
         assert_eq!(registry.views().store.lock().readers.len(), 1);
+        registry.remove_reader();
+    }
+
+    /// A read in progress does not drain, so its view still holds the value of a cell that was dropped; a cell that
+    /// took the dropped one's id must not be given that value.
+    fn a_nested_read_of_a_cell_that_reused_an_id_sees_the_new_cells_value(full: bool) {
+        let registry = registry();
+        let old = registry.cell::<u64>();
+        registry.set_cell(&old, Some(Arc::new(7)));
+        if full {
+            registry.register_reader();
+        }
+        assert_eq!(registry.with_view(|v| v.get(&old).copied()), Some(7));
+        registry.with_view(|outer| {
+            let id = old.id;
+            drop(old);
+            let new = registry.cell::<u64>();
+            assert_eq!(new.id, id, "the id was reused");
+            registry.set_cell(&new, Some(Arc::new(9)));
+            assert_eq!(
+                registry.with_view(|nested| nested.get(&new).copied()),
+                Some(9),
+                "a nested read cannot drain, and must still not see the dead cell's 7"
+            );
+            assert_eq!(outer.get(&new).copied(), Some(9));
+        });
+        registry.remove_reader();
+    }
+
+    #[test]
+    fn a_full_readers_nested_read_does_not_see_a_dropped_cells_value_in_a_reused_id() {
+        a_nested_read_of_a_cell_that_reused_an_id_sees_the_new_cells_value(true);
+    }
+
+    #[test]
+    fn a_light_readers_nested_read_does_not_see_a_dropped_cells_value_in_a_reused_id() {
+        a_nested_read_of_a_cell_that_reused_an_id_sees_the_new_cells_value(false);
+    }
+
+    /// The writer drops a light reader whose mailbox backed up and skips the offers after that; a read that was
+    /// already under way must still find the current value.
+    #[test]
+    fn a_light_read_that_is_evicted_while_it_runs_still_finds_the_current_value() {
+        let registry = registry();
+        let cell = registry.cell::<u64>();
+        registry.set_cell(&cell, Some(Arc::new(0)));
+        assert_eq!(registry.with_view(|v| v.get(&cell).copied()), Some(0));
+        let seen = registry.with_view(|v| {
+            for value in 1..=(LIGHT_BACKLOG + 10) {
+                registry.set_cell(&cell, Some(Arc::new(value)));
+            }
+            v.get(&cell).copied()
+        });
+        assert_eq!(seen, Some(LIGHT_BACKLOG + 10));
         registry.remove_reader();
     }
 

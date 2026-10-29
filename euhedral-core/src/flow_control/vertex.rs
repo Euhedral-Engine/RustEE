@@ -394,10 +394,11 @@ impl LatticeVertex {
         if deferred.is_empty() {
             return;
         }
-        if self.edge.registry().is_full_reader() {
-            // The last holder is a worker (or a producer thread on the frame path): a retirement may close a clone and
-            // wait for its workers, which for this very worker is waiting for itself, and for any other stalls its
-            // frames. Java runs it here, on the last reader of the retired state; here it goes to a thread of its own.
+        if UpstreamRegistry::in_reader_context() {
+            // The last holder is a reader letting go (a worker, a producer, or any thread on a frame path): a retirement
+            // may close a clone and wait for its workers, which for this very worker is waiting for itself, and for any
+            // other stalls its frames. Java runs it here, on the last reader of the retired state; here it goes to a
+            // thread of its own. The writer's own drop of a replaced generation, on a lifecycle thread, runs it inline.
             let name = self.name.clone();
             let task = Arc::new(LifecycleMutex::new(Some(deferred)));
             let spawned = {

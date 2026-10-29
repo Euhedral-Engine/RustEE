@@ -49,15 +49,20 @@ they drain.
   holding it lets go: for each worker, at its next cycle or read. Java releases them when the last push that counted
   against the state ends. Category: missing Rust equivalent (there is no per-push count, which is what the views remove
   from the frame path); the delay is bounded by a worker's cycle and its timed parks.
-- **Retirements never wait on a frame path (deviation from Java).** When the last holder is a worker or another frame-path
-  thread, `release_generation` hands the deferred retirements to a thread of its own; Java runs them on the last
+- **Retirements never wait on a frame path (deviation from Java).** When the last holder is a reader letting go (a
+  worker draining, or a light reader ending a read: a producer, another lattice's worker), `release_generation` hands the
+  deferred retirements to a thread of its own (a worker that is a generation's last holder takes the book lock, allocates
+  and hands off or spawns: per generation, not per frame); the writer's own drop on a lifecycle thread runs them inline; Java runs them on the last
   reader, where `closeClone` waits for the clone's workers, and for the clone's own worker that is a wait on itself.
   Category: Java bug against the frame-path rule.
 - **Cost per push, exactly.** Inside the interceptor's `request` the routing state is read from the view: a worker pays no
   read-modify-write, a light reader one reference-count pair (the state's upgrade). Outside a request every push also
   upgrades the interceptor's `Weak` of its vertex, one more pair for any thread (a worker one, a light reader two).
 - Cells are freed: a dropped `Cell` returns its id to the registry and tells every reader to forget its value, so
-  rebalances no longer grow the store and every view. A light reader whose mailbox holds more than 1024 updates (a
+  rebalances no longer grow the store and every view. Each id carries a reuse epoch (in the `Cell`, the updates and the
+  views): a read in progress cannot drain, so its view may still hold the dead cell's value for a recycled id, and a read
+  whose epoch does not match the cell's reads the value under the lock instead. The same fallback serves a light read
+  whose reader the writer dropped for a backed-up mailbox. A light reader whose mailbox holds more than 1024 updates (a
   thread that read once and never again) is dropped by the writer and registers again at its next read. Lifecycle code
   reads `LatticeEdge::parent()` under the lock and does not become a reader.
 - `euhedral_hardware_utils::affinity::PinnedThreadExecutor::get_or_create_within` waits (up to a timeout) for a closed
