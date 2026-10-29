@@ -218,7 +218,7 @@ mod loom_tests {
         }
     }
 
-    /// The reader's side of `tryAcquireRoutingState`: load the pointer, count, re-check; read the table.
+    /// The reader's side: load the pointer, count, re-check; read the table.
     fn read(current: &AtomicPtr<State>) -> Option<u32> {
         let pointer = current.load(Ordering::Acquire);
         // SAFETY: states outlive the model's threads.

@@ -50,8 +50,8 @@ use euhedral_core::ingest::{IngestSink, QueueIngestSink};
 use euhedral_graph::testing::FakeDevice;
 use euhedral_graph::{
     Completions, DEFAULT_RETRY_BACKSTOP, EdgeKind, GraphRuntime, Join, Lake, LaneId, LanePool,
-    Marker, QuantumOutcome, Sequencer, Slot, Stage, StageCx, StageError, StageGraph,
-    StageGraphSpec, StageSpec, Submitted,
+    Marker, Part, QuantumOutcome, Registrar, Sequencer, Slot, Stage, StageCx, StageError,
+    StageGraph, StageGraphSpec, StageSpec, Submitted,
 };
 use euhedral_hardware_utils::affinity;
 
@@ -214,7 +214,8 @@ struct Staged {
     seq: u64,
     kill: Arc<AtomicBool>,
     marker: Marker,
-    lease: Arc<Join<()>>,
+    /// Part 1 of the item's lease: the item was sent.
+    sent: Part<()>,
 }
 
 /// The quantum: one item of one generation.
@@ -223,9 +224,10 @@ struct Item {
     seq: u64,
     kill: Arc<AtomicBool>,
     slot: Mutex<Option<Slot<Staged>>>,
-    /// Part 0: the quantum retired. Part 1: the item was sent (a value) or dropped after admission
-    /// (none).
-    lease: Arc<Join<()>>,
+    /// Part 0 of the lease: the quantum retired.
+    retired: Mutex<Option<Part<()>>>,
+    /// Part 1: the item was sent (a value) or dropped after admission (none).
+    sent: Mutex<Option<Part<()>>>,
 }
 
 impl Item {
@@ -233,7 +235,9 @@ impl Item {
     fn drop_slot(&self) {
         if let Some(slot) = lock(&self.slot).take() {
             slot.abandon();
-            self.lease.abandon(1);
+            if let Some(sent) = lock(&self.sent).take() {
+                sent.abandon();
+            }
         }
     }
 }
@@ -285,15 +289,15 @@ impl Stage<Item> for Compute {
                 generation,
                 seq,
                 ref kill,
-                ref lease,
                 ..
             } = *item;
+            let sent = lock(&item.sent).take().expect("the item was not sent yet");
             slot.complete(Staged {
                 generation,
                 seq,
                 kill: kill.clone(),
                 marker,
-                lease: lease.clone(),
+                sent,
             });
         }
         Ok(Submitted::marker(marker))
@@ -342,6 +346,8 @@ struct Ctx {
     device: Arc<Device>,
     graph: OnceLock<Arc<StageGraph<Item>>>,
     sequencer: OnceLock<Arc<Sequencer<Staged>>>,
+    /// The one registrar: items are admitted by one thread at a time, so the lock is never contended.
+    registrar: Mutex<Option<Registrar<Staged>>>,
     link: Mutex<Admission>,
     delivering: AtomicBool,
     again: AtomicBool,
@@ -366,6 +372,7 @@ impl Ctx {
             device: Arc::new(Device { lanes: devices }),
             graph: OnceLock::new(),
             sequencer: OnceLock::new(),
+            registrar: Mutex::new(None),
             link: Mutex::new(Admission {
                 generation: 0,
                 kill: Arc::new(AtomicBool::new(false)),
@@ -383,7 +390,7 @@ impl Ctx {
             me: me.clone(),
         });
         let me = ctx.me.clone();
-        let sequencer = Sequencer::new(move |ready: Staged| {
+        let (sequencer, registrar) = Sequencer::new(64, move |ready: Staged| {
             let Some(ctx) = me.upgrade() else { return };
             hop(2, ready.generation, ready.seq);
             let frame = Pack {
@@ -394,6 +401,7 @@ impl Ctx {
             ctx.offer(Box::new(frame));
         });
         assert!(ctx.sequencer.set(sequencer).is_ok());
+        *lock(&ctx.registrar) = Some(registrar);
         let mut spec = StageGraphSpec::new();
         let fetch = spec.stage(StageSpec {
             name: "fetch",
@@ -442,7 +450,9 @@ impl Ctx {
                     }
                 }
                 item.drop_slot();
-                item.lease.arrive(0, ());
+                if let Some(retired) = lock(&item.retired).take() {
+                    retired.arrive(());
+                }
             },
         )
         .expect("a valid graph");
@@ -490,18 +500,24 @@ impl Ctx {
             .max_in_flight
             .fetch_max(link.in_flight, Ordering::Relaxed);
         let me = self.me.clone();
-        let lease = Join::new(2, move |parts: Vec<Option<()>>| {
+        let mut lease = Join::once(2, move |parts: Vec<Option<()>>| {
             if let Some(ctx) = me.upgrade() {
                 ctx.release(parts[1].is_some());
             }
         });
-        let slot = self.sequencer.get().expect("the sequencer").register();
+        let (retired, sent) = (lease.next(), lease.next());
+        let slot = lock(&self.registrar)
+            .as_mut()
+            .expect("the registrar")
+            .register()
+            .expect("the ring holds the pool's items");
         let item = Item {
             generation: link.generation,
             seq,
             kill: link.kill.clone(),
             slot: Mutex::new(Some(slot)),
-            lease,
+            retired: Mutex::new(retired),
+            sent: Mutex::new(sent),
         };
         Some((item, link.kill.clone()))
     }
@@ -582,7 +598,7 @@ impl Frame for Pack {
     fn do_finally(mut self: Box<Self>) {
         let ready = self.ready.take().expect("once");
         if !self.header.is_alive() {
-            return ready.lease.abandon(1);
+            return ready.sent.abandon();
         }
         hop(3, ready.generation, ready.seq);
         let marker = self
@@ -611,7 +627,7 @@ impl Frame for Dispatch {
     fn do_finally(mut self: Box<Self>) {
         let ready = self.ready.take().expect("once");
         if !self.header.is_alive() {
-            return ready.lease.abandon(1);
+            return ready.sent.abandon();
         }
         hop(4, ready.generation, ready.seq);
         let marker = self.ctx.device.submit(NIC, SEND, &[]);
@@ -640,7 +656,7 @@ impl Frame for Sent {
             generation: ready.generation,
             seq: ready.seq,
         });
-        ready.lease.arrive(1, ());
+        ready.sent.arrive(());
     }
 }
 

@@ -47,21 +47,29 @@ default, the output lines, and a smoke run of a fork with a tiny target on a rea
 - **`Latch`, `LatchSetter` and `LatchWaiter` are removed** (**breaking**; G5). A latch let the main thread block until
   the lattice's work was done; the main thread can check on it periodically instead, with a one-shot. It was the last
   blocking call in `euhedral-graph`.
-- `Sequencer` (G6) is Java's: the order is a multi-producer queue of entries with a `ready` flag, and the thread that
-  raises the work-in-progress count from zero concludes the ready prefix. Any thread may register. Its length is the
-  order queue's, not a counter of its own.
+- `Sequencer` (G6) is Java's: a ring of cells indexed by sequence number, each with a ready state word, and the thread
+  that raises the work-in-progress count from zero concludes the ready prefix. **Breaking:** `Sequencer::new(capacity,
+  emit)` returns the sequencer with its one `Registrar` (not `Clone`; `register(&mut self)` returns `None` while
+  `capacity` slots are unreleased). A registration allocates nothing and takes no read-modify-write; the registrar
+  keeps the order, so registration is by one thread at a time. A slot still holds an `Arc` of the sequencer.
 - `Lake` (G7-G9): the attached set is a `Published` reference in the lattice's epoch domain; `offer` and `admit` read
   it with one pinned load. Attach and detach run under a lifecycle lock off the hot scope. The idle watch's downstream
   is a `DownstreamSlot`. `ControlPlaneLattice::registry()` is new.
 - Lane sources and `Join` (G16, G17; barriers, not locks): `LaneSource::request` banks demand with one release
   `fetch_add` (and spends unbounded demand with none) and sets its wake flag with a release store, where it did
-  three sequentially consistent read-modify-writes per call. A `Join` arrival is one `fetch_sub(AcqRel)`; the check
-  that a part ends once is made in debug builds only, so **a part that ends twice in a release build is a data race
-  on its slot** (Java has no check either). New: `Join::discard_round(&mut self)` (safe: exclusive access proves no part is outstanding, for a unit whose frames
-  were killed), `Join::arm_owned` (unsafe, the same for an owner that cannot borrow exclusively) and `Join::is_idle`. `Join::reset` keeps its check. **Breaking
-  for the lane-source consumers' expectations:** a double arrival no longer panics in a release build, and
-  `euhedral-data-structures` now builds the loom crate as a dependency under `--cfg loom` (the graph's join
-  models run again).
+  three sequentially consistent read-modify-writes per call. `euhedral-data-structures` now builds the loom crate as a
+  dependency under `--cfg loom` (the graph's join models run again).
+- **`Join` API change (breaking).** A part is a move-only token: `Join::reset`, `Round::rearm`, `Join::once` (was
+  `Join::new`) and the unsafe `Join::arm_owned` return the round's `Parts`, an iterator of `Part`s;
+  `Part::arrive(value)` and `Part::abandon()` consume a part, and dropping one abandons. `Join::arrive(index, value)`
+  and `Join::abandon(index)` are gone. A part ends once because it is consumed, so a double arrival does not compile,
+  and the debug-only `closed` flag and the range check are gone; an arrival stays one `fetch_sub(AcqRel)`. A killed
+  unit drops its parts and the round completes with `None`s. `Join::with_capacity` returns an `Arc<Join>` (a part holds
+  its join, because there is no collector to keep it alive). `Join::discard_round(&mut self)` (for an `Arc::get_mut`
+  owner), `Join::arm_owned` (unsafe: only the caller knows that no part of the old round will end) and `Join::is_idle`
+  remain; `Join::reset` keeps its check. Reason: the earlier contract ("each part ends exactly once") was undefined
+  behaviour reachable from safe code.
+
 - `HOT_FIX_TAGS` loses C14, G5, G6 and G7 and lists 35.
 
 **Why.** An outcome crossed a channel whose waker took a mutex on the worker that finished the chain; a latch took a
