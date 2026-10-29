@@ -10,6 +10,7 @@
 
 pub mod atomics;
 pub mod queues;
+pub mod sync;
 
 /// Compiles and runs the examples in the crate README as doctests.
 #[cfg(doctest)]

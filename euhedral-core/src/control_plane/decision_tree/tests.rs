@@ -1,6 +1,6 @@
 use super::*;
 use crate::config::TimingProvider;
-use crate::flow_control::{UpstreamHandle, UpstreamRegistry};
+use crate::flow_control::{Claim, UpstreamHandle, UpstreamRegistry};
 use crate::frames::Frame;
 use euhedral_hardware_utils::util::CpuSet;
 
@@ -271,6 +271,7 @@ impl UpstreamHandle for Contended {
 
     fn pull(
         &self,
+        _claim: &mut Claim,
         _: &mut dyn FnMut(Box<dyn Frame>),
         _: &mut dyn FnMut(&dyn Frame) -> bool,
         _: u64,
@@ -278,14 +279,14 @@ impl UpstreamHandle for Contended {
         Some(0)
     }
 
-    fn request(&self, _: u64) {}
+    fn request(&self, _claim: &mut Claim, _: u64) {}
 
     fn is_complete(&self) -> bool {
         false
     }
 
-    fn try_acquire(&self) -> bool {
-        false
+    fn try_acquire(&self) -> Option<Claim> {
+        None
     }
 }
 

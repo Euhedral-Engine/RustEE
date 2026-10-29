@@ -18,6 +18,7 @@ the `FrameManager`'s recycle queue are queues from this crate.
 | `queues::PlainQueue` ([source](src/queues/plain_queue.rs)) | A single-thread FIFO with the same batch API and no synchronisation. |
 | [`queues::queue_utils`](src/queues/queue_utils.rs) | Sizing helpers: `MAX_SIZE`, `round_chunk_size`, `chunk_mask`, `unsigned_multiply_high`. |
 | `queues` internals: [`core`](src/queues/core.rs), [`chunk`](src/queues/chunk.rs) | The chunked ring buffer behind every queue, its slots, and the pool that recycles retired chunks. Private. |
+| [`sync`](src/sync/mod.rs) | `SetOnce<T>`: a lock-free cell installed at most once by a compare-and-set and read with an acquire load. Its loom model runs with `RUSTFLAGS="--cfg loom"`. |
 | [`atomics`](src/atomics/mod.rs) | `CachePadded<T>`; `AtomicDouble`; `PaddedAtomicLong`, `PaddedAtomicDouble`; `PaddedAtomicLongArray`, `PaddedAtomicDoubleArray` (each element on its own cache line); `PaddedLongAdder`, `PaddedDoubleAdder` (striped counters). |
 
 ## Key concepts

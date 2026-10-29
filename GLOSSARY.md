@@ -91,6 +91,31 @@ frames flow down.
 pushes and hears `on_complete` and `on_error`; a terminal is the bottom of a chain that attaches to a
 source; an interceptor is a stage that is both a source and a receiver.
 
+**source invariant**: the lattice serializes a source's `pull` and `request`. One worker is inside
+either at a time, and the interceptor's claim orders one worker's exit before the next worker's entry.
+State that only those calls touch is plain, in a `SourceCell`, with no atomics and no lock. `request`
+is always called; `pull` may never be.
+
+**SourceCell, SourceGuard** ([`SourceCell`](euhedral-core/src/generics/source_cell.rs)): a source's
+plain state under the source invariant. `enter` is `unsafe`, because the compiler cannot see the
+lattice's guarantee; the caller is inside `pull` or `request`, or in an action `serialize` runs. A
+source's lifecycle calls from other threads set atomics, and the source applies them there. In
+debug builds a second entry, nested or from another thread, panics. Release builds carry no check.
+
+**`serialize`** ([`LatticeReceiver::serialize`](euhedral-core/src/generics/lattice.rs)): runs an action
+when no `pull` or `request` of the receiver's source is in progress, without waiting: at once if none
+is, otherwise on the worker that holds the source, once that worker has let go of its `pull` or
+`request`. Actions run one at a time, in order, each exactly once. The interceptor uses it to release
+the source it holds. The default runs the action at once.
+
+**DownstreamSlot** ([`DownstreamSlot`](euhedral-core/src/generics/downstream_slot.rs)): the one receiver
+a source pushes to, read without a lock. A second attach is told `on_error`; the receiver hears
+`on_complete` exactly once however attach and completion race; the receiver's `Arc` stays in the slot
+until the slot drops, and a `live` flag ends its use. Every method touches atomics only.
+
+**SetOnce** ([`SetOnce`](euhedral-data-structures/src/sync/set_once.rs)): a cell installed at most once
+by a compare-and-set and read with an acquire load; the value lives until the cell drops.
+
 **ingest sink** ([`IngestSink`](euhedral-core/src/ingest/mod.rs)): a ready-made `LatticeSource` that
 feeds a lattice from outside it. Hand its `delegate()` to `ControlPlaneLattice::add_upstream`;
 `complete()` finishes it at once.
@@ -182,8 +207,10 @@ edge and demand climbs up it; a vertex is a node that routes each frame to one o
 **upstream, UpstreamHandle, UpstreamInterceptor**
 ([`UpstreamHandle`](euhedral-core/src/flow_control/upstream_queue.rs),
 [`UpstreamInterceptor`](euhedral-core/src/flow_control/vertex.rs)): a source fed into the lattice,
-as the workers see it. A worker services a handle only while it holds the handle's lock, so the
-source sees one worker at a time.
+as the workers see it. A worker services a handle only while it holds the handle's claim, a counter
+(`wip`) moved from zero by `fetch_add`, so the source sees one worker at a time. `try_acquire` returns
+a `Claim`, the proof that `pull`, `request` and `release` require. The interceptor installs its source
+before it is registered and lets it go, through `serialize`, when it finishes.
 
 **UpstreamRegistry, UpstreamQueue** ([`registry`](euhedral-core/src/flow_control/registry.rs),
 [`upstream_queue`](euhedral-core/src/flow_control/upstream_queue.rs)): the registry holds a lattice's

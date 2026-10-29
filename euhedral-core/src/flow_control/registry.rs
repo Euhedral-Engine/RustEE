@@ -271,6 +271,7 @@ fn offer(producer: &Producer<Entry, Multi>, handle: &Arc<dyn UpstreamHandle>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::flow_control::Claim;
     use crate::frames::Frame;
     use std::sync::atomic::AtomicBool;
     use std::thread;
@@ -298,6 +299,7 @@ mod tests {
 
         fn pull(
             &self,
+            _claim: &mut Claim,
             _consumer: &mut dyn FnMut(Box<dyn Frame>),
             _stop: &mut dyn FnMut(&dyn Frame) -> bool,
             _demand: u64,
@@ -305,7 +307,7 @@ mod tests {
             Some(0)
         }
 
-        fn request(&self, demand: u64) {
+        fn request(&self, _claim: &mut Claim, demand: u64) {
             self.requested.fetch_add(demand, Ordering::Relaxed);
         }
 

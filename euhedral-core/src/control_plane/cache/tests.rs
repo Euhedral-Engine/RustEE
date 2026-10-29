@@ -1,6 +1,6 @@
 use super::*;
-use crate::flow_control::UpstreamHandle;
 use crate::flow_control::testing::{Fate, Fates, Tracked, frame};
+use crate::flow_control::{Claim, UpstreamHandle};
 use euhedral_hardware_utils::monitor::{HardwareUtilization, HardwareUtilizationParts};
 use euhedral_hardware_utils::topology::CpuInfo;
 use euhedral_hardware_utils::topology::source::{
@@ -107,6 +107,7 @@ impl UpstreamHandle for Source {
 
     fn pull(
         &self,
+        _claim: &mut Claim,
         consumer: &mut dyn FnMut(Box<dyn Frame>),
         stop: &mut dyn FnMut(&dyn Frame) -> bool,
         demand: u64,
@@ -125,7 +126,7 @@ impl UpstreamHandle for Source {
         Some(pulled)
     }
 
-    fn request(&self, demand: u64) {
+    fn request(&self, _claim: &mut Claim, demand: u64) {
         self.requested.fetch_add(demand, Ordering::SeqCst);
     }
 

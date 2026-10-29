@@ -2,7 +2,9 @@ use super::*;
 use crate::flow_control::LatticeHotSource;
 use crate::flow_control::testing::{Fate, Fates, TestReceiver, Tracked, frame};
 use crate::frames::BenchmarkFrame;
+use crate::generics::{DownstreamSlot, SourceCell};
 use euhedral_hardware_utils::util::CpuSet;
+use std::sync::Barrier;
 use std::sync::atomic::AtomicUsize;
 use std::sync::mpsc;
 use std::thread;
@@ -370,7 +372,7 @@ fn ingesting_attaches_the_source_once() {
     let interceptor = vertex.ingest(source.clone()).unwrap();
 
     let upstream: Arc<dyn LatticeSource> = source.clone();
-    assert!(Arc::ptr_eq(interceptor.upstream().unwrap(), &upstream));
+    assert!(interceptor.has_upstream(&upstream));
     assert_eq!(
         registry.upstream_handle_count(),
         1,
@@ -417,7 +419,9 @@ fn an_interceptor_takes_one_source() {
     assert!(second.is_complete());
     assert!(!first.is_complete());
     let upstream: Arc<dyn LatticeSource> = first;
-    assert!(Arc::ptr_eq(interceptor.upstream().unwrap(), &upstream));
+    assert!(interceptor.has_upstream(&upstream));
+    let other: Arc<dyn LatticeSource> = second;
+    assert!(!interceptor.has_upstream(&other));
 }
 
 #[test]
@@ -471,30 +475,26 @@ fn an_interceptor_is_serviced_only_under_its_lock() {
     let vertex = LatticeVertex::new(&registry(), "lock", 1);
     let source = Arc::new(DeferredSource::default());
     let interceptor = vertex.ingest(source.clone()).unwrap();
-    let pull = |interceptor: &UpstreamInterceptor, demand| {
-        interceptor.pull(&mut |_| {}, &mut |_| false, demand)
+    let pull = |interceptor: &UpstreamInterceptor, claim: &mut Claim, demand| {
+        interceptor.pull(claim, &mut |_| {}, &mut |_| false, demand)
     };
 
-    assert_eq!(pull(&interceptor, 1), None);
-    interceptor.request(1);
-    assert_eq!(source.requested.load(Ordering::Relaxed), 0);
-
-    assert!(interceptor.try_acquire());
-    assert!(!interceptor.try_acquire());
-    assert_eq!(pull(&interceptor, 1), Some(0));
-    assert_eq!(pull(&interceptor, 0), None);
-    interceptor.request(0);
-    interceptor.request(2);
+    let mut claim = interceptor.try_acquire().expect("the handle is free");
+    assert!(interceptor.try_acquire().is_none(), "one claim at a time");
+    assert_eq!(pull(&interceptor, &mut claim, 1), Some(0));
+    assert_eq!(pull(&interceptor, &mut claim, 0), None);
+    interceptor.request(&mut claim, 0);
+    interceptor.request(&mut claim, 2);
     assert_eq!(source.requested.load(Ordering::Relaxed), 2);
 
     vertex.set_drain(true);
-    assert_eq!(pull(&interceptor, 1), None);
-    interceptor.request(2);
+    assert_eq!(pull(&interceptor, &mut claim, 1), None);
+    interceptor.request(&mut claim, 2);
     assert_eq!(source.requested.load(Ordering::Relaxed), 2);
     vertex.set_drain(false);
 
-    interceptor.release();
-    assert!(interceptor.try_acquire());
+    interceptor.release(claim);
+    assert!(given_back(&interceptor));
 }
 
 #[test]
@@ -507,10 +507,20 @@ fn a_panicking_source_completes_its_interceptor() {
     let requesting = vertex.ingest(requested.clone()).unwrap();
     pulled.panics.store(true, Ordering::Relaxed);
     requested.panics.store(true, Ordering::Relaxed);
-    assert!(pulling.try_acquire() && requesting.try_acquire());
+    let mut pulling_claim = pulling.try_acquire().unwrap();
+    let mut requesting_claim = requesting.try_acquire().unwrap();
 
-    assert_eq!(pulling.pull(&mut |_| {}, &mut |_| false, 1), None);
-    requesting.request(1);
+    assert_eq!(
+        pulling.pull(&mut pulling_claim, &mut |_| {}, &mut |_| false, 1),
+        None
+    );
+    requesting.request(&mut requesting_claim, 1);
+
+    // The source is completed once the worker lets the interceptor go.
+    assert!(pulling.is_complete() && requesting.is_complete());
+    assert!(!pulled.is_complete() && !requested.is_complete());
+    pulling.release(pulling_claim);
+    requesting.release(requesting_claim);
 
     assert!(pulling.is_complete() && pulled.is_complete());
     assert!(requesting.is_complete() && requested.is_complete());
@@ -933,4 +943,680 @@ fn attaching_after_the_vertex_is_gone_completes_the_source() {
     let fates = Fates::default();
     interceptor.push(Tracked::new(1, &fates));
     assert!(matches!(fates.lock().unwrap()[0], (1, Fate::Failed(_))));
+}
+
+/// A source that records what it is doing, so a test can see actions interleave with it.
+#[derive(Default)]
+struct Watched {
+    /// Inside a `pull` or `request`.
+    busy: AtomicBool,
+    /// Inside a serialized action.
+    acting: AtomicBool,
+    overlaps: AtomicUsize,
+    complete: AtomicBool,
+    drops: Mutex<Option<Arc<AtomicUsize>>>,
+}
+
+impl Watched {
+    fn work(&self) {
+        if self.acting.load(Ordering::SeqCst) {
+            self.overlaps.fetch_add(1, Ordering::SeqCst);
+        }
+        self.busy.store(true, Ordering::SeqCst);
+        std::hint::spin_loop();
+        self.busy.store(false, Ordering::SeqCst);
+    }
+}
+
+impl Drop for Watched {
+    fn drop(&mut self) {
+        if let Some(drops) = self.drops.lock().unwrap().as_ref() {
+            drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
+impl LatticeSource for Watched {
+    fn add_downstream(self: Arc<Self>, _downstream: Arc<dyn LatticeReceiver>) {}
+
+    fn pull(
+        &self,
+        _consumer: &mut dyn FnMut(Box<dyn Frame>),
+        _stop: &mut dyn FnMut(&dyn Frame) -> bool,
+        _demand: u64,
+    ) -> u64 {
+        self.work();
+        0
+    }
+
+    fn request(&self, _demand: u64) {
+        self.work();
+    }
+
+    fn complete(&self) {
+        self.complete.store(true, Ordering::Release);
+    }
+
+    fn is_complete(&self) -> bool {
+        self.complete.load(Ordering::Acquire)
+    }
+}
+
+fn ingest_watched(name: &str) -> (Arc<LatticeVertex>, Arc<Watched>, Arc<UpstreamInterceptor>) {
+    let vertex = LatticeVertex::new(&registry(), name, 1);
+    let source = Arc::new(Watched::default());
+    let interceptor = vertex.ingest(source.clone()).unwrap();
+    (vertex, source, interceptor)
+}
+
+/// Whether the claim is free: takes it and gives it back.
+fn given_back(interceptor: &UpstreamInterceptor) -> bool {
+    interceptor
+        .try_acquire()
+        .map(|claim| interceptor.release(claim))
+        .is_some()
+}
+
+/// An action that adds one to `counter`.
+fn bump(counter: &Arc<AtomicUsize>) -> Box<dyn FnOnce() + Send> {
+    let counter = counter.clone();
+    Box::new(move || {
+        counter.fetch_add(1, Ordering::SeqCst);
+    })
+}
+
+#[test]
+fn serialize_runs_at_once_when_no_worker_holds_the_source() {
+    let (_vertex, _source, interceptor) = ingest_watched("serialize-now");
+    let ran = Arc::new(AtomicUsize::new(0));
+
+    interceptor.serialize(bump(&ran));
+
+    assert_eq!(ran.load(Ordering::SeqCst), 1);
+    assert!(given_back(&interceptor), "the claim was given back");
+}
+
+#[test]
+fn serialize_runs_at_release_when_another_worker_holds_the_source() {
+    let (_vertex, _source, interceptor) = ingest_watched("serialize-later");
+    let (acquired_tx, acquired_rx) = mpsc::channel();
+    let (go_tx, go_rx) = mpsc::channel::<()>();
+    let worker = {
+        let interceptor = interceptor.clone();
+        thread::spawn(move || {
+            let claim = interceptor.try_acquire().unwrap();
+            acquired_tx.send(()).unwrap();
+            go_rx.recv().unwrap();
+            interceptor.release(claim);
+            thread::current().id()
+        })
+    };
+    acquired_rx.recv().unwrap();
+
+    let ran_on = Arc::new(Mutex::new(None));
+    let recorded = ran_on.clone();
+    interceptor.serialize(Box::new(move || {
+        *recorded.lock().unwrap() = Some(thread::current().id());
+    }));
+    assert!(
+        ran_on.lock().unwrap().is_none(),
+        "the action waits for the holder"
+    );
+
+    go_tx.send(()).unwrap();
+    let worker_id = worker.join().unwrap();
+    assert_eq!(*ran_on.lock().unwrap(), Some(worker_id));
+}
+
+/// A source whose `pull` serializes an action through its receiver.
+struct SerializingSource {
+    downstream: Mutex<Option<Arc<dyn LatticeReceiver>>>,
+    in_pull: Arc<AtomicBool>,
+    ran_during_pull: Arc<AtomicBool>,
+    ran: Arc<AtomicBool>,
+}
+
+impl LatticeSource for SerializingSource {
+    fn add_downstream(self: Arc<Self>, downstream: Arc<dyn LatticeReceiver>) {
+        *self.downstream.lock().unwrap() = Some(downstream);
+    }
+
+    fn pull(
+        &self,
+        _consumer: &mut dyn FnMut(Box<dyn Frame>),
+        _stop: &mut dyn FnMut(&dyn Frame) -> bool,
+        _demand: u64,
+    ) -> u64 {
+        self.in_pull.store(true, Ordering::SeqCst);
+        let downstream = self.downstream.lock().unwrap().clone().unwrap();
+        let (in_pull, during, ran) = (
+            self.in_pull.clone(),
+            self.ran_during_pull.clone(),
+            self.ran.clone(),
+        );
+        downstream.serialize(Box::new(move || {
+            during.store(in_pull.load(Ordering::SeqCst), Ordering::SeqCst);
+            ran.store(true, Ordering::SeqCst);
+        }));
+        self.in_pull.store(false, Ordering::SeqCst);
+        0
+    }
+
+    fn request(&self, _demand: u64) {}
+
+    fn complete(&self) {}
+
+    fn is_complete(&self) -> bool {
+        false
+    }
+}
+
+#[test]
+fn serialize_from_inside_the_sources_own_pull_runs_before_release() {
+    let vertex = LatticeVertex::new(&registry(), "serialize-own-pull", 1);
+    let (in_pull, during, ran) = (
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let source = Arc::new(SerializingSource {
+        downstream: Mutex::new(None),
+        in_pull,
+        ran_during_pull: during.clone(),
+        ran: ran.clone(),
+    });
+    let interceptor = vertex.ingest(source).unwrap();
+    let mut claim = interceptor.try_acquire().unwrap();
+
+    assert_eq!(
+        interceptor.pull(&mut claim, &mut |_| {}, &mut |_| false, 1),
+        Some(0)
+    );
+    assert!(
+        !ran.load(Ordering::SeqCst),
+        "the action waits for the pull to end"
+    );
+
+    interceptor.release(claim);
+    assert!(ran.load(Ordering::SeqCst));
+    assert!(!during.load(Ordering::SeqCst), "and never overlapped it");
+}
+
+#[test]
+fn an_action_never_runs_while_a_pull_or_request_is_in_progress() {
+    const ACTIONS: usize = 10_000;
+    let (_vertex, source, interceptor) = ingest_watched("never-overlaps");
+    let ran = Arc::new(AtomicUsize::new(0));
+    let workers: Vec<_> = (0..4)
+        .map(|_| {
+            let interceptor = interceptor.clone();
+            thread::spawn(move || {
+                for _ in 0..ACTIONS {
+                    if let Some(mut claim) = interceptor.try_acquire() {
+                        interceptor.request(&mut claim, 1);
+                        interceptor.pull(&mut claim, &mut |_| {}, &mut |_| false, 1);
+                        interceptor.release(claim);
+                    }
+                }
+            })
+        })
+        .collect();
+    let serializer = {
+        let (interceptor, source, ran) = (interceptor.clone(), source.clone(), ran.clone());
+        thread::spawn(move || {
+            for _ in 0..ACTIONS {
+                let (source, ran) = (source.clone(), ran.clone());
+                interceptor.serialize(Box::new(move || {
+                    source.acting.store(true, Ordering::SeqCst);
+                    if source.busy.load(Ordering::SeqCst) {
+                        source.overlaps.fetch_add(1, Ordering::SeqCst);
+                    }
+                    std::hint::spin_loop();
+                    source.acting.store(false, Ordering::SeqCst);
+                    ran.fetch_add(1, Ordering::SeqCst);
+                }));
+            }
+        })
+    };
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    serializer.join().unwrap();
+
+    assert_eq!(source.overlaps.load(Ordering::SeqCst), 0);
+    assert_eq!(ran.load(Ordering::SeqCst), ACTIONS);
+}
+
+#[test]
+fn release_races_serialize_and_no_action_is_stranded() {
+    const ACTIONS: usize = 10_000;
+    let (_vertex, _source, interceptor) = ingest_watched("no-strand");
+    let ran = Arc::new(AtomicUsize::new(0));
+    let workers: Vec<_> = (0..4)
+        .map(|_| {
+            let interceptor = interceptor.clone();
+            thread::spawn(move || {
+                for _ in 0..ACTIONS * 2 {
+                    if let Some(claim) = interceptor.try_acquire() {
+                        interceptor.release(claim);
+                    }
+                }
+            })
+        })
+        .collect();
+    let serializers: Vec<_> = (0..2)
+        .map(|_| {
+            let (interceptor, ran) = (interceptor.clone(), ran.clone());
+            thread::spawn(move || {
+                for _ in 0..ACTIONS / 2 {
+                    interceptor.serialize(bump(&ran));
+                }
+            })
+        })
+        .collect();
+    for thread in workers.into_iter().chain(serializers) {
+        thread.join().unwrap();
+    }
+
+    assert_eq!(ran.load(Ordering::SeqCst), ACTIONS);
+}
+
+#[test]
+fn actions_run_in_the_order_they_were_handed_over() {
+    let (_vertex, _source, interceptor) = ingest_watched("order-of-actions");
+    let claim = interceptor.try_acquire().unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    for id in 0..5 {
+        let seen = seen.clone();
+        interceptor.serialize(Box::new(move || seen.lock().unwrap().push(id)));
+    }
+    assert!(seen.lock().unwrap().is_empty());
+
+    interceptor.release(claim);
+
+    assert_eq!(*seen.lock().unwrap(), [0, 1, 2, 3, 4]);
+}
+
+#[test]
+fn an_action_that_serializes_another_runs_it_in_the_same_drain() {
+    let (_vertex, _source, interceptor) = ingest_watched("nested-serialize");
+    let ran = Arc::new(AtomicUsize::new(0));
+    let (inner, counter) = (interceptor.clone(), ran.clone());
+    interceptor.serialize(Box::new(move || {
+        inner.serialize(bump(&counter));
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "queued behind this action"
+        );
+    }));
+    assert_eq!(ran.load(Ordering::SeqCst), 1);
+    assert!(given_back(&interceptor), "the claim was given back");
+}
+
+#[test]
+fn a_panicking_action_does_not_stop_the_rest() {
+    let (_vertex, _source, interceptor) = ingest_watched("panicking-action");
+    let ran = Arc::new(AtomicUsize::new(0));
+    let claim = interceptor.try_acquire().unwrap();
+    interceptor.serialize(Box::new(|| panic!("an action broke")));
+    interceptor.serialize(bump(&ran));
+
+    interceptor.release(claim);
+
+    assert_eq!(ran.load(Ordering::SeqCst), 1);
+    assert!(given_back(&interceptor));
+}
+
+#[test]
+fn the_interceptor_drops_its_source_when_it_finishes() {
+    let vertex = LatticeVertex::new(&registry(), "drops-source", 1);
+    let drops = Arc::new(AtomicUsize::new(0));
+    let source = Arc::new(Watched::default());
+    *source.drops.lock().unwrap() = Some(drops.clone());
+    let interceptor = vertex.ingest(source).unwrap();
+    let claim = interceptor.try_acquire().unwrap();
+
+    interceptor.on_complete();
+    assert_eq!(
+        drops.load(Ordering::SeqCst),
+        0,
+        "a worker still holds the source"
+    );
+
+    interceptor.release(claim);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn an_interceptor_does_not_keep_a_source_that_holds_it() {
+    let vertex = LatticeVertex::new(&registry(), "no-cycle", 1);
+    let source = Arc::new(Watched::default());
+    let weak = Arc::downgrade(&source);
+    let interceptor = vertex.ingest(source).unwrap();
+    assert!(weak.upgrade().is_some());
+
+    interceptor.on_error("broken".into());
+
+    assert!(
+        weak.upgrade().is_none(),
+        "the source held the interceptor, and the interceptor let the source go"
+    );
+}
+
+#[test]
+fn a_source_that_arrives_after_the_interceptor_finished_is_completed_and_not_kept() {
+    let vertex = LatticeVertex::new(&registry(), "late-source", 1);
+    let interceptor = UpstreamInterceptor::new(&vertex);
+    interceptor.on_complete();
+    let source = Arc::new(Watched::default());
+    let weak = Arc::downgrade(&source);
+
+    interceptor.add_upstream(source.clone());
+    assert!(source.is_complete());
+    drop(source);
+
+    assert!(weak.upgrade().is_none());
+}
+
+#[test]
+fn complete_completes_the_source_through_serialize() {
+    let (_vertex, source, interceptor) = ingest_watched("complete-serialized");
+    let claim = interceptor.try_acquire().unwrap();
+
+    interceptor.complete();
+    assert!(interceptor.is_complete());
+    assert!(!source.is_complete(), "the holder is inside the source");
+
+    interceptor.release(claim);
+    assert!(source.is_complete());
+}
+
+#[test]
+fn a_release_and_a_serialize_in_the_same_instant_never_strand_the_action() {
+    const ROUNDS: usize = 20_000;
+    let (_vertex, _source, interceptor) = ingest_watched("same-instant");
+    let ran = Arc::new(AtomicUsize::new(0));
+    let start = Arc::new(AtomicUsize::new(0));
+    let finished = Arc::new(AtomicUsize::new(0));
+    let spin_until = |flag: &AtomicUsize, value: usize| {
+        while flag.load(Ordering::Acquire) < value {
+            std::hint::spin_loop();
+        }
+    };
+    let worker = {
+        let (interceptor, start, finished) = (interceptor.clone(), start.clone(), finished.clone());
+        thread::spawn(move || {
+            for round in 1..=ROUNDS {
+                spin_until(&start, round);
+                if let Some(claim) = interceptor.try_acquire() {
+                    interceptor.release(claim);
+                }
+                finished.fetch_add(1, Ordering::AcqRel);
+            }
+        })
+    };
+    let serializer = {
+        let (interceptor, ran, start, finished) = (
+            interceptor.clone(),
+            ran.clone(),
+            start.clone(),
+            finished.clone(),
+        );
+        thread::spawn(move || {
+            for round in 1..=ROUNDS {
+                spin_until(&start, round);
+                interceptor.serialize(bump(&ran));
+                finished.fetch_add(1, Ordering::AcqRel);
+            }
+        })
+    };
+    for round in 1..=ROUNDS {
+        start.store(round, Ordering::Release);
+        spin_until(&finished, round * 2);
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            round,
+            "round {round} stranded its action"
+        );
+    }
+    worker.join().unwrap();
+    serializer.join().unwrap();
+}
+
+#[test]
+fn two_serializers_and_a_release_in_the_same_instant_never_strand_an_action() {
+    const ROUNDS: usize = 20_000;
+    let (_vertex, _source, interceptor) = ingest_watched("two-serializers");
+    let ran = Arc::new(AtomicUsize::new(0));
+    let start = Arc::new(AtomicUsize::new(0));
+    let finished = Arc::new(AtomicUsize::new(0));
+    let spin_until = |flag: &AtomicUsize, value: usize| {
+        while flag.load(Ordering::Acquire) < value {
+            std::hint::spin_loop();
+        }
+    };
+    let worker = {
+        let (interceptor, start, finished) = (interceptor.clone(), start.clone(), finished.clone());
+        thread::spawn(move || {
+            for round in 1..=ROUNDS {
+                spin_until(&start, round);
+                if let Some(claim) = interceptor.try_acquire() {
+                    interceptor.release(claim);
+                }
+                finished.fetch_add(1, Ordering::AcqRel);
+            }
+        })
+    };
+    let serializers: Vec<_> = (0..2)
+        .map(|_| {
+            let (interceptor, ran, start, finished) = (
+                interceptor.clone(),
+                ran.clone(),
+                start.clone(),
+                finished.clone(),
+            );
+            thread::spawn(move || {
+                for round in 1..=ROUNDS {
+                    spin_until(&start, round);
+                    interceptor.serialize(bump(&ran));
+                    finished.fetch_add(1, Ordering::AcqRel);
+                }
+            })
+        })
+        .collect();
+    for round in 1..=ROUNDS {
+        start.store(round, Ordering::Release);
+        spin_until(&finished, round * 3);
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            round * 2,
+            "round {round} stranded an action"
+        );
+    }
+    worker.join().unwrap();
+    for serializer in serializers {
+        serializer.join().unwrap();
+    }
+}
+
+#[test]
+fn the_source_is_in_place_before_a_worker_can_find_the_handle() {
+    for round in 0..300 {
+        let registry = registry();
+        let vertex = LatticeVertex::new(&registry, "installed-first", 1);
+        let interceptor = UpstreamInterceptor::new(&vertex);
+        let source = Arc::new(DeferredSource::default());
+        let observer = {
+            let (registry, interceptor, source) =
+                (registry.clone(), interceptor.clone(), source.clone());
+            thread::spawn(move || {
+                while registry.upstream_handle_count() == 0 {
+                    std::hint::spin_loop();
+                }
+                let mut claim = interceptor.try_acquire().expect("nothing else holds it");
+                interceptor.request(&mut claim, 1);
+                interceptor.release(claim);
+                assert_eq!(
+                    source.requested.load(Ordering::Relaxed),
+                    1,
+                    "round {round}: a request that found the handle reached the source"
+                );
+            })
+        };
+        interceptor.add_upstream(source);
+        observer.join().unwrap();
+    }
+}
+
+#[test]
+fn a_new_source_is_never_taken_for_a_dropped_one_at_the_same_address() {
+    let vertex = LatticeVertex::new(&registry(), "identity", 1);
+    let source = Arc::new(Watched::default());
+    let first: Arc<dyn LatticeSource> = source.clone();
+    let interceptor = vertex.ingest(source).unwrap();
+    assert!(interceptor.has_upstream(&first));
+    interceptor.complete();
+    drop(first);
+
+    // Were the dropped source's allocation free, one of these would take it.
+    let fresh: Vec<Arc<dyn LatticeSource>> = (0..256)
+        .map(|_| Arc::new(Watched::default()) as Arc<dyn LatticeSource>)
+        .collect();
+    assert!(fresh.iter().all(|source| !interceptor.has_upstream(source)));
+}
+
+#[test]
+fn a_claim_taken_from_another_handle_is_refused() {
+    let vertex = LatticeVertex::new(&registry(), "foreign-claim", 1);
+    let first = vertex.ingest(Arc::new(Watched::default())).unwrap();
+    let second = vertex.ingest(Arc::new(Watched::default())).unwrap();
+    let mut claim = first.try_acquire().unwrap();
+
+    let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        second.request(&mut claim, 1);
+    }));
+
+    assert!(refused.is_err());
+    first.release(claim);
+    assert!(given_back(&second), "the other handle was left alone");
+}
+
+/// A source whose plain state is in a `SourceCell`, and whose lifecycle calls set atomics only.
+struct Stateful {
+    slot: DownstreamSlot,
+    state: SourceCell<Vec<u32>>,
+    cleared: AtomicBool,
+    /// Makes the next `request` stop inside its state until the test lets it go.
+    block: AtomicBool,
+    inside: Barrier,
+    hold: Barrier,
+    applied: AtomicUsize,
+}
+
+impl Stateful {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            slot: DownstreamSlot::new(),
+            state: SourceCell::new(Vec::new()),
+            cleared: AtomicBool::new(false),
+            block: AtomicBool::new(false),
+            inside: Barrier::new(2),
+            hold: Barrier::new(2),
+            applied: AtomicUsize::new(0),
+        })
+    }
+
+    /// A lifecycle call from any thread: it sets an atomic and nothing else.
+    fn clear(&self) {
+        self.cleared.store(true, Ordering::SeqCst);
+    }
+}
+
+impl LatticeSource for Stateful {
+    fn add_downstream(self: Arc<Self>, downstream: Arc<dyn LatticeReceiver>) {
+        let source: Arc<dyn LatticeSource> = self.clone();
+        self.slot.attach(source, downstream);
+    }
+
+    fn pull(
+        &self,
+        _consumer: &mut dyn FnMut(Box<dyn Frame>),
+        _stop: &mut dyn FnMut(&dyn Frame) -> bool,
+        _demand: u64,
+    ) -> u64 {
+        0
+    }
+
+    fn request(&self, demand: u64) {
+        // SAFETY: the interceptor calls `request` under its claim.
+        let mut state = unsafe { self.state.enter() };
+        if self.cleared.swap(false, Ordering::SeqCst) {
+            self.applied.fetch_add(state.len(), Ordering::SeqCst);
+            state.clear();
+        }
+        state.push(demand as u32);
+        if self.block.swap(false, Ordering::SeqCst) {
+            self.inside.wait();
+            self.hold.wait();
+        }
+    }
+
+    fn complete(&self) {
+        self.slot.complete();
+    }
+
+    fn is_complete(&self) -> bool {
+        self.slot.is_complete()
+    }
+}
+
+#[test]
+fn lifecycle_calls_from_another_thread_touch_only_atomics_and_take_effect_on_the_next_request() {
+    let vertex = LatticeVertex::new(&registry(), "lifecycle", 1);
+    let source = Stateful::new();
+    let interceptor = vertex.ingest(source.clone()).unwrap();
+    let worker = |interceptor: Arc<UpstreamInterceptor>, requests: usize| {
+        thread::spawn(move || {
+            let mut claim = interceptor.try_acquire().expect("the handle is free");
+            for _ in 0..requests {
+                interceptor.request(&mut claim, 1);
+            }
+            interceptor.release(claim);
+        })
+    };
+
+    // A clear while a worker is inside `request` waits for the next `request`.
+    source.block.store(true, Ordering::SeqCst);
+    let first = worker(interceptor.clone(), 2);
+    source.inside.wait();
+    source.clear();
+    assert_eq!(
+        source.applied.load(Ordering::SeqCst),
+        0,
+        "not applied from this thread"
+    );
+    source.hold.wait();
+    first.join().unwrap();
+    assert_eq!(
+        source.applied.load(Ordering::SeqCst),
+        1,
+        "applied by the next request"
+    );
+
+    // A completion while a worker is inside `request` reaches the receiver at once; the source is
+    // let go only after the worker has released it.
+    source.block.store(true, Ordering::SeqCst);
+    let second = worker(interceptor.clone(), 1);
+    source.inside.wait();
+    source.complete();
+    assert!(interceptor.is_complete());
+    assert_eq!(
+        Arc::strong_count(&source),
+        2,
+        "the interceptor still holds the source"
+    );
+    source.hold.wait();
+    second.join().unwrap();
+    assert_eq!(Arc::strong_count(&source), 1, "released with the claim");
 }

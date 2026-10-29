@@ -3,6 +3,85 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## The source invariant's primitives (2026-10-29)
+
+**What.**
+- `euhedral-data-structures`: `sync::SetOnce<T>`, a cell installed at most once by a compare-and-set (`SeqCst`) and read
+  with an acquire load. Its value lives until the cell drops.
+- `euhedral-core`:
+  - `SourceCell<T>` and `SourceGuard`: a source's plain state under the lattice's single-entry guarantee. `unsafe fn
+    enter(&self)` takes the state; in debug builds a second entry, nested or from another thread, panics.
+  - `DownstreamSlot`: the one receiver a source pushes to. `attach` refuses a second receiver with `on_error`, tells a
+    late receiver of a completed slot `on_complete`, and otherwise installs the receiver, sets `live` and hands the
+    receiver the source through `add_upstream`. `complete` tells a live receiver `on_complete` exactly once, however
+    attach and completion race. `receiver()` reads without a lock.
+  - `LatticeReceiver::serialize(action)`: runs `action` when no `pull` or `request` of the source the receiver serves is
+    in progress, without waiting. The default runs it at once. It is the interceptor's own hand-off; a source's
+    lifecycle calls do not use it.
+  - `UpstreamInterceptor` implements `serialize`: actions go on an MPSC queue, and whoever holds the claim runs them
+    before it releases. The interceptor installs its source before it is registered and drops it, through
+    `serialize`, when it finishes.
+- **Breaking** for code that implements or drives `UpstreamHandle`:
+  - `try_acquire` returns `Option<Claim>` where it returned `bool`. A `Claim` is the proof that the caller holds the
+    handle's claim. Code outside `euhedral-core` cannot make one; the default `try_acquire` still never contends.
+  - `pull` and `request` take `&mut Claim` first, and `release` takes the `Claim` by value. A handle refuses a claim
+    taken from another handle. This makes the interceptor's `unsafe` entry into its source sound for safe callers: a
+    spurious `release`, or a `pull` while a serialized action runs, cannot be written.
+  - `UpstreamInterceptor::upstream()` is replaced by `has_upstream(&Arc<dyn LatticeSource>)`. The source is identified
+    by a weak reference whose allocation outlives the source, so an address reused after the source is dropped never
+    matches.
+  - The interceptor's claim is a counter (`wip`): `try_acquire` is `fetch_add(1) == 0`, and release is one swap to zero.
+    A source completed through its interceptor (a source panic, `complete()`) is now completed when the worker that
+    holds it releases it, not at the call.
+
+**Why.** A source's state is touched by exactly one worker at a time, so it should need no atomics. Its lifecycle
+calls (completion, release) arrive from other threads while a worker may be inside `pull` or `request`, and used to
+need a lock or a flag per field. A source's lifecycle calls now set atomics only and the source applies them in its next
+`request` or `pull`, where its state is single-consumer. The interceptor's claim as a counter lets a releasing worker
+see an action that arrived while it held the claim, with no fence on the uncontended path.
+
+**How.** A source keeps its worker-only state in a `SourceCell` and its receiver in a `DownstreamSlot`. Its lifecycle
+calls (`complete`, and any clear or kill it offers) set atomics; its `request` and `pull` read them and apply the change
+to the cell. The interceptor releases the source it holds through its own `serialize`. An implementer of
+`LatticeReceiver` that is no lattice needs nothing: the default runs the action at once.
+
+**Semantics.**
+- Every serialized action runs exactly once, in the order it was handed over, never while a `pull` or `request` of the
+  source is in progress, on the worker that holds the claim or on the caller if no worker does.
+- The claim: `try_acquire` is `wip.fetch_add(1, SeqCst) == 0`. `serialize` offers the action, sets `pending`
+  (`SeqCst`), then tries the claim; if it gets it, it runs the actions (clearing `pending` with one swap) and releases.
+  `release` is one swap of `wip` to zero (`AcqRel`). If the swap returns 1, no caller tried the claim meanwhile; a later
+  `serialize` finds zero and runs its own action. If it returns more, the swap has acquired from a caller's
+  `fetch_add`, which follows that caller's `pending` store, so the holder sees `pending`, takes the claim again and runs
+  the actions. An uncontended service is the `fetch_add` and one swap.
+- The source is installed (compare-and-set, once) before the interceptor is registered, so a worker that finds the
+  handle finds the source. The interceptor's `complete` flag is checked again after the install, and the source is
+  released through `serialize`.
+- `DownstreamSlot` touches atomics only. A lifecycle call from another thread never enters the source's `SourceCell`.
+- `SourceGuard` is `Send` when `T` is and `Sync` only when `T` is.
+- A panicking action is caught and logged; the actions behind it still run.
+- `has_upstream` answers by identity (a weak reference, whose allocation is not reused while the interceptor lives) and stays true after the interceptor has dropped its source.
+
+**Tests.**
+- `SetOnce`: `set_hands_the_value_back_when_one_is_set`, `a_set_value_is_dropped_exactly_once`,
+  `racing_setters_install_exactly_one`, and the loom model `loom_one_setter_wins_and_every_reader_sees_it`
+  (`RUSTFLAGS="--cfg loom" cargo test -p euhedral-data-structures --release --lib sync::set_once::loom`).
+- `SourceCell`: `a_second_thread_entering_while_one_is_inside_panics_in_debug`, `a_nested_enter_panics_in_debug`,
+  `a_direct_request_racing_the_lattice_is_caught_in_debug`, `entries_in_turn_from_many_threads_are_accepted`.
+- `DownstreamSlot`: `attach_racing_complete_tells_the_receiver_exactly_once` (10 000 rounds), the attach and complete
+  order tests.
+- The interceptor (`flow_control::vertex`): `serialize_runs_at_release_when_another_worker_holds_the_source`,
+  `serialize_from_inside_the_sources_own_pull_runs_before_release`,
+  `an_action_never_runs_while_a_pull_or_request_is_in_progress`, `release_races_serialize_and_no_action_is_stranded`,
+  `a_release_and_a_serialize_in_the_same_instant_never_strand_the_action` and
+  `two_serializers_and_a_release_in_the_same_instant_never_strand_an_action` (ignoring the release swap's result makes
+  both fail), `the_source_is_in_place_before_a_worker_can_find_the_handle`,
+  `a_new_source_is_never_taken_for_a_dropped_one_at_the_same_address`, `a_claim_taken_from_another_handle_is_refused`,
+  `the_interceptor_drops_its_source_when_it_finishes`, `complete_completes_the_source_through_serialize`.
+  `lifecycle_calls_from_another_thread_touch_only_atomics_and_take_effect_on_the_next_request`, and the compile-fail
+  doctest on `SourceGuard`. CI runs the stress tests in release and the loom model. The `SetOnce` loom model carries a loom
+  `UnsafeCell` payload, so a `get` weaker than `Acquire` fails it.
+
 ## `Marker` names its queue (2026-10-28)
 
 **What.** `euhedral-graph`: `Marker` gained `queue: QueueId`, and `Marker::new(queue, lane, value)`. `QueueId` is an opaque,

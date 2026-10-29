@@ -17,6 +17,20 @@ pub trait LatticeReceiver: LatticeTerminal {
 
     /// The source failed.
     fn on_error(&self, error: Failure);
+
+    /// Runs `action` when no `pull` or `request` of the source this receiver serves is in progress,
+    /// without waiting: at once if none is, otherwise on the worker that holds the source, after
+    /// that worker has let it go. Actions run one at a time, in the order they were handed over,
+    /// each exactly once.
+    ///
+    /// This is the lattice's own hand-off, for state that belongs to the source's attachment (the
+    /// interceptor releasing the source it holds). A source's lifecycle calls do not use it: they set
+    /// atomic state, and the source applies that state in its next `request` or `pull`. The default
+    /// runs `action` at once: a receiver that is no lattice has the caller as the source's only
+    /// driver.
+    fn serialize(&self, action: Box<dyn FnOnce() + Send>) {
+        action();
+    }
 }
 
 /// Where frames come from.
