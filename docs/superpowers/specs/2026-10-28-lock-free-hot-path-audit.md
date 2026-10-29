@@ -622,8 +622,9 @@ Java `LatticeHotSource`, `ControlPlaneFragment`'s output, `StopWatch`, `Fragment
   values a cut-short round left are dropped; `is_idle` says whether a round is armed. Java's design implies the owner-only
   force: `expect` is unconditional and a killed frame simply never arrives, so a killed picture's join is re-armed
   by its owner rather than made to `abandon` every unended part. `reset` keeps its check (one `AcqRel` compare-and-set).
-  Deviation (missing Rust equivalent): `arm_owned` is `unsafe`, because a Rust join has no collector to prove that
-  no frame still holds a part.
+  `Join::discard_round(&mut self)` is the safe form for an owner with exclusive access (a concluded picture): the
+  borrow proves that no frame holds a part. Deviation (missing Rust equivalent): `arm_owned` is `unsafe`, because a
+  Rust join has no collector to prove that no frame still holds a part.
 - **G7, G8, G9: the lake's two modes** (Java's lake, the `FrameLake` implementation). `idle_release` stays:
   `Duration::ZERO` keeps the sinks attached for life (Java `idleDetachNanos <= 0`); a positive value detaches them once
   no unit has been active for that long, and the next offer re-attaches a fresh set. The hot side is Java's:

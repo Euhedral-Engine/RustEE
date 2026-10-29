@@ -29,7 +29,10 @@
 //! unit it has just taken, a round it knows ended) arms with [`Join::arm_owned`], which is Java's `expect`: a
 //! plain release store of the count, no check, no read-modify-write. It is the way to re-arm a cell whose
 //! previous round was cut short, as a unit whose frames were killed: the parts that never arrived are not
-//! waited for, and the values that did arrive are dropped. [`Join::is_idle`] says whether a round is armed.
+//! waited for, and the values that did arrive are dropped. [`Join::discard_round`] is the safe form for an owner
+//! with exclusive access (`&mut`), which proves that no part is outstanding; Java implies the unconditional form
+//! (its `expect` is a plain store and a killed frame simply never arrives), not an obligation on the kill path to
+//! `abandon` every part it cut off. [`Join::is_idle`] says whether a round is armed.
 //!
 //! # The continuation and the next round
 //!
@@ -361,6 +364,22 @@ impl<T> Join<T> {
     /// round ended. An acquire load, a hint for an owner deciding how to arm.
     pub fn is_idle(&self) -> bool {
         self.pending.load(Ordering::Acquire) == IDLE
+    }
+
+    /// Discards an unfinished round: drops the values that arrived, forgets the parts that never did and leaves the
+    /// join idle, ready for [`Join::reset`]. For an owner that has a unit whose frames were killed and dropped (a
+    /// concluded picture): exclusive access proves that no part is outstanding, because a part's frame holds the
+    /// join by shared reference. A round that completed (or never started) is left idle, as it is.
+    ///
+    /// # Panics
+    /// If a value's drop panics, after the round is discarded.
+    pub fn discard_round(&mut self) {
+        let parts = self.parts.load(Ordering::Relaxed);
+        let panic = self.clear(parts);
+        self.pending.store(IDLE, Ordering::Release);
+        if let Some(panic) = panic {
+            resume_unwind(panic);
+        }
     }
 
     /// Arms a round of `parts` parts (1 to the capacity) without asking whether the previous one ended: Java's
@@ -787,6 +806,32 @@ mod tests {
         unsafe { join.arm_owned(1) };
         join.arrive(0, Counted(drops.clone()));
         assert_eq!(ran.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn discard_round_drops_what_arrived_and_leaves_the_join_ready_for_reset() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        struct Counted(Arc<AtomicUsize>);
+        impl Drop for Counted {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+        let mut join = Join::<Counted>::with_capacity(3, |_| panic!("the round never completes"));
+        join.reset(3);
+        join.arrive(0, Counted(drops.clone()));
+        join.arrive(2, Counted(drops.clone()));
+        assert!(catch_unwind(AssertUnwindSafe(|| join.reset(3))).is_err());
+        join.discard_round();
+        assert!(join.is_idle());
+        assert_eq!(drops.load(Ordering::Acquire), 2);
+        // A round that was never armed, and one already discarded, are left as they are.
+        join.discard_round();
+        join.reset(1);
+        assert!(!join.is_idle());
+        let mut fresh = Join::<u8>::with_capacity(1, |_| {});
+        fresh.discard_round();
+        assert!(fresh.is_idle());
     }
 
     #[test]
