@@ -110,6 +110,11 @@ fn drive(arguments: &Arguments) -> Result<(), String> {
             } else {
                 vec!["--no-pin"]
             })
+            .args(if options.latency {
+                vec![]
+            } else {
+                vec!["--no-latency"]
+            })
             .stdout(Stdio::piped())
             .spawn()
             .map_err(|error| format!("cannot start fork {fork}: {error}"))?;
