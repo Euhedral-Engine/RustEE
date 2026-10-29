@@ -2,6 +2,6 @@
 //! loom test explores every interleaving; otherwise they are the standard library's.
 
 #[cfg(loom)]
-pub(crate) use loom::sync::atomic::{AtomicPtr, Ordering};
+pub(crate) use loom::sync::atomic::{AtomicBool, AtomicPtr, Ordering, fence};
 #[cfg(not(loom))]
-pub(crate) use std::sync::atomic::{AtomicPtr, Ordering};
+pub(crate) use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering, fence};
