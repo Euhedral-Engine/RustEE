@@ -608,8 +608,25 @@ impl ControlPlaneLattice {
         });
 
         let timeout = self.config.shutdown_timeout;
-        if !timeout.is_zero() && done.recv_timeout(timeout).is_err() {
-            log::warn!(target: &self.name, "close is waiting for admitted routes to retire");
+        if !timeout.is_zero() {
+            // The routes retire when the readers pinned at the swap have left; nobody is guaranteed to look (a
+            // worker looks at the start of each cycle), so this thread runs what has come due while it waits.
+            let deadline = Instant::now() + timeout;
+            let registry = self.controller.edge().registry().clone();
+            let retired = loop {
+                registry.run_due();
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    break false;
+                }
+                match done.recv_timeout(left.min(Duration::from_millis(5))) {
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break true,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                }
+            };
+            if !retired {
+                log::warn!(target: &self.name, "close is waiting for admitted routes to retire");
+            }
         }
         self.pool.shutdown();
         log::info!(target: &self.name, "closed");

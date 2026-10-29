@@ -69,7 +69,6 @@ jobs:
           cargo test -p euhedral-data-structures --release --lib sync::set_once::loom
           cargo test -p euhedral-data-structures --release --lib sync::claim_cell::loom
           cargo test -p euhedral-data-structures --release --lib sync::published::tests::loom
-          cargo test -p euhedral-data-structures --release --lib sync::admission::loom
           cargo test -p euhedral-data-structures --release --lib sync::one_shot::tests::loom
           cargo test -p euhedral-graph --release --lib join::loom
 
@@ -107,10 +106,10 @@ jobs:
         run: |
           cargo +nightly miri test -p euhedral-core --lib -- flow_control::hot_source utils::stop_watch control_plane::decision_tree::tests::the_estimate control_plane::decision_tree::tests::recalibrating
 
-      - name: Published cells, routing admission, vertex and edge races
+      - name: Published cells, epoch routing, vertex and edge races
         run: |
-          cargo +nightly miri test -p euhedral-data-structures --lib -- sync::published sync::admission
-          cargo +nightly miri test -p euhedral-core --lib -- flow_control::vertex::tests::pushes_racing flow_control::vertex::tests::the_last_reader flow_control::vertex::tests::the_states_stay_few flow_control::vertex::tests::a_remap_reuses flow_control::vertex::tests::a_held_generation_is_not_rewritten flow_control::vertex::tests::a_panicking_routing_function flow_control::vertex::tests::a_late flow_control::vertex::tests::a_generation_is_released flow_control::vertex::tests::releasing_the_last_reader flow_control::edge::tests::close_while_pushing flow_control::edge::tests::a_closed_edge_refuses flow_control::edge::tests::a_receiver_refused flow_control::edge::tests::attaches_racing flow_control::edge::tests::racing_attaches flow_control::edge::tests::set_parent flow_control::edge::tests::a_parent_replaced flow_control::edge::tests::pushes_and_set_parent
+          cargo +nightly miri test -p euhedral-data-structures --lib -- sync::published
+          cargo +nightly miri test -p euhedral-core --lib -- flow_control::vertex::tests::pushes_racing flow_control::vertex::tests::the_last_reader flow_control::vertex::tests::the_states_stay_few flow_control::vertex::tests::a_remap_reuses flow_control::vertex::tests::a_held_generation_is_not_rewritten flow_control::vertex::tests::a_panicking_routing_function flow_control::vertex::tests::close_retirements flow_control::vertex::tests::a_generation_is_released flow_control::vertex::tests::releasing_the_last_reader flow_control::edge::tests::close_while_pushing flow_control::edge::tests::a_closed_edge_refuses flow_control::edge::tests::a_receiver_refused flow_control::edge::tests::attaches_racing flow_control::edge::tests::racing_attaches flow_control::edge::tests::set_parent flow_control::edge::tests::a_parent_replaced flow_control::edge::tests::pushes_and_set_parent
 
       - name: One-shot, sequencer
         run: |

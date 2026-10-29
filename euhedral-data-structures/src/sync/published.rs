@@ -134,8 +134,9 @@ impl EpochDomain {
     }
 
     /// Begins a new epoch and returns its number: every read section that starts after this call sees what was
-    /// published before it.
-    fn advance(&self) -> u64 {
+    /// published before it. A value swapped out before this call is free once [`passed`](Self::passed) says so for
+    /// the returned number.
+    pub fn advance(&self) -> u64 {
         self.epoch.fetch_add(1, Ordering::SeqCst) + 1
     }
 
@@ -170,8 +171,10 @@ impl EpochDomain {
         floor
     }
 
-    /// Whether every thread is idle or has announced epoch `target` or later.
-    fn passed(&self, target: u64) -> bool {
+    /// Whether every thread is idle or has announced epoch `target` or later: no read section that began before the
+    /// epoch `target` began is still open. May issue the writer's heavy barrier (shared with the other checks of the
+    /// same range of epochs).
+    pub fn passed(&self, target: u64) -> bool {
         self.floor(target).is_none_or(|floor| floor >= target)
     }
 }

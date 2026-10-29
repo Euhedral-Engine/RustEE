@@ -646,7 +646,7 @@ fn close_waits_for_held_routes_before_closing_shards() {
     });
     fixture.source.set(utilization(&ALL, 8.0));
     fixture.lattice.start().unwrap();
-    let held = fixture.lattice.controller.routing_state();
+    let held = fixture.lattice.controller.hold_routing();
 
     fixture.lattice.close();
     assert!(

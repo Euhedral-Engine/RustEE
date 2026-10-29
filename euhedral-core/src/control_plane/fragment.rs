@@ -370,6 +370,11 @@ impl ControlPlaneFragment {
         // the lattice's published cells stays valid until the next point or the park.
         if let Some(epoch) = epoch {
             epoch.quiescent();
+            // What waited for the readers of the last cycle (a retired routing generation's release) may be due
+            // now. One load when nothing waits.
+            if self.registry.has_due() {
+                self.registry.run_due();
+            }
         }
 
         let half_life = policy.idle_policy().contention_half_life();

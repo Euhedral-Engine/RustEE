@@ -93,7 +93,7 @@ fn a_new_vertex_routes_nowhere() {
     let vertex = LatticeVertex::new(&registry(), "fresh", 4);
     assert_eq!(vertex.downstream_count(), 4);
     assert_eq!(vertex.name(), "fresh");
-    assert!(vertex.routing_state().is_empty());
+    assert!(vertex.hold_routing().is_empty());
     assert!((0..4).all(|id| vertex.active_downstream_index(id).is_none()));
 }
 
@@ -122,7 +122,7 @@ fn a_mapping_activates_downstreams_and_adopts_them() {
     assert!(same(&vertex.downstream(0).unwrap(), &first));
     assert!(same(&vertex.downstream(2).unwrap(), &second));
     assert!(vertex.downstream(1).is_none());
-    assert_eq!(vertex.routing_state().mappings(), [0, 2]);
+    assert_eq!(vertex.hold_routing().mappings(), [0, 2]);
     assert_eq!(vertex.active_downstream_index(0), Some(0));
     assert_eq!(vertex.active_downstream_index(2), Some(1));
     assert_eq!(vertex.active_downstream_index(9), None);
@@ -154,7 +154,7 @@ fn mapping_needs_a_drained_open_vertex_and_valid_handles() {
         !vertex.set_downstream_mapping(&[1], &[node(&edge), None]),
         "an empty handle"
     );
-    assert!(vertex.routing_state().is_empty());
+    assert!(vertex.hold_routing().is_empty());
     assert!(edge.parent().is_none(), "a refused mapping changes nothing");
 
     vertex.close();
@@ -547,11 +547,11 @@ fn a_held_generation_keeps_its_downstreams_open() {
     let edges: Vec<_> = (0..5).map(|_| receiving_edge(&registry).0).collect();
     let handles: Vec<_> = edges.iter().map(node).collect();
     assert!(map(&vertex, &[1, 4], &handles));
-    let previous = vertex.routing_state();
+    let previous = vertex.hold_routing();
     assert_eq!(previous.mappings(), [1, 4]);
 
     assert!(map(&vertex, &[2, 4], &handles));
-    let current = vertex.routing_state();
+    let current = vertex.hold_routing();
 
     assert!(!ptr::eq(&*previous, &*current));
     assert_eq!(current.mappings(), [2, 4]);
@@ -691,6 +691,8 @@ fn pushes_racing_remaps_always_reach_an_open_downstream() {
         .into_iter()
         .map(|producer| producer.join().unwrap())
         .sum();
+    // The readers are gone: what waited for them is due.
+    registry.run_due();
 
     let delivered: usize = generations
         .iter()
@@ -818,6 +820,9 @@ fn race_remaps(pushers: u64, remaps: usize) -> RemapRace {
         .into_iter()
         .map(|producer| producer.join().unwrap())
         .sum();
+    // The readers are gone: what waited for them is due.
+    registry.run_due();
+    assert!(!registry.has_due(), "every release ran");
     let states = vertex.book.lock().arena.states.len();
     RemapRace {
         sent,
@@ -919,57 +924,33 @@ fn a_remap_reuses_a_retired_state_once_its_readers_left() {
         );
     }
     assert!(!edge.is_closed(), "the generations all route to it");
-    assert_eq!(vertex.routing_state().mappings(), [1]);
+    assert_eq!(vertex.hold_routing().mappings(), [1]);
 }
 
 #[test]
-fn a_held_generation_is_not_rewritten_and_the_pool_shrinks_back_to_use() {
+fn a_held_generation_is_not_rewritten_and_the_pool_is_reused_once_it_is_dropped() {
     let registry = registry();
     let vertex = LatticeVertex::new(&registry, "held", 2);
     let (edge, _) = receiving_edge(&registry);
     let handles = [node(&edge), node(&edge)];
     assert!(map(&vertex, &[0], &handles));
-    let held = vertex.routing_state();
+    let held = vertex.hold_routing();
     for _ in 0..20 {
         assert!(map(&vertex, &[1], &handles));
         assert_eq!(held.mappings(), [0], "a held generation never changes");
     }
-    assert_eq!(vertex.book.lock().arena.states.len(), 3);
+    // A reader that stays pinned holds back the release of every generation retired after it began: each remap needs
+    // a state of its own meanwhile.
+    assert_eq!(vertex.book.lock().arena.states.len(), 21);
     drop(held);
     for _ in 0..20 {
         assert!(map(&vertex, &[1], &handles));
     }
     assert_eq!(
         vertex.book.lock().arena.states.len(),
-        3,
-        "the freed state is reused, not added to"
+        21,
+        "the released states are reused, not added to"
     );
-}
-
-#[test]
-fn a_late_release_of_a_rewritten_state_changes_nothing() {
-    let registry = registry();
-    let vertex = LatticeVertex::new(&registry, "late", 2);
-    let (first, _) = receiving_edge(&registry);
-    let (second, _) = receiving_edge(&registry);
-    let handles = [node(&first), node(&second)];
-    assert!(map(&vertex, &[0], &handles));
-    let first_state = vertex.book.lock().arena.states[0];
-    // The next remap rewrites the first state for its generation.
-    assert!(map(&vertex, &[1], &handles));
-    assert_eq!(vertex.book.lock().arena.states.len(), 2);
-
-    // A reader that decided in the state's last life, and is late: the state is published again, so nothing is
-    // released and the generation keeps routing.
-    // SAFETY: states live until the vertex drops.
-    vertex.release_handles_when_quiescent(unsafe { first_state.as_ref() });
-    assert_eq!(vertex.routing_state().mappings(), [1]);
-    assert!(!second.is_closed());
-    assert!(
-        first.is_closed(),
-        "the first generation was released by its remap"
-    );
-    assert_eq!(vertex.book.lock().references.len(), 1);
 }
 
 #[test]
@@ -978,7 +959,7 @@ fn a_generation_is_released_once_however_often_it_is_asked() {
     let vertex = LatticeVertex::new(&registry, "once", 1);
     let (edge, receiver) = receiving_edge(&registry);
     assert!(map(&vertex, &[0], &[node(&edge)]));
-    let held = vertex.routing_state();
+    let held = vertex.hold_routing();
     let state = ptr::from_ref(&*held);
     assert!(map(&vertex, &[], &[]));
     assert!(!edge.is_closed(), "a reader still holds the generation");
@@ -1020,7 +1001,7 @@ fn releasing_the_last_reader_inside_a_hot_scope_takes_the_book_off_it() {
     let vertex = LatticeVertex::new(&registry, "hot-release", 1);
     let (edge, receiver) = receiving_edge(&registry);
     assert!(map(&vertex, &[0], &[node(&edge)]));
-    let held = vertex.routing_state();
+    let held = vertex.hold_routing();
     assert!(map(&vertex, &[], &[]));
     assert!(!edge.is_closed());
 
@@ -1061,7 +1042,7 @@ fn retirement_waits_until_no_generation_routes_to_the_child() {
     let (child, _) = receiving_edge(&registry);
     let (other, _) = receiving_edge(&registry);
     assert!(map(&vertex, &[0], &[node(&child)]));
-    let held = vertex.routing_state();
+    let held = vertex.hold_routing();
 
     let (retired, action) = counter();
     child.defer_retirement(Box::new(action));
@@ -1110,7 +1091,7 @@ fn close_retirements_wait_for_held_generations() {
     let vertex = LatticeVertex::new(&registry, "close-retire", 1);
     let (child, _) = receiving_edge(&registry);
     assert!(map(&vertex, &[0], &[node(&child)]));
-    let held = vertex.routing_state();
+    let held = vertex.hold_routing();
 
     let (first, action) = counter();
     vertex.close_after_routes_retire(action);
@@ -1162,22 +1143,22 @@ fn close_retirements_wait_for_every_generation() {
     let (first, _) = receiving_edge(&registry);
     let (second, _) = receiving_edge(&registry);
     assert!(map(&vertex, &[0], &[node(&first)]));
-    let older = vertex.routing_state();
+    let older = vertex.hold_routing();
     assert!(map(&vertex, &[0], &[node(&second)]));
-    let newer = vertex.routing_state();
+    let newer = vertex.hold_routing();
 
     let (closed, action) = counter();
     vertex.close_after_routes_retire(action);
+    // The older reader began before both retirements: the epoch holds both back until it leaves, however many
+    // readers of the newer generation have gone.
     drop(newer);
-    assert!(second.is_closed());
-    assert_eq!(
-        closed.load(Ordering::Acquire),
-        0,
-        "the older generation still routes"
-    );
+    assert!(!second.is_closed());
+    assert!(!first.is_closed());
+    assert_eq!(closed.load(Ordering::Acquire), 0);
 
     drop(older);
     assert!(first.is_closed());
+    assert!(second.is_closed());
     assert_eq!(closed.load(Ordering::Acquire), 1);
 }
 

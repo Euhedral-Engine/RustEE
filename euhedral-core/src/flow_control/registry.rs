@@ -1,7 +1,9 @@
 use super::upstream_queue::{Entry, UpstreamHandle, UpstreamQueue};
 use euhedral_data_structures::atomics::PaddedAtomicLong;
 use euhedral_data_structures::queues::{MpscQueue, Multi, Producer};
-use euhedral_data_structures::sync::{EpochDomain, EpochGuard, EpochSlot, LifecycleMutex};
+use euhedral_data_structures::sync::{
+    EpochDomain, EpochGuard, EpochSlot, HotScope, LifecycleMutex,
+};
 use euhedral_hardware_utils::affinity;
 use euhedral_hardware_utils::topology::Topology;
 use euhedral_hardware_utils::util::CpuSet;
@@ -10,6 +12,12 @@ use std::collections::BTreeSet;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
+
+/// An action that waits for the readers that were pinned when it was queued to leave.
+struct Due {
+    target: u64,
+    action: Box<dyn FnOnce() + Send>,
+}
 
 /// Chunk size of each worker's handle queue.
 const HANDLE_QUEUE_CHUNK: usize = 256;
@@ -83,6 +91,11 @@ pub struct UpstreamRegistry {
     p_cpus: CpuSet,
     shuffle_window: usize,
     state: LifecycleMutex<State>,
+    /// Actions queued by [`defer_after_readers`](Self::defer_after_readers) (rebalance work: a retired routing
+    /// generation's release). A worker looks at `due_len` at the start of each cycle and, when it is not zero, runs
+    /// what the readers have passed; a lifecycle call that queues one runs what is due at once.
+    due: LifecycleMutex<Vec<Due>>,
+    due_len: AtomicUsize,
 }
 
 impl UpstreamRegistry {
@@ -103,6 +116,8 @@ impl UpstreamRegistry {
             p_cpus,
             shuffle_window: cpu_span.max(1),
             state: LifecycleMutex::new(State::default()),
+            due: LifecycleMutex::new(Vec::new()),
+            due_len: AtomicUsize::new(0),
         })
     }
 
@@ -160,6 +175,68 @@ impl UpstreamRegistry {
         match self.thread_epoch() {
             Some(slot) => f(&slot.pin()),
             None => f(&self.epochs.register().pin()),
+        }
+    }
+
+    /// Runs `action` once every read section that is open now has ended: at once if none is. For rebalance work that
+    /// must not run while a reader may still hold what it releases. The action runs on whichever thread finds it due
+    /// (the caller, or a worker at the start of its cycle), off the hot scope. It must not assume that the thread
+    /// that runs it holds none of the lifecycle locks it takes: a thread that holds one runs only what it queued
+    /// after dropping it.
+    ///
+    /// `target` is the epoch that [`EpochDomain::advance`] returned after the values the action releases were
+    /// swapped out.
+    pub fn defer_after_readers(&self, target: u64, action: impl FnOnce() + Send + 'static) {
+        {
+            let _cold = HotScope::leave();
+            self.due.lock().push(Due {
+                target,
+                action: Box::new(action),
+            });
+            self.due_len.fetch_add(1, Ordering::Release);
+        }
+        self.run_due();
+    }
+
+    /// Whether an action is waiting for readers.
+    pub fn has_due(&self) -> bool {
+        self.due_len.load(Ordering::Relaxed) != 0
+    }
+
+    /// Runs the deferred actions the readers have passed. A worker calls it after it announces a quiescent point
+    /// (its own old announcement would hold its own actions back); a lifecycle thread calls it with no lock held.
+    pub fn run_due(&self) {
+        if self.due_len.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let _cold = HotScope::leave();
+        let ready: Vec<Due> = {
+            let Some(mut due) = self.due.try_lock() else {
+                return;
+            };
+            let mut ready = Vec::new();
+            let mut index = 0;
+            let newest = due.iter().map(|d| d.target).max().unwrap_or(0);
+            if !self.epochs.passed(newest) {
+                // Some may still be due: those older than the floor. Check one by one.
+                while index < due.len() {
+                    if self.epochs.passed(due[index].target) {
+                        ready.push(due.swap_remove(index));
+                    } else {
+                        index += 1;
+                    }
+                }
+            } else {
+                ready.append(&mut due);
+            }
+            ready
+        };
+        if ready.is_empty() {
+            return;
+        }
+        self.due_len.fetch_sub(ready.len(), Ordering::Release);
+        for due in ready {
+            (due.action)();
         }
     }
 
