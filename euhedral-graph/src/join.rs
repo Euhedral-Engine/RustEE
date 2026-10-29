@@ -388,7 +388,7 @@ mod tests {
     #[test]
     #[allow(clippy::disallowed_methods)] // The test's own threads arrive, as branches on lattice workers would.
     fn parts_arriving_on_many_threads_run_the_continuation_exactly_once() {
-        for _ in 0..50 {
+        for _ in 0..if cfg!(miri) { 2 } else { 50 } {
             let runs = Arc::new(AtomicUsize::new(0));
             let counted = runs.clone();
             let join = Join::new(64, move |values: Vec<Option<usize>>| {
@@ -413,7 +413,7 @@ mod tests {
     #[test]
     #[allow(clippy::disallowed_methods)] // The test's own threads arrive, as branches on lattice workers would.
     fn a_join_of_64_parts_from_8_threads_runs_once_per_round() {
-        const ROUNDS: usize = 1000;
+        const ROUNDS: usize = if cfg!(miri) { 10 } else { 1000 };
         let rounds = Arc::new(AtomicUsize::new(0));
         let counted = rounds.clone();
         let join = Arc::new(Join::<usize>::with_capacity(64, move |mut round| {
