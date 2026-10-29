@@ -1,9 +1,14 @@
-//! A fake device queue, for tests of code that submits to device lanes (feature `testing`).
+//! Fakes for tests of code that submits to device lanes (feature `testing`): [`FakeDevice`], an in-order fake
+//! device queue on a timeline, and [`FakeLanes`], a stepped fake lane submitter.
 
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use crate::lanes::{DeviceQueue, LaneId, LanePool, Marker, QueueId};
+
+mod lanes;
+
+pub use lanes::{FakeLane, FakeLaneError, FakeLanes, FakeOp};
 
 /// A fake device queue: submissions run in order, each after the queue's earlier work and after the
 /// markers it waits for (on any lane of its pool), taking its given cost. A query is one comparison

@@ -325,13 +325,19 @@ mod tests {
         let mut builder = LanePoolBuilder::new();
         let first = builder.reserve(1);
         let second = builder.reserve(1);
-        let (x, y) = (Arc::new(Idle(QueueId::next())), Arc::new(Idle(QueueId::next())));
+        let (x, y) = (
+            Arc::new(Idle(QueueId::next())),
+            Arc::new(Idle(QueueId::next())),
+        );
         builder.set(first, x.clone());
         builder.set(second, y.clone());
         let pool = builder.build();
         assert!(pool.reached(Marker::new(x.id(), first, 0)));
         assert!(pool.reached(Marker::new(y.id(), second, 0)));
-        assert!(!pool.reached(Marker::new(x.id(), second, 0)), "a queue at another lane");
+        assert!(
+            !pool.reached(Marker::new(x.id(), second, 0)),
+            "a queue at another lane"
+        );
     }
 
     #[test]
