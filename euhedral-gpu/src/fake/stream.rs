@@ -8,6 +8,8 @@ use crate::kept::Kept;
 use crate::retire::{RetireSink, Retirements};
 use crate::{Gpu, GpuError, POISONED_STATUS, RetireListener, RetireTicket, Stream, StreamPriority};
 
+use crate::lanes::Probe;
+
 use super::{FAKE_GREATEST_PRIORITY, FAKE_NORMAL_PRIORITY, FakeEnqueue, FakeGpu, QOp};
 
 /// The query side of a fake stream: what the pool and `Completions` hold. Shared and `Sync`.
@@ -127,10 +129,11 @@ impl FakeStream {
         })
     }
 
-    /// One look at the device on behalf of a stream with retirements outstanding: the fake's queue query, which learns
-    /// a fault the device has. `CudaStream` queries its latest marker's event the same way.
-    pub(crate) fn probe_fault(&mut self, _throttled: bool) {
-        if self.retire.outstanding() > 0 {
+    /// One look at the device: the fake's queue query, which learns a fault the device has when a marker of the lane is
+    /// still to complete. `CudaStream` queries its marker events the same way; [`Probe::Idle`] looks only while
+    /// retirements are outstanding, [`Probe::Confirm`] whenever a retirement just arrived. The fake does not throttle.
+    pub(crate) fn probe_fault(&mut self, mode: Probe) {
+        if mode == Probe::Confirm || self.retire.outstanding() > 0 {
             let _ = self.queue.completed();
         }
     }

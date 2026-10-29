@@ -11,8 +11,8 @@ use common::{HostWord, Item, Plan, Probe, collect_all, lock, pump, pump_from};
 use euhedral_core::generics::LatticeSource as _;
 use euhedral_gpu::fake::{FAKE_GREATEST_PRIORITY, FakeGpu, FakeModule, FakeOp, FakeStream};
 use euhedral_gpu::{
-    Args, CompileOptions, Gpu, GpuError, LaneSpec, Module, Stream, StreamOptions, StreamPriority,
-    open_lane_sources,
+    Args, CompileOptions, Enqueue, Gpu, GpuError, LaneSpec, Module, Stream, StreamOptions,
+    StreamPriority, open_lane_sources,
 };
 use euhedral_graph::testing::FakeLanes;
 use euhedral_graph::{
@@ -450,4 +450,45 @@ fn the_stream_as_a_lane_submitter_numbers_arms_and_settles_arrivals() {
     ));
     // SAFETY: the fake's handle is the queue id; nothing is enqueued through it.
     assert_eq!(unsafe { LaneSubmit::raw(&mut a) }, Stream::id(&a).get());
+}
+
+#[test]
+fn a_retirement_that_arrives_ok_is_confirmed_with_a_look_even_when_it_was_the_last_in_flight() {
+    let gpu = gpu();
+    gpu.define("illegal", |_, _, _| {
+        Err(euhedral_gpu::fake::FakeFault::IllegalAddress)
+    });
+    let module =
+        FakeModule::from_source(&gpu, "// fake source", &CompileOptions::default()).unwrap();
+    let bad = module.kernel("illegal").unwrap();
+    let mut streams = gpu
+        .open_lanes_at(LaneId(0), &["a", "b"], &[StreamOptions::default(); 2])
+        .unwrap();
+    let mut b = streams.pop().unwrap();
+    let mut a = streams.pop().unwrap();
+    // Lane b's retirement is armed first and completes cleanly. Then lane a faults, and lane b's later marker waits
+    // behind lane a's, so it never completes.
+    LaneSubmit::arm_retirement(&mut b).unwrap();
+    a.submit(|q| {
+        // SAFETY: the fake kernel touches no memory.
+        unsafe { q.launch(&bad, euhedral_gpu::Launch::linear(1, 1), &Args::new()) }
+    })
+    .unwrap();
+    let after_fault = LaneSubmit::mark(&mut a).unwrap().unwrap();
+    LaneSubmit::await_marker(&mut b, after_fault).unwrap();
+    LaneSubmit::mark(&mut b).unwrap().unwrap();
+    gpu.run_until_idle();
+    assert!(
+        gpu.poisoned().is_none(),
+        "the host has not learned of the fault"
+    );
+    // The one retirement in flight arrives with status 0, and is the last: the look that confirms it still happens, and
+    // finds the fault.
+    let retired = LaneSubmit::poll_retired(&mut b).expect("the retirement arrived");
+    assert_eq!(retired.seq, 0);
+    assert!(
+        matches!(retired.failure, Some(GpuError::Poisoned(_))),
+        "{:?}",
+        retired.failure
+    );
 }

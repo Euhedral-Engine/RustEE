@@ -5,6 +5,11 @@
 //! run on a bounds-checked fake memory; a kernel fault poisons the device once the host observes it (a marker query, a retirement's status, a submission),
 //! as a CUDA fault does; work behind it never runs and its markers never complete.
 //!
+//! Two simplifications, both the worse case for a caller. A wait on a marker of a faulted lane never ends, where a real
+//! driver may instead finish the waiting stream's callbacks with an error status. And a submission, a marker or a wait on
+//! the poisoned device returns `Poisoned` on first contact, where the CUDA backend returns the driver's `Fault` for the
+//! call that met it and `Poisoned` afterwards.
+//!
 //! The streams of the fake follow the same ownership rules as any backend's: a shared queue and a single-owner
 //! submitter, with no lock in the submitter. The simulated *device* (its memory, its per-lane operation logs and its
 //! kernel registry) is one state behind a mutex: it stands for hardware in tests, not for a submission path, and a real

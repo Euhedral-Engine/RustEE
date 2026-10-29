@@ -14,6 +14,21 @@ use euhedral_graph::{
 
 use crate::{Gpu, GpuError, Stream, StreamOptions};
 
+/// Why a stream looks at the device.
+#[cfg_attr(
+    not(any(feature = "fake", feature = "cuda")),
+    allow(dead_code, reason = "the backends' streams use it")
+)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Probe {
+    /// No callback arrived and retirements are outstanding: one look, at most every millisecond, when a marker is
+    /// still to complete.
+    Idle,
+    /// A retirement arrived with status 0 (its ticket is already taken, so it may have been the last one in flight):
+    /// one look, when a marker is still to complete.
+    Confirm,
+}
+
 /// One lane to open: its name, how its stream is set up, and the state its source keeps.
 #[derive(Clone, Debug)]
 pub struct LaneSpec<X> {
@@ -150,12 +165,12 @@ macro_rules! lane_submit {
                 let ticket = match Stream::poll_retired(self) {
                     Some(ticket) => ticket,
                     None => {
-                        self.probe_fault(true);
+                        self.probe_fault(Probe::Idle);
                         Stream::poll_retired(self)?
                     }
                 };
                 if ticket.ok() {
-                    self.probe_fault(false);
+                    self.probe_fault(Probe::Confirm);
                 }
                 let failure = Stream::confirm_retired(self, ticket);
                 Some(Retired {

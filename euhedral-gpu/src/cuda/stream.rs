@@ -14,6 +14,7 @@ use crate::{
 };
 
 use super::{CudaEnqueue, CudaGpu, from_cuda};
+use crate::lanes::Probe;
 
 /// How often a stream with retirements outstanding looks at the device while no callback arrives: one event query.
 const PROBE_EVERY: Duration = Duration::from_millis(1);
@@ -396,19 +397,22 @@ impl CudaStream {
         })
     }
 
-    /// One look at the device on behalf of a stream with retirements outstanding: a query of its marker events, which
-    /// poisons the device when the query fails for any reason but "not ready". A retirement armed behind a lane that
-    /// faulted may never get its callback (the work it follows never completes), and nothing else would notice; this
-    /// is how Java's `confirmRetired` learns of it, from the completion event. It costs one `cuEventQuery`, and nothing
-    /// when every marker completed. With `throttled`, no more often than every [`PROBE_EVERY`].
-    pub(crate) fn probe_fault(&mut self, throttled: bool) {
-        if self.retire.outstanding() == 0 {
+    /// One look at the device: a query of the stream's marker events, which poisons the device when the query fails for
+    /// any reason but "not ready". A retirement armed behind a lane that faulted may never get its callback (the work
+    /// it follows never completes), and nothing else would notice; this is how Java's `confirmRetired` learns of it,
+    /// from the completion event. It costs one `cuEventQuery`, and nothing when every marker completed.
+    ///
+    /// [`Probe::Idle`] looks only while retirements are outstanding, and no more often than every [`PROBE_EVERY`].
+    /// [`Probe::Confirm`] looks whenever a marker is still to complete: the ticket it confirms is already taken, so it
+    /// may have been the last retirement in flight.
+    pub(crate) fn probe_fault(&mut self, mode: Probe) {
+        if mode == Probe::Idle && self.retire.outstanding() == 0 {
             return;
         }
         if self.ring.done.load(Ordering::Acquire) >= self.ring.marked.load(Ordering::Acquire) {
             return;
         }
-        if throttled {
+        if mode == Probe::Idle {
             let now = Instant::now();
             if self
                 .last_probe
