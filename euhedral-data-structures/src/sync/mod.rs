@@ -5,6 +5,7 @@
 //!   has passed (the stand-in for a collector).
 //! - [`Admission`]: a reader count with a retired bit (Java's `admission` word): readers take a count while
 //!   the state is current, and a writer that retires it learns when the last reader leaves.
+//! - [`one_shot`]: Java's `CompletableFuture` for one result, from one completer to one reader that polls; nothing waits.
 //! - [`ClaimCell`]: plain state that one thread at a time claims with a compare-and-set that fails instead of
 //!   waiting.
 //!
@@ -19,11 +20,13 @@ mod barrier;
 mod claim_cell;
 mod lifecycle;
 mod loom;
+mod one_shot;
 mod published;
 mod set_once;
 
 pub use admission::Admission;
 pub use claim_cell::{ClaimCell, ClaimGuard};
 pub use lifecycle::{ColdGuard, HotGuard, HotScope, LifecycleMutex, LifecycleRwLock};
+pub use one_shot::{OneShotReceiver, OneShotSender, RecvError, one_shot};
 pub use published::{EpochDomain, EpochGuard, EpochSlot, Published, Retired};
 pub use set_once::SetOnce;
