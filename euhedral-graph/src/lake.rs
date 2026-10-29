@@ -4,7 +4,9 @@
 //! Producers offer frames from anywhere: a stage that made its successors ready, a driver
 //! callback, a request. A frame goes into the sink its routing hash selects, so the frames of one
 //! lane (equal hashes) keep to one sink and the frames that may run in parallel spread over all of
-//! them. Every sink is a [`QueueIngestSink`] of one partition, attached to the lattice on its own:
+//! them. The sink is the unsigned multiply high of the hash and the sink count, as a vertex picks a
+//! downstream: ids are xxHash64 values whose high bits avalanche well, so the choice is
+//! deterministic yet spreads lanes evenly over the sinks. Every sink is a [`QueueIngestSink`] of one partition, attached to the lattice on its own:
 //! the workers pull from many sources at once instead of all queuing at one, which keeps producers
 //! and consumers off a common cache line.
 //!
@@ -48,6 +50,7 @@ use euhedral_core::flow_control::UpstreamRegistry;
 use euhedral_core::frames::Frame;
 use euhedral_core::generics::{DownstreamSlot, FrameSink, LatticeReceiver, LatticeSource};
 use euhedral_core::ingest::{IngestSink, QueueIngestSink};
+use euhedral_core::utils::math::unsigned_multiply_high;
 use euhedral_data_structures::sync::{HotScope, LifecycleMutex};
 
 /// Set in the admission word once admission closes; the rest counts the units admitted and not
@@ -145,7 +148,7 @@ struct Generation {
 
 impl Generation {
     fn sink_of(&self, frame: &dyn Frame) -> &QueueIngestSink {
-        let index = frame.header().routing_hash() % self.sinks.len() as u64;
+        let index = unsigned_multiply_high(frame.header().routing_hash(), self.sinks.len() as u64);
         &self.sinks[index as usize]
     }
 

@@ -23,6 +23,8 @@ libc = "0.2.174"
 euhedral-graph = { path = ".", default-features = false, features = ["testing"] }
 # The credit-graph test checks the CPUs this process may run on.
 euhedral-hardware-utils = { path = "../euhedral-hardware-utils" }
+# The lake tests hash their lane ids as real ids are hashed.
+euhedral-hashing = { path = "../euhedral-hashing" }
 
 # The model checker behind `--cfg loom` (`RUSTFLAGS="--cfg loom" cargo test -p euhedral-graph --release --lib join::loom`).
 # A build without that flag never sees it. It is a regular dependency because the library's own atomics are

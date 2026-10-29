@@ -26,6 +26,7 @@ use euhedral_data_structures::sync::{OneShotSender, one_shot};
 use euhedral_graph::Lake;
 use euhedral_hardware_utils::affinity;
 use euhedral_hardware_utils::util::CpuSet;
+use euhedral_hashing::hasher_api::mix;
 
 /// The tests build lattices on the same CPU, whose pinned executor is one per process: a lattice that closes leaves the
 /// executor closed with a worker still winding down, and a lattice built meanwhile cannot get it. The tests therefore
@@ -96,16 +97,17 @@ fn eventually(what: &str, condition: impl Fn() -> bool) {
     }
 }
 
-/// A frame of ordered lane `hash` that counts itself in `ran` and notes `value` in `seen`.
+/// A frame of ordered lane `lane` that counts itself in `ran` and notes `value` in `seen`. Lanes are
+/// hashed as real ids are, so the lake's multiply-high routing spreads them over its sinks.
 fn noting(
-    hash: u64,
+    lane: u64,
     value: u64,
     seen: &Arc<Mutex<Vec<u64>>>,
     ran: &Arc<AtomicU64>,
 ) -> Box<dyn Frame> {
     let (seen, ran) = (seen.clone(), ran.clone());
     Box::new(RunnableFrame::new(
-        hash,
+        mix(lane),
         Arc::new(move || {
             seen.lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -115,10 +117,10 @@ fn noting(
     ))
 }
 
-fn counting(hash: u64, ran: &Arc<AtomicU64>) -> Box<dyn Frame> {
+fn counting(lane: u64, ran: &Arc<AtomicU64>) -> Box<dyn Frame> {
     let ran = ran.clone();
     Box::new(RunnableFrame::new(
-        hash,
+        mix(lane),
         Arc::new(move || {
             ran.fetch_add(1, Ordering::AcqRel);
         }),
@@ -226,7 +228,7 @@ fn offer_without_admitted_unit_is_refused() {
     let refused = lake
         .offer(counting(11, &ran))
         .expect_err("no unit is admitted");
-    assert_eq!(refused.header().id_hash(), 11);
+    assert_eq!(refused.header().id_hash(), mix(11));
     assert!(!lake.is_attached());
     assert_eq!(lake.attachments(), 0);
 
@@ -234,7 +236,7 @@ fn offer_without_admitted_unit_is_refused() {
     drop(lake.admit().expect("a unit"));
     let sink: &dyn FrameSink = &*lake;
     let refused = sink.offer(counting(12, &ran)).expect_err("the unit ended");
-    assert_eq!(refused.header().id_hash(), 12);
+    assert_eq!(refused.header().id_hash(), mix(12));
 
     // A refused frame was not queued anywhere.
     std::thread::sleep(Duration::from_millis(50));
