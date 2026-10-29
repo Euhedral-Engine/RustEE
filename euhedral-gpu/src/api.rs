@@ -18,11 +18,11 @@
 //!   Exclusivity is the borrow checker's, so there is no lock to take or to wait on, and a call on a stream from
 //!   inside its own `submit` closure does not compile.
 //!
-//! The intended shape is RustEE's own: a lane's `LatticeSource` owns its submitter. The lattice serializes the source's
-//! `request` and `pull`, so whichever worker runs them is the submitter's only user, and nothing is locked. Work for the
-//! lane from other frames reaches the source through one of RustEE's lock-free queues (an MPSC intake the source
-//! drains), or the submitter is handed from frame to frame inside a chain, as [`retire_into`](crate::retire_into) does,
-//! or the work runs on another lane. This crate has no routing layer.
+//! In RustEE's model the owner is a lane's `LatticeSource`: the lattice serializes its `request` and `pull`, so
+//! whichever worker runs them is the submitter's only user, and nothing is locked. [`open_lane_sources`](crate::open_lane_sources)
+//! opens a device's streams that way; work for a lane from other frames reaches the source through the lock-free
+//! intakes of `euhedral-graph`. A chain of frames can instead carry the submitter along, as
+//! [`retire_into`](crate::retire_into) does.
 
 use std::any::Any;
 use std::fmt;
@@ -44,13 +44,36 @@ pub trait Gpu: Send + Sync + fmt::Debug + Sized + 'static {
     type Graph: Graph<Gpu = Self>;
     type Sequence<'a>: Sequence<Kernel = Self::Kernel>;
 
-    /// New streams, `names[i]` as lane `i` of a new pool (1 to 64 names). The pool holds each stream's query side;
-    /// the submitters are returned to be owned, one per lane.
+    /// New streams, `names[i]` as lane `i` of a new pool (1 to 64 names), all set up with `options`. The pool holds
+    /// each stream's query side; the submitters are returned to be owned, one per lane.
+    ///
+    /// This is [`open_lanes_at`](Self::open_lanes_at) at lane 0, with the pool made of the streams' queues.
     fn open_lanes(
         self: &Arc<Self>,
         names: &[&str],
         options: StreamOptions,
-    ) -> Result<Lanes<Self>, GpuError>;
+    ) -> Result<Lanes<Self>, GpuError> {
+        let streams = self.open_lanes_at(LaneId(0), names, &vec![options; names.len()])?;
+        let queues = streams.iter().map(Stream::queue).collect();
+        Ok((Arc::new(LanePool::new(queues)), streams))
+    }
+
+    /// New streams for lanes `first..first + names.len()` of a pool built elsewhere
+    /// ([`LanePoolBuilder::reserve`](euhedral_graph::LanePoolBuilder::reserve)), `options[i]` for `names[i]`. Their
+    /// markers name those lanes; the caller sets each stream's [`queue`](Stream::queue) into the builder at its lane.
+    ///
+    /// A marker of a lane that this call did not open is refused by [`Stream::await_marker`] (`Err(Invalid)`), as a
+    /// marker of any other queue is: a pool of several backends orders across them by handing the marker to the item
+    /// that bridges it. Lanes of two calls on one device therefore cannot order on the device; open the lanes that must
+    /// order each other in one call.
+    ///
+    /// `Err(Invalid)` for no names, a different number of options, or lanes past 63.
+    fn open_lanes_at(
+        self: &Arc<Self>,
+        first: LaneId,
+        names: &[&str],
+        options: &[StreamOptions],
+    ) -> Result<Vec<Self::Stream>, GpuError>;
 
     /// The device's first fault, once it has one.
     fn poisoned(&self) -> Option<GpuError>;
@@ -234,8 +257,8 @@ pub trait Kernel: Clone + Send + Sync + fmt::Debug {
     fn id(&self) -> u64;
 }
 
-/// Code loaded at run time. Loading is a build-time call: it blocks (compile, file reads, the driver's load), so it
-/// runs at start-up or on a lattice set aside for blocking work.
+/// Code loaded at run time. Loading is a long call: it blocks (compile, file reads, the driver's load), so it runs in
+/// the frame or item that needs it, on the worker that reaches it (a worker is a CPU), and not per item.
 pub trait Module: Send + Sync + fmt::Debug + Sized {
     type Gpu: Gpu<Module = Self>;
 
@@ -350,16 +373,32 @@ impl RetireTicket {
     }
 }
 
+/// How the device schedules a stream's work against other streams' (a device property: the driver decides what it
+/// does with the hint).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StreamPriority {
+    /// The driver's default priority.
+    #[default]
+    Normal,
+    /// The greatest priority the device offers: its waiting blocks are scheduled ahead of a normal stream's.
+    High,
+}
+
 /// How a stream is set up.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StreamOptions {
     /// Markers a stream can have outstanding: the size of its event ring.
     pub markers: u32,
+    /// The stream's priority on the device.
+    pub priority: StreamPriority,
 }
 
 impl Default for StreamOptions {
     fn default() -> Self {
-        Self { markers: 256 }
+        Self {
+            markers: 256,
+            priority: StreamPriority::Normal,
+        }
     }
 }
 

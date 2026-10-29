@@ -32,6 +32,8 @@ libc = { version = "0.2.174", optional = true }
 [dev-dependencies]
 # The crate's own tests use the fake backend.
 euhedral-gpu = { path = ".", default-features = false, features = ["fake", "test-hooks"] }
+# The lane-source tests use the stepped fake lane beside the device's.
+euhedral-graph = { path = "../euhedral-graph", features = ["testing"] }
 # The acceptance example picks a CPU for its lattice.
 euhedral-hardware-utils = { path = "../euhedral-hardware-utils" }
 

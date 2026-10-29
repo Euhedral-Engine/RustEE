@@ -1,3 +1,5 @@
+use std::sync::atomic::AtomicU64;
+
 use euhedral_core::metrics::Histogram;
 
 /// What a lane source records. Values are nanoseconds, except the depth.
@@ -11,6 +13,9 @@ pub struct LaneMetrics {
     pub intake_to_run_ns: Histogram,
     /// The ready queue's depth at the end of each `request`.
     pub ready_depth: Histogram,
+    /// Items dropped without their `retired` call because an item took their retirement from the
+    /// submitter (a misuse; the count says it happened).
+    pub stranded: AtomicU64,
 }
 
 impl LaneMetrics {
@@ -20,6 +25,7 @@ impl LaneMetrics {
             item_ns: (0..kinds).map(|_| Histogram::new()).collect(),
             intake_to_run_ns: Histogram::new(),
             ready_depth: Histogram::new(),
+            stranded: AtomicU64::new(0),
         }
     }
 }

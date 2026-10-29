@@ -550,6 +550,37 @@ fn a_failed_await_ends_the_item_with_failed() {
 }
 
 #[test]
+fn an_item_that_fails_in_run_ends_with_failed_and_delivers_no_successor() {
+    let rig = Rig::new(1, &[]);
+    let successor = rig.job(2).frame();
+    rig.deliver(
+        rig.job(1)
+            .fail()
+            .frame()
+            .then_deliver(successor, rig.lane(0)),
+        rig.lane(0),
+    );
+    rig.deliver(rig.job(3).submit(false).frame(), rig.lane(0));
+    rig.sources[0].request(10);
+    assert_eq!(*lock(&rig.probe.failed), vec![1]);
+    assert_eq!(
+        rig.probe.ran(),
+        vec![1, 3],
+        "no successor of the failed item ran"
+    );
+    assert_eq!(
+        marks(&rig, 0),
+        1,
+        "the failed item was not marked; the next was"
+    );
+    assert_eq!(
+        rig.received(0),
+        vec![3],
+        "no frame of the failed item, and the lane went on"
+    );
+}
+
+#[test]
 fn an_item_that_requests_its_own_source_banks_the_demand_and_is_served_after_it() {
     // The cell's claim is taken in every build: the nested request leaves a wakeup, the nested pull
     // hands over nothing, and the outer call serves the wakeup when the item is done.

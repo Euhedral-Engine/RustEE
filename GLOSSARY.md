@@ -671,3 +671,8 @@ fingerprint is 128 bits of it. A changed shape is `GpuError::ShapeChanged`.
 
 **shadow stream** ([`CudaSequence`](euhedral-gpu/src/cuda/graph.rs)): the stream a recording captures a stream's work
 on, so the real stream is never in capture mode and a failed capture never disturbs the work.
+
+**stream priority** ([`StreamPriority`](euhedral-gpu/src/api.rs)): how the device schedules a stream's waiting work against
+other streams'. `Normal` is the driver's default (0); `High` is the context's greatest priority (numerically the lowest
+value, from `cuCtxGetStreamPriorityRange`). A device property: the driver decides what it does with the hint. Set per lane
+in `StreamOptions`.

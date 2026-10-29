@@ -44,7 +44,7 @@ impl Graph for FakeGraph {
     }
 
     fn replay(&mut self, stream: &mut FakeStream) -> Result<(), GpuError> {
-        stream.gpu().poison.check()?;
+        stream.gpu().alive()?;
         for op in &self.ops {
             stream.push(match op {
                 RecOp::Launch {
@@ -150,7 +150,7 @@ impl FakeGpu {
     where
         F: FnOnce(&mut FakeSequence<'_>) -> Result<(), GpuError>,
     {
-        self.poison.check()?;
+        self.alive()?;
         if streams.is_empty() {
             return Err(GpuError::Invalid("a recording needs a stream".into()));
         }
@@ -200,7 +200,7 @@ impl FakeGpu {
     where
         F: FnOnce(&mut FakeSequence<'_>) -> Result<(), GpuError>,
     {
-        self.poison.check()?;
+        self.alive()?;
         let mut seq = FakeSequence {
             rec: Recording::new(mode),
             streams,

@@ -6,9 +6,11 @@ use euhedral_graph::{DeviceQueue, LaneId, Marker, QueueId};
 
 use crate::kept::Kept;
 use crate::retire::{RetireSink, Retirements};
-use crate::{Gpu, GpuError, POISONED_STATUS, RetireListener, RetireTicket, Stream};
+use crate::{Gpu, GpuError, POISONED_STATUS, RetireListener, RetireTicket, Stream, StreamPriority};
 
-use super::{FakeEnqueue, FakeGpu, QOp};
+use crate::lanes::Probe;
+
+use super::{FAKE_GREATEST_PRIORITY, FAKE_NORMAL_PRIORITY, FakeEnqueue, FakeGpu, QOp};
 
 /// The query side of a fake stream: what the pool and `Completions` hold. Shared and `Sync`.
 #[derive(Debug)]
@@ -29,19 +31,37 @@ impl DeviceQueue for FakeQueue {
     }
 
     fn completed(&self) -> u64 {
-        let poisoned = self.gpu.poison.get().is_some();
-        let st = self.gpu.lock();
-        let lane = &st.lanes[self.global];
-        if poisoned {
-            lane.marks_enqueued
+        let (run, enqueued) = {
+            let st = self.gpu.lock();
+            let lane = &st.lanes[self.global];
+            (lane.marks_run, lane.marks_enqueued)
+        };
+        if run < enqueued {
+            // A query of a marker that has not completed reaches the device: a fault it has is learned here.
+            self.gpu.observe_fault();
+        }
+        if self.gpu.poison.get().is_some() {
+            enqueued
         } else {
-            lane.marks_run
+            run
         }
     }
 
     fn name(&self) -> &str {
         &self.name
     }
+}
+
+/// Where a stream sits among the lanes of the call that opened it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Placement {
+    /// Global index of the call's first lane.
+    pub(crate) base: usize,
+    /// The id of that lane in its pool.
+    pub(crate) first: u16,
+    /// This stream's index among the call's lanes, and how many lanes the call made.
+    pub(crate) index: usize,
+    pub(crate) count: usize,
 }
 
 /// A fake stream's submitter: lane `lane` of its pool. It has one owner, `Send` and not `Sync`; everything that
@@ -51,10 +71,13 @@ pub struct FakeStream {
     gpu: Arc<FakeGpu>,
     queue: Arc<FakeQueue>,
     id: QueueId,
-    /// Global index of lane 0 of this stream's pool, this stream's index in the pool, and the pool's size.
+    /// Global index of the first lane the opening call made, that lane's id, this stream's index among the call's
+    /// lanes, and how many lanes the call made.
     base: usize,
+    first: u16,
     index: usize,
     count: usize,
+    priority: StreamPriority,
     /// The owner's end of the retirement queue, and the retirements armed.
     pub(crate) retire: Retirements,
     pub(crate) kept: Kept,
@@ -65,11 +88,16 @@ impl FakeStream {
         gpu: Arc<FakeGpu>,
         id: QueueId,
         name: &str,
-        base: usize,
-        index: usize,
-        count: usize,
+        place: Placement,
+        priority: StreamPriority,
     ) -> Self {
-        let lane = LaneId(u16::try_from(index).expect("at most 64 lanes"));
+        let Placement {
+            base,
+            first,
+            index,
+            count,
+        } = place;
+        let lane = LaneId(first + u16::try_from(index).expect("at most 64 lanes"));
         let (retire, sink) = Retirements::new(id, lane);
         let queue = Arc::new(FakeQueue {
             gpu: gpu.clone(),
@@ -83,15 +111,40 @@ impl FakeStream {
             queue,
             id,
             base,
+            first,
             index,
             count,
+            priority,
             retire,
             kept: Kept::default(),
         }
     }
 
-    pub(crate) fn queue_arc(&self) -> Arc<FakeQueue> {
-        self.queue.clone()
+    /// The priority the stream was opened with, as a driver reports it: [`FAKE_NORMAL_PRIORITY`] or
+    /// [`FAKE_GREATEST_PRIORITY`]. The signature is `CudaStream::priority`'s.
+    pub fn priority(&self) -> Result<i32, GpuError> {
+        Ok(match self.priority {
+            StreamPriority::Normal => FAKE_NORMAL_PRIORITY,
+            StreamPriority::High => FAKE_GREATEST_PRIORITY,
+        })
+    }
+
+    /// One look at the device: the fake's queue query, which learns a fault the device has when a marker of the lane is
+    /// still to complete. `CudaStream` queries its marker events the same way; [`Probe::Idle`] looks only while
+    /// retirements are outstanding, [`Probe::Confirm`] whenever a retirement just arrived. The fake does not throttle.
+    pub(crate) fn probe_fault(&mut self, mode: Probe) {
+        if mode == Probe::Confirm || self.retire.outstanding() > 0 {
+            let _ = self.queue.completed();
+        }
+    }
+
+    /// Whether `marker` names a lane this stream's opening call made, under that lane's queue.
+    pub(crate) fn owns_marker_lane(&self, marker: Marker) -> bool {
+        let Some(offset) = marker.lane.0.checked_sub(self.first) else {
+            return false;
+        };
+        let offset = usize::from(offset);
+        offset < self.count && self.gpu.lock().lanes[self.base + offset].id == marker.queue
     }
 
     fn global(&self) -> usize {
@@ -99,7 +152,7 @@ impl FakeStream {
     }
 
     fn lane_id(&self) -> u16 {
-        u16::try_from(self.index).expect("at most 64 lanes")
+        self.first + u16::try_from(self.index).expect("at most 64 lanes")
     }
 
     pub(crate) fn push(&self, op: QOp) {
@@ -107,7 +160,7 @@ impl FakeStream {
     }
 
     fn arm(&mut self, listener: Option<Box<dyn RetireListener>>) -> Result<(), GpuError> {
-        self.gpu.poison.check()?;
+        self.gpu.alive()?;
         self.push(QOp::Retire {
             seq: self.retire.next_seq(),
             sink: self.queue.sink.clone(),
@@ -118,7 +171,7 @@ impl FakeStream {
 
     /// A marker after the work enqueued so far.
     pub(crate) fn mark_now(&self) -> Result<Marker, GpuError> {
-        self.gpu.poison.check()?;
+        self.gpu.alive()?;
         let value = {
             let st = self.gpu.lock();
             let lane = &st.lanes[self.global()];
@@ -133,15 +186,17 @@ impl FakeStream {
 
     /// Later work on this stream waits for `marker`.
     pub(crate) fn await_now(&self, marker: Marker) -> Result<(), GpuError> {
-        self.gpu.poison.check()?;
-        let lane = usize::from(marker.lane.0);
-        if lane >= self.count {
-            return Err(GpuError::Invalid(format!(
-                "{} lane {} is not a lane of this stream's pool",
-                marker.queue, marker.lane.0
-            )));
-        }
-        let target = self.base + lane;
+        self.gpu.alive()?;
+        let offset = match marker.lane.0.checked_sub(self.first) {
+            Some(offset) if usize::from(offset) < self.count => usize::from(offset),
+            _ => {
+                return Err(GpuError::Invalid(format!(
+                    "{} lane {} is not a lane of this stream's pool",
+                    marker.queue, marker.lane.0
+                )));
+            }
+        };
+        let target = self.base + offset;
         {
             let st = self.gpu.lock();
             let lane = &st.lanes[target];
@@ -194,7 +249,7 @@ impl Stream for FakeStream {
         &mut self,
         f: impl FnOnce(&mut FakeEnqueue<'_>) -> Result<R, GpuError>,
     ) -> Result<R, GpuError> {
-        self.gpu.poison.check()?;
+        self.gpu.alive()?;
         f(&mut FakeEnqueue {
             target: Some(self),
             rec: None,
@@ -246,6 +301,8 @@ impl Stream for FakeStream {
         }
         self.kept.release_through(ticket.seq());
         if ticket.status() != 0 {
+            // The status is the device's own report of the fault.
+            self.gpu.observe_fault();
             return self.gpu.poisoned();
         }
         self.gpu

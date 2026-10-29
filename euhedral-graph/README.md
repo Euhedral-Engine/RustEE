@@ -140,7 +140,7 @@ enqueues. The lattice enters the source, and each `request(demand)`:
    shared intake. There is no budget: a long item runs on the worker that needs it;
 5. pushes at most the banked demand of the frames the items made.
 
-An item that cannot go on answers `Outcome::Wait`; it stays in the source and items of its order key wait behind it.
+An item that cannot go on answers `Outcome::Wait`; it stays in the source and items of its order key wait behind it. An item that could not do its work (a submission the device refused) answers `Outcome::Failed(error)`: the source calls `failed` and delivers no successor.
 `pull` hands over ready frames and never submits work. The example drives one lane by hand with the stepped fake:
 
 ```rust
@@ -159,7 +159,7 @@ impl LaneWork<FakeLane, ()> for Item {
     const KINDS: &'static [&'static str] = &["item"];
     fn kind(&self) -> usize { 0 }
     fn waits(&self) -> &[Marker] { &[] }
-    fn run(&mut self, _cx: &mut LaneCx<'_, FakeLane, (), Self>) -> Outcome<std::convert::Infallible> {
+    fn run(&mut self, _cx: &mut LaneCx<'_, FakeLane, (), Self>) -> Outcome<std::convert::Infallible, FakeLaneError> {
         Outcome::Submitted { retire: false }
     }
     fn then(&mut self, _marker: Option<Marker>, cx: &mut LaneCx<'_, FakeLane, (), Self>) {

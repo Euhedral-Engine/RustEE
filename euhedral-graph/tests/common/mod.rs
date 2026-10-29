@@ -123,6 +123,8 @@ pub struct Job {
     pub steal: bool,
     /// `run` arms a retirement of its own through the submitter (a stray call).
     pub stray_arm: bool,
+    /// `run` answers `Failed` (a submission the device refused).
+    pub fail: bool,
     /// `run` blocks on these barriers (a long item).
     pub hold: Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
 }
@@ -142,6 +144,7 @@ impl Job {
             reenter: None,
             stray_arm: false,
             steal: false,
+            fail: false,
             hold: None,
         }
     }
@@ -191,6 +194,11 @@ impl Job {
         self
     }
 
+    pub fn fail(mut self) -> Self {
+        self.fail = true;
+        self
+    }
+
     pub fn hold(mut self, a: &Arc<std::sync::Barrier>, b: &Arc<std::sync::Barrier>) -> Self {
         self.hold = Some((a.clone(), b.clone()));
         self
@@ -229,7 +237,7 @@ impl LaneWork<FakeLane, Gate> for Job {
         self.key
     }
 
-    fn run(&mut self, cx: &mut Cx<'_>) -> Outcome<u64> {
+    fn run(&mut self, cx: &mut Cx<'_>) -> Outcome<u64, FakeLaneError> {
         if let Some(need) = self.need
             && cx.state().value.load(Ordering::SeqCst) < need
         {
@@ -257,6 +265,9 @@ impl LaneWork<FakeLane, Gate> for Job {
             b.wait();
         }
         lock(&self.probe.ran).push(self.tag);
+        if self.fail {
+            return Outcome::Failed(FakeLaneError::Refused);
+        }
         match self.submit {
             Some(retire) => Outcome::Submitted { retire },
             None => Outcome::Finished,

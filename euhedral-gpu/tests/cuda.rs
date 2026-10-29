@@ -790,7 +790,13 @@ mod markers {
         let Some(ops) = ops(&gpu) else { return };
         let spin = ops.kernel("spin").unwrap();
         let (pool, mut s) = gpu
-            .open_lanes(&["a", "b"], StreamOptions { markers: 4 })
+            .open_lanes(
+                &["a", "b"],
+                StreamOptions {
+                    markers: 4,
+                    ..StreamOptions::default()
+                },
+            )
             .unwrap();
         let spin_for = |stream: &mut euhedral_gpu::cuda::CudaStream, ms: u64| {
             stream

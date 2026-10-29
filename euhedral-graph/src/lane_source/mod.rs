@@ -85,7 +85,9 @@ pub trait LaneSubmit: Send + 'static {
     /// # Safety
     ///
     /// The caller enqueues on the handle only from inside an item of this lane, and a
-    /// [`mark`](Self::mark) afterwards covers it.
+    /// [`mark`](Self::mark) afterwards covers it. The caller also makes whatever the backend needs
+    /// current on its thread before it calls the backend's own functions (for CUDA, the context:
+    /// `Device::enter`); the lane source does not.
     unsafe fn raw(&mut self) -> Self::Raw;
 }
 
@@ -114,7 +116,7 @@ impl LaneState for () {
 
 /// What running an item decided.
 #[derive(Debug)]
-pub enum Outcome<A> {
+pub enum Outcome<A, E> {
     /// The item submitted work. The lane marks it; `retire` asks for a retirement to follow.
     Submitted { retire: bool },
     /// The item needed no device work.
@@ -122,6 +124,11 @@ pub enum Outcome<A> {
     /// The item cannot go on until the lane's state meets `A`. It stays in the source, and items
     /// with its order key wait behind it.
     Wait(A),
+    /// The item could not do its work (a submission the device refused). The lane ends it with
+    /// [`LaneWork::failed`] and does not call [`LaneWork::then`]: no successor is delivered, as a
+    /// failed stage publishes none. Work the item enqueued before it failed is covered by the next
+    /// item's mark.
+    Failed(E),
 }
 
 /// One item of work on a lane.
@@ -141,7 +148,7 @@ pub trait LaneWork<S: LaneSubmit, X: LaneState>: Send + Sized + 'static {
     }
 
     /// Runs the item on its lane.
-    fn run(&mut self, cx: &mut LaneCx<'_, S, X, Self>) -> Outcome<X::Wait>;
+    fn run(&mut self, cx: &mut LaneCx<'_, S, X, Self>) -> Outcome<X::Wait, S::Error>;
 
     /// After the lane marked the work (`Some`) or the item finished with no device work (`None`):
     /// deliver the successors and queue the frames.
@@ -180,6 +187,10 @@ impl<S: LaneSubmit, X, W: Send + 'static> LaneCx<'_, S, X, W> {
     }
 
     /// The lane's submitter, for the item's own submissions.
+    ///
+    /// [`LaneSubmit::raw`] lends the queue's handle for work the backend's submit calls do not
+    /// cover; its safety section says what the caller owes (inside an item, a mark afterwards, the
+    /// backend's context current).
     ///
     /// An item must not call `poll_retired` or `arm_retirement` on it: retirements belong to the
     /// lane source, which arms them for items that ask (`Outcome::Submitted { retire: true }`) and
