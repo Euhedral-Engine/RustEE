@@ -632,6 +632,38 @@ fn a_direct_request_while_the_lane_is_busy_is_served_when_it_lets_go() {
 }
 
 #[test]
+fn requests_racing_the_holders_release_are_all_served_and_none_is_lost() {
+    // Many callers bank demand and leave a wakeup while whoever holds the claim serves and lets go: the flag is a
+    // release store and the claim attempt after it is the caller's barrier, so a wakeup is either seen by the
+    // holder after its release or the caller takes the claim itself. Every delivered frame must come out.
+    const ROUNDS: u64 = 40;
+    const THREADS: u64 = 4;
+    const FRAMES: u64 = 64;
+    for round in 0..ROUNDS {
+        let rig = Rig::new(1, &[]);
+        for frame in 0..FRAMES {
+            rig.deliver(rig.job(round * 1000 + frame).frame(), rig.lane(0));
+        }
+        let barrier = Barrier::new(THREADS as usize);
+        std::thread::scope(|scope| {
+            for _ in 0..THREADS {
+                scope.spawn(|| {
+                    barrier.wait();
+                    for _ in 0..FRAMES {
+                        rig.sources[0].request(1);
+                    }
+                });
+            }
+        });
+        assert_eq!(
+            rig.received(0).len() as u64,
+            FRAMES,
+            "round {round}: a wakeup was lost, or a frame doubled"
+        );
+    }
+}
+
+#[test]
 fn a_retirement_armed_from_inside_an_item_is_not_paired_with_a_continuation() {
     let rig = Rig::new(1, &[]);
     rig.deliver(rig.job(1).stray_arm().submit(true), rig.lane(0));
