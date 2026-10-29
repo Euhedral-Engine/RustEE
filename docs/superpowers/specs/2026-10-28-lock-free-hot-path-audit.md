@@ -599,7 +599,7 @@ Java `LatticeHotSource`, `ControlPlaneFragment`'s output, `StopWatch`, `Fragment
 - **C14** (Java `PipelineRunner.submit` → `CompletableFuture`, `root.observe(future)`): `submit*` returns a
   `OneShot<Outcome>` receiver; one is allocated per submission, as Java allocates its future.
 - **G4**: rebuilt by the lane-source plan's Part 2 on Java's `Join`; nothing left here.
-- **G5** `Latch`: a wrapper of `OneShot` (Java waits for results with `CompletableFuture`).
+- **G5** `Latch`: removed. The main thread checks a `OneShot` periodically instead of blocking on it.
 - **G6** `Sequencer` (Java `Sequencer`):
   - `order`: an `MpscQueue` of `Arc<Entry>`, offered by `register` in order. An entry holds `ready: AtomicBool`
     (Java's entry `ready()`) and its value in an `UnsafeCell`.
@@ -802,7 +802,7 @@ runtime" is the Java runtime `euhedral-graph` is derived from (its `runtime/grap
 | C8, C9 edges | core `LatticeEdge.DOWNSTREAM`, `PARENT` | Downstream kept until drop; a receiver added to a closed edge is told complete once, taken or refused (a Java race: `close` nulls `DOWNSTREAM`, so a later compare-and-set attaches a receiver that is never told); parent a cell (no GC). |
 | C11, C12 ingest | core `ingest/AbstractIngestSink`, `QueueIngestSink` | `clear` claims (Java bug: unclaimed single-consumer drain); demand is unsigned and saturates at the top (`add_demand`, `take_demand`) where Java's `accumulate` takes a signed step; the queue is finished when its source drops (no GC); `clear` cancels the frames (`do_finally_with_error`) where Java's `clear` drops them silently; `pull`'s stop also matches once the source has completed. |
 | C13 single use | core `ingest/SingleUseSource` | `complete` cancels an untaken frame (Java bug: `complete` leaves it takeable); a `pull` whose stop condition matches gives the frame back (Java ignores the stop condition); a frame nobody took is cancelled when the source drops. |
-| C14 pipeline outcome | core `ingest/PipelineRunner`, `CompletableFuture` | None. |
+| C14 pipeline outcome | core `ingest/PipelineRunner`, `CompletableFuture` | One reader that polls, not Java's many waiters and callbacks; a chain dropped without ending abandons the receiver where Java's future would stay incomplete (missing Rust equivalent: no collector notices a dropped future). |
 | C15 hot receiver | core `flow_control/LatticeHotReceiver`, `utils/SpinWait` | None (already mirrored). |
 | C16-C19 lattice, shard | core `ControlPlaneLattice`, `ControlPlaneShard` | `Published` for the arrays (no GC). |
 | C20 task pool | core `controlPlaneExecutor` (JDK fixed pool) | Lock-free job queue: the JDK queue locks, and ticks are hot. |
@@ -811,9 +811,9 @@ runtime" is the Java runtime `euhedral-graph` is derived from (its `runtime/grap
 | H6, H7 mapper | hardware-utils `TopologyMapper` | `Published` (no GC). |
 | G1-G3 completions | none; nearest core `QueueIngestSink` | A request that finds the poll held leaves a wakeup for the holder (`request_pending`, as `QueueIngestSink`'s); the lane pool lives with the source (a marker is reached when its lane says so, also after `complete`, as in Java); the poll state is a `SourceCell`, the state a holder mutates; a registration whose marker is still unreached is leaked and counted instead of finished when it is cancelled (at drop, by a sweep, or refused after `complete`), because the device may still use what it holds. |
 | G4 join | graph runtime `Join` | In the lane-source plan. |
-| G5 latch | none; `CompletableFuture` | — |
-| G6 sequencer | graph runtime `Sequencer` | None. |
-| G7-G9 lake | graph runtime `FrameLake` implementation (both modes) | `Published` for the generation (no GC); retirements held in `retiring`. |
+| G5 latch | none; `CompletableFuture` | Removed with `Latch` (user decision: a blocking wait for the lattice's work is not needed; the main thread checks periodically with a one-shot). It was the last blocking call in `euhedral-graph`. |
+| G6 sequencer | graph runtime `Sequencer` | A panic in `emit` resumes on the releasing thread once the drain ended; Java logs it (the Rust caller of `complete` sees it). Entries are `Arc`s (no GC); `len` is the order queue's length. `ready` is release/acquire and the work-in-progress count is the one read-modify-write (the claim). |
+| G7-G9 lake | graph runtime `FrameLake` implementation (both modes) | `Published` for the generation (no GC), with the attach lock's own strong reference to the set for the lifecycle side; retirements held in `retiring`. The terminating unit stores `idle_since` before it lowers the count and the watch reads the count before the time (Java stores after the decrement, so a watch that sees the count at zero can read the previous idle time and detach a set that just went idle: a Java bug). The watch's downstream is a `DownstreamSlot`. |
 | G10-G15 stage graph | graph runtime `StageGraph`, `StageFrame`, `AbstractQuantum` | Wider-than-64-lane masks. |
 | I1-I6 io_uring | graph runtime `AsyncReads`, `UringBackend` | Operations written in place behind a reserve step (no allocation per operation). I1, I2: a request that finds the front entered leaves a wakeup for the holder (`request_pending`, as `QueueIngestSink`'s). |
 | I7-I15 Windows | graph runtime `CompletionPortBackend`, `IoRingBackend` | `register` for sockets (Java reads files only); pool-job results have no counterpart. |
