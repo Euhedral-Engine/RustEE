@@ -8,7 +8,7 @@
 //! - Nothing on the lattice waits for the device, and nothing is locked: a replay's completion arrives as a frame,
 //!   which checks the result, updates the arguments, submits the next replay and arms its retirement. Lane a's
 //!   submitter and the graph have one owner at a time: each continuation frame owns them, uses them, and hands them to
-//!   the next (`retire_into` carries the stream with its continuation). The main thread waits on a latch for the last
+//!   the next (`retire_into` carries the stream with its continuation). The main thread checks a one-shot for the last
 //!   frame, which hands them back so that dropping them (which waits for the device) happens there.
 //!
 //! Run with `cargo run -p euhedral-gpu --features cuda --example graph_replay`; NVRTC is found through
@@ -24,12 +24,13 @@ use euhedral_core::control_plane::ControlPlaneLattice;
 use euhedral_core::frames::Frame;
 use euhedral_core::generics::LatticeSource;
 use euhedral_core::impls::DefaultExecutor;
+use euhedral_data_structures::sync::{OneShotReceiver, OneShotSender, one_shot};
 use euhedral_gpu::cuda::{CudaGpu, CudaGraph, CudaKernel, CudaModule, CudaStream};
 use euhedral_gpu::{
     Args, CompileOptions, Enqueue, Gpu, GpuError, Graph, Launch, Module, OnceFrame, Sequence,
     Stream, StreamOptions, retire_into, retire_into_with,
 };
-use euhedral_graph::{Completions, Latch, LatchSetter};
+use euhedral_graph::Completions;
 use euhedral_hardware_utils::affinity;
 use euhedral_hardware_utils::util::CpuSet;
 use euhedral_memory::cuda::{DeviceMemory, PinnedHost};
@@ -86,23 +87,45 @@ struct Outcome {
 
 /// The way out of the chain. If the chain is dropped without finishing (a retirement that could not be armed, a
 /// lattice that closed early), the guard still ends the main thread's wait.
-struct Finish(Option<LatchSetter<Outcome>>);
+struct Finish(Option<OneShotSender<Outcome>>);
 
 impl Finish {
     fn with(mut self, outcome: Outcome) {
-        if let Some(setter) = self.0.take() {
-            setter.set(outcome);
+        if let Some(sender) = self.0.take() {
+            sender.send(outcome);
         }
     }
 }
 
 impl Drop for Finish {
     fn drop(&mut self) {
-        if let Some(setter) = self.0.take() {
-            setter.set(Outcome {
+        if let Some(sender) = self.0.take() {
+            sender.send(Outcome {
                 result: Err("the chain ended before it finished".into()),
                 parts: None,
             });
+        }
+    }
+}
+
+/// How long the main thread checks for the lattice's work before it gives up.
+const PATIENCE: Duration = Duration::from_secs(120);
+
+/// The main thread checks `receiver` periodically, as the owner of a lattice checks on its work: nothing parks.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the main thread of the example has nothing to run while the lattice works: it checks, then sleeps"
+)]
+fn check_until_set<T: Send>(mut receiver: OneShotReceiver<T>, what: &str) -> Result<T, String> {
+    let deadline = std::time::Instant::now() + PATIENCE;
+    loop {
+        match receiver.try_take() {
+            Ok(Some(value)) => return Ok(value),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Ok(None) => return Err(format!("{what} did not finish in {PATIENCE:?}")),
+            Err(error) => return Err(format!("{what}: {error}")),
         }
     }
 }
@@ -331,15 +354,15 @@ fn run() -> Result<(), String> {
             unsafe { q.copy_to_device(x.addr, staging.addr as *const u8, BYTES) }
         })
         .map_err(|e| e.to_string())?;
-    let (uploaded_set, uploaded) = Latch::new();
+    let (uploaded_set, uploaded) = one_shot();
     retire_into(lane_a, &completions, move |mut stream, ticket| {
         let failure = stream.confirm_retired(ticket);
         Box::new(OnceFrame::new(LANE, move || {
-            uploaded_set.set((stream, failure));
+            uploaded_set.send((stream, failure));
         }))
     })
     .map_err(|e| e.error.to_string())?;
-    let (mut lane_a, failure) = uploaded.wait();
+    let (mut lane_a, failure) = check_until_set(uploaded, "the upload")?;
     if let Some(error) = failure {
         return Err(format!("the upload: {error}"));
     }
@@ -350,7 +373,7 @@ fn run() -> Result<(), String> {
         .record(&mut [&mut lane_a, &mut lane_b], |q| shared.sequence(q, 0))
         .map_err(|e| e.to_string())?;
     drop(lane_b);
-    let (setter, waiter) = Latch::new();
+    let (setter, waiter) = one_shot();
     arm(
         Chain {
             shared: shared.clone(),
@@ -361,7 +384,7 @@ fn run() -> Result<(), String> {
         0,
     );
 
-    let outcome = waiter.wait();
+    let outcome = check_until_set(waiter, "the chain")?;
 
     // Shut down: nothing is pending once the last frame ran. The streams and the graph come home to be dropped here.
     let (p50, p99, max) = completions.lateness_us();

@@ -20,7 +20,6 @@
 //! | [`LanePool`], [`Marker`], [`DeviceQueue`] | [`lanes`] | device lanes and markers |
 //! | [`StageGraph`] | [`stage_graph`] | static stage DAGs run per quantum |
 //! | [`Lake`], [`UnitGuard`] | [`lake`] | the pool of ready work of one kind |
-//! | [`Latch`] | [`latch`] | a one-shot hand-off from a frame to the main thread |
 //!
 //! Every public type is also re-exported at the crate root. Types of `euhedral-core` (`Frame`,
 //! `LatticeSource`, ...) are not: import them from `euhedral_core`.
@@ -44,7 +43,6 @@ pub mod join;
 pub mod lake;
 pub mod lane_source;
 pub mod lanes;
-pub mod latch;
 pub mod sequencer;
 pub mod stage_graph;
 pub(crate) mod sync;
@@ -59,7 +57,6 @@ pub use lane_source::{
     LaneState, LaneSubmit, LaneWork, Outcome, Retired,
 };
 pub use lanes::{DeviceQueue, LaneId, LanePool, LanePoolBuilder, Marker, QueueId};
-pub use latch::{Latch, LatchSetter, LatchWaiter};
 pub use sequencer::{Sequencer, Slot};
 pub use stage_graph::{
     DEFAULT_RETRY_BACKSTOP, EdgeKind, ExternalEdge, GraphError, GraphRuntime, QuantumOutcome,
