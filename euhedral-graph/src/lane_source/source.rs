@@ -226,7 +226,7 @@ impl<S: LaneSubmit, X: LaneState, W: LaneWork<S, X>> LaneSource<S, X, W> {
             }
             self.metrics
                 .intake_to_run_ns
-                .record(ns(clock.saturating_duration_since(item.delivered)));
+                .record_owned(ns(clock.saturating_duration_since(item.delivered)));
         }
         item.wait = None;
         // One clock read per item: the end of the previous item is the start of this one.
@@ -237,7 +237,7 @@ impl<S: LaneSubmit, X: LaneState, W: LaneWork<S, X>> LaneSource<S, X, W> {
         };
         *clock = Instant::now();
         if let Some(histogram) = self.metrics.item_ns.get(item.work.kind()) {
-            histogram.record(ns(clock.saturating_duration_since(started)));
+            histogram.record_owned(ns(clock.saturating_duration_since(started)));
         }
         match outcome {
             Outcome::Submitted { retire } => match inner.submitter.mark() {
@@ -491,7 +491,7 @@ impl<S: LaneSubmit, X: LaneState, W: LaneWork<S, X>> LaneSource<S, X, W> {
                     });
             }
         }
-        self.metrics.ready_depth.record(inner.ready.len() as f64);
+        self.metrics.ready_depth.record_owned(inner.ready.len() as f64);
         self.publish(inner);
         self.metrics.service_ns.record(ns(started.elapsed()));
     }
