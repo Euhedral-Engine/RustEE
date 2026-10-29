@@ -7,7 +7,9 @@ pub(crate) use loom::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 pub(crate) use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// An `UnsafeCell` whose accesses are closures over a raw pointer, the shape `loom`'s cell has, so the
-/// model checker sees each access and can report an unordered one.
+/// model checker sees each access and can report an unordered one. The checker tracks the closure's
+/// duration only: a reference made from the pointer and kept after `f` returns is not checked, so code under
+/// a model reads through an access that ends inside the closure (an owned `take`, a copy).
 #[cfg(not(loom))]
 #[derive(Debug)]
 pub(crate) struct UnsafeCell<T>(std::cell::UnsafeCell<T>);

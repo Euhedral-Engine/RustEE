@@ -14,23 +14,48 @@
 //! - A part writes its slot plainly before that read-modify-write and the last arrival reads the slots plainly
 //!   after it.
 //! - `closed[part]` says whether a part may still end. An arrival takes it with one `swap(true, Acquire)`, so
-//!   exactly one of two racing arrivals of a part proceeds; arming stores it with `Release`, which is what
-//!   makes a slot's earlier readers happen before the new round's write to it.
+//!   exactly one of two racing arrivals of a part proceeds, and an arrival checks it before it touches the
+//!   count. Arming stores the count first and then reopens the parts with `Release`: a late arrival of the
+//!   previous round meets a closed part, and a part's reopening is what makes the slot's earlier reads
+//!   happen before the new round's write to it.
 //!
 //! # The continuation and the next round
 //!
-//! The continuation runs with a [`Round`], which lends the slots. [`Round::rearm`] consumes it, so the
-//! values cannot be read once the next round can write them, and the continuation may deliver the next
-//! round's work after calling it. Dropping the round without re-arming leaves the join idle, ready for
-//! [`Join::reset`]. [`Join::reset`] refuses while a round is armed or its continuation is running.
+//! The continuation runs with a [`Round`], which lends the slots. Whatever it does not take, the round
+//! drops when it ends, so a slot is empty whenever a part can next write it. The round ends in one of three
+//! ways, each consuming it so the values cannot be read once the next round can write them:
+//! - [`Round::rearm`] starts the next round; the continuation may deliver that round's work after it;
+//! - [`Round::end`] (or dropping the round) leaves the join idle, ready for [`Join::reset`];
+//! - a panic in the continuation drops the round, which is `end`.
+//!
+//! [`Join::reset`] refuses while a round is armed or its round is still held. A continuation that hands
+//! the unit holding the join to another worker ends the round **first**:
+//!
+//! ```
+//! # use euhedral_graph::Join;
+//! # fn put_back(_: u32) {}
+//! let join = Join::<u32>::with_capacity(2, |mut round| {
+//!     let sum = round.take(0).unwrap_or(0) + round.take(1).unwrap_or(0);
+//!     round.end(); // before the unit can be picked up and re-armed
+//!     put_back(sum);
+//! });
+//! join.reset(2);
+//! join.arrive(0, 1);
+//! join.arrive(1, 2);
+//! join.reset(2); // armed again
+//! ```
 
 #![allow(
     unsafe_code,
     reason = "parts own their slots until the count publishes them"
 )]
 
+use std::any::Any;
+use std::cell::Cell;
 use std::fmt;
+use std::marker::PhantomData;
 use std::mem;
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::Arc;
 
 use crate::sync::{AtomicBool, AtomicUsize, Ordering, UnsafeCell};
@@ -84,12 +109,28 @@ impl<T> fmt::Debug for Join<T> {
     }
 }
 
-/// The values of a finished round, lent to the continuation. [`Round::rearm`] starts the next round and
-/// ends the loan.
+/// The values of a finished round, lent to the continuation. The loan ends, and the join can be armed
+/// again, when the round is dropped, [`Round::end`]ed or [`Round::rearm`]ed. A continuation that hands
+/// the join's unit to anyone else (a pool, another worker) ends the round first: until then the join
+/// refuses [`Join::reset`].
+///
+/// `&Round` lends `&T`, so a round is `Sync` only when `T` is, and `Send` when `T` is `Send`:
+///
+/// ```compile_fail
+/// use std::cell::Cell;
+/// fn is_sync<T: Sync>() {}
+/// is_sync::<euhedral_graph::Round<'static, Cell<u8>>>();
+/// ```
 pub struct Round<'a, T> {
     join: &'a Join<T>,
     parts: usize,
+    /// Makes the round `!Sync` for every `T`; the impl below restores `Sync` for `T: Sync`.
+    _not_sync: PhantomData<Cell<()>>,
 }
+
+// SAFETY: `&Round` gives out `&T` only (`get`, `values`); `take` needs `&mut`. Sharing `&T` between threads
+// is exactly `T: Sync`. `Send` follows from the fields: `&Join<T>` is `Send` when `T: Send`.
+unsafe impl<T: Send + Sync> Sync for Round<'_, T> {}
 
 impl<T> fmt::Debug for Round<'_, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -150,16 +191,31 @@ impl<T> Round<'_, T> {
 
     /// Arms the next round of `parts` parts (1 to the capacity) and ends this loan: the next round's
     /// parts may arrive, on any thread, as soon as this returns. The join's usual call from its
-    /// continuation, before it delivers the next round's work.
+    /// continuation, before it delivers the next round's work. Values the continuation did not take are
+    /// dropped first.
     ///
     /// # Panics
-    /// When `parts` is 0 or above the capacity.
+    /// When `parts` is 0 or above the capacity. If a value's drop panics, the next round is armed and
+    /// the panic is raised after.
     pub fn rearm(self, parts: usize) {
         let join = self.join;
+        let round = self.parts;
         join.check_parts(parts);
         // The loan ends here; dropping `self` would mark the join idle.
         mem::forget(self);
+        let panic = join.clear(round);
         join.arm(parts);
+        if let Some(panic) = panic {
+            resume_unwind(panic);
+        }
+    }
+
+    /// Ends the round: drops the values the continuation did not take and leaves the join idle, ready
+    /// for [`Join::reset`]. Dropping the round does the same; call this where the continuation hands the
+    /// unit that holds the join to anyone else, before it does, because until the round ends the join
+    /// refuses to be armed.
+    pub fn end(self) {
+        drop(self);
     }
 }
 
@@ -167,7 +223,13 @@ impl<T> Drop for Round<'_, T> {
     /// A continuation that does not re-arm leaves the join idle, ready for [`Join::reset`]. This also runs
     /// when the continuation panics.
     fn drop(&mut self) {
+        let panic = self.join.clear(self.parts);
         self.join.pending.store(IDLE, Ordering::SeqCst);
+        if let Some(panic) = panic
+            && !std::thread::panicking()
+        {
+            resume_unwind(panic);
+        }
     }
 }
 
@@ -248,14 +310,33 @@ impl<T> Join<T> {
         );
     }
 
-    /// Opens the first `parts` parts and publishes the round. The caller owns the join's state: `pending`
-    /// is `RESETTING`, or 0 inside a continuation that gave up its loan.
+    /// Drops the values of a finished round of `parts` parts that its continuation left in the slots, so
+    /// a slot is empty whenever a part can next write it: a smaller later round keeps nothing alive, and
+    /// an arrival never runs a drop before its read-modify-write. A value whose drop panics does not stop
+    /// the others; the first panic is returned. The caller owns the round.
+    fn clear(&self, parts: usize) -> Option<Box<dyn Any + Send>> {
+        let mut panic = None;
+        for slot in &self.slots[..parts] {
+            // SAFETY: the caller owns the finished round: every part ended, and none can write before the
+            // join is armed.
+            let value = slot.value.with_mut(|cell| unsafe { (*cell).take() });
+            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(value))) {
+                panic.get_or_insert(payload);
+            }
+        }
+        panic
+    }
+
+    /// Publishes a round of `parts` parts. The caller owns the join's state: `pending` is `RESETTING`, or 0
+    /// inside a continuation that gave up its loan.
     fn arm(&self, parts: usize) {
         self.parts.store(parts, Ordering::Relaxed);
+        // The count first: until the parts are reopened below, a late arrival of the previous round meets a
+        // closed part and is refused before it touches the count.
+        self.pending.store(parts, Ordering::SeqCst);
         for (index, slot) in self.slots.iter().enumerate() {
             slot.closed.store(index >= parts, Ordering::Release);
         }
-        self.pending.store(parts, Ordering::SeqCst);
     }
 
     /// Branch `part` arrived with `value`. Each part arrives or is abandoned exactly once.
@@ -308,7 +389,11 @@ impl<T> Join<T> {
     /// The last arrival of a round.
     fn finish(&self) {
         let parts = self.parts.load(Ordering::Relaxed);
-        let mut round = Round { join: self, parts };
+        let mut round = Round {
+            join: self,
+            parts,
+            _not_sync: PhantomData,
+        };
         match &self.then {
             Then::Each(then) => then(round),
             Then::Once(once) => {
@@ -587,21 +672,161 @@ mod tests {
     }
 
     #[test]
-    fn values_a_round_leaves_behind_are_dropped_with_the_join() {
+    fn values_a_round_leaves_untaken_are_dropped_when_the_round_ends() {
         let live = Arc::new(());
         let join = Join::<Arc<()>>::with_capacity(2, |_| {});
         join.reset(2);
         join.arrive(0, live.clone());
         join.arrive(1, live.clone());
-        assert_eq!(Arc::strong_count(&live), 3);
+        // The continuation took nothing: the round's end drops what it left, a smaller later round
+        // does not keep it alive.
+        assert_eq!(Arc::strong_count(&live), 1);
+        join.reset(1);
+        join.abandon(0);
+        assert_eq!(Arc::strong_count(&live), 1);
+    }
+
+    #[test]
+    fn values_of_a_round_that_never_completes_are_dropped_with_the_join() {
+        let live = Arc::new(());
+        let join = Join::<Arc<()>>::with_capacity(2, |_| {});
+        join.reset(2);
+        join.arrive(0, live.clone());
+        assert_eq!(Arc::strong_count(&live), 2);
         drop(join);
         assert_eq!(Arc::strong_count(&live), 1);
+    }
+
+    /// A value whose drop panics while the round is being released.
+    struct PanicsOnDrop(Arc<AtomicUsize>);
+
+    impl Drop for PanicsOnDrop {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::AcqRel);
+            if !std::thread::panicking() {
+                panic!("drop");
+            }
+        }
+    }
+
+    #[test]
+    fn a_value_whose_drop_panics_does_not_strand_the_join() {
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let join = Join::<PanicsOnDrop>::with_capacity(2, |_| {});
+        join.reset(2);
+        join.arrive(0, PanicsOnDrop(dropped.clone()));
+        // The last arrival's round release drops both values; the first panic comes out of `arrive`,
+        // after every value was dropped and the join was released.
+        assert!(
+            catch_unwind(AssertUnwindSafe(
+                || join.arrive(1, PanicsOnDrop(dropped.clone()))
+            ))
+            .is_err()
+        );
+        assert_eq!(dropped.load(Ordering::Acquire), 2);
+        join.reset(1);
+        join.abandon(0);
+    }
+
+    /// The text of a panic.
+    fn message(payload: Box<dyn std::any::Any + Send>) -> String {
+        match payload.downcast::<String>() {
+            Ok(text) => *text,
+            Err(payload) => payload
+                .downcast::<&str>()
+                .map(|t| t.to_string())
+                .unwrap_or_default(),
+        }
+    }
+
+    #[test]
+    fn a_duplicate_arrival_around_a_re_arm_is_refused_and_the_count_survives() {
+        let slot: Arc<OnceLock<Arc<Join<u8>>>> = Arc::new(OnceLock::new());
+        let weak = Arc::downgrade(&slot);
+        let refusals = Arc::new(Mutex::new(Vec::new()));
+        let record = refusals.clone();
+        let rounds = Arc::new(AtomicUsize::new(0));
+        let counted = rounds.clone();
+        let join = Arc::new(Join::<u8>::with_capacity(2, move |round| {
+            let join = weak.upgrade().unwrap().get().unwrap().clone();
+            // Before the re-arm the round's parts are all closed: a late duplicate is refused ...
+            let late = catch_unwind(AssertUnwindSafe(|| join.arrive(0, 9)));
+            record.lock().unwrap().push(message(late.unwrap_err()));
+            if counted.fetch_add(1, Ordering::AcqRel) == 0 {
+                round.rearm(2);
+            }
+        }));
+        slot.set(join.clone()).unwrap();
+        join.reset(2);
+        join.arrive(0, 1);
+        join.arrive(1, 2);
+        // ... and the re-armed round still needs both of its parts.
+        join.arrive(0, 3);
+        assert_eq!(rounds.load(Ordering::Acquire), 1);
+        let duplicate = catch_unwind(AssertUnwindSafe(|| join.arrive(0, 4)));
+        assert!(message(duplicate.unwrap_err()).contains("ended twice"));
+        join.arrive(1, 5);
+        assert_eq!(rounds.load(Ordering::Acquire), 2);
+        assert!(
+            refusals
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|m| m.contains("ended twice"))
+        );
+    }
+
+    #[test]
+    #[allow(clippy::disallowed_methods)] // The test's own threads stand for the workers that take a pooled unit.
+    fn a_unit_handed_back_inside_the_continuation_is_re_armed_at_once_by_another_thread() {
+        const ROUNDS: usize = if cfg!(miri) { 6 } else { 60 };
+        type Handles = Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>;
+        let handles: Handles = Arc::new(Mutex::new(Vec::new()));
+        let runs = Arc::new(AtomicUsize::new(0));
+        let slot: Arc<OnceLock<Arc<Join<usize>>>> = Arc::new(OnceLock::new());
+        let (weak, spawned, counted) = (Arc::downgrade(&slot), handles.clone(), runs.clone());
+        let join = Arc::new(Join::<usize>::with_capacity(2, move |mut round| {
+            let r = counted.fetch_add(1, Ordering::AcqRel);
+            assert_eq!((round.take(0), round.take(1)), (Some(r), Some(r + 1)));
+            // The unit goes back to the pool: the round ends before another worker can take it.
+            round.end();
+            if r + 1 < ROUNDS {
+                let unit = weak.upgrade().unwrap().get().unwrap().clone();
+                let next = std::thread::spawn(move || {
+                    unit.reset(2); // must not find the previous round still held
+                    unit.arrive(0, r + 1);
+                    unit.arrive(1, r + 2);
+                });
+                spawned.lock().unwrap().push(next);
+            }
+        }));
+        slot.set(join.clone()).unwrap();
+        join.reset(2);
+        join.arrive(0, 0);
+        join.arrive(1, 1);
+        loop {
+            let next = handles.lock().unwrap().pop();
+            let Some(next) = next else { break };
+            next.join().unwrap();
+        }
+        assert_eq!(runs.load(Ordering::Acquire), ROUNDS);
+    }
+
+    /// `Round` lends `&T` across threads only when `T: Sync`.
+    #[test]
+    fn a_round_is_sync_exactly_when_its_values_are() {
+        fn sync<T: Sync>() {}
+        fn send<T: Send>() {}
+        sync::<Round<'static, u8>>();
+        send::<Round<'static, std::cell::Cell<u8>>>();
     }
 }
 
 /// Model checks of the arrival protocol: `RUSTFLAGS="--cfg loom" cargo test -p euhedral-graph --release --lib
 /// join::loom`. Each explores every interleaving of the threads' atomic operations the memory model allows,
-/// and `loom`'s cell reports a slot access that is not ordered after the write it reads.
+/// and `loom`'s cell reports a slot access that is not ordered after the write it reads. The models read
+/// slots with `take`: a reference from `get` outlives the cell's closure, so a read through it is not
+/// checked.
 #[cfg(all(test, loom))]
 mod loom {
     use ::loom::sync::Arc;
@@ -659,7 +884,7 @@ mod loom {
         ::loom::model(|| {
             let runs = Arc::new(AtomicUsize::new(0));
             let counted = runs.clone();
-            let join = Arc::new(Join::<usize>::with_capacity(2, move |round| {
+            let join = Arc::new(Join::<usize>::with_capacity(2, move |mut round| {
                 let r = counted.fetch_add(1, Ordering::SeqCst);
                 // Round 0 abandons part 1; round 1 abandons part 0. Neither sees the other's value.
                 let expected = if r == 0 {
@@ -667,10 +892,7 @@ mod loom {
                 } else {
                     [None, Some(value(1, 1))]
                 };
-                assert_eq!(
-                    round.values().map(|v| v.copied()).collect::<Vec<_>>(),
-                    expected
-                );
+                assert_eq!([round.take(0), round.take(1)], expected);
             }));
             for round in 0..2 {
                 join.reset(2);
@@ -691,6 +913,51 @@ mod loom {
                 }
                 assert_eq!(runs.load(Ordering::SeqCst), round + 1);
             }
+        });
+    }
+
+    #[test]
+    fn loom_a_unit_ended_and_handed_over_is_re_armed_by_another_thread() {
+        ::loom::model(|| {
+            let handed = Arc::new(AtomicBool::new(false));
+            let flag = handed.clone();
+            let runs = Arc::new(AtomicUsize::new(0));
+            let counted = runs.clone();
+            let join = Arc::new(Join::<usize>::with_capacity(2, move |mut round| {
+                if counted.fetch_add(1, Ordering::SeqCst) == 0 {
+                    assert_eq!(round.take(0), Some(value(0, 0)));
+                    assert_eq!(round.take(1), Some(value(0, 1)));
+                    // The unit goes to the pool: the round ends first.
+                    round.end();
+                    flag.store(true, Ordering::Release);
+                } else {
+                    // The taker's round of one abandoned part.
+                    assert_eq!((round.len(), round.take(0)), (1, None));
+                }
+            }));
+            join.reset(2);
+            let first: Vec<_> = (0..2)
+                .map(|part| {
+                    let join = join.clone();
+                    thread::spawn(move || join.arrive(part, value(0, part)))
+                })
+                .collect();
+            let taker = {
+                let join = join.clone();
+                thread::spawn(move || {
+                    while !handed.load(Ordering::Acquire) {
+                        thread::yield_now();
+                    }
+                    // Another worker takes the unit and arms it at once.
+                    join.reset(1);
+                    join.abandon(0);
+                })
+            };
+            for thread in first {
+                thread.join().unwrap();
+            }
+            taker.join().unwrap();
+            assert_eq!(runs.load(Ordering::SeqCst), 2);
         });
     }
 

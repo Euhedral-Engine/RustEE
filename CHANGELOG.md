@@ -9,8 +9,8 @@ semantics and the tests that pin it.
 - `Join::with_capacity(capacity, then)` makes a cell for a pooled unit: `capacity` part slots and a continuation stored
   once. `Join::reset(parts)` arms a round (1 to the capacity); `arrive(part, value)` and `abandon(part)` end a part.
 - The continuation receives a `Round`: `len`, `get`, `take` and `values` read the round's values (`None` for an
-  abandoned part), and `Round::rearm(parts)` starts the next round and ends the loan. A continuation that does not
-  re-arm leaves the join idle, ready for `reset`.
+  abandoned part). The round ends with `Round::rearm(parts)` (starts the next round), `Round::end()` or a drop (the
+  join is idle, ready for `reset`). It drops the values the continuation left. `Round` is `Sync` only when `T` is.
 - `Join::new(parts, then)` keeps its behaviour: it arms at construction and runs the `FnOnce` with a `Vec` of the
   values (its one allocation per round). A join made by `new` has one round; `reset` on it panics.
 - `new`, `arrive` and `abandon` are unchanged for callers. The `Mutex` is gone.
@@ -22,9 +22,12 @@ sender, round after round) had to build a new `Arc<Join>` and boxed continuation
 ```rust
 let join = Join::<u32>::with_capacity(2, |mut round| {
     let (a, b) = (round.take(0), round.take(1));
-    deliver(a, b);
-    // Another round follows: arm it before delivering its work.
+    // Another round follows: arm it, then deliver its work.
     // round.rearm(2);
+    // Otherwise, end the round BEFORE the unit that holds the join goes back to a pool:
+    // until then `reset` refuses, and another worker that takes the unit would panic.
+    round.end();
+    deliver(a, b);
 });
 join.reset(2);
 join.arrive(0, 10); // from any thread
@@ -36,18 +39,21 @@ Semantics:
 - A part is taken by one swap on its own flag, so two arrivals of one part cannot both write: the second panics. An
   arrival at a part beyond the round, at a join that is not armed, or after its round completed panics the same way.
   These checks run in every build, because a slot is shared memory.
-- `reset` is one compare-and-swap from the idle state. It panics while a round is armed or its continuation runs.
+- `reset` is one compare-and-swap from the idle state. It panics while a round is armed or its round is still held (not yet ended).
   `Round::rearm` is the form for inside the continuation: it consumes the round, so the values cannot be read once the
-  next round's parts can write them.
-- Values a round leaves in a slot are replaced when the next round's part ends, or dropped with the join.
+  next round's parts can write them. `rearm` stores the count and then reopens the parts, so a late arrival of the
+  previous round is refused before it touches the count.
+- Values a round leaves in a slot are dropped when the round ends (a panicking drop does not strand the join: every
+  value is dropped, the join is released, then the panic continues), so a slot is empty whenever a part can write it.
 - The continuation must not wait; it delivers work.
 
 **Tests.** `a_join_of_64_parts_from_8_threads_runs_once_per_round`, `reset_from_inside_the_continuation_arms_the_next_round`,
 `a_re_armed_round_never_sees_the_previous_rounds_values`, `fewer_parts_than_capacity_use_only_the_first_slots`,
-`an_abandoned_part_reaches_the_continuation_as_none`, `reset_before_the_round_completes_panics`,
+`an_abandoned_part_reaches_the_continuation_as_none`, `a_unit_handed_back_inside_the_continuation_is_re_armed_at_once_by_another_thread`,
+`a_duplicate_arrival_around_a_re_arm_is_refused_and_the_count_survives`, `a_value_whose_drop_panics_does_not_strand_the_join`, a `compile_fail` doctest that `Round<Cell<_>>` is not `Sync`, `reset_before_the_round_completes_panics`,
 `reset_through_the_join_while_the_continuation_runs_is_refused` and the arrival-refusal tests (`join`);
 `a_join_rearmed_10_000_times_allocates_nothing_after_construction` (`tests/join_alloc.rs`, a counting allocator); the
-`loom` models `loom_two_parts_run_the_continuation_once_and_rearm`,
+`loom` models `loom_two_parts_run_the_continuation_once_and_rearm`, `loom_a_unit_ended_and_handed_over_is_re_armed_by_another_thread`,
 `loom_an_abandoned_part_and_an_outside_reset_start_a_clean_round` and `loom_one_part_racing_itself_is_taken_once`
 (`RUSTFLAGS="--cfg loom" cargo test -p euhedral-graph --release --lib join::loom`).
 
