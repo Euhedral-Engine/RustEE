@@ -2,7 +2,7 @@
 //!
 //! Dekker's pattern needs a full fence on both sides: a reader stores its announcement and then loads the pointer; a
 //! writer stores the pointer and then loads the announcements; each must see the other's store or be seen by it. A
-//! reader that pays the fence pays it on the frame's path. The asymmetric form (userspace RCU's "memb" flavour) moves
+//! reader that pays the fence pays it on every read. The asymmetric form (userspace RCU's "memb" flavour) moves
 //! the cost: the reader stores, then only stops the compiler from reordering (`compiler_fence`); the writer, between
 //! its store and its loads, forces a full barrier on every running thread of the process:
 //!

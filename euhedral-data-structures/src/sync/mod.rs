@@ -3,7 +3,7 @@
 //! - [`SetOnce`]: a value installed at most once by a compare-and-set, read with an acquire load.
 //! - [`Published`]: an atomically replaceable shared value with count-free reads, reclaimed once every reader's epoch
 //!   has passed (the stand-in for a collector).
-//! - [`Admission`]: a reader count with a retired bit, Java's `admission` of a routing state: readers take a count while
+//! - [`Admission`]: a reader count with a retired bit (Java's `admission` word): readers take a count while
 //!   the state is current, and a writer that retires it learns when the last reader leaves.
 //! - [`ClaimCell`]: plain state that one thread at a time claims with a compare-and-set that fails instead of
 //!   waiting.

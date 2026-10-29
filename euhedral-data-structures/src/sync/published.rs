@@ -25,8 +25,8 @@ struct SlotNode {
 /// The global epoch and the announcements of the threads that read [`Published`] values.
 ///
 /// This is the stand-in for the garbage collector that frees what a replaced reference pointed to once no thread
-/// can still read it. A lattice has one domain: each worker of its registry announces a quiescent point once per
-/// cycle ([`EpochSlot::quiescent`]) and marks itself idle before it parks ([`EpochSlot::idle`]); any other thread
+/// can still read it. A reader thread that works in repeated passes announces a quiescent point once per
+/// pass ([`EpochSlot::quiescent`]) and marks itself idle before it parks ([`EpochSlot::idle`]); any other thread
 /// that reads a published value pins the domain for the length of the read ([`EpochSlot::pin`]).
 ///
 /// The slots form a push-only list. A slot a thread gave back is reused by the next [`register`](Self::register);
@@ -179,13 +179,13 @@ impl fmt::Debug for EpochDomain {
     }
 }
 
-/// One thread's slot in an [`EpochDomain`]. The slot belongs to the thread that uses it: it is `Send`, so a worker
+/// One thread's slot in an [`EpochDomain`]. The slot belongs to the thread that uses it: it is `Send`, so a thread
 /// can be handed its slot, and not `Sync`.
 ///
-/// - A worker calls [`quiescent`](Self::quiescent) at the start of each cycle, which promises it holds no
+/// - A thread that works in repeated passes calls [`quiescent`](Self::quiescent) at the start of each pass, which promises it holds no
 ///   reference to a published value from before the call, and [`idle`](Self::idle) before it parks. Between the
 ///   two, the references it loaded stay valid, and a [`pin`](Self::pin) costs one load.
-/// - A thread that is not in a cycle [`pin`](Self::pin)s for the length of a read.
+/// - A thread that is not in a pass [`pin`](Self::pin)s for the length of a read.
 ///
 /// Dropping the slot makes it idle and frees it for the next thread.
 pub struct EpochSlot {
@@ -352,8 +352,8 @@ struct Deferred<T> {
 /// dropped on the thread that finds it free.
 ///
 /// The destructor of `T` must not panic: a sweep takes the list whole and drops the freeable values one by one, so
-/// a panic in one leaves the rest of that sweep's list unfreed. (The cells in the workspace hold weak references
-/// and small records, whose destructors do not panic.)
+/// a panic in one leaves the rest of that sweep's list unfreed. (A cell holding weak references or small
+/// records has such destructors.)
 pub struct Published<T> {
     domain: Arc<EpochDomain>,
     /// `Arc::into_raw` of the current value, or null.
@@ -585,7 +585,7 @@ impl<T: Send + Sync> Retired<'_, T> {
     }
 
     /// Frees the value once every reader has passed, spinning until `deadline`; hands the retirement back if the
-    /// readers have not passed by then. For lifecycle threads that are not themselves readers in a cycle: a reader
+    /// readers have not passed by then. For lifecycle threads that are not themselves readers in a pass: a reader
     /// that waits on its own announcement waits for the deadline.
     pub fn wait(self, deadline: Instant) -> Result<(), Self> {
         loop {

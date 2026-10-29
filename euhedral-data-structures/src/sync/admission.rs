@@ -1,7 +1,7 @@
 use super::loom::{AtomicI64, Ordering};
 use std::fmt;
 
-/// A reader count with a retired bit: the admission a routing state is read under.
+/// A reader count with a retired bit: the admission that readers of a replaceable state take.
 ///
 /// A reader [`try_acquire`](Self::try_acquire)s a count while the state is current, uses the state, and
 /// [`release`](Self::release)s. A writer that replaces the state [`retire`](Self::retire)s it, which refuses new
@@ -9,7 +9,7 @@ use std::fmt;
 /// reader (or the writer, if there was none) releases what the state holds.
 ///
 /// The counter is one word: the readers in the low 63 bits and the retired bit as the sign bit, so "retired and
-/// without readers" is exactly [`RETIRED`](Self::RETIRED), one read. This is Java's `RoutingState.admission`:
+/// without readers" is exactly [`RETIRED`](Self::RETIRED), one read. This is Java's `admission` word:
 /// `tryAcquire` is a compare-and-set up while the word is not negative, `retire` a compare-and-set of the sign bit
 /// in, `release` a decrement. A reader that loaded the address of a state just before the writer replaced it may
 /// still count against it; the owner of the states keeps them allocated, and the reader's re-check against the
@@ -200,7 +200,7 @@ mod loom_tests {
     use loom::thread;
     use std::sync::Arc;
 
-    /// A routing state in miniature: the admission and the table readers use.
+    /// A replaceable state in miniature: the admission and the table readers use.
     struct State {
         admission: Admission,
         table: UnsafeCell<u32>,
@@ -274,8 +274,8 @@ mod loom_tests {
         });
     }
 
-    /// The vertex's release protocol in miniature: two routing states, a book (a lock) that serializes the remapper's
-    /// rewrite and every release, a `released` flag per state, and a table the release reads and clears.
+    /// The release protocol of a replaceable state in miniature: two states, a book (a lock) that serializes the
+    /// rewriter's rewrite and every release, a `released` flag per state, and a table the release reads and clears.
     struct Model {
         states: [ModelState; 2],
         current: AtomicPtr<ModelState>,
@@ -324,7 +324,7 @@ mod loom_tests {
                 .store(&self.states[0] as *const _ as *mut _, Ordering::Release);
         }
 
-        /// Java's `tryAcquireRoutingState`, then a read of the table under the count, then the release.
+        /// Java's `tryAcquire`, then a read of the table under the count, then the release.
         fn read(&self) -> Option<u32> {
             let pointer = self.current.load(Ordering::Acquire);
             // SAFETY: the states live as long as the model.
@@ -388,9 +388,9 @@ mod loom_tests {
         }
     }
 
-    // The remapper remaps twice, so the first state is recycled for generation 3 when its readers are gone; one
+    // The rewriter replaces the table twice, so the first state is recycled for generation 3 when its readers are gone; one
     // reader reads and releases (and may be the last reader of a retired generation, late), the other is stale:
-    // it loaded a pointer before the remaps and counts after them. Every generation the remapper retired is
+    // it loaded a pointer before the replacements and counts after them. Every generation the rewriter retired is
     // released exactly once, with its own table, never while a reader holds a count (loom reports a table read
     // or cleared concurrently with a rewrite), and a late release of a recycled state changes nothing.
     #[test]
