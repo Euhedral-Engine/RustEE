@@ -24,8 +24,10 @@ euhedral-graph = { path = ".", default-features = false, features = ["testing"] 
 # The credit-graph test checks the CPUs this process may run on.
 euhedral-hardware-utils = { path = "../euhedral-hardware-utils" }
 
-# The model checker behind `--cfg loom` (`RUSTFLAGS="--cfg loom" cargo test -p euhedral-graph --release --lib loom`).
-[target.'cfg(loom)'.dev-dependencies]
+# The model checker behind `--cfg loom` (`RUSTFLAGS="--cfg loom" cargo test -p euhedral-graph --release --lib join::loom`).
+# A build without that flag never sees it. It is a regular dependency because the library's own atomics are
+# what the model swaps, and the crate's self dev-dependency below builds the library without dev-dependencies.
+[target.'cfg(loom)'.dependencies]
 loom = "0.7"
 
 [lints.rust]

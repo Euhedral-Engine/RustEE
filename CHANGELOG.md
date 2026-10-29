@@ -3,6 +3,54 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## Re-armable `Join` (2026-10-29)
+
+**What.** `euhedral-graph`: `Join` is a lock-free fan-in cell that is armed again each round without allocating.
+- `Join::with_capacity(capacity, then)` makes a cell for a pooled unit: `capacity` part slots and a continuation stored
+  once. `Join::reset(parts)` arms a round (1 to the capacity); `arrive(part, value)` and `abandon(part)` end a part.
+- The continuation receives a `Round`: `len`, `get`, `take` and `values` read the round's values (`None` for an
+  abandoned part), and `Round::rearm(parts)` starts the next round and ends the loan. A continuation that does not
+  re-arm leaves the join idle, ready for `reset`.
+- `Join::new(parts, then)` keeps its behaviour: it arms at construction and runs the `FnOnce` with a `Vec` of the
+  values (its one allocation per round). A join made by `new` has one round; `reset` on it panics.
+- `new`, `arrive` and `abandon` are unchanged for callers. The `Mutex` is gone.
+
+**Why.** Every completion took a `Mutex`, and a unit that recycles (a pooled object that joins its retirement with its
+sender, round after round) had to build a new `Arc<Join>` and boxed continuation each time.
+
+**How.**
+```rust
+let join = Join::<u32>::with_capacity(2, |mut round| {
+    let (a, b) = (round.take(0), round.take(1));
+    deliver(a, b);
+    // Another round follows: arm it before delivering its work.
+    // round.rearm(2);
+});
+join.reset(2);
+join.arrive(0, 10); // from any thread
+join.abandon(1);    // the last arrival runs the continuation, once
+```
+Semantics:
+- The count is one atomic. An arrival writes its slot, then `fetch_sub(1, SeqCst)`; the arrival that read 1 runs the
+  continuation and sees every earlier arrival's value.
+- A part is taken by one swap on its own flag, so two arrivals of one part cannot both write: the second panics. An
+  arrival at a part beyond the round, at a join that is not armed, or after its round completed panics the same way.
+  These checks run in every build, because a slot is shared memory.
+- `reset` is one compare-and-swap from the idle state. It panics while a round is armed or its continuation runs.
+  `Round::rearm` is the form for inside the continuation: it consumes the round, so the values cannot be read once the
+  next round's parts can write them.
+- Values a round leaves in a slot are replaced when the next round's part ends, or dropped with the join.
+- The continuation must not wait; it delivers work.
+
+**Tests.** `a_join_of_64_parts_from_8_threads_runs_once_per_round`, `reset_from_inside_the_continuation_arms_the_next_round`,
+`a_re_armed_round_never_sees_the_previous_rounds_values`, `fewer_parts_than_capacity_use_only_the_first_slots`,
+`an_abandoned_part_reaches_the_continuation_as_none`, `reset_before_the_round_completes_panics`,
+`reset_through_the_join_while_the_continuation_runs_is_refused` and the arrival-refusal tests (`join`);
+`a_join_rearmed_10_000_times_allocates_nothing_after_construction` (`tests/join_alloc.rs`, a counting allocator); the
+`loom` models `loom_two_parts_run_the_continuation_once_and_rearm`,
+`loom_an_abandoned_part_and_an_outside_reset_start_a_clean_round` and `loom_one_part_racing_itself_is_taken_once`
+(`RUSTFLAGS="--cfg loom" cargo test -p euhedral-graph --release --lib join::loom`).
+
 ## The source invariant's primitives (2026-10-29)
 
 **What.**

@@ -285,8 +285,8 @@ impl<T> Join<T> {
         // SAFETY: closing the part gave this arrival the slot alone. The round's last arrival reads it only
         // after the read-modify-write below, and arming (which reopens it) happens after that read.
         slot.value.with_mut(|cell| unsafe { *cell = value });
-        // Java's `decrementAndGet`: one read-modify-write whose predecessor chain carries every earlier
-        // slot write to the arrival that sees 1.
+        // One read-modify-write, so the chain of arrivals carries every earlier slot write to the arrival
+        // that sees 1.
         if self.pending.fetch_sub(1, Ordering::SeqCst) == 1 {
             self.finish();
         }
@@ -326,7 +326,7 @@ impl<T> Join<T> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests {
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -596,5 +596,129 @@ mod tests {
         assert_eq!(Arc::strong_count(&live), 3);
         drop(join);
         assert_eq!(Arc::strong_count(&live), 1);
+    }
+}
+
+/// Model checks of the arrival protocol: `RUSTFLAGS="--cfg loom" cargo test -p euhedral-graph --release --lib
+/// join::loom`. Each explores every interleaving of the threads' atomic operations the memory model allows,
+/// and `loom`'s cell reports a slot access that is not ordered after the write it reads.
+#[cfg(all(test, loom))]
+mod loom {
+    use ::loom::sync::Arc;
+    use ::loom::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use ::loom::thread;
+
+    use super::*;
+
+    /// The value part `part` of round `round` sends.
+    fn value(round: usize, part: usize) -> usize {
+        round * 10 + part
+    }
+
+    #[test]
+    fn loom_two_parts_run_the_continuation_once_and_rearm() {
+        ::loom::model(|| {
+            let runs = Arc::new(AtomicUsize::new(0));
+            let rearmed = Arc::new(AtomicBool::new(false));
+            let (counted, flag) = (runs.clone(), rearmed.clone());
+            let join = Arc::new(Join::<usize>::with_capacity(2, move |mut round| {
+                let r = counted.fetch_add(1, Ordering::SeqCst);
+                assert!(r < 2, "the continuation ran a third time");
+                assert_eq!(round.len(), 2);
+                assert_eq!(round.take(0), Some(value(r, 0)), "round {r} part 0");
+                assert_eq!(round.take(1), Some(value(r, 1)), "round {r} part 1");
+                if r == 0 {
+                    round.rearm(2);
+                    // Work that follows the re-arm, delivered from inside the continuation.
+                    flag.store(true, Ordering::Release);
+                }
+            }));
+            join.reset(2);
+            let threads: Vec<_> = (0..2)
+                .map(|part| {
+                    let join = join.clone();
+                    let rearmed = rearmed.clone();
+                    thread::spawn(move || {
+                        join.arrive(part, value(0, part));
+                        while !rearmed.load(Ordering::Acquire) {
+                            thread::yield_now();
+                        }
+                        join.arrive(part, value(1, part));
+                    })
+                })
+                .collect();
+            for thread in threads {
+                thread.join().unwrap();
+            }
+            assert_eq!(runs.load(Ordering::SeqCst), 2);
+        });
+    }
+
+    #[test]
+    fn loom_an_abandoned_part_and_an_outside_reset_start_a_clean_round() {
+        ::loom::model(|| {
+            let runs = Arc::new(AtomicUsize::new(0));
+            let counted = runs.clone();
+            let join = Arc::new(Join::<usize>::with_capacity(2, move |round| {
+                let r = counted.fetch_add(1, Ordering::SeqCst);
+                // Round 0 abandons part 1; round 1 abandons part 0. Neither sees the other's value.
+                let expected = if r == 0 {
+                    [Some(value(0, 0)), None]
+                } else {
+                    [None, Some(value(1, 1))]
+                };
+                assert_eq!(
+                    round.values().map(|v| v.copied()).collect::<Vec<_>>(),
+                    expected
+                );
+            }));
+            for round in 0..2 {
+                join.reset(2);
+                let threads: Vec<_> = (0..2)
+                    .map(|part| {
+                        let join = join.clone();
+                        thread::spawn(move || {
+                            if part == round {
+                                join.arrive(part, value(round, part));
+                            } else {
+                                join.abandon(part);
+                            }
+                        })
+                    })
+                    .collect();
+                for thread in threads {
+                    thread.join().unwrap();
+                }
+                assert_eq!(runs.load(Ordering::SeqCst), round + 1);
+            }
+        });
+    }
+
+    #[test]
+    fn loom_one_part_racing_itself_is_taken_once() {
+        ::loom::model(|| {
+            let join = Arc::new(Join::<usize>::with_capacity(1, |_| {}));
+            join.reset(1);
+            let refused = Arc::new(AtomicUsize::new(0));
+            let threads: Vec<_> = (0..2)
+                .map(|_| {
+                    let join = join.clone();
+                    let refused = refused.clone();
+                    thread::spawn(move || {
+                        // Two arrivals of one part: one passes, the other is refused (the panic is caught).
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            join.arrive(0, 1)
+                        }));
+                        if result.is_err() {
+                            refused.fetch_add(1, Ordering::SeqCst);
+                        }
+                    })
+                })
+                .collect();
+            for thread in threads {
+                thread.join().unwrap();
+            }
+            assert_eq!(refused.load(Ordering::SeqCst), 1);
+        });
     }
 }

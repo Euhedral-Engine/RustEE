@@ -16,7 +16,7 @@
 //! |---|---|---|
 //! | [`Completions`] | [`completions`] | completions found by polls |
 //! | [`Sequencer`] | [`sequencer`] | execute in any order, conclude in admission order |
-//! | [`Join`] | [`join`] | run-time fan-in: the last arrival publishes the continuation |
+//! | [`Join`], [`Round`] | [`join`] | re-armable run-time fan-in: the last arrival runs the continuation |
 //! | [`LanePool`], [`Marker`], [`DeviceQueue`] | [`lanes`] | device lanes and markers |
 //! | [`StageGraph`] | [`stage_graph`] | static stage DAGs run per quantum |
 //! | [`Lake`], [`UnitGuard`] | [`lake`] | the pool of ready work of one kind |
