@@ -8,7 +8,7 @@ license = "Apache-2.0"
 
 [dependencies]
 
-[target.'cfg(loom)'.dev-dependencies]
+[target.'cfg(loom)'.dependencies]
 loom = "0.7"
 
 [lints.rust]
