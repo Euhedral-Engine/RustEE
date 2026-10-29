@@ -150,17 +150,33 @@ impl LatticeEdge {
         }
     }
 
+    /// The topmost edge a request or pull from this one reaches: `Some(None)` when this edge is the top,
+    /// `Some(Some(node))` for the topmost node above it, and `None` when a closed or draining edge on the way
+    /// stops it. One pin covers the whole climb.
+    fn climb(&self) -> Option<Option<Arc<dyn LatticeNode>>> {
+        self.registry.with_pinned(|guard| {
+            let mut top: Option<Arc<dyn LatticeNode>> = None;
+            let mut next = self.parent.load(guard).and_then(Weak::upgrade);
+            while let Some(node) = next {
+                let edge = node.edge();
+                if edge.is_edge_closed() || edge.is_draining() {
+                    return None;
+                }
+                next = edge.parent.load(guard).and_then(Weak::upgrade);
+                top = Some(node);
+            }
+            Some(top)
+        })
+    }
+
     /// Signals demand for `demand` frames to the upstream handles, through the parents.
     pub fn request(&self, demand: u64) {
         if demand == 0 || self.is_edge_closed() || self.is_draining() {
             return;
         }
-        match self.parent() {
-            Some(parent) => parent.edge().request(demand),
-            None => {
-                self.registry
-                    .with_thread_queue(|queue| queue.request(demand));
-            }
+        if self.climb().is_some() {
+            self.registry
+                .with_thread_queue(|queue| queue.request(demand));
         }
     }
 
@@ -172,16 +188,12 @@ impl LatticeEdge {
         stop: &mut dyn FnMut(&dyn Frame) -> bool,
         demand: u64,
     ) -> u64 {
-        if demand == 0 || self.is_edge_closed() || self.is_draining() {
+        if demand == 0 || self.is_edge_closed() || self.is_draining() || self.climb().is_none() {
             return 0;
         }
-        match self.parent() {
-            Some(parent) => parent.edge().pull(consumer, stop, demand),
-            None => self
-                .registry
-                .with_thread_queue(|queue| queue.pull(consumer, stop, demand))
-                .unwrap_or(0),
-        }
+        self.registry
+            .with_thread_queue(|queue| queue.pull(consumer, stop, demand))
+            .unwrap_or(0)
     }
 
     /// Adds `handle` to the registry, after waiting for any drain to end.
@@ -192,7 +204,8 @@ impl LatticeEdge {
 
     /// Makes `receiver` the floor of this edge's branch: the downstream of this edge, or of the
     /// lowest node below it. If the branch already has a receiver, `receiver` is told of the error
-    /// instead. An edge that has closed completes the receiver it takes.
+    /// instead. A receiver added to an edge that has closed is told it completed, once, whether the edge took it or
+    /// refused it.
     pub fn add_downstream(&self, receiver: Arc<dyn LatticeReceiver>) {
         let receiver = match self.downstream.set(Downstream::Receiver(receiver)) {
             Ok(()) => {
@@ -207,6 +220,11 @@ impl LatticeEdge {
         };
         match self.downstream.get() {
             Some(Downstream::Node(node)) => node.edge().add_downstream(receiver),
+            // A refused receiver of a closed edge hears the edge completed, once: it was never installed, so
+            // nothing else tells it.
+            Some(Downstream::Receiver(_)) | None if self.closed.load(Ordering::SeqCst) => {
+                receiver.on_complete();
+            }
             Some(Downstream::Receiver(_)) | None => receiver.on_error(already_attached()),
         }
     }
@@ -742,6 +760,29 @@ mod tests {
         assert_eq!(fates.lock().unwrap().len(), 1);
         edge.close_edge();
         assert_eq!(told.completions.load(Ordering::SeqCst), 1, "told once");
+    }
+
+    #[test]
+    fn a_receiver_refused_by_a_closed_edge_that_has_one_is_completed_once() {
+        let registry = registry();
+        let edge = edge(&registry);
+        let first = Arc::new(Told::default());
+        edge.add_downstream(first.clone());
+        assert!(edge.close_edge());
+        assert_eq!(first.completions.load(Ordering::SeqCst), 1);
+
+        let late = Arc::new(Told::default());
+        edge.add_downstream(late.clone());
+        assert_eq!(
+            late.completions.load(Ordering::SeqCst),
+            1,
+            "a late receiver of a closed edge hears it completed, though the edge refused it"
+        );
+        let refused = TestReceiver::new();
+        edge.add_downstream(refused.clone());
+        assert!(refused.is_completed());
+        assert!(refused.errors().is_empty());
+        assert_eq!(first.completions.load(Ordering::SeqCst), 1);
     }
 
     #[test]

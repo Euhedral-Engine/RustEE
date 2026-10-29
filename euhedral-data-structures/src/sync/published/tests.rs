@@ -279,22 +279,31 @@ fn store_if_current_refuses_a_value_that_was_replaced() {
     let count = drops();
     let first = Counted::new(&count);
     let cell = Published::new(domain.clone(), Some(first.clone()));
-    let first_address = Arc::as_ptr(&first);
     cell.store(Some(Counted::new(&count))).wait(soon()).ok();
 
     let late = Counted::new(&count);
     let refused = cell
-        .store_if_current(first_address, Some(late.clone()))
+        .store_if_current(Some(&first), Some(late.clone()))
         .err()
         .expect("the cell holds another value now");
     assert!(Arc::ptr_eq(&refused.unwrap(), &late));
+    assert!(
+        cell.store_if_current(None, None).is_err(),
+        "the cell is not empty"
+    );
 
-    let current = cell.current_address();
-    cell.store_if_current(current, None)
+    let reader = domain.register();
+    let guard = reader.pin();
+    let current = cell.load(&guard).unwrap();
+    cell.store_if_current(Some(current), None)
         .unwrap_or_else(|_| panic!("the cell still holds that value"))
-        .wait(soon())
-        .ok();
-    assert!(cell.current_address().is_null());
+        .defer();
+    drop(guard);
+    assert!(cell.load(&reader.pin()).is_none());
+    assert!(
+        cell.store_if_current(None, Some(late)).is_ok(),
+        "the cell is empty now"
+    );
 }
 
 #[test]
@@ -482,6 +491,108 @@ mod loom {
             reader.idle();
             cell.try_reclaim();
             assert_eq!(cell.pending(), 0);
+        });
+    }
+
+    // The reader's slot is idle: its first pin announces the epoch, fences and then loads, while the writer swaps the
+    // pointer, advances the epoch and scans. Either the pin's load sees the new value, or the scan sees the
+    // announcement and the old value stays; loom treats the sequentially consistent fence as acquire-release, so
+    // this checks the reasoning the model can (the free is ordered after the read) and
+    // `readers_never_see_a_freed_value` runs the store-buffer part on real threads.
+    #[test]
+    fn loom_a_first_pin_from_idle_races_a_store() {
+        ::loom::model(|| {
+            let domain = EpochDomain::new(1);
+            let cell = Arc::new(Published::new(domain.clone(), Some(Payload::new())));
+            let reader = domain.register();
+            let read = {
+                let cell = cell.clone();
+                thread::spawn(move || {
+                    let held = {
+                        let guard = reader.pin();
+                        cell.load(&guard).map(|value| value.read())
+                    };
+                    assert!(matches!(held, Some(7)), "read {held:?}");
+                    assert!(!reader.is_active(), "the guard withdrew the announcement");
+                })
+            };
+            let write = {
+                let cell = cell.clone();
+                thread::spawn(move || {
+                    cell.store(Some(Payload::new())).defer();
+                    cell.try_reclaim();
+                })
+            };
+            read.join().unwrap();
+            write.join().unwrap();
+            cell.try_reclaim();
+            assert_eq!(
+                cell.pending(),
+                0,
+                "every retirement was freed once the reader left"
+            );
+        });
+    }
+
+    /// Counts its drops.
+    struct Counting(Arc<::loom::sync::atomic::AtomicUsize>);
+
+    impl Drop for Counting {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, ::loom::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    // Two threads defer retirements (`push_chain`, one by `store`, one by `store_if_current` under a pin), a third
+    // reclaims (take the list whole, free what passed, push the rest back) while the main thread counts with
+    // `pending()` (which takes the list too). Every value is dropped exactly once and none is lost.
+    #[test]
+    fn loom_two_deferrers_a_reclaimer_and_pending() {
+        let mut builder = ::loom::model::Builder::new();
+        builder.preemption_bound = Some(3);
+        builder.check(|| {
+            let drops = Arc::new(::loom::sync::atomic::AtomicUsize::new(0));
+            let domain = EpochDomain::new(2);
+            let cell = Arc::new(Published::new(
+                domain.clone(),
+                Some(Arc::new(Counting(drops.clone()))),
+            ));
+            let slot = domain.register();
+            let storer = {
+                let (cell, drops) = (cell.clone(), drops.clone());
+                thread::spawn(move || {
+                    cell.store(Some(Arc::new(Counting(drops)))).defer();
+                })
+            };
+            let swapper = {
+                let (cell, drops) = (cell.clone(), drops.clone());
+                thread::spawn(move || {
+                    let guard = slot.pin();
+                    let current = cell.load(&guard);
+                    if let Ok(retired) =
+                        cell.store_if_current(current, Some(Arc::new(Counting(drops))))
+                    {
+                        retired.defer();
+                    }
+                })
+            };
+            let reclaimer = {
+                let cell = cell.clone();
+                thread::spawn(move || cell.try_reclaim())
+            };
+            let seen = cell.pending();
+            assert!(seen <= 2, "{seen} pending");
+            storer.join().unwrap();
+            swapper.join().unwrap();
+            reclaimer.join().unwrap();
+            // All threads are idle now: a sweep frees everything retired.
+            cell.try_reclaim();
+            assert_eq!(cell.pending(), 0);
+            let cell = Arc::into_inner(cell).expect("the threads are done");
+            drop(cell);
+            // The initial value plus up to two replacements; a refused replacement is dropped by its caller.
+            let dropped = drops.load(::loom::sync::atomic::Ordering::SeqCst);
+            assert_eq!(dropped, 3, "every value is dropped exactly once");
         });
     }
 }

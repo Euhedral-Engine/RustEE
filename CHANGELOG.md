@@ -24,7 +24,7 @@ semantics and the tests that pin it.
   generation, off the hot scope, and releases a generation once: the check is made under the lock, since a recycled
   state could otherwise be released again in its next life by a thread that decided in its last.
 - `LatticeEdge` (C8, C9): the downstream is a `SetOnce` and the parent a `Published` weak reference; neither read
-  takes a lock. A receiver attached to a closed edge is told `on_complete`.
+  takes a lock. A receiver added to a closed edge is told `on_complete`, once, whether the edge took it or refused it. `request` and `pull` pin once for the whole climb through the parents.
 - `HOT_FIX_TAGS` loses C4 to C9 and lists 39.
 
 **Why.** Every frame a source pushes through the lattice crossed two vertex routing locks and two edge downstream

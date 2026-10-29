@@ -322,6 +322,10 @@ struct Deferred<T> {
 /// A store never waits and never fails: the retirements a cell has not yet been able to free chain on a list, and
 /// each store, deferral and [`try_reclaim`](Self::try_reclaim) frees those the readers have passed. A value is
 /// dropped on the thread that finds it free.
+///
+/// The destructor of `T` must not panic: a sweep takes the list whole and drops the freeable values one by one, so
+/// a panic in one leaves the rest of that sweep's list unfreed. (The cells in the workspace hold weak references
+/// and small records, whose destructors do not panic.)
 pub struct Published<T> {
     domain: Arc<EpochDomain>,
     /// `Arc::into_raw` of the current value, or null.
@@ -379,14 +383,19 @@ impl<T: Send + Sync> Published<T> {
         }
     }
 
-    /// Publishes `value` if the cell still holds the value at `expected`, and returns the retirement of the old
-    /// value; otherwise hands `value` back (Java's compare-and-set).
+    /// Publishes `value` if the cell still holds `expected` (`None`: still holds nothing), and returns the
+    /// retirement of the old value; otherwise hands `value` back (Java's compare-and-set).
+    ///
+    /// `expected` is a reference, normally the one a [`load`](Self::load) under a guard returned: while the caller
+    /// holds it the allocation cannot be freed and its address reused, so a match is a match of the value, not of
+    /// a recycled address.
     pub fn store_if_current(
         &self,
-        expected: *const T,
+        expected: Option<&T>,
         value: Option<Arc<T>>,
     ) -> Result<Retired<'_, T>, Option<Arc<T>>> {
         let new = into_raw(value);
+        let expected = expected.map_or(ptr::null(), ptr::from_ref);
         match self.current.compare_exchange(
             expected.cast_mut(),
             new,
@@ -401,12 +410,6 @@ impl<T: Send + Sync> Published<T> {
             // SAFETY: `new` came from `into_raw` just above and was not published.
             Err(_) => Err(unsafe { from_raw(new) }),
         }
-    }
-
-    /// The address of the current value, for [`store_if_current`](Self::store_if_current); null when empty. The
-    /// address is not a reference: nothing may be read through it.
-    pub fn current_address(&self) -> *const T {
-        self.current.load(Ordering::Acquire)
     }
 
     /// Frees the retirements the readers have passed. Cheap when none is pending.

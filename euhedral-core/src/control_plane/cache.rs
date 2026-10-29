@@ -101,7 +101,7 @@ impl CacheDirectory {
             if !Weak::ptr_eq(held, cache) {
                 return None;
             }
-            slot.store_if_current(ptr::from_ref(held), None).ok()
+            slot.store_if_current(Some(held), None).ok()
         });
         if let Some(retired) = retired {
             retired.defer();

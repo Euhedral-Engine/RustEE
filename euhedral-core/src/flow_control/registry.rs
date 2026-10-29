@@ -147,9 +147,13 @@ impl UpstreamRegistry {
     }
 
     /// Runs `f` with a guard that keeps the values the calling thread loads from the lattice's [`Published`]
-    /// cells valid for the call. Inside a worker's cycle that costs one load of the slot; any other thread
-    /// announces itself for the call. A thread that is exiting, and has no slot of its own any more, uses a
-    /// temporary one.
+    /// cells valid for the call.
+    ///
+    /// The cost is a thread-local lookup of the thread's slot (a borrow of the thread's list and a search for this
+    /// registry), a reference-count update on the slot, and the pin: inside a worker's cycle the pin is one load
+    /// of the slot, and on any other thread it announces the thread for the call (two stores and a fence) and
+    /// withdraws it. Pin once around a series of loads, as the edges' climb does. A thread that is exiting, and
+    /// has no slot of its own any more, uses a temporary one.
     ///
     /// [`Published`]: euhedral_data_structures::sync::Published
     pub fn with_pinned<R>(self: &Arc<Self>, f: impl FnOnce(&EpochGuard<'_>) -> R) -> R {

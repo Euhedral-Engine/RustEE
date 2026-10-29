@@ -196,7 +196,7 @@ mod tests {
 mod loom_tests {
     use super::*;
     use loom::cell::UnsafeCell;
-    use loom::sync::atomic::AtomicPtr;
+    use loom::sync::atomic::{AtomicBool, AtomicPtr};
     use loom::thread;
     use std::sync::Arc;
 
@@ -274,42 +274,169 @@ mod loom_tests {
         });
     }
 
-    // The release that leaves a retired state without readers, and the writer's own check after it retires, race;
-    // a once-only gate (Java's `handlesReleased`) lets exactly one of them release what the state holds, however
-    // the retirement falls among the releases.
+    /// The vertex's release protocol in miniature: two routing states, a book (a lock) that serializes the remapper's
+    /// rewrite and every release, a `released` flag per state, and a table the release reads and clears.
+    struct Model {
+        states: [ModelState; 2],
+        current: AtomicPtr<ModelState>,
+        /// The generations released, in order; the book.
+        book: loom::sync::Mutex<Vec<u32>>,
+    }
+
+    struct ModelState {
+        admission: Admission,
+        released: AtomicBool,
+        /// The generation the state holds; 0 once released.
+        table: UnsafeCell<u32>,
+    }
+
+    // SAFETY: the table is read under a count or under the book, and written under the book while the state is
+    // retired, idle and released (a rewrite) or retired, idle and not released (the release).
+    unsafe impl Sync for ModelState {}
+    // SAFETY: as above.
+    unsafe impl Send for ModelState {}
+
+    impl Model {
+        /// The first state publishes generation 1; the second is retired, idle and released: free for reuse.
+        fn new() -> Self {
+            let model = Self {
+                states: [
+                    ModelState {
+                        admission: Admission::new(),
+                        released: AtomicBool::new(false),
+                        table: UnsafeCell::new(1),
+                    },
+                    ModelState {
+                        admission: Admission::new(),
+                        released: AtomicBool::new(true),
+                        table: UnsafeCell::new(0),
+                    },
+                ],
+                current: AtomicPtr::new(std::ptr::null_mut()),
+                book: loom::sync::Mutex::new(Vec::new()),
+            };
+            model.states[1].admission.retire();
+            model
+        }
+
+        fn publish_first(&self) {
+            self.current
+                .store(&self.states[0] as *const _ as *mut _, Ordering::Release);
+        }
+
+        /// Java's `tryAcquireRoutingState`, then a read of the table under the count, then the release.
+        fn read(&self) -> Option<u32> {
+            let pointer = self.current.load(Ordering::Acquire);
+            // SAFETY: the states live as long as the model.
+            let state = unsafe { &*pointer };
+            if !state.admission.try_acquire() {
+                return None;
+            }
+            let generation = (pointer == self.current.load(Ordering::Acquire)).then(|| {
+                // SAFETY: a count is held on a state that is not retired.
+                state.table.with(|table| unsafe { *table })
+            });
+            if state.admission.release() {
+                self.release_handles(state);
+            }
+            generation
+        }
+
+        /// The remap: under the book, rewrite a state that is retired, idle and released for the next generation,
+        /// reopen it, publish it and retire the old one; then release the old one. Returns whether it remapped.
+        fn remap(&self, generation: u32) -> bool {
+            let retired = {
+                let book = self.book.lock().unwrap();
+                let Some(next) = self.states.iter().find(|state| {
+                    state.admission.is_retired_and_idle() && state.released.load(Ordering::Acquire)
+                }) else {
+                    return false;
+                };
+                // SAFETY: retired, idle and released: no reader holds a count or can take one, and the release
+                // has read the table under the book, which is held.
+                next.table.with_mut(|table| unsafe { *table = generation });
+                next.released.store(false, Ordering::Relaxed);
+                next.admission.reopen();
+                let old = self
+                    .current
+                    .swap(next as *const _ as *mut _, Ordering::AcqRel);
+                // SAFETY: the states live as long as the model.
+                let old = unsafe { &*old };
+                old.admission.retire();
+                drop(book);
+                old
+            };
+            self.release_handles(retired);
+            true
+        }
+
+        /// `release_handles_when_quiescent`: the checks before the lock only filter; the ones under it decide.
+        fn release_handles(&self, state: &ModelState) {
+            if !state.admission.is_retired() || state.admission.has_readers() {
+                return;
+            }
+            let mut book = self.book.lock().unwrap();
+            if state.released.load(Ordering::Acquire) || !state.admission.is_retired_and_idle() {
+                return;
+            }
+            // SAFETY: retired and idle, not released, under the book: no one else reads or rewrites the table.
+            let generation = state
+                .table
+                .with_mut(|table| unsafe { std::mem::take(&mut *table) });
+            book.push(generation);
+            state.released.store(true, Ordering::Release);
+        }
+    }
+
+    // The remapper remaps twice, so the first state is recycled for generation 3 when its readers are gone; one
+    // reader reads and releases (and may be the last reader of a retired generation, late), the other is stale:
+    // it loaded a pointer before the remaps and counts after them. Every generation the remapper retired is
+    // released exactly once, with its own table, never while a reader holds a count (loom reports a table read
+    // or cleared concurrently with a rewrite), and a late release of a recycled state changes nothing.
     #[test]
-    fn loom_one_thread_releases_a_retired_state_whichever_side_sees_it_idle() {
-        use loom::sync::atomic::AtomicBool;
-        loom::model(|| {
-            let admission = Arc::new(Admission::new());
-            let gate = Arc::new(AtomicBool::new(false));
-            assert!(admission.try_acquire());
-            assert!(admission.try_acquire());
-            let take = |gate: &AtomicBool| {
-                gate.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                    .is_ok()
+    fn loom_the_release_protocol_releases_each_generation_once_whatever_the_recycling() {
+        let mut builder = loom::model::Builder::new();
+        builder.preemption_bound = Some(3);
+        builder.check(|| {
+            let model = Arc::new(Model::new());
+            model.publish_first();
+            let remapper = {
+                let model = model.clone();
+                thread::spawn(move || {
+                    let first = model.remap(2);
+                    let second = model.remap(3);
+                    (first, second)
+                })
             };
             let readers: Vec<_> = (0..2)
                 .map(|_| {
-                    let (admission, gate) = (admission.clone(), gate.clone());
-                    thread::spawn(move || {
-                        admission.release() && admission.is_retired() && take(&gate)
-                    })
+                    let model = model.clone();
+                    thread::spawn(move || model.read())
                 })
                 .collect();
-            let retirer = {
-                let (admission, gate) = (admission.clone(), gate.clone());
-                thread::spawn(move || {
-                    admission.retire();
-                    !admission.has_readers() && take(&gate)
-                })
-            };
-            let mut released = usize::from(retirer.join().unwrap());
+            let (first, second) = remapper.join().unwrap();
             for reader in readers {
-                released += usize::from(reader.join().unwrap());
+                let read = reader.join().unwrap();
+                assert!(matches!(read, None | Some(1..=3)), "read {read:?}");
             }
-            assert_eq!(released, 1, "the state's handles are released exactly once");
-            assert!(admission.is_retired_and_idle());
+            let book = model.book.lock().unwrap();
+            let retired = usize::from(first) + usize::from(second);
+            // Each retired generation was released, once; the last published one still routes.
+            let mut released = book.clone();
+            released.sort_unstable();
+            released.dedup();
+            assert_eq!(released.len(), book.len(), "released twice: {book:?}");
+            assert_eq!(
+                book.len(),
+                retired,
+                "a retired generation was not released: {book:?}"
+            );
+            let expected: Vec<u32> = match (first, second) {
+                (true, true) => vec![1, 2],
+                (true, false) => vec![1],
+                _ => vec![],
+            };
+            assert_eq!(released, expected, "wrong generations released: {book:?}");
         });
     }
 }
