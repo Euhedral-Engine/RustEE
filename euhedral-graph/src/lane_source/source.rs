@@ -388,12 +388,12 @@ fn ns(d: std::time::Duration) -> f64 {
     d.as_nanos() as f64
 }
 
-/// Java's `accumulate` for a positive step: saturating; `u64::MAX` is unbounded.
+/// Adds banked demand: saturating, with `u64::MAX` meaning unbounded.
 fn bank(current: u64, add: u64) -> u64 {
     current.saturating_add(add)
 }
 
-/// Java's `accumulate` for a negative step: floors at zero; unbounded demand is never spent.
+/// Spends banked demand: floors at zero; unbounded demand is never spent.
 fn spend(current: u64, spent: u64) -> u64 {
     if current == u64::MAX {
         current

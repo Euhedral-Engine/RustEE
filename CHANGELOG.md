@@ -3,6 +3,58 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## Lane sources (2026-10-29)
+
+**What.** `euhedral-graph`:
+- `LanePoolBuilder`: composes a `LanePool` from the queues of several backends. `reserve` takes consecutive lane ids,
+  `set` places a queue at one, `build` makes the immutable pool.
+- `LaneSubmit`: the backend-neutral submitter of one lane (`lane`, `id`, `queue`, `accepts`, `await_marker`, `mark`,
+  `arm_retirement`, `poll_retired`, and the `unsafe` `raw`). `LaneState`: a lane's own hardware state (`check`,
+  `met`) and what an item can wait for. `LaneWork`: an item (`run`, `then`, `retired`, `failed`, with `Outcome` and the
+  `LaneCx` it runs in).
+- `LaneIntakes`, `LaneInputs`, `Deliver` and `GroupId`: delivery into each lane's own intake (MPSC) and each lane
+  group's shared intake (MPMC).
+- `LaneSource<S, X, W>`: a `LatticeSource` per lane; `LaneMetrics`.
+- `testing`: `FakeLanes`, `FakeLane`, `FakeOp`, `FakeLaneError`: a stepped fake `LaneSubmit`.
+
+**Why.** A device lane's submitter has one owner. Running the lane as a source lets the interceptor's claim give one
+worker at a time the lane's state, with no lock, no owner thread and no hand-off. A long call runs on the worker that
+needs it, and other sources of the group take the shared intake meanwhile.
+
+**How.** Build the pool with `LanePoolBuilder`, make the intakes with `LaneIntakes::new(pool, groups)`, make one
+`LaneSource::new(submitter, state, inputs, intakes)` per lane and attach each with `add_upstream`. Deliver work with
+`LaneIntakes::deliver` (or `LaneCx::deliver` from an item).
+
+**Semantics.**
+- `request(demand)` is always called. It banks the demand (a saturating add; `u64::MAX` is unbounded and never
+  subtracted from), then in this order: drains the retirements that arrived and runs their continuations; calls
+  `LaneState::check` once; retries the mark of an item the marker ring could not take; runs the waiting items whose wait
+  is met; runs the lane's own intake; runs the group's shared intake; pushes at most the banked demand of ready frames,
+  in the order they were made, and subtracts what it pushed. It runs every ready item, with no budget.
+- Readiness is selective admission: nothing ready pushes nothing. There is no "has work" flag. Unmet demand
+  accumulates.
+- `pull(demand)` hands over at most `demand` ready frames, stopping before the first the `stop` callback refuses. It
+  never banks demand, never runs an item and never drains a retirement.
+- An item awaits input markers on its first run: markers of its own lane are skipped, markers the submitter `accepts`
+  are awaited on the device, and any other (another backend's) is left for the item to bridge (`LaneCx::bridges`).
+- `Outcome::Submitted { retire }`: the lane marks, calls `then(Some(marker))`, and arms a retirement if asked; the item
+  waits in arm order for `retired`. `Finished` calls `then(None)`. `Wait(a)` keeps the item in the source; the lane asks
+  `met` once per request, and items of the same order key wait behind it.
+- A full marker ring (`mark` returns `Ok(None)`) stalls the lane: the item is marked first at the next entry, and
+  nothing else runs before it.
+- Delivery is an enqueue. It spends no demand and runs nothing. The shared intake is taken one item at a time and its
+  claim is not held while an item runs.
+- `complete` is the ingest sources' `complete`: compare-and-set, zero the bank, tell the receiver; it drains nothing.
+  Dropping the source drops the submitter first, then every item it holds, then ends the unpushed frames with an error.
+
+**Tests.**
+- `euhedral-graph/tests/lane_source.rs`: delivery, `pull`, completion, drop, and every rule of `request` on the stepped
+  fake, with two-thread tests for the shared intake.
+- `tests/lane_source_lattice.rs`: three group sources and one lane source on a real lattice (4 workers), 20 000 items
+  with retirements, every frame executed once.
+- `tests/lane_intake_alloc.rs`: delivery, `request` and retirements allocate nothing in steady state.
+- `lanes.rs`: `LanePoolBuilder`.
+
 ## Re-armable `Join` (2026-10-29)
 
 **What.** `euhedral-graph`: `Join` is a lock-free fan-in cell that is armed again each round without allocating.

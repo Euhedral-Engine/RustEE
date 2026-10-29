@@ -60,7 +60,9 @@ impl LaneWork<FakeLane, ()> for Item {
     }
 
     fn run(&mut self, _cx: &mut Cx<'_>) -> Outcome<std::convert::Infallible> {
-        Outcome::Submitted { retire: self.retire }
+        Outcome::Submitted {
+            retire: self.retire,
+        }
     }
 
     fn retired(self, _marker: Marker, _failure: Option<FakeLaneError>, _cx: &mut Cx<'_>) {
@@ -91,7 +93,10 @@ fn steady_state_delivery_and_requests_allocate_nothing() {
     // The counter sees allocations at all.
     let probe = ALLOCATIONS.load(Ordering::Relaxed);
     drop(std::hint::black_box(Box::new(7u64)));
-    assert!(ALLOCATIONS.load(Ordering::Relaxed) > probe, "the counting allocator is live");
+    assert!(
+        ALLOCATIONS.load(Ordering::Relaxed) > probe,
+        "the counting allocator is live"
+    );
 
     let mut builder = LanePoolBuilder::new();
     let first = builder.reserve(2);

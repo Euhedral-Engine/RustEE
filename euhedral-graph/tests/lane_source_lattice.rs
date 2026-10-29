@@ -217,7 +217,11 @@ fn lane_sources_on_a_real_lattice_deliver_every_frame_once() {
     // Let any wrongly duplicated frame show itself.
     std::thread::sleep(Duration::from_millis(50));
     for (index, counter) in counters.iter().enumerate() {
-        assert_eq!(counter.load(Ordering::SeqCst), 1, "frame {index} executed once");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "frame {index} executed once"
+        );
     }
     assert_eq!(failures.load(Ordering::SeqCst), 0);
     lattice.close();
