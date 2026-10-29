@@ -79,16 +79,17 @@ impl<S: LaneSubmit, X: LaneState, W> Drop for Inner<S, X, W> {
         // Order: the device work ends (`quiesce`), the state closes against the queue's raw handle and is dropped, and
         // the submitter, which owns the queue, goes last (its shutdown waits for what the items still hold). A panic in
         // any step is held back until the rest is released.
-        // SAFETY (all three): each field is dropped here only, and none is used again.
         let ended = panic::catch_unwind(AssertUnwindSafe(|| {
             self.submitter.quiesce();
             // SAFETY: the lane's work has ended, and the source is being dropped, so no item runs.
             let raw = unsafe { self.submitter.raw() };
             self.state.close(&raw);
         }));
+        // SAFETY: `state` is dropped here only, and no field is used again.
         let state = panic::catch_unwind(AssertUnwindSafe(|| unsafe {
             ManuallyDrop::drop(&mut self.state);
         }));
+        // SAFETY: `submitter` is dropped here only, and no field is used again.
         let shutdown = panic::catch_unwind(AssertUnwindSafe(|| unsafe {
             ManuallyDrop::drop(&mut self.submitter);
         }));
