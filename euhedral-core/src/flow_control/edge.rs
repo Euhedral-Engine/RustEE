@@ -1,9 +1,10 @@
 use super::registry::UpstreamRegistry;
 use super::upstream_queue::UpstreamHandle;
+use super::views::Cell;
 use crate::frames::{Failure, Frame, FrameError};
 use crate::generics::LatticeReceiver;
 use crate::utils::spin_wait;
-use euhedral_data_structures::sync::{Published, SetOnce};
+use euhedral_data_structures::sync::SetOnce;
 use std::sync::atomic::{AtomicBool, Ordering, fence};
 use std::sync::{Arc, Weak};
 
@@ -52,18 +53,20 @@ enum Downstream {
 /// downstream is set once, by a compare-and-set (Java's `DOWNSTREAM`), and stays until the edge drops: an edge
 /// closes for good, so nothing attaches again, and a push that read it just before the close may still be using it.
 ///
+/// An edge's parent, as its cell holds it.
+pub(crate) struct ParentRef(Weak<dyn LatticeNode>);
+
 /// An edge may have a parent, the node above it. Demand from a request or pull climbs from parent
 /// to parent, skipped by any closed or draining edge on the way, and the topmost edge serves it
 /// from the calling thread's [`UpstreamQueue`](super::UpstreamQueue). Upstream handles are added
-/// to the [`UpstreamRegistry`] all linked edges share, through any of them. The parent is a
-/// [`Published`] weak reference in the registry's epoch domain (Java's `PARENT`): reading it takes no lock, and a
-/// replaced reference is freed once the workers have passed the store.
+/// to the [`UpstreamRegistry`] all linked edges share, through any of them. The parent is a weak reference in a cell
+/// of the registry (Java's `PARENT`): a worker reads it from its own view, which a change reaches through a queue.
 pub struct LatticeEdge {
     registry: Arc<UpstreamRegistry>,
     drain: Arc<AtomicBool>,
     /// The node built on this edge, handed to children as their parent.
     node: Weak<dyn LatticeNode>,
-    parent: Published<Weak<dyn LatticeNode>>,
+    parent: Cell<ParentRef>,
     downstream: SetOnce<Downstream>,
     closed: AtomicBool,
     /// Whether the receiver below was told the edge completed: the closing thread and an attach that finds the
@@ -87,7 +90,7 @@ impl LatticeEdge {
             registry: registry.clone(),
             drain,
             node,
-            parent: Published::new(registry.epochs().clone(), None),
+            parent: registry.cell(),
             downstream: SetOnce::new(),
             closed: AtomicBool::new(false),
             told: AtomicBool::new(false),
@@ -122,7 +125,7 @@ impl LatticeEdge {
     /// The node above this edge, if it is still alive.
     pub fn parent(&self) -> Option<Arc<dyn LatticeNode>> {
         self.registry
-            .with_pinned(|guard| self.parent.load(guard)?.upgrade())
+            .with_view(|view| view.get(&self.parent)?.0.upgrade())
     }
 
     /// Makes `parent` the node above this edge, or detaches the edge with `None`. The edge holds its
@@ -138,38 +141,35 @@ impl LatticeEdge {
                 "linked edges must share one upstream registry"
             );
         }
-        let replaced = self.registry.with_pinned(|guard| {
-            let unchanged = match (self.parent.load(guard), parent) {
-                (None, None) => true,
-                (Some(current), Some(parent)) => {
-                    current.as_ptr().cast::<()>() == Arc::as_ptr(parent).cast::<()>()
-                }
-                _ => false,
-            };
-            (!unchanged).then(|| {
-                self.parent
-                    .store(parent.map(|parent| Arc::new(Arc::downgrade(parent))))
-            })
-        });
-        // Outside the pin, which would hold back the very reclamation the deferral tries.
-        if let Some(replaced) = replaced {
-            replaced.defer();
+        let current = self.registry.cell_value(&self.parent);
+        let unchanged = match (&current, parent) {
+            (None, None) => true,
+            (Some(current), Some(parent)) => {
+                current.0.as_ptr().cast::<()>() == Arc::as_ptr(parent).cast::<()>()
+            }
+            _ => false,
+        };
+        if !unchanged {
+            self.registry.set_cell(
+                &self.parent,
+                parent.map(|parent| Arc::new(ParentRef(Arc::downgrade(parent)))),
+            );
         }
     }
 
     /// The topmost edge a request or pull from this one reaches: `Some(None)` when this edge is the top,
     /// `Some(Some(node))` for the topmost node above it, and `None` when a closed or draining edge on the way
-    /// stops it. One pin covers the whole climb.
+    /// stops it. One read of the worker's view covers the whole climb.
     fn climb(&self) -> Option<Option<Arc<dyn LatticeNode>>> {
-        self.registry.with_pinned(|guard| {
+        self.registry.with_view(|view| {
             let mut top: Option<Arc<dyn LatticeNode>> = None;
-            let mut next = self.parent.load(guard).and_then(Weak::upgrade);
+            let mut next = view.get(&self.parent).and_then(|p| p.0.upgrade());
             while let Some(node) = next {
                 let edge = node.edge();
                 if edge.closed_hint() || edge.is_draining() {
                     return None;
                 }
-                next = edge.parent.load(guard).and_then(Weak::upgrade);
+                next = view.get(&edge.parent).and_then(|p| p.0.upgrade());
                 top = Some(node);
             }
             Some(top)
@@ -862,55 +862,23 @@ mod tests {
     }
 
     #[test]
-    fn set_parent_with_the_same_parent_stores_nothing() {
-        let registry = registry();
-        let child = edge(&registry);
-        let parent: Arc<dyn LatticeNode> = edge(&registry);
-        child.set_parent(Some(&parent));
-        child.set_parent(None);
-        child.set_parent(Some(&parent));
-        child.set_parent(None);
-        child.set_parent(None);
-        assert_eq!(
-            child.parent.pending(),
-            0,
-            "no worker is mid-cycle, so the replaced references were freed as they were stored"
-        );
-
-        let reader = registry.epochs().register();
-        reader.quiescent();
-        child.set_parent(Some(&parent));
-        for _ in 0..10 {
-            child.set_parent(Some(&parent));
-        }
-        assert_eq!(
-            child.parent.pending(),
-            0,
-            "setting the same parent stores nothing"
-        );
-        let other: Arc<dyn LatticeNode> = edge(&registry);
-        child.set_parent(Some(&other));
-        assert_eq!(child.parent.pending(), 1, "a changed parent is stored");
-        assert!(Arc::ptr_eq(&child.parent().unwrap(), &other));
-    }
-
-    #[test]
-    fn a_parent_replaced_while_a_worker_reads_is_freed_after_its_next_point() {
+    fn set_parent_replaces_the_parent_a_worker_reads_at_its_next_read() {
         let registry = registry();
         let child = edge(&registry);
         let first: Arc<dyn LatticeNode> = edge(&registry);
         let second: Arc<dyn LatticeNode> = edge(&registry);
         child.set_parent(Some(&first));
-        let worker = registry.epochs().register();
-        worker.quiescent();
-
+        // The worker's view holds the first parent until it drains.
+        registry.register_reader();
+        assert!(Arc::ptr_eq(&child.parent().unwrap(), &first));
+        for _ in 0..10 {
+            child.set_parent(Some(&first));
+        }
         child.set_parent(Some(&second));
-        assert_eq!(child.parent.pending(), 1, "the worker may be reading it");
         assert!(Arc::ptr_eq(&child.parent().unwrap(), &second));
-
-        worker.quiescent();
-        child.parent.try_reclaim();
-        assert_eq!(child.parent.pending(), 0);
+        child.set_parent(None);
+        assert!(child.parent().is_none());
+        registry.remove_reader();
     }
 
     #[test]

@@ -1,9 +1,8 @@
 use super::upstream_queue::{Entry, UpstreamHandle, UpstreamQueue};
+use super::views::Views;
 use euhedral_data_structures::atomics::PaddedAtomicLong;
 use euhedral_data_structures::queues::{MpscQueue, Multi, Producer};
-use euhedral_data_structures::sync::{
-    EpochDomain, EpochGuard, EpochSlot, HotScope, LifecycleMutex,
-};
+use euhedral_data_structures::sync::LifecycleMutex;
 use euhedral_hardware_utils::affinity;
 use euhedral_hardware_utils::topology::Topology;
 use euhedral_hardware_utils::util::CpuSet;
@@ -13,12 +12,6 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
-/// An action that waits for the readers that were pinned when it was queued to leave.
-struct Due {
-    target: u64,
-    action: Box<dyn FnOnce() + Send>,
-}
-
 /// Chunk size of each worker's handle queue.
 const HANDLE_QUEUE_CHUNK: usize = 256;
 
@@ -26,7 +19,6 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
     static THREAD_QUEUES: RefCell<Vec<ThreadQueue>> = const { RefCell::new(Vec::new()) };
-    static THREAD_EPOCHS: RefCell<Vec<ThreadEpoch>> = const { RefCell::new(Vec::new()) };
 }
 
 /// This thread's queue for one registry. Dropping it, when the thread exits or
@@ -38,14 +30,6 @@ struct ThreadQueue {
     cpu: Option<usize>,
     queue: Rc<RefCell<UpstreamQueue>>,
     producer: Producer<Entry, Multi>,
-}
-
-/// This thread's slot in one registry's epoch domain. It lives apart from the queue: a thread that only reads the
-/// lattice's published values (a lifecycle thread, a test) gets a slot and no queue.
-struct ThreadEpoch {
-    registry: Weak<UpstreamRegistry>,
-    registry_id: u64,
-    slot: Rc<EpochSlot>,
 }
 
 impl Drop for ThreadQueue {
@@ -78,12 +62,11 @@ struct State {
 ///
 /// The edges of one lattice share its registry.
 ///
-/// The registry also owns the lattice's [`EpochDomain`]: every thread that uses it has one slot there, and a
-/// worker announces a quiescent point once per cycle. A lattice's published values (the cache directory, an edge's
-/// parent) are freed once every worker has passed the epoch that replaced them.
+/// The registry also owns the lattice's cells (see [`Cell`](super::views::Cell)): the values its workers read on every
+/// frame and that change only when the lattice is rebuilt. They reach the workers through queues.
 pub struct UpstreamRegistry {
     id: u64,
-    epochs: Arc<EpochDomain>,
+    views: Views,
     upstream_count: Arc<PaddedAtomicLong>,
     thread_count: AtomicUsize,
     /// One past each CPU's rank among the workers' CPUs, or zero for a CPU without workers.
@@ -91,11 +74,6 @@ pub struct UpstreamRegistry {
     p_cpus: CpuSet,
     shuffle_window: usize,
     state: LifecycleMutex<State>,
-    /// Actions queued by [`defer_after_readers`](Self::defer_after_readers) (rebalance work: a retired routing
-    /// generation's release). A worker looks at `due_len` at the start of each cycle and, when it is not zero, runs
-    /// what the readers have passed; a lifecycle call that queues one runs what is due at once.
-    due: LifecycleMutex<Vec<Due>>,
-    due_len: AtomicUsize,
 }
 
 impl UpstreamRegistry {
@@ -109,15 +87,13 @@ impl UpstreamRegistry {
     pub fn with_topology(cpu_span: usize, p_cpus: CpuSet) -> Arc<Self> {
         Arc::new(Self {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
-            epochs: EpochDomain::new(cpu_span),
+            views: Views::new(),
             upstream_count: Arc::new(PaddedAtomicLong::new(0)),
             thread_count: AtomicUsize::new(0),
             ranks: (0..cpu_span).map(|_| AtomicUsize::new(0)).collect(),
             p_cpus,
             shuffle_window: cpu_span.max(1),
             state: LifecycleMutex::new(State::default()),
-            due: LifecycleMutex::new(Vec::new()),
-            due_len: AtomicUsize::new(0),
         })
     }
 
@@ -134,110 +110,12 @@ impl UpstreamRegistry {
         Some(f(&mut queue))
     }
 
-    /// The epoch domain of the lattice's published values.
-    pub fn epochs(&self) -> &Arc<EpochDomain> {
-        &self.epochs
+    pub(super) fn id(&self) -> u64 {
+        self.id
     }
 
-    /// The calling thread's slot in [`epochs`](Self::epochs), created on first use. A worker keeps
-    /// it for its cycles ([`EpochSlot::quiescent`], [`EpochSlot::idle`]); [`with_pinned`](Self::with_pinned) uses
-    /// the same slot. `None` while the thread is exiting.
-    pub fn thread_epoch(self: &Arc<Self>) -> Option<Rc<EpochSlot>> {
-        THREAD_EPOCHS
-            .try_with(|entries| {
-                let mut entries = entries.borrow_mut();
-                if let Some(entry) = entries.iter().find(|entry| entry.registry_id == self.id) {
-                    return entry.slot.clone();
-                }
-                entries.retain(|entry| entry.registry.strong_count() > 0);
-                let slot = Rc::new(self.epochs.register());
-                entries.push(ThreadEpoch {
-                    registry: Arc::downgrade(self),
-                    registry_id: self.id,
-                    slot: slot.clone(),
-                });
-                slot
-            })
-            .ok()
-    }
-
-    /// Runs `f` with a guard that keeps the values the calling thread loads from the lattice's [`Published`]
-    /// cells valid for the call.
-    ///
-    /// The cost is a thread-local lookup of the thread's slot (a borrow of the thread's list and a search for this
-    /// registry), a reference-count update on the slot, and the pin: inside a worker's cycle the pin is one load
-    /// of the slot, and on any other thread it announces the thread for the call (two stores, and a fence only where the process cannot issue the
-    /// writer's heavy barrier) and withdraws it. Pin once around a series of loads, as the edges' climb does. A thread that is exiting, and
-    /// has no slot of its own any more, uses a temporary one.
-    ///
-    /// [`Published`]: euhedral_data_structures::sync::Published
-    pub fn with_pinned<R>(self: &Arc<Self>, f: impl FnOnce(&EpochGuard<'_>) -> R) -> R {
-        match self.thread_epoch() {
-            Some(slot) => f(&slot.pin()),
-            None => f(&self.epochs.register().pin()),
-        }
-    }
-
-    /// Runs `action` once every read section that is open now has ended: at once if none is. For rebalance work that
-    /// must not run while a reader may still hold what it releases. The action runs on whichever thread finds it due
-    /// (the caller, or a worker at the start of its cycle), off the hot scope. It must not assume that the thread
-    /// that runs it holds none of the lifecycle locks it takes: a thread that holds one runs only what it queued
-    /// after dropping it.
-    ///
-    /// `target` is the epoch that [`EpochDomain::advance`] returned after the values the action releases were
-    /// swapped out.
-    pub fn defer_after_readers(&self, target: u64, action: impl FnOnce() + Send + 'static) {
-        {
-            let _cold = HotScope::leave();
-            self.due.lock().push(Due {
-                target,
-                action: Box::new(action),
-            });
-            self.due_len.fetch_add(1, Ordering::Release);
-        }
-        self.run_due();
-    }
-
-    /// Whether an action is waiting for readers.
-    pub fn has_due(&self) -> bool {
-        self.due_len.load(Ordering::Relaxed) != 0
-    }
-
-    /// Runs the deferred actions the readers have passed. A worker calls it after it announces a quiescent point
-    /// (its own old announcement would hold its own actions back); a lifecycle thread calls it with no lock held.
-    pub fn run_due(&self) {
-        if self.due_len.load(Ordering::Acquire) == 0 {
-            return;
-        }
-        let _cold = HotScope::leave();
-        let ready: Vec<Due> = {
-            let Some(mut due) = self.due.try_lock() else {
-                return;
-            };
-            let mut ready = Vec::new();
-            let mut index = 0;
-            let newest = due.iter().map(|d| d.target).max().unwrap_or(0);
-            if !self.epochs.passed(newest) {
-                // Some may still be due: those older than the floor. Check one by one.
-                while index < due.len() {
-                    if self.epochs.passed(due[index].target) {
-                        ready.push(due.swap_remove(index));
-                    } else {
-                        index += 1;
-                    }
-                }
-            } else {
-                ready.append(&mut due);
-            }
-            ready
-        };
-        if ready.is_empty() {
-            return;
-        }
-        self.due_len.fetch_sub(ready.len(), Ordering::Release);
-        for due in ready {
-            (due.action)();
-        }
+    pub(super) fn views(&self) -> &Views {
+        &self.views
     }
 
     /// Makes the calling thread a worker. Does nothing if it already is one.
@@ -255,6 +133,8 @@ impl UpstreamRegistry {
         let Some(worker) = worker else {
             return;
         };
+        // A worker reads the lattice's cells from a view of its own.
+        self.register_reader();
         let mut state = self.state.lock();
         if state
             .workers
@@ -287,12 +167,7 @@ impl UpstreamRegistry {
             })
             .unwrap_or_default();
         drop(removed);
-        // The thread's slot goes back to the domain once nothing else holds it.
-        let _ = THREAD_EPOCHS.try_with(|entries| {
-            entries
-                .borrow_mut()
-                .retain(|entry| entry.registry_id != self.id);
-        });
+        self.remove_reader();
     }
 
     /// The number of live upstream handles.

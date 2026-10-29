@@ -1,6 +1,6 @@
 use crate::config::{CacheConfig, CloneConfig};
 use crate::flow_control::{
-    LatticeEdge, LatticeNode, RoutingPolicy, UpstreamRegistry, route_by_hash,
+    Cell, LatticeEdge, LatticeNode, RoutingPolicy, UpstreamRegistry, route_by_hash,
 };
 use crate::frames::{DummyFrame, Failure, Frame, FrameError};
 use crate::metrics::{CacheMetrics, Meter, MeterSource};
@@ -10,7 +10,7 @@ use crate::utils::spin_wait;
 use euhedral_data_structures::atomics::CachePadded;
 use euhedral_data_structures::queues::partitioned::{PartitionedMpscQueue, PartitionedProducer};
 use euhedral_data_structures::queues::queue::{Consumer, Multi, Single};
-use euhedral_data_structures::sync::{ClaimCell, ClaimGuard, HotScope, Published};
+use euhedral_data_structures::sync::{ClaimCell, ClaimGuard, HotScope};
 use euhedral_hardware_utils::monitor::CoreSnapshot;
 use euhedral_hardware_utils::topology::{CpuCacheLayout, Topology};
 use euhedral_hardware_utils::util::CpuSet;
@@ -30,15 +30,18 @@ const FIRST_TOUCH_ROUNDS: usize = 3;
 /// The [`ControlPlaneCache`]s of one lattice by the CPU they run on, which work stealing visits,
 /// with the upstream registry and topology they share.
 ///
-/// Each CPU's slot is a [`Published`] weak reference to its cache, in the registry's epoch domain: a cache
-/// publishes itself when it is built and withdraws when it closes, both lifecycle work, and a steal reads the slot
-/// with no lock. The directory does not own the caches: a cache lives as long as its owner holds it, and a
-/// stealer that found one holds it for the steal.
+/// Each CPU's slot is a weak reference to its cache in a cell of the registry: a cache publishes itself when it is
+/// built and withdraws when it closes, both lifecycle work, and a steal reads the slot from the worker's own view,
+/// which a change reaches through a queue. The directory does not own the caches: a cache lives as long as its owner
+/// holds it, and a stealer that found one holds it for the steal.
 pub struct CacheDirectory {
     registry: Arc<UpstreamRegistry>,
     topology: Topology,
-    slots: Box<[Published<Weak<ControlPlaneCache>>]>,
+    slots: Box<[Cell<CacheRef>]>,
 }
+
+/// A cache, as a slot of the directory holds it.
+struct CacheRef(Weak<ControlPlaneCache>);
 
 impl fmt::Debug for CacheDirectory {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -51,9 +54,7 @@ impl fmt::Debug for CacheDirectory {
 impl CacheDirectory {
     /// An empty directory with a slot for every CPU of `topology`.
     pub fn new(registry: Arc<UpstreamRegistry>, topology: Topology) -> Arc<Self> {
-        let slots = (0..topology.cpu_span())
-            .map(|_| Published::new(registry.epochs().clone(), None))
-            .collect();
+        let slots = (0..topology.cpu_span()).map(|_| registry.cell()).collect();
         Arc::new(Self {
             registry,
             topology,
@@ -69,51 +70,33 @@ impl CacheDirectory {
         &self.topology
     }
 
-    /// The live cache at `cursor`, wrapped over the CPU slots: an acquire load of the slot under the calling
-    /// thread's epoch pin (free inside a worker's cycle) and an upgrade of the weak reference.
+    /// The live cache at `cursor`, wrapped over the CPU slots: a read of the calling thread's view and an upgrade of
+    /// the weak reference.
     fn cache_at(&self, cursor: usize) -> Option<Arc<ControlPlaneCache>> {
         if self.slots.is_empty() {
             return None;
         }
         let slot = &self.slots[cursor % self.slots.len()];
-        self.registry
-            .with_pinned(|guard| slot.load(guard)?.upgrade())
+        self.registry.with_view(|view| view.get(slot)?.0.upgrade())
     }
 
-    /// Publishes `cache` at `cpu`, replacing the cache that was there. The replaced reference is freed once every
-    /// worker has passed the store.
+    /// Publishes `cache` at `cpu`, replacing the cache that was there.
     fn claim(&self, cpu: usize, cache: Weak<ControlPlaneCache>) {
         if let Some(slot) = self.slots.get(cpu) {
-            slot.store(Some(Arc::new(cache))).defer();
+            self.registry
+                .set_cell(slot, Some(Arc::new(CacheRef(cache))));
         }
     }
 
-    /// Empties `cpu`'s slot if `cache` still holds it; the reference is freed once every worker has passed the
-    /// store (Java's compare-and-set to null).
+    /// Empties `cpu`'s slot if `cache` still holds it (Java's compare-and-set to null). A slot that holds another
+    /// cache stays.
     fn withdraw(&self, cpu: usize, cache: &Weak<ControlPlaneCache>) {
-        let Some(slot) = self.slots.get(cpu) else {
-            return;
-        };
-        // The compare-and-set runs under the pin, so the reference it compares cannot be freed and its address
-        // reused meanwhile. A slot that changed since the load holds another cache: it stays.
-        let retired = self.registry.with_pinned(|guard| {
-            let held = slot.load(guard)?;
-            if !Weak::ptr_eq(held, cache) {
-                return None;
-            }
-            slot.store_if_current(Some(held), None).ok()
-        });
-        if let Some(retired) = retired {
-            retired.defer();
-        }
-        // Closing is lifecycle work: free what earlier withdrawals left once the workers have passed.
-        self.reclaim();
-    }
-
-    /// Frees the references that withdrawn or replaced caches left behind, once the workers have passed.
-    pub fn reclaim(&self) {
-        for slot in &self.slots {
-            slot.try_reclaim();
+        if let Some(slot) = self.slots.get(cpu) {
+            self.registry.set_cell_if(
+                slot,
+                |held| held.is_some_and(|held| Weak::ptr_eq(&held.0, cache)),
+                None,
+            );
         }
     }
 }

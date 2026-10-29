@@ -27,11 +27,12 @@
 //! leaving the lattice with nothing to poll. The next unit attaches a fresh set.
 //! [`Duration::ZERO`] as the idle time keeps the sinks attached.
 //!
-//! **The hot side is lock-free** (Java's volatile `generation`): the attached set is a [`Published`] reference in the
-//! lattice's epoch domain, so [`Lake::offer`] and [`Lake::admit`] read it with one pinned load, with no lock and no
-//! reference count. Attaching a set (the first unit of a busy period) and detaching it are rebalance work under a
-//! lifecycle lock, taken off the hot scope; a set that is detached stays allocated until the offers that read it
-//! have passed.
+//! **The hot side is lock-free** (Java's volatile `generation`): the attached set is a cell of the lattice's registry,
+//! so [`Lake::offer`] and [`Lake::admit`] read it from the calling thread's view with no lock and no reference count
+//! (a thread that is not a registered reader of the registry takes the lock for each call: a producer thread calls
+//! [`UpstreamRegistry::register_reader`] once). Attaching a set (the first unit of a busy period) and detaching it are
+//! rebalance work under a lifecycle lock, taken off the hot scope; a set that is detached stays allocated until every
+//! reader has applied the change.
 
 use std::error::Error;
 use std::fmt;
@@ -41,11 +42,12 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use euhedral_core::control_plane::{ControlPlaneLattice, LatticeError};
+use euhedral_core::flow_control::Cell;
 use euhedral_core::flow_control::UpstreamRegistry;
 use euhedral_core::frames::Frame;
 use euhedral_core::generics::{DownstreamSlot, FrameSink, LatticeReceiver, LatticeSource};
 use euhedral_core::ingest::{IngestSink, QueueIngestSink};
-use euhedral_data_structures::sync::{HotScope, LifecycleMutex, Published};
+use euhedral_data_structures::sync::{HotScope, LifecycleMutex};
 
 /// Set in the admission word once admission closes; the rest counts the units admitted and not
 /// yet terminated.
@@ -178,7 +180,7 @@ pub struct Lake {
     admission: Arc<Admission>,
     /// The sinks attached now with their watch, or empty while none are (Java's volatile `generation`): read with
     /// a pinned load, changed under `current`.
-    generation: Published<Generation>,
+    generation: Cell<Generation>,
     /// The attach lock (Java's `synchronized (attachedSources)`) and the set it guards: the one attached now. Taken
     /// by `attach`, `detach`, `discard` and `complete`, off the hot scope.
     current: LifecycleMutex<Option<Arc<Generation>>>,
@@ -211,7 +213,7 @@ impl Lake {
     ) -> Arc<Self> {
         let registry = lattice.registry().clone();
         Arc::new_cyclic(|this| Self {
-            generation: Published::new(registry.epochs().clone(), None),
+            generation: registry.cell(),
             registry,
             lattice,
             sinks,
@@ -260,15 +262,15 @@ impl Lake {
             if self.admission.units() == 0 || self.is_complete() {
                 return Err(frame);
             }
-            let attempt =
-                self.registry
-                    .with_pinned(move |guard| match self.generation.load(guard) {
-                        None => Attempt::Detached(frame),
-                        Some(generation) => match generation.sink_of(&*frame).offer(frame) {
-                            Ok(()) => Attempt::Done,
-                            Err(refused) => Attempt::Refused(refused, generation.id),
-                        },
-                    });
+            let attempt = self
+                .registry
+                .with_view(move |view| match view.get(&self.generation) {
+                    None => Attempt::Detached(frame),
+                    Some(generation) => match generation.sink_of(&*frame).offer(frame) {
+                        Ok(()) => Attempt::Done,
+                        Err(refused) => Attempt::Refused(refused, generation.id),
+                    },
+                });
             match attempt {
                 Attempt::Done => return Ok(()),
                 Attempt::Detached(returned) => frame = returned,
@@ -349,7 +351,7 @@ impl Lake {
     fn ensure_attached(&self) -> Result<(), LakeClosed> {
         let attached = self
             .registry
-            .with_pinned(|guard| self.generation.load(guard).is_some());
+            .with_view(|view| view.get(&self.generation).is_some());
         if attached {
             return Ok(());
         }
@@ -376,7 +378,8 @@ impl Lake {
                 return Err(LakeClosed::Completed);
             }
             let generation = Arc::new(self.generation_of_sinks());
-            self.generation.store(Some(generation.clone())).defer();
+            self.registry
+                .set_cell(&self.generation, Some(generation.clone()));
             *current = Some(generation.clone());
             (generation, true)
         };
@@ -433,7 +436,7 @@ impl Lake {
                 .is_some_and(|attached| Arc::ptr_eq(attached, generation))
             {
                 *current = None;
-                self.generation.store(None).defer();
+                self.registry.set_cell(&self.generation, None);
             }
         }
         generation.abort();
@@ -452,7 +455,7 @@ impl Lake {
                 && !self.is_complete()
                 && current.as_ref().is_some_and(|attached| attached.id == id)
             {
-                self.generation.store(None).defer();
+                self.registry.set_cell(&self.generation, None);
                 current.take()
             } else {
                 None
@@ -472,7 +475,7 @@ impl Lake {
         }
         let attached = {
             let mut current = self.current.lock();
-            self.generation.store(None).defer();
+            self.registry.set_cell(&self.generation, None);
             current.take()
         };
         if let Some(generation) = attached {
@@ -485,6 +488,8 @@ impl Drop for Lake {
     /// A lake dropped before it completed lets its sinks drain and complete.
     fn drop(&mut self) {
         let attached = self.current.lock().take();
+        // The registry holds the set too: let go of it with the lake.
+        self.registry.set_cell(&self.generation, None);
         if let Some(generation) = attached {
             generation.finish();
         }

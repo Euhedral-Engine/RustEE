@@ -9,7 +9,7 @@ use crate::metrics::{
 };
 use crate::utils::{FlowContext, FlowRecorder};
 use euhedral_data_structures::atomics::CachePadded;
-use euhedral_data_structures::sync::{EpochSlot, HotScope, LifecycleMutex};
+use euhedral_data_structures::sync::{HotScope, LifecycleMutex};
 use euhedral_hardware_utils::affinity::{self, ExecutorError, PinnedThreadExecutor, TaskInterrupt};
 use euhedral_hardware_utils::monitor::CoreSnapshot;
 use std::error::Error;
@@ -353,29 +353,19 @@ impl ControlPlaneFragment {
         // The executors this worker pushes to time each frame's execute into its summary.
         let _service_time = self.metrics.clone().map(ServiceTimeSink::install);
         self.initialized.store(true, Ordering::Release);
-        // The worker's announcement in the lattice's epoch domain: it is withdrawn when the loop ends, also by a
-        // panic, so a worker that stops never holds back the release of a replaced value.
-        let epoch = self.registry.thread_epoch();
-        let _withdraw = epoch.as_deref().map(Withdraw);
         while self.running.load(Ordering::Acquire) && !affinity::is_interrupted() {
-            self.run_cycle(&mut policy, &mut cycle, epoch.as_deref());
+            self.run_cycle(&mut policy, &mut cycle);
         }
     }
 
-    fn run_cycle(&self, policy: &mut DecisionTree, cycle: &mut Cycle, epoch: Option<&EpochSlot>) {
+    fn run_cycle(&self, policy: &mut DecisionTree, cycle: &mut Cycle) {
         // A reset is lifecycle work; the cycle proper is the hot path.
         self.handle_reset_request(policy, cycle);
         let _hot = HotScope::enter();
-        // The cycle's quiescent point: nothing loaded in an earlier cycle is held, and what this cycle loads from
-        // the lattice's published cells stays valid until the next point or the park.
-        if let Some(epoch) = epoch {
-            epoch.quiescent();
-            // What waited for the readers of the last cycle (a retired routing generation's release) may be due
-            // now. One load when nothing waits.
-            if self.registry.has_due() {
-                self.registry.run_due();
-            }
-        }
+        // The cycle's drain: what the lattice's cells changed to since the last cycle (a new routing generation, a
+        // parent, a cache) reaches this worker's view now, and the values it replaced are let go of. One load when
+        // nothing changed.
+        self.registry.refresh_view();
 
         let half_life = policy.idle_policy().contention_half_life();
         let (contention, upstreams) = self
@@ -387,9 +377,6 @@ impl ControlPlaneFragment {
             })
             .unwrap_or_default();
         if upstreams == 0 && self.cache.is_drained() {
-            if let Some(epoch) = epoch {
-                epoch.idle();
-            }
             #[allow(clippy::disallowed_methods, reason = "JAVA-BACKOFF")]
             thread::park_timeout(EMPTY_PARK);
             return;
@@ -458,9 +445,6 @@ impl ControlPlaneFragment {
         }
 
         if run.processed == 0 {
-            if let Some(epoch) = epoch {
-                epoch.idle();
-            }
             if path == ExecutionPath::Idle {
                 let park = self
                     .with_queue(|queue| policy.idle_park(queue, cycle.now, registered, productive))
@@ -921,16 +905,6 @@ impl Drop for InProgress<'_> {
     fn drop(&mut self) {
         self.0
             .store(self.0.load(Ordering::Relaxed) - 1, Ordering::Release);
-    }
-}
-
-/// Withdraws a worker's announcement in the lattice's epoch domain when dropped, also when the worker's loop
-/// unwinds.
-struct Withdraw<'a>(&'a EpochSlot);
-
-impl Drop for Withdraw<'_> {
-    fn drop(&mut self) {
-        self.0.idle();
     }
 }
 

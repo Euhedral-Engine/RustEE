@@ -995,29 +995,6 @@ fn a_cache_closed_while_stolen_from_lives_for_the_steal_and_its_slot_reference_i
     release.send(()).unwrap();
     assert_eq!(stealing.join().unwrap(), 1);
     assert!(weak.upgrade().is_none(), "freed when the steal ended");
-    directory.reclaim();
-    assert_eq!(directory.slots[cpu].pending(), 0);
-}
-
-#[test]
-fn a_directory_slot_reference_waits_for_a_worker_mid_cycle_and_is_freed_after_its_next_point() {
-    let directory = directory();
-    let victim = cache_on(&directory, &config(1), 1);
-    let cpu = victim.cpu();
-    let worker = directory.registry().epochs().register();
-    worker.quiescent();
-
-    victim.close();
-    directory.reclaim();
-    assert_eq!(
-        directory.slots[cpu].pending(),
-        1,
-        "the worker may be reading the slot"
-    );
-
-    worker.quiescent();
-    directory.reclaim();
-    assert_eq!(directory.slots[cpu].pending(), 0);
 }
 
 #[test]

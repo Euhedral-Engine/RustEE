@@ -299,7 +299,7 @@ impl ControlPlaneLattice {
     }
 
     /// The lattice's upstream registry: its workers' queues and the epoch domain its published values are read
-    /// under (see [`UpstreamRegistry::with_pinned`]).
+    /// under (see [`UpstreamRegistry::with_view`]).
     pub fn registry(&self) -> &Arc<UpstreamRegistry> {
         self.controller.edge().registry()
     }
@@ -609,12 +609,8 @@ impl ControlPlaneLattice {
 
         let timeout = self.config.shutdown_timeout;
         if !timeout.is_zero() {
-            // The routes retire when the readers pinned at the swap have left; nobody is guaranteed to look (a
-            // worker looks at the start of each cycle), so this thread runs what has come due while it waits.
             let deadline = Instant::now() + timeout;
-            let registry = self.controller.edge().registry().clone();
             let retired = loop {
-                registry.run_due();
                 let left = deadline.saturating_duration_since(Instant::now());
                 if left.is_zero() {
                     break false;

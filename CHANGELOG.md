@@ -3,6 +3,28 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## Values the workers read, handed over through queues (2026-10-29)
+
+**What.** `Published`, `EpochDomain`, `EpochSlot`, `Retired` and the `membarrier` module are removed (**breaking**), with the
+registry's deferred-release list. A lattice's changing state lives in **cells** of its `UpstreamRegistry`
+(`registry.cell::<T>()`, `set_cell`, `set_cell_if`, `cell_value`): the writer keeps the current value under a lifecycle
+lock and sends it, through a queue (`MpscQueue`), to the mailbox of every registered reader (`register_reader`, called
+by `register` for a worker). A worker drains its mailbox in one batch at the start of each cycle (`refresh_view`) and at
+a read, and applies the values to a view only it reads (`with_view(|view| view.get(&cell))`). A thread that is not a
+registered reader reads under the lock, once per cell per call.
+- Users: a vertex's routing generation (`RoutingState` is an `Arc`; the last holder to let go of a generation releases
+  its downstreams from `Drop`), an edge's parent, a CPU's cache in the `CacheDirectory`, and the lake's attached set (a
+  producer thread calls `register_reader` once to read it without the lock). `LatticeVertex::routing_state()` and
+  `RouteGuard` give way to `with_routing_state`.
+- Reclamation is `Arc`: no epoch, no announcement, no barrier instruction, no platform code. A reader's view holds a
+  replaced generation until it drains (at its next cycle or read); a thread that exits drops its view.
+
+**Why.** One place where correctness lives (a queue and a lock) instead of a slot list, a retirement chain, an epoch
+domain and a process-wide barrier; a frame reads worker-owned state.
+
+**Semantics.** A remap reaches a worker at its next read or cycle; a frame in flight finishes on the generation it
+began with (nested reads do not drain). A dropped vertex or lake clears its cells.
+
 ## Queue fidelity, step 1: the audit and the first weakening (2026-10-29)
 
 **What.** `mp_reserve` reads the producer's tail chunk with a relaxed load (Java reads it plain); the acquire load of the

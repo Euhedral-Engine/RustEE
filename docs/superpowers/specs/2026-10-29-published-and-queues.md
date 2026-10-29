@@ -87,3 +87,18 @@ the barrier and `run_due` *for workers*. They do **not** cover the lake's extern
 Recommendation: A, if the lake's producer handle is acceptable. It is the only option that deletes the machinery
 rather than moving it. Before building it: confirm with the user that `Lake::offer` may take a per-producer handle
 (or tell me which of 1(a)-(c) they prefer), because it is the one case the queues cannot cover on their own.
+
+## Decision and what was built
+
+The user's direction: wherever threads hand something off, use a queue variant. Option A was built (branch
+`queue-handoff`): cells in the registry, one MPSC mailbox per registered reader, per-reader views, `Arc` as the
+reclamation. `Lake` readers register once (`register_reader`); a thread that does not takes the lock per call.
+
+Other hand-rolled hand-offs in the stack, for a later chunk (each is a place a queue variant could carry the hand-off):
+- `OneShot` (a result from a completer to a reader that polls): a bounded single-producer single-consumer queue of one.
+- The sequencer's ready flags and work-in-progress count: the order is already a ring; the "ready" hand-off is the part
+  a queue could carry (an MPSC of completions drained by the releaser).
+- `Join`'s slot writes and arrival count: a fan-in that an MPSC of parts could carry.
+- The lake's attach path (`current` lock plus a cell): a message to the registry's mailboxes (done for the read side).
+- `Completions`' incoming list and `Sequencer`'s `wip`: already queues plus a claim.
+- The interceptor's `serving` pointer and the registry's per-worker handle queues: queues already.
