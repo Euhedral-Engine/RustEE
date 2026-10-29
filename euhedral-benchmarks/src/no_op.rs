@@ -161,15 +161,18 @@ impl RepeatingSource {
     }
 
     /// Banks `demand`; `u64::MAX` is unbounded.
+    ///
+    /// The lattice serializes a source's `request` and `pull`: one worker is inside either at a time, and the
+    /// interceptor's claim orders one worker's exit before the next one's entry. The banked demand is therefore plain
+    /// state of whoever is inside, kept in an atomic only so that the source is `Sync`: it changes by a load and a
+    /// store, never a read-modify-write.
     fn bank(&self, demand: u64) {
         if demand == 0 {
             return;
         }
-        let _ = self
-            .demand
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |banked| {
-                Some(banked.saturating_add(demand))
-            });
+        let banked = self.demand.load(Ordering::Relaxed);
+        self.demand
+            .store(banked.saturating_add(demand), Ordering::Relaxed);
     }
 
     /// Pushes frames to the receiver while demand is banked and frames are back.
@@ -178,7 +181,7 @@ impl RepeatingSource {
             return;
         };
         while !self.downstream.is_complete() {
-            let banked = self.demand.load(Ordering::Acquire);
+            let banked = self.demand.load(Ordering::Relaxed);
             if banked == 0 {
                 return;
             }
@@ -186,7 +189,7 @@ impl RepeatingSource {
                 return;
             };
             if banked != u64::MAX {
-                self.demand.fetch_sub(1, Ordering::AcqRel);
+                self.demand.store(banked - 1, Ordering::Relaxed);
             }
             let mut frame = frame;
             frame.stamp();

@@ -17,6 +17,11 @@ flags and `EUHEDRAL_HCT_SOURCES`).
 waits for 32,000,000 completions. The harness thread has a core of its own. The output is one line per iteration and a
 summary of the mean and standard deviation of the measured iterations.
 
+The repeating source's banked demand is state of whichever worker is inside its `request` or `pull` (the lattice
+serializes them), so it changes by a load and a store, not a read-modify-write; the completion counter and the latency
+recorders keep their read-modify-write, because a thread's slot is shared once the process has made more threads than
+slots.
+
 **Tests.** The harness-core selection, the worker CPU set, the completion target and its bounded wait, the sources
 default, the output lines, and a smoke run of a fork with a tiny target on a real lattice.
 
