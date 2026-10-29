@@ -8,6 +8,7 @@ use euhedral_data_structures::queues::partitioned::{
 use euhedral_data_structures::queues::queue::{Multi, Single};
 use euhedral_data_structures::sync::{ClaimCell, ClaimGuard, HotScope};
 use std::any::Any;
+use std::cell::Cell;
 use std::num::NonZeroUsize;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering, fence};
@@ -331,9 +332,15 @@ impl QueueSource {
             }
             let delivered = match self.downstream.receiver() {
                 Some(receiver) if !self.downstream.is_complete() => {
+                    // Counted before each push, so a push that panics still counts: the frame
+                    // left the queue.
+                    let pushed = Cell::new(0_u64);
                     let drained = panic::catch_unwind(AssertUnwindSafe(|| {
                         consumer.drain_while(
-                            |frame| receiver.push(frame),
+                            |frame| {
+                                pushed.set(pushed.get() + 1);
+                                receiver.push(frame);
+                            },
                             |_| self.downstream.is_complete(),
                             self.demand.load(Ordering::SeqCst),
                         )
@@ -347,6 +354,9 @@ impl QueueSource {
                             Some(delivered)
                         }
                         Err(panic) => {
+                            // What was pushed is off the demand, so a later holder pushes no more
+                            // than was asked for.
+                            self.take_demand(pushed.get());
                             consumer.release_seq_cst();
                             let _ = panic::catch_unwind(AssertUnwindSafe(|| self.drain_finished()));
                             panic::resume_unwind(panic);

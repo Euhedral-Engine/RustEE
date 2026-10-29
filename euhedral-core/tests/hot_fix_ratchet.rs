@@ -416,8 +416,21 @@ fn the_hot_fix_tags_and_their_uses_are_exactly_the_listed_ones() {
 }
 
 /// The `lock!(` call sites in `text`.
+///
+/// A site is `lock!` (not the tail of a longer name) followed by optional whitespace and an opening delimiter.
 fn lock_sites(text: &str) -> usize {
-    text.matches("lock!(").count()
+    let mut count = 0;
+    let mut rest = text;
+    while let Some(at) = rest.find("lock!") {
+        let before = rest[..at].chars().next_back();
+        let after = rest[at + "lock!".len()..].trim_start();
+        let part_of_a_name = before.is_some_and(|c| c.is_alphanumeric() || c == '_');
+        if !part_of_a_name && after.starts_with(['(', '[', '{']) {
+            count += 1;
+        }
+        rest = &rest[at + "lock!".len()..];
+    }
+    count
 }
 
 #[test]
@@ -449,6 +462,15 @@ fn the_lock_macro_sites_are_exactly_the_listed_ones() {
         ));
     }
     assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+#[test]
+fn lock_sites_are_found_however_they_are_spelled() {
+    assert_eq!(lock_sites("lock!(&a) lock! (&b) lock!\n[c] lock!{d}"), 4);
+    assert_eq!(
+        lock_sites("unlock!(a) block!(b) my_lock!(c) macro_rules! lock {"),
+        0
+    );
 }
 
 #[test]

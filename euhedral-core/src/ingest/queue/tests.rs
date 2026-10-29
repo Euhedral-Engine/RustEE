@@ -384,8 +384,8 @@ fn a_panicking_receiver_does_not_wedge_the_queue() {
 
 #[test]
 fn concurrent_publishers_and_requesters_deliver_every_frame_once() {
-    const PUBLISHERS: u64 = 4;
-    const EACH: u64 = 2_000;
+    const PUBLISHERS: u64 = if cfg!(miri) { 2 } else { 4 };
+    const EACH: u64 = if cfg!(miri) { 12 } else { 2_000 };
     let sink = QueueIngestSink::with_partitions(NonZeroUsize::new(2).unwrap());
     let source = sink.delegate();
     let receiver = TestReceiver::new();
@@ -792,4 +792,32 @@ fn a_panicking_cancel_does_not_stop_the_clear_or_wedge_the_queue() {
     offer(&sink, [3]);
     source.request(1);
     assert_eq!(receiver.received(), [3], "the queue is not left claimed");
+}
+
+#[test]
+fn a_panicking_receiver_takes_the_frames_it_was_pushed_off_the_demand() {
+    let failing = Arc::new(AtomicBool::new(true));
+    let flag = failing.clone();
+    let receiver = Hooked::on_push(move |_| {
+        if flag.swap(false, Ordering::AcqRel) {
+            panic!("receiver failed");
+        }
+    });
+    let sink = QueueIngestSink::new();
+    let source = sink.delegate();
+    source.clone().add_downstream(receiver.clone());
+    offer(&sink, [1, 2]);
+    assert!(panic::catch_unwind(AssertUnwindSafe(|| source.request(1))).is_err());
+    assert_eq!(
+        sink.demand(),
+        0,
+        "the frame whose push panicked was handed over, so it is off the demand"
+    );
+    source.request(1);
+    assert_eq!(receiver.inner.received(), [1, 2]);
+    assert_eq!(
+        sink.demand(),
+        0,
+        "a later holder pushed no more than the demand"
+    );
 }

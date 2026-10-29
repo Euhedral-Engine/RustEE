@@ -1,5 +1,6 @@
 //! Completions found by polls (Euhedral-Inference `GpuCompletions`).
 
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::fmt;
 use std::panic::{self, AssertUnwindSafe};
@@ -81,6 +82,9 @@ pub struct Completions {
     demand: AtomicU64,
     downstream: DownstreamSlot,
     complete: AtomicBool,
+    /// Registrations whose marker was still unreached when the source dropped, leaked (see the
+    /// `Drop` impl); shared, so it can be read after the drop.
+    leaked: Arc<AtomicUsize>,
     /// How late each emission was, in µs, since the start (lock-free: polls record, readers copy).
     lateness: Histogram,
 }
@@ -123,16 +127,31 @@ enum Waits {
 
 impl Drop for Completions {
     /// The last owner lets go: no thread can register any more, and none will poll. What is still
-    /// in the queue, and what was absorbed and never emitted, is cancelled (`do_finally`), so no
-    /// registration is left without an end.
+    /// in the queue, and what was absorbed and never emitted, ends here, so no registration is left
+    /// without an end:
+    ///
+    /// - a registration that waits for a lane's marker the lane has still not reached is **leaked**
+    ///   (`mem::forget`) and counted in [`leaked_at_drop`](Completions::leaked_at_drop). The device
+    ///   may still use what its frame holds, and finishing the frame would release it; a leak is
+    ///   the same choice as a ring's in-flight buffers make when it drops;
+    /// - every other registration, including one whose marker was reached, is finished with
+    ///   `do_finally` (cancelled), as before.
     fn drop(&mut self) {
         let poll = self.poll.get_mut();
-        let late = Self::absorb(poll);
-        for what in late {
-            Self::cancel(what);
-        }
-        for entry in std::mem::take(&mut poll.waiting) {
-            Self::cancel(entry.what);
+        let mut ends = Self::absorb(poll);
+        ends.extend(
+            std::mem::take(&mut poll.waiting)
+                .into_iter()
+                .map(|entry| entry.what),
+        );
+        for what in ends {
+            match what {
+                Waits::Marker(marker, _) if !self.lanes.reached(marker) => {
+                    self.leaked.fetch_add(1, Ordering::Release);
+                    std::mem::forget(what);
+                }
+                what => Self::cancel(what),
+            }
         }
     }
 }
@@ -187,6 +206,7 @@ impl Completions {
             demand: AtomicU64::new(0),
             downstream: DownstreamSlot::new(),
             complete: AtomicBool::new(false),
+            leaked: Arc::new(AtomicUsize::new(0)),
             lateness: Histogram::new(),
         })
     }
@@ -322,20 +342,34 @@ impl Completions {
             if let Some(downstream) = self.downstream.receiver()
                 && !self.complete.load(Ordering::SeqCst)
             {
-                let emitted = self.emit(
-                    &mut poll,
-                    &mut |frame| downstream.push(frame),
-                    &mut |_| false,
-                    self.demand.load(Ordering::SeqCst),
-                );
-                if emitted > 0 {
+                // Counted before each push, so a push that panics still counts: the frame left
+                // the source.
+                let pushed = Cell::new(0_u64);
+                let emitted = panic::catch_unwind(AssertUnwindSafe(|| {
+                    self.emit(
+                        &mut poll,
+                        &mut |frame| {
+                            pushed.set(pushed.get() + 1);
+                            downstream.push(frame);
+                        },
+                        &mut |_| false,
+                        self.demand.load(Ordering::SeqCst),
+                    )
+                }));
+                if pushed.get() > 0 {
                     // Accounted before the claim is released, so the next holder cannot
                     // over-deliver.
                     let _ = self
                         .demand
                         .try_update(Ordering::SeqCst, Ordering::SeqCst, |d| {
-                            Some(d.saturating_sub(emitted))
+                            Some(d.saturating_sub(pushed.get()))
                         });
+                }
+                if let Err(panic) = emitted {
+                    // The wakeups refused meanwhile are still served.
+                    poll.release_seq_cst();
+                    let _ = panic::catch_unwind(AssertUnwindSafe(|| self.after_release()));
+                    panic::resume_unwind(panic);
                 }
             }
             poll.release_seq_cst();
@@ -362,6 +396,12 @@ impl Completions {
     /// Polls `pending` until it yields its continuation.
     pub fn register(&self, pending: Box<dyn Pending>) {
         self.add(Waits::Pending(pending));
+    }
+
+    /// How many registrations the source leaked when it dropped because their marker was still
+    /// unreached (see its `Drop`). The counter outlives the source.
+    pub fn leaked_at_drop(&self) -> Arc<AtomicUsize> {
+        self.leaked.clone()
     }
 
     /// Operations still in flight.
@@ -408,7 +448,6 @@ impl Completions {
         let waiting = &mut poll.waiting;
         let now = Instant::now();
         let mut emitted = 0;
-        let mut late = Vec::new();
         let mut index = 0;
         while index < waiting.len() && emitted < demand {
             let entry = &mut waiting[index];
@@ -456,15 +495,13 @@ impl Completions {
             else {
                 unreachable!("a done entry at index")
             };
-            late.push(now.saturating_duration_since(since));
-            consumer(frame);
+            // The frame leaves the source here: it is off `pending` (and its lateness recorded)
+            // before the consumer sees it, so a consumer that unwinds leaves both exact.
+            self.pending.fetch_sub(1, Ordering::AcqRel);
+            self.lateness
+                .record(now.saturating_duration_since(since).as_micros() as f64);
             emitted += 1;
-        }
-        if emitted > 0 {
-            self.pending.fetch_sub(emitted as usize, Ordering::AcqRel);
-            for sample in late {
-                self.lateness.record(sample.as_micros() as f64);
-            }
+            consumer(frame);
         }
         emitted
     }
@@ -1379,11 +1416,14 @@ mod tests {
                 emitted, 0,
                 "an unreached lane emits nothing, also after complete"
             );
+            let leaks = completions.leaked_at_drop();
             drop(completions);
+            // Cancelled behind the marker (ended), or registered ahead of it and still waiting on an
+            // unreached lane at drop (leaked and counted): one or the other, exactly once.
             assert_eq!(
-                ends.load(Ordering::Acquire),
+                ends.load(Ordering::Acquire) + leaks.load(Ordering::Acquire),
                 1,
-                "and the frame still ends once"
+                "the frame ends once or is leaked once"
             );
         }
     }
@@ -1436,6 +1476,106 @@ mod tests {
             *recorder.ids.lock().unwrap(),
             [2],
             "the unwinding poll still served the request"
+        );
+    }
+
+    #[test]
+    fn a_panicking_consumer_leaves_pending_exact() {
+        let (completions, _) = setup();
+        completions.at(Instant::now(), tagged(1));
+        assert_eq!(completions.pending(), 1);
+        let pulled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            completions.pull(&mut |_| panic!("consumer failed"), &mut |_| false, 1)
+        }));
+        assert!(pulled.is_err());
+        assert_eq!(
+            completions.pending(),
+            0,
+            "the frame left the source when it was handed over"
+        );
+    }
+
+    /// Takes frames until told otherwise; the first push waits for the test and then panics.
+    struct PanicOncePush {
+        inside: std::sync::Barrier,
+        release: std::sync::Barrier,
+        first: AtomicBool,
+        ids: Mutex<Vec<u64>>,
+    }
+
+    impl euhedral_core::generics::LatticeTerminal for PanicOncePush {
+        fn add_upstream(&self, _: Arc<dyn LatticeSource>) {}
+    }
+
+    impl LatticeReceiver for PanicOncePush {
+        fn push(&self, frame: Box<dyn Frame>) {
+            if self.first.swap(false, Ordering::SeqCst) {
+                self.inside.wait();
+                self.release.wait();
+                panic!("push failed");
+            }
+            self.ids.lock().unwrap().push(frame.header().id_hash());
+        }
+
+        fn on_complete(&self) {}
+
+        fn on_error(&self, _: euhedral_core::frames::Failure) {}
+    }
+
+    #[test]
+    fn a_panicking_push_keeps_demand_exact_and_serves_the_request_refused_meanwhile() {
+        let (completions, _) = setup();
+        let receiver = Arc::new(PanicOncePush {
+            inside: std::sync::Barrier::new(2),
+            release: std::sync::Barrier::new(2),
+            first: AtomicBool::new(true),
+            ids: Mutex::default(),
+        });
+        completions.clone().add_downstream(receiver.clone());
+        completions.at(Instant::now(), tagged(1));
+        completions.at(Instant::now(), tagged(2));
+        std::thread::scope(|scope| {
+            let requester = scope.spawn(|| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| completions.request(1)))
+            });
+            receiver.inside.wait();
+            completions.request(1);
+            receiver.release.wait();
+            assert!(requester.join().unwrap().is_err());
+        });
+        assert_eq!(
+            *receiver.ids.lock().unwrap(),
+            [2],
+            "the unwinding request served the one refused meanwhile"
+        );
+        assert_eq!(
+            completions.demand.load(Ordering::SeqCst),
+            0,
+            "each frame handed over was taken off the demand, also the one whose push panicked"
+        );
+        assert_eq!(completions.pending(), 0);
+    }
+
+    #[test]
+    fn dropping_with_an_unreached_marker_leaks_the_frame_and_counts_it() {
+        let (completions, lane) = setup();
+        let leaks = completions.leaked_at_drop();
+        let (unreached, unreached_ends) = counted(1);
+        let (reached, reached_ends) = counted(2);
+        completions.after_marker(Marker::new(lane.id, LaneId(0), 9), unreached);
+        completions.after_marker(Marker::new(lane.id, LaneId(0), 1), reached);
+        lane.completed.store(1, Ordering::Release);
+        drop(completions);
+        assert_eq!(
+            unreached_ends.load(Ordering::Acquire),
+            0,
+            "a frame whose device work may still run is not finished"
+        );
+        assert_eq!(leaks.load(Ordering::Acquire), 1, "and it is counted");
+        assert_eq!(
+            reached_ends.load(Ordering::Acquire),
+            1,
+            "one whose marker was reached is finished"
         );
     }
 }

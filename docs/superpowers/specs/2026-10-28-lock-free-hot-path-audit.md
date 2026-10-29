@@ -786,7 +786,7 @@ runtime" is the Java runtime `euhedral-graph` is derived from (its `runtime/grap
 | H1-H4 monitor | hardware-utils `ResourceMonitor`, `SystemSnapshotProvider` | H2: claim instead of `synchronized` (ticks hot); H3 `Published` (no GC). |
 | H5 dispatcher | hardware-utils `LatestValueDispatcher` | Mailbox swap and copy-on-write listeners instead of its spin lock (ticks hot). |
 | H6, H7 mapper | hardware-utils `TopologyMapper` | `Published` (no GC). |
-| G1-G3 completions | none; nearest core `QueueIngestSink` | A request that finds the poll held leaves a wakeup for the holder (`request_pending`, as `QueueIngestSink`'s); the lane pool lives with the source (a marker is reached when its lane says so, also after `complete`, as in Java); the poll state is a `SourceCell`, the state a holder mutates. |
+| G1-G3 completions | none; nearest core `QueueIngestSink` | A request that finds the poll held leaves a wakeup for the holder (`request_pending`, as `QueueIngestSink`'s); the lane pool lives with the source (a marker is reached when its lane says so, also after `complete`, as in Java); the poll state is a `SourceCell`, the state a holder mutates; at drop, a registration whose marker is still unreached is leaked and counted instead of finished (the device may still use what it holds). |
 | G4 join | graph runtime `Join` | In the lane-source plan. |
 | G5 latch | none; `CompletableFuture` | — |
 | G6 sequencer | graph runtime `Sequencer` | None. |

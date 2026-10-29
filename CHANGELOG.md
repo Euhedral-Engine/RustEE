@@ -28,8 +28,11 @@ semantics and the tests that pin it.
   `request` and a late registration's sweep each try to enter. A `request` that finds it held banks its demand and leaves a wakeup, and a sweep that
   finds it held sets `sweep_pending`; the holder serves both after it releases. The lane pool is a fixed `Arc` that lives
   as long as the source (a marker is reached when its lane says so, also after `complete`), and the downstream is a
-  `DownstreamSlot`. `complete` touches no poll state. Dropping the source cancels what is still queued and what was
-  absorbed and never emitted.
+  `DownstreamSlot`. `complete` touches no poll state. Dropping the source finishes (`do_finally`) what is still queued and what was
+  absorbed and never emitted, except a registration whose marker its lane has still not reached: that frame is leaked
+  (`mem::forget`, as an I/O ring leaks in-flight buffers) and counted in `Completions::leaked_at_drop()`, because the
+  device may still use what the frame holds. `pending()` is decremented as each frame is handed to the consumer, and
+  `demand` as each is pushed, so a consumer or downstream that panics leaves both exact.
 - `euhedral-io`: the `AsyncIo` front (I1, I2) keeps the continuations a pull's `stop` held back in a `SourceCell` and its
   downstream in a `DownstreamSlot`; a `request` banks its demand with the same wakeup. The engines lock their tables
   through a `lock!` macro (the function it replaces named the lock type).
