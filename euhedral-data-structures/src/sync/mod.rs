@@ -4,8 +4,8 @@
 //!
 //! Locks for lifecycle work, and the debug check that keeps them off the hot path:
 //!
-//! - [`LifecycleMutex`], [`LifecycleRwLock`]: the only lock types the workspace lints allow.
-//! - [`HotScope`]: marks the code a worker or producer runs per frame; a lifecycle lock taken inside one panics in
+//! - [`LifecycleMutex`], [`LifecycleRwLock`]: the lock types meant for start, stop and rebalance state.
+//! - [`HotScope`]: marks the code a thread runs once per unit of work; a lifecycle lock taken inside one aborts in
 //!   debug builds.
 
 mod lifecycle;

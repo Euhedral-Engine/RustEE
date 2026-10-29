@@ -1,19 +1,19 @@
 //! Locks for start, stop and rebalance, and the debug check that keeps them off the hot path.
 //!
-//! The hot path of the runtime takes no lock. Locks remain for lifecycle work only: start, stop (shutdown, drop,
-//! complete, close) and rebalance (attaching and detaching sources and receivers, lattice resizing, shard moves).
-//! [`LifecycleMutex`] and [`LifecycleRwLock`] are the lock types the workspace lints allow without a tag, and each
-//! checks, in debug builds, that it is not taken inside a [`HotScope`]. A worker's cycle and a producer's offer run
-//! inside one, so a lifecycle lock that a frame reaches ends the test run instead of costing a stall in production.
+//! Code that runs per unit of work takes no lock. Locks remain for lifecycle work only: start, stop (shutdown, drop,
+//! complete, close) and rebalance (attaching and detaching participants, resizing, moving work between owners).
+//! [`LifecycleMutex`] and [`LifecycleRwLock`] are the lock types meant for that state, and each checks, in debug
+//! builds, that it is not taken inside a [`HotScope`]. Code that runs per unit of work opens one, so a lifecycle lock
+//! that such code reaches ends the test run instead of costing a stall in production.
 //!
 //! A violation prints "lifecycle lock taken inside a hot scope" with the location of the lock call and aborts the
-//! process. A panic would unwind into the frame runners, which catch panics and report them as a frame's failure, so
-//! the violation could pass unseen. A test that provokes a violation on purpose installs a hook
+//! process. A panic could be caught on the way out by code that treats a panic as the failure of one unit of work,
+//! so the violation could pass unseen. A test that provokes a violation on purpose installs a hook
 //! ([`HotScope::install_violation_hook`], debug builds only); the hook receives the location, and the lock then
 //! proceeds. A hook that is not meant for a location forwards it to [`HotScope::report_default`].
 //!
 //! Release builds carry none of it: the scope is a no-op and the locks are the standard ones. A poisoned lock is
-//! used as it stands, as the runtime's other lifecycle state is.
+//! used as it stands.
 
 // The wrappers are the one place a standard lock type is named.
 #![allow(clippy::disallowed_types)]
@@ -60,10 +60,10 @@ impl Drop for ViolationHookGuard {
     }
 }
 
-/// Marks the code a thread runs per frame, per pull, per request, per offer or per completion.
+/// Marks the code a thread runs once per unit of work, such as a cycle, a request, an offer or a completion.
 ///
 /// [`enter`](Self::enter) opens a scope for the guard's lifetime; scopes nest. A lifecycle step that a hot path
-/// legitimately reaches (the first attach of a lake, the retirement of a routing generation) calls
+/// legitimately reaches (the first initialization of a shared structure, the retirement of a replaced table) calls
 /// [`leave`](Self::leave) first, which suspends the scopes until its guard drops. Every method does nothing in a
 /// release build.
 pub struct HotScope;
@@ -394,7 +394,7 @@ mod tests {
         assert_eq!(places.len(), 1, "{places:?}");
     }
 
-    /// The default report cannot be caught: the frame runners catch panics, so a panic could pass unseen.
+    /// The default report cannot be caught: code that catches panics would swallow one, so a panic could pass unseen.
     #[cfg(all(debug_assertions, unix, not(miri)))]
     #[test]
     fn the_default_report_aborts_even_inside_catch_unwind() {
