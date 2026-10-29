@@ -14,6 +14,11 @@ use euhedral_hardware_utils::util::CpuSet;
 use std::collections::VecDeque;
 use std::sync::Condvar;
 use std::sync::mpsc;
+use std::sync::{Mutex, PoisonError};
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 fn directory() -> Arc<CacheDirectory> {
     CacheDirectory::new(UpstreamRegistry::new(), Topology::system().clone())

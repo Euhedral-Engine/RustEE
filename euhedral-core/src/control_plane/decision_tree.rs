@@ -6,9 +6,8 @@ use crate::config::IdlePolicy;
 use crate::flow_control::UpstreamQueue;
 use crate::utils::ACQUIRE_CONTENTION_SCALE;
 use crate::utils::calibration::benchmark;
-use std::sync::atomic::{AtomicU64, Ordering};
-#[allow(clippy::disallowed_types, reason = "HOT-FIX(C3)")]
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// Contention, scaled by [`ACQUIRE_CONTENTION_SCALE`], above which costly bodies are staged: 85%.
@@ -46,37 +45,39 @@ pub(super) enum ExecutionPath {
 /// Each window of 32 samples yields its second-smallest, which replaces the estimate at once if it
 /// is cheap, and only after two windows in a row if it is expensive. The output hooks record
 /// samples on the worker's thread; the policy reads the estimate.
+///
+/// The window is plain state of that one worker, held in relaxed atomics so the hooks and the
+/// policy can share it through an `Arc`: `record`, `calibrate` and `reset` run on the worker, in
+/// turn. The count and the estimate are what other threads may read, and keep their release
+/// stores.
 pub(super) struct BodyCost {
-    #[allow(clippy::disallowed_types, reason = "HOT-FIX(C3)")]
-    window: Mutex<Window>,
+    /// The window's samples, as `f64` bits.
+    samples: [AtomicU64; WINDOW],
+    /// The cost, as `f64` bits, from which a body counts as expensive.
+    expensive_threshold_ns: AtomicU64,
+    confirmations: AtomicU32,
     estimate_ns: AtomicU64,
-    samples: AtomicU64,
-}
-
-struct Window {
-    samples: [f64; WINDOW],
-    expensive_threshold_ns: f64,
-    confirmations: u32,
+    recorded: AtomicU64,
 }
 
 impl BodyCost {
     /// An empty estimate that takes no body as expensive until [`calibrate`](Self::calibrate)d.
-    #[allow(clippy::disallowed_types, reason = "HOT-FIX(C3)")]
     pub(super) fn new() -> Self {
         Self {
-            window: Mutex::new(Window {
-                samples: [0.0; WINDOW],
-                expensive_threshold_ns: f64::INFINITY,
-                confirmations: 0,
-            }),
+            samples: std::array::from_fn(|_| AtomicU64::new(0f64.to_bits())),
+            expensive_threshold_ns: AtomicU64::new(f64::INFINITY.to_bits()),
+            confirmations: AtomicU32::new(0),
             estimate_ns: AtomicU64::new(0f64.to_bits()),
-            samples: AtomicU64::new(0),
+            recorded: AtomicU64::new(0),
         }
     }
 
     /// Takes bodies costing at least `expensive_threshold` as expensive, and starts over.
     pub(super) fn calibrate(&self, expensive_threshold: Duration) {
-        self.window().expensive_threshold_ns = expensive_threshold.as_nanos() as f64;
+        self.expensive_threshold_ns.store(
+            (expensive_threshold.as_nanos() as f64).to_bits(),
+            Ordering::Relaxed,
+        );
         self.reset();
     }
 
@@ -85,14 +86,13 @@ impl BodyCost {
         if elapsed.is_zero() {
             return;
         }
-        let mut window = self.window();
-        let samples = self.samples.load(Ordering::Relaxed);
-        let index = (samples % WINDOW as u64) as usize;
-        window.samples[index] = elapsed.as_nanos() as f64;
-        self.samples
-            .store(samples.saturating_add(1), Ordering::Release);
+        let recorded = self.recorded.load(Ordering::Relaxed);
+        let index = (recorded % WINDOW as u64) as usize;
+        self.samples[index].store((elapsed.as_nanos() as f64).to_bits(), Ordering::Relaxed);
+        self.recorded
+            .store(recorded.saturating_add(1), Ordering::Release);
         if index == WINDOW - 1 {
-            self.update(&mut window);
+            self.update();
         }
     }
 
@@ -103,24 +103,20 @@ impl BodyCost {
 
     /// Whether a full window has been recorded.
     pub(super) fn has_history(&self) -> bool {
-        self.samples.load(Ordering::Acquire) >= WINDOW as u64
+        self.recorded.load(Ordering::Acquire) >= WINDOW as u64
     }
 
     /// Forgets every sample and the estimate, keeping the calibration.
     pub(super) fn reset(&self) {
-        let mut window = self.window();
-        window.confirmations = 0;
-        self.samples.store(0, Ordering::Release);
+        self.confirmations.store(0, Ordering::Relaxed);
+        self.recorded.store(0, Ordering::Release);
         self.estimate_ns.store(0f64.to_bits(), Ordering::Release);
     }
 
-    fn window(&self) -> MutexGuard<'_, Window> {
-        self.window.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    fn update(&self, window: &mut Window) {
+    fn update(&self) {
         let (mut minimum, mut second) = (f64::INFINITY, f64::INFINITY);
-        for &sample in &window.samples {
+        for sample in &self.samples {
+            let sample = f64::from_bits(sample.load(Ordering::Relaxed));
             if sample < minimum {
                 second = minimum;
                 minimum = sample;
@@ -128,13 +124,16 @@ impl BodyCost {
                 second = sample;
             }
         }
-        if second >= window.expensive_threshold_ns {
-            window.confirmations = (window.confirmations + 1).min(EXPENSIVE_CONFIRMATION_WINDOWS);
-            if window.confirmations < EXPENSIVE_CONFIRMATION_WINDOWS {
+        let threshold = f64::from_bits(self.expensive_threshold_ns.load(Ordering::Relaxed));
+        if second >= threshold {
+            let confirmations = (self.confirmations.load(Ordering::Relaxed) + 1)
+                .min(EXPENSIVE_CONFIRMATION_WINDOWS);
+            self.confirmations.store(confirmations, Ordering::Relaxed);
+            if confirmations < EXPENSIVE_CONFIRMATION_WINDOWS {
                 return;
             }
         } else {
-            window.confirmations = 0;
+            self.confirmations.store(0, Ordering::Relaxed);
         }
         self.estimate_ns.store(second.to_bits(), Ordering::Release);
     }

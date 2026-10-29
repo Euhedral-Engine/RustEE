@@ -26,8 +26,6 @@ use std::path::{Path, PathBuf};
 /// places each is used (its field, each use the lint reports, its marker comment).
 const HOT_FIX_TAGS: &[(&str, usize)] = &[
     ("C1", 5),
-    ("C2", 3),
-    ("C3", 3),
     ("C4", 6),
     ("C5", 3),
     ("C6", 3),

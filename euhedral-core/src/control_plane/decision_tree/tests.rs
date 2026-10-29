@@ -3,6 +3,7 @@ use crate::config::TimingProvider;
 use crate::flow_control::{Claim, UpstreamHandle, UpstreamRegistry};
 use crate::frames::Frame;
 use euhedral_hardware_utils::util::CpuSet;
+use std::sync::Mutex;
 
 fn nanos(nanos: u64) -> Duration {
     Duration::from_nanos(nanos)
@@ -143,6 +144,41 @@ fn the_estimate_waits_for_a_full_window_and_skips_zero_samples() {
     assert_eq!(body_cost.estimate_ns(), 0.0);
     body_cost.record(nanos(100));
     assert_eq!(body_cost.estimate_ns(), 100.0);
+}
+
+#[test]
+fn body_cost_estimate_is_unchanged_by_the_atomics() {
+    let body_cost = BodyCost::new();
+    body_cost.calibrate(nanos(1000));
+    // A window of falling samples whose second-smallest is 90, then a window of costly ones, then
+    // another: the first costly window waits for its confirmation, the second replaces the estimate.
+    let falling = (0..30).map(|i| 400 - i * 3).chain([40, 90]);
+    record_all(&body_cost, falling);
+    assert_eq!(body_cost.estimate_ns(), 90.0);
+    record_all(&body_cost, (0..32).map(|i| 1000 + i));
+    assert_eq!(body_cost.estimate_ns(), 90.0);
+    record_all(&body_cost, (0..32).map(|i| 2000 + i));
+    assert_eq!(body_cost.estimate_ns(), 2001.0);
+    // A cheap window replaces it at once and clears the confirmation.
+    record_all(&body_cost, [5; 32]);
+    assert_eq!(body_cost.estimate_ns(), 5.0);
+    record_all(&body_cost, [9000; 32]);
+    assert_eq!(body_cost.estimate_ns(), 5.0);
+}
+
+#[test]
+fn recalibrating_forgets_the_window_while_sharing_it() {
+    let body_cost = Arc::new(BodyCost::new());
+    body_cost.calibrate(nanos(100));
+    record_all(&body_cost, [500; 32]);
+    record_all(&body_cost, [500; 32]);
+    assert_eq!(body_cost.estimate_ns(), 500.0);
+    let shared = body_cost.clone();
+    shared.calibrate(nanos(1000));
+    assert!(!body_cost.has_history());
+    assert_eq!(body_cost.estimate_ns(), 0.0);
+    record_all(&body_cost, [500; 32]);
+    assert_eq!(body_cost.estimate_ns(), 500.0);
 }
 
 #[test]
@@ -375,6 +411,7 @@ fn calibration_measures_both_thresholds() {
     let body_cost = Arc::new(BodyCost::new());
     let tree = DecisionTree::calibrated(IdlePolicy::default(), body_cost.clone());
     assert!(tree.direct_threshold_ns > 0.0);
-    assert!(body_cost.window().expensive_threshold_ns > 0.0);
-    assert!(body_cost.window().expensive_threshold_ns.is_finite());
+    let threshold = f64::from_bits(body_cost.expensive_threshold_ns.load(Ordering::Relaxed));
+    assert!(threshold > 0.0);
+    assert!(threshold.is_finite());
 }

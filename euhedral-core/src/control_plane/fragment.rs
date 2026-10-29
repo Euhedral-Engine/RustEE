@@ -17,8 +17,7 @@ use std::fmt;
 use std::panic::{self, AssertUnwindSafe};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-#[allow(clippy::disallowed_types, reason = "HOT-FIX(C2)")]
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
+use std::sync::{Arc, MutexGuard, Weak};
 use std::thread::{self, Thread};
 use std::time::{Duration, Instant};
 
@@ -757,22 +756,16 @@ fn initial_batch_cap(config: &FragmentConfig, cache: &ControlPlaneCache) -> u64 
 }
 
 /// An output that times a sample of the frame bodies it pushes into `body_cost`.
-#[allow(clippy::disallowed_types, reason = "HOT-FIX(C2)")]
 fn timed_output(body_cost: Arc<BodyCost>) -> LatticeHotSource {
-    let watch = Arc::new(Mutex::new(StopWatch::new()));
+    let watch = Arc::new(StopWatch::new());
     let started = watch.clone();
     LatticeHotSource::new()
-        .before_each(move |_| lock(&started).start())
+        .before_each(move |_| started.start())
         .after_each(move || {
-            if let Some(elapsed) = lock(&watch).stop() {
+            if let Some(elapsed) = watch.stop() {
                 body_cost.record(elapsed);
             }
         })
-}
-
-#[allow(clippy::disallowed_types, reason = "HOT-FIX(C2)")]
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// The worker's own state between cycles.
