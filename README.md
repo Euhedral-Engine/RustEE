@@ -21,6 +21,7 @@ arm64 (Linux, macOS and Windows back ends) and is untested on mobile.
 | [`euhedral-graph`](euhedral-graph/README.md) | No-wait dataflow on the lattice: completions, a sequencer, joins, device lanes and stage graphs. |
 | [`euhedral-io`](euhedral-io/README.md) | Asynchronous file and socket I/O whose completions are frames: `AsyncIo` (io_uring on Linux and Android; IoRing and completion ports on Windows). |
 | [`euhedral-gpu`](euhedral-gpu/README.md) | Asynchronous, backend-neutral GPU access: streams as device lanes, markers, retirement as frames, kernels loaded at run time, graph record and replay (CUDA backend, feature `cuda`). |
+| [`euhedral-benchmarks`](euhedral-benchmarks/README.md) | End-to-end benchmarks of the control plane: the high-contention throughput benchmark. |
 
 The crates form layers, and a crate builds only on lower ones. No cycles: nothing below `euhedral-gpu` depends on it,
 not even through a dev-dependency or a feature (`euhedral-gpu/tests/layering.rs` checks every manifest).
@@ -31,6 +32,7 @@ not even through a dev-dependency or a feature (`euhedral-gpu/tests/layering.rs`
 4. `euhedral-graph` and `euhedral-io`, on `euhedral-core` (and the utilities they use).
 5. `euhedral-memory`, on `euhedral-core`, `euhedral-graph` and the utilities.
 6. `euhedral-gpu`, on `euhedral-core`, `euhedral-graph`, `euhedral-memory` and `euhedral-hashing`.
+7. `euhedral-benchmarks`, on `euhedral-core` and the utilities; nothing depends on it.
 
 - [`GLOSSARY.md`](GLOSSARY.md): every term a user of RustEE meets, with links to the code.
 - [`CHANGELOG.md`](CHANGELOG.md): changes to the lattice's execution model, newest first.
