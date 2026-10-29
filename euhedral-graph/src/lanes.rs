@@ -1,4 +1,4 @@
-//! Device lanes and markers (Euhedral-Inference `LanePool`).
+//! Device lanes and markers (the upstream Java `LanePool`).
 
 use std::fmt;
 use std::num::NonZeroU64;

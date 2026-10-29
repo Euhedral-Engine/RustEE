@@ -1,7 +1,7 @@
 # euhedral-core
 
 The RustEE runtime: frames, the lattice that runs them, and the sources that feed it. It is a port
-of the upstream Java `euhedral-core` (Euhedral-Execution). See [`GLOSSARY.md`](../GLOSSARY.md) for
+of the upstream Java `euhedral-core`. See [`GLOSSARY.md`](../GLOSSARY.md) for
 every term used here.
 
 **Where it sits.** It depends on the other three crates of the workspace and on `log`:

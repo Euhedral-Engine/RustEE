@@ -1,4 +1,4 @@
-//! Completions found by polls (Euhedral-Inference `GpuCompletions`).
+//! Completions found by polls (the upstream Java `GpuCompletions`).
 
 use std::cell::Cell;
 use std::collections::VecDeque;

@@ -6,7 +6,7 @@ their lifecycle events, each finished frame handing the next one on. A **Lattice
 programmable stream that the lattice's workers pull frames from or request them from. The lattice
 runs one pinned worker per core, routes frames by their routing hash and routing policy, keeps
 ordered frames in order on their owning CPU, and lets idle workers steal the rest. RustEE is a port
-of the Java [Euhedral-Execution](https://github.com/Euhedral-Engine/Euhedral-Execution) runtime. It runs on x86 and
+of a Java runtime of the same design. It runs on x86 and
 arm64 (Linux, macOS and Windows back ends) and is untested on mobile.
 
 ## Crates

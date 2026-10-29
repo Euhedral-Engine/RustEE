@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! high_contention_throughput [--forks N] [--sources N] [--warmup-iterations N] [--warmup-seconds S]
-//!                            [--iterations N] [--seconds S] [--tasks N] [--no-pin] [--no-latency]
+//!                            [--iterations N] [--seconds S] [--tasks N] [--no-pin] [--no-latency] [--pooled]
 //! ```
 //!
 //! The defaults are upstream's: 3 forks (separate processes, each with its own lattice), 3 warm-up iterations of 3
@@ -61,6 +61,7 @@ fn parse(arguments: impl Iterator<Item = String>) -> Result<Arguments, String> {
             "--tasks" => parsed.options.tasks = (number("--tasks")? as u64).max(1),
             "--no-pin" => parsed.options.pin_harness = false,
             "--no-latency" => parsed.options.latency = false,
+            "--pooled" => parsed.options.pooled_frames = true,
             "--child" => parsed.child = true,
             "--help" | "-h" => return Err(String::new()),
             other => return Err(format!("unknown argument {other}")),
@@ -115,6 +116,11 @@ fn drive(arguments: &Arguments) -> Result<(), String> {
             } else {
                 vec!["--no-latency"]
             })
+            .args(if options.pooled_frames {
+                vec!["--pooled"]
+            } else {
+                vec![]
+            })
             .stdout(Stdio::piped())
             .spawn()
             .map_err(|error| format!("cannot start fork {fork}: {error}"))?;
@@ -151,7 +157,7 @@ fn main() -> ExitCode {
             }
             eprintln!(
                 "usage: high_contention_throughput [--forks N] [--sources N] [--warmup-iterations N] \
-                 [--warmup-seconds S] [--iterations N] [--seconds S] [--tasks N] [--no-pin] [--no-latency]"
+                 [--warmup-seconds S] [--iterations N] [--seconds S] [--tasks N] [--no-pin] [--no-latency] [--pooled]"
             );
             return ExitCode::from(2);
         }
