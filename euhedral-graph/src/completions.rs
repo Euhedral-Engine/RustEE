@@ -2,14 +2,17 @@
 
 use std::collections::VecDeque;
 use std::fmt;
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering, fence};
 use std::time::Instant;
 
 use euhedral_core::frames::Frame;
-use euhedral_core::generics::{DownstreamSlot, LatticeReceiver, LatticeSource};
+use euhedral_core::generics::{
+    DownstreamSlot, LatticeReceiver, LatticeSource, SourceCell, SourceGuard,
+};
 use euhedral_data_structures::queues::{Consumer, MpscQueue, Multi, Producer, Single};
-use euhedral_data_structures::sync::{ClaimCell, ClaimGuard, HotScope};
+use euhedral_data_structures::sync::HotScope;
 
 use euhedral_core::metrics::Histogram;
 
@@ -58,17 +61,17 @@ pub trait Pending: Send {
 /// cancellation does not panic: only the polling thread sees it, and it cannot tell a misuse from a
 /// poll that was late.
 pub struct Completions {
-    /// The lanes polled for markers: fixed for the source's life and dropped with it (a marker is
-    /// treated as reached once the source has completed, whatever its lane says).
+    /// The lanes polled for markers: fixed for the source's life and dropped with it. A marker
+    /// counts as reached when its lane says so, also after the source has completed.
     lanes: Arc<LanePool>,
     /// Registered since the last poll; any thread appends, lock-free. [`LatticeSource::complete`]
     /// appends one [`Slot::Closed`] marker: what is behind it was registered too late.
     incoming: Producer<Slot, Multi>,
-    /// The polling side: the queue's consumer and what it drained and has not emitted. A claim,
-    /// as a queue sink's `draining` flag is: `pull` and `request` (one thread at a time) take it
-    /// without contention, a late registration's sweep takes it only if free, and whoever finds it
-    /// held leaves its work to the holder, which looks for it after letting go.
-    poll: ClaimCell<Poll>,
+    /// The polling side: the queue's consumer and what it drained and has not emitted. State the
+    /// holder mutates, so a `SourceCell`: `pull` and `request` (one thread at a time) enter it
+    /// without contention, a late registration's sweep enters it only if free, and whoever finds it
+    /// entered leaves its work to the holder, which looks for it after letting go.
+    poll: SourceCell<Poll>,
     /// A sweep waiting for the holder of `poll`: set before the claim is tried, read by the holder
     /// after it releases.
     sweep_pending: AtomicBool,
@@ -120,11 +123,37 @@ enum Waits {
 
 impl Drop for Completions {
     /// The last owner lets go: no thread can register any more, and none will poll. What is still
-    /// in the queue behind the marker is cancelled, so no registration is left without an end.
+    /// in the queue, and what was absorbed and never emitted, is cancelled (`do_finally`), so no
+    /// registration is left without an end.
     fn drop(&mut self) {
-        let late = Self::absorb(self.poll.get_mut());
+        let poll = self.poll.get_mut();
+        let late = Self::absorb(poll);
         for what in late {
             Self::cancel(what);
+        }
+        for entry in std::mem::take(&mut poll.waiting) {
+            Self::cancel(entry.what);
+        }
+    }
+}
+
+/// Serves what was refused the poll while it was held, when a poll lets go.
+struct AfterRelease<'a> {
+    source: &'a Completions,
+    armed: bool,
+}
+
+impl Drop for AfterRelease<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // The entry is a plain drop on the unwinding path: order the reads below after it.
+        fence(Ordering::SeqCst);
+        if std::thread::panicking() {
+            let _ = panic::catch_unwind(AssertUnwindSafe(|| self.source.after_release()));
+        } else {
+            self.source.after_release();
         }
     }
 }
@@ -147,7 +176,7 @@ impl Completions {
         Arc::new(Self {
             lanes,
             incoming: queue.producer(),
-            poll: ClaimCell::new(Poll {
+            poll: SourceCell::new(Poll {
                 consumer: queue.consumer(),
                 waiting: VecDeque::new(),
                 closed: false,
@@ -255,10 +284,15 @@ impl Completions {
     /// Absorbs the queue and cancels the late ones while a sweep is waiting and the claim is free.
     fn run_sweeps(&self) {
         while self.sweep_pending.load(Ordering::SeqCst) {
-            let Some(mut poll) = self.poll.try_claim() else {
+            let Some(mut poll) = self.poll.try_enter() else {
                 return;
             };
-            self.sweep_pending.store(false, Ordering::SeqCst);
+            // One read-modify-write takes the wakeup and synchronizes with the store that set it, so
+            // the registration made before that store is seen by the absorb below.
+            if !self.sweep_pending.swap(false, Ordering::SeqCst) {
+                poll.release_seq_cst();
+                continue;
+            }
             let late = Self::absorb(&mut poll);
             self.cancel_late(late);
             poll.release_seq_cst();
@@ -276,10 +310,15 @@ impl Completions {
     /// the claim is free.
     fn serve_requests(&self) {
         while self.request_pending.load(Ordering::SeqCst) {
-            let Some(mut poll) = self.poll.try_claim() else {
+            let Some(mut poll) = self.poll.try_enter() else {
                 return;
             };
-            self.request_pending.store(false, Ordering::SeqCst);
+            // As in `run_sweeps`: the read-modify-write sees the demand banked before the request's
+            // store, which a plain store of `false` over a racing request's would not guarantee.
+            if !self.request_pending.swap(false, Ordering::SeqCst) {
+                poll.release_seq_cst();
+                continue;
+            }
             if let Some(downstream) = self.downstream.receiver()
                 && !self.complete.load(Ordering::SeqCst)
             {
@@ -287,7 +326,7 @@ impl Completions {
                     &mut poll,
                     &mut |frame| downstream.push(frame),
                     &mut |_| false,
-                    self.demand.load(Ordering::Acquire),
+                    self.demand.load(Ordering::SeqCst),
                 );
                 if emitted > 0 {
                     // Accounted before the claim is released, so the next holder cannot
@@ -353,7 +392,7 @@ impl Completions {
     /// many.
     fn emit(
         &self,
-        poll: &mut ClaimGuard<'_, Poll>,
+        poll: &mut SourceGuard<'_, Poll>,
         consumer: &mut dyn FnMut(Box<dyn Frame>),
         stop: &mut dyn FnMut(&dyn Frame) -> bool,
         demand: u64,
@@ -368,9 +407,6 @@ impl Completions {
         }
         let waiting = &mut poll.waiting;
         let now = Instant::now();
-        // A completed source has let its lanes go: nothing it still holds can be waiting for a
-        // device.
-        let released = self.complete.load(Ordering::Acquire);
         let mut emitted = 0;
         let mut late = Vec::new();
         let mut index = 0;
@@ -380,7 +416,7 @@ impl Completions {
             // queried again (a query may have effects: a driver call that fetches the result).
             let done = match &mut entry.what {
                 Waits::Ready(ready, _) => ready.is_ready(),
-                Waits::Marker(marker, _) => released || self.lanes.reached(*marker),
+                Waits::Marker(marker, _) => self.lanes.reached(*marker),
                 Waits::At(deadline, _) => now >= *deadline,
                 Waits::Pending(pending) => match pending.poll() {
                     Some(frame) => {
@@ -451,12 +487,18 @@ impl LatticeSource for Completions {
         if demand == 0 {
             return 0;
         }
-        let Some(mut poll) = self.poll.try_claim() else {
+        // Declared before the entry, so it runs after the entry is let go, also when `consumer`
+        // unwinds: the requests and sweeps refused meanwhile are still served.
+        let mut after = AfterRelease {
+            source: self,
+            armed: false,
+        };
+        let Some(mut poll) = self.poll.try_enter() else {
             return 0;
         };
+        after.armed = true;
         let emitted = self.emit(&mut poll, consumer, stop, demand);
         poll.release_seq_cst();
-        self.after_release();
         emitted
     }
 
@@ -1313,5 +1355,87 @@ mod tests {
             "the holder swept as it let go"
         );
         assert_eq!(completions.pending(), 0);
+    }
+
+    #[test]
+    fn a_marker_registration_racing_complete_on_an_unreached_lane_is_not_emitted() {
+        for _ in 0..if cfg!(miri) { 4 } else { 200 } {
+            let (completions, lane) = setup();
+            let (frame, ends) = counted(1);
+            let marker = Marker::new(lane.id, LaneId(0), 5);
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    // A registration that sees the flag fails visibly in debug builds.
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        completions.after_marker(marker, frame)
+                    }));
+                });
+                scope.spawn(|| completions.complete());
+            });
+            // Registered ahead of the marker or cancelled behind it; never emitted while the lane
+            // has not reached it.
+            let emitted = pull_and_end(&completions);
+            assert_eq!(
+                emitted, 0,
+                "an unreached lane emits nothing, also after complete"
+            );
+            drop(completions);
+            assert_eq!(
+                ends.load(Ordering::Acquire),
+                1,
+                "and the frame still ends once"
+            );
+        }
+    }
+
+    #[test]
+    fn dropping_the_source_cancels_what_it_absorbed_and_never_emitted() {
+        let (completions, _) = setup();
+        let token = Token::default();
+        let (frame, ends) = counted(1);
+        completions.after(Box::new(token), frame);
+        assert!(poll(&completions).is_empty(), "absorbed, in flight");
+        assert_eq!(ends.load(Ordering::Acquire), 0);
+        drop(completions);
+        assert_eq!(
+            ends.load(Ordering::Acquire),
+            1,
+            "ended by the drop, not lost"
+        );
+    }
+
+    #[test]
+    fn a_consumer_that_panics_does_not_strand_a_request_refused_meanwhile() {
+        let (completions, _) = setup();
+        let recorder = Arc::new(Recorder::default());
+        completions.clone().add_downstream(recorder.clone());
+        completions.at(Instant::now(), tagged(1));
+        completions.at(Instant::now(), tagged(2));
+        let inside = std::sync::Barrier::new(2);
+        let release = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let puller = scope.spawn(|| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    completions.pull(
+                        &mut |_frame| {
+                            inside.wait();
+                            release.wait();
+                            panic!("consumer failed");
+                        },
+                        &mut |_| false,
+                        1,
+                    )
+                }))
+            });
+            inside.wait();
+            completions.request(1);
+            release.wait();
+            assert!(puller.join().unwrap().is_err());
+        });
+        assert_eq!(
+            *recorder.ids.lock().unwrap(),
+            [2],
+            "the unwinding poll still served the request"
+        );
     }
 }

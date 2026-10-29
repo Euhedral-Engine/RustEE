@@ -7,6 +7,7 @@ use euhedral_data_structures::queues::partitioned::{
 };
 use euhedral_data_structures::queues::queue::{Multi, Single};
 use euhedral_data_structures::sync::{ClaimCell, ClaimGuard, HotScope};
+use std::any::Any;
 use std::num::NonZeroUsize;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering, fence};
@@ -204,11 +205,26 @@ impl QueueSource {
     }
 
     /// What runs after a drain lets go of the queue (Java's `onDrainFinished`): a waiting `clear`,
-    /// then the owner's.
+    /// then the owner's. A panic in either is raised after both have run.
     fn drain_finished(&self) {
-        self.apply_clear();
-        if let Some(owner) = self.owner() {
-            owner.drain_finished(self);
+        let cleared = self.apply_clear();
+        let owned = panic::catch_unwind(AssertUnwindSafe(|| {
+            if let Some(owner) = self.owner() {
+                owner.drain_finished(self);
+            }
+        }));
+        if let Some(panic) = cleared.or(owned.err()) {
+            panic::resume_unwind(panic);
+        }
+    }
+
+    /// The tail of every release of the queue: the waiting `clear`, the owner's hook, and the
+    /// requests that were refused the queue while it was held.
+    fn after_release(&self) {
+        let finished = panic::catch_unwind(AssertUnwindSafe(|| self.drain_finished()));
+        self.drain_requests();
+        if let Err(panic) = finished {
+            panic::resume_unwind(panic);
         }
     }
 
@@ -229,13 +245,15 @@ impl QueueSource {
     }
 
     /// Hands every queued frame to `consume`, unless a drain holds the queue: that drain hands the
-    /// frames queued behind it on when it lets go (Java's `discardQueued`).
+    /// frames queued behind it on when it lets go (Java's `discardQueued`). A panic in `consume` is
+    /// raised after the rest are handed over and the release's tail has run.
     pub(super) fn discard_queued(&self, mut consume: impl FnMut(Box<dyn Frame>)) {
+        let mut panicked = None;
         loop {
             let Some(mut consumer) = self.try_hold() else {
-                return;
+                break;
             };
-            consumer.drain_all(&mut consume);
+            Self::drain_catching(&mut consumer, &mut consume, &mut panicked);
             // The release is ordered before the emptiness check, so a frame published behind the
             // drain is seen here, or its publisher takes the claim.
             consumer.release_seq_cst();
@@ -243,28 +261,56 @@ impl QueueSource {
                 break;
             }
         }
-        self.apply_clear();
+        panicked = self.apply_clear().or(panicked);
+        self.drain_requests();
+        if let Some(panic) = panicked {
+            panic::resume_unwind(panic);
+        }
     }
 
-    /// Cancels every queued frame. A drain that holds the queue cancels them when it lets go; the
-    /// call never waits for it.
+    /// Hands every queued frame to `consume`, keeping the first panic and going on.
+    fn drain_catching(
+        consumer: &mut Consumer,
+        mut consume: impl FnMut(Box<dyn Frame>),
+        panicked: &mut Option<Box<dyn Any + Send>>,
+    ) {
+        consumer.drain_all(|frame| {
+            if let Err(panic) = panic::catch_unwind(AssertUnwindSafe(|| consume(frame))) {
+                panicked.get_or_insert(panic);
+            }
+        });
+    }
+
+    /// Cancels every queued frame. A drain that holds the queue cancels them when it lets go, so the
+    /// call never waits.
     pub(super) fn clear(&self) {
         self.clear_requested.store(true, Ordering::SeqCst);
-        self.apply_clear();
+        let panicked = self.apply_clear();
+        self.drain_requests();
+        if let Some(panic) = panicked {
+            panic::resume_unwind(panic);
+        }
     }
 
     /// Cancels the queued frames while a `clear` is waiting, if the queue can be had. Only a holder
     /// takes the request off, so a `clear` that finds the queue held is answered by the holder.
-    fn apply_clear(&self) {
+    /// Returns the first panic of a cancellation; the rest were cancelled all the same.
+    fn apply_clear(&self) -> Option<Box<dyn Any + Send>> {
+        let mut panicked = None;
         while self.clear_requested.load(Ordering::SeqCst) {
             let Some(mut consumer) = self.try_hold() else {
-                return;
+                break;
             };
             if self.clear_requested.swap(false, Ordering::SeqCst) {
-                consumer.drain_all(|frame| frame.do_finally_with_error(FrameError::Cancelled));
+                Self::drain_catching(
+                    &mut consumer,
+                    |frame| frame.do_finally_with_error(FrameError::Cancelled),
+                    &mut panicked,
+                );
             }
             consumer.release_seq_cst();
         }
+        panicked
     }
 
     /// Delivers queued frames to the receiver while requests are waiting and no other drain holds
@@ -276,14 +322,20 @@ impl QueueSource {
             let Some(mut consumer) = self.try_hold() else {
                 return;
             };
-            self.request_pending.store(false, Ordering::SeqCst);
+            // One read-modify-write takes the wakeup and synchronizes with the store that set it,
+            // so the demand banked before that store is seen below (a plain store of `false`
+            // could overwrite a racing request's and leave this holder reading older demand).
+            if !self.request_pending.swap(false, Ordering::SeqCst) {
+                consumer.release_seq_cst();
+                continue;
+            }
             let delivered = match self.downstream.receiver() {
                 Some(receiver) if !self.downstream.is_complete() => {
                     let drained = panic::catch_unwind(AssertUnwindSafe(|| {
                         consumer.drain_while(
                             |frame| receiver.push(frame),
                             |_| self.downstream.is_complete(),
-                            self.demand.load(Ordering::Acquire),
+                            self.demand.load(Ordering::SeqCst),
                         )
                     }));
                     match drained {
@@ -296,7 +348,7 @@ impl QueueSource {
                         }
                         Err(panic) => {
                             consumer.release_seq_cst();
-                            self.drain_finished();
+                            let _ = panic::catch_unwind(AssertUnwindSafe(|| self.drain_finished()));
                             panic::resume_unwind(panic);
                         }
                     }
@@ -307,10 +359,12 @@ impl QueueSource {
                 }
             };
             self.drain_finished();
-            match delivered {
-                Some(delivered) if self.should_end(delivered) => self.complete_owner(),
-                Some(_) => {}
-                None => return,
+            // A request refused while the queue was held (or while `drain_finished` held it) is
+            // seen by the loop's condition.
+            if let Some(delivered) = delivered
+                && self.should_end(delivered)
+            {
+                self.complete_owner();
             }
         }
     }
@@ -354,9 +408,11 @@ impl LatticeSource for QueueSource {
             )
         }));
         queue.release_seq_cst();
-        self.drain_finished();
-        self.drain_requests();
+        let finished = panic::catch_unwind(AssertUnwindSafe(|| self.after_release()));
         let pulled = pulled.unwrap_or_else(|panic| panic::resume_unwind(panic));
+        if let Err(panic) = finished {
+            panic::resume_unwind(panic);
+        }
         if self.should_end(pulled) {
             self.complete_owner();
         }

@@ -10,6 +10,8 @@
 //!   reason with `HOT-FIX(<id>)` (one or more, comma separated, each listed), `LIFECYCLE(<id>)` (a row of the audit)
 //!   or, for a call, `JAVA-BACKOFF`; or it is a test-only `cfg_attr`, or a file-level allow of a file on
 //!   [`EXEMPT_FILES`].
+//! - `euhedral-io`'s engines lock through the `lock!` macro, which names no lock type; its call sites are counted per
+//!   file ([`LOCK_MACRO_SITES`]) and only shrink.
 //! - A type alias may not name a lock type: the lint reports the alias, not its uses, so an alias would hide the lock
 //!   from every site that uses it.
 
@@ -72,6 +74,18 @@ const HOT_FIX_TAGS: &[(&str, usize)] = &[
     ("S1", 1),
     ("S2", 1),
     ("S6a", 1),
+];
+
+/// The `lock!(..)` call sites of `euhedral-io`'s engines (the macro names no lock type, so the lint cannot see them),
+/// by file, with the ids of the audit the locks it takes belong to. A file's count only shrinks, and is 0 once none
+/// of its ids is listed in [`HOT_FIX_TAGS`]; a file not listed here has no site.
+const LOCK_MACRO_SITES: &[(&str, &[&str], usize)] = &[
+    ("euhedral-io/src/uring.rs", &["I3", "I4", "I5", "I6"], 5),
+    (
+        "euhedral-io/src/win/mod.rs",
+        &["I7", "I8", "I9", "I10", "I11", "I12", "I13", "I14", "I15"],
+        31,
+    ),
 ];
 
 /// Files whose file-level `allow` of a disallowed type is part of their design.
@@ -399,6 +413,42 @@ fn the_hot_fix_tags_and_their_uses_are_exactly_the_listed_ones() {
          new hot lock:\n{}",
         differing.join("\n")
     );
+}
+
+/// The `lock!(` call sites in `text`.
+fn lock_sites(text: &str) -> usize {
+    text.matches("lock!(").count()
+}
+
+#[test]
+fn the_lock_macro_sites_are_exactly_the_listed_ones() {
+    let listed: BTreeSet<&str> = HOT_FIX_TAGS.iter().map(|(id, _)| *id).collect();
+    let mut found: BTreeMap<String, usize> = BTreeMap::new();
+    for (path, text) in sources() {
+        if path.starts_with("euhedral-io/src/") && lock_sites(&text) > 0 {
+            found.insert(path, lock_sites(&text));
+        }
+    }
+    let mut problems = Vec::new();
+    for (file, ids, count) in LOCK_MACRO_SITES {
+        let actual = found.remove(*file).unwrap_or(0);
+        if actual != *count {
+            problems.push(format!(
+                "{file}: listed {count} `lock!(` sites, found {actual}"
+            ));
+        }
+        if *count > 0 && !ids.iter().any(|id| listed.contains(id)) {
+            problems.push(format!(
+                "{file}: none of its ids {ids:?} is listed any more, so it may have no `lock!(` site"
+            ));
+        }
+    }
+    for (file, actual) in found {
+        problems.push(format!(
+            "{file}: {actual} `lock!(` sites, and the file is not listed"
+        ));
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
 
 #[test]

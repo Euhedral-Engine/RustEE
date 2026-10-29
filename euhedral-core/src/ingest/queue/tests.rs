@@ -696,3 +696,100 @@ fn clear_racing_a_pull_discards_every_frame_once() {
         );
     }
 }
+
+/// A frame whose cancellation waits for the test: it reports that it is inside, then waits to go on.
+struct SlowCancel {
+    header: crate::frames::FrameHeader,
+    gate: Arc<(std::sync::Barrier, std::sync::Barrier)>,
+}
+
+impl Frame for SlowCancel {
+    fn header(&self) -> &crate::frames::FrameHeader {
+        &self.header
+    }
+
+    fn header_mut(&mut self) -> &mut crate::frames::FrameHeader {
+        &mut self.header
+    }
+
+    fn do_finally_with_error(self: Box<Self>, _error: FrameError) {
+        self.gate.0.wait();
+        self.gate.1.wait();
+    }
+}
+
+#[test]
+fn a_request_refused_by_a_clear_holder_is_served() {
+    use std::sync::Barrier;
+    let sink = QueueIngestSink::with_partitions(NonZeroUsize::new(2).unwrap());
+    let source = sink.delegate();
+    let receiver = TestReceiver::new();
+    source.clone().add_downstream(receiver.clone());
+    let gate = Arc::new((Barrier::new(2), Barrier::new(2)));
+    // The slow frame sits in the last partition, so the clear is inside its cancellation after it
+    // has visited the first one.
+    let slow = Box::new(SlowCancel {
+        header: crate::frames::FrameHeader::new(100),
+        gate: gate.clone(),
+    });
+    assert!(sink.offer_to(1, slow).is_ok());
+    thread::scope(|scope| {
+        let clearing = scope.spawn(|| sink.clear());
+        gate.0.wait();
+        // The clear holds the queue and has passed partition 0: this frame is behind it.
+        assert!(sink.offer_to(0, frame(7)).is_ok());
+        source.request(1);
+        assert!(receiver.received().is_empty(), "the clear holds the queue");
+        gate.1.wait();
+        clearing.join().unwrap();
+    });
+    assert_eq!(
+        receiver.received(),
+        [7],
+        "the clear served the refused request as it let go"
+    );
+    assert_eq!(sink.size(), 0);
+    assert_eq!(sink.demand(), 0);
+}
+
+/// A frame whose cancellation panics.
+struct PanicCancel {
+    header: crate::frames::FrameHeader,
+}
+
+impl Frame for PanicCancel {
+    fn header(&self) -> &crate::frames::FrameHeader {
+        &self.header
+    }
+
+    fn header_mut(&mut self) -> &mut crate::frames::FrameHeader {
+        &mut self.header
+    }
+
+    fn do_finally_with_error(self: Box<Self>, _error: FrameError) {
+        panic!("cancel failed");
+    }
+}
+
+#[test]
+fn a_panicking_cancel_does_not_stop_the_clear_or_wedge_the_queue() {
+    let (sink, source, receiver) = attached();
+    let fates = Fates::default();
+    assert!(
+        sink.offer(Box::new(PanicCancel {
+            header: crate::frames::FrameHeader::new(1)
+        }))
+        .is_ok()
+    );
+    assert!(sink.offer(Tracked::new(2, &fates)).is_ok());
+    assert!(panic::catch_unwind(AssertUnwindSafe(|| sink.clear())).is_err());
+    assert_eq!(
+        *fates.lock().unwrap(),
+        [(2, Fate::Failed(FrameError::Cancelled.to_string()))],
+        "the frame behind the panicking one was still cancelled"
+    );
+    assert_eq!(sink.size(), 0);
+    offer(&sink, [3]);
+    source.request(1);
+    assert_eq!(receiver.received(), [3], "the queue is not left claimed");
+}

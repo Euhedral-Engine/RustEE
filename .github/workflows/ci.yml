@@ -67,3 +67,25 @@ jobs:
           cargo clippy -p euhedral-memory --all-targets --features cuda -- -D warnings
           cargo clippy -p euhedral-gpu --all-targets --features cuda -- -D warnings
           cargo test -p euhedral-gpu --features cuda
+
+  # The lock-free sources' handshakes (a claim, a wakeup flag, a re-check after release) under Miri's weak-memory
+  # emulation with several seeds. The tests scale their rounds down under `cfg(miri)`.
+  miri:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      MIRIFLAGS: -Zmiri-many-seeds=0..16 -Zmiri-ignore-leaks
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install a nightly toolchain with Miri
+        run: |
+          rustup toolchain install nightly --profile minimal --component miri --component rust-src
+          cargo +nightly miri setup
+
+      - name: Claims, ingest sources, completions
+        run: |
+          cargo +nightly miri test -p euhedral-data-structures --lib sync::claim_cell
+          cargo +nightly miri test -p euhedral-core --lib ingest::single_use
+          cargo +nightly miri test -p euhedral-core --lib -- ingest::queue::tests::a_request_while ingest::queue::tests::a_request_refused ingest::queue::tests::request_pushes ingest::queue::tests::a_source_driven ingest::queue::tests::a_publish_after ingest::queue::tests::clear_racing ingest::queue::tests::a_panicking_cancel ingest::queue::tests::frames_queued
+          cargo +nightly miri test -p euhedral-graph --lib -- completions::tests::registrations_racing completions::tests::a_request_while completions::tests::a_sweep_that completions::tests::a_consumer_that completions::tests::a_marker_registration completions::tests::dropping_the_source

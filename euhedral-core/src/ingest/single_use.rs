@@ -9,6 +9,7 @@
 use crate::frames::{Frame, FrameError};
 use crate::generics::{DownstreamSlot, LatticeReceiver, LatticeSource};
 use std::cell::UnsafeCell;
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering, fence};
 
@@ -93,7 +94,17 @@ impl LatticeSource for SingleUseSource {
         let Some(frame) = self.frame_mut().take() else {
             return 0;
         };
-        if stop(&*frame) {
+        // A panicking stop condition ends the frame (cancelled) and the source, so the frame is
+        // neither lost nor left claimed with nothing to complete the source.
+        let stopped = match panic::catch_unwind(AssertUnwindSafe(|| stop(&*frame))) {
+            Ok(stopped) => stopped,
+            Err(panic) => {
+                frame.do_finally_with_error(FrameError::Cancelled);
+                self.complete();
+                panic::resume_unwind(panic);
+            }
+        };
+        if stopped {
             *self.frame_mut() = Some(frame);
             self.taken.store(false, Ordering::SeqCst);
             // A `complete` that found the frame held has left it to us: it set the slot's
@@ -104,8 +115,12 @@ impl LatticeSource for SingleUseSource {
             }
             return 0;
         }
-        consumer(frame);
+        // The frame is taken: the source completes whether or not `consumer` unwinds.
+        let handed = panic::catch_unwind(AssertUnwindSafe(|| consumer(frame)));
         self.complete();
+        if let Err(panic) = handed {
+            panic::resume_unwind(panic);
+        }
         1
     }
 
@@ -120,8 +135,11 @@ impl LatticeSource for SingleUseSource {
         if self.try_take()
             && let Some(frame) = self.frame_mut().take()
         {
-            receiver.push(frame);
+            let pushed = panic::catch_unwind(AssertUnwindSafe(|| receiver.push(frame)));
             self.complete();
+            if let Err(panic) = pushed {
+                panic::resume_unwind(panic);
+            }
         }
     }
 
@@ -286,5 +304,34 @@ mod tests {
             *fates.lock().unwrap(),
             [(5, Fate::Failed(FrameError::Cancelled.to_string()))]
         );
+    }
+
+    #[test]
+    fn a_panicking_stop_condition_cancels_the_frame_and_completes_the_source() {
+        let fates = Fates::default();
+        let source = SingleUseSource::wrap(Tracked::new(4, &fates));
+        let receiver = TestReceiver::new();
+        source.clone().add_downstream(receiver.clone());
+        let pulled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            source.pull(&mut |_| unreachable!(), &mut |_| panic!("stop failed"), 1)
+        }));
+        assert!(pulled.is_err());
+        assert_eq!(
+            *fates.lock().unwrap(),
+            [(4, Fate::Failed(FrameError::Cancelled.to_string()))],
+            "the frame ended once"
+        );
+        assert!(source.is_complete() && receiver.is_completed());
+        assert_eq!(source.pull(&mut |_| unreachable!(), &mut |_| false, 1), 0);
+    }
+
+    #[test]
+    fn a_panicking_consumer_still_completes_the_source() {
+        let source = SingleUseSource::wrap(frame(1));
+        let pulled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            source.pull(&mut |_| panic!("consumer failed"), &mut |_| false, 1)
+        }));
+        assert!(pulled.is_err());
+        assert!(source.is_complete());
     }
 }

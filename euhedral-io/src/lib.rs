@@ -631,7 +631,13 @@ impl Front {
             let Some(mut held) = self.held.try_enter() else {
                 return;
             };
-            self.request_pending.store(false, Ordering::SeqCst);
+            // One read-modify-write takes the wakeup and synchronizes with the store that set it, so
+            // the demand banked before that store is seen below (a plain store of `false` could
+            // overwrite a racing request's and leave this holder reading older demand).
+            if !self.request_pending.swap(false, Ordering::SeqCst) {
+                drop(held);
+                continue;
+            }
             let Some(downstream) = self.downstream.receiver() else {
                 return;
             };
@@ -644,7 +650,7 @@ impl Front {
                 engine,
                 &mut |frame| downstream.push(frame),
                 &mut |_| false,
-                self.demand.load(Ordering::Acquire),
+                self.demand.load(Ordering::SeqCst),
             );
             if emitted > 0 {
                 // Accounted before the front is let go, so the next holder cannot over-deliver.
@@ -922,9 +928,22 @@ impl LatticeSource for AsyncIo {
         stop: &mut dyn FnMut(&dyn Frame) -> bool,
         demand: u64,
     ) -> u64 {
-        let reaped = self.front.reap(&self.engine, consumer, stop, demand);
-        self.front.serve_requests(&self.engine);
-        reaped
+        // Serves the requests refused meanwhile also when `consumer` unwinds.
+        struct Serve<'a>(&'a AsyncIo);
+        impl Drop for Serve<'_> {
+            fn drop(&mut self) {
+                std::sync::atomic::fence(Ordering::SeqCst);
+                if std::thread::panicking() {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        self.0.front.serve_requests(&self.0.engine)
+                    }));
+                } else {
+                    self.0.front.serve_requests(&self.0.engine);
+                }
+            }
+        }
+        let _serve = Serve(self);
+        self.front.reap(&self.engine, consumer, stop, demand)
     }
 
     /// Banks `demand` and pushes ended operations' frames to the downstream up to the total.

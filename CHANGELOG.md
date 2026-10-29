@@ -24,15 +24,16 @@ semantics and the tests that pin it.
   - `SingleUseSource` takes its frame with a compare-and-set (`pull`, `request` and `complete` each try it). `complete`
     cancels an untaken frame, a completed source delivers nothing to a later `pull`, a `pull` whose stop condition
     matches the frame gives it back, and a frame nobody took is cancelled when the source drops.
-- `euhedral-graph`: `Completions` (G1-G3) holds its poll state in a `ClaimCell` that `pull`, `request` and a late
-  registration's sweep each try. A `request` that finds it held banks its demand and leaves a wakeup, and a sweep that
+- `euhedral-graph`: `Completions` (G1-G3) holds its poll state in a `SourceCell` (state the holder mutates) that `pull`,
+  `request` and a late registration's sweep each try to enter. A `request` that finds it held banks its demand and leaves a wakeup, and a sweep that
   finds it held sets `sweep_pending`; the holder serves both after it releases. The lane pool is a fixed `Arc` that lives
-  as long as the source (a marker counts as reached once the source has completed), and the downstream is a
-  `DownstreamSlot`. `complete` touches no poll state.
+  as long as the source (a marker is reached when its lane says so, also after `complete`), and the downstream is a
+  `DownstreamSlot`. `complete` touches no poll state. Dropping the source cancels what is still queued and what was
+  absorbed and never emitted.
 - `euhedral-io`: the `AsyncIo` front (I1, I2) keeps the continuations a pull's `stop` held back in a `SourceCell` and its
   downstream in a `DownstreamSlot`; a `request` banks its demand with the same wakeup. The engines lock their tables
   through a `lock!` macro (the function it replaces named the lock type).
-- `HOT_FIX_TAGS` loses 8 ids (C11, C12, C13, G1, G2, G3, I1, I2) and lists 49.
+- `HOT_FIX_TAGS` loses 8 ids (C11, C12, C13, G1, G2, G3, I1, I2) and lists 49. The ratchet also counts the engines' `lock!(` call sites per file (5 in `uring.rs`, 31 in `win/mod.rs`), so the macro cannot hide a new lock.
 
 **Why.** A source's `request` and `pull` are serialized by the lattice, and its lifecycle calls (`complete`, `clear`,
 kill) arrive from any thread. None of that needs a lock: the lifecycle calls set atomics, the thread that holds the
@@ -45,8 +46,19 @@ source applies them, and a thread that finds the source held leaves a wakeup the
 **Semantics.**
 - `QueueIngestSink::clear` returns at once; the frames are cancelled by the caller if the queue was free, otherwise by
   the drain that held it, before that drain returns.
-- A refused `request` is never lost: its demand is banked and the holder pushes within it. `Completions::pull` and
-  `AsyncIo::pull` return 0 when another poll is inside.
+- A refused `request` is never lost. It banks its demand and stores `request_pending` (`SeqCst`) before it tries the
+  claim; every holder, whatever it was doing (a pull, a request drain, a `clear`, a `discard_queued`, a sweep), ends
+  with one tail that re-reads the flag after a `SeqCst` release and serves the request. The holder takes the flag with
+  one `swap(false)`, which synchronizes with the store that set it, so it reads the banked demand with the flag (a
+  plain store of `false` could overwrite a racing request's and read older demand on weakly ordered hardware). The
+  same holds for `sweep_pending` and `clear_requested`.
+- `Completions::pull` and `AsyncIo::pull` return 0 when another poll is inside; a panicking consumer still lets the
+  poll serve what was refused. A panic while cancelling frames (`clear`, `discard_queued`) is raised after the rest
+  were cancelled and the tail ran. A panicking stop condition or consumer ends a `SingleUseSource`'s frame and
+  completes the source.
+- Rule for the two cells: a `SourceCell` wherever the claim guards state the holder mutates (`Completions`' poll, the
+  `AsyncIo` front's held frames); a `ClaimCell` where the claim guards no state of its own (the ingest queue's
+  consumer role handle, Java's `draining` flag).
 - `Completions` holds its lanes until its last owner drops it, not from `complete`.
 
 **Tests.** `ClaimCell`: `a_second_claim_fails_while_the_first_is_held`, `a_released_claim_can_be_taken_again`,
@@ -58,7 +70,9 @@ model `loom_two_claimers_exclude_each_other_and_see_prior_writes`
 `frames_queued_when_the_source_drops_are_finished`, `clear_racing_a_pull_discards_every_frame_once`,
 `a_frame_is_delivered_or_cancelled_exactly_once`, `a_completed_source_delivers_nothing_to_a_later_pull`. Completions:
 `registrations_racing_complete_are_each_cancelled_or_emitted_once`, `a_request_while_another_thread_polls_returns_at_once`,
-`a_sweep_that_finds_the_poll_held_is_run_by_the_holder_when_it_lets_go`. `AsyncIo`:
+`a_sweep_that_finds_the_poll_held_is_run_by_the_holder_when_it_lets_go`,
+`a_request_refused_by_a_clear_holder_is_served`, `a_panicking_cancel_does_not_stop_the_clear_or_wedge_the_queue`,
+`a_marker_registration_racing_complete_on_an_unreached_lane_is_not_emitted`. `AsyncIo`:
 `a_request_only_lattice_delivers_every_completion`,
 `a_request_while_a_pull_holds_the_front_returns_at_once_and_is_served_after`.
 

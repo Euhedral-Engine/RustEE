@@ -777,7 +777,7 @@ runtime" is the Java runtime `euhedral-graph` is derived from (its `runtime/grap
 | C6 routing | core `LatticeVertex.ROUTING_STATE`, `RoutingState.admission` | Retired states recycled until the vertex drops (no GC). |
 | C7 routing book | core `LatticeVertex.releaseHandlesWhenQuiescent` | None. |
 | C8, C9 edges | core `LatticeEdge.DOWNSTREAM`, `PARENT` | Downstream kept until drop; parent `Published` (no GC). |
-| C11, C12 ingest | core `ingest/AbstractIngestSink`, `QueueIngestSink` | `clear` claims (Java bug: unclaimed single-consumer drain); demand is unsigned and saturates at the top (`add_demand`, `take_demand`) where Java's `accumulate` takes a signed step; the queue is finished when its source drops (no GC). |
+| C11, C12 ingest | core `ingest/AbstractIngestSink`, `QueueIngestSink` | `clear` claims (Java bug: unclaimed single-consumer drain); demand is unsigned and saturates at the top (`add_demand`, `take_demand`) where Java's `accumulate` takes a signed step; the queue is finished when its source drops (no GC); `clear` cancels the frames (`do_finally_with_error`) where Java's `clear` drops them silently; `pull`'s stop also matches once the source has completed. |
 | C13 single use | core `ingest/SingleUseSource` | `complete` cancels an untaken frame (Java bug: `complete` leaves it takeable); a `pull` whose stop condition matches gives the frame back (Java ignores the stop condition); a frame nobody took is cancelled when the source drops. |
 | C14 pipeline outcome | core `ingest/PipelineRunner`, `CompletableFuture` | None. |
 | C15 hot receiver | core `flow_control/LatticeHotReceiver`, `utils/SpinWait` | None (already mirrored). |
@@ -786,7 +786,7 @@ runtime" is the Java runtime `euhedral-graph` is derived from (its `runtime/grap
 | H1-H4 monitor | hardware-utils `ResourceMonitor`, `SystemSnapshotProvider` | H2: claim instead of `synchronized` (ticks hot); H3 `Published` (no GC). |
 | H5 dispatcher | hardware-utils `LatestValueDispatcher` | Mailbox swap and copy-on-write listeners instead of its spin lock (ticks hot). |
 | H6, H7 mapper | hardware-utils `TopologyMapper` | `Published` (no GC). |
-| G1-G3 completions | none; nearest core `QueueIngestSink` | A request that finds the poll held leaves a wakeup for the holder (`request_pending`, as `QueueIngestSink`'s); the lane pool lives with the source, and a marker counts as reached once the source has completed. |
+| G1-G3 completions | none; nearest core `QueueIngestSink` | A request that finds the poll held leaves a wakeup for the holder (`request_pending`, as `QueueIngestSink`'s); the lane pool lives with the source (a marker is reached when its lane says so, also after `complete`, as in Java); the poll state is a `SourceCell`, the state a holder mutates. |
 | G4 join | graph runtime `Join` | In the lane-source plan. |
 | G5 latch | none; `CompletableFuture` | — |
 | G6 sequencer | graph runtime `Sequencer` | None. |

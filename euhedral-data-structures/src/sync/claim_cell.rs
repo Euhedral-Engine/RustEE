@@ -5,20 +5,24 @@ use std::marker::PhantomData;
 use std::mem;
 use std::ops::{Deref, DerefMut};
 
-/// State that one thread at a time may claim, and that a thread that finds it claimed leaves alone.
+/// A claim that one thread at a time may hold, and that a thread that finds it held leaves alone.
 ///
-/// This is the claim a queue sink's drain takes: a flag set by a compare-and-set, the state read
-/// and written plainly while the flag is held, and a flag cleared by a store. A claimer that loses
-/// the compare-and-set never waits: it relies on the holder, which looks for work that arrived
-/// behind its drain after it lets go (the pattern the callers document).
+/// This is the claim a queue sink's drain takes (Java's `draining` flag): a flag set by a
+/// compare-and-set and cleared by a store, over what the holder is licensed to call. Use it where the
+/// claim guards no state of its own, such as a queue's single-consumer role handle. Where the claim
+/// guards state the holder mutates (a poll's waiting list, a reap's held-back frames), use
+/// `SourceCell` in `euhedral-core`, which also checks the lattice's single-entry guarantee.
+///
+/// A claimer that loses the compare-and-set never waits: it writes what it wants before it tries
+/// (a pending request), and the holder looks for it after it lets go.
 ///
 /// - [`try_claim`](Self::try_claim) is a compare-and-set (`SeqCst`), as a volatile one is.
 /// - Dropping the guard stores `false` with release ordering, enough to hand the state to the next
 ///   claimer.
-/// - [`ClaimGuard::release_seq_cst`] stores `false` sequentially consistently and then fences, for a
-///   holder that goes on to read other state a racing claimer wrote before it lost (the holder's
-///   re-check of a "request pending" flag or of the queue). A volatile store has the store-load
-///   ordering a plain `SeqCst` store lacks on weakly ordered hardware; the fence supplies it.
+/// - [`ClaimGuard::release_seq_cst`] stores `false` sequentially consistently and then fences. A
+///   `SeqCst` store followed by a `SeqCst` load is ordered already; the fence orders the reads that
+///   are not `SeqCst` (a queue's emptiness, a completion flag) after the release, which Java's
+///   volatile write does for the reads that follow it.
 pub struct ClaimCell<T> {
     claimed: AtomicBool,
     value: UnsafeCell<T>,
@@ -108,9 +112,9 @@ unsafe impl<T: Sync> Sync for ClaimGuard<'_, T> {}
 
 impl<T> ClaimGuard<'_, T> {
     /// Gives the claim back with a sequentially consistent store, then a sequentially consistent
-    /// fence: whatever the holder reads next is ordered after the release, as it is after a volatile
-    /// store. A claimer that lost to this holder wrote its wakeup first, so the holder's re-check
-    /// finds it or the claimer wins the next claim.
+    /// fence: the holder's next reads, `SeqCst` or not, are ordered after the release. A claimer that
+    /// lost to this holder wrote its wakeup first, so the holder's re-check finds it or the claimer
+    /// wins the next claim.
     pub fn release_seq_cst(self) {
         let cell = self.cell;
         // The guard has nothing else to drop.

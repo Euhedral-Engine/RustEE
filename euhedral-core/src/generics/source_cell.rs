@@ -7,6 +7,10 @@
 //! thread, set atomics instead, and the source applies them to its cell in its next `request` or
 //! `pull`.
 //!
+//! Use a [`SourceCell`] wherever the claim guards state the holder mutates, and a
+//! [`ClaimCell`](euhedral_data_structures::sync::ClaimCell) only where the claim guards no state of its own (Java's
+//! `draining` flag over a queue's consumer role).
+//!
 //! A [`SourceCell`] holds such state and checks the guarantee itself, in every build: entering takes
 //! a claim with one compare-and-set (uncontended under the lattice), so a nested entry, or a direct
 //! call that races the lattice, can never produce two live `&mut` to the state. The source decides
@@ -18,7 +22,7 @@
 use std::cell::UnsafeCell;
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering, fence};
 
 /// State that only a source's `pull` and `request` (and actions `serialize` runs) touch.
 ///
@@ -132,6 +136,17 @@ pub struct SourceGuard<'a, T> {
 unsafe impl<T: Send> Send for SourceGuard<'_, T> {}
 // SAFETY: a shared reference to the guard gives `&T`, which is `Send` exactly when `T` is `Sync`.
 unsafe impl<T: Sync> Sync for SourceGuard<'_, T> {}
+
+impl<T> SourceGuard<'_, T> {
+    /// Gives the claim back like a drop, then fences: reads of other state that follow (`Acquire`
+    /// loads of a queue's counters, a completion flag) are ordered after the release, as they are
+    /// after a Java volatile write. A holder that goes on to look for work a refused caller left
+    /// for it (a pending request) releases this way.
+    pub fn release_seq_cst(self) {
+        drop(self);
+        fence(Ordering::SeqCst);
+    }
+}
 
 impl<T> Deref for SourceGuard<'_, T> {
     type Target = T;
