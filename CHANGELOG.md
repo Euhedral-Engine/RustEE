@@ -53,6 +53,15 @@ default, the output lines, and a smoke run of a fork with a tiny target on a rea
 - `Lake` (G7-G9): the attached set is a `Published` reference in the lattice's epoch domain; `offer` and `admit` read
   it with one pinned load. Attach and detach run under a lifecycle lock off the hot scope. The idle watch's downstream
   is a `DownstreamSlot`. `ControlPlaneLattice::registry()` is new.
+- Lane sources and `Join` (G16, G17; barriers, not locks): `LaneSource::request` banks demand with one release
+  `fetch_add` (and spends unbounded demand with none) and sets its wake flag with a release store, where it did
+  three sequentially consistent read-modify-writes per call. A `Join` arrival is one `fetch_sub(AcqRel)`; the check
+  that a part ends once is made in debug builds only, so **a part that ends twice in a release build is a data race
+  on its slot** (Java has no check either). New: `Join::arm_owned` (unsafe, for a cell its owner knows is quiet,
+  including one whose round was cut short by a kill) and `Join::is_idle`. `Join::reset` keeps its check. **Breaking
+  for the lane-source consumers' expectations:** a double arrival no longer panics in a release build, and
+  `euhedral-data-structures` now builds the loom crate as a dependency under `--cfg loom` (the graph's join
+  models run again).
 - `HOT_FIX_TAGS` loses C14, G5, G6 and G7 and lists 35.
 
 **Why.** An outcome crossed a channel whose waker took a mutex on the worker that finished the chain; a latch took a

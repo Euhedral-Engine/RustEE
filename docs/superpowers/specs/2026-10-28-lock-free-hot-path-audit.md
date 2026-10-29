@@ -99,7 +99,7 @@ counterpart):
 | CONST | C1, G2 | 2 |
 | ATOMIC | C13 | 1 |
 | OWNED | C2, C3 | 2 |
-| FAN-IN | C14, G5, G6, G10, G11, G12, G13, G14, G15 | 9 |
+| FAN-IN | C14, G5, G6, G10, G11, G12, G13, G14, G15, G16, G17 | 11 |
 | THREAD | I4, I14, I15 | 3 |
 | SPLIT | I3, I6, I7, I8, I9, I13 | 6 |
 | MOVE | C7, I11, I12 | 3 |
@@ -251,6 +251,8 @@ request-side drain may also run after its `pull` releases the queue, as Java's `
 | G4 | HOT | LANE-SOURCE | The lane-source plan's Part 2 rebuilds `Join` on Java's `Join` (`pending` count, per-part slots). |
 | G5 | HOT | FAN-IN | No Java graph counterpart; Java waits for a result with a `CompletableFuture`: a one-shot. |
 | G6 | HOT | FAN-IN | Java `Sequencer`: an MPSC order queue and a `wip` counter; whoever wins `wip` drains the ready prefix. |
+| G16 | BARRIER | FAN-IN | A lane source's `request` banks demand and sets its wake flag with `SeqCst` operations on every call, once per source per lattice cycle: three full barriers (the bank's compare-and-set, the flag's exchange, the claim). Added after the audit, with the lane sources. Java's `QueueIngestSink.hookOnRequest` banks with `accumulateAndGet` and `requestPending.set(true)` (volatile: a barrier too); the rule for a frame's path is stricter than Java's. |
+| G17 | BARRIER | FAN-IN | A `Join` arrival costs a `swap` on the part's closed flag plus a `SeqCst` `fetch_sub`; `reset` a `SeqCst` compare-and-set, a `SeqCst` store and a release store per part. Java's `Join.arrive` is one `decrementAndGet` and `expect` two plain volatile stores. |
 | G10 | HOT | FAN-IN | Java `StageGraph.quantum` is a plain field ordered by the live and arrival counts. |
 | G11 | HOT | FAN-IN | Java `AbstractQuantum.failure`: `compareAndSet(null, cause)`, the first wins. |
 | G12 | HOT | FAN-IN | Java: a successor reads its predecessors' plain `marker` and `lane` after its final arrival (`ARRIVALS.getAndAdd`). |
@@ -608,6 +610,20 @@ Java `LatticeHotSource`, `ControlPlaneFragment`'s output, `StopWatch`, `Fragment
     emit it and pop it; `missed = wip.fetch_sub(missed, SeqCst) - missed`; return at 0. The order consumer is owned
     by the `wip` winner (an `UnsafeCell`, `// SAFETY:` the `wip` count), as Java's `peek`/`poll`.
   - A failing emit is logged and the drain continues (Java's catch).
+- **G16** lane source `request` (Java `QueueIngestSink.hookOnRequest`): bank the demand with one `fetch_add(Release)`
+  (saturating: a sum that wrapped is stored back as unbounded), only for a non-zero demand; set the wake flag with a
+  plain release store; the claim attempt that follows is the requester's one full barrier, and the holder reads the flag
+  after its sequentially consistent release of the claim and takes it with `swap(false, SeqCst)`. Unbounded demand
+  is never spent, so serving it takes no read-modify-write; spending is one `AcqRel` compare-and-set.
+  Deviation (Java bug against the frame-path rule): Java's volatile bank and volatile flag store are full barriers.
+- **G17** `Join` (Java `Join`): an arrival writes its slot and does one `fetch_sub(AcqRel)`; the check that a part
+  ends once is made in debug builds only (Java has none), and a part outside the round is refused in every build.
+  `Join::arm_owned` is Java's `expect` for a cell its owner knows is quiet: a release store of the count, after the
+  values a cut-short round left are dropped; `is_idle` says whether a round is armed. Java's design implies the owner-only
+  force: `expect` is unconditional and a killed frame simply never arrives, so a killed picture's join is re-armed
+  by its owner rather than made to `abandon` every unended part. `reset` keeps its check (one `AcqRel` compare-and-set).
+  Deviation (missing Rust equivalent): `arm_owned` is `unsafe`, because a Rust join has no collector to prove that
+  no frame still holds a part.
 - **G7, G8, G9: the lake's two modes** (Java's lake, the `FrameLake` implementation). `idle_release` stays:
   `Duration::ZERO` keeps the sinks attached for life (Java `idleDetachNanos <= 0`); a positive value detaches them once
   no unit has been active for that long, and the next offer re-attaches a fresh set. The hot side is Java's:
@@ -813,6 +829,8 @@ runtime" is the Java runtime `euhedral-graph` is derived from (its `runtime/grap
 | G4 join | graph runtime `Join` | In the lane-source plan. |
 | G5 latch | none; `CompletableFuture` | Removed with `Latch` (user decision: a blocking wait for the lattice's work is not needed; the main thread checks periodically with a one-shot). It was the last blocking call in `euhedral-graph`. |
 | G6 sequencer | graph runtime `Sequencer` | A panic in `emit` resumes on the releasing thread once the drain ended; Java logs it (the Rust caller of `complete` sees it). Entries are `Arc`s (no GC); `len` is the order queue's length. `ready` is release/acquire and the work-in-progress count is the one read-modify-write (the claim). |
+| G16 lane source request | core `QueueIngestSink.hookOnRequest` | A release-ordered bank and flag; the claim attempt is the barrier (Java: volatile bank and flag). |
+| G17 join | graph runtime `Join` | Debug-only double-arrival check (Java: none); `arm_owned` is Java's `expect` and `unsafe` (no collector); `is_idle`. |
 | G7-G9 lake | graph runtime `FrameLake` implementation (both modes) | `Published` for the generation (no GC), with the attach lock's own strong reference to the set for the lifecycle side; retirements held in `retiring`. The terminating unit stores `idle_since` before it lowers the count and the watch reads the count before the time (Java stores after the decrement, so a watch that sees the count at zero can read the previous idle time and detach a set that just went idle: a Java bug). The watch's downstream is a `DownstreamSlot`. |
 | G10-G15 stage graph | graph runtime `StageGraph`, `StageFrame`, `AbstractQuantum` | Wider-than-64-lane masks. |
 | I1-I6 io_uring | graph runtime `AsyncReads`, `UringBackend` | Operations written in place behind a reserve step (no allocation per operation). I1, I2: a request that finds the front entered leaves a wakeup for the holder (`request_pending`, as `QueueIngestSink`'s). |
