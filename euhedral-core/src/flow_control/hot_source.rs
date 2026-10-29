@@ -1,10 +1,10 @@
 use crate::frames::{Frame, FrameError};
 use crate::generics::{LatticeReceiver, LatticeSource};
-#[allow(clippy::disallowed_types, reason = "HOT-FIX(C1), HOT-FIX(C10)")]
-use std::sync::{Arc, Mutex, RwLock};
+#[allow(clippy::disallowed_types, reason = "HOT-FIX(C10)")]
+use std::sync::{Arc, RwLock};
 
-type BeforeEach = Box<dyn FnMut(&dyn Frame) + Send>;
-type AfterEach = Box<dyn FnMut() + Send>;
+type BeforeEach = Box<dyn Fn(&dyn Frame) + Send + Sync>;
+type AfterEach = Box<dyn Fn() + Send + Sync>;
 
 #[derive(Default)]
 struct State {
@@ -19,10 +19,8 @@ struct State {
 /// Optional hooks run around each push, for example to time it.
 #[derive(Default)]
 pub struct LatticeHotSource {
-    #[allow(clippy::disallowed_types, reason = "HOT-FIX(C1)")]
-    before_each: Option<Mutex<BeforeEach>>,
-    #[allow(clippy::disallowed_types, reason = "HOT-FIX(C1)")]
-    after_each: Option<Mutex<AfterEach>>,
+    before_each: Option<BeforeEach>,
+    after_each: Option<AfterEach>,
     #[allow(clippy::disallowed_types, reason = "HOT-FIX(C10)")]
     state: RwLock<State>,
 }
@@ -33,16 +31,14 @@ impl LatticeHotSource {
     }
 
     /// Runs `hook` with each frame just before it is pushed.
-    #[allow(clippy::disallowed_types, reason = "HOT-FIX(C1)")]
-    pub fn before_each(mut self, hook: impl FnMut(&dyn Frame) + Send + 'static) -> Self {
-        self.before_each = Some(Mutex::new(Box::new(hook)));
+    pub fn before_each(mut self, hook: impl Fn(&dyn Frame) + Send + Sync + 'static) -> Self {
+        self.before_each = Some(Box::new(hook));
         self
     }
 
     /// Runs `hook` just after each push returns.
-    #[allow(clippy::disallowed_types, reason = "HOT-FIX(C1)")]
-    pub fn after_each(mut self, hook: impl FnMut() + Send + 'static) -> Self {
-        self.after_each = Some(Mutex::new(Box::new(hook)));
+    pub fn after_each(mut self, hook: impl Fn() + Send + Sync + 'static) -> Self {
+        self.after_each = Some(Box::new(hook));
         self
     }
 
@@ -59,11 +55,11 @@ impl LatticeHotSource {
         };
 
         if let Some(before_each) = &self.before_each {
-            (before_each.lock().unwrap())(&*frame);
+            before_each(&*frame);
         }
         downstream.push(frame);
         if let Some(after_each) = &self.after_each {
-            (after_each.lock().unwrap())();
+            after_each();
         }
     }
 }
@@ -120,6 +116,10 @@ impl LatticeSource for LatticeHotSource {
 mod tests {
     use super::*;
     use crate::flow_control::testing::{Fate, Fates, TestReceiver, Tracked, frame};
+    use crate::frames::Failure;
+    use crate::generics::LatticeTerminal;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn attached() -> (Arc<LatticeHotSource>, Arc<TestReceiver>) {
         let source = Arc::new(LatticeHotSource::new());
@@ -164,6 +164,68 @@ mod tests {
         source.accept(frame(5));
         assert_eq!(*log.lock().unwrap(), ["before 5", "after"]);
         assert_eq!(receiver.received(), [5]);
+    }
+
+    /// Counts its pushes, and the pushes at which the before-hook led the after-hook by one.
+    struct Leading {
+        before: Arc<AtomicUsize>,
+        after: Arc<AtomicUsize>,
+        pushes: AtomicUsize,
+        led: AtomicUsize,
+    }
+
+    impl LatticeTerminal for Leading {
+        fn add_upstream(&self, _upstream: Arc<dyn LatticeSource>) {}
+    }
+
+    impl LatticeReceiver for Leading {
+        fn push(&self, _frame: Box<dyn Frame>) {
+            self.pushes.fetch_add(1, Ordering::SeqCst);
+            if self.before.load(Ordering::SeqCst) == self.after.load(Ordering::SeqCst) + 1 {
+                self.led.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        fn on_complete(&self) {}
+
+        fn on_error(&self, _error: Failure) {}
+    }
+
+    #[test]
+    fn hooks_run_around_each_push_from_one_pusher() {
+        const ROUNDS: usize = if cfg!(miri) { 20 } else { 1000 };
+        let before = Arc::new(AtomicUsize::new(0));
+        let after = Arc::new(AtomicUsize::new(0));
+        let source = Arc::new(
+            LatticeHotSource::new()
+                .before_each({
+                    let before = before.clone();
+                    move |_| {
+                        before.fetch_add(1, Ordering::SeqCst);
+                    }
+                })
+                .after_each({
+                    let after = after.clone();
+                    move || {
+                        after.fetch_add(1, Ordering::SeqCst);
+                    }
+                }),
+        );
+        let receiver = Arc::new(Leading {
+            before: before.clone(),
+            after: after.clone(),
+            pushes: AtomicUsize::new(0),
+            led: AtomicUsize::new(0),
+        });
+        source.clone().add_downstream(receiver.clone());
+
+        for round in 1..=ROUNDS {
+            source.accept(frame(round as u64));
+            assert_eq!(before.load(Ordering::SeqCst), round);
+            assert_eq!(after.load(Ordering::SeqCst), round);
+        }
+        assert_eq!(receiver.pushes.load(Ordering::SeqCst), ROUNDS);
+        assert_eq!(receiver.led.load(Ordering::SeqCst), ROUNDS);
     }
 
     #[test]
