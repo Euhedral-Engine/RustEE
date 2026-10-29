@@ -545,10 +545,12 @@ Java `LatticeHotSource`, `ControlPlaneFragment`'s output, `StopWatch`, `Fragment
   releases with `Release`. `first_touch` and `reset_for_next_trial` loop on `try_claim` (lifecycle). Deviation: Java
   skips the claim when work stealing is off (`pLocks == null`); Rust always claims (one uncontended CAS), because a
   plain consumer shared behind `&self` has no safe Rust form.
-- **C5** (Java `WORK_STEAL`): `slots: Box<[Published<ControlPlaneCache>]>`. Build stores (Java `setRelease`); a steal
-  reads with `load_in_cycle` (Java `getAcquire`); `withdraw` stores `None` only if the slot still holds this cache
-  (Java's CAS to null) and defers the retirement (a stealer may be running stolen frames). The cache's `retired` flag
-  refuses pushes, as Java's. Deviation: `Published` stands in for the collector.
+- **C5** (Java `WORK_STEAL`): `slots: Box<[Published<Weak<ControlPlaneCache>>]>`. Build stores (Java `setRelease`); a steal
+  loads the slot under the thread's epoch pin (Java's `getAcquire`) and upgrades the weak reference, then holds the
+  cache for the steal; `withdraw` stores `None` only if the slot still holds this cache (Java's CAS to null) and defers
+  the retirement of the replaced reference. The cache's `retired` flag refuses pushes, as Java's. Deviation:
+  `Published` stands in for the collector, and the slot holds a weak reference, so a directory that owned its caches
+  strongly would form a cycle with the caches' directory handle; a cache lives as long as its owner holds it.
 - **C6** (Java `LatticeVertex.ROUTING_STATE`, `RoutingState.admission`). Java's protocol, field for field:
   - `routing: AtomicPtr<RoutingState>`, published with `Release` after the state is built.
   - `admission: AtomicI64` per state: a reader count with a `RETIRED` sign bit. `try_acquire` CASes it up while it is
@@ -562,9 +564,18 @@ Java `LatticeHotSource`, `ControlPlaneFragment`'s output, `StopWatch`, `Fragment
     `release_handles_when_quiescent(old)`.
   - Deviation (no garbage collector): a reader may CAS `admission` on a state whose pointer it loaded just before the
     swap, so that memory must remain a `RoutingState`. Retired states are recycled, never freed before the vertex
-    drops. The writer reuses a retired state only when its admission is exactly `RETIRED` (no readers), rewrites its
-    contents while the count is negative (every `try_acquire` refuses), stores `admission = 0` (`SeqCst`) and then
-    publishes it. A stale reader that acquires a recycled state either finds it current (and uses it, correctly) or
+    drops. The writer reuses a retired state only when its admission is exactly `RETIRED` (no readers) and its handles
+    are released (`released`, set under the book: the releasing thread reads the table under the lock, so the state
+    may not be rewritten before it has), rewrites its contents while the count is negative (every `try_acquire`
+    refuses), stores `admission = 0` (`SeqCst`) and then publishes it.
+  - Deviation (no garbage collector): Java's `handlesReleased` compare-and-set before the lock admits a thread once
+    per state, and a state is new for each generation. A recycled state could be released a second time, in its next
+    life, by a thread that decided in its last (the last reader, late), clearing the next generation's table. The
+    release therefore checks under the lock that the state is retired, idle and not yet released.
+  - Deviation (a reader never waits for the writer): the writer publishes the next state and then retires the old one.
+    Java retires first, so a reader that loaded the retired state retries until the writer publishes; here a reader
+    that loaded the old pointer either counts before the retirement and finds the pointer changed, or fails the count
+    and loads the new pointer. A stale reader that acquires a recycled state either finds it current (and uses it, correctly) or
     fails the re-check and releases. The pool holds at most the number of generations retired at once.
 - **C7** (Java `releaseHandlesWhenQuiescent` under `synchronized(routingUpdateLock)`): rebalance work, run by
   whichever thread releases the last reader of a retired generation, as in Java. `Book` becomes a `LifecycleMutex`;
@@ -779,10 +790,10 @@ runtime" is the Java runtime `euhedral-graph` is derived from (its `runtime/grap
 | C2 stop watch | core `utils/StopWatch` | **Plain fields, not atomics.** Java's watch is plain state of one thread, and the Rust worker times its own pushes, so no closure shares it. The first Rust design shared it between the output's two hooks as relaxed atomics (deviation category: missing Rust equivalent of a plain field shared by two closures); owning it on the worker removes that need. |
 | C3 body cost | core `control_plane/FragmentDecisionTree` | Plain fields owned by the decision tree, as C2; a snapshot for other threads, published per window. |
 | C4 cache partitions | core `ControlPlaneCache.pLocks` | Always claimed (no safe unguarded form). |
-| C5 cache directory | core `ControlPlaneCache.WORK_STEAL` | `Published` (no GC). |
-| C6 routing | core `LatticeVertex.ROUTING_STATE`, `RoutingState.admission` | Retired states recycled until the vertex drops (no GC). |
+| C5 cache directory | core `ControlPlaneCache.WORK_STEAL` | `Published` weak references (no GC); a stealer holds the cache it upgraded for the steal. |
+| C6 routing | core `LatticeVertex.ROUTING_STATE`, `RoutingState.admission` | Retired states recycled until the vertex drops (no GC), rewritten only after their handles are released; the next state is published before the old one is retired, so no reader waits for the writer. |
 | C7 routing book | core `LatticeVertex.releaseHandlesWhenQuiescent` | None. |
-| C8, C9 edges | core `LatticeEdge.DOWNSTREAM`, `PARENT` | Downstream kept until drop; parent `Published` (no GC). |
+| C8, C9 edges | core `LatticeEdge.DOWNSTREAM`, `PARENT` | Downstream kept until drop; a receiver attached to a closed edge is told complete once (Java leaves it untold); parent `Published` (no GC). |
 | C11, C12 ingest | core `ingest/AbstractIngestSink`, `QueueIngestSink` | `clear` claims (Java bug: unclaimed single-consumer drain); demand is unsigned and saturates at the top (`add_demand`, `take_demand`) where Java's `accumulate` takes a signed step; the queue is finished when its source drops (no GC); `clear` cancels the frames (`do_finally_with_error`) where Java's `clear` drops them silently; `pull`'s stop also matches once the source has completed. |
 | C13 single use | core `ingest/SingleUseSource` | `complete` cancels an untaken frame (Java bug: `complete` leaves it takeable); a `pull` whose stop condition matches gives the frame back (Java ignores the stop condition); a frame nobody took is cancelled when the source drops. |
 | C14 pipeline outcome | core `ingest/PipelineRunner`, `CompletableFuture` | None. |

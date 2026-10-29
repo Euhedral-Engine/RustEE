@@ -116,6 +116,20 @@ until the slot drops, and a `live` flag ends its use. Every method touches atomi
 **SetOnce** ([`SetOnce`](euhedral-data-structures/src/sync/set_once.rs)): a cell installed at most once
 by a compare-and-set and read with an acquire load; the value lives until the cell drops.
 
+**Published, EpochDomain, EpochSlot** ([`Published`](euhedral-data-structures/src/sync/published.rs)): a shared
+`Option<Arc<T>>` that lifecycle code replaces and any thread reads with an acquire load, with no lock and no reference
+count. It stands in for the garbage collector: a reader loads under an epoch guard, and a replaced value is freed
+once every reader has passed the epoch that replaced it. The lattice's domain belongs to its registry; a worker
+announces a quiescent point once per cycle and goes idle before it parks, and any other thread pins for the length of
+a read. A store never waits: the retirements that cannot be freed yet are swept by the next store or reclaim.
+
+**routing admission** ([`Admission`](euhedral-data-structures/src/sync/admission.rs),
+[`RoutingState`](euhedral-core/src/flow_control/vertex.rs)): a routing generation's reader count, with a retired
+sign bit. A push takes a count by compare-and-set while the generation is current, re-checks that it still is, routes
+and releases. A remap publishes the next generation and retires the old one; the release that leaves a retired
+generation without readers closes the downstreams no other generation routes to. Retired generations are rewritten
+for later ones, never freed before the vertex drops.
+
 **ingest sink** ([`IngestSink`](euhedral-core/src/ingest/mod.rs)): a ready-made `LatticeSource` that
 feeds a lattice from outside it. Hand its `delegate()` to `ControlPlaneLattice::add_upstream`;
 `complete()` finishes it at once.
@@ -189,7 +203,8 @@ its own cache (the sibling cache). The core's frames reach the first cache, whic
 an odd routing hash to the sibling.
 
 **CacheDirectory** ([`CacheDirectory`](euhedral-core/src/control_plane/cache.rs)): a lattice's caches
-by CPU, which work stealing walks, with the upstream registry and topology they share.
+by CPU, which work stealing walks, with the upstream registry and topology they share. Each slot is a `Published`
+weak reference: a cache publishes itself when built and withdraws when it closes.
 
 **first touch** ([`CloneableObject::first_touch`](euhedral-core/src/generics/cloneable.rs),
 [`ControlPlaneCache::first_touch`](euhedral-core/src/control_plane/cache.rs)): filling a clone's
@@ -202,7 +217,7 @@ routing generation can still send it frames.
 
 **routing generation** ([`RoutingState`](euhedral-core/src/flow_control/vertex.rs)): one immutable
 version of a vertex's routing table. A push routes with the generation current when it began, and
-holding a generation keeps its downstreams open.
+holding a generation (the `RouteGuard` of `routing_state()`) keeps its downstreams open.
 
 **LatticeEdge, LatticeNode, LatticeVertex** ([`edge`](euhedral-core/src/flow_control/edge.rs),
 [`vertex`](euhedral-core/src/flow_control/vertex.rs)): the links of a lattice. Frames flow down an

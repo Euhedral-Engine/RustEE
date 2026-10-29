@@ -3,6 +3,65 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## Routing, cache and edges without locks (2026-10-29)
+
+**What.**
+- `Published<T>`, `EpochDomain`, `EpochSlot`, `EpochGuard` and `Retired<T>` (`euhedral-data-structures::sync`): an
+  atomically replaceable `Option<Arc<T>>` read with an acquire load under an epoch guard, written by lifecycle
+  code, and reclaimed once every reader has passed the epoch that replaced the value. This stands in for the
+  collector wherever Java publishes a reference and later replaces it while readers may still hold the old one.
+- `Admission` (`euhedral-data-structures::sync`): Java's routing-state reader count, with the retired bit as the sign
+  bit.
+- Workers announce a quiescent point once per cycle and go idle before they park. `UpstreamRegistry::epochs`,
+  `thread_epoch` and `with_pinned` expose the lattice's domain.
+- `ControlPlaneCache` partitions (audit C4) are `ClaimCell`s, Java's `pLocks`: a consumer that finds a partition held
+  passes it over, as before, with no mutex.
+- `CacheDirectory` slots (C5) are `Published` weak references: a steal reads one with no lock under the thread's pin.
+- `LatticeVertex` routing (C6, C7): the published `RoutingState` is an `AtomicPtr`; `try_push` takes a count on it
+  with a compare-and-set, re-checks the pointer and releases, in place of an `RwLock` read and two reference-count
+  updates. `routing_state()` returns a `RouteGuard` (it was an `Arc<RoutingState>`): holding the guard keeps the
+  generation's downstreams open. The book is a lifecycle lock, taken by the thread whose release retires a
+  generation, off the hot scope, and releases a generation once: the check is made under the lock, since a recycled
+  state could otherwise be released again in its next life by a thread that decided in its last.
+- `LatticeEdge` (C8, C9): the downstream is a `SetOnce` and the parent a `Published` weak reference; neither read
+  takes a lock. A receiver attached to a closed edge is told `on_complete`.
+- `HOT_FIX_TAGS` loses C4 to C9 and lists 39.
+
+**Why.** Every frame a source pushes through the lattice crossed two vertex routing locks and two edge downstream
+locks, each with a reference-count update on a line every worker shares; every steal attempt took a directory lock and
+every cache take a partition mutex. Java has none of them: it takes a counter on the routing state, reads the
+downstream with an opaque load and the parent with an acquire load, and claims a partition with a compare-and-set.
+
+**How.**
+- Hold a routing generation with `let state = vertex.routing_state();` and drop the guard to let go.
+- A thread that reads published values outside a worker's cycle goes through
+  `registry.with_pinned(|guard| cell.load(guard))`.
+
+**Semantics.**
+- Routing states are never freed before their vertex drops. A remap rewrites a state for the next generation once it
+  is retired, has no readers and has released its handles; a reader that counted against a state just before a
+  rewrite either finds it published (and routes with it) or gives the count back. The vertex keeps as many states
+  as there are generations still being read, plus one.
+- The new generation is published before the old one is retired. Java retires first, so a reader that loads the
+  retired state waits for the writer; here no reader waits.
+- The downstream of an edge stays allocated until the edge drops. A cache stays published until it closes, and a
+  stealer that found one holds it for the steal, so a closed cache lives until its last stealer lets go.
+- A `Published` store never waits and never fails; the retirements a cell cannot free yet chain on a list, which
+  each store, deferral and `try_reclaim` sweeps. A worker that parks, or whose loop ends by a panic, holds nothing
+  back.
+
+**Tests.** `a_value_is_never_dropped_while_a_reader_holds_it`, `wait_never_returns_before_every_slot_passed_the_epoch`,
+`a_store_never_waits_and_the_retirements_chain_until_the_readers_pass`, `readers_never_see_a_freed_value`,
+`loom_reader_and_writer_never_see_a_freed_value`, `loom_stale_reader_and_recycler`,
+`a_parked_worker_does_not_hold_back_a_retirement`, `stealers_racing_a_greedy_owner_never_take_an_ordered_frame`,
+`a_stealer_skips_a_claimed_partition_without_waiting`, `a_cache_closed_while_stolen_from_lives_for_the_steal_and_its_slot_reference_is_reclaimed`,
+`pushes_racing_remaps_reach_only_validated_downstreams`,
+`the_last_reader_of_a_retired_generation_closes_its_dropped_downstreams_once`, `a_remap_reuses_a_retired_state_once_its_readers_left`,
+`a_panicking_routing_function_gives_its_count_back`, `close_while_pushing_finishes_or_delivers_every_frame`,
+`a_closed_edge_refuses_a_new_downstream`, `attaches_racing_a_close_tell_the_receiver_exactly_once`,
+`set_parent_with_the_same_parent_stores_nothing`. The concurrency tests run under Miri with many seeds (the `miri` CI
+job) and the loom models under `--cfg loom`.
+
 ## The hot source and the fragment's output without locks (2026-10-29)
 
 **What.**
