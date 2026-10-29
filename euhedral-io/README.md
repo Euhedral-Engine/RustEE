@@ -38,6 +38,10 @@ platform's: descriptors on Linux and Android, `HANDLE`s and `SOCKET`s on Windows
 completion holds a worker for long. The `AsyncIo` type is the same everywhere; an engine under it
 starts operations and finds their ends, and `src/lib.rs` does the rest.
 
+The source side takes no lock: the continuations a pull's `stop` held back are plain state of the polling
+call, and the downstream is a `DownstreamSlot`. A `request` that finds a poll running banks its demand and
+leaves a wakeup, which the running poll serves as it lets go.
+
 **Reads into memory you own.** `read_into(file, offset, buf, then)` reads straight into a region the
 caller owns, such as a pinned host arena, so the bytes land in place with no copy. `buf` is any
 `IoMemory`: an `unsafe` trait whose implementor promises that the region is initialized, stays put

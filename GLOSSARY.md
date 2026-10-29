@@ -128,11 +128,15 @@ partitioned queue that any thread offers frames to. Frames of one partition are 
 frames, delivered in order. It completes as soon as its last frame is taken.
 
 **SingleUseSource** ([`SingleUseSource`](euhedral-core/src/ingest/single_use.rs)): a source of one
-frame. It completes once the frame is taken; completed before that, it cancels the frame.
+frame. `pull`, `request` and `complete` each try one compare-and-set, and the winner owns the frame. It
+completes once the frame is taken; completed before that, it cancels the frame.
 
-**Downstream** ([`ingest::downstream`](euhedral-core/src/ingest/downstream.rs), private): the one
-receiver an ingest source pushes to, the demand it asked for, and the source's completion, which the
-receiver hears of exactly once.
+**ClaimCell, ClaimGuard** ([`ClaimCell`](euhedral-data-structures/src/sync/claim_cell.rs)): state that one
+thread at a time claims with a compare-and-set that returns `None` instead of waiting. It is the lock-free form
+of a queue sink's `draining` flag: a thread that finds the claim held records what it wants (a pending request,
+a pending sweep, a pending clear) before it tries, and the holder looks for those records after it releases
+(`release_seq_cst`, a sequentially consistent store and fence). The ingest queue's consumer and `Completions`'s
+poll state are claims.
 
 **PipelineRunner** ([`PipelineRunner`](euhedral-core/src/ingest/pipeline_runner.rs)): an ingest
 sink that runs typed `PipelineFrame` chains. `run` and `submit` admit an input; `complete_gracefully`

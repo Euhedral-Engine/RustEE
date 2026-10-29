@@ -3,6 +3,65 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## Lock-free sources and claims (2026-10-29)
+
+**What.**
+- `euhedral_data_structures::sync`: `ClaimCell<T>` and `ClaimGuard`. `try_claim` is a `SeqCst` compare-and-set that
+  returns `None` instead of waiting; dropping the guard releases with a release store, and
+  `ClaimGuard::release_seq_cst` releases with a `SeqCst` store and a `SeqCst` fence, for a holder that reads other state
+  next (its "request pending" flag, the queue's emptiness).
+- Ingest (`QueueIngestSink`, `ArrayIngestSink`, `PipelineRunner`, `SingleUseSource`; audit C11-C13):
+  - the receiver is a `DownstreamSlot` and the demand a padded atomic with Java's saturating `accumulate`; a source that
+    is complete, has no receiver or has no demand refuses `request` and `pull` at once, and a `request` with no receiver
+    banks nothing;
+  - the queue's consumer is a `ClaimCell`, Java's `draining` flag. `pull`, the request drain and `discard_queued` each try
+    it and never wait. A request that finds it held leaves `request_pending` (a wakeup, not demand), and the holder
+    serves it after releasing;
+  - `QueueIngestSink::clear` no longer waits for a running drain: it sets `clear_requested` and takes the claim if it is
+    free; the holder applies the request as it lets go. A frame is cancelled exactly once either way;
+  - the kill switch of a `PipelineRunner` is written and read `SeqCst`;
+  - dropping a queue source cancels every frame still queued;
+  - `SingleUseSource` takes its frame with a compare-and-set (`pull`, `request` and `complete` each try it). `complete`
+    cancels an untaken frame, a completed source delivers nothing to a later `pull`, a `pull` whose stop condition
+    matches the frame gives it back, and a frame nobody took is cancelled when the source drops.
+- `euhedral-graph`: `Completions` (G1-G3) holds its poll state in a `ClaimCell` that `pull`, `request` and a late
+  registration's sweep each try. A `request` that finds it held banks its demand and leaves a wakeup, and a sweep that
+  finds it held sets `sweep_pending`; the holder serves both after it releases. The lane pool is a fixed `Arc` that lives
+  as long as the source (a marker counts as reached once the source has completed), and the downstream is a
+  `DownstreamSlot`. `complete` touches no poll state.
+- `euhedral-io`: the `AsyncIo` front (I1, I2) keeps the continuations a pull's `stop` held back in a `SourceCell` and its
+  downstream in a `DownstreamSlot`; a `request` banks its demand with the same wakeup. The engines lock their tables
+  through a `lock!` macro (the function it replaces named the lock type).
+- `HOT_FIX_TAGS` loses 8 ids (C11, C12, C13, G1, G2, G3, I1, I2) and lists 49.
+
+**Why.** A source's `request` and `pull` are serialized by the lattice, and its lifecycle calls (`complete`, `clear`,
+kill) arrive from any thread. None of that needs a lock: the lifecycle calls set atomics, the thread that holds the
+source applies them, and a thread that finds the source held leaves a wakeup the holder serves.
+
+**How.** A source keeps its consumer or poll state in a `ClaimCell` (or its worker-only state in a `SourceCell`), calls
+`try_claim` and returns when it gets `None`, and after releasing re-reads the flags a refused caller sets before it tried
+(`request_pending`, `sweep_pending`, `clear_requested`).
+
+**Semantics.**
+- `QueueIngestSink::clear` returns at once; the frames are cancelled by the caller if the queue was free, otherwise by
+  the drain that held it, before that drain returns.
+- A refused `request` is never lost: its demand is banked and the holder pushes within it. `Completions::pull` and
+  `AsyncIo::pull` return 0 when another poll is inside.
+- `Completions` holds its lanes until its last owner drops it, not from `complete`.
+
+**Tests.** `ClaimCell`: `a_second_claim_fails_while_the_first_is_held`, `a_released_claim_can_be_taken_again`,
+`claims_from_8_threads_never_overlap`, `writes_under_one_claim_are_seen_by_the_next`, the wakeup test, and the `loom`
+model `loom_two_claimers_exclude_each_other_and_see_prior_writes`
+(`RUSTFLAGS="--cfg loom" cargo test -p euhedral-data-structures --release --lib sync::claim_cell::loom`). Ingest:
+`a_request_while_a_pull_holds_the_queue_is_served_when_the_pull_releases`, `request_pushes_no_more_than_the_banked_demand`,
+`a_source_driven_only_by_request_delivers_every_frame`, `a_publish_after_close_is_discarded_by_someone`,
+`frames_queued_when_the_source_drops_are_finished`, `clear_racing_a_pull_discards_every_frame_once`,
+`a_frame_is_delivered_or_cancelled_exactly_once`, `a_completed_source_delivers_nothing_to_a_later_pull`. Completions:
+`registrations_racing_complete_are_each_cancelled_or_emitted_once`, `a_request_while_another_thread_polls_returns_at_once`,
+`a_sweep_that_finds_the_poll_held_is_run_by_the_holder_when_it_lets_go`. `AsyncIo`:
+`a_request_only_lattice_delivers_every_completion`,
+`a_request_while_a_pull_holds_the_front_returns_at_once_and_is_served_after`.
+
 ## Hot-path guard rails (2026-10-29)
 
 **What.**

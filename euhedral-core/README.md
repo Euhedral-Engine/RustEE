@@ -190,7 +190,10 @@ The ingest sinks, all ready-made `LatticeSource`s:
 
 - **`QueueIngestSink`**: a partitioned queue any thread offers frames to (`offer`, `offer_seeded`,
   `offer_to`); frames of one partition are delivered in order. `complete_gracefully` completes it
-  once the lattice has drained it; `complete` stops it at once and leaves what is queued.
+  once the lattice has drained it; `complete` stops it at once and leaves what is queued. One drain
+  holds the queue at a time, and none waits: a `request` that finds it held banks its demand and the
+  holder pushes within it as it lets go. `clear` cancels the queued frames, through the holder if one
+  is running.
 - **`ArrayIngestSink`**: a fixed batch, delivered in order, complete once its last frame is taken.
 - **`SingleUseSource`**: one frame.
 - **`PipelineRunner`**: runs typed `PipelineFrame` chains (below).

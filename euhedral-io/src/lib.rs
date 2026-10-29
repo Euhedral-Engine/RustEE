@@ -581,6 +581,9 @@ impl Front {
         stop: &mut dyn FnMut(&dyn Frame) -> bool,
         demand: u64,
     ) -> u64 {
+        if demand == 0 || pending.load(Ordering::Acquire) == 0 {
+            return 0;
+        }
         let mut emitted = 0u64;
         // Continuations an earlier pull's `stop` held back go first, in the order they were reaped.
         while emitted < demand {
