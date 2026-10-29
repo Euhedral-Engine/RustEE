@@ -32,7 +32,7 @@ not even through a dev-dependency or a feature (`euhedral-gpu/tests/layering.rs`
 4. `euhedral-graph` and `euhedral-io`, on `euhedral-core` (and the utilities they use).
 5. `euhedral-memory`, on `euhedral-core`, `euhedral-graph` and the utilities.
 6. `euhedral-gpu`, on `euhedral-core`, `euhedral-graph`, `euhedral-memory` and `euhedral-hashing`.
-7. `euhedral-benchmarks`, on `euhedral-core` and the utilities; nothing depends on it.
+7. `euhedral-benchmarks`, on `euhedral-core` and the utilities; nothing depends on it (layer 6 in `layering.rs`).
 
 - [`GLOSSARY.md`](GLOSSARY.md): every term a user of RustEE meets, with links to the code.
 - [`CHANGELOG.md`](CHANGELOG.md): changes to the lattice's execution model, newest first.
