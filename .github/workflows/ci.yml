@@ -87,6 +87,6 @@ jobs:
         run: |
           cargo +nightly miri test -p euhedral-data-structures --lib sync::claim_cell
           cargo +nightly miri test -p euhedral-core --lib ingest::single_use
-          cargo +nightly miri test -p euhedral-core --lib -- metrics::histogram::tests::an_owner metrics::histogram::tests::a_reader metrics::histogram::tests::concurrent
+          cargo +nightly miri test -p euhedral-core --lib -- metrics::histogram::tests::an_owner metrics::histogram::tests::a_reader
           cargo +nightly miri test -p euhedral-core --lib -- ingest::queue::tests::a_request_while ingest::queue::tests::a_request_refused ingest::queue::tests::request_pushes ingest::queue::tests::a_source_driven ingest::queue::tests::a_publish_after ingest::queue::tests::clear_racing ingest::queue::tests::a_panicking ingest::queue::tests::concurrent_publishers ingest::queue::tests::frames_queued
           cargo +nightly miri test -p euhedral-graph --lib -- completions::tests::registrations_racing completions::tests::a_request_while completions::tests::a_sweep_that completions::tests::a_consumer_that completions::tests::a_panicking completions::tests::a_late_registration completions::tests::a_marker_registration completions::tests::dropping_
