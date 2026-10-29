@@ -724,6 +724,17 @@ fn cache_local_frames_behind_a_blocking_one_stay_on_their_core_in_both_modes() {
         let Some((lattice, source)) = running_lattice(fragment, &cpus) else {
             return;
         };
+        // The test is about frames whose core is active. A core joins the routing when its clone is ready, which can
+        // follow the start of the lattice; until then its cache-local frames fall back to a hashed core, as they
+        // should. Send nothing before both cores are in, and skip a host where they never are.
+        let deadline = Instant::now() + PATIENCE;
+        while lattice.active_workers() < 2 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        if lattice.active_workers() < 2 {
+            lattice.close();
+            return;
+        }
         let started = Arc::new(AtomicBool::new(false));
         let release = Arc::new(AtomicBool::new(false));
         source.accept(Box::new(Blocking {
