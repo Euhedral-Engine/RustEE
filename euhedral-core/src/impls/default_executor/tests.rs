@@ -182,6 +182,7 @@ fn clone_object_on_a_pinned_executor_makes_a_new_executor() {
     let Some(cpu) = affinity::base_mask().first() else {
         return;
     };
+    let _turn = crate::control_plane::testing::pinned_turn();
     let pinned = PinnedThreadExecutor::get_or_create(cpu, "executor-test").unwrap();
     let executor: Arc<dyn CloneableObject> = Arc::new(DefaultExecutor::on_cpu(cpu));
     let config = CloneConfig::new("", 0, CpuSet::from_iter([cpu]));

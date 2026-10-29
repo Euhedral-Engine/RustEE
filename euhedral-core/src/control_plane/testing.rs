@@ -18,9 +18,50 @@ pub(crate) const PATIENCE: Duration = Duration::from_secs(10);
 
 /// Tests that start workers pin them to the same few host CPUs and assert on those CPUs' executors
 /// (that they are open, closed or gone), so they take turns.
-pub(crate) fn pinned_turn() -> MutexGuard<'static, ()> {
+///
+/// The turn also ends cleanly: before it is handed on, the executors of the CPUs the tests use are settled, so the
+/// next test never meets one that is closed but still has a worker winding down (`get_or_create` refuses that with
+/// `ClosedWithActiveTasks`).
+pub(crate) fn pinned_turn() -> PinnedTurn {
     static PINNED: Mutex<()> = Mutex::new(());
-    PINNED.lock().unwrap_or_else(PoisonError::into_inner)
+    PinnedTurn {
+        _guard: PINNED.lock().unwrap_or_else(PoisonError::into_inner),
+    }
+}
+
+/// The turn of one test on the pinned CPUs; see [`pinned_turn`].
+pub(crate) struct PinnedTurn {
+    _guard: MutexGuard<'static, ()>,
+}
+
+impl Drop for PinnedTurn {
+    fn drop(&mut self) {
+        // Runs while the lock is still held: the fields drop after this.
+        let cpus = SMT_CORE
+            .as_ref()
+            .map(|(_, cpus)| cpus.clone())
+            .into_iter()
+            .flatten()
+            .chain(SINGLE_CORE.map(|(_, cpu)| cpu));
+        for cpu in cpus {
+            let deadline = Instant::now() + PATIENCE;
+            loop {
+                match affinity::PinnedThreadExecutor::get_or_create(cpu, "settle") {
+                    // A closed executor still has tasks winding down: wait for them.
+                    Err(affinity::ExecutorError::ClosedWithActiveTasks(_))
+                        if Instant::now() < deadline =>
+                    {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Ok(executor) => {
+                        executor.release();
+                        break;
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+    }
 }
 
 /// Waits for `condition`, failing the test after [`PATIENCE`].

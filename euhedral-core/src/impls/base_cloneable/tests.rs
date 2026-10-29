@@ -1,7 +1,9 @@
 use super::*;
 use crate::config::FragmentConfig;
 use crate::config::{CacheConfig, LatticeConfig};
-use crate::control_plane::testing::{PATIENCE, SINGLE_CORE, SMT_CORE, pinned_turn, wait_until};
+use crate::control_plane::testing::{
+    PATIENCE, PinnedTurn, SINGLE_CORE, SMT_CORE, pinned_turn, wait_until,
+};
 use crate::control_plane::{CacheDirectory, ControlPlaneLattice};
 use crate::flow_control::testing::{Fate, Fates, Tracked, frame};
 use crate::flow_control::{LatticeHotSource, LatticeNode, UpstreamRegistry};
@@ -88,7 +90,7 @@ fn close(clone: &BaseCloneableObject<impl AbstractExecutor>) {
 struct Placed {
     log: Arc<Log>,
     clone: Arc<BaseCloneableObject<Recording>>,
-    _turn: std::sync::MutexGuard<'static, ()>,
+    _turn: PinnedTurn,
 }
 
 impl Placed {
