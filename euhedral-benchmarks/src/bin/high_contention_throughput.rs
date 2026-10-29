@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! high_contention_throughput [--forks N] [--sources N] [--warmup-iterations N] [--warmup-seconds S]
-//!                            [--iterations N] [--seconds S] [--tasks N] [--no-pin]
+//!                            [--iterations N] [--seconds S] [--tasks N] [--no-pin] [--no-latency]
 //! ```
 //!
 //! The defaults are upstream's: 3 forks (separate processes, each with its own lattice), 3 warm-up iterations of 3
@@ -13,7 +13,10 @@
 use euhedral_benchmarks::high_contention::{
     ForkError, Options, SOURCES_VARIABLE, run_fork, sources_from,
 };
-use euhedral_benchmarks::report::{parse_sample, sample_line, setup_line, summary_line};
+use euhedral_benchmarks::latency::Histogram;
+use euhedral_benchmarks::report::{
+    histogram_line, parse_histogram, parse_sample, sample_line, setup_line, summary_line,
+};
 use euhedral_hardware_utils::topology::Topology;
 use std::io::{BufRead, BufReader};
 use std::process::{Command, ExitCode, Stdio};
@@ -57,6 +60,7 @@ fn parse(arguments: impl Iterator<Item = String>) -> Result<Arguments, String> {
             }
             "--tasks" => parsed.options.tasks = (number("--tasks")? as u64).max(1),
             "--no-pin" => parsed.options.pin_harness = false,
+            "--no-latency" => parsed.options.latency = false,
             "--child" => parsed.child = true,
             "--help" | "-h" => return Err(String::new()),
             other => return Err(format!("unknown argument {other}")),
@@ -67,12 +71,13 @@ fn parse(arguments: impl Iterator<Item = String>) -> Result<Arguments, String> {
 
 /// One fork, in this process: prints its setup and iterations.
 fn child(options: &Options) -> Result<(), ForkError> {
-    run_fork(
+    let outcome = run_fork(
         options,
         |setup| println!("{}", setup_line(setup.sources, &setup.isolation)),
         |sample| println!("{}", sample_line(sample)),
-    )
-    .map(drop)
+    )?;
+    println!("{}", histogram_line(&outcome.measured_latency));
+    Ok(())
 }
 
 /// The forks, each a process of this binary with `--child`.
@@ -80,6 +85,7 @@ fn drive(arguments: &Arguments) -> Result<(), String> {
     let executable = std::env::current_exe().map_err(|error| error.to_string())?;
     let mut samples = Vec::new();
     let mut setup = String::new();
+    let mut latency = Histogram::new();
     for fork in 1..=arguments.forks {
         let options = &arguments.options;
         let mut process = Command::new(&executable)
@@ -113,6 +119,8 @@ fn drive(arguments: &Arguments) -> Result<(), String> {
             println!("fork {fork}: {line}");
             if let Some(rest) = line.strip_prefix("setup ") {
                 rest.clone_into(&mut setup);
+            } else if let Some(histogram) = parse_histogram(&line) {
+                latency.merge(&histogram);
             } else if let Some(sample) = parse_sample(&line) {
                 samples.push(sample);
             }
@@ -122,7 +130,10 @@ fn drive(arguments: &Arguments) -> Result<(), String> {
             return Err(format!("fork {fork} failed: {status}"));
         }
     }
-    println!("{}", summary_line(arguments.forks, &setup, &samples));
+    println!(
+        "{}",
+        summary_line(arguments.forks, &setup, &samples, &latency)
+    );
     Ok(())
 }
 
@@ -135,7 +146,7 @@ fn main() -> ExitCode {
             }
             eprintln!(
                 "usage: high_contention_throughput [--forks N] [--sources N] [--warmup-iterations N] \
-                 [--warmup-seconds S] [--iterations N] [--seconds S] [--tasks N] [--no-pin]"
+                 [--warmup-seconds S] [--iterations N] [--seconds S] [--tasks N] [--no-pin] [--no-latency]"
             );
             return ExitCode::from(2);
         }

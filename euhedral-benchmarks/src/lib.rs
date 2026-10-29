@@ -7,5 +7,6 @@
 //! The binary `high_contention_throughput` runs it; see its `--help`.
 
 pub mod high_contention;
+pub mod latency;
 pub mod no_op;
 pub mod report;
