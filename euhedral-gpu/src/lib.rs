@@ -9,6 +9,7 @@
 //! | [`Gpu`], [`Stream`], [`Enqueue`] | `api` | a device, an ordered queue of device work, and what a submission enqueues |
 //! | [`Module`], [`Kernel`], [`Args`] | `api`, `args` | code loaded at run time and its typed arguments |
 //! | [`Sequence`], [`Graph`] | `api` | a recurring sequence of submissions, recorded once and replayed |
+//! | [`open_lane_sources`], [`LaneSpec`] | `lanes` | a device's streams as lane sources: a pool, its intakes and a `LaneSource` per lane |
 //! | [`retire_into`], [`RetireListener`] | `retire`, `api` | retirement: the callback queues, the owner drains and dispatches, and it continues as a frame |
 //! | [`ModuleCache`] | `module_cache` | compiled modules keyed by a content hash |
 //! | `fake::FakeGpu` (feature `fake`) | `fake` | a stepped device for tests, with no wall clock |

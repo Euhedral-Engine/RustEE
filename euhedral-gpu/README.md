@@ -17,7 +17,8 @@ Asynchronous, backend-neutral GPU access for the RustEE control plane. A lattice
 
 | Module | Main types |
 |---|---|
-| [`api`](src/api.rs) | The traits: `Gpu`, `Stream`, `Enqueue`, `Module`, `Kernel`, `Sequence`, `Graph`, `RetireListener`; `RetireTicket`, `StreamOptions`, `CompileOptions`, `Rerecorded`. |
+| [`api`](src/api.rs) | The traits: `Gpu`, `Stream`, `Enqueue`, `Module`, `Kernel`, `Sequence`, `Graph`, `RetireListener`; `RetireTicket`, `StreamOptions`, `StreamPriority`, `CompileOptions`, `Rerecorded`. |
+| [`lanes`](src/lanes.rs) | `LaneSubmit` for the backends' streams, and `open_lane_sources`: a device's lanes as a pool, its intakes and a `LaneSource` per lane (`LaneSpec`, `OpenedLanes`). |
 | [`args`](src/args.rs) | `KernelArg`, `Args` (the typed argument builder), `Launch`, `Dim3`. |
 | [`error`](src/error.rs) | `GpuError`, the one error type. |
 | [`poison`](src/poison.rs) | `Poison`: a device's first fault, set once. |
@@ -31,7 +32,7 @@ Asynchronous, backend-neutral GPU access for the RustEE control plane. A lattice
 ## Key concepts
 
 - **Streams are lanes, and ownership replaces locking.**
-  - `Gpu::open_lanes` opens streams as the lanes of a new `LanePool` and returns one *submitter* per lane. A stream is
+  - `Gpu::open_lanes` opens streams as the lanes of a new `LanePool` and returns one *submitter* per lane. `Gpu::open_lanes_at` opens them at lane ids a `LanePoolBuilder` reserved, with options per lane (the marker ring, and the **stream priority**). A stream is
     split in two. Its **queue** (`DeviceQueue`: `id`, `completed`, `name`) is shared and `Sync`: the pool and
     `Completions` hold it, so a stage graph's lane choice, `Marker` and `Completions::after_marker` work with it as
     they are. Its **submitter** (`Stream`) is `Send` and not `Sync`, with exactly one owner.
@@ -135,7 +136,7 @@ Asynchronous, backend-neutral GPU access for the RustEE control plane. A lattice
   driver's other unrecoverable errors (an event query that fails for any reason but "not ready") poison it the same
   way. A fault is sticky for the process, so recovery is a new process. Nothing panics on the lattice.
 - **Build-time calls.** Module loading (compile, file reads, the driver's load), dropping a stream and dropping a
-  graph block. Make them at start-up or shutdown, or on a lattice set aside for blocking work.
+  graph block. Run them in the frame or item that needs them; a worker is a CPU. Keep them out of paths that run per item.
 
 ```rust
 use std::sync::{Arc, Mutex};
@@ -211,26 +212,75 @@ assert_eq!(u32::from_le_bytes(out), 1);
 drop(copy_lane); // a shutdown call: made here, in the source's stop path, never in a frame
 ```
 
-## The intended shape: a lane is a source
+## Lanes as sources
 
-In RustEE a lane's work belongs to a `LatticeSource`. The lattice serializes the source's `request` and `pull`, so the
-submitter it owns is only ever used by one call at a time, on whichever worker runs it, and nothing is locked. A sketch
-(not code of this crate):
+A lane's work belongs to a `LatticeSource`: [`open_lane_sources`](src/lanes.rs) opens a device's streams as one pool, makes
+the intakes, and returns a `euhedral_graph::LaneSource` per lane. The lattice serializes a source's `request` and
+`pull`, so the submitter it owns is only used by one call at a time, on whichever worker runs it, and nothing is locked.
+Every stream is a `euhedral_graph::LaneSubmit`: `mark` returns `Ok(None)` for a full marker ring (the source stalls the
+lane and marks the item at its next entry), `arm_retirement` returns the retirement's number, `poll_retired` settles the
+ticket and reports the device failure, and `raw` lends the stream's handle (the `CUstream`; the queue id for the fake)
+to an item that enqueues work of its own, with the context made current by the item (`Device::enter`) and covered by the
+next mark.
 
-```rust,ignore
-struct LaneSource {
-    stream: CudaStream,                 // the submitter: this source is its one owner
-    intake: Consumer<Job, Single>,      // an MPSC queue other frames push jobs into
-    downstream: Option<Arc<dyn LatticeReceiver>>,
+```rust,no_run
+use std::convert::Infallible;
+
+use euhedral_gpu::fake::{FakeGpu, FakeStream};
+use euhedral_gpu::{Enqueue, GpuError, LaneSpec, Stream, StreamOptions, open_lane_sources};
+use euhedral_graph::{Deliver, LaneCx, LaneId, LaneWork, Marker, Outcome};
+
+/// An item that sets a device word on its lane.
+struct Fill {
+    at: u64,
+    waits: Vec<Marker>,
 }
 
-// In `request`/`pull`, whichever worker runs it:
-//   1. drain the intake: each job is `stream.submit(..)` (launches, copies) and, if it needs its completion,
-//      `stream.notify_retired(listener)` or `stream.arm_retirement()`;
-//   2. drain the retirements: `while let Some(ticket) = stream.poll_retired() { stream.confirm_retired(ticket); .. }`
-//      and push the follow-on frames downstream;
-// and in the stop path (`complete`): drop the stream, a shutdown call that waits for the device.
+impl LaneWork<FakeStream, ()> for Fill {
+    const KINDS: &'static [&'static str] = &["fill"];
+
+    fn kind(&self) -> usize {
+        0
+    }
+
+    fn waits(&self) -> &[Marker] {
+        &self.waits
+    }
+
+    fn run(&mut self, cx: &mut LaneCx<'_, FakeStream, (), Self>) -> Outcome<Infallible> {
+        let at = self.at;
+        // SAFETY: `at` is a live allocation of 4 bytes that only this item touches.
+        cx.submitter().submit(|q| unsafe { q.memset(at, 7, 4) }).unwrap();
+        Outcome::Submitted { retire: false }
+    }
+
+    fn failed(self, error: GpuError, _cx: &mut LaneCx<'_, FakeStream, (), Self>) {
+        panic!("{error}");
+    }
+}
+
+let gpu = FakeGpu::new();
+let word = gpu.alloc(4);
+let lanes = vec![LaneSpec {
+    name: "compute".to_owned(),
+    options: StreamOptions::default(),
+    state: (),
+}];
+let opened = open_lane_sources::<_, (), Fill>(&gpu, lanes, &[]).unwrap();
+// Attach a receiver to each source (`LatticeSource::add_downstream`); a worker's `request` then runs the item.
+opened
+    .intakes
+    .deliver(Fill { at: word, waits: Vec::new() }, Deliver::Lane(LaneId(0)))
+    .unwrap();
 ```
+
+A pool of several backends is built by hand: `LanePoolBuilder::reserve` a range per backend, `Gpu::open_lanes_at` at the
+range's first lane, `LanePoolBuilder::set` each stream's `queue()`, then `LaneIntakes::new` and one `LaneSource::new`
+per lane. A stream refuses (`Err(Invalid)`) a marker of a lane its own opening call did not make; the lane source hands
+such a marker to the item (`LaneCx::bridges`) instead of awaiting it.
+
+Code that imports both `Stream` and `LaneSubmit` names the one it means with a path (`Stream::mark(&mut s)`), as both
+have `mark`, `id` and `await_marker`.
 
 `retire_into` is the same shape for a chain of frames: the stream travels inside the continuation instead of living in a
 source, and the last frame hands it back to the source that stops it.
@@ -254,5 +304,5 @@ mise exec -- cargo run -p euhedral-gpu --features cuda --example graph_replay   
 ```
 
 NVRTC is found through `EUHEDRAL_NVRTC` (a library file) or `CUDA_HOME` (a toolkit); without it, tests that compile from
-source skip and prebuilt images still load. The test `tests/cuda_fault.rs` is a process of its own, because a device
-fault is sticky.
+source skip and prebuilt images still load. The tests `tests/cuda_fault.rs` and `tests/cuda_lanes_fault.rs` are processes of their own, because a device
+fault is sticky. `tests/cuda_lanes.rs` is the lane-source suite on the device, and `tests/fake_lanes.rs` the same on the fake.

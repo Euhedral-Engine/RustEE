@@ -3,6 +3,51 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## GPU lane sources (2026-10-29)
+
+**What.** `euhedral-gpu`:
+- `Gpu::open_lanes_at(first, names, options)`: streams for lanes `first..first + n` of a pool built elsewhere
+  (`LanePoolBuilder::reserve`). `open_lanes` is the same call at lane 0, with the pool made of the streams' queues (a
+  provided method).
+- `StreamOptions::priority` (`StreamPriority::{Normal, High}`): `High` is the context's greatest stream priority
+  (`cuCtxGetStreamPriorityRange`, `cuStreamCreateWithPriority`). `CudaStream::priority()` reports it
+  (`cuStreamGetPriority`); the fake reports `FAKE_NORMAL_PRIORITY` or `FAKE_GREATEST_PRIORITY`.
+- `LaneSubmit` for `CudaStream` and `FakeStream` (`Error = GpuError`; `Raw` is the `CUstream`, or the queue id for the fake).
+- `open_lane_sources(gpu, lanes, groups)`: one pool of the device's lanes, its `LaneIntakes` and a `LaneSource` per lane
+  (`LaneSpec`, `OpenedLanes`).
+
+**Why.** A lane is a source that owns its stream, so the lattice's claim gives one worker at a time the lane's
+submitter. The streams needed to join a pool of several backends, to carry a priority, and to speak the backend-neutral
+`LaneSubmit`.
+
+**How.** `open_lane_sources::<_, X, W>(&gpu, vec![LaneSpec { name, options, state }, ..], &[&[LaneId(0), LaneId(1)]])`,
+then attach a receiver to each source and deliver work through `opened.intakes`. A pool of several backends: reserve
+a range per backend in a `LanePoolBuilder`, `open_lanes_at` at the range's first lane, set each stream's `queue()`, then
+`LaneIntakes::new` and `LaneSource::new`.
+
+**Semantics.**
+- The CUDA lane array is `Arc<[Option<Arc<LaneRing>>]>` of length `first + n`: the ids below the call's first lane are
+  holes. `await_marker` refuses (`Err(Invalid)`) a marker of a lane the call did not open, or under another queue;
+  `LaneSubmit::accepts` is the same test, so the lane source hands such a marker to the item (`LaneCx::bridges`).
+- `LaneSubmit::mark` maps `Err(Busy)` (a full ring, or a slot an awaiter pins) to `Ok(None)`. `arm_retirement` returns
+  the number the stream's retirement queue gives the retirement, which `poll_retired` reports as `Retired::seq`;
+  `poll_retired` settles the ticket (`confirm_retired`) and reports the device failure. A poisoned device reports the
+  retirements it never delivered with `POISONED_STATUS`, so no item is stranded.
+- `raw` lends the `CUstream`. The caller makes the context current (`Device::enter`) and a mark afterwards covers the
+  work.
+- `open_lanes_at` is `Err(Invalid)` for no names, a different number of options, a ring of no markers or lanes past 63;
+  `open_lane_sources` is `Err(Invalid)` for a group lane that is not a lane or a lane in two groups.
+- Both `Stream` and `LaneSubmit` have `mark`, `id` and `await_marker`: code that imports both writes
+  `Stream::mark(&mut s)`.
+
+**Tests.**
+- `tests/fake_streams.rs`: lanes at reserved ids, a marker of a lane the call did not open, the priority option.
+- `tests/fake_lanes.rs`: a chain across a lane group, retirement read-back, a foreign lane's marker bridged, a full
+  marker ring, the priority, bad group lists, a device fault reaching the item, and the submitter's numbering of arms.
+- `tests/cuda_lanes.rs` (feature `cuda`, on the device): a 300-item chain across a group and a high-priority lane, the
+  greatest priority, raw-handle work covered by the next mark, a foreign lane bridged. `tests/cuda_lanes_fault.rs`: a
+  poisoned device fails armed items.
+
 ## Lane sources (2026-10-29)
 
 **What.** `euhedral-graph`:

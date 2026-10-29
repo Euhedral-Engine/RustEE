@@ -18,11 +18,11 @@
 //!   Exclusivity is the borrow checker's, so there is no lock to take or to wait on, and a call on a stream from
 //!   inside its own `submit` closure does not compile.
 //!
-//! The intended shape is RustEE's own: a lane's `LatticeSource` owns its submitter. The lattice serializes the source's
-//! `request` and `pull`, so whichever worker runs them is the submitter's only user, and nothing is locked. Work for the
-//! lane from other frames reaches the source through one of RustEE's lock-free queues (an MPSC intake the source
-//! drains), or the submitter is handed from frame to frame inside a chain, as [`retire_into`](crate::retire_into) does,
-//! or the work runs on another lane. This crate has no routing layer.
+//! In RustEE's model the owner is a lane's `LatticeSource`: the lattice serializes its `request` and `pull`, so
+//! whichever worker runs them is the submitter's only user, and nothing is locked. [`open_lane_sources`](crate::open_lane_sources)
+//! opens a device's streams that way; work for a lane from other frames reaches the source through the lock-free
+//! intakes of `euhedral-graph`. A chain of frames can instead carry the submitter along, as
+//! [`retire_into`](crate::retire_into) does.
 
 use std::any::Any;
 use std::fmt;
@@ -256,8 +256,8 @@ pub trait Kernel: Clone + Send + Sync + fmt::Debug {
     fn id(&self) -> u64;
 }
 
-/// Code loaded at run time. Loading is a build-time call: it blocks (compile, file reads, the driver's load), so it
-/// runs at start-up or on a lattice set aside for blocking work.
+/// Code loaded at run time. Loading is a long call: it blocks (compile, file reads, the driver's load), so it runs in
+/// the frame or item that needs it, on the worker that reaches it (a worker is a CPU), and not per item.
 pub trait Module: Send + Sync + fmt::Debug + Sized {
     type Gpu: Gpu<Module = Self>;
 
