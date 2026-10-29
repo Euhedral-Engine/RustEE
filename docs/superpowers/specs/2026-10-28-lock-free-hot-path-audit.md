@@ -35,8 +35,8 @@ lock-free one-shot. A lake has two modes, attached for life and idle detach (det
 offer), as Java's lake. Long calls run on the worker that needs them
 (principle 6). A `loom` dev-dependency and Miri on a nightly toolchain are approved. `SourceCell` is approved. Every
 place mirrors its Java counterpart (principle 7); the hot source and receiver are Java's. The source primitives and the
-re-armable `Join` come from the lane-source plan (§3.11). Decision 6 (I/O submission in the poll) is superseded by
-Java's per-thread ring, pending the one question in §6.
+re-armable `Join` come from the lane-source plan (§3.11). Decision 6 (I/O submission in the poll) is superseded, as the user settled, by
+Java's per-thread ring (§6).
 
 **Scope.** `main` at `b33258c`: `euhedral-core`, `euhedral-data-structures`, `euhedral-hashing`,
 `euhedral-hardware-utils`, `euhedral-graph`, `euhedral-io`, `euhedral-memory`. `euhedral-gpu` is out of scope (it is
@@ -865,10 +865,6 @@ that needs them, with no blocking-work facility (principle 6, M1); `loom` and Mi
 place mirrors its Java counterpart (principle 7, §3.12); the hot source and receiver are Java's (S3 dropped, C15
 kept); the source primitives and `Join` come from the lane-source plan (§3.11).
 
-Question for the user:
-
-1. **I/O submission (decision 6).** Decision 6 chose "all kernel submission moves into the `AsyncIo` source's poll".
-   The Java counterpart does something else: each thread's ring has that thread as its only submitter, and `submit`
-   enters the kernel itself, so the submission side is single-owner without the poll's added latency. This revision
-   follows Java (I4, chunk 7). If the poll-only submission is still wanted, chunk 7's Task 7.3 changes and the rest
-   stays.
+Settled by the user (2026-10-28): **I/O submission follows Java** (decision 6 superseded). Each thread's ring has
+that thread as its only submitter and `submit` enters the kernel itself, so the submission side is single-owner without
+the poll's added latency (I4, chunk 7). There are no open questions.
