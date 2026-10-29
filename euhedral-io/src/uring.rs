@@ -22,7 +22,7 @@ use io_uring::{IoUring, Submitter, opcode, squeue, types};
 
 use super::{
     AsyncIo, AsyncIoOptions, Buf, Create, Engine, MAX_PIECE, OpenSpec, READ_PIECE, Request, Then,
-    conclude as conclude_io, lock,
+    conclude as conclude_io,
 };
 
 /// Entries of each ring's submission queue (its completion queue has twice as many).
@@ -387,7 +387,7 @@ impl Ring {
     }
 
     fn reap_one(&self, user_data: u64, result: i32, max_piece: usize) -> Reaped {
-        let mut ops = lock(&self.ops);
+        let mut ops = lock!(&self.ops);
         let Some(op) = ops.get(user_data) else {
             return Reaped::Stray;
         };
@@ -430,7 +430,7 @@ impl Drop for Ring {
     fn drop(&mut self) {
         // The kernel may still write into the buffers of operations in flight while the ring tears
         // down: leak them.
-        let ops = std::mem::take(&mut *lock(&self.ops));
+        let ops = std::mem::take(&mut *lock!(&self.ops));
         for op in ops.slots.into_iter().flatten() {
             std::mem::forget(op);
         }
@@ -524,7 +524,7 @@ impl Uring {
             {
                 return Ok(ring);
             }
-            let mut rings = lock(&self.rings);
+            let mut rings = lock!(&self.rings);
             if rings.len() >= MAX_RINGS {
                 return Err(io::Error::other("too many threads submit to this AsyncIo"));
             }
@@ -605,7 +605,7 @@ impl Engine for Uring {
         let kind = Self::kind(request)?;
         let ring = self.ring()?;
         let entry = {
-            let mut ops = lock(&ring.ops);
+            let mut ops = lock!(&ring.ops);
             let user_data = ops.insert(Op {
                 kind,
                 buf,
@@ -621,7 +621,7 @@ impl Engine for Uring {
     }
 
     fn poll(&self, room: &mut dyn FnMut() -> bool, offer: &mut dyn FnMut(Box<dyn Frame>) -> bool) {
-        let rings: Vec<Arc<Ring>> = lock(&self.rings).clone();
+        let rings: Vec<Arc<Ring>> = lock!(&self.rings).clone();
         for ring in &rings {
             ring.flush_waiting(&*self.enter);
             let Ok(_reaping) = ring.cq.try_lock() else {
@@ -899,7 +899,7 @@ mod tests {
                 from,
                 part,
                 Box::new(move |done: IoDoneOwned<ArenaPart>| {
-                    lock(&returned).push((done.buf.expect("memory back"), done.result.unwrap()));
+                    lock!(&returned).push((done.buf.expect("memory back"), done.result.unwrap()));
                     Box::new(RunnableFrame::new(1, Arc::new(|| {})))
                 }),
             )
@@ -910,7 +910,7 @@ mod tests {
             assert!(Instant::now() < deadline, "the reads did not complete");
             io.pull(&mut |frame| drop(frame), &mut |_| false, u64::MAX);
         }
-        let returned = std::mem::take(&mut *lock(&returned));
+        let returned = std::mem::take(&mut *lock!(&returned));
         assert_eq!(returned.len(), 2);
         assert!(returned.iter().all(|(_, n)| *n == 4096));
         drop(returned);
@@ -939,11 +939,11 @@ mod tests {
                         io.read(fd, 4096 * i, buf(4096), then(i)).unwrap();
                     }
                     let deadline = Instant::now() + Duration::from_secs(10);
-                    while lock(&results).len() < 64 {
+                    while lock!(&results).len() < 64 {
                         assert!(Instant::now() < deadline, "the reads did not complete");
-                        let _one_poller = lock(&poller);
+                        let _one_poller = lock!(&poller);
                         io.pull(
-                            &mut |frame| lock(&results).push(frame),
+                            &mut |frame| lock!(&results).push(frame),
                             &mut |_| false,
                             u64::MAX,
                         );
@@ -954,7 +954,7 @@ mod tests {
         for thread in threads {
             thread.join().unwrap();
         }
-        let mut results: Vec<(u64, Box<Done>)> = std::mem::take(&mut *lock(&results))
+        let mut results: Vec<(u64, Box<Done>)> = std::mem::take(&mut *lock!(&results))
             .into_iter()
             .map(|f| {
                 (
@@ -977,7 +977,7 @@ mod tests {
             );
         }
         assert_eq!(
-            lock(&io.engine.rings).len(),
+            lock!(&io.engine.rings).len(),
             8,
             "a ring per submitting thread"
         );
@@ -1215,7 +1215,7 @@ mod tests {
         let io = AsyncIo::open().unwrap();
         io.read(file.as_raw_fd(), 0, buf(8), then(1)).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
-        while lock(&io.front.held).is_empty() {
+        while io.front.held.enter().is_empty() {
             assert!(Instant::now() < deadline, "the read did not complete");
             let pulled = io.pull(&mut |_| panic!("held back"), &mut |_| true, u64::MAX);
             assert_eq!(pulled, 0);
@@ -1465,7 +1465,7 @@ mod tests {
             libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
             0o644,
             Box::new(move |fd| {
-                *lock(&slot) = Some(fd);
+                *lock!(&slot) = Some(fd);
                 Box::new(Done {
                     header: FrameHeader::new(1),
                     done: None,
@@ -1475,7 +1475,7 @@ mod tests {
         )
         .unwrap();
         poll(&io, 1);
-        let fd = lock(&opened).take().unwrap().unwrap();
+        let fd = lock!(&opened).take().unwrap().unwrap();
         let settings = b"new settings, longer than the old".to_vec();
         io.write(
             fd.as_raw_fd(),
@@ -1498,7 +1498,7 @@ mod tests {
             &temp.0,
             &target.0,
             Box::new(move |result| {
-                *lock(&slot) = Some(result);
+                *lock!(&slot) = Some(result);
                 Box::new(Done {
                     header: FrameHeader::new(3),
                     done: None,
@@ -1508,7 +1508,7 @@ mod tests {
         )
         .unwrap();
         poll(&io, 1);
-        lock(&renamed).take().unwrap().unwrap();
+        lock!(&renamed).take().unwrap().unwrap();
         assert_eq!(std::fs::read(&target.0).unwrap(), settings);
         assert!(!temp.0.exists(), "the temporary file was renamed");
         use std::os::unix::fs::PermissionsExt;
@@ -1537,7 +1537,7 @@ mod tests {
             libc::O_RDONLY,
             0,
             Box::new(move |r| {
-                lock(&a).push(r.unwrap_err().raw_os_error());
+                lock!(&a).push(r.unwrap_err().raw_os_error());
                 Box::new(Done {
                     header: FrameHeader::new(1),
                     done: None,
@@ -1550,7 +1550,7 @@ mod tests {
             missing,
             &missing.with_extension("x"),
             Box::new(move |r| {
-                lock(&b).push(r.unwrap_err().raw_os_error());
+                lock!(&b).push(r.unwrap_err().raw_os_error());
                 Box::new(Done {
                     header: FrameHeader::new(2),
                     done: None,
@@ -1560,7 +1560,7 @@ mod tests {
         )
         .unwrap();
         poll(&io, 2);
-        assert_eq!(*lock(&errors), [Some(libc::ENOENT), Some(libc::ENOENT)]);
+        assert_eq!(*lock!(&errors), [Some(libc::ENOENT), Some(libc::ENOENT)]);
         assert!(
             io.open_file(
                 std::path::Path::new("nul\0byte"),
@@ -1584,7 +1584,7 @@ mod tests {
         }
         impl LatticeReceiver for Recorder {
             fn push(&self, frame: Box<dyn Frame>) {
-                lock(&self.0).push(frame.header().id_hash());
+                lock!(&self.0).push(frame.header().id_hash());
             }
             fn on_complete(&self) {
                 self.1.store(true, Ordering::Release);
@@ -1597,11 +1597,11 @@ mod tests {
         io.clone().add_downstream(recorder.clone());
         io.read(file.as_raw_fd(), 0, buf(8), then(5)).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
-        while lock(&recorder.0).is_empty() {
+        while lock!(&recorder.0).is_empty() {
             assert!(Instant::now() < deadline);
             io.request(1);
         }
-        assert_eq!(*lock(&recorder.0), [5]);
+        assert_eq!(*lock!(&recorder.0), [5]);
         io.complete();
         assert!(recorder.1.load(Ordering::Acquire));
     }

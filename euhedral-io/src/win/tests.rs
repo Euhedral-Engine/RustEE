@@ -15,7 +15,6 @@ use super::sys::{
     verbatim_path,
 };
 use super::{Engine, MAX_PIECE};
-use crate::lock;
 use crate::{
     AsyncIoOptions, Buf, Create, Engine as EngineTrait, Front, IoBuf, IoDone, IoDoneOwned,
     OpenSpec, Region, Request, Then,
@@ -791,7 +790,7 @@ fn an_ioring_hresult_keeps_a_win32_code_and_otherwise_says_what_it_was() {
 
 /// The address of the `OVERLAPPED` of slot 0.
 fn first_overlapped(h: &Harness) -> usize {
-    lock(&h.engine.table).slots[0].rec.0.as_ptr() as usize
+    lock!(&h.engine.table).slots[0].rec.0.as_ptr() as usize
 }
 
 #[test]
@@ -840,7 +839,7 @@ fn a_late_packet_never_ends_the_operation_that_reused_its_slot() {
     let first = h.pull_n(1);
     assert_eq!(ended_clone_error(&first[0]), Some(234));
     assert_eq!(
-        h.sim.packets_waiting() + lock(&h.engine.inbox).len(),
+        h.sim.packets_waiting() + lock!(&h.engine.inbox).len(),
         1,
         "the late packet waits"
     );
@@ -947,7 +946,7 @@ fn a_ring_completion_or_a_packet_ends_only_a_record_on_its_own_route() {
     assert_eq!(h.engine.strays.load(Ordering::Relaxed), 1);
     // A ring completion with the wrong generation, or on a record not routed through the ring,
     // ends nothing either.
-    let ring = lock(&h.engine.rings)[0].clone();
+    let ring = lock!(&h.engine.rings)[0].clone();
     assert!(
         h.engine.take_token(0, 1 + 7, Some(&ring)).is_none(),
         "wrong generation"
@@ -1004,8 +1003,8 @@ fn a_flush_builds_a_bounded_number_of_entries_and_a_submission_never_waits_for_o
     let file = h.sim.file(&data);
     h.read(file, 0, 10, 99).unwrap(); // makes this thread's ring
     h.drain(1);
-    let ring = lock(&h.engine.rings)[0].clone();
-    let busy = lock(&ring.inner);
+    let ring = lock!(&h.engine.rings)[0].clone();
+    let busy = lock!(&ring.inner);
     // Another thread is submitting: this one only queues its entries (it must not wait).
     for tag in 0..40u64 {
         h.read(file, tag * 10, 10, tag).unwrap();
@@ -1234,7 +1233,7 @@ fn an_operation_ended_by_the_issuers_recheck_of_a_broken_ring_leaks_its_buffer()
         offset: 0,
         user_data: super::token(held.slot, held.generation),
     };
-    lock(&ring.backlog).push_back(entry);
+    lock!(&ring.backlog).push_back(entry);
     // ... and a concurrent flush (which saw the ring healthy) builds it: the kernel has it.
     h.engine.flush_ring(&ring);
     assert_eq!(
@@ -1365,7 +1364,7 @@ fn an_owned_read_whose_ring_broke_leaks_its_memory_and_its_continuation_says_so(
         offset: 0,
         user_data: super::token(held.slot, held.generation),
     };
-    lock(&ring.backlog).push_back(entry);
+    lock!(&ring.backlog).push_back(entry);
     h.engine.flush_ring(&ring);
     ring.broken.store(true, Ordering::Release);
     h.engine.end_if_broken(&ring, entry.user_data);

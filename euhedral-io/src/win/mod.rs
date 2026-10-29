@@ -56,7 +56,7 @@ use self::sys::{
 };
 use super::{
     AsyncIo, AsyncIoOptions, Buf, Engine as EngineTrait, MAX_PIECE, OpenSpec, READ_PIECE, Request,
-    Then, conclude as conclude_io, invalid, lock,
+    Then, conclude as conclude_io, invalid,
 };
 
 #[cfg(all(windows, test))]
@@ -258,7 +258,7 @@ impl Drop for Delivery {
                 "the OS thread pool did not finish the job (it panicked or refused it)",
             ))
         });
-        lock(&self.queue).push_back(PoolDone {
+        lock!(&self.queue).push_back(PoolDone {
             slot: self.slot,
             generation: self.generation,
             result,
@@ -464,7 +464,7 @@ impl Engine {
 
     /// A slot for `op`, in `state`: its record is filled, and nothing else refers to it.
     fn begin(&self, op: Op, state: State) -> io::Result<Held> {
-        let mut table = lock(&self.table);
+        let mut table = lock!(&self.table);
         let slot = match table.free.pop() {
             Some(slot) => slot,
             None => {
@@ -504,7 +504,7 @@ impl Engine {
 
     /// A taken operation goes in again: a new issue of the same slot.
     fn rebegin(&self, held: Held, state: State) -> Held {
-        let mut table = lock(&self.table);
+        let mut table = lock!(&self.table);
         let entry = &mut table.slots[held.slot as usize];
         debug_assert_eq!(entry.state, State::Busy);
         entry.state = state;
@@ -516,12 +516,12 @@ impl Engine {
     }
 
     fn set_state(&self, held: Held, state: State) {
-        lock(&self.table).slots[held.slot as usize].state = state;
+        lock!(&self.table).slots[held.slot as usize].state = state;
     }
 
     /// The slot is free again.
     fn release(&self, held: Held) {
-        let mut table = lock(&self.table);
+        let mut table = lock!(&self.table);
         table.slots[held.slot as usize].state = State::Idle;
         table.free.push(held.slot);
     }
@@ -530,7 +530,7 @@ impl Engine {
     /// and its call finished: its slot becomes `Busy`. The call's status and byte count are read
     /// from the `OVERLAPPED`, and the packet's count must agree with it.
     fn take_packet(&self, packet: &Packet) -> Taken {
-        let mut table = lock(&self.table);
+        let mut table = lock!(&self.table);
         let Some(&slot) = table.by_addr.get(&packet.overlapped) else {
             return Taken::Stray;
         };
@@ -573,7 +573,7 @@ impl Engine {
     /// The operation a ring completion (`ring`) or a pool result (`None`) names, if its slot is
     /// `InFlight` on that route with that generation: the slot becomes `Busy`.
     fn take_token(&self, slot: u32, generation: usize, ring: Option<&Arc<Ring>>) -> Option<Held> {
-        let mut table = lock(&self.table);
+        let mut table = lock!(&self.table);
         let entry = table.slots.get_mut(slot as usize)?;
         if entry.state != State::InFlight
             || (entry.generation as usize) & GENERATION_MASK != generation & GENERATION_MASK
@@ -605,7 +605,7 @@ impl Engine {
 
     /// The operation that failed at its call (a `Busy` slot of that generation).
     fn take_failed(&self, failed: &Failed) -> Option<Held> {
-        let table = lock(&self.table);
+        let table = lock!(&self.table);
         let entry = table.slots.get(failed.slot as usize)?;
         (entry.state == State::Busy && entry.generation == failed.generation).then_some(Held {
             slot: failed.slot,
@@ -617,7 +617,7 @@ impl Engine {
     /// The operation fails at its call: it ends with `error` at the next poll.
     fn fail(&self, held: Held, error: io::Error) {
         self.set_state(held, State::Busy);
-        lock(&self.ready).push_back(Failed {
+        lock!(&self.ready).push_back(Failed {
             slot: held.slot,
             generation: held.generation,
             error,
@@ -630,7 +630,7 @@ impl Engine {
     fn fail_token(&self, user_data: usize, error: io::Error, leak: bool) {
         let (slot, generation) = untoken(user_data);
         let held = {
-            let mut table = lock(&self.table);
+            let mut table = lock!(&self.table);
             let Some(entry) = table.slots.get_mut(slot as usize) else {
                 return;
             };
@@ -648,7 +648,7 @@ impl Engine {
                 op.buf.leak();
             }
         }
-        lock(&self.ready).push_back(Failed {
+        lock!(&self.ready).push_back(Failed {
             slot: held.0,
             generation: held.1,
             error,
@@ -682,7 +682,7 @@ impl Engine {
                 }
                 mine.retain(|(id, _)| *id != self.id);
             }
-            let mut rings = lock(&self.rings);
+            let mut rings = lock!(&self.rings);
             if rings.len() >= MAX_RINGS {
                 return None;
             }
@@ -710,13 +710,13 @@ impl Engine {
         };
         if ring.broken.load(Ordering::Acquire) {
             // Nothing is handed to a ring that cannot be read; its entries were ended.
-            lock(&ring.backlog).clear();
+            lock!(&ring.backlog).clear();
             return;
         }
         let sys = &*self.sys;
         let mut built = 0;
         while built < FLUSH_ENTRIES && ring.in_kernel.load(Ordering::Acquire) < ring.capacity {
-            let Some(entry) = lock(&ring.backlog).front().copied() else {
+            let Some(entry) = lock!(&ring.backlog).front().copied() else {
                 break;
             };
             // SAFETY: the entry's pointer is into its record's buffer, which stays untouched
@@ -744,13 +744,13 @@ impl Engine {
             };
             match built_now {
                 Ok(()) => {
-                    lock(&ring.backlog).pop_front();
+                    lock!(&ring.backlog).pop_front();
                     ring.in_kernel.fetch_add(1, Ordering::AcqRel);
                     built += 1;
                 }
                 Err(BuildError::Full) => break,
                 Err(BuildError::Other(error)) => {
-                    lock(&ring.backlog).pop_front();
+                    lock!(&ring.backlog).pop_front();
                     // Not built: the kernel never had the buffer.
                     self.fail_token(entry.user_data, error, false);
                 }
@@ -790,7 +790,7 @@ impl Engine {
         }
         let mut failed = Vec::new();
         {
-            let mut table = lock(&self.table);
+            let mut table = lock!(&self.table);
             for (slot, entry) in table.slots.iter_mut().enumerate() {
                 if entry.state != State::InFlight {
                     continue;
@@ -814,7 +814,7 @@ impl Engine {
             if let Some(op) = op {
                 op.buf.leak();
             }
-            lock(&self.ready).push_back(Failed {
+            lock!(&self.ready).push_back(Failed {
                 slot,
                 generation,
                 error: ring_failed_with(error),
@@ -822,8 +822,8 @@ impl Engine {
         }
         // The backlog is cleared under the submit lock, so a flush never pops an entry another
         // thread has just taken out from under it.
-        let _inner = lock(&ring.inner);
-        lock(&ring.backlog).clear();
+        let _inner = lock!(&ring.inner);
+        lock!(&ring.backlog).clear();
     }
 
     // ---- starting operations
@@ -849,11 +849,11 @@ impl Engine {
     fn join_port(&self, handle: Handle) -> io::Result<()> {
         match self.sys.associate(self.port.handle, handle) {
             Ok(()) => {
-                lock(&self.associated).insert(handle);
+                lock!(&self.associated).insert(handle);
                 Ok(())
             }
             Err(error) if error.raw_os_error() == Some(87) => {
-                if lock(&self.associated).contains(&handle) {
+                if lock!(&self.associated).contains(&handle) {
                     Ok(())
                 } else {
                     Err(invalid(
@@ -870,12 +870,12 @@ impl Engine {
     /// handle that belongs to a port (`ERROR_INVALID_PARAMETER`), so a handle that joined the
     /// port stays on it, and one a ring serves is never joined.
     fn file_route(&self, handle: Handle) -> io::Result<Route> {
-        if self.ring_files && !lock(&self.associated).contains(&handle) {
+        if self.ring_files && !lock!(&self.associated).contains(&handle) {
             if let Some(ring) = self.ring() {
-                lock(&self.ringed).insert(handle);
+                lock!(&self.ringed).insert(handle);
                 return Ok(Route::Ring(ring));
             }
-            if lock(&self.ringed).contains(&handle) {
+            if lock!(&self.ringed).contains(&handle) {
                 return Err(io::Error::other(
                     "this file handle is served by IoRing, and no ring is available to this thread",
                 ));
@@ -966,7 +966,7 @@ impl Engine {
             Call::Ring(ring, entry) => {
                 // The record is not touched again: the entry may complete as soon as it is built.
                 self.set_state(held, State::InFlight);
-                lock(&ring.backlog).push_back(entry);
+                lock!(&ring.backlog).push_back(entry);
                 self.end_if_broken(&ring, entry.user_data);
                 if !ring.broken.load(Ordering::Acquire) {
                     self.flush_ring(&ring);
@@ -1276,7 +1276,7 @@ impl Engine {
         room: &mut dyn FnMut() -> bool,
         offer: &mut dyn FnMut(Box<dyn Frame>) -> bool,
     ) -> bool {
-        let mut batch: VecDeque<Packet> = std::mem::take(&mut *lock(&self.inbox));
+        let mut batch: VecDeque<Packet> = std::mem::take(&mut *lock!(&self.inbox));
         let from_inbox = !batch.is_empty();
         if !from_inbox {
             batch = self.dequeue();
@@ -1301,7 +1301,7 @@ impl Engine {
             Some(_) => {}
         }
         later.extend(batch);
-        *lock(&self.inbox) = later;
+        *lock!(&self.inbox) = later;
         go_on
     }
 
@@ -1312,7 +1312,7 @@ impl Engine {
         offer: &mut dyn FnMut(Box<dyn Frame>) -> bool,
     ) -> bool {
         while room() {
-            let Some(failed) = lock(&self.ready).pop_front() else {
+            let Some(failed) = lock!(&self.ready).pop_front() else {
                 break;
             };
             let Some(held) = self.take_failed(&failed) else {
@@ -1430,7 +1430,7 @@ impl EngineTrait for Engine {
         }
         // What open and rename jobs left.
         while room() {
-            let Some(done) = lock(&self.pool_done).pop_front() else {
+            let Some(done) = lock!(&self.pool_done).pop_front() else {
                 break;
             };
             let Some(held) = self.take_token(done.slot, done.generation as usize, None) else {
@@ -1446,7 +1446,7 @@ impl EngineTrait for Engine {
         if !self.poll_port(room, offer) {
             return;
         }
-        let rings: Vec<Arc<Ring>> = lock(&self.rings).clone();
+        let rings: Vec<Arc<Ring>> = lock!(&self.rings).clone();
         for ring in &rings {
             self.flush_ring(ring);
             while room() {
