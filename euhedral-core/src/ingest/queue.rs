@@ -1,17 +1,16 @@
 use super::IngestSink;
-use super::downstream::Downstream;
 use crate::frames::{Frame, FrameError};
-use crate::generics::{FrameSink, LatticeReceiver, LatticeSource};
+use crate::generics::{DownstreamSlot, FrameSink, LatticeReceiver, LatticeSource};
+use euhedral_data_structures::atomics::CachePadded;
 use euhedral_data_structures::queues::partitioned::{
     PartitionedConsumer, PartitionedMpscQueue, PartitionedProducer,
 };
 use euhedral_data_structures::queues::queue::{Multi, Single};
-use euhedral_data_structures::sync::HotScope;
+use euhedral_data_structures::sync::{ClaimCell, ClaimGuard, HotScope};
 use std::num::NonZeroUsize;
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, Ordering, fence};
-#[allow(clippy::disallowed_types, reason = "HOT-FIX(C12)")]
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, TryLockError, Weak};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering, fence};
+use std::sync::{Arc, OnceLock, Weak};
 
 type Consumer = PartitionedConsumer<Box<dyn Frame>, Single>;
 
@@ -40,17 +39,26 @@ pub(super) trait Owner: Send + Sync {
 /// The lattice-facing side of a queue sink: a [`LatticeSource`] that delivers queued frames to
 /// demand, and a [`FrameSink`] that queues them.
 ///
-/// One drain holds the queue at a time. A drain blocked out by another leaves the delivery to it:
-/// the holder runs again for requests that arrived while it held the queue.
+/// One drain holds the queue at a time: the `consumer` claim is Java's `draining` flag. A drain
+/// blocked out by another leaves the delivery to it: the holder runs again for requests that
+/// arrived while it held the queue, and nothing ever waits.
+///
+/// Lifecycle calls set atomics and try the claim once: `close` sets `publication_closed` and
+/// completes the downstream slot, a kill sets the owner's kill switch, and `clear` sets
+/// `clear_requested`. A holder applies them as it lets go (`drain_finished`), and the next
+/// `request` or `pull` otherwise. `Drop` finishes what is still queued.
 pub(super) struct QueueSource {
-    downstream: Downstream,
+    downstream: DownstreamSlot,
+    /// Demand asked for and not yet delivered (Java's padded `demand`).
+    demand: CachePadded<AtomicU64>,
     queue: PartitionedMpscQueue<Box<dyn Frame>>,
     producer: PartitionedProducer<Box<dyn Frame>, Multi>,
-    #[allow(clippy::disallowed_types, reason = "HOT-FIX(C12)")]
-    consumer: Mutex<Consumer>,
+    consumer: ClaimCell<Consumer>,
     /// A request waiting for a drain: a wakeup, not outstanding demand, so an empty queue never
-    /// spins.
+    /// spins (Java's `requestPending`).
     request_pending: AtomicBool,
+    /// A `clear` waiting for whoever holds the queue.
+    clear_requested: AtomicBool,
     finish: AtomicBool,
     publication_closed: AtomicBool,
     ending: Ending,
@@ -58,15 +66,16 @@ pub(super) struct QueueSource {
 }
 
 impl QueueSource {
-    #[allow(clippy::disallowed_types, reason = "HOT-FIX(C12)")]
     pub(super) fn new(partitions: NonZeroUsize, chunk_size: usize, ending: Ending) -> Arc<Self> {
         let queue = PartitionedMpscQueue::with_partitions(partitions.get(), chunk_size);
         Arc::new(Self {
-            downstream: Downstream::default(),
+            downstream: DownstreamSlot::new(),
+            demand: CachePadded::new(AtomicU64::new(0)),
             producer: queue.producer(),
-            consumer: Mutex::new(queue.consumer()),
+            consumer: ClaimCell::new(queue.consumer()),
             queue,
             request_pending: AtomicBool::new(false),
+            clear_requested: AtomicBool::new(false),
             finish: AtomicBool::new(false),
             publication_closed: AtomicBool::new(false),
             ending,
@@ -148,13 +157,41 @@ impl QueueSource {
     }
 
     pub(super) fn demand(&self) -> u64 {
-        self.downstream.demand()
+        self.demand.load(Ordering::Acquire)
+    }
+
+    /// Adds `demand`, stopping at the largest value, and returns the total (Java's `accumulate`
+    /// with a positive step, a compare-and-set loop).
+    fn add_demand(&self, demand: u64) -> u64 {
+        self.demand
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                Some(current.saturating_add(demand))
+            })
+            .map_or_else(
+                |current| current,
+                |previous| previous.saturating_add(demand),
+            )
+    }
+
+    /// Takes `delivered` off the demand, stopping at zero (Java's `accumulate` with a negative
+    /// step), and returns what is left.
+    fn take_demand(&self, delivered: u64) -> u64 {
+        self.demand
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                Some(current.saturating_sub(delivered))
+            })
+            .map_or_else(
+                |current| current,
+                |previous| previous.saturating_sub(delivered),
+            )
     }
 
     /// Closes publication and completes the source, leaving what is queued.
     pub(super) fn close(&self) {
-        self.publication_closed.store(true, Ordering::Release);
+        self.publication_closed.store(true, Ordering::SeqCst);
         fence(Ordering::SeqCst);
+        // Java forgets the demand (`lazySet(0)`) before it tells the receiver.
+        self.demand.store(0, Ordering::Release);
         self.downstream.complete();
     }
 
@@ -166,7 +203,10 @@ impl QueueSource {
         }
     }
 
+    /// What runs after a drain lets go of the queue (Java's `onDrainFinished`): a waiting `clear`,
+    /// then the owner's.
     fn drain_finished(&self) {
+        self.apply_clear();
         if let Some(owner) = self.owner() {
             owner.drain_finished(self);
         }
@@ -184,67 +224,85 @@ impl QueueSource {
     }
 
     /// The queue, unless a drain holds it.
-    fn try_hold(&self) -> Option<MutexGuard<'_, Consumer>> {
-        match self.consumer.try_lock() {
-            Ok(consumer) => Some(consumer),
-            Err(TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
-            Err(TryLockError::WouldBlock) => None,
-        }
+    fn try_hold(&self) -> Option<ClaimGuard<'_, Consumer>> {
+        self.consumer.try_claim()
     }
 
     /// Hands every queued frame to `consume`, unless a drain holds the queue: that drain hands the
-    /// frames queued behind it on when it lets go.
+    /// frames queued behind it on when it lets go (Java's `discardQueued`).
     pub(super) fn discard_queued(&self, mut consume: impl FnMut(Box<dyn Frame>)) {
         loop {
             let Some(mut consumer) = self.try_hold() else {
                 return;
             };
             consumer.drain_all(&mut consume);
-            drop(consumer);
+            // The release is ordered before the emptiness check, so a frame published behind the
+            // drain is seen here, or its publisher takes the claim.
+            consumer.release_seq_cst();
             if self.queue.is_empty() {
-                return;
+                break;
             }
         }
+        self.apply_clear();
     }
 
-    /// Cancels every queued frame, waiting for a running drain.
+    /// Cancels every queued frame. A drain that holds the queue cancels them when it lets go; the
+    /// call never waits for it.
     pub(super) fn clear(&self) {
-        let mut consumer = self.consumer.lock().unwrap_or_else(PoisonError::into_inner);
-        consumer.drain_all(|frame| frame.do_finally_with_error(FrameError::Cancelled));
+        self.clear_requested.store(true, Ordering::SeqCst);
+        self.apply_clear();
     }
 
-    /// Delivers queued frames to the receiver while requests are waiting and no other drain holds
-    /// the queue.
-    fn drain_requests(&self) {
-        while self.request_pending.load(Ordering::Acquire) {
+    /// Cancels the queued frames while a `clear` is waiting, if the queue can be had. Only a holder
+    /// takes the request off, so a `clear` that finds the queue held is answered by the holder.
+    fn apply_clear(&self) {
+        while self.clear_requested.load(Ordering::SeqCst) {
             let Some(mut consumer) = self.try_hold() else {
                 return;
             };
-            self.request_pending.store(false, Ordering::Release);
-            let receiver = self.downstream.receiver();
-            let delivered = match &receiver {
+            if self.clear_requested.swap(false, Ordering::SeqCst) {
+                consumer.drain_all(|frame| frame.do_finally_with_error(FrameError::Cancelled));
+            }
+            consumer.release_seq_cst();
+        }
+    }
+
+    /// Delivers queued frames to the receiver while requests are waiting and no other drain holds
+    /// the queue (Java's `drainRequests`).
+    fn drain_requests(&self) {
+        // The wakeup is published before the claim is tried: the releasing holder either sees it,
+        // or the requester takes the claim itself.
+        while self.request_pending.load(Ordering::SeqCst) {
+            let Some(mut consumer) = self.try_hold() else {
+                return;
+            };
+            self.request_pending.store(false, Ordering::SeqCst);
+            let delivered = match self.downstream.receiver() {
                 Some(receiver) if !self.downstream.is_complete() => {
                     let drained = panic::catch_unwind(AssertUnwindSafe(|| {
                         consumer.drain_while(
                             |frame| receiver.push(frame),
                             |_| self.downstream.is_complete(),
-                            self.downstream.demand(),
+                            self.demand.load(Ordering::Acquire),
                         )
                     }));
-                    drop(consumer);
                     match drained {
                         Ok(delivered) => {
-                            self.downstream.deliver(delivered);
+                            // Accounted before the claim is released, so the next holder cannot
+                            // over-deliver.
+                            self.take_demand(delivered);
+                            consumer.release_seq_cst();
                             Some(delivered)
                         }
                         Err(panic) => {
+                            consumer.release_seq_cst();
                             self.drain_finished();
                             panic::resume_unwind(panic);
                         }
                     }
                 }
                 _ => {
-                    drop(consumer);
+                    consumer.release_seq_cst();
                     None
                 }
             };
@@ -255,6 +313,16 @@ impl QueueSource {
                 None => return,
             }
         }
+    }
+}
+
+impl Drop for QueueSource {
+    /// Finishes every frame still queued: a frame is owned by whoever holds its `Box`, and nothing
+    /// is left to deliver it.
+    fn drop(&mut self) {
+        self.consumer
+            .get_mut()
+            .drain_all(|frame| frame.do_finally_with_error(FrameError::Cancelled));
     }
 }
 
@@ -285,7 +353,7 @@ impl LatticeSource for QueueSource {
                 demand,
             )
         }));
-        drop(queue);
+        queue.release_seq_cst();
         self.drain_finished();
         self.drain_requests();
         let pulled = pulled.unwrap_or_else(|panic| panic::resume_unwind(panic));
@@ -300,8 +368,8 @@ impl LatticeSource for QueueSource {
         if demand == 0 || self.downstream.is_complete() || self.downstream.receiver().is_none() {
             return;
         }
-        self.downstream.add_demand(demand);
-        self.request_pending.store(true, Ordering::Release);
+        self.add_demand(demand);
+        self.request_pending.store(true, Ordering::SeqCst);
         self.drain_requests();
     }
 
@@ -372,7 +440,8 @@ impl QueueIngestSink {
         self.source.offer_to(partition, frame)
     }
 
-    /// Cancels every queued frame, waiting for a running drain. Do not call it from a drain.
+    /// Cancels every queued frame. If a drain holds the queue it cancels them when it lets go, so the
+    /// call never waits, and may be made from a drain.
     pub fn clear(&self) {
         self.source.clear();
     }

@@ -9,7 +9,6 @@
 //! - [`SingleUseSource`]: one frame.
 
 mod array;
-mod downstream;
 mod pipeline_runner;
 mod queue;
 mod single_use;

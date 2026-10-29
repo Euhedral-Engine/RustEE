@@ -1,33 +1,77 @@
-use super::downstream::Downstream;
+//! A source of one frame.
+//!
+//! Java's `SingleUseSource` decides who takes the frame with `COMPLETE.compareAndSet(false, true)`;
+//! the frame is read only by the winner, so it sits in a plain cell.
+
+// The compare-and-set winner is the frame cell's only user.
+#![allow(unsafe_code, reason = "the compare-and-set winner owns the frame")]
+
 use crate::frames::{Frame, FrameError};
-use crate::generics::{LatticeReceiver, LatticeSource};
-#[allow(clippy::disallowed_types, reason = "HOT-FIX(C13)")]
-use std::sync::{Arc, Mutex, PoisonError};
+use crate::generics::{DownstreamSlot, LatticeReceiver, LatticeSource};
+use std::cell::UnsafeCell;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering, fence};
 
 /// A source of one frame. It completes once the frame is taken; completed before that, it cancels
 /// the frame.
+///
+/// `taken` is Java's `COMPLETE`: `pull`, `request` and `complete` each try to flip it, and the one
+/// that does owns the frame. A `pull` whose stop condition matches the frame gives it back and
+/// leaves the source untaken.
 pub struct SingleUseSource {
-    #[allow(clippy::disallowed_types, reason = "HOT-FIX(C13)")]
-    frame: Mutex<Option<Box<dyn Frame>>>,
-    downstream: Downstream,
+    taken: AtomicBool,
+    /// Read and written only by the holder of `taken`, or through `&mut self`.
+    frame: UnsafeCell<Option<Box<dyn Frame>>>,
+    downstream: DownstreamSlot,
 }
 
+// SAFETY: the frame is reached only by the thread that flipped `taken` from false to true (it
+// stays true until that thread hands the frame back or finishes with it), or through `&mut self`.
+// The frame is `Send`, and the cell never shares a reference to it between threads.
+unsafe impl Sync for SingleUseSource {}
+
 impl SingleUseSource {
-    #[allow(clippy::disallowed_types, reason = "HOT-FIX(C13)")]
     pub fn wrap(frame: Box<dyn Frame>) -> Arc<Self> {
         Arc::new(Self {
-            frame: Mutex::new(Some(frame)),
-            downstream: Downstream::default(),
+            taken: AtomicBool::new(false),
+            frame: UnsafeCell::new(Some(frame)),
+            downstream: DownstreamSlot::new(),
         })
     }
 
-    /// The frame, unless it was taken or `stop` matches it.
-    fn take(&self, stop: impl FnOnce(&dyn Frame) -> bool) -> Option<Box<dyn Frame>> {
-        let mut slot = self.frame.lock().unwrap_or_else(PoisonError::into_inner);
-        if slot.as_deref().is_some_and(stop) {
-            return None;
+    /// Flips `taken`; the caller that does so owns the frame.
+    fn try_take(&self) -> bool {
+        self.taken
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    /// The frame, for the holder of `taken`.
+    #[allow(
+        clippy::mut_from_ref,
+        reason = "the `taken` flag, not the borrow, makes the access exclusive"
+    )]
+    fn frame_mut(&self) -> &mut Option<Box<dyn Frame>> {
+        // SAFETY: the caller holds `taken`, so no other thread reads or writes the cell.
+        unsafe { &mut *self.frame.get() }
+    }
+
+    /// Cancels the frame if nobody has taken it.
+    fn cancel_untaken(&self) {
+        if self.try_take()
+            && let Some(frame) = self.frame_mut().take()
+        {
+            frame.do_finally_with_error(FrameError::Cancelled);
         }
-        slot.take()
+    }
+}
+
+impl Drop for SingleUseSource {
+    /// A frame nobody took is cancelled.
+    fn drop(&mut self) {
+        if let Some(frame) = self.frame.get_mut().take() {
+            frame.do_finally_with_error(FrameError::Cancelled);
+        }
     }
 }
 
@@ -43,12 +87,23 @@ impl LatticeSource for SingleUseSource {
         stop: &mut dyn FnMut(&dyn Frame) -> bool,
         demand: u64,
     ) -> u64 {
-        if demand == 0 {
+        if demand == 0 || !self.try_take() {
             return 0;
         }
-        let Some(frame) = self.take(|frame| stop(frame)) else {
+        let Some(frame) = self.frame_mut().take() else {
             return 0;
         };
+        if stop(&*frame) {
+            *self.frame_mut() = Some(frame);
+            self.taken.store(false, Ordering::SeqCst);
+            // A `complete` that found the frame held has left it to us: it set the slot's
+            // completion first, and the fence orders our store before this read.
+            fence(Ordering::SeqCst);
+            if self.downstream.is_complete() {
+                self.cancel_untaken();
+            }
+            return 0;
+        }
         consumer(frame);
         self.complete();
         1
@@ -62,7 +117,9 @@ impl LatticeSource for SingleUseSource {
         let Some(receiver) = self.downstream.receiver() else {
             return;
         };
-        if let Some(frame) = self.take(|_| false) {
+        if self.try_take()
+            && let Some(frame) = self.frame_mut().take()
+        {
             receiver.push(frame);
             self.complete();
         }
@@ -70,10 +127,8 @@ impl LatticeSource for SingleUseSource {
 
     /// Completes the source, cancelling the frame if it was not taken.
     fn complete(&self) {
-        if let Some(frame) = self.take(|_| false) {
-            frame.do_finally_with_error(FrameError::Cancelled);
-        }
         self.downstream.complete();
+        self.cancel_untaken();
     }
 
     fn is_complete(&self) -> bool {
@@ -139,5 +194,97 @@ mod tests {
         let second = TestReceiver::new();
         source.clone().add_downstream(second.clone());
         assert_eq!(second.errors().len(), 1);
+    }
+
+    #[test]
+    fn a_frame_is_delivered_or_cancelled_exactly_once() {
+        use std::sync::Barrier;
+        const ROUNDS: u64 = if cfg!(miri) { 20 } else { 10_000 };
+        let fates = Fates::default();
+        let barrier = Barrier::new(2);
+        let sources: Vec<_> = (0..ROUNDS)
+            .map(|id| {
+                let source = SingleUseSource::wrap(Tracked::new(id, &fates));
+                let receiver = TestReceiver::new();
+                source.clone().add_downstream(receiver.clone());
+                (source, receiver)
+            })
+            .collect();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                barrier.wait();
+                for (source, _) in &sources {
+                    source.complete();
+                }
+            });
+            barrier.wait();
+            for (source, _) in &sources {
+                source.request(1);
+            }
+        });
+        let mut cancelled = 0;
+        for (id, (source, receiver)) in sources.iter().enumerate() {
+            assert!(source.is_complete());
+            assert!(receiver.is_completed());
+            let delivered = receiver.received().len();
+            let fated = fates
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(fated, _)| *fated == id as u64)
+                .count();
+            // Delivered frames are the receiver's to finish: `TestReceiver` drops them unfinished.
+            assert_eq!(delivered + fated, 1, "round {id}");
+            cancelled += fated;
+        }
+        assert!(cancelled <= ROUNDS as usize);
+    }
+
+    #[test]
+    fn a_completed_source_delivers_nothing_to_a_later_pull() {
+        let source = SingleUseSource::wrap(frame(7));
+        source.complete();
+        let mut pulled = Vec::new();
+        assert_eq!(source.pull(&mut |f| pulled.push(f), &mut |_| false, 1), 0);
+        assert!(pulled.is_empty());
+        let receiver = TestReceiver::new();
+        source.clone().add_downstream(receiver.clone());
+        source.request(1);
+        assert!(receiver.received().is_empty());
+    }
+
+    #[test]
+    fn a_pull_that_stops_gives_the_frame_back_and_a_racing_complete_still_cancels_it() {
+        use std::sync::Barrier;
+        const ROUNDS: u64 = if cfg!(miri) { 10 } else { 5_000 };
+        for id in 0..ROUNDS {
+            let fates = Fates::default();
+            let source = SingleUseSource::wrap(Tracked::new(id, &fates));
+            let barrier = Barrier::new(2);
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    barrier.wait();
+                    source.complete();
+                });
+                barrier.wait();
+                // The stop condition always matches, so the pull never delivers.
+                assert_eq!(source.pull(&mut |_| unreachable!(), &mut |_| true, 1), 0);
+            });
+            assert_eq!(
+                *fates.lock().unwrap(),
+                [(id, Fate::Failed(FrameError::Cancelled.to_string()))],
+                "round {id}: cancelled exactly once"
+            );
+        }
+    }
+
+    #[test]
+    fn a_source_dropped_with_its_frame_cancels_it() {
+        let fates = Fates::default();
+        drop(SingleUseSource::wrap(Tracked::new(5, &fates)));
+        assert_eq!(
+            *fates.lock().unwrap(),
+            [(5, Fate::Failed(FrameError::Cancelled.to_string()))]
+        );
     }
 }

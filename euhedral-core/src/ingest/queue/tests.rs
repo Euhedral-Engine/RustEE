@@ -442,3 +442,257 @@ fn an_attached_receiver_hears_of_completion_exactly_once() {
     sink.complete();
     assert_eq!(receiver.completions(), 1);
 }
+
+#[test]
+fn request_without_a_receiver_banks_nothing() {
+    let sink = QueueIngestSink::new();
+    sink.delegate().request(5);
+    assert_eq!(sink.demand(), 0);
+    offer(&sink, [1]);
+    let receiver = TestReceiver::new();
+    sink.delegate().add_downstream(receiver.clone());
+    assert!(
+        receiver.received().is_empty(),
+        "the early request is not remembered"
+    );
+}
+
+#[test]
+fn demand_saturates_and_floors_at_zero() {
+    let sink = QueueIngestSink::new();
+    let source = &sink.source;
+    assert_eq!(source.add_demand(u64::MAX), u64::MAX);
+    assert_eq!(source.add_demand(u64::MAX), u64::MAX);
+    assert_eq!(source.add_demand(1), u64::MAX);
+    assert_eq!(source.take_demand(u64::MAX), 0);
+    assert_eq!(source.take_demand(7), 0);
+    assert_eq!(source.add_demand(3), 3);
+    assert_eq!(source.take_demand(1), 2);
+    assert_eq!(sink.demand(), 2);
+}
+
+#[test]
+fn complete_before_attach_tells_the_late_receiver_once() {
+    let sink = QueueIngestSink::new();
+    sink.complete();
+    let receiver = Arc::new(Hooked::default());
+    sink.delegate().add_downstream(receiver.clone());
+    sink.complete();
+    assert_eq!(receiver.completions(), 1);
+}
+
+#[test]
+fn a_request_while_a_pull_holds_the_queue_is_served_when_the_pull_releases() {
+    use std::sync::Barrier;
+    let (sink, source, receiver) = attached();
+    offer(&sink, 0..5);
+    let inside = Barrier::new(2);
+    let release = Barrier::new(2);
+    thread::scope(|scope| {
+        let puller = {
+            let source = source.clone();
+            let (inside, release) = (&inside, &release);
+            scope.spawn(move || {
+                source.pull(
+                    &mut |_frame| {
+                        inside.wait();
+                        release.wait();
+                    },
+                    &mut |_| false,
+                    1,
+                )
+            })
+        };
+        inside.wait();
+        source.request(4);
+        assert!(
+            receiver.received().is_empty(),
+            "the request did not wait for the pull, and delivered nothing yet"
+        );
+        assert_eq!(sink.demand(), 4, "the refused request banked its demand");
+        release.wait();
+        assert_eq!(puller.join().unwrap(), 1);
+    });
+    assert_eq!(
+        receiver.received().len(),
+        4,
+        "the pull served the request as it let go"
+    );
+    assert_eq!(sink.demand(), 0);
+    assert_eq!(sink.size(), 0);
+}
+
+#[test]
+fn request_pushes_no_more_than_the_banked_demand() {
+    let (sink, source, receiver) = attached();
+    offer(&sink, 0..10);
+    source.request(3);
+    assert_eq!(receiver.received(), [0, 1, 2]);
+    assert_eq!(sink.demand(), 0);
+    source.request(10);
+    assert_eq!(receiver.received().len(), 10);
+    assert_eq!(sink.demand(), 3);
+}
+
+#[test]
+fn a_source_driven_only_by_request_delivers_every_frame() {
+    const PUBLISHERS: u64 = 4;
+    const EACH: u64 = if cfg!(miri) { 10 } else { 250 };
+    let (sink, source, receiver) = attached();
+    thread::scope(|scope| {
+        for publisher in 0..PUBLISHERS {
+            let sink = &sink;
+            scope.spawn(move || {
+                for id in 0..EACH {
+                    assert!(sink.offer(frame(publisher * EACH + id)).is_ok());
+                }
+            });
+        }
+        let deadline = Instant::now() + PATIENCE;
+        while receiver.received.lock().unwrap().len() < (PUBLISHERS * EACH) as usize
+            && Instant::now() < deadline
+        {
+            source.request(1);
+            thread::yield_now();
+        }
+    });
+    let mut received = receiver.received();
+    received.sort_unstable();
+    assert_eq!(received, (0..PUBLISHERS * EACH).collect::<Vec<_>>());
+}
+
+/// An owner that discards what is queued after the source closes, as a killed runner does.
+struct Discarding;
+
+impl Owner for Discarding {
+    fn complete(&self, source: &QueueSource) {
+        source.close();
+        source.discard_queued(|frame| frame.do_finally_with_error(FrameError::Cancelled));
+    }
+
+    fn drain_finished(&self, source: &QueueSource) {
+        if source.is_complete() {
+            source.discard_queued(|frame| frame.do_finally_with_error(FrameError::Cancelled));
+        }
+    }
+}
+
+#[test]
+fn a_publish_after_close_is_discarded_by_someone() {
+    const PUBLISHERS: u64 = 4;
+    const EACH: u64 = if cfg!(miri) { 5 } else { 500 };
+    for round in 0..if cfg!(miri) { 2 } else { 50 } {
+        let fates = Fates::default();
+        let source = QueueSource::new(NonZeroUsize::MIN, 64, Ending::Gracefully);
+        let owner: Arc<dyn Owner> = Arc::new(Discarding);
+        source.set_owner(Arc::downgrade(&owner));
+        let receiver = TestReceiver::new();
+        source.clone().add_downstream(receiver.clone());
+        thread::scope(|scope| {
+            for publisher in 0..PUBLISHERS {
+                let (source, fates) = (&source, &fates);
+                scope.spawn(move || {
+                    for id in 0..EACH {
+                        let tracked = Tracked::new(publisher * EACH + id, fates);
+                        if let Err(refused) = source.offer(tracked) {
+                            refused.do_finally_with_error(FrameError::Cancelled);
+                        }
+                    }
+                });
+            }
+            let puller = {
+                let source = source.clone();
+                scope.spawn(move || {
+                    for _ in 0..EACH {
+                        source.pull(
+                            &mut |frame| frame.do_finally_with_error(FrameError::Cancelled),
+                            &mut |_| false,
+                            8,
+                        );
+                        thread::yield_now();
+                    }
+                })
+            };
+            thread::yield_now();
+            owner.complete(&source);
+            puller.join().unwrap();
+        });
+        let mut ids: Vec<u64> = fates.lock().unwrap().iter().map(|(id, _)| *id).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            (0..PUBLISHERS * EACH).collect::<Vec<_>>(),
+            "round {round}: every frame finished exactly once"
+        );
+        assert_eq!(source.size(), 0, "round {round}: none left queued");
+    }
+}
+
+#[test]
+fn frames_queued_when_the_source_drops_are_finished() {
+    let fates = Fates::default();
+    let sink = QueueIngestSink::new();
+    for id in 0..10 {
+        assert!(sink.offer(Tracked::new(id, &fates)).is_ok());
+    }
+    sink.complete();
+    assert!(
+        fates.lock().unwrap().is_empty(),
+        "a complete sink keeps its queue"
+    );
+    drop(sink);
+    let mut ids: Vec<u64> = fates.lock().unwrap().iter().map(|(id, _)| *id).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, (0..10).collect::<Vec<_>>());
+}
+
+#[test]
+fn clear_racing_a_pull_discards_every_frame_once() {
+    const FRAMES: u64 = if cfg!(miri) { 30 } else { 1_000 };
+    for _ in 0..if cfg!(miri) { 2 } else { 20 } {
+        let sink = QueueIngestSink::new();
+        let source = sink.delegate();
+        let receiver = TestReceiver::new();
+        source.clone().add_downstream(receiver.clone());
+        let fates = Fates::default();
+        for id in 0..FRAMES {
+            assert!(sink.offer(Tracked::new(id, &fates)).is_ok());
+        }
+        let delivered = Fates::default();
+        thread::scope(|scope| {
+            let puller = {
+                let (source, delivered) = (source.clone(), &delivered);
+                scope.spawn(move || {
+                    while source.pull(
+                        &mut |frame| {
+                            let id = frame.header().id_hash();
+                            delivered.lock().unwrap().push((id, Fate::Finished));
+                        },
+                        &mut |_| false,
+                        1,
+                    ) > 0
+                    {}
+                })
+            };
+            thread::yield_now();
+            sink.clear();
+            puller.join().unwrap();
+        });
+        // A clear that found the pull holding the queue is answered by the pull; one more pull
+        // (any call that lets go of the queue) is not needed.
+        assert_eq!(sink.size(), 0, "nothing left queued");
+        let mut ids: Vec<u64> = fates
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, _)| *id)
+            .chain(delivered.lock().unwrap().iter().map(|(id, _)| *id))
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            (0..FRAMES).collect::<Vec<_>>(),
+            "every frame delivered or cancelled, exactly once"
+        );
+    }
+}
