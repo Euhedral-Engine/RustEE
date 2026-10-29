@@ -490,3 +490,84 @@ fn retire_into_refuses_a_stream_with_a_ticket_outstanding() {
         .is_ok()
     );
 }
+
+// ---- lanes at reserved ids, and the priority option -------------------------------------------------------------
+
+#[test]
+fn lanes_opened_at_reserved_ids_mark_with_those_ids() {
+    use euhedral_gpu::StreamPriority;
+    let gpu = gpu_with_kernels();
+    let options = [StreamOptions::default(); 2];
+    let mut s = gpu.open_lanes_at(LaneId(3), &["a", "b"], &options).unwrap();
+    assert_eq!((s[0].lane(), s[1].lane()), (LaneId(3), LaneId(4)));
+    let a = s[0].mark().unwrap();
+    let b = s[1].mark().unwrap();
+    assert_eq!((a.lane, b.lane), (LaneId(3), LaneId(4)));
+    assert_eq!((a.queue, b.queue), (s[0].id(), s[1].id()));
+    // Lane `b` orders itself behind lane `a`'s marker, and the device runs them in that order.
+    s[1].await_marker(a).unwrap();
+    gpu.run_until_idle();
+    assert_eq!(s[0].queue().completed(), 1);
+    assert_eq!(s[1].queue().completed(), 1);
+    // The default pool opener is the same call at lane 0.
+    let (pool, streams) = gpu
+        .open_lanes(&["x", "y"], StreamOptions::default())
+        .unwrap();
+    assert_eq!(pool.len(), 2);
+    assert_eq!(streams[1].lane(), LaneId(1));
+    assert_eq!(StreamOptions::default().priority, StreamPriority::Normal);
+}
+
+#[test]
+fn a_marker_of_a_lane_this_call_did_not_open_is_refused() {
+    let gpu = gpu_with_kernels();
+    let mut a = gpu
+        .open_lanes_at(LaneId(0), &["a"], &[StreamOptions::default()])
+        .unwrap();
+    let mut b = gpu
+        .open_lanes_at(LaneId(1), &["b"], &[StreamOptions::default()])
+        .unwrap();
+    let marker_a = a[0].mark().unwrap();
+    let r = b[0].await_marker(marker_a);
+    assert!(matches!(r, Err(GpuError::Invalid(_))), "{r:?}");
+    // A lane id inside no call's range is refused too, and a marker of the same lane under another queue.
+    let stray = Marker::new(b[0].id(), LaneId(5), 1);
+    assert!(matches!(
+        b[0].await_marker(stray),
+        Err(GpuError::Invalid(_))
+    ));
+    let forged = Marker::new(QueueId::next(), LaneId(1), 1);
+    assert!(matches!(
+        b[0].await_marker(forged),
+        Err(GpuError::Invalid(_))
+    ));
+}
+
+#[test]
+fn the_priority_option_reaches_the_stream() {
+    use euhedral_gpu::StreamPriority;
+    use euhedral_gpu::fake::{FAKE_GREATEST_PRIORITY, FAKE_NORMAL_PRIORITY};
+    let gpu = gpu_with_kernels();
+    let high = StreamOptions {
+        priority: StreamPriority::High,
+        ..StreamOptions::default()
+    };
+    let s = gpu
+        .open_lanes_at(
+            LaneId(0),
+            &["high", "normal"],
+            &[high, StreamOptions::default()],
+        )
+        .unwrap();
+    assert_eq!(s[0].priority(), FAKE_GREATEST_PRIORITY);
+    assert_eq!(s[1].priority(), FAKE_NORMAL_PRIORITY);
+}
+
+#[test]
+fn one_options_entry_per_name_is_required() {
+    let gpu = gpu_with_kernels();
+    let r = gpu.open_lanes_at(LaneId(0), &["a", "b"], &[StreamOptions::default()]);
+    assert!(matches!(r, Err(GpuError::Invalid(_))));
+    let r = gpu.open_lanes_at(LaneId(63), &["a", "b"], &[StreamOptions::default(); 2]);
+    assert!(matches!(r, Err(GpuError::Invalid(_))), "past lane 63");
+}

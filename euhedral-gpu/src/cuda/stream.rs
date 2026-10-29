@@ -8,7 +8,9 @@ use euhedral_memory::cuda::{CuEvent, CuStream, Device, STREAM_NON_BLOCKING};
 
 use crate::kept::Kept;
 use crate::retire::{RetireSink, Retirements};
-use crate::{GpuError, POISONED_STATUS, RetireListener, RetireTicket, Stream, StreamOptions};
+use crate::{
+    GpuError, POISONED_STATUS, RetireListener, RetireTicket, Stream, StreamOptions, StreamPriority,
+};
 
 use super::{CudaEnqueue, CudaGpu, from_cuda};
 
@@ -222,7 +224,9 @@ pub struct CudaStream {
     pub(crate) raw: CuStream,
     pub(crate) queue: Arc<CudaQueue>,
     ring: Arc<LaneRing>,
-    lanes: Arc<[Arc<LaneRing>]>,
+    /// The rings of the lanes the opening call made, at their lane ids; the ids below the call's first lane are
+    /// `None`. An await accepts only these lanes' markers.
+    lanes: Arc<[Option<Arc<LaneRing>>]>,
     /// The stream a recording captures this stream's work on, made on first use.
     pub(crate) shadow: Option<CuStream>,
     /// The owner's end of the retirement queue, and the retirements armed.
@@ -236,47 +240,73 @@ pub struct CudaStream {
 unsafe impl Send for CudaStream {}
 
 impl CudaStream {
-    /// New streams `names[i]` as lane `i`, each with a ring of `options.markers` events.
+    /// New streams `names[i]` as lane `first + i`, each with a ring of `options[i].markers` events and the priority
+    /// `options[i].priority` names.
     pub(crate) fn open(
         gpu: &Arc<CudaGpu>,
+        first: LaneId,
         names: &[&str],
-        options: StreamOptions,
+        options: &[StreamOptions],
     ) -> Result<Vec<CudaStream>, GpuError> {
-        if names.is_empty() || names.len() > 64 {
-            return Err(GpuError::Invalid("a pool has 1 to 64 lanes".into()));
+        let first = usize::from(first.0);
+        if names.is_empty() || first + names.len() > 64 {
+            return Err(GpuError::Invalid(
+                "a pool has 1 to 64 lanes, and the streams of a call fit in it".into(),
+            ));
         }
-        if options.markers == 0 {
+        if options.len() != names.len() {
+            return Err(GpuError::Invalid("one options entry per lane name".into()));
+        }
+        if options.iter().any(|o| o.markers == 0) {
             return Err(GpuError::Invalid("a lane needs at least one marker".into()));
         }
         gpu.poison.check()?;
         let device = gpu.device();
-        let rings = names
+        let rings = options
             .iter()
-            .map(|_| LaneRing::new(QueueId::next(), device, options.markers).map(Arc::new))
+            .map(|o| LaneRing::new(QueueId::next(), device, o.markers).map(Arc::new))
             .collect::<Result<Vec<_>, _>>()?;
-        let lanes: Arc<[Arc<LaneRing>]> = rings.into();
+        let mut slots: Vec<Option<Arc<LaneRing>>> = vec![None; first];
+        slots.extend(rings.iter().cloned().map(Some));
+        let lanes: Arc<[Option<Arc<LaneRing>>]> = slots.into();
         let _c = device.enter().map_err(from_cuda)?;
-        let f = &device.driver.fns;
+        let greatest = if options.iter().any(|o| o.priority == StreamPriority::High) {
+            let (mut least, mut greatest) = (0, 0);
+            // SAFETY: out pointers; the context is current.
+            let code =
+                unsafe { (gpu.fns.ctx_get_stream_priority_range)(&mut least, &mut greatest) };
+            gpu.check("cuCtxGetStreamPriorityRange", code)?;
+            greatest
+        } else {
+            0
+        };
         let mut streams = Vec::with_capacity(names.len());
         for (i, name) in names.iter().enumerate() {
+            let priority = match options[i].priority {
+                StreamPriority::Normal => 0,
+                StreamPriority::High => greatest,
+            };
             let mut raw = std::ptr::null_mut();
             // SAFETY: an out pointer; the context is current.
-            let code = unsafe { (f.stream_create)(&mut raw, STREAM_NON_BLOCKING) };
-            device.check("cuStreamCreate", code).map_err(from_cuda)?;
-            let lane = LaneId(u16::try_from(i).expect("at most 64 lanes"));
-            let (retire, sink) = Retirements::new(lanes[i].id, lane);
+            let code = unsafe {
+                (gpu.fns.stream_create_with_priority)(&mut raw, STREAM_NON_BLOCKING, priority)
+            };
+            gpu.check("cuStreamCreateWithPriority", code)?;
+            let lane = LaneId(u16::try_from(first + i).expect("at most 64 lanes"));
+            let ring = rings[i].clone();
+            let (retire, sink) = Retirements::new(ring.id, lane);
             streams.push(CudaStream {
                 gpu: gpu.clone(),
-                id: lanes[i].id,
+                id: ring.id,
                 lane,
                 raw,
                 queue: Arc::new(CudaQueue {
                     gpu: gpu.clone(),
-                    ring: lanes[i].clone(),
+                    ring: ring.clone(),
                     name: (*name).to_owned(),
                     sink,
                 }),
-                ring: lanes[i].clone(),
+                ring,
                 lanes: lanes.clone(),
                 shadow: None,
                 retire,
@@ -286,8 +316,15 @@ impl CudaStream {
         Ok(streams)
     }
 
-    pub(crate) fn queue_arc(&self) -> Arc<CudaQueue> {
-        self.queue.clone()
+    /// The stream's priority as the driver reports it (`cuStreamGetPriority`): 0 for [`StreamPriority::Normal`], the
+    /// device's greatest (numerically lowest) for [`StreamPriority::High`].
+    pub fn priority(&self) -> Result<i32, GpuError> {
+        let _c = self.enter()?;
+        let mut priority = 0;
+        // SAFETY: this stream and an out pointer; the context is current.
+        let code = unsafe { (self.gpu.fns.stream_get_priority)(self.raw, &mut priority) };
+        self.gpu.check("cuStreamGetPriority", code)?;
+        Ok(priority)
     }
 
     /// A marker after the work submitted so far. The context is current.
@@ -320,6 +357,7 @@ impl CudaStream {
         let other = self
             .lanes
             .get(usize::from(marker.lane.0))
+            .and_then(Option::as_ref)
             .filter(|ring| ring.id == marker.queue)
             .ok_or_else(|| {
                 GpuError::Invalid(format!(

@@ -32,7 +32,7 @@ mod shape;
 
 pub use api::{
     CompileOptions, Enqueue, Gpu, Graph, Kernel, Lanes, Module, POISONED_STATUS, Rerecorded,
-    RetireListener, RetireTicket, Sequence, Stream, StreamOptions,
+    RetireListener, RetireTicket, Sequence, Stream, StreamOptions, StreamPriority,
 };
 pub use args::{Args, Dim3, KernelArg, Launch};
 pub use error::GpuError;

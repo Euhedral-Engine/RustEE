@@ -6,9 +6,9 @@ use euhedral_graph::{DeviceQueue, LaneId, Marker, QueueId};
 
 use crate::kept::Kept;
 use crate::retire::{RetireSink, Retirements};
-use crate::{Gpu, GpuError, POISONED_STATUS, RetireListener, RetireTicket, Stream};
+use crate::{Gpu, GpuError, POISONED_STATUS, RetireListener, RetireTicket, Stream, StreamPriority};
 
-use super::{FakeEnqueue, FakeGpu, QOp};
+use super::{FAKE_GREATEST_PRIORITY, FAKE_NORMAL_PRIORITY, FakeEnqueue, FakeGpu, QOp};
 
 /// The query side of a fake stream: what the pool and `Completions` hold. Shared and `Sync`.
 #[derive(Debug)]
@@ -44,6 +44,18 @@ impl DeviceQueue for FakeQueue {
     }
 }
 
+/// Where a stream sits among the lanes of the call that opened it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Placement {
+    /// Global index of the call's first lane.
+    pub(crate) base: usize,
+    /// The id of that lane in its pool.
+    pub(crate) first: u16,
+    /// This stream's index among the call's lanes, and how many lanes the call made.
+    pub(crate) index: usize,
+    pub(crate) count: usize,
+}
+
 /// A fake stream's submitter: lane `lane` of its pool. It has one owner, `Send` and not `Sync`; everything that
 /// enqueues takes `&mut self`.
 #[derive(Debug)]
@@ -51,10 +63,13 @@ pub struct FakeStream {
     gpu: Arc<FakeGpu>,
     queue: Arc<FakeQueue>,
     id: QueueId,
-    /// Global index of lane 0 of this stream's pool, this stream's index in the pool, and the pool's size.
+    /// Global index of the first lane the opening call made, that lane's id, this stream's index among the call's
+    /// lanes, and how many lanes the call made.
     base: usize,
+    first: u16,
     index: usize,
     count: usize,
+    priority: StreamPriority,
     /// The owner's end of the retirement queue, and the retirements armed.
     pub(crate) retire: Retirements,
     pub(crate) kept: Kept,
@@ -65,11 +80,16 @@ impl FakeStream {
         gpu: Arc<FakeGpu>,
         id: QueueId,
         name: &str,
-        base: usize,
-        index: usize,
-        count: usize,
+        place: Placement,
+        priority: StreamPriority,
     ) -> Self {
-        let lane = LaneId(u16::try_from(index).expect("at most 64 lanes"));
+        let Placement {
+            base,
+            first,
+            index,
+            count,
+        } = place;
+        let lane = LaneId(first + u16::try_from(index).expect("at most 64 lanes"));
         let (retire, sink) = Retirements::new(id, lane);
         let queue = Arc::new(FakeQueue {
             gpu: gpu.clone(),
@@ -83,15 +103,22 @@ impl FakeStream {
             queue,
             id,
             base,
+            first,
             index,
             count,
+            priority,
             retire,
             kept: Kept::default(),
         }
     }
 
-    pub(crate) fn queue_arc(&self) -> Arc<FakeQueue> {
-        self.queue.clone()
+    /// The priority the stream was opened with, as a driver reports it: [`FAKE_NORMAL_PRIORITY`] or
+    /// [`FAKE_GREATEST_PRIORITY`].
+    pub fn priority(&self) -> i32 {
+        match self.priority {
+            StreamPriority::Normal => FAKE_NORMAL_PRIORITY,
+            StreamPriority::High => FAKE_GREATEST_PRIORITY,
+        }
     }
 
     fn global(&self) -> usize {
@@ -99,7 +126,7 @@ impl FakeStream {
     }
 
     fn lane_id(&self) -> u16 {
-        u16::try_from(self.index).expect("at most 64 lanes")
+        self.first + u16::try_from(self.index).expect("at most 64 lanes")
     }
 
     pub(crate) fn push(&self, op: QOp) {
@@ -134,14 +161,16 @@ impl FakeStream {
     /// Later work on this stream waits for `marker`.
     pub(crate) fn await_now(&self, marker: Marker) -> Result<(), GpuError> {
         self.gpu.poison.check()?;
-        let lane = usize::from(marker.lane.0);
-        if lane >= self.count {
-            return Err(GpuError::Invalid(format!(
-                "{} lane {} is not a lane of this stream's pool",
-                marker.queue, marker.lane.0
-            )));
-        }
-        let target = self.base + lane;
+        let offset = match marker.lane.0.checked_sub(self.first) {
+            Some(offset) if usize::from(offset) < self.count => usize::from(offset),
+            _ => {
+                return Err(GpuError::Invalid(format!(
+                    "{} lane {} is not a lane of this stream's pool",
+                    marker.queue, marker.lane.0
+                )));
+            }
+        };
+        let target = self.base + offset;
         {
             let st = self.gpu.lock();
             let lane = &st.lanes[target];

@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use euhedral_graph::{LanePool, QueueId};
+use euhedral_graph::{LaneId, QueueId};
 
 use crate::retire::RetireSink;
 
@@ -30,7 +30,14 @@ use crate::{
 pub use enqueue::FakeEnqueue;
 pub use graph::{FakeGraph, FakeSequence};
 pub use module::{FakeKernel, FakeModule};
+use stream::Placement;
 pub use stream::{FakeQueue, FakeStream};
+
+/// The priority a fake stream of [`StreamPriority::Normal`](crate::StreamPriority::Normal) reports.
+pub const FAKE_NORMAL_PRIORITY: i32 = 0;
+/// The priority a fake stream of [`StreamPriority::High`](crate::StreamPriority::High) reports: the greatest the fake
+/// device offers, numerically lower than the normal one, as a driver's.
+pub const FAKE_GREATEST_PRIORITY: i32 = -1;
 
 /// A fake kernel: runs on the fake memory with the launch geometry and arguments.
 pub type FakeKernelFn =
@@ -414,42 +421,53 @@ impl Gpu for FakeGpu {
     type Graph = FakeGraph;
     type Sequence<'a> = FakeSequence<'a>;
 
-    fn open_lanes(
+    fn open_lanes_at(
         self: &Arc<Self>,
+        first: LaneId,
         names: &[&str],
-        options: StreamOptions,
-    ) -> Result<crate::Lanes<Self>, GpuError> {
-        if names.is_empty() || names.len() > 64 {
-            return Err(GpuError::Invalid("a pool has 1 to 64 lanes".into()));
+        options: &[StreamOptions],
+    ) -> Result<Vec<FakeStream>, GpuError> {
+        if names.is_empty() || usize::from(first.0) + names.len() > 64 {
+            return Err(GpuError::Invalid(
+                "a pool has 1 to 64 lanes, and the streams of a call fit in it".into(),
+            ));
+        }
+        if options.len() != names.len() {
+            return Err(GpuError::Invalid("one options entry per lane name".into()));
+        }
+        if options.iter().any(|o| o.markers == 0) {
+            return Err(GpuError::Invalid("a lane needs at least one marker".into()));
         }
         self.poison.check()?;
         let ids: Vec<QueueId> = names.iter().map(|_| QueueId::next()).collect();
         let base = {
             let mut st = self.lock();
             let base = st.lanes.len();
-            for id in &ids {
+            for (id, o) in ids.iter().zip(options) {
                 st.lanes.push(Lane {
                     id: *id,
                     queue: VecDeque::new(),
                     marks_enqueued: 0,
                     marks_run: 0,
-                    markers: options.markers,
+                    markers: o.markers,
                 });
             }
             base
         };
         let count = names.len();
-        let streams: Vec<FakeStream> = names
+        Ok(names
             .iter()
             .enumerate()
-            .map(|(i, name)| FakeStream::new(self.clone(), ids[i], name, base, i, count))
-            .collect();
-        // The pool holds the shared query sides; the submitters go to their owners.
-        let queues = streams
-            .iter()
-            .map(|s| s.queue_arc() as Arc<dyn euhedral_graph::DeviceQueue>)
-            .collect();
-        Ok((Arc::new(LanePool::new(queues)), streams))
+            .map(|(i, name)| {
+                let place = Placement {
+                    base,
+                    first: first.0,
+                    index: i,
+                    count,
+                };
+                FakeStream::new(self.clone(), ids[i], name, place, options[i].priority)
+            })
+            .collect())
     }
 
     fn poisoned(&self) -> Option<GpuError> {

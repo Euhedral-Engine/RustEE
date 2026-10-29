@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use euhedral_memory::cuda::{CudaError, Device, Driver};
 
-use euhedral_graph::LanePool;
+use euhedral_graph::LaneId;
 
 use enqueue::Mode;
 
@@ -176,18 +176,13 @@ impl Gpu for CudaGpu {
     type Graph = CudaGraph;
     type Sequence<'a> = CudaSequence<'a>;
 
-    fn open_lanes(
+    fn open_lanes_at(
         self: &Arc<Self>,
+        first: LaneId,
         names: &[&str],
-        options: StreamOptions,
-    ) -> Result<crate::Lanes<Self>, GpuError> {
-        let streams = CudaStream::open(self, names, options)?;
-        // The pool holds the shared query sides; the submitters go to their owners.
-        let queues = streams
-            .iter()
-            .map(|s| s.queue_arc() as Arc<dyn euhedral_graph::DeviceQueue>)
-            .collect();
-        Ok((Arc::new(LanePool::new(queues)), streams))
+        options: &[StreamOptions],
+    ) -> Result<Vec<CudaStream>, GpuError> {
+        CudaStream::open(self, first, names, options)
     }
 
     fn poisoned(&self) -> Option<GpuError> {

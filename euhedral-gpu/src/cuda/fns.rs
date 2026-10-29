@@ -91,6 +91,12 @@ impl fmt::Debug for CaptureInfo {
 #[derive(Clone, Copy)]
 pub struct GpuFns {
     pub stream_wait_event: unsafe extern "C" fn(CuStream, CuEvent, c_uint) -> CuResult,
+    /// `cuStreamCreateWithPriority`: the stream's flags and its priority.
+    pub stream_create_with_priority: unsafe extern "C" fn(*mut CuStream, c_uint, c_int) -> CuResult,
+    /// `cuCtxGetStreamPriorityRange`: the least and the greatest priority (the greatest is the numerically lowest).
+    pub ctx_get_stream_priority_range: unsafe extern "C" fn(*mut c_int, *mut c_int) -> CuResult,
+    /// `cuStreamGetPriority`.
+    pub stream_get_priority: unsafe extern "C" fn(CuStream, *mut c_int) -> CuResult,
     /// `cuStreamAddCallback`: required. Its callback receives the status of the work before it, exactly once, even
     /// after a device fault, which is what retirement relies on.
     pub stream_add_callback:
@@ -190,6 +196,9 @@ impl GpuFns {
         };
         Ok(Self {
             stream_wait_event: cast!(required(driver, c"cuStreamWaitEvent")?),
+            stream_create_with_priority: cast!(required(driver, c"cuStreamCreateWithPriority")?),
+            ctx_get_stream_priority_range: cast!(required(driver, c"cuCtxGetStreamPriorityRange")?),
+            stream_get_priority: cast!(required(driver, c"cuStreamGetPriority")?),
             stream_add_callback: cast!(required(driver, c"cuStreamAddCallback")?),
             module_load_data_ex: cast!(required(driver, c"cuModuleLoadDataEx")?),
             module_get_function: cast!(required(driver, c"cuModuleGetFunction")?),

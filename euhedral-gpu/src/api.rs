@@ -44,13 +44,35 @@ pub trait Gpu: Send + Sync + fmt::Debug + Sized + 'static {
     type Graph: Graph<Gpu = Self>;
     type Sequence<'a>: Sequence<Kernel = Self::Kernel>;
 
-    /// New streams, `names[i]` as lane `i` of a new pool (1 to 64 names). The pool holds each stream's query side;
-    /// the submitters are returned to be owned, one per lane.
+    /// New streams, `names[i]` as lane `i` of a new pool (1 to 64 names), all set up with `options`. The pool holds
+    /// each stream's query side; the submitters are returned to be owned, one per lane.
+    ///
+    /// This is [`open_lanes_at`](Self::open_lanes_at) at lane 0, with the pool made of the streams' queues.
     fn open_lanes(
         self: &Arc<Self>,
         names: &[&str],
         options: StreamOptions,
-    ) -> Result<Lanes<Self>, GpuError>;
+    ) -> Result<Lanes<Self>, GpuError> {
+        let streams = self.open_lanes_at(LaneId(0), names, &vec![options; names.len()])?;
+        let queues = streams.iter().map(Stream::queue).collect();
+        Ok((Arc::new(LanePool::new(queues)), streams))
+    }
+
+    /// New streams for lanes `first..first + names.len()` of a pool built elsewhere
+    /// ([`LanePoolBuilder::reserve`](euhedral_graph::LanePoolBuilder::reserve)), `options[i]` for `names[i]`. Their
+    /// markers name those lanes; the caller sets each stream's [`queue`](Stream::queue) into the builder at its lane.
+    ///
+    /// A marker of a lane that this call did not open is refused by [`Stream::await_marker`] (`Err(Invalid)`), as a
+    /// marker of any other queue is: a pool of several backends, or of several calls, orders across them by handing
+    /// the marker to the item that bridges it.
+    ///
+    /// `Err(Invalid)` for no names, a different number of options, or lanes past 63.
+    fn open_lanes_at(
+        self: &Arc<Self>,
+        first: LaneId,
+        names: &[&str],
+        options: &[StreamOptions],
+    ) -> Result<Vec<Self::Stream>, GpuError>;
 
     /// The device's first fault, once it has one.
     fn poisoned(&self) -> Option<GpuError>;
@@ -350,16 +372,32 @@ impl RetireTicket {
     }
 }
 
+/// How the device schedules a stream's work against other streams' (a device property: the driver decides what it
+/// does with the hint).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StreamPriority {
+    /// The driver's default priority.
+    #[default]
+    Normal,
+    /// The greatest priority the device offers: its waiting blocks are scheduled ahead of a normal stream's.
+    High,
+}
+
 /// How a stream is set up.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StreamOptions {
     /// Markers a stream can have outstanding: the size of its event ring.
     pub markers: u32,
+    /// The stream's priority on the device.
+    pub priority: StreamPriority,
 }
 
 impl Default for StreamOptions {
     fn default() -> Self {
-        Self { markers: 256 }
+        Self {
+            markers: 256,
+            priority: StreamPriority::Normal,
+        }
     }
 }
 
