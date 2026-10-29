@@ -5,6 +5,7 @@
 //! invocation. An iteration repeats invocations for a fixed time and reports throughput; a fork builds a lattice,
 //! runs the warm-up iterations, then the measured ones, and tears it down.
 
+use crate::latency::{Histogram, Quantiles, Recorders};
 use crate::no_op::{FRAMES_PER_SOURCE, RepeatingSource};
 use euhedral_core::config::LatticeConfig;
 use euhedral_core::control_plane::{ControlPlaneLattice, LatticeError};
@@ -203,6 +204,8 @@ pub struct Options {
     pub tasks: u64,
     /// Pin the harness thread to its own core.
     pub pin_harness: bool,
+    /// Sample the latency of one frame in 64.
+    pub latency: bool,
 }
 
 impl Options {
@@ -216,6 +219,7 @@ impl Options {
             iteration_time: Duration::from_secs(5),
             tasks: TASKS,
             pin_harness: true,
+            latency: true,
         }
     }
 }
@@ -231,6 +235,8 @@ pub struct Sample {
     pub ops_per_second: f64,
     /// Nanoseconds per operation.
     pub ns_per_op: f64,
+    /// The latency quantiles of the frames sampled during the iteration, if latency is sampled.
+    pub latency: Option<Quantiles>,
 }
 
 /// Why a fork failed.
@@ -266,11 +272,13 @@ fn invoke(counters: &PaddedLongAdder, tasks: u64) -> Result<(), ForkError> {
 /// One iteration: invocations for at least `time`, as the harness counts them.
 fn iterate(
     counters: &PaddedLongAdder,
+    recorders: Option<&Recorders>,
     tasks: u64,
     time: Duration,
     measured: bool,
     index: u32,
-) -> Result<Sample, ForkError> {
+) -> Result<(Sample, Histogram), ForkError> {
+    let before = recorders.map(Recorders::snapshot);
     let start = Instant::now();
     let mut invocations = 0_u64;
     while invocations == 0 || start.elapsed() < time {
@@ -279,14 +287,28 @@ fn iterate(
     }
     let elapsed = start.elapsed();
     let ops_per_second = (invocations * tasks) as f64 / elapsed.as_secs_f64();
-    Ok(Sample {
+    let latency = match (recorders, before) {
+        (Some(recorders), Some(before)) => recorders.snapshot().since(&before),
+        _ => Histogram::new(),
+    };
+    let sample = Sample {
         measured,
         index,
         invocations,
         elapsed,
         ops_per_second,
         ns_per_op: 1e9 / ops_per_second,
-    })
+        latency: latency.quantiles(),
+    };
+    Ok((sample, latency))
+}
+
+/// What a fork produced.
+#[derive(Debug)]
+pub struct ForkOutcome {
+    pub samples: Vec<Sample>,
+    /// The latencies of every measured iteration, merged.
+    pub measured_latency: Histogram,
 }
 
 /// What a fork built, for the report.
@@ -302,7 +324,7 @@ pub fn run_fork(
     options: &Options,
     mut announce: impl FnMut(&Setup),
     mut report: impl FnMut(&Sample),
-) -> Result<Vec<Sample>, ForkError> {
+) -> Result<ForkOutcome, ForkError> {
     let topology = Topology::system();
     let isolation =
         isolate_harness_core(topology, options.pin_harness).map_err(ForkError::NoWorkers)?;
@@ -318,6 +340,7 @@ pub fn run_fork(
         .cpu_span()
         .max(std::thread::available_parallelism().map_or(1, usize::from));
     let counters = Arc::new(PaddedLongAdder::with_options(slots, true, true));
+    let recorders = options.latency.then(|| Arc::new(Recorders::new(slots)));
     let sources: Vec<_> = (0..options.sources)
         .map(|source| {
             RepeatingSource::new(
@@ -326,6 +349,7 @@ pub fn run_fork(
                 id_hash().wrapping_add((source * FRAMES_PER_SOURCE) as u64),
                 &counters,
                 slots,
+                recorders.as_ref(),
             )
         })
         .collect();
@@ -344,23 +368,36 @@ pub fn run_fork(
 
     let result = (|| {
         let mut samples = Vec::new();
+        let mut measured_latency = Histogram::new();
         for index in 1..=options.warmup_iterations {
-            let sample = iterate(&counters, options.tasks, options.warmup_time, false, index)?;
-            report(&sample);
-            samples.push(sample);
-        }
-        for index in 1..=options.iterations {
-            let sample = iterate(
+            let (sample, _) = iterate(
                 &counters,
+                recorders.as_deref(),
                 options.tasks,
-                options.iteration_time,
-                true,
+                options.warmup_time,
+                false,
                 index,
             )?;
             report(&sample);
             samples.push(sample);
         }
-        Ok(samples)
+        for index in 1..=options.iterations {
+            let (sample, latency) = iterate(
+                &counters,
+                recorders.as_deref(),
+                options.tasks,
+                options.iteration_time,
+                true,
+                index,
+            )?;
+            measured_latency.merge(&latency);
+            report(&sample);
+            samples.push(sample);
+        }
+        Ok(ForkOutcome {
+            samples,
+            measured_latency,
+        })
     })();
 
     // Stops all repeating sources and releases the lattice after the fork.

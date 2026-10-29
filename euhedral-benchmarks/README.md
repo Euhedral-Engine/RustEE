@@ -15,6 +15,11 @@ End-to-end benchmarks of the control plane. Nothing depends on this crate.
 - An invocation waits for the completion count to advance by 32,000,000 (1 minute timeout), spinning and yielding. An
   iteration repeats invocations for its time. A fork builds its own lattice and runs 3 warm-up iterations of 3 seconds
   and 5 measured ones of 5 seconds; the driver runs 3 forks as separate processes.
+- One frame in 64 is stamped when its source hands it out, and the worker that executes it records the time since in
+  a histogram of its own (relaxed atomic increments, no lock; fixed log-linear buckets, 0.8% relative error). Each
+  iteration reports the latency quantiles P0, P25, P50, P90, P99 and P100 in nanoseconds; the summary reports them over
+  every measured iteration of every fork. `--no-latency` turns the sampling off. Per-iteration P0 and P100 are the
+  edges of the lowest and highest occupied buckets.
 - The output is one line per iteration, and a `summary` line with the mean and standard deviation of the measured
   iterations' throughput (operations per second) and time per operation (nanoseconds), the sources and the worker CPUs.
 

@@ -13,7 +13,7 @@ and throughput of a lattice that many sources feed with no-op frames.
 **How.** `cargo run --release -p euhedral-benchmarks --bin high_contention_throughput` (see the crate's README for the
 flags and `EUHEDRAL_HCT_SOURCES`).
 
-**Semantics.** 3 forks (processes) of 3 warm-up iterations of 3 s and 5 measured iterations of 5 s; one invocation
+**Semantics.** One frame in 64 is timed from its source handing it out to a worker executing it, and each iteration and the summary report the latency quantiles P0, P25, P50, P90, P99 and P100 (`--no-latency` turns it off). 3 forks (processes) of 3 warm-up iterations of 3 s and 5 measured iterations of 5 s; one invocation
 waits for 32,000,000 completions. The harness thread has a core of its own. The output is one line per iteration and a
 summary of the mean and standard deviation of the measured iterations.
 

@@ -5,6 +5,7 @@
 //! operation, the sources and the worker CPUs.
 
 use crate::high_contention::{Isolation, Sample, mean_and_deviation};
+use crate::latency::{Histogram, Quantiles};
 use std::time::Duration;
 
 /// The line a fork prints for its setup.
@@ -18,9 +19,17 @@ pub fn setup_line(sources: usize, isolation: &Isolation) -> String {
     )
 }
 
+/// The quantiles as `latency_n=.. p0=..` fields, in nanoseconds.
+pub fn quantile_fields(q: &Quantiles) -> String {
+    format!(
+        "latency_samples={} p0={} p25={} p50={} p90={} p99={} p100={}",
+        q.count, q.p0, q.p25, q.p50, q.p90, q.p99, q.p100
+    )
+}
+
 /// The line a fork prints for an iteration.
 pub fn sample_line(sample: &Sample) -> String {
-    format!(
+    let mut line = format!(
         "sample phase={} index={} invocations={} seconds={:.3} ops_per_s={:.1} ns_per_op={:.4}",
         if sample.measured { "measure" } else { "warmup" },
         sample.index,
@@ -28,7 +37,22 @@ pub fn sample_line(sample: &Sample) -> String {
         sample.elapsed.as_secs_f64(),
         sample.ops_per_second,
         sample.ns_per_op
-    )
+    );
+    if let Some(latency) = &sample.latency {
+        line.push(' ');
+        line.push_str(&quantile_fields(latency));
+    }
+    line
+}
+
+/// The line a fork prints at its end: the merged latencies of its measured iterations.
+pub fn histogram_line(measured: &Histogram) -> String {
+    format!("histogram {}", measured.to_sparse())
+}
+
+/// The histogram a `histogram` line carries.
+pub fn parse_histogram(line: &str) -> Option<Histogram> {
+    Histogram::from_sparse(line.strip_prefix("histogram")?.trim())
 }
 
 /// The iteration a `sample` line describes.
@@ -48,11 +72,12 @@ pub fn parse_sample(line: &str) -> Option<Sample> {
         elapsed: Duration::from_secs_f64(value("seconds")?.parse().ok()?),
         ops_per_second: value("ops_per_s")?.parse().ok()?,
         ns_per_op: value("ns_per_op")?.parse().ok()?,
+        latency: None,
     })
 }
 
-/// The one-line summary of the measured iterations of `forks` forks.
-pub fn summary_line(forks: usize, setup: &str, samples: &[Sample]) -> String {
+/// The one-line summary of the measured iterations of `forks` forks; `latency` holds every measured fork's latencies.
+pub fn summary_line(forks: usize, setup: &str, samples: &[Sample], latency: &Histogram) -> String {
     let measured: Vec<&Sample> = samples.iter().filter(|sample| sample.measured).collect();
     let (ops, ops_deviation) = mean_and_deviation(
         &measured
@@ -62,11 +87,19 @@ pub fn summary_line(forks: usize, setup: &str, samples: &[Sample]) -> String {
     );
     let (ns, ns_deviation) =
         mean_and_deviation(&measured.iter().map(|s| s.ns_per_op).collect::<Vec<_>>());
-    format!(
+    let mut line = format!(
         "summary forks={forks} iterations={} {setup} throughput_ops_per_s={ops:.0} +- {ops_deviation:.0} \
          average_ns_per_op={ns:.4} +- {ns_deviation:.4}",
         measured.len()
-    )
+    );
+    match latency.quantiles() {
+        Some(q) => {
+            line.push(' ');
+            line.push_str(&quantile_fields(&q));
+        }
+        None => line.push_str(" latency=off"),
+    }
+    line
 }
 
 #[cfg(test)]
@@ -82,6 +115,7 @@ mod tests {
             elapsed: Duration::from_millis(5_250),
             ops_per_second: ops,
             ns_per_op: 1e9 / ops,
+            latency: None,
         }
     }
 
@@ -104,7 +138,11 @@ mod tests {
             sample(true, 10_000_000.0),
             sample(true, 30_000_000.0),
         ];
-        let line = summary_line(2, "sources=3", &samples);
+        let mut latency = Histogram::new();
+        for value in 1..=100 {
+            latency.record(value);
+        }
+        let line = summary_line(2, "sources=3", &samples, &latency);
         assert!(
             line.starts_with("summary forks=2 iterations=2 sources=3 "),
             "{line}"
@@ -113,6 +151,27 @@ mod tests {
             line.contains("throughput_ops_per_s=20000000 +- 14142136"),
             "{line}"
         );
+    }
+
+    #[test]
+    fn a_sample_line_carries_its_quantiles_and_a_histogram_line_round_trips() {
+        let mut with = sample(true, 1e7);
+        let mut histogram = Histogram::new();
+        for value in [100, 200, 300, 4_000] {
+            histogram.record(value);
+        }
+        with.latency = histogram.quantiles();
+        let line = sample_line(&with);
+        assert!(line.contains("latency_samples=4 p0=100 "), "{line}");
+        assert!(
+            line.ends_with("p100=4000") || line.contains(" p100="),
+            "{line}"
+        );
+        assert_eq!(
+            parse_histogram(&histogram_line(&histogram)),
+            Some(histogram)
+        );
+        assert!(parse_histogram("sample x").is_none());
     }
 
     #[test]

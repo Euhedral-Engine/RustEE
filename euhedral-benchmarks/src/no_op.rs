@@ -4,6 +4,7 @@
 //! so a fixed set of frames circulates, as the same frame objects are pushed again and again. [`RepeatingSource`]
 //! pushes those frames to whatever receiver the lattice attaches, as many as the demand allows.
 
+use crate::latency::Recorders;
 use euhedral_core::frames::{Frame, FrameHeader};
 use euhedral_core::generics::{DownstreamSlot, LatticeReceiver, LatticeSource};
 use euhedral_data_structures::atomics::PaddedLongAdder;
@@ -11,6 +12,10 @@ use euhedral_data_structures::queues::{Consumer, MpmcQueue, Multi, Producer};
 use std::cell::Cell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::Instant;
+
+/// One frame in this many is stamped and timed.
+pub const SAMPLE_EVERY: u64 = 64;
 
 /// How many frames a source circulates.
 pub const FRAMES_PER_SOURCE: usize = 2_048;
@@ -23,7 +28,7 @@ thread_local! {
 }
 
 /// The completion counter slot of the calling thread.
-fn stripe(slots: usize) -> usize {
+pub fn stripe(slots: usize) -> usize {
     STRIPE.with(|stripe| {
         let chosen = stripe.get().unwrap_or_else(|| {
             let next = NEXT_STRIPE.fetch_add(1, Ordering::Relaxed);
@@ -45,6 +50,19 @@ pub struct NoOpFrame {
     /// The counter's slot count.
     slots: usize,
     home: Home,
+    /// Where the latency of a sampled frame is recorded; `None` for a frame that is not sampled.
+    latency: Option<Arc<Recorders>>,
+    /// When the source handed the frame out, if it is being sampled.
+    stamp: Option<Instant>,
+}
+
+impl NoOpFrame {
+    /// Notes the time a sampled frame leaves its source.
+    fn stamp(&mut self) {
+        if self.latency.is_some() {
+            self.stamp = Some(Instant::now());
+        }
+    }
 }
 
 impl Frame for NoOpFrame {
@@ -54,6 +72,17 @@ impl Frame for NoOpFrame {
 
     fn header_mut(&mut self) -> &mut FrameHeader {
         &mut self.header
+    }
+
+    /// Records the time since a sampled frame left its source, on the worker that runs it.
+    fn execute(&mut self) -> Result<(), euhedral_core::frames::FrameError> {
+        if let Some(stamp) = self.stamp.take()
+            && let Some(recorders) = &self.latency
+        {
+            let nanos = u64::try_from(stamp.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            recorders.slot(stripe(self.slots)).record(nanos);
+        }
+        Ok(())
     }
 
     /// Counts the completion, then returns the frame to its source.
@@ -77,6 +106,7 @@ pub fn generate(
     seed: u64,
     counters: &Arc<PaddedLongAdder>,
     slots: usize,
+    latency: Option<&Arc<Recorders>>,
     home: Home,
 ) -> Vec<Box<NoOpFrame>> {
     (0..length as u64)
@@ -88,6 +118,9 @@ pub fn generate(
                 counters: counters.clone(),
                 slots,
                 home,
+                // One frame in `SAMPLE_EVERY` is sampled, every time it circulates.
+                latency: latency.filter(|_| index % SAMPLE_EVERY == 0).cloned(),
+                stamp: None,
             })
         })
         .collect()
@@ -112,10 +145,11 @@ impl RepeatingSource {
         seed: u64,
         counters: &Arc<PaddedLongAdder>,
         slots: usize,
+        latency: Option<&Arc<Recorders>>,
     ) -> Arc<Self> {
         let queue = MpmcQueue::new(length.next_power_of_two());
         let home: Home = Box::leak(Box::new(queue.producer()));
-        for frame in generate(id_hash, length, seed, counters, slots, home) {
+        for frame in generate(id_hash, length, seed, counters, slots, latency, home) {
             let _ = home.offer(frame);
         }
         Arc::new(Self {
@@ -154,6 +188,8 @@ impl RepeatingSource {
             if banked != u64::MAX {
                 self.demand.fetch_sub(1, Ordering::AcqRel);
             }
+            let mut frame = frame;
+            frame.stamp();
             receiver.push(frame);
         }
     }
@@ -181,6 +217,8 @@ impl LatticeSource for RepeatingSource {
                 let _ = self.home.offer(frame);
                 break;
             }
+            let mut frame = frame;
+            frame.stamp();
             consumer(frame);
             taken += 1;
         }
