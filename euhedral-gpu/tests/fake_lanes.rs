@@ -6,13 +6,12 @@ mod common;
 
 use std::marker::PhantomData;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
 
-use common::{Item, Plan, Probe, collect_all, lock, pump};
+use common::{HostWord, Item, Plan, Probe, collect_all, lock, pump, pump_from};
 use euhedral_core::generics::LatticeSource as _;
 use euhedral_gpu::fake::{FAKE_GREATEST_PRIORITY, FakeGpu, FakeModule, FakeOp, FakeStream};
 use euhedral_gpu::{
-    Args, CompileOptions, Gpu, LaneSpec, Module, Stream, StreamOptions, StreamPriority,
+    Args, CompileOptions, Gpu, GpuError, LaneSpec, Module, Stream, StreamOptions, StreamPriority,
     open_lane_sources,
 };
 use euhedral_graph::testing::FakeLanes;
@@ -55,7 +54,7 @@ fn fold_plan(
             vec![(kernel.clone(), Args::new().device(word).arg(step + 1))]
         }),
         device_word: word,
-        host_word: Arc::new(AtomicU32::new(0)),
+        host_word: HostWord::leaked(),
         probe: Probe::new(),
         retire_steps: false,
         _stream: PhantomData,
@@ -97,32 +96,68 @@ fn a_chain_of_kernel_items_across_lanes_runs_in_order() {
         .intakes
         .deliver(Item1::first(&plan), Deliver::Group(GroupId(0)))
         .unwrap();
+    // The device does not run until the whole chain is submitted, so no marker has completed when its successor orders
+    // itself behind it (an await on a completed marker is elided, as the driver's would be).
     for round in 0..1000 {
-        pump(&opened.sources);
-        gpu.run_until_idle();
-        if !collect.received().is_empty() {
+        // The start rotates, so each of the group's lanes takes group work in turn.
+        pump_from(&opened.sources, round % 4);
+        if plan.probe.ran().len() == steps as usize + 1 {
             break;
         }
         assert!(round < 999, "the chain did not finish");
     }
+    gpu.run_until_idle();
     pump(&opened.sources);
     assert_eq!(collect.received(), vec![u64::from(expected)]);
-    assert_eq!(plan.host_word.load(Ordering::SeqCst), expected);
+    assert_eq!(plan.host_word.load(), expected);
     assert!(lock(&plan.probe.failed).is_empty());
-    assert!(lock(&plan.probe.retired).iter().all(|(_, f)| f.is_none()));
+    assert!(
+        lock(&plan.probe.retired)
+            .iter()
+            .all(|(_, _, f)| f.is_none())
+    );
     // Odd steps ran on lane x (3); even steps on the group's lanes.
-    let lanes: Vec<(u16, String)> = gpu
-        .log()
-        .into_iter()
-        .filter_map(|op| match op {
-            FakeOp::Launch { lane, kernel } => Some((lane, kernel)),
+    let log = gpu.log();
+    let launches: Vec<(usize, u16)> = log
+        .iter()
+        .enumerate()
+        .filter_map(|(at, op)| match op {
+            FakeOp::Launch { lane, .. } => Some((at, *lane)),
             _ => None,
         })
         .collect();
-    assert_eq!(lanes.len(), steps as usize);
-    for (i, (lane, _)) in lanes.iter().enumerate() {
+    assert_eq!(launches.len(), steps as usize);
+    for (i, (_, lane)) in launches.iter().enumerate() {
         assert_eq!(*lane == 3, i % 2 == 1, "step {i} ran on lane {lane}");
     }
+    // Every step but the first ran behind an await of the previous step's marker on its own lane (each is on another
+    // lane than its predecessor): a lane that skipped the await would show a launch with no `Await` before it.
+    for (i, &(at, lane)) in launches.iter().enumerate().skip(1) {
+        let before = launches[i - 1].1;
+        let predecessor_mark = log[..at]
+            .iter()
+            .rev()
+            .find_map(|op| match op {
+                FakeOp::Mark { lane: l, value } if *l == before => Some(*value),
+                _ => None,
+            })
+            .expect("the predecessor was marked");
+        assert_eq!(
+            log[at - 1],
+            FakeOp::Await {
+                lane,
+                value: predecessor_mark
+            },
+            "step {i} is not ordered behind its predecessor's marker"
+        );
+    }
+    // The group's lanes all took work.
+    let group_lanes: std::collections::BTreeSet<u16> = launches
+        .iter()
+        .filter(|(_, lane)| *lane != 3)
+        .map(|(_, lane)| *lane)
+        .collect();
+    assert!(group_lanes.len() > 1, "{group_lanes:?}");
 }
 
 #[test]
@@ -209,7 +244,7 @@ fn a_busy_marker_ring_stalls_then_resumes() {
             vec![(kernel.clone(), Args::new().device(word).arg(step + 1))]
         }),
         device_word: word,
-        host_word: Arc::new(AtomicU32::new(0)),
+        host_word: HostWord::leaked(),
         probe: Probe::new(),
         retire_steps: false,
         _stream: PhantomData,
@@ -224,7 +259,7 @@ fn a_busy_marker_ring_stalls_then_resumes() {
     }
     // `then` of each item delivers its successor; only the first four steps matter, so look at the first pass.
     opened.sources[0].request(1);
-    let tags: Vec<u64> = chain.probe.ran().iter().map(|t| t / 1_000_000).collect();
+    let tags: Vec<u64> = chain.probe.ran().iter().map(|(tag, _)| *tag).collect();
     assert_eq!(
         tags,
         vec![1, 2, 3],
@@ -243,7 +278,7 @@ fn a_busy_marker_ring_stalls_then_resumes() {
         gpu.run_until_idle();
         opened.sources[0].request(1);
     }
-    let tags: Vec<u64> = chain.probe.ran().iter().map(|t| t / 1_000_000).collect();
+    let tags: Vec<u64> = chain.probe.ran().iter().map(|(tag, _)| *tag).collect();
     assert!(
         tags.len() > 4,
         "the lane went on after the ring freed: {tags:?}"
@@ -285,40 +320,96 @@ fn bad_group_lists_are_refused_not_panicked() {
     assert!(open_lane_sources::<_, (), Item1>(&gpu, specs(&[]), &[]).is_err());
 }
 
-#[test]
-fn a_retirement_failure_from_a_faulted_device_reaches_the_item() {
+/// Lane a faults on the device; lane b's item waits for lane a's marker and asks for a retirement. With `retire_steps`
+/// the faulting item asks for one as well.
+fn fault_run(retire_steps: bool) {
     let gpu = gpu();
-    gpu.define("trap", |_, _, _| Err(euhedral_gpu::fake::FakeFault::Trap));
-    let opened = open_lane_sources::<_, (), Item1>(&gpu, specs(&["a"]), &[]).unwrap();
+    let opened = open_lane_sources::<_, (), Item1>(&gpu, specs(&["a", "b"]), &[]).unwrap();
     let _collect = collect_all(&opened.sources);
     let module =
         FakeModule::from_source(&gpu, "// fake source", &CompileOptions::default()).unwrap();
-    let kernel = module.kernel("trap").unwrap();
-    let word = gpu.alloc(4);
+    gpu.define("illegal", |_, _, _| {
+        Err(euhedral_gpu::fake::FakeFault::IllegalAddress)
+    });
+    let kernel = module.kernel("illegal").unwrap();
     let plan = Arc::new(Plan::<FakeStream> {
         steps: 1,
-        route: Box::new(|_| Deliver::Lane(LaneId(0))),
+        route: Box::new(|_| Deliver::Lane(LaneId(1))),
         launches: Box::new(move |_| vec![(kernel.clone(), Args::new())]),
-        device_word: word,
-        host_word: Arc::new(AtomicU32::new(0)),
+        device_word: gpu.alloc(256),
+        host_word: HostWord::leaked(),
         probe: Probe::new(),
-        retire_steps: false,
+        retire_steps,
         _stream: PhantomData,
     });
     opened
         .intakes
         .deliver(Item1::first(&plan), Deliver::Lane(LaneId(0)))
         .unwrap();
-    // Step 0 traps on the device; the read item (step 1) is delivered behind its marker, and its retirement reports
-    // the poisoned device.
+    // Step 0 faults on lane a; step 1 on lane b waits for lane a's marker, which never completes, so its callback
+    // never fires. The lane's look at the device is what finds the fault and reports the retirement.
     for _ in 0..10 {
-        opened.sources[0].request(1);
+        pump(&opened.sources);
         gpu.run_until_idle();
     }
-    opened.sources[0].request(1);
     let retired = lock(&plan.probe.retired).clone();
-    assert_eq!(retired.len(), 1);
-    assert!(retired[0].1.is_some(), "{retired:?}");
+    let step = |n: u32| retired.iter().find(|(_, step, _)| *step == n);
+    let Some((_, _, Some(read))) = step(1) else {
+        panic!("step 1's retirement was stranded or carried no failure: {retired:?}");
+    };
+    assert!(
+        matches!(read, GpuError::Poisoned(_) | GpuError::Fault { .. }),
+        "{read:?}"
+    );
+    if retire_steps {
+        let Some((_, _, Some(first))) = step(0) else {
+            panic!("step 0's retirement is missing: {retired:?}");
+        };
+        assert!(
+            matches!(first, GpuError::Fault { code: 700, .. }),
+            "{first:?}"
+        );
+    } else {
+        assert!(step(0).is_none());
+    }
+    assert!(
+        lock(&plan.probe.failed).is_empty(),
+        "nothing was refused yet"
+    );
+    // Later work fails fast: an item's submission on the poisoned device ends it with `failed`.
+    let mut late = Item1::first(&plan);
+    late.tag = 9;
+    opened
+        .intakes
+        .deliver(late, Deliver::Lane(LaneId(0)))
+        .unwrap();
+    pump(&opened.sources);
+    let failed = lock(&plan.probe.failed).clone();
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert_eq!((failed[0].0, failed[0].1), (9, 0));
+    assert!(
+        matches!(failed[0].2, GpuError::Poisoned(_)),
+        "{:?}",
+        failed[0].2
+    );
+    assert!(
+        gpu.log()
+            .iter()
+            .filter(|op| matches!(op, FakeOp::Launch { .. }))
+            .count()
+            <= 1,
+        "nothing ran behind the fault"
+    );
+}
+
+#[test]
+fn a_retirement_behind_a_faulted_lane_is_reported_not_stranded() {
+    fault_run(false);
+}
+
+#[test]
+fn every_retirement_of_a_fault_run_reaches_its_item() {
+    fault_run(true);
 }
 
 #[test]

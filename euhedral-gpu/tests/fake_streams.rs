@@ -335,6 +335,8 @@ fn a_poisoned_device_still_emits_retire_into_continuations() {
         .is_ok()
     );
     assert!(gpu.step(), "only the faulting launch runs");
+    // The host learns of the fault from a call that reaches the device.
+    gpu.observe_fault();
     assert!(gpu.poisoned().is_some());
     let mut emitted = 0;
     for _ in 0..1000 {
@@ -445,6 +447,7 @@ fn a_poisoned_device_reports_the_retirements_still_outstanding() {
     }
     assert!(gpu.step(), "only the faulting launch runs");
     assert!(seen.lock().unwrap().is_empty());
+    gpu.observe_fault();
     s[1].poll_retired();
     let seen = seen.lock().unwrap();
     assert_eq!(seen.len(), 2, "each reported once, none stranded");
@@ -559,8 +562,8 @@ fn the_priority_option_reaches_the_stream() {
             &[high, StreamOptions::default()],
         )
         .unwrap();
-    assert_eq!(s[0].priority(), FAKE_GREATEST_PRIORITY);
-    assert_eq!(s[1].priority(), FAKE_NORMAL_PRIORITY);
+    assert_eq!(s[0].priority().unwrap(), FAKE_GREATEST_PRIORITY);
+    assert_eq!(s[1].priority().unwrap(), FAKE_NORMAL_PRIORITY);
 }
 
 #[test]

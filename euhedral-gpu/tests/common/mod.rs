@@ -26,16 +26,15 @@ pub type Kern<S> = <<S as Stream>::Gpu as Gpu>::Kernel;
 /// The launches of one kernel item: kernels with their arguments.
 pub type Launches<S> = Vec<(Kern<S>, Args)>;
 
-/// What the items of a test record.
+/// What the items of a test record. Items are named by `(tag, step)`: the tag of the chain, the step in it.
 #[derive(Default)]
 pub struct Probe {
-    /// Tags of the items that ran, in order.
-    pub ran: Mutex<Vec<u64>>,
-    pub retired: Mutex<Vec<(u64, Option<GpuError>)>>,
-    pub failed: Mutex<Vec<(u64, GpuError)>>,
+    /// `(tag, step)` of the items that ran, in order.
+    pub ran: Mutex<Vec<(u64, u32)>>,
+    pub retired: Mutex<Vec<(u64, u32, Option<GpuError>)>>,
+    /// Items the lane ended with `failed`: a submission the device refused, or an await or mark it refused.
+    pub failed: Mutex<Vec<(u64, u32, GpuError)>>,
     pub bridged: Mutex<Vec<(u64, Marker)>>,
-    /// Submissions an item could not make.
-    pub submit_errors: Mutex<Vec<(u64, GpuError)>>,
     pub dropped: AtomicUsize,
 }
 
@@ -44,8 +43,42 @@ impl Probe {
         Arc::new(Self::default())
     }
 
-    pub fn ran(&self) -> Vec<u64> {
+    pub fn ran(&self) -> Vec<(u64, u32)> {
         lock(&self.ran).clone()
+    }
+}
+
+/// A host word the device copies into: a pointer to 4 bytes, `Copy`, valid as its constructor says.
+#[derive(Clone, Copy, Debug)]
+pub struct HostWord(*mut u32);
+
+// SAFETY: the word is plain memory that the device writes and the host reads after the retirement; the constructor's
+// contract keeps it alive.
+unsafe impl Send for HostWord {}
+// SAFETY: as above.
+unsafe impl Sync for HostWord {}
+
+impl HostWord {
+    /// A word that is never freed: 4 bytes per call.
+    pub fn leaked() -> Self {
+        Self(Box::leak(Box::new(AtomicU32::new(0))).as_ptr())
+    }
+
+    /// # Safety
+    /// `ptr` is aligned and valid for reads and writes of 4 bytes (pinned host memory for a CUDA copy) until every item
+    /// that holds the word is gone.
+    pub unsafe fn from_raw(ptr: *mut u32) -> Self {
+        Self(ptr)
+    }
+
+    pub fn bytes(&self) -> *mut u8 {
+        self.0.cast()
+    }
+
+    /// The word, after the retirement that covers the copy.
+    pub fn load(&self) -> u32 {
+        // SAFETY: valid for reads by the constructor's contract.
+        unsafe { self.0.read_volatile() }
     }
 }
 
@@ -59,7 +92,7 @@ pub struct Plan<S: Stream> {
     pub launches: Box<dyn Fn(u32) -> Launches<S> + Send + Sync>,
     /// The device word the last item copies, and the host word it copies to.
     pub device_word: u64,
-    pub host_word: Arc<AtomicU32>,
+    pub host_word: HostWord,
     pub probe: Arc<Probe>,
     /// Every kernel item asks for a retirement too, not only the last item.
     pub retire_steps: bool,
@@ -74,6 +107,7 @@ pub struct Item<S: Stream> {
 }
 
 impl<S: Stream> Item<S> {
+    /// Step 0 of a chain.
     pub fn first(plan: &Arc<Plan<S>>) -> Self {
         Self {
             tag: 0,
@@ -108,9 +142,9 @@ where
         &self.waits
     }
 
-    fn run(&mut self, cx: &mut LaneCx<'_, S, (), Self>) -> Outcome<Infallible> {
+    fn run(&mut self, cx: &mut LaneCx<'_, S, (), Self>) -> Outcome<Infallible, GpuError> {
         let probe = self.plan.probe.clone();
-        lock(&probe.ran).push(u64::from(self.step) + self.tag * 1_000_000);
+        lock(&probe.ran).push((self.tag, self.step));
         for &marker in &self.waits {
             if cx.bridges(marker) {
                 lock(&probe.bridged).push((self.tag, marker));
@@ -123,7 +157,7 @@ where
             if last {
                 // SAFETY: the host word lives in the plan, which this item keeps until the retirement arrives; the
                 // device word is a live allocation that only the chain touches.
-                unsafe { q.copy_to_host(plan.host_word.as_ptr().cast::<u8>(), plan.device_word, 4) }
+                unsafe { q.copy_to_host(plan.host_word.bytes(), plan.device_word, 4) }
             } else {
                 for (kernel, args) in (plan.launches)(step) {
                     // SAFETY: the arguments match the kernel; the device word is a live allocation that only the
@@ -137,10 +171,7 @@ where
             Ok(()) => Outcome::Submitted {
                 retire: last || plan.retire_steps,
             },
-            Err(error) => {
-                lock(&probe.submit_errors).push((self.tag, error));
-                Outcome::Finished
-            }
+            Err(error) => Outcome::Failed(error),
         }
     }
 
@@ -160,14 +191,12 @@ where
     }
 
     fn retired(self, _marker: Marker, failure: Option<GpuError>, cx: &mut LaneCx<'_, S, (), Self>) {
-        lock(&self.plan.probe.retired).push((self.tag, failure));
-        cx.ready(Value::frame(u64::from(
-            self.plan.host_word.load(Ordering::SeqCst),
-        )));
+        lock(&self.plan.probe.retired).push((self.tag, self.step, failure));
+        cx.ready(Value::frame(u64::from(self.plan.host_word.load())));
     }
 
     fn failed(self, error: GpuError, _cx: &mut LaneCx<'_, S, (), Self>) {
-        lock(&self.plan.probe.failed).push((self.tag, error));
+        lock(&self.plan.probe.failed).push((self.tag, self.step, error));
     }
 }
 
@@ -243,3 +272,18 @@ where
         source.request(u64::MAX);
     }
 }
+
+/// One round that starts at source `start` and goes round: the sources visit the shared intake in turn, so each of a
+/// group's lanes takes group work.
+pub fn pump_from<S, W>(sources: &[Arc<LaneSource<S, (), W>>], start: usize)
+where
+    S: LaneSubmit,
+    W: LaneWork<S, ()>,
+{
+    for i in 0..sources.len() {
+        sources[(start + i) % sources.len()].request(u64::MAX);
+    }
+}
+
+#[cfg(feature = "cuda")]
+pub mod cuda_support;

@@ -10,63 +10,22 @@ mod common;
 use std::convert::Infallible;
 use std::marker::PhantomData;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use common::{Item, Plan, Probe, Value, collect_all, lock, pump};
+use common::cuda_support::{Pinned, device_word, gpu, module, wait_until};
+use common::{HostWord, Item, Plan, Probe, Value, collect_all, lock, pump_from};
 use euhedral_gpu::cuda::{CudaGpu, CudaKernel, CudaModule, CudaStream};
 use euhedral_gpu::{
-    Args, CompileOptions, Enqueue, Gpu, GpuError, LaneSpec, Launch, Module, Stream, StreamOptions,
-    StreamPriority, open_lane_sources,
+    Args, Enqueue, Gpu, GpuError, LaneSpec, Launch, Module, Stream, StreamOptions, StreamPriority,
+    open_lane_sources,
 };
 use euhedral_graph::testing::FakeLanes;
 use euhedral_graph::{
     Deliver, GroupId, LaneCx, LaneId, LaneIntakes, LanePoolBuilder, LaneSource, LaneSubmit,
     LaneWork, Marker, Outcome,
 };
-use euhedral_memory::cuda::DeviceMemory;
-use euhedral_memory::{Backend, LocationId};
-
-const OPS: &str = include_str!("kernels/ops.cu");
-const OPS_PTX: &[u8] = include_bytes!("kernels/ops.ptx");
 
 type CudaItem = Item<CudaStream>;
-
-fn gpu() -> Option<Arc<CudaGpu>> {
-    match CudaGpu::open(0) {
-        Ok(gpu) => Some(gpu),
-        Err(e) => {
-            eprintln!("no CUDA device: skipped ({e})");
-            None
-        }
-    }
-}
-
-fn module(gpu: &Arc<CudaGpu>) -> Option<CudaModule> {
-    let module = if gpu.driver_version() >= 13010 {
-        CudaModule::from_image(gpu, OPS_PTX)
-    } else {
-        CudaModule::from_source(gpu, OPS, &CompileOptions::default())
-    };
-    match module {
-        Ok(module) => Some(module),
-        Err(e) => {
-            eprintln!("no way to load the test kernels: skipped ({e})");
-            None
-        }
-    }
-}
-
-fn wait_until(limit: Duration, mut condition: impl FnMut() -> bool) -> bool {
-    let start = Instant::now();
-    while !condition() {
-        if start.elapsed() > limit {
-            return false;
-        }
-        std::thread::sleep(Duration::from_micros(100));
-    }
-    true
-}
 
 fn specs(names: &[(&str, StreamPriority)]) -> Vec<LaneSpec<()>> {
     names
@@ -82,33 +41,13 @@ fn specs(names: &[(&str, StreamPriority)]) -> Vec<LaneSpec<()>> {
         .collect()
 }
 
-/// Zeroes `bytes` at `addr` on a stream of its own and waits for it from the test thread.
-fn zero(gpu: &Arc<CudaGpu>, addr: u64, bytes: usize) {
-    let (pool, mut s) = gpu.open_lanes(&["zero"], StreamOptions::default()).unwrap();
-    s[0].submit(|q| {
-        // SAFETY: a live device allocation that nothing else uses yet.
-        unsafe { q.memset(addr, 0, bytes) }
-    })
-    .unwrap();
-    let marker = Stream::mark(&mut s[0]).unwrap();
-    assert!(wait_until(Duration::from_secs(5), || pool.reached(marker)));
-}
-
-fn device_word(gpu: &Arc<CudaGpu>) -> (DeviceMemory, euhedral_memory::Block) {
-    let mem = DeviceMemory {
-        device: gpu.device().clone(),
-        location: LocationId(0),
-    };
-    let block = mem.alloc(256).unwrap();
-    zero(gpu, block.addr, 256);
-    (mem, block)
-}
-
-/// A chain of `steps` fold items: each spins a little, then sets `x = 0.5 * x + c`, an order-sensitive fold of a float
-/// word; the host word receives its bits.
+/// A chain of `steps` fold items: even steps spin for about a millisecond, then every step sets `x = 0.5 * x + c`, an
+/// order-sensitive fold of a float word; the host word receives its bits. A step that ran before its predecessor
+/// finished (a lane that did not wait for the marker) would read the word too early.
 fn fold_plan(
     module: &CudaModule,
     word: u64,
+    host: HostWord,
     steps: u32,
     route: impl Fn(u32) -> Deliver + Send + Sync + 'static,
 ) -> (Arc<Plan<CudaStream>>, f32) {
@@ -120,21 +59,23 @@ fn fold_plan(
         steps,
         route: Box::new(route),
         launches: Box::new(move |step| {
-            vec![
-                (spin.clone(), Args::new().arg(200_000u64)),
-                (
-                    axpb.clone(),
-                    Args::new()
-                        .device(word)
-                        .device(word)
-                        .arg(0.5f32)
-                        .arg(c(step))
-                        .arg(1u32),
-                ),
-            ]
+            let fold = (
+                axpb.clone(),
+                Args::new()
+                    .device(word)
+                    .device(word)
+                    .arg(0.5f32)
+                    .arg(c(step))
+                    .arg(1u32),
+            );
+            if step % 2 == 0 {
+                vec![(spin.clone(), Args::new().arg(2_000_000u64)), fold]
+            } else {
+                vec![fold]
+            }
         }),
         device_word: word,
-        host_word: Arc::new(AtomicU32::new(0)),
+        host_word: host,
         probe: Probe::new(),
         retire_steps: false,
         _stream: PhantomData,
@@ -147,6 +88,7 @@ fn lane_sources_on_the_device_run_a_chain_and_retire_it() {
     let Some(gpu) = gpu() else { return };
     let Some(module) = module(&gpu) else { return };
     let (mem, block) = device_word(&gpu);
+    let pinned = Pinned::new(&gpu);
     let opened = open_lane_sources::<_, (), CudaItem>(
         &gpu,
         specs(&[
@@ -160,7 +102,7 @@ fn lane_sources_on_the_device_run_a_chain_and_retire_it() {
     .unwrap();
     // 300 items alternate between the group and the high-priority lane, then one copies the word out and retires.
     let steps = 300;
-    let (plan, expected) = fold_plan(&module, block.addr, steps, |step| {
+    let (plan, expected) = fold_plan(&module, block.addr, pinned.word(), steps, |step| {
         if step % 2 == 0 {
             Deliver::Group(GroupId(0))
         } else {
@@ -172,9 +114,12 @@ fn lane_sources_on_the_device_run_a_chain_and_retire_it() {
         .intakes
         .deliver(CudaItem::first(&plan), Deliver::Group(GroupId(0)))
         .unwrap();
+    // The start of each round rotates, so k1 and k2 take group work too.
+    let mut round = 0;
     assert!(
         wait_until(Duration::from_secs(10), || {
-            pump(&opened.sources);
+            pump_from(&opened.sources, round % 4);
+            round += 1;
             !collect.received().is_empty()
         }),
         "the chain did not finish in time: {} items ran",
@@ -184,14 +129,14 @@ fn lane_sources_on_the_device_run_a_chain_and_retire_it() {
     let got = f32::from_bits(u32::try_from(collect.received()[0]).unwrap());
     assert_eq!(got, expected, "the fold ran out of order");
     assert!(lock(&plan.probe.failed).is_empty());
-    assert!(lock(&plan.probe.submit_errors).is_empty());
     let retired = lock(&plan.probe.retired).clone();
     assert_eq!(retired.len(), 1);
-    assert!(retired[0].1.is_none(), "{retired:?}");
+    assert!(retired[0].2.is_none(), "{retired:?}");
     assert_eq!(plan.probe.ran().len(), steps as usize + 1);
     drop((opened, collect));
     // SAFETY: the lanes are gone (their streams waited for their work); nothing uses the block.
-    unsafe { mem.free(block) };
+    unsafe { euhedral_memory::Backend::free(&mem, block) };
+    drop(pinned);
 }
 
 #[test]
@@ -228,7 +173,7 @@ struct RawMemset {
     gpu: Arc<CudaGpu>,
     spin: CudaKernel,
     dst: u64,
-    host: Arc<AtomicU32>,
+    host: HostWord,
     probe: Arc<Probe>,
     stage: u8,
     waits: Vec<Marker>,
@@ -245,36 +190,36 @@ impl LaneWork<CudaStream, ()> for RawMemset {
         &self.waits
     }
 
-    fn run(&mut self, cx: &mut LaneCx<'_, CudaStream, (), Self>) -> Outcome<Infallible> {
-        lock(&self.probe.ran).push(u64::from(self.stage));
+    fn run(&mut self, cx: &mut LaneCx<'_, CudaStream, (), Self>) -> Outcome<Infallible, GpuError> {
+        lock(&self.probe.ran).push((0, u32::from(self.stage)));
         if self.stage == 1 {
-            let (dst, host) = (self.dst, self.host.as_ptr().cast::<u8>());
-            let read = cx
-                .submitter()
-                .submit(|q| {
-                    // SAFETY: the host word lives in this item, kept until the retirement; the device word is a live
-                    // allocation behind the memset.
-                    unsafe { q.copy_to_host(host, dst, 4) }
-                })
-                .is_ok();
-            assert!(read);
-            return Outcome::Submitted { retire: true };
+            let (dst, host) = (self.dst, self.host.bytes());
+            let read = cx.submitter().submit(|q| {
+                // SAFETY: the host word is pinned and lives until the test frees it, after the lanes are gone; the
+                // device word is a live allocation behind the memset.
+                unsafe { q.copy_to_host(host, dst, 4) }
+            });
+            return match read {
+                Ok(()) => Outcome::Submitted { retire: true },
+                Err(error) => Outcome::Failed(error),
+            };
         }
         let spin = self.spin.clone();
-        cx.submitter()
-            .submit(|q| {
-                // SAFETY: the spin touches no memory.
-                unsafe { q.launch(&spin, Launch::linear(1, 1), &Args::new().arg(20_000_000u64)) }
-            })
-            .unwrap();
+        let spun = cx.submitter().submit(|q| {
+            // SAFETY: the spin touches no memory.
+            unsafe { q.launch(&spin, Launch::linear(1, 1), &Args::new().arg(20_000_000u64)) }
+        });
+        if let Err(error) = spun {
+            return Outcome::Failed(error);
+        }
         let symbol = self.gpu.device().driver.symbol(c"cuMemsetD8Async");
         assert!(!symbol.is_null());
         // SAFETY: the driver exports cuMemsetD8Async(CUdeviceptr, unsigned char, size_t, CUstream) -> CUresult.
         let memset: unsafe extern "C" fn(u64, u8, usize, *mut std::ffi::c_void) -> i32 =
             unsafe { std::mem::transmute(symbol) };
         let _context = self.gpu.device().enter().unwrap();
-        // SAFETY: the lane's handle, used from inside an item of this lane; the next mark covers the work. The
-        // destination is a live allocation of at least 4 bytes that only this chain touches.
+        // SAFETY: the lane's handle, used from inside an item of this lane with the context current; the next mark
+        // covers the work. The destination is a live allocation of at least 4 bytes that only this chain touches.
         let code = unsafe { memset(self.dst, 0xAB, 4, cx.submitter().raw()) };
         assert_eq!(code, 0);
         Outcome::Submitted { retire: false }
@@ -288,7 +233,7 @@ impl LaneWork<CudaStream, ()> for RawMemset {
             gpu: self.gpu.clone(),
             spin: self.spin.clone(),
             dst: self.dst,
-            host: self.host.clone(),
+            host: self.host,
             probe: self.probe.clone(),
             stage: 1,
             waits: marker.into_iter().collect(),
@@ -303,11 +248,11 @@ impl LaneWork<CudaStream, ()> for RawMemset {
         cx: &mut LaneCx<'_, CudaStream, (), Self>,
     ) {
         assert!(failure.is_none(), "{failure:?}");
-        cx.ready(Value::frame(u64::from(self.host.load(Ordering::SeqCst))));
+        cx.ready(Value::frame(u64::from(self.host.load())));
     }
 
     fn failed(self, error: GpuError, _cx: &mut LaneCx<'_, CudaStream, (), Self>) {
-        lock(&self.probe.failed).push((u64::from(self.stage), error));
+        lock(&self.probe.failed).push((0, u32::from(self.stage), error));
     }
 }
 
@@ -316,6 +261,7 @@ fn work_enqueued_on_the_raw_handle_is_covered_by_the_next_mark() {
     let Some(gpu) = gpu() else { return };
     let Some(module) = module(&gpu) else { return };
     let (mem, block) = device_word(&gpu);
+    let pinned = Pinned::new(&gpu);
     let opened = open_lane_sources::<_, (), RawMemset>(
         &gpu,
         specs(&[("a", StreamPriority::Normal), ("b", StreamPriority::Normal)]),
@@ -328,7 +274,7 @@ fn work_enqueued_on_the_raw_handle_is_covered_by_the_next_mark() {
         gpu: gpu.clone(),
         spin: module.kernel("spin").unwrap(),
         dst: block.addr,
-        host: Arc::new(AtomicU32::new(0)),
+        host: pinned.word(),
         probe: probe.clone(),
         stage: 0,
         waits: Vec::new(),
@@ -337,8 +283,10 @@ fn work_enqueued_on_the_raw_handle_is_covered_by_the_next_mark() {
         .intakes
         .deliver(first, Deliver::Lane(LaneId(0)))
         .unwrap();
+    let mut round = 0;
     assert!(wait_until(Duration::from_secs(10), || {
-        pump(&opened.sources);
+        pump_from(&opened.sources, round % 2);
+        round += 1;
         !collect.received().is_empty()
     }));
     // The dependent item on lane b copied the bytes out behind the marker that covers the raw memset.
@@ -346,7 +294,8 @@ fn work_enqueued_on_the_raw_handle_is_covered_by_the_next_mark() {
     assert!(lock(&probe.failed).is_empty());
     drop((opened, collect));
     // SAFETY: the lanes are gone; nothing uses the block.
-    unsafe { mem.free(block) };
+    unsafe { euhedral_memory::Backend::free(&mem, block) };
+    drop(pinned);
 }
 
 #[test]
@@ -354,13 +303,18 @@ fn a_foreign_lane_in_the_pool_is_bridged_not_awaited() {
     let Some(gpu) = gpu() else { return };
     let Some(module) = module(&gpu) else { return };
     let (mem, block) = device_word(&gpu);
-    // One pool of two backends: CUDA lanes 0 and 1, and a foreign lane 2.
+    let pinned = Pinned::new(&gpu);
+    // One pool of two backends. The foreign lane is reserved first, so the CUDA lanes open at ids 1 and 2 and the
+    // lane array has a hole below them.
     let mut builder = LanePoolBuilder::new();
-    let first = builder.reserve(2);
     let foreign_first = builder.reserve(1);
+    let first = builder.reserve(2);
+    assert_eq!((foreign_first, first), (LaneId(0), LaneId(1)));
     let streams = gpu
         .open_lanes_at(first, &["a", "b"], &[StreamOptions::default(); 2])
         .unwrap();
+    assert_eq!(Stream::lane(&streams[0]), LaneId(1));
+    assert_eq!(Stream::lane(&streams[1]), LaneId(2));
     for stream in &streams {
         builder.set(Stream::lane(stream), Stream::queue(stream));
     }
@@ -369,20 +323,34 @@ fn a_foreign_lane_in_the_pool_is_bridged_not_awaited() {
     let pool = builder.build();
     let marker = LaneSubmit::mark(&mut foreign[0]).unwrap().unwrap();
     assert!(!LaneSubmit::accepts(&streams[0], marker));
+    // The hole below the call's first lane is a lane of no stream, even under this stream's own queue.
+    let hole = Marker::new(Stream::id(&streams[0]), LaneId(0), 1);
+    assert!(!LaneSubmit::accepts(&streams[0], hole));
+    // Awaiting it is refused, not an index out of range.
+    let mut probe_stream = streams;
+    assert!(matches!(
+        Stream::await_marker(&mut probe_stream[0], hole),
+        Err(GpuError::Invalid(_))
+    ));
     let (intakes, inputs) = LaneIntakes::<CudaItem>::new(pool, &[]);
-    let sources: Vec<_> = streams
+    // The foreign lane has no source; the inputs are in lane order, so the CUDA lanes' are the ones after it.
+    let sources: Vec<_> = probe_stream
         .into_iter()
-        .zip(inputs)
+        .zip(inputs.into_iter().skip(1))
         .map(|(stream, input)| LaneSource::new(stream, (), input, intakes.clone()))
         .collect();
     let collect = collect_all(&sources);
     // A chain of one step, then the read; the first item names the foreign marker among its inputs.
-    let (plan, expected) = fold_plan(&module, block.addr, 1, |_| Deliver::Lane(LaneId(1)));
+    let (plan, expected) = fold_plan(&module, block.addr, pinned.word(), 1, |_| {
+        Deliver::Lane(LaneId(2))
+    });
     let mut item = CudaItem::first(&plan);
     item.waits = vec![marker];
-    intakes.deliver(item, Deliver::Lane(LaneId(0))).unwrap();
+    intakes.deliver(item, Deliver::Lane(first)).unwrap();
+    let mut round = 0;
     assert!(wait_until(Duration::from_secs(10), || {
-        pump(&sources);
+        pump_from(&sources, round % 2);
+        round += 1;
         !collect.received().is_empty()
     }));
     // The foreign marker is for the item to bridge; the lane never tried to wait for it on the device (which would
@@ -395,5 +363,6 @@ fn a_foreign_lane_in_the_pool_is_bridged_not_awaited() {
     );
     drop((sources, intakes, collect));
     // SAFETY: the lanes are gone; nothing uses the block.
-    unsafe { mem.free(block) };
+    unsafe { euhedral_memory::Backend::free(&mem, block) };
+    drop(pinned);
 }
