@@ -26,18 +26,26 @@
 //! and when no unit has been admitted for the idle time the watch detaches the sinks and itself,
 //! leaving the lattice with nothing to poll. The next unit attaches a fresh set.
 //! [`Duration::ZERO`] as the idle time keeps the sinks attached.
+//!
+//! **The hot side is lock-free** (Java's volatile `generation`): the attached set is a cell of the lattice's registry,
+//! so [`Lake::offer`] and [`Lake::admit`] read it from the calling thread's view with no lock and no reference count
+//! (a thread that is not a registered reader of the registry takes the lock for each call: a producer thread calls
+//! [`UpstreamRegistry::register_reader`] once). Attaching a set (the first unit of a busy period) and detaching it are
+//! rebalance work under a lifecycle lock, taken off the hot scope; a set that is detached stays allocated until every
+//! reader has applied the change.
 
 use std::error::Error;
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-#[allow(clippy::disallowed_types, reason = "HOT-FIX(G7)")]
-use std::sync::{Arc, PoisonError, RwLock, Weak};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use euhedral_core::control_plane::{ControlPlaneLattice, LatticeError};
+use euhedral_core::flow_control::Cell;
+use euhedral_core::flow_control::UpstreamRegistry;
 use euhedral_core::frames::Frame;
-use euhedral_core::generics::{FrameSink, LatticeReceiver, LatticeSource};
+use euhedral_core::generics::{DownstreamSlot, FrameSink, LatticeReceiver, LatticeSource};
 use euhedral_core::ingest::{IngestSink, QueueIngestSink};
 use euhedral_data_structures::sync::{HotScope, LifecycleMutex};
 
@@ -117,8 +125,13 @@ impl Admission {
 
     /// Has the lake been without a unit for `idle`?
     fn idle_for(&self, idle: Duration) -> bool {
+        // The count first: a terminate stores the time before it lowers the count, so a watch that sees the count
+        // at zero sees the time it reached zero, not an earlier one.
+        if self.units() != 0 {
+            return false;
+        }
         let since = self.idle_since.load(Ordering::Acquire);
-        self.units() == 0 && u128::from(self.nanos().saturating_sub(since)) >= idle.as_nanos()
+        u128::from(self.nanos().saturating_sub(since)) >= idle.as_nanos()
     }
 }
 
@@ -160,12 +173,17 @@ impl Generation {
 /// The pool of ready work of one kind. See the [module](self) documentation.
 pub struct Lake {
     lattice: Arc<ControlPlaneLattice>,
+    /// The lattice's registry, whose epoch domain `generation` is read under.
+    registry: Arc<UpstreamRegistry>,
     sinks: NonZeroUsize,
     idle_release: Duration,
     admission: Arc<Admission>,
-    /// The sinks attached now with their watch, or `None` while none are.
-    #[allow(clippy::disallowed_types, reason = "HOT-FIX(G7)")]
-    generation: RwLock<Option<Arc<Generation>>>,
+    /// The sinks attached now with their watch, or empty while none are (Java's volatile `generation`): read with
+    /// a pinned load, changed under `current`.
+    generation: Cell<Generation>,
+    /// The attach lock (Java's `synchronized (attachedSources)`) and the set it guards: the one attached now. Taken
+    /// by `attach`, `detach`, `discard` and `complete`, off the hot scope.
+    current: LifecycleMutex<Option<Arc<Generation>>>,
     /// Generations made so far.
     attachments: AtomicU64,
     /// Generations taken out of `generation` whose sinks have not all completed yet: draining.
@@ -188,18 +206,20 @@ impl Lake {
     /// A lake of `sinks` ingest sinks. They attach to `lattice` when the first unit is admitted,
     /// not before, and detach once no unit has been admitted for `idle_release`
     /// ([`Duration::ZERO`]: they stay attached).
-    #[allow(clippy::disallowed_types, reason = "HOT-FIX(G7)")]
     pub fn new(
         lattice: Arc<ControlPlaneLattice>,
         sinks: NonZeroUsize,
         idle_release: Duration,
     ) -> Arc<Self> {
+        let registry = lattice.registry().clone();
         Arc::new_cyclic(|this| Self {
+            generation: registry.cell(),
+            registry,
             lattice,
             sinks,
             idle_release,
             admission: Arc::new(Admission::new()),
-            generation: RwLock::new(None),
+            current: LifecycleMutex::new(None),
             attachments: AtomicU64::new(0),
             retiring: LifecycleMutex::new(Vec::new()),
             finished: AtomicBool::new(false),
@@ -224,32 +244,47 @@ impl Lake {
                 .upgrade()
                 .expect("a lake that is being used is alive"),
         };
-        self.attach(false)?;
+        self.ensure_attached()?;
         Ok(guard)
     }
 
     /// Queues `frame` in the sink its routing hash selects, or hands it back when no unit is
     /// admitted or the lake has completed.
+    ///
+    /// Java's `publish` loop: read the set, offer to the sink the routing hash picks; a set detached while the
+    /// frame was on its way refuses it, and the frame goes to the set attached since. A lake that finished, or an
+    /// attach that returns the set that refused, hands the frame back.
     pub fn offer(&self, frame: Box<dyn Frame>) -> Result<(), Box<dyn Frame>> {
         let _hot = HotScope::enter();
         let mut frame = frame;
-        let Ok(mut generation) = self.attach_for_offer() else {
-            return Err(frame);
-        };
+        let mut refused_by = None;
         loop {
-            match generation.sink_of(&*frame).offer(frame) {
-                Ok(()) => return Ok(()),
-                Err(refused) => frame = refused,
-            }
-            // The set detached while the frame was on its way: the frame goes to the set attached
-            // since, if its unit still holds the lake open.
-            let Ok(next) = self.attach_for_offer() else {
-                return Err(frame);
-            };
-            if Arc::ptr_eq(&next, &generation) {
+            if self.admission.units() == 0 || self.is_complete() {
                 return Err(frame);
             }
-            generation = next;
+            let attempt = self
+                .registry
+                .with_view(move |view| match view.get(&self.generation) {
+                    None => Attempt::Detached(frame),
+                    Some(generation) => match generation.sink_of(&*frame).offer(frame) {
+                        Ok(()) => Attempt::Done,
+                        Err(refused) => Attempt::Refused(refused, generation.id),
+                    },
+                });
+            match attempt {
+                Attempt::Done => return Ok(()),
+                Attempt::Detached(returned) => frame = returned,
+                Attempt::Refused(returned, id) => {
+                    frame = returned;
+                    refused_by = Some(id);
+                }
+            }
+            // The set detached while the frame was on its way, or none is attached: the frame goes to the set
+            // attached since, if its unit still holds the lake open.
+            match self.attach(true) {
+                Ok(next) if refused_by != Some(next.id) => {}
+                _ => return Err(frame),
+            }
         }
     }
 
@@ -280,9 +315,8 @@ impl Lake {
         let live =
             |generation: &Generation| generation.sinks.iter().any(|sink| !sink.is_complete());
         if self
-            .generation
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
+            .current
+            .lock()
             .as_ref()
             .is_some_and(|generation| live(generation))
         {
@@ -313,41 +347,41 @@ impl Lake {
         self.sinks.get()
     }
 
-    /// The sinks attached now; attaches a fresh set (and the watch) when there are none.
+    /// Makes sure a set is attached: one pinned load while one is.
+    fn ensure_attached(&self) -> Result<(), LakeClosed> {
+        let attached = self
+            .registry
+            .with_view(|view| view.get(&self.generation).is_some());
+        if attached {
+            return Ok(());
+        }
+        self.attach(false).map(drop)
+    }
+
+    /// The sinks attached now; attaches a fresh set (and the watch) when there are none (Java's `attach`, under
+    /// the attach lock, which is rebalance work and so taken off the hot scope).
     ///
     /// `for_offer`: the attach is for a frame, so no generation is made unless a unit is admitted
     /// when the lock is held (a unit that ended since the caller looked must not leave sinks
     /// attached for nothing).
     fn attach(&self, for_offer: bool) -> Result<Arc<Generation>, LakeClosed> {
-        if let Some(current) = self
-            .generation
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
-        {
-            return Ok(current);
-        }
-        // The first attach of a busy period is rebalance work, also when an offer starts it.
         let _cold = HotScope::leave();
         let (generation, fresh) = {
-            let mut slot = self
-                .generation
-                .write()
-                .unwrap_or_else(PoisonError::into_inner);
+            let mut current = self.current.lock();
+            if let Some(attached) = current.as_ref() {
+                return Ok(attached.clone());
+            }
             if self.finished.load(Ordering::Acquire) {
                 return Err(LakeClosed::Completed);
             }
-            if for_offer && slot.is_none() && self.admission.units() == 0 {
+            if for_offer && self.admission.units() == 0 {
                 return Err(LakeClosed::Completed);
             }
-            match slot.as_ref() {
-                Some(current) => (current.clone(), false),
-                None => {
-                    let generation = Arc::new(self.generation_of_sinks());
-                    *slot = Some(generation.clone());
-                    (generation, true)
-                }
-            }
+            let generation = Arc::new(self.generation_of_sinks());
+            self.registry
+                .set_cell(&self.generation, Some(generation.clone()));
+            *current = Some(generation.clone());
+            (generation, true)
         };
         // Outside the lock: attaching asks the new sources for demand, and a watch may poll at once.
         if fresh && let Err(error) = self.register(&generation) {
@@ -355,14 +389,6 @@ impl Lake {
             return Err(error);
         }
         Ok(generation)
-    }
-
-    /// As [`attach`](Self::attach), for a frame: only while a unit is admitted.
-    fn attach_for_offer(&self) -> Result<Arc<Generation>, LakeClosed> {
-        if self.admission.units() == 0 || self.is_complete() {
-            return Err(LakeClosed::Completed);
-        }
-        self.attach(true)
     }
 
     fn generation_of_sinks(&self) -> Generation {
@@ -378,8 +404,7 @@ impl Lake {
                     admission: self.admission.clone(),
                     idle: self.idle_release,
                     generation: id,
-                    downstream: LifecycleMutex::new(None),
-                    complete: AtomicBool::new(false),
+                    downstream: DownstreamSlot::new(),
                 })
             }),
         }
@@ -403,36 +428,33 @@ impl Lake {
     /// Drops a generation the lattice would not take.
     fn discard(&self, generation: &Arc<Generation>) {
         {
-            let mut slot = self
-                .generation
-                .write()
-                .unwrap_or_else(PoisonError::into_inner);
-            if slot
+            let mut current = self.current.lock();
+            if current
                 .as_ref()
-                .is_some_and(|current| Arc::ptr_eq(current, generation))
+                .is_some_and(|attached| Arc::ptr_eq(attached, generation))
             {
-                *slot = None;
+                *current = None;
+                self.registry.set_cell(&self.generation, None);
             }
         }
         generation.abort();
     }
 
-    /// Detaches generation `id` when no unit is admitted: its watch found the lake idle.
+    /// Detaches generation `id` when no unit is admitted: its watch found the lake idle (Java's `detach`, under
+    /// the attach lock).
     fn detach(&self, id: u64) {
         // The idle watch detaches from a poll: rebalance work on a worker's thread.
         let _cold = HotScope::leave();
         let detached = {
-            let mut slot = self
-                .generation
-                .write()
-                .unwrap_or_else(PoisonError::into_inner);
+            let mut current = self.current.lock();
             // A unit admitted after this check attaches a fresh set: it counts itself before it
             // asks for one.
             if self.admission.units() == 0
                 && !self.is_complete()
-                && slot.as_ref().is_some_and(|current| current.id == id)
+                && current.as_ref().is_some_and(|attached| attached.id == id)
             {
-                slot.take()
+                self.registry.set_cell(&self.generation, None);
+                current.take()
             } else {
                 None
             }
@@ -449,11 +471,11 @@ impl Lake {
         if self.finished.swap(true, Ordering::AcqRel) {
             return;
         }
-        let attached = self
-            .generation
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
+        let attached = {
+            let mut current = self.current.lock();
+            self.registry.set_cell(&self.generation, None);
+            current.take()
+        };
         if let Some(generation) = attached {
             self.retire(generation);
         }
@@ -463,11 +485,9 @@ impl Lake {
 impl Drop for Lake {
     /// A lake dropped before it completed lets its sinks drain and complete.
     fn drop(&mut self) {
-        let attached = self
-            .generation
-            .get_mut()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
+        let attached = self.current.lock().take();
+        // The registry holds the set too: let go of it with the lake.
+        self.registry.set_cell(&self.generation, None);
         if let Some(generation) = attached {
             generation.finish();
         }
@@ -511,20 +531,30 @@ impl Drop for UnitGuard {
     }
 }
 
+/// What one pinned look at the attached set came to.
+enum Attempt {
+    /// A sink took the frame.
+    Done,
+    /// No set is attached: the frame comes back.
+    Detached(Box<dyn Frame>),
+    /// The set `id` refused the frame, having detached: the frame comes back.
+    Refused(Box<dyn Frame>, u64),
+}
+
 /// A source the workers poll beside the sinks: it notices that the lake has been idle long enough.
 struct IdleWatch {
     lake: Weak<Lake>,
     admission: Arc<Admission>,
     idle: Duration,
     generation: u64,
-    downstream: LifecycleMutex<Option<Arc<dyn LatticeReceiver>>>,
-    complete: AtomicBool,
+    /// Java's idle watch is an ingest delegate: the downstream is installed once and completed once.
+    downstream: DownstreamSlot,
 }
 
 impl IdleWatch {
     /// One look at the lake: two atomic loads while it is busy.
     fn poll(&self) {
-        if self.complete.load(Ordering::Acquire) || !self.admission.idle_for(self.idle) {
+        if self.downstream.is_complete() || !self.admission.idle_for(self.idle) {
             return;
         }
         match self.lake.upgrade() {
@@ -536,12 +566,8 @@ impl IdleWatch {
 
 impl LatticeSource for IdleWatch {
     fn add_downstream(self: Arc<Self>, downstream: Arc<dyn LatticeReceiver>) {
-        if self.complete.load(Ordering::Acquire) {
-            downstream.on_complete();
-            return;
-        }
-        *self.downstream.lock() = Some(downstream.clone());
-        downstream.add_upstream(self);
+        let source: Arc<dyn LatticeSource> = self.clone();
+        self.downstream.attach(source, downstream);
     }
 
     /// It holds no frames; a pull is the worker's poll.
@@ -562,16 +588,10 @@ impl LatticeSource for IdleWatch {
     fn complete(&self) {
         // Completing is lifecycle work, also when a frame does it.
         let _cold = HotScope::leave();
-        if self.complete.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        let downstream = self.downstream.lock().take();
-        if let Some(downstream) = downstream {
-            downstream.on_complete();
-        }
+        self.downstream.complete();
     }
 
     fn is_complete(&self) -> bool {
-        self.complete.load(Ordering::Acquire)
+        self.downstream.is_complete()
     }
 }

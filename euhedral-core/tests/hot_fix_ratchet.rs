@@ -25,7 +25,6 @@ use std::path::{Path, PathBuf};
 /// The `HOT-FIX(<id>)` ids that the library sources carry today, one per finding of the audit, and the number of
 /// places each is used (its field, each use the lint reports, its marker comment).
 const HOT_FIX_TAGS: &[(&str, usize)] = &[
-    ("G7", 3),
     ("C16", 3),
     ("C17", 3),
     ("C18", 3),
