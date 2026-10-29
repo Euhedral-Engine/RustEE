@@ -60,8 +60,9 @@ counterpart):
 - **CLAIM**: single-consumer state that Java guards with a try-claim (a CAS that fails instead of waiting), because a
   second thread may reach it (a kill, a late publisher, a stealer): a `ClaimCell`.
 - **PUBLISH**: a reference Java publishes with a release store and later replaces or nulls while readers may still
-  hold it. Rust has no garbage collector, so the old value is kept alive by a stand-in: `Published` (epochs), a
-  recycled allocation, or keeping it until its owner drops.
+  hold it. Rust has no garbage collector, so the old value is kept alive by a stand-in: a **cell** of the lattice's
+  registry, whose replacements travel to each reader through a queue (§2, primitive 2), a recycled allocation, or
+  keeping it until its owner drops.
 - **CONST**: written once (at construction or at first use) and never again: a plain field or a `SetOnce`.
 - **ATOMIC**: a Java atomic or CAS that stays one in Rust (the `COMPLETE` compare-and-set of a one-use source).
 - **OWNED**: Java plain fields touched by one thread. In Rust they are plain fields of the one thread's state, changed
@@ -438,19 +439,25 @@ workspace offers it:
    - `is_claimed` (`Relaxed`) for tests and metrics; `get_mut` and `into_inner` with `&mut self`.
    - A lifecycle caller that must have the value (a cache's first touch or reset) loops on `try_claim` inside its
      lifecycle step.
-2. **`Published<T>`** (chunk 4): the stand-in for Java's garbage collector where Java publishes a reference with
-   `setRelease` and replaces or nulls it while readers may still hold the old one. An atomically replaceable
-   `Option<Arc<T>>` with lock-free, count-free reads and lifecycle-only writes, reclaimed by epochs. The domain is the
-   lattice's: `UpstreamRegistry` already keeps one queue per thread and now keeps one padded epoch slot per thread too.
-   - A **worker** announces a quiescent point once per cycle (`run_cycle` start: one load of the global epoch and one
-     store to its own slot) and marks itself idle before it parks. Inside the cycle, `load_in_cycle()` is a plain
-     acquire load of the pointer (Java's `getAcquire`/`getOpaque`): no read-modify-write and no reference count.
-   - **Any other thread** uses `load()`, which marks its slot active at the current epoch for the guard's life (one
-     store and one fence, its own line).
-   - `store(new)` swaps the pointer, advances the epoch, and returns a `Retired<T>`. `wait(deadline)` (lifecycle
-     threads; spins) drops the old value once every slot is idle or past the new epoch. `defer` keeps it in the cell's
-     single pending slot until a later `store`, `try_reclaim` or `Drop` finds it reclaimable. A store with a
-     still-pending retirement waits (lifecycle) or, as `try_store`, hands the value back.
+2. **Cells and views** (chunk 4; `euhedral-core::flow_control::views`): the stand-in for Java's garbage collector where
+   Java publishes a reference with `setRelease` and replaces or nulls it while readers may still hold the old one. The
+   rule it follows: wherever threads meet to hand something off, a queue carries it.
+   - A **cell** is a slot of lattice state of one type, made by `UpstreamRegistry::cell`. The writer (lifecycle work:
+     start, stop, rebalance, attach) keeps the current value under a `LifecycleMutex` and, in the same critical section,
+     offers it to the mailbox of every registered reader: one `MpscQueue` per reader, many writers, one consumer.
+   - A **reader** (a worker, or any thread on its first read) owns a mailbox and a **view**: a thread-local vector of
+     the values it last drained. It drains the mailbox in one batch at the start of each cycle (`refresh_view`) and at
+     the start of an outermost read, and a read (`with_view`) is a load from the view: no lock, no atomic
+     read-modify-write, no barrier instruction and no reference count. A nested read does not drain, so a reference
+     handed out by an outer read stays valid.
+   - Reclamation is `Arc`: the writer and each view hold a clone, and the last holder to let go drops the value (a
+     routing generation releases its downstreams from `Drop`). A thread that exits withdraws its mailbox and drops its
+     view. There is no epoch, no announcement and no barrier.
+   - A reader that stops reading keeps the values it last saw until it reads again, exits, or calls `remove_reader`;
+     a worker drains at every cycle start and its parks are timed.
+   - Deviation (missing Rust equivalent): Java's volatile read of a field the collector keeps alive. Later chunks that
+     planned a `Published` cell (the lake's generation, the shard's arrays, the monitor and the mapper) use a cell
+     where they have a registry and a queue of updates where they have not.
 3. **`OneShot<T>`** (chunk 5): Java's `CompletableFuture` as `PipelineRunner.submit` uses it. `state: AtomicU8`
    (empty, waiting, set, abandoned), the value in an `UnsafeCell`, and a `SetOnce<Thread>` waiter. The setter writes,
    swaps the state (`SeqCst`) and unparks a waiter it finds (a wake, never a wait). `try_recv`, and a parking `recv`
@@ -545,37 +552,41 @@ Java `LatticeHotSource`, `ControlPlaneFragment`'s output, `StopWatch`, `Fragment
   releases with `Release`. `first_touch` and `reset_for_next_trial` loop on `try_claim` (lifecycle). Deviation: Java
   skips the claim when work stealing is off (`pLocks == null`); Rust always claims (one uncontended CAS), because a
   plain consumer shared behind `&self` has no safe Rust form.
-- **C5** (Java `WORK_STEAL`): `slots: Box<[Published<ControlPlaneCache>]>`. Build stores (Java `setRelease`); a steal
-  reads with `load_in_cycle` (Java `getAcquire`); `withdraw` stores `None` only if the slot still holds this cache
-  (Java's CAS to null) and defers the retirement (a stealer may be running stolen frames). The cache's `retired` flag
-  refuses pushes, as Java's. Deviation: `Published` stands in for the collector.
-- **C6** (Java `LatticeVertex.ROUTING_STATE`, `RoutingState.admission`). Java's protocol, field for field:
-  - `routing: AtomicPtr<RoutingState>`, published with `Release` after the state is built.
-  - `admission: AtomicI64` per state: a reader count with a `RETIRED` sign bit. `try_acquire` CASes it up while it is
-    non-negative (`SeqCst`); `retire` CASes the sign bit in; `release` is `fetch_sub(1, SeqCst)`, and the release that
-    leaves exactly `RETIRED` runs `release_handles_when_quiescent`.
-  - `try_push`: load the pointer (`Acquire`), `try_acquire`, re-check that it is still the current state and the vertex
-    is not closed (else release and retry), push, release. One CAS and one decrement per push replace the `RwLock`
-    read and the `Arc` clone.
+- **C5** (Java `WORK_STEAL`): `slots: Box<[Cell<CacheRef>]>`, one cell per CPU. Build stores (Java `setRelease`); a steal
+  reads the slot from the thread's view (Java's `getAcquire`) and upgrades the weak reference, then holds the cache for
+  the steal; `withdraw` stores `None` only if the slot still holds this cache (Java's CAS to null, `set_cell_if`, decided
+  under the lock). The cache's `retired` flag refuses pushes, as Java's. Deviation: a cell stands in for the collector,
+  and the slot holds a weak reference, so a directory that owned its caches strongly would form a cycle with the
+  caches' directory handle; a cache lives as long as its owner holds it. The upgrade is one reference-count update per
+  steal that finds a cache; a borrowed reference would need a proof that the cache outlives the steal, which the
+  view cannot give.
+- **C6** (Java `LatticeVertex.ROUTING_STATE`, `RoutingState.admission`). The routing generation is a cell of
+  `Arc<RoutingState>`.
+  - `try_push` reads the state from the worker's view (Java's `getAcquire` of `ROUTING_STATE`), checks that the vertex
+    is not closed (`Relaxed`, Java opaque), routes and pushes. It takes no count: Java's `admission` reader count
+    (a compare-and-set and a decrement on one line every pusher shares per frame) is not needed, because a generation's
+    downstreams are released when the last holder of its `Arc` lets go, and a view holds it until the reader drains.
   - The writer (`set_downstream_mapping`, `close_after_routes_retire`, under the routing-update lifecycle lock) builds
-    the next state, retains its handles, retires the old state, publishes the next, and calls
-    `release_handles_when_quiescent(old)`.
-  - Deviation (no garbage collector): a reader may CAS `admission` on a state whose pointer it loaded just before the
-    swap, so that memory must remain a `RoutingState`. Retired states are recycled, never freed before the vertex
-    drops. The writer reuses a retired state only when its admission is exactly `RETIRED` (no readers), rewrites its
-    contents while the count is negative (every `try_acquire` refuses), stores `admission = 0` (`SeqCst`) and then
-    publishes it. A stale reader that acquires a recycled state either finds it current (and uses it, correctly) or
-    fails the re-check and releases. The pool holds at most the number of generations retired at once.
+    the next state, retains its handles, and stores it in the cell; the old generation's `Arc` drops from the store
+    and, as each reader drains, from the views.
+  - `UpstreamInterceptor::request` names its vertex for the call, so the pushes of the source inside it take no
+    reference of their own (Java's interceptor holds its vertex in a field).
+  - Deviation (a Java bug against the lock-free rule): Java retires the old state first, so a reader that loaded it
+    spins until the writer publishes, and a writer descheduled inside `synchronized` stalls every pusher; here the new
+    generation is stored before the old one is let go, and no reader waits.
+  - Deviation (missing Rust equivalent): the release runs from `Drop` of the last holder instead of from the reader
+    count reaching the retired value. A reader that stops reading holds its generation until it reads again or exits.
 - **C7** (Java `releaseHandlesWhenQuiescent` under `synchronized(routingUpdateLock)`): rebalance work, run by
-  whichever thread releases the last reader of a retired generation, as in Java. `Book` becomes a `LifecycleMutex`;
-  the releasing worker leaves its hot scope for it (once per retired generation).
+  whichever thread lets go of the last `Arc` of a retired generation, as in Java it is run by the last reader. The
+  releasing thread leaves its hot scope for the lifecycle lock (once per retired generation).
 - **C8** (Java `LatticeEdge.DOWNSTREAM`): `downstream: SetOnce<Downstream>` installed by CAS (Java
   `compareAndExchange`: the loser gets the existing value and attaches below it, as Java). A push reads the edge's
   `closed` flag (`Relaxed`, Java opaque) and the slot (`Acquire`). `close_edge` swaps `closed`, then tells a receiver
   `on_complete`. Deviation: the downstream stays allocated until the edge drops (an edge closes for good, so nothing
   re-attaches).
-- **C9** (Java `LatticeEdge.PARENT`): `parent: Published<Weak<dyn LatticeNode>>`. The climb reads with `load()` and
-  upgrades; `set_parent` stores, skipping an unchanged parent. Deviation: `Published` stands in for the collector.
+- **C9** (Java `LatticeEdge.PARENT`): `parent: Cell<ParentRef>` (a weak reference). The climb reads it from the view
+  and upgrades; `set_parent` stores, skipping an unchanged parent. Deviation: a cell stands in for the collector; the
+  upgrade is one reference-count update per hop of a request or pull.
 
 ### 3.4 Fan-in and the lake (chunk 5)
 
@@ -778,11 +789,11 @@ runtime" is the Java runtime `euhedral-graph` is derived from (its `runtime/grap
 | C1, C10 hot source | core `flow_control/LatticeHotSource` | **One word, not Java's two.** `downstream` is null (open, no receiver), a link, or a `COMPLETE` tag, so `complete` is one `swap(COMPLETE)` and `add_downstream` one CAS loop that installs over null or `COMPLETE` and refuses over a link. Java sets `complete` and `downstream` in two steps; racing `complete` and `add_downstream` can then leave an attached receiver never told (the attach lands between the two steps) or tell a live receiver the source completed (a reopen between them). Here Rust has `on_complete` and no GC, and a receiver that is not told leaks the interceptor's source cycle, so the one word makes `complete` linearizable, as the lock the base held made it. Acquire pointer load (no final-field rule). Retired receivers are kept until drop (no GC), on an intrusive push-only stack of links rather than a lifecycle-locked list, so `add_downstream` and `complete` set atomics only; a source attached `k` times holds `k` retired receivers until it drops (a bounded scheme, counting the pushes in flight and freeing a retired link at zero, is possible if a reattach-heavy user appears; not built). `on_complete` at complete (the interceptor drops its source on it: no GC). `accept` finishes an unsent frame (Java bug: it drops it unfinished), finishes the frame when the before-hook panics, and runs the after-hook after every before-hook that returned, also when the push panics. |
 | C2 stop watch | core `utils/StopWatch` | **Plain fields, not atomics.** Java's watch is plain state of one thread, and the Rust worker times its own pushes, so no closure shares it. The first Rust design shared it between the output's two hooks as relaxed atomics (deviation category: missing Rust equivalent of a plain field shared by two closures); owning it on the worker removes that need. |
 | C3 body cost | core `control_plane/FragmentDecisionTree` | Plain fields owned by the decision tree, as C2; a snapshot for other threads, published per window. |
-| C4 cache partitions | core `ControlPlaneCache.pLocks` | Always claimed (no safe unguarded form). |
-| C5 cache directory | core `ControlPlaneCache.WORK_STEAL` | `Published` (no GC). |
-| C6 routing | core `LatticeVertex.ROUTING_STATE`, `RoutingState.admission` | Retired states recycled until the vertex drops (no GC). |
+| C4 cache partitions | core `ControlPlaneCache.pLocks` | Always claimed (missing Rust equivalent: `Consumer<_, Single>` behind `&self` needs proven exclusive access). |
+| C5 cache directory | core `ControlPlaneCache.WORK_STEAL` | Cells of weak references (no GC); a stealer holds the cache it upgraded for the steal. Known cost: each steal attempt that finds a cache does one reference-count update on it (`Arc<Weak>` plus `upgrade`), which Java's plain reference does not. |
+| C6 routing | core `LatticeVertex.ROUTING_STATE`, `RoutingState.admission` | No reader count: the generation is a cell, released by the last holder of its `Arc` (missing Rust equivalent of the collector); the next state is stored before the old one is let go, so no reader waits for the writer (Java bug against the lock-free rule). |
 | C7 routing book | core `LatticeVertex.releaseHandlesWhenQuiescent` | None. |
-| C8, C9 edges | core `LatticeEdge.DOWNSTREAM`, `PARENT` | Downstream kept until drop; parent `Published` (no GC). |
+| C8, C9 edges | core `LatticeEdge.DOWNSTREAM`, `PARENT` | Downstream kept until drop; a receiver added to a closed edge is told complete once, taken or refused (a Java race: `close` nulls `DOWNSTREAM`, so a later compare-and-set attaches a receiver that is never told); parent a cell (no GC). |
 | C11, C12 ingest | core `ingest/AbstractIngestSink`, `QueueIngestSink` | `clear` claims (Java bug: unclaimed single-consumer drain); demand is unsigned and saturates at the top (`add_demand`, `take_demand`) where Java's `accumulate` takes a signed step; the queue is finished when its source drops (no GC); `clear` cancels the frames (`do_finally_with_error`) where Java's `clear` drops them silently; `pull`'s stop also matches once the source has completed. |
 | C13 single use | core `ingest/SingleUseSource` | `complete` cancels an untaken frame (Java bug: `complete` leaves it takeable); a `pull` whose stop condition matches gives the frame back (Java ignores the stop condition); a frame nobody took is cancelled when the source drops. |
 | C14 pipeline outcome | core `ingest/PipelineRunner`, `CompletableFuture` | None. |
@@ -813,13 +824,13 @@ tasks, one draft PR per chunk. In outline:
 | 1. Guard rails | `LifecycleMutex`, `HotScope`, clippy config, `HOT-FIX(<id>)` tags, the ratchet test | sets 57 | lane-source Parts 1 and 2 merged |
 | 2. Sources and claims | C11, C12, C13, G1, G2, G3, I1, I2; adds `ClaimCell` | -8 | chunk 1 |
 | 3. Hot source | C1, C2, C3, C10 | -4 | chunk 1 |
-| 4. Cache, vertex, edges | C4-C9; adds `Published` | -6 | chunk 2 (`ClaimCell`) |
-| 5. Fan-in and lake | C14, G5, G6, G7; adds `OneShot` | -4 | chunk 4 (`Published`) |
+| 4. Cache, vertex, edges | C4-C9; adds cells and views | -6 | chunk 2 (`ClaimCell`) |
+| 5. Fan-in and lake | C14, G5, G6, G7; adds `OneShot` | -4 | chunk 4 (cells) |
 | 6. Stage graph | G10-G15; adds `TakeAllStack` | -6 | chunk 1 |
 | 7. io_uring | I3, I4, I5, I6, S6a | -5 | chunk 2 (the front) |
 | 8. Windows engine | I7-I15 | -9 | chunk 7 (the shared slots and refusal API) |
 | 9. Memory | M1, S1, S2 | -3 | chunk 1 |
-| 10. Tick path | C16-C20, H1-H7 | -12 | chunk 4 (`Published`, `ClaimCell`) |
+| 10. Tick path | C16-C20, H1-H7 | -12 | chunk 4 (cells, `ClaimCell`) |
 | 11. Lock the door | the ratchet becomes "no `HOT-FIX(` tag" | to 0 | chunks 2-10 |
 
 The 57 tags are the 54 HOT and MIXED findings left once lane-source Part 2 has fixed G4 and without C15 (Java's
@@ -845,13 +856,10 @@ gate, keep or discard).
 - **Lifecycle calls on a source take effect when its holder releases.** `clear`, kill and `complete` set atomics and
   may return before their effect when a worker holds the claim; the holder applies them before it lets go, or the next
   `request`/`pull` does, or `Drop` (Java's `drainRequests` and `onDrainFinished` protocol). Waiting instead would deadlock when the call comes from a frame the source's own `pull` runs.
-- **Recycled routing states (C6).** A stale reader may CAS a recycled state's count; the re-check against the current
-  pointer makes that safe. Mitigations: a loom model of reader, writer and recycler; drop-counted handles in the remap
-  tests.
-- **Reclamation bugs** in `Published` and the tag slots. Mitigations: drop-counting tests, loom, Miri, one pending
-  retirement per cell.
-- **Grace periods follow worker cycles.** A remap waits for each busy worker to finish its cycle; a long frame
-  lengthens the rebalance, and the deadline then defers the retirement.
+- **Stale views (C6).** A reader that stops reading holds the generation it last saw, so a retired generation's
+  downstreams are released late. Mitigations: workers drain at each cycle start and their parks are timed; threads that are not workers hold weak references only;
+  a thread that exits drops its view; drop-counted handles in the remap tests.
+- **Reclamation bugs** in the cells and the tag slots. Mitigations: drop-counting tests, Miri, one owner per mailbox.
 - **I/O submission can now be refused** (I4, the Java mirror): `submit*` hands a request back when its ring is full, its
   tag slot is busy or the thread has no ring; callers handle it synchronously, as Java's do. Short-read rests that
   cannot be resubmitted end the operation with an error.

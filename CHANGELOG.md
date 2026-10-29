@@ -3,6 +3,60 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## Routing, cache and edges without locks (2026-10-29)
+
+**What.**
+- A lattice's changing state lives in **cells** of its `UpstreamRegistry` (`registry.cell::<T>()`, `set_cell`,
+  `set_cell_if`, `cell_value`): the writer keeps the current value under a lifecycle lock and sends it, through a queue
+  (`MpscQueue`), to the mailbox of every registered reader (`register_reader`, called by `register` for a worker). A
+  worker drains its mailbox in one batch at the start of each cycle (`refresh_view`) and at a read, and applies the
+  values to a view only it reads (`with_view(|view| view.get(&cell))`). A frame reads worker-owned state: no lock, no
+  atomic read-modify-write, no barrier instruction. No reader locks: a thread that reads without registering gets a
+  light mailbox on its first read (through the same queue) and withdraws it when it exits; its view holds weak
+  references, upgraded for the length of one call (one reference-count update), so an idle thread never keeps a replaced
+  value alive.
+- Reclamation is `Arc`: a worker's view holds a replaced value until it drains (at its next cycle or read); a thread
+  that exits drops its view, and the last holder to let go of a value drops it.
+- `ControlPlaneCache` partitions (audit C4) are `ClaimCell`s, Java's `pLocks`: a consumer that finds a partition held
+  passes it over, as before, with no mutex.
+- `CacheDirectory` slots (C5) are cells of weak references: a steal reads one from its view with no lock.
+- `LatticeVertex` routing (C6, C7): the routing generation is a cell of `Arc<RoutingState>`; a push reads it from the
+  worker's view. The generation's downstreams are released from the `Drop` of the state, by whichever holder lets go of
+  it last. Java's reader count (`admission`) is not needed: a push takes no count, and neither does it wait for a
+  retirement. `routing_state()` and `RouteGuard` give way to `with_routing_state(|state| ..)`.
+- `UpstreamInterceptor::request` names its vertex for the call, so the source's pushes inside it take no reference of
+  their own. The drain flag and the edge's closed flag on the request and pull path are `Relaxed` (Java `getOpaque`).
+- `LatticeEdge` (C8, C9): the downstream is a `SetOnce` and the parent a cell; neither read takes a lock. A receiver
+  added to a closed edge is told `on_complete`, once, whether the edge took it or refused it.
+- `HOT_FIX_TAGS` loses C4 to C9 and lists 39.
+
+**Why.** Every frame a source pushes through the lattice crossed two vertex routing locks and two edge downstream
+locks, each with a reference-count update on a line every worker shares; every steal attempt took a directory lock and
+every cache take a partition mutex. Java has none of them: it reads the routing state, the downstream and the parent
+with volatile loads and claims a partition with a compare-and-set. Rust has no collector to keep a replaced value
+alive for a late reader, so a queue carries each replacement to the threads that read it, and they drop their copy when
+they drain.
+
+**How.**
+- Read a routing generation with `vertex.with_routing_state(|state| ..)`.
+- A long-lived thread that reads cells on every frame outside a worker's cycle calls `registry.register_reader()` once,
+  to hold the values and read with no reference-count update.
+
+**Semantics.**
+- A remap reaches a worker at its next read or cycle; a frame in flight finishes on the generation it began with
+  (nested reads do not drain). A dropped vertex clears its cell.
+- The downstream of an edge stays allocated until the edge drops. A cache stays visible until it closes, and a
+  stealer that found one holds it for the steal, so a closed cache lives until its last stealer lets go.
+
+**Tests.** The cell and view tests in `flow_control::views`; `stealers_racing_a_greedy_owner_never_take_an_ordered_frame`,
+`a_stealer_skips_a_claimed_partition_without_waiting`, `a_cache_closed_while_stolen_from_lives_for_the_steal_and_its_slot_reference_is_reclaimed`,
+`pushes_racing_remaps_reach_only_validated_downstreams`,
+`the_last_reader_of_a_retired_generation_closes_its_dropped_downstreams_once`,
+`a_panicking_routing_function_gives_its_count_back`, `close_while_pushing_finishes_or_delivers_every_frame`,
+`a_closed_edge_refuses_a_new_downstream`, `attaches_racing_a_close_tell_the_receiver_exactly_once`,
+`set_parent_with_the_same_parent_stores_nothing`. The concurrency tests run under Miri with many seeds (the `miri` CI
+job).
+
 ## The hot source and the fragment's output without locks (2026-10-29)
 
 **What.**
