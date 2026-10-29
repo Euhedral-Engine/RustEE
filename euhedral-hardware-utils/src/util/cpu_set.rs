@@ -122,6 +122,34 @@ impl CpuSet {
         self.words.iter().zip(&other.words).any(|(a, b)| a & b != 0)
     }
 
+    /// The number of CPUs in both sets, counted word by word without building the intersection.
+    pub fn intersection_len(&self, other: &CpuSet) -> usize {
+        self.words
+            .iter()
+            .zip(&other.words)
+            .map(|(a, b)| (a & b).count_ones() as usize)
+            .sum()
+    }
+
+    /// The `n`th CPU (counting from 0, in ascending order) that is in both sets, found word by word without building
+    /// the intersection; `None` if there are not that many.
+    pub fn nth_of_intersection(&self, other: &CpuSet, mut n: usize) -> Option<usize> {
+        for (index, (a, b)) in self.words.iter().zip(&other.words).enumerate() {
+            let mut word = a & b;
+            let count = word.count_ones() as usize;
+            if n >= count {
+                n -= count;
+                continue;
+            }
+            // Clear the lowest `n` set bits; the lowest remaining one is the answer.
+            for _ in 0..n {
+                word &= word - 1;
+            }
+            return Some(index * 64 + word.trailing_zeros() as usize);
+        }
+        None
+    }
+
     pub fn is_subset(&self, other: &CpuSet) -> bool {
         self.difference(other).is_empty()
     }
@@ -225,6 +253,21 @@ mod tests {
         assert_eq!(a, b);
         assert_eq!(a.words(), &[0b101]);
         assert_eq!(CpuSet::from_words(&[0, 0]), CpuSet::new());
+    }
+
+    #[test]
+    fn the_nth_cpu_of_an_intersection_is_found_without_building_it() {
+        let a: CpuSet = [1, 3, 5, 64, 70, 130, 200].into_iter().collect();
+        let b: CpuSet = [3, 4, 5, 64, 130, 131].into_iter().collect();
+        let both = a.intersection(&b);
+        assert_eq!(a.intersection_len(&b), both.len());
+        for (n, cpu) in both.iter().enumerate() {
+            assert_eq!(a.nth_of_intersection(&b, n), Some(cpu));
+            assert_eq!(b.nth_of_intersection(&a, n), Some(cpu));
+        }
+        assert_eq!(a.nth_of_intersection(&b, both.len()), None);
+        assert_eq!(a.nth_of_intersection(&CpuSet::new(), 0), None);
+        assert_eq!(CpuSet::new().intersection_len(&a), 0);
     }
 
     #[test]

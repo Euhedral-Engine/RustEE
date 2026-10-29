@@ -1,4 +1,5 @@
 use super::*;
+use crate::control_plane::PlacementPicker;
 use crate::control_plane::testing::TestClone;
 use crate::flow_control::LatticeHotSource;
 use crate::flow_control::testing::{Fate, Fates, Tracked, frame};
@@ -769,4 +770,203 @@ fn clear_waits_out_a_rebalance() {
         .unwrap();
     releaser.join().unwrap();
     assert_eq!(reset.active_workers, 2);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The placement policy.
+
+fn cpus(list: &[usize]) -> CpuSet {
+    list.iter().copied().collect()
+}
+
+#[test]
+fn the_placement_policy_can_only_be_set_while_the_lattice_is_shut_down() {
+    let fixture = Fixture::new(&ALL, |_| {});
+    // Not started: allowed, and a second call replaces the first.
+    fixture
+        .lattice
+        .set_placement_policy(|_, _| {})
+        .expect("not started");
+    fixture
+        .lattice
+        .set_placement_policy(|_, _| {})
+        .expect("still not started");
+    fixture.source.set(utilization(&ALL, 8.0));
+    fixture.lattice.start().unwrap();
+    assert!(matches!(
+        fixture.lattice.set_placement_policy(|_, _| {}),
+        Err(LatticeError::Running)
+    ));
+    fixture.lattice.close();
+    fixture
+        .lattice
+        .set_placement_policy(|_, _| {})
+        .expect("closed");
+}
+
+#[test]
+fn the_placement_policy_runs_first_and_sees_the_cpus_the_lattice_routes_with() {
+    let fixture = Fixture::new(&ALL, |_| {});
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    fixture
+        .lattice
+        .set_placement_policy(move |frame, cpus| {
+            // Nothing has routed the frame yet: it still has the origin it was made with.
+            sink.lock()
+                .unwrap()
+                .push((frame.header().origin().is_none(), cpus.clone()));
+            frame.header_mut().set_origin(Some(CpuInfo {
+                cpu: 6,
+                core: 3,
+                socket: 1,
+            }));
+            frame
+                .header_mut()
+                .set_routing_policy(RoutingPolicy::CacheLocal);
+        })
+        .unwrap();
+    fixture
+        .source
+        .set(utilization(&[0, 1, 2, 3, 4, 5, 6, 7], 8.0));
+    fixture.lattice.start().unwrap();
+    fixture.push(frame(1));
+    // The policy chose core 3 of socket 1, and the routing that follows honoured it.
+    assert_eq!(fixture.clone_on(3).receiver.received(), [1]);
+    assert_eq!(
+        *seen.lock().unwrap(),
+        [(true, cpus(&ALL))],
+        "the policy saw the unrouted frame and the lattice's effective CPUs"
+    );
+}
+
+fn picker_policy(
+    long: impl Fn(&dyn Frame) -> bool + Send + Sync + 'static,
+    a: &[usize],
+    b: &[usize],
+) -> impl Fn(&mut dyn Frame, &CpuSet) + Send + Sync + 'static {
+    PlacementPicker::new(two_sockets(), long, cpus(a), cpus(b)).into_policy()
+}
+
+#[test]
+fn frames_land_on_the_core_the_picker_chose() {
+    let fixture = Fixture::new(&ALL, |_| {});
+    // Even ids go to core 2 (CPU 4), odd ones to core 1 (CPU 2).
+    fixture
+        .lattice
+        .set_placement_policy(picker_policy(
+            |frame| frame.header().id_hash().is_multiple_of(2),
+            &[4],
+            &[2],
+        ))
+        .unwrap();
+    fixture.source.set(utilization(&ALL, 8.0));
+    fixture.lattice.start().unwrap();
+    for id in 0..200u64 {
+        fixture.push(hashed(id, id.wrapping_mul(0x9e37_79b9_7f4a_7c15)));
+    }
+    let on_core_2 = fixture.clone_on(2).receiver.received();
+    let on_core_1 = fixture.clone_on(1).receiver.received();
+    assert_eq!(on_core_2.len(), 100);
+    assert!(on_core_2.iter().all(|id| id % 2 == 0));
+    assert_eq!(on_core_1.len(), 100);
+    assert!(on_core_1.iter().all(|id| id % 2 == 1));
+    assert!(fixture.clone_on(0).receiver.received().is_empty());
+    assert!(fixture.clone_on(3).receiver.received().is_empty());
+}
+
+#[test]
+fn ordered_lanes_never_land_on_the_long_call_cores() {
+    let fixture = Fixture::new(&ALL, |_| {});
+    // Long calls (every third id) go to the cores of set A (2 and 3); everything else, the ordered lanes, to B (0, 1).
+    fixture
+        .lattice
+        .set_placement_policy(picker_policy(
+            |frame| frame.header().id_hash().is_multiple_of(3),
+            &[4, 5, 6, 7],
+            &[0, 1, 2, 3],
+        ))
+        .unwrap();
+    fixture.source.set(utilization(&ALL, 8.0));
+    fixture.lattice.start().unwrap();
+    for id in 0..600u64 {
+        fixture.push(hashed(id, id.wrapping_mul(0x9e37_79b9_7f4a_7c15)));
+    }
+    let in_a = fixture.received_on(&[2, 3]);
+    let in_b = fixture.received_on(&[0, 1]);
+    assert_eq!(in_a.len() + in_b.len(), 600);
+    assert!(
+        in_a.iter().all(|id| id % 3 == 0),
+        "an ordered lane reached A"
+    );
+    assert!(in_b.iter().all(|id| id % 3 != 0), "a long call reached B");
+    assert_eq!(in_a.len(), 200);
+    // Both cores of each set are used: the hash spreads within the chosen set.
+    assert!(!fixture.clone_on(2).receiver.received().is_empty());
+    assert!(!fixture.clone_on(3).receiver.received().is_empty());
+    assert!(!fixture.clone_on(0).receiver.received().is_empty());
+    assert!(!fixture.clone_on(1).receiver.received().is_empty());
+}
+
+#[test]
+#[allow(clippy::disallowed_methods)] // The test's own threads stand for producers.
+fn the_policy_and_the_predicate_run_from_many_threads_at_once() {
+    const THREADS: usize = 8;
+    const PER_THREAD: u64 = if cfg!(miri) { 20 } else { 2_000 };
+    let fixture = Fixture::new(&ALL, |_| {});
+    let calls = Arc::new(AtomicUsize::new(0));
+    let inside = Arc::new(AtomicUsize::new(0));
+    let overlapped = Arc::new(AtomicBool::new(false));
+    let (counted, busy, overlap) = (calls.clone(), inside.clone(), overlapped.clone());
+    let picker = PlacementPicker::new(
+        two_sockets(),
+        move |frame: &dyn Frame| {
+            // Concurrency is the point: the predicate is re-entrant, and sees its peers.
+            if busy.fetch_add(1, Ordering::AcqRel) > 0 {
+                overlap.store(true, Ordering::Release);
+            }
+            std::hint::spin_loop();
+            busy.fetch_sub(1, Ordering::AcqRel);
+            frame.header().id_hash().is_multiple_of(2)
+        },
+        cpus(&[4, 5, 6, 7]),
+        cpus(&[0, 1, 2, 3]),
+    );
+    fixture
+        .lattice
+        .set_placement_policy(move |frame, set| {
+            counted.fetch_add(1, Ordering::Relaxed);
+            picker.place(frame, set);
+        })
+        .unwrap();
+    fixture.source.set(utilization(&ALL, 8.0));
+    fixture.lattice.start().unwrap();
+    thread::scope(|scope| {
+        for thread in 0..THREADS as u64 {
+            let fixture = &fixture;
+            scope.spawn(move || {
+                for i in 0..PER_THREAD {
+                    let id = thread * PER_THREAD + i;
+                    fixture.push(hashed(id, id.wrapping_mul(0x9e37_79b9_7f4a_7c15)));
+                }
+            });
+        }
+    });
+    let total = THREADS as u64 * PER_THREAD;
+    assert_eq!(
+        calls.load(Ordering::Relaxed) as u64,
+        total,
+        "once per frame"
+    );
+    let in_a = fixture.received_on(&[2, 3]);
+    let in_b = fixture.received_on(&[0, 1]);
+    assert_eq!(in_a.len() as u64 + in_b.len() as u64, total);
+    assert!(in_a.iter().all(|id| id % 2 == 0));
+    assert!(in_b.iter().all(|id| id % 2 == 1));
+    if !cfg!(miri) {
+        assert!(
+            overlapped.load(Ordering::Acquire),
+            "the producers did run the predicate at the same time"
+        );
+    }
 }

@@ -12,6 +12,7 @@
 //! it, and the drop releases the downstreams no later generation routes to.
 
 use super::edge::{LatticeEdge, LatticeNode, Retirement};
+use super::placement::Placement;
 use super::registry::UpstreamRegistry;
 use super::upstream_queue::{Claim, UpstreamHandle, note_routed_push};
 use super::views::Cell;
@@ -171,6 +172,8 @@ pub struct LatticeVertex {
     name: String,
     downstream_count: usize,
     route: RoutingFunction,
+    /// The placement policy that runs on every frame before the routing function, if this vertex has one.
+    placement: Option<Arc<Placement>>,
     /// Java's `routingState`: the published generation, a cell of the registry that each worker reads from its view.
     routing: Cell<RoutingState>,
     /// Java's `routingUpdateLock` and the state it guards.
@@ -200,6 +203,27 @@ impl LatticeVertex {
         downstream_count: usize,
         route: impl Fn(&dyn Frame, &RoutingState) -> usize + Send + Sync + 'static,
     ) -> Arc<Self> {
+        Self::build(registry, name, downstream_count, route, None)
+    }
+
+    /// Like [`with_routing`](Self::with_routing), running `placement`'s policy on each frame before `route` sees it.
+    pub fn with_placement(
+        registry: &Arc<UpstreamRegistry>,
+        name: impl Into<String>,
+        downstream_count: usize,
+        placement: Arc<Placement>,
+        route: impl Fn(&dyn Frame, &RoutingState) -> usize + Send + Sync + 'static,
+    ) -> Arc<Self> {
+        Self::build(registry, name, downstream_count, route, Some(placement))
+    }
+
+    fn build(
+        registry: &Arc<UpstreamRegistry>,
+        name: impl Into<String>,
+        downstream_count: usize,
+        route: impl Fn(&dyn Frame, &RoutingState) -> usize + Send + Sync + 'static,
+        placement: Option<Arc<Placement>>,
+    ) -> Arc<Self> {
         let name = name.into();
         let routing = registry.cell::<RoutingState>();
         let vertex = Arc::new_cyclic(|this: &Weak<Self>| Self {
@@ -207,6 +231,7 @@ impl LatticeVertex {
             name,
             downstream_count,
             route: Arc::new(route),
+            placement,
             routing,
             book: LifecycleMutex::new(Book {
                 references: HashMap::new(),
@@ -443,7 +468,11 @@ impl LatticeVertex {
         // The frame moves into the closure, and comes back out if the vertex is closed or nothing is active.
         let mut slot = Some(frame);
         let routed = self.with_route(|state| {
-            let frame = slot.take().expect("routed once");
+            let mut frame = slot.take().expect("routed once");
+            // The very first thing a routed frame meets: the placement policy, if the vertex has one and it is set.
+            if let Some(placement) = &self.placement {
+                placement.apply(self.edge.registry(), &mut *frame);
+            }
             if state.is_empty() {
                 return Err(frame);
             }

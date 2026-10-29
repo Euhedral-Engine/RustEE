@@ -47,6 +47,36 @@ thread offers to, and its entry is the caller's.
 models of an offer racing a drain, two completions racing, and a dropped slot racing a completion (each fails if the
 `missed` loop is removed; the order queue is not modelled).
 
+## Placement policy (2026-10-29)
+
+**What.**
+- `ControlPlaneLattice::set_placement_policy(policy)`: one callback (not a registry) that runs first on every frame the
+  lattice routes, before the shard and the core are chosen. It sees the frame and `&CpuSet`, the CPUs the lattice routes
+  with now, and says where the frame goes by setting its origin and a cache-local routing policy; the routing that
+  follows honours them. It can be set while the lattice is shut down (not started, or closed) and replaces the previous
+  policy; while it runs the call returns `LatticeError::Running`.
+- **Concurrency.** The policy is `Fn + Send + Sync + 'static`, never `FnMut`: it runs on the frame path, from every
+  thread that routes frames, at the same time. It must be re-entrant, take no lock, not allocate and not block; what it
+  reads is the caller's to make safe to read from many threads.
+- **The CPU set** is passed by reference, from the lattice's current routing snapshot, not by value: `CpuSet` is
+  vector-backed, so a clone per frame would allocate on the frame path. The snapshot is a cell of the registry, republished
+  when the effective topology changes, and the policy reads it from the thread's view with no lock.
+- `PlacementPicker` implements the common policy: a predicate on the frame chooses CPU set A or B; the chosen set is
+  intersected with the lattice's; the nth CPU of the intersection is picked by `unsigned_multiply_high(routing_hash,
+  count)`, and the frame's origin becomes that CPU, cache-local. No lock, no allocation (`CpuSet::intersection_len` and
+  `nth_of_intersection` work word by word). A frame whose chosen set shares no CPU with the lattice's keeps its origin.
+- `TopologyMapper::effective_cpus()`: the effective CPU set, public.
+- `LatticeVertex::with_placement` / `flow_control::Placement`: the hook a vertex runs before its routing function.
+
+**Cost.** A lattice with no policy pays a relaxed load and a branch per frame.
+
+**Java.** None of this exists in Java (frames are routed by hash and routing policy only); there is nothing to mirror.
+
+**Tests.** The policy is settable only while shut down; it runs first and sees the unrouted frame and the effective CPUs;
+frames land on the picked core; long calls land in set A and ordered lanes never do; eight threads route at once;
+placing allocates nothing (`tests/placement_alloc.rs`: the picker, and the policy read from a registered and from a light
+reader).
+
 ## Lane source gaps from the first consumer (2026-10-29)
 
 **What.**

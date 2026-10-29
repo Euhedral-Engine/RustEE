@@ -207,6 +207,12 @@ effective CPUs on a core, the fragment runs a second worker, its SMT buddy, on t
 its own cache (the sibling cache). The core's frames reach the first cache, which hands those with
 an odd routing hash to the sibling.
 
+**placement policy, placement picker** ([`ControlPlaneLattice::set_placement_policy`](euhedral-core/src/control_plane/lattice.rs),
+[`PlacementPicker`](euhedral-core/src/control_plane/placement.rs)): one callback that runs first on every frame the
+lattice routes, with the frame and the CPUs the lattice routes with, and sets the frame's origin (cache-local); the
+routing then honours it. It runs from many threads at once. The picker chooses between CPU sets A and B by a predicate
+and picks the nth CPU of the chosen set within the lattice's by the frame's routing hash.
+
 **CacheDirectory** ([`CacheDirectory`](euhedral-core/src/control_plane/cache.rs)): a lattice's caches
 by CPU, which work stealing walks, with the upstream registry and topology they share. Each slot is a cell holding a
 weak reference: a cache publishes itself when built and withdraws when it closes.

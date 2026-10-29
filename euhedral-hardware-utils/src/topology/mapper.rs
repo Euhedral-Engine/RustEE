@@ -102,6 +102,11 @@ impl TopologyMapper {
             .clone()
     }
 
+    /// The CPUs that are effective now: the monitor's, within the topology and the allowed set.
+    pub fn effective_cpus(&self) -> CpuSet {
+        self.effective_topology().effective_cpus.clone()
+    }
+
     pub fn global_version(&self) -> u64 {
         self.effective_topology().global_version
     }
