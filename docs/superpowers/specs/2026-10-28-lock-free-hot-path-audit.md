@@ -777,8 +777,8 @@ runtime" is the Java runtime `euhedral-graph` is derived from (its `runtime/grap
 | C6 routing | core `LatticeVertex.ROUTING_STATE`, `RoutingState.admission` | Retired states recycled until the vertex drops (no GC). |
 | C7 routing book | core `LatticeVertex.releaseHandlesWhenQuiescent` | None. |
 | C8, C9 edges | core `LatticeEdge.DOWNSTREAM`, `PARENT` | Downstream kept until drop; parent `Published` (no GC). |
-| C11, C12 ingest | core `ingest/AbstractIngestSink`, `QueueIngestSink` | `clear` claims (Java bug: unclaimed single-consumer drain). |
-| C13 single use | core `ingest/SingleUseSource` | `complete` cancels an untaken frame (Java bug: `complete` leaves it takeable). |
+| C11, C12 ingest | core `ingest/AbstractIngestSink`, `QueueIngestSink` | `clear` claims (Java bug: unclaimed single-consumer drain); demand is unsigned and saturates at the top (`add_demand`, `take_demand`) where Java's `accumulate` takes a signed step; the queue is finished when its source drops (no GC); `clear` cancels the frames (`do_finally_with_error`) where Java's `clear` drops them silently; `pull`'s stop also matches once the source has completed. |
+| C13 single use | core `ingest/SingleUseSource` | `complete` cancels an untaken frame (Java bug: `complete` leaves it takeable); a `pull` whose stop condition matches gives the frame back (Java ignores the stop condition); a frame nobody took is cancelled when the source drops. |
 | C14 pipeline outcome | core `ingest/PipelineRunner`, `CompletableFuture` | None. |
 | C15 hot receiver | core `flow_control/LatticeHotReceiver`, `utils/SpinWait` | None (already mirrored). |
 | C16-C19 lattice, shard | core `ControlPlaneLattice`, `ControlPlaneShard` | `Published` for the arrays (no GC). |
@@ -786,13 +786,13 @@ runtime" is the Java runtime `euhedral-graph` is derived from (its `runtime/grap
 | H1-H4 monitor | hardware-utils `ResourceMonitor`, `SystemSnapshotProvider` | H2: claim instead of `synchronized` (ticks hot); H3 `Published` (no GC). |
 | H5 dispatcher | hardware-utils `LatestValueDispatcher` | Mailbox swap and copy-on-write listeners instead of its spin lock (ticks hot). |
 | H6, H7 mapper | hardware-utils `TopologyMapper` | `Published` (no GC). |
-| G1-G3 completions | none; nearest core `QueueIngestSink` | — |
+| G1-G3 completions | none; nearest core `QueueIngestSink` | A request that finds the poll held leaves a wakeup for the holder (`request_pending`, as `QueueIngestSink`'s); the lane pool lives with the source (a marker is reached when its lane says so, also after `complete`, as in Java); the poll state is a `SourceCell`, the state a holder mutates; a registration whose marker is still unreached is leaked and counted instead of finished when it is cancelled (at drop, by a sweep, or refused after `complete`), because the device may still use what it holds. |
 | G4 join | graph runtime `Join` | In the lane-source plan. |
 | G5 latch | none; `CompletableFuture` | — |
 | G6 sequencer | graph runtime `Sequencer` | None. |
 | G7-G9 lake | graph runtime `FrameLake` implementation (both modes) | `Published` for the generation (no GC); retirements held in `retiring`. |
 | G10-G15 stage graph | graph runtime `StageGraph`, `StageFrame`, `AbstractQuantum` | Wider-than-64-lane masks. |
-| I1-I6 io_uring | graph runtime `AsyncReads`, `UringBackend` | Operations written in place behind a reserve step (no allocation per operation). |
+| I1-I6 io_uring | graph runtime `AsyncReads`, `UringBackend` | Operations written in place behind a reserve step (no allocation per operation). I1, I2: a request that finds the front entered leaves a wakeup for the holder (`request_pending`, as `QueueIngestSink`'s). |
 | I7-I15 Windows | graph runtime `CompletionPortBackend`, `IoRingBackend` | `register` for sockets (Java reads files only); pool-job results have no counterpart. |
 | M1 frees | graph runtime `CudaGpuMemory` pinned pool | Trim on a worker (the user's rule over Java's comment). |
 | S1, S2 memory sources | none; nearest core `QueueIngestSink` | — |

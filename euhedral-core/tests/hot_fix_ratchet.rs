@@ -10,6 +10,8 @@
 //!   reason with `HOT-FIX(<id>)` (one or more, comma separated, each listed), `LIFECYCLE(<id>)` (a row of the audit)
 //!   or, for a call, `JAVA-BACKOFF`; or it is a test-only `cfg_attr`, or a file-level allow of a file on
 //!   [`EXEMPT_FILES`].
+//! - A file that locks through the `lock!` macro, which names no lock type, has its call sites counted per file
+//!   ([`LOCK_MACRO_SITES`]); the count only shrinks.
 //! - A type alias may not name a lock type: the lint reports the alias, not its uses, so an alias would hide the lock
 //!   from every site that uses it.
 
@@ -33,18 +35,12 @@ const HOT_FIX_TAGS: &[(&str, usize)] = &[
     ("C8", 3),
     ("C9", 3),
     ("C10", 2),
-    ("C11", 2),
-    ("C12", 3),
-    ("C13", 3),
     ("C14", 5),
     ("C16", 3),
     ("C17", 3),
     ("C18", 3),
     ("C19", 3),
     ("C20", 5),
-    ("G1", 4),
-    ("G2", 4),
-    ("G3", 4),
     ("G5", 3),
     ("G6", 3),
     ("G7", 3),
@@ -61,8 +57,6 @@ const HOT_FIX_TAGS: &[(&str, usize)] = &[
     ("H5", 4),
     ("H6", 3),
     ("H7", 3),
-    ("I1", 4),
-    ("I2", 4),
     ("I3", 3),
     ("I4", 3),
     ("I5", 3),
@@ -80,6 +74,18 @@ const HOT_FIX_TAGS: &[(&str, usize)] = &[
     ("S1", 1),
     ("S2", 1),
     ("S6a", 1),
+];
+
+/// The `lock!(..)` call sites by file (the macro names no lock type, so the lint cannot see them), with the ids of the
+/// audit the locks it takes belong to. A file's count only shrinks, and is 0 once none of its ids is listed in
+/// [`HOT_FIX_TAGS`]; a file not listed here has no site.
+const LOCK_MACRO_SITES: &[(&str, &[&str], usize)] = &[
+    ("euhedral-io/src/uring.rs", &["I3", "I4", "I5", "I6"], 5),
+    (
+        "euhedral-io/src/win/mod.rs",
+        &["I7", "I8", "I9", "I10", "I11", "I12", "I13", "I14", "I15"],
+        31,
+    ),
 ];
 
 /// Files whose file-level `allow` of a disallowed type is part of their design.
@@ -406,6 +412,64 @@ fn the_hot_fix_tags_and_their_uses_are_exactly_the_listed_ones() {
         "lower or delete the entries of HOT_FIX_TAGS for the tags this change removed; an id or a use that is new is a \
          new hot lock:\n{}",
         differing.join("\n")
+    );
+}
+
+/// The `lock!(` call sites in `text`.
+///
+/// A site is `lock!` (not the tail of a longer name) followed by optional whitespace and an opening delimiter.
+fn lock_sites(text: &str) -> usize {
+    let mut count = 0;
+    let mut rest = text;
+    while let Some(at) = rest.find("lock!") {
+        let before = rest[..at].chars().next_back();
+        let after = rest[at + "lock!".len()..].trim_start();
+        let part_of_a_name = before.is_some_and(|c| c.is_alphanumeric() || c == '_');
+        if !part_of_a_name && after.starts_with(['(', '[', '{']) {
+            count += 1;
+        }
+        rest = &rest[at + "lock!".len()..];
+    }
+    count
+}
+
+#[test]
+fn the_lock_macro_sites_are_exactly_the_listed_ones() {
+    let listed: BTreeSet<&str> = HOT_FIX_TAGS.iter().map(|(id, _)| *id).collect();
+    let mut found: BTreeMap<String, usize> = BTreeMap::new();
+    for (path, text) in sources() {
+        if path.starts_with("euhedral-io/src/") && lock_sites(&text) > 0 {
+            found.insert(path, lock_sites(&text));
+        }
+    }
+    let mut problems = Vec::new();
+    for (file, ids, count) in LOCK_MACRO_SITES {
+        let actual = found.remove(*file).unwrap_or(0);
+        if actual != *count {
+            problems.push(format!(
+                "{file}: listed {count} `lock!(` sites, found {actual}"
+            ));
+        }
+        if *count > 0 && !ids.iter().any(|id| listed.contains(id)) {
+            problems.push(format!(
+                "{file}: none of its ids {ids:?} is listed any more, so it may have no `lock!(` site"
+            ));
+        }
+    }
+    for (file, actual) in found {
+        problems.push(format!(
+            "{file}: {actual} `lock!(` sites, and the file is not listed"
+        ));
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+#[test]
+fn lock_sites_are_found_however_they_are_spelled() {
+    assert_eq!(lock_sites("lock!(&a) lock! (&b) lock!\n[c] lock!{d}"), 4);
+    assert_eq!(
+        lock_sites("unlock!(a) block!(b) my_lock!(c) macro_rules! lock {"),
+        0
     );
 }
 

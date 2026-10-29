@@ -214,3 +214,152 @@ fn owned_buffer_returned_on_error() {
     assert_eq!(refused.unwrap_err().kind(), io::ErrorKind::InvalidInput);
     assert_eq!(io.pending(), 0);
 }
+
+/// Takes each frame its upstream pushes and records its tag.
+#[derive(Default)]
+struct Collector {
+    tags: Mutex<Vec<u64>>,
+}
+
+impl euhedral_core::generics::LatticeTerminal for Collector {
+    fn add_upstream(&self, _upstream: Arc<dyn LatticeSource>) {}
+}
+
+impl euhedral_core::generics::LatticeReceiver for Collector {
+    fn push(&self, frame: Box<dyn Frame>) {
+        self.tags.lock().unwrap().push(frame.header().id_hash());
+    }
+
+    fn on_complete(&self) {}
+
+    fn on_error(&self, _error: euhedral_core::frames::Failure) {}
+}
+
+/// A file handle shared with reader threads: the file outlives them, and the engine takes the raw
+/// value only to submit.
+#[derive(Clone, Copy)]
+struct SharedFile(RawFile);
+
+// SAFETY: the handle is a plain value; the test keeps the owning `OwnedFile` alive past every thread.
+#[allow(unsafe_code)]
+unsafe impl Send for SharedFile {}
+// SAFETY: as above.
+#[allow(unsafe_code)]
+unsafe impl Sync for SharedFile {}
+
+impl SharedFile {
+    fn get(&self) -> RawFile {
+        self.0
+    }
+}
+
+#[test]
+fn a_request_only_lattice_delivers_every_completion() {
+    const THREADS: u64 = 4;
+    const EACH: u64 = 125;
+    let io = AsyncIo::open().unwrap();
+    let data = content(4096);
+    let (_scratch, file) = open_file(&io, "request-only", &data);
+    let collector = Arc::new(Collector::default());
+    io.clone().add_downstream(collector.clone());
+    let shared = SharedFile(raw(&file));
+    std::thread::scope(|scope| {
+        for thread in 0..THREADS {
+            let io = &io;
+            scope.spawn(move || {
+                for index in 0..EACH {
+                    let tag = thread * EACH + index;
+                    io.read_into(
+                        shared.get(),
+                        0,
+                        vec![SENTINEL; 64],
+                        Box::new(move |_done| Ended::frame(tag)),
+                    )
+                    .unwrap();
+                }
+            });
+        }
+        // The driver is a lattice that only requests: no pull is ever made.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while collector.tags.lock().unwrap().len() < (THREADS * EACH) as usize {
+            assert!(
+                Instant::now() < deadline,
+                "the completions did not all arrive"
+            );
+            io.request(8);
+            std::thread::yield_now();
+        }
+    });
+    let mut tags = collector.tags.lock().unwrap().clone();
+    tags.sort_unstable();
+    assert_eq!(
+        tags,
+        (0..THREADS * EACH).collect::<Vec<_>>(),
+        "each arrived once"
+    );
+    assert_eq!(io.pending(), 0);
+}
+
+#[test]
+fn a_request_while_a_pull_holds_the_front_returns_at_once_and_is_served_after() {
+    let io = AsyncIo::open().unwrap();
+    let data = content(4096);
+    let (_scratch, file) = open_file(&io, "refused-request", &data);
+    let collector = Arc::new(Collector::default());
+    io.clone().add_downstream(collector.clone());
+    let raw = raw(&file);
+    for tag in 0..2u64 {
+        io.read_into(
+            raw,
+            0,
+            vec![SENTINEL; 64],
+            Box::new(move |_done| Ended::frame(tag)),
+        )
+        .unwrap();
+    }
+    let inside = std::sync::Barrier::new(2);
+    let release = std::sync::Barrier::new(2);
+    let pulled = Mutex::new(Vec::new());
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            // Poll until one completion is in hand; its consumer holds the front.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                assert!(Instant::now() < deadline, "no read completed");
+                let got = io.pull(
+                    &mut |frame| {
+                        pulled.lock().unwrap().push(frame.header().id_hash());
+                        inside.wait();
+                        release.wait();
+                    },
+                    &mut |_| false,
+                    1,
+                );
+                if got == 1 {
+                    break;
+                }
+            }
+        });
+        inside.wait();
+        io.request(5);
+        assert!(
+            collector.tags.lock().unwrap().is_empty(),
+            "the request did not wait for the pull, and pushed nothing yet"
+        );
+        release.wait();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while collector.tags.lock().unwrap().is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "the other completion did not arrive"
+            );
+            io.request(1);
+            std::thread::yield_now();
+        }
+    });
+    let mut tags = pulled.lock().unwrap().clone();
+    tags.extend(collector.tags.lock().unwrap().iter().copied());
+    tags.sort_unstable();
+    assert_eq!(tags, [0, 1], "each completion went to exactly one of them");
+    assert_eq!(io.pending(), 0);
+}

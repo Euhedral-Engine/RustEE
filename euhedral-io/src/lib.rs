@@ -34,13 +34,22 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::io;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-#[allow(clippy::disallowed_types, reason = "HOT-FIX(I1), HOT-FIX(I2)")]
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use euhedral_core::frames::Frame;
-use euhedral_core::generics::{LatticeReceiver, LatticeSource};
+use euhedral_core::generics::{DownstreamSlot, LatticeReceiver, LatticeSource, SourceCell};
 use euhedral_data_structures::sync::HotScope;
+
+/// Locks a mutex for the engines' remaining shared tables, taking the state of a lock a panic poisoned.
+/// A macro, so that it names no lock type; the fields it locks carry their `HOT-FIX` tags.
+macro_rules! lock {
+    ($mutex:expr) => {
+        $mutex
+            .lock()
+            .unwrap_or_else(::std::sync::PoisonError::into_inner)
+    };
+}
 
 /// What turns a completed operation's result into the frame that continues the work.
 pub type Continuation<T> = Box<dyn FnOnce(T) -> Box<dyn Frame> + Send>;
@@ -510,27 +519,30 @@ pub struct AsyncIo {
 }
 
 /// The portable state of the `LatticeSource`.
+///
+/// Like Java's `AsyncReads.Delegate` (an ingest sink's delegate), `request` banks its demand and
+/// pushes what has ended within it; a request that finds the front entered leaves a wakeup that
+/// the holder serves as it lets go.
 pub(crate) struct Front {
-    /// Continuations reaped while a pull's `stop` matched them, the oldest first; only the polling
-    /// thread touches it.
-    #[allow(clippy::disallowed_types, reason = "HOT-FIX(I1)")]
-    held: Mutex<VecDeque<Box<dyn Frame>>>,
+    /// Continuations reaped while a pull's `stop` matched them, the oldest first. Plain state of
+    /// the polling call, as Java's reap state is ("reaped by one thread at a time"): entered only
+    /// from `reap`.
+    held: SourceCell<VecDeque<Box<dyn Frame>>>,
     pending: AtomicUsize,
     demand: AtomicU64,
-    #[allow(clippy::disallowed_types, reason = "HOT-FIX(I2)")]
-    downstream: Mutex<Option<Arc<dyn LatticeReceiver>>>,
-    complete: AtomicBool,
+    /// A request waiting for the holder of `held`; its demand is already banked.
+    request_pending: AtomicBool,
+    downstream: DownstreamSlot,
 }
 
 impl Front {
-    #[allow(clippy::disallowed_types, reason = "HOT-FIX(I1), HOT-FIX(I2)")]
     pub(crate) fn new() -> Self {
         Self {
-            held: Mutex::new(VecDeque::new()),
+            held: SourceCell::new(VecDeque::new()),
             pending: AtomicUsize::new(0),
             demand: AtomicU64::new(0),
-            downstream: Mutex::new(None),
-            complete: AtomicBool::new(false),
+            request_pending: AtomicBool::new(false),
+            downstream: DownstreamSlot::new(),
         }
     }
 
@@ -538,7 +550,12 @@ impl Front {
         self.pending.load(Ordering::Acquire)
     }
 
-    /// One poll: holds back or hands up to `demand` continuations' frames to `consumer`.
+    pub(crate) fn is_complete(&self) -> bool {
+        self.downstream.is_complete()
+    }
+
+    /// One poll: holds back or hands up to `demand` continuations' frames to `consumer`. Returns 0
+    /// at once if another poll is inside.
     pub(crate) fn reap(
         &self,
         engine: &dyn Engine,
@@ -549,16 +566,33 @@ impl Front {
         if demand == 0 || self.pending() == 0 {
             return 0;
         }
+        let Some(mut held) = self.held.try_enter() else {
+            return 0;
+        };
+        Self::reap_entered(&self.pending, &mut held, engine, consumer, stop, demand)
+    }
+
+    /// [`reap`](Self::reap) by the holder of `held`.
+    fn reap_entered(
+        pending: &AtomicUsize,
+        held: &mut VecDeque<Box<dyn Frame>>,
+        engine: &dyn Engine,
+        consumer: &mut dyn FnMut(Box<dyn Frame>),
+        stop: &mut dyn FnMut(&dyn Frame) -> bool,
+        demand: u64,
+    ) -> u64 {
+        if demand == 0 || pending.load(Ordering::Acquire) == 0 {
+            return 0;
+        }
         let mut emitted = 0u64;
         // Continuations an earlier pull's `stop` held back go first, in the order they were reaped.
-        let mut held = lock(&self.held);
         while emitted < demand {
             let Some(frame) = held.front() else { break };
             if stop(&**frame) {
                 return emitted;
             }
             let frame = held.pop_front().expect("the front");
-            self.pending.fetch_sub(1, Ordering::AcqRel);
+            pending.fetch_sub(1, Ordering::AcqRel);
             consumer(frame);
             emitted += 1;
         }
@@ -571,12 +605,62 @@ impl Front {
                 held.push_back(frame);
                 return false;
             }
-            self.pending.fetch_sub(1, Ordering::AcqRel);
+            pending.fetch_sub(1, Ordering::AcqRel);
             consumer(frame);
             emitted.set(emitted.get() + 1);
             true
         });
         emitted.get()
+    }
+
+    /// Adds `demand` (Java's `accumulate`: saturating) and returns the total.
+    fn add_demand(&self, demand: u64) {
+        let _ = self
+            .demand
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                Some(current.saturating_add(demand))
+            });
+    }
+
+    /// Pushes ended operations' frames to the downstream, up to the banked demand, while requests
+    /// are waiting and the front is free (Java's `drainRequests`).
+    fn serve_requests(&self, engine: &dyn Engine) {
+        // The wakeup is published before the front is entered: the releasing holder either sees
+        // it, or the requester enters the front itself.
+        while self.request_pending.load(Ordering::SeqCst) {
+            let Some(mut held) = self.held.try_enter() else {
+                return;
+            };
+            // One read-modify-write takes the wakeup and synchronizes with the store that set it, so
+            // the demand banked before that store is seen below (a plain store of `false` could
+            // overwrite a racing request's and leave this holder reading older demand).
+            if !self.request_pending.swap(false, Ordering::SeqCst) {
+                drop(held);
+                continue;
+            }
+            let Some(downstream) = self.downstream.receiver() else {
+                return;
+            };
+            if self.is_complete() {
+                return;
+            }
+            let emitted = Self::reap_entered(
+                &self.pending,
+                &mut held,
+                engine,
+                &mut |frame| downstream.push(frame),
+                &mut |_| false,
+                self.demand.load(Ordering::SeqCst),
+            );
+            if emitted > 0 {
+                // Accounted before the front is let go, so the next holder cannot over-deliver.
+                let _ = self
+                    .demand
+                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |d| {
+                        Some(d.saturating_sub(emitted))
+                    });
+            }
+        }
     }
 }
 
@@ -586,11 +670,6 @@ impl fmt::Debug for AsyncIo {
             .field("pending", &self.pending())
             .finish_non_exhaustive()
     }
-}
-
-#[allow(clippy::disallowed_types, reason = "HOT-FIX(I1), HOT-FIX(I2)")]
-pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 fn invalid(what: &'static str) -> io::Error {
@@ -644,7 +723,7 @@ impl AsyncIo {
 
     fn submit(&self, request: Request, buf: Buf, then: Then) -> io::Result<()> {
         let _hot = HotScope::enter();
-        if self.front.complete.load(Ordering::Acquire) {
+        if self.front.is_complete() {
             return Err(io::Error::other("this AsyncIo is complete"));
         }
         // Counted before the engine may see the operation: a poll then never finds an end that is
@@ -837,62 +916,53 @@ impl AsyncIo {
 
 impl LatticeSource for AsyncIo {
     fn add_downstream(self: Arc<Self>, downstream: Arc<dyn LatticeReceiver>) {
-        if self.front.complete.load(Ordering::Acquire) {
-            downstream.on_complete();
-            return;
-        }
-        *lock(&self.front.downstream) = Some(downstream.clone());
-        downstream.add_upstream(self);
+        self.front.downstream.attach(self.clone(), downstream);
     }
 
+    /// Hands up to `demand` ended operations' frames to `consumer`, unless another poll is inside:
+    /// then it returns 0 at once, and that poll serves the requests that arrived meanwhile when it
+    /// lets go.
     fn pull(
         &self,
         consumer: &mut dyn FnMut(Box<dyn Frame>),
         stop: &mut dyn FnMut(&dyn Frame) -> bool,
         demand: u64,
     ) -> u64 {
+        // Serves the requests refused meanwhile also when `consumer` unwinds.
+        struct Serve<'a>(&'a AsyncIo);
+        impl Drop for Serve<'_> {
+            fn drop(&mut self) {
+                std::sync::atomic::fence(Ordering::SeqCst);
+                if std::thread::panicking() {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        self.0.front.serve_requests(&self.0.engine)
+                    }));
+                } else {
+                    self.0.front.serve_requests(&self.0.engine);
+                }
+            }
+        }
+        let _serve = Serve(self);
         self.front.reap(&self.engine, consumer, stop, demand)
     }
 
+    /// Banks `demand` and pushes ended operations' frames to the downstream up to the total.
     fn request(&self, demand: u64) {
-        if demand == 0 || self.front.complete.load(Ordering::Acquire) {
+        if demand == 0 || self.front.is_complete() || self.front.downstream.receiver().is_none() {
             return;
         }
-        let total = self
-            .front
-            .demand
-            .fetch_add(demand, Ordering::AcqRel)
-            .saturating_add(demand);
-        let Some(downstream) = lock(&self.front.downstream).clone() else {
-            return;
-        };
-        let emitted = self.front.reap(
-            &self.engine,
-            &mut |frame| downstream.push(frame),
-            &mut |_| false,
-            total,
-        );
-        if emitted > 0 {
-            let _ = self
-                .front
-                .demand
-                .try_update(Ordering::AcqRel, Ordering::Acquire, |d| {
-                    Some(d.saturating_sub(emitted))
-                });
-        }
+        self.front.add_demand(demand);
+        self.front.request_pending.store(true, Ordering::SeqCst);
+        self.front.serve_requests(&self.engine);
     }
 
     /// Stops new submissions (they fail) and tells the downstream. Complete it once
     /// [`AsyncIo::pending`] is zero.
     fn complete(&self) {
-        if !self.front.complete.swap(true, Ordering::AcqRel)
-            && let Some(downstream) = lock(&self.front.downstream).take()
-        {
-            downstream.on_complete();
-        }
+        self.front.downstream.complete();
     }
 
     fn is_complete(&self) -> bool {
-        self.front.complete.load(Ordering::Acquire)
+        self.front.is_complete()
     }
 }

@@ -50,12 +50,16 @@ jobs:
         run: |
           cargo test --release -p euhedral-core --lib flow_control::vertex
           cargo test --release -p euhedral-core --lib generics::
+          cargo test --release -p euhedral-core --lib ingest::
+          cargo test --release -p euhedral-graph --lib completions::
 
       - name: Loom models
         if: runner.os == 'Linux'
         env:
           RUSTFLAGS: --cfg loom
-        run: cargo test -p euhedral-data-structures --release --lib sync::set_once::loom
+        run: |
+          cargo test -p euhedral-data-structures --release --lib sync::set_once::loom
+          cargo test -p euhedral-data-structures --release --lib sync::claim_cell::loom
 
       - name: CUDA backend (built and linted; its tests skip with no device)
         if: runner.os == 'Linux'
@@ -63,3 +67,26 @@ jobs:
           cargo clippy -p euhedral-memory --all-targets --features cuda -- -D warnings
           cargo clippy -p euhedral-gpu --all-targets --features cuda -- -D warnings
           cargo test -p euhedral-gpu --features cuda
+
+  # The lock-free sources' handshakes (a claim, a wakeup flag, a re-check after release) under Miri's weak-memory
+  # emulation with several seeds. The tests scale their rounds down under `cfg(miri)`.
+  miri:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      MIRIFLAGS: -Zmiri-many-seeds=0..16 -Zmiri-ignore-leaks
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install a nightly toolchain with Miri
+        run: |
+          rustup toolchain install nightly --profile minimal --component miri --component rust-src
+          cargo +nightly miri setup
+
+      - name: Claims, ingest sources, completions
+        run: |
+          cargo +nightly miri test -p euhedral-data-structures --lib sync::claim_cell
+          cargo +nightly miri test -p euhedral-core --lib ingest::single_use
+          cargo +nightly miri test -p euhedral-core --lib -- metrics::histogram::tests::an_owner metrics::histogram::tests::a_reader
+          cargo +nightly miri test -p euhedral-core --lib -- ingest::queue::tests::a_request_while ingest::queue::tests::a_request_refused ingest::queue::tests::request_pushes ingest::queue::tests::a_source_driven ingest::queue::tests::a_publish_after ingest::queue::tests::clear_racing ingest::queue::tests::a_panicking ingest::queue::tests::concurrent_publishers ingest::queue::tests::frames_queued
+          cargo +nightly miri test -p euhedral-graph --lib -- completions::tests::registrations_racing completions::tests::a_request_while completions::tests::a_sweep_that completions::tests::a_consumer_that completions::tests::a_panicking completions::tests::a_late_registration completions::tests::a_marker_registration completions::tests::dropping_

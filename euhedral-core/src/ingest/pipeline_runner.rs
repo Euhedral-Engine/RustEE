@@ -82,7 +82,9 @@ impl Shared {
 
     /// Kills every chain, closes admission and the source, then cancels whatever is queued.
     fn kill(&self) {
-        self.kill_switch.store(true, Ordering::Release);
+        // Sequentially consistent, as a volatile write is: a drain that holds the queue reads it
+        // after letting go, and the kill's own claim attempt must not both miss it.
+        self.kill_switch.store(true, Ordering::SeqCst);
         self.close_admission();
         let closed = panic::catch_unwind(AssertUnwindSafe(|| self.source.close()));
         self.cancel_queued(&self.source);
@@ -92,7 +94,7 @@ impl Shared {
     }
 
     fn cancel_queued(&self, source: &QueueSource) {
-        if self.kill_switch.load(Ordering::Acquire) {
+        if self.kill_switch.load(Ordering::SeqCst) {
             source.discard_queued(|frame| frame.do_finally_with_error(FrameError::Cancelled));
         }
     }

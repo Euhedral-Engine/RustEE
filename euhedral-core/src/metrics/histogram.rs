@@ -20,8 +20,9 @@ pub const BUCKETS: usize = 1 + OCTAVES * SUB_BUCKETS;
 /// share the first bucket and values of `2^48` or more the last. Negative and `NaN` values are
 /// ignored, as Micrometer's distribution summaries ignore negative amounts.
 ///
-/// Recording takes no lock and allocates nothing. Readers take a [`snapshot`](Self::snapshot) at
-/// any time without stopping writers.
+/// Recording takes no lock and allocates nothing. Any number of threads may [`record`](Self::record); a histogram
+/// with one recording thread at a time uses [`record_owned`](Self::record_owned). Readers take a
+/// [`snapshot`](Self::snapshot) at any time without stopping writers.
 pub struct Histogram {
     count: AtomicU64,
     sum: AtomicDouble,
@@ -52,6 +53,30 @@ impl Histogram {
         self.sum.get_and_add(value);
         self.max.fetch_max(value.to_bits(), Ordering::Relaxed);
         self.count.fetch_add(1, Ordering::Release);
+    }
+
+    /// Adds `value` to the distribution, for a histogram that one thread records into at a time.
+    /// Negative and `NaN` values are ignored.
+    ///
+    /// Each field is read, changed and written back with plain loads and stores instead of read-modify-write
+    /// instructions, so recording is as cheap as a counter in the owner's own memory, and readers
+    /// ([`snapshot`](Self::snapshot), [`count`](Self::count)) see the same fields as with
+    /// [`record`](Self::record). Two threads recording at once lose updates; hand the histogram from one recording
+    /// thread to the next with a synchronizing step, as a claim or a join does.
+    #[inline]
+    pub fn record_owned(&self, value: f64) {
+        if value.is_nan() || value < 0.0 {
+            return;
+        }
+        let value = value + 0.0;
+        let bucket = &self.buckets[bucket_of(value)];
+        bucket.store(bucket.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+        self.sum.set_opaque(self.sum.get_opaque() + value);
+        if value.to_bits() > self.max.load(Ordering::Relaxed) {
+            self.max.store(value.to_bits(), Ordering::Relaxed);
+        }
+        self.count
+            .store(self.count.load(Ordering::Relaxed) + 1, Ordering::Release);
     }
 
     /// The values recorded so far.
@@ -341,5 +366,40 @@ mod tests {
             .map(|writer| (0..10_000u64).map(|v| v % 64 + writer).sum::<u64>())
             .sum();
         assert_eq!(snapshot.sum, exact as f64);
+    }
+
+    #[test]
+    fn an_owner_records_what_the_shared_record_does() {
+        let shared = Histogram::new();
+        let owned = Histogram::new();
+        for value in [3.0, 0.5, 100.0, 0.0, 3.0, -0.0] {
+            shared.record(value);
+            owned.record_owned(value);
+        }
+        owned.record_owned(-1.0);
+        owned.record_owned(f64::NAN);
+        assert_eq!(owned.snapshot(), shared.snapshot());
+        assert_eq!(owned.count(), 6);
+    }
+
+    #[test]
+    fn a_reader_alongside_an_owner_sees_a_consistent_prefix() {
+        const VALUES: u64 = if cfg!(miri) { 64 } else { 20_000 };
+        let histogram = Histogram::new();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for value in 0..VALUES {
+                    histogram.record_owned((value % 64) as f64);
+                }
+            });
+            let mut seen = 0;
+            while seen < VALUES {
+                let snapshot = histogram.snapshot();
+                assert!(snapshot.count >= seen, "the count only grows");
+                assert!(snapshot.buckets.iter().sum::<u64>() >= snapshot.count);
+                seen = snapshot.count;
+            }
+        });
+        assert_eq!(histogram.snapshot().count, VALUES);
     }
 }

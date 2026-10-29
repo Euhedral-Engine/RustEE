@@ -63,6 +63,10 @@ frame whose kill switch is set is still emitted: the executor skips it and runs 
 which ends what it holds, so `pending()` drains to zero on its own. `lateness_us()` reports how
 late emissions were: the cost of finding completions by polls.
 
+One poll runs at a time and none waits. A `request` that finds a poll running banks its demand and leaves a wakeup,
+and the running poll pushes within the demand as it lets go; the same holds for the sweep that cancels a
+registration made after `complete`.
+
 This runs one by hand, with a `Sequencer` that releases in admission order whatever order the
 items finished in:
 

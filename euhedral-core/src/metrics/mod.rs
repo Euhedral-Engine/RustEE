@@ -265,16 +265,19 @@ impl ExecutionMetrics {
         &self.registry
     }
 
-    /// Counts `frames` more frames run.
+    /// Counts `frames` more frames run. Only the worker whose meters these are calls it; readers load the count.
     #[inline]
     pub(crate) fn record_frames(&self, frames: u64) {
-        self.frames.fetch_add(frames, Ordering::Relaxed);
+        self.frames.store(
+            self.frames.load(Ordering::Relaxed) + frames,
+            Ordering::Relaxed,
+        );
     }
 
     /// Records how long one frame's `execute` took.
     #[inline]
     pub(crate) fn record_service_time(&self, elapsed: Duration) {
-        self.service_time.record(elapsed.as_nanos() as f64);
+        self.service_time.record_owned(elapsed.as_nanos() as f64);
     }
 
     /// The frames whose `execute` was timed, and the sum of their times in nanoseconds.
@@ -297,7 +300,8 @@ impl ExecutionMetrics {
 
     /// Records a rate in frames per nanosecond, as frames per second.
     pub(crate) fn report_throughput(&self, frames_per_nano: f64) {
-        self.throughput.record(frames_per_nano * NANOS_PER_SECOND);
+        self.throughput
+            .record_owned(frames_per_nano * NANOS_PER_SECOND);
     }
 
     /// Appends the worker's meters, with `in_progress` for its gauge.
