@@ -35,6 +35,7 @@
 pub mod completions;
 pub mod join;
 pub mod lake;
+pub mod lane_source;
 pub mod lanes;
 pub mod latch;
 pub mod sequencer;
@@ -46,7 +47,11 @@ pub mod testing;
 pub use completions::{Completions, Pending, Ready};
 pub use join::{Join, Round};
 pub use lake::{Lake, LakeClosed, UnitGuard};
-pub use lanes::{DeviceQueue, LaneId, LanePool, Marker, QueueId};
+pub use lane_source::{
+    Deliver, GroupId, LaneClosed, LaneCx, LaneInputs, LaneIntakes, LaneMetrics, LaneSource,
+    LaneState, LaneSubmit, LaneWork, Outcome, Retired,
+};
+pub use lanes::{DeviceQueue, LaneId, LanePool, LanePoolBuilder, Marker, QueueId};
 pub use latch::{Latch, LatchSetter, LatchWaiter};
 pub use sequencer::{Sequencer, Slot};
 pub use stage_graph::{

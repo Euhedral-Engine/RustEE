@@ -22,9 +22,10 @@ so it needs no thread of its own. It does not re-export `euhedral-core`: import 
 | [`join`](src/join.rs) | `Join`, `Round`: a re-armable fan-in cell; the continuation runs when its last part arrives. |
 | [`lake`](src/lake.rs) | `Lake`, `UnitGuard` and `LakeClosed`: the pool of ready work of one kind, as several ingest sinks that attach to the lattice for a busy period. A `FrameSink`. |
 | [`latch`](src/latch.rs) | `Latch`, `LatchSetter` and `LatchWaiter`: a frame hands one value to the main thread, which parks until it arrives. |
-| [`lanes`](src/lanes.rs) | `LanePool`, `LaneId`, `Marker` and the trait `DeviceQueue`: device timelines that are queried, never waited on. |
+| [`lanes`](src/lanes.rs) | `LanePool`, `LanePoolBuilder`, `LaneId`, `Marker` and the trait `DeviceQueue`: device timelines that are queried, never waited on. |
+| [`lane_source`](src/lane_source/mod.rs) | `LaneSource`, a `LatticeSource` per device lane; the traits it drives (`LaneSubmit`, `LaneState`, `LaneWork` with `Outcome` and `LaneCx`); `LaneIntakes`, `LaneInputs`, `Deliver` and `GroupId` for delivery; `LaneMetrics`. |
 | [`stage_graph`](src/stage_graph.rs) | `StageGraph` and its spec (`StageGraphSpec`, `StageSpec`, `StageId`, `EdgeKind`), the `Stage` trait with `StageCx`, `Submitted` and `StageError`, `QuantumOutcome`, `ExternalEdge`, `QuantumRef`, `GraphRuntime`, `RetryCounts`, `GraphError` and `DEFAULT_RETRY_BACKSTOP`. |
-| [`testing`](src/testing.rs) | `FakeDevice`, an in-order fake `DeviceQueue`. Feature `testing`. |
+| [`testing`](src/testing.rs) | `FakeDevice`, an in-order fake `DeviceQueue`, and `FakeLanes`, a stepped fake `LaneSubmit`. Feature `testing`. |
 | crate root | Every type above, re-exported; `ThreadUsage` (the calling thread's CPU time and involuntary context switches, to tell a preempted callback from a slow one; measured on Linux and Android). |
 
 ## Key concepts
@@ -125,6 +126,82 @@ query, `completed()`, one cheap read. A `Marker` names the queue that made it (`
 a `LanePool` holds the lanes and answers `reached(marker)`, which is false for a marker of another queue. Submitting is technology-specific and lives with whoever
 owns the queue: it takes the markers its work must wait for on the device and returns the marker
 of the new work.
+
+### A lane is a source
+
+A device lane's submitter has one owner, so a lane runs as one `LatticeSource`, a `LaneSource`. Work is
+**delivered** to a lane's own intake or to its group's shared intake (`LaneIntakes::deliver`), which only
+enqueues. The lattice enters the source, and each `request(demand)`:
+
+1. banks the demand;
+2. runs the continuations of the retirements that arrived;
+3. reads the lane's hardware state once (`LaneState::check`);
+4. runs every item that is ready, the released waiting items first, then the lane's own intake, then the group's
+   shared intake. There is no budget: a long item runs on the worker that needs it;
+5. pushes at most the banked demand of the frames the items made.
+
+An item that cannot go on answers `Outcome::Wait`; it stays in the source and items of its order key wait behind it.
+`pull` hands over ready frames and never submits work. The example drives one lane by hand with the stepped fake:
+
+```rust
+use std::sync::Arc;
+use euhedral_core::frames::{Failure, Frame, FrameHeader};
+use euhedral_core::generics::{LatticeReceiver, LatticeSource, LatticeTerminal};
+use euhedral_graph::testing::{FakeLane, FakeLaneError, FakeLanes};
+use euhedral_graph::{
+    Deliver, LaneCx, LaneId, LaneIntakes, LanePoolBuilder, LaneSource, LaneWork, Marker, Outcome,
+};
+
+/// An item that submits, then queues one frame.
+struct Item(u64);
+
+impl LaneWork<FakeLane, ()> for Item {
+    const KINDS: &'static [&'static str] = &["item"];
+    fn kind(&self) -> usize { 0 }
+    fn waits(&self) -> &[Marker] { &[] }
+    fn run(&mut self, _cx: &mut LaneCx<'_, FakeLane, (), Self>) -> Outcome<std::convert::Infallible> {
+        Outcome::Submitted { retire: false }
+    }
+    fn then(&mut self, _marker: Option<Marker>, cx: &mut LaneCx<'_, FakeLane, (), Self>) {
+        cx.ready(Box::new(Out(FrameHeader::new(self.0))));
+    }
+    fn failed(self, _error: FakeLaneError, _cx: &mut LaneCx<'_, FakeLane, (), Self>) {}
+}
+
+struct Out(FrameHeader);
+impl Frame for Out {
+    fn header(&self) -> &FrameHeader { &self.0 }
+    fn header_mut(&mut self) -> &mut FrameHeader { &mut self.0 }
+}
+
+/// Counts what it is pushed.
+#[derive(Default)]
+struct Count(std::sync::atomic::AtomicUsize);
+impl LatticeTerminal for Count {
+    fn add_upstream(&self, _upstream: Arc<dyn LatticeSource>) {}
+}
+impl LatticeReceiver for Count {
+    fn push(&self, _frame: Box<dyn Frame>) { self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst); }
+    fn on_complete(&self) {}
+    fn on_error(&self, _error: Failure) {}
+}
+
+let mut builder = LanePoolBuilder::new();
+let first = builder.reserve(1);
+let (_fake, mut lanes, queues) = FakeLanes::open(first, 1);
+builder.set(first, queues.into_iter().next().unwrap());
+let (intakes, mut inputs) = LaneIntakes::<Item>::new(builder.build(), &[]);
+let source = LaneSource::new(lanes.remove(0), (), inputs.remove(0), intakes.clone());
+let out = Arc::new(Count::default());
+source.clone().add_downstream(out.clone());
+
+intakes.deliver(Item(1), Deliver::Lane(LaneId(0)));
+intakes.deliver(Item(2), Deliver::Lane(LaneId(0)));
+source.request(1); // demand for one frame: both items run, one frame is pushed
+assert_eq!(out.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+source.request(1); // the second frame goes out with the demand banked since
+assert_eq!(out.0.load(std::sync::atomic::Ordering::SeqCst), 2);
+```
 
 ### Stage graphs
 

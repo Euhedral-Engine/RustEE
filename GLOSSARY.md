@@ -97,10 +97,10 @@ State that only those calls touch is plain, in a `SourceCell`, with no atomics a
 is always called; `pull` may never be.
 
 **SourceCell, SourceGuard** ([`SourceCell`](euhedral-core/src/generics/source_cell.rs)): a source's
-plain state under the source invariant. `enter` is `unsafe`, because the compiler cannot see the
-lattice's guarantee; the caller is inside `pull` or `request`, or in an action `serialize` runs. A
-source's lifecycle calls from other threads set atomics, and the source applies them there. In
-debug builds a second entry, nested or from another thread, panics. Release builds carry no check.
+plain state under the source invariant. Entry takes a claim with one compare-and-set in every build, so
+two guards never exist: `try_enter` hands a refusal back (a nested entry, or a direct call racing the lattice),
+`enter` panics. Under the lattice the claim is always free. A source's lifecycle calls from other threads set
+atomics, and the source applies them in `pull` or `request`.
 
 **`serialize`** ([`LatticeReceiver::serialize`](euhedral-core/src/generics/lattice.rs)): runs an action
 when no `pull` or `request` of the receiver's source is in progress, without waiting: at once if none
@@ -347,6 +347,37 @@ behind a marker on the device.
 **LanePool** ([`LanePool`](euhedral-graph/src/lanes.rs), [`LaneId`](euhedral-graph/src/lanes.rs)):
 the device lanes shared by every graph of a process. `reached` says whether a marker's work has
 completed; `choose` picks a stage's lane, continuing its predecessor's when allowed.
+
+**LanePoolBuilder** ([`LanePoolBuilder`](euhedral-graph/src/lanes.rs)): composes a `LanePool` from the queues of
+several backends. A backend `reserve`s a range of lane ids, opens its queues at them and `set`s each one; `build`
+makes the immutable pool.
+
+**lane source** ([`LaneSource`](euhedral-graph/src/lane_source/source.rs)): a device lane as one `LatticeSource`.
+It owns the lane's submitter and per-lane state in a `SourceCell`, takes work from its own intake and its lane
+group's shared intake, and pushes the frames its items made within the demand it has banked. Each `request` drains
+retirements, reads the lane's hardware state once, runs every item whose dependencies are met (no budget) and then
+pushes; `pull` hands over ready frames and does nothing else.
+
+**intake, shared intake** ([`LaneIntakes`](euhedral-graph/src/lane_source/intake.rs)): where delivered work waits.
+A lane's own intake is an MPSC queue, so delivery order is kept per lane. A lane group's shared intake is an MPMC
+queue that every source of the group takes from, one item at a time, so unbound work runs on whichever source of the
+group a worker enters first. Delivery only enqueues: it spends no demand and runs nothing.
+
+**lane group** ([`GroupId`](euhedral-graph/src/lane_source/intake.rs)): lanes whose sources share one intake. A lane
+is in at most one group, and a group may hold lanes of several backends.
+
+**banked demand** ([`LaneSource::banked`](euhedral-graph/src/lane_source/source.rs)): the demand a lane source has
+been asked for and has not yet spent on a push. `request` always adds to it, even with nothing ready, and a push
+subtracts what it pushed; `pull` never touches it. `u64::MAX` saturates the bank; a spend floors at zero.
+
+**lane item** ([`LaneWork`](euhedral-graph/src/lane_source/mod.rs)): one unit of work on a lane. It runs on the
+lane's submitter, answers `Submitted`, `Finished` or `Wait`, delivers its successors after the lane marked it, and
+may ask for a retirement whose continuation runs when the device is done. An item can carry an order key: items of
+one key run in delivery order, even across a wait.
+
+**waits for** ([`Outcome::Wait`](euhedral-graph/src/lane_source/mod.rs), [`LaneState::met`](euhedral-graph/src/lane_source/mod.rs)):
+an item that cannot go on until the lane's own hardware state allows it answers `Wait`. It stays in the source,
+the source asks `met` once per request, and items with the same order key wait behind it.
 
 **submission edge, completion edge, external edge**
 ([`EdgeKind`](euhedral-graph/src/stage_graph.rs), [`ExternalEdge`](euhedral-graph/src/stage_graph.rs)): when a

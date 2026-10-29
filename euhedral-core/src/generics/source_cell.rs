@@ -5,70 +5,77 @@
 //! only those calls touch (and the actions [`LatticeReceiver::serialize`] runs in their place)
 //! therefore needs no atomics and no lock. A source's lifecycle calls, which may arrive from any
 //! thread, set atomics instead, and the source applies them to its cell in its next `request` or
-//! `pull`. A [`SourceCell`] holds such state and says so in the
-//! type: entering it is `unsafe`, because the compiler cannot see the lattice's guarantee.
+//! `pull`.
+//!
+//! A [`SourceCell`] holds such state and checks the guarantee itself, in every build: entering takes
+//! a claim with one compare-and-set (uncontended under the lattice), so a nested entry, or a direct
+//! call that races the lattice, can never produce two live `&mut` to the state. The source decides
+//! what a refused entry means: [`try_enter`](SourceCell::try_enter) hands the refusal back, as the
+//! ingest sinks' `draining` flag does; [`enter`](SourceCell::enter) panics.
 //!
 //! [`LatticeReceiver::serialize`]: super::LatticeReceiver::serialize
 
 use std::cell::UnsafeCell;
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
-#[cfg(debug_assertions)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// State that only a source's `pull` and `request` (and actions `serialize` runs) touch.
 ///
-/// In debug builds [`enter`](Self::enter) panics if the cell is entered again before its guard
-/// drops, from the same thread (a nested entry) or from another. Release builds carry no field
-/// and make no check.
+/// Entry takes a claim, a compare-and-set of the entering thread's token into `inside` (`SeqCst`),
+/// and the guard's drop gives it back (`SeqCst` store of 0). The state is reached only through a
+/// guard, so at most one `&mut T` exists at a time in every build.
 pub struct SourceCell<T> {
     value: UnsafeCell<T>,
     /// The token of the thread inside, or 0.
-    #[cfg(debug_assertions)]
     inside: AtomicUsize,
 }
 
-// SAFETY: the value is reached only through `enter`, whose contract admits one thread at a time,
-// so sharing the cell moves the `T` between threads without ever aliasing it.
+// SAFETY: the value is reached only through a guard, and the claim admits one guard at a time, so
+// sharing the cell moves the `T` between threads without ever aliasing it.
 unsafe impl<T: Send> Sync for SourceCell<T> {}
 
 impl<T> SourceCell<T> {
     pub const fn new(value: T) -> Self {
         Self {
             value: UnsafeCell::new(value),
-            #[cfg(debug_assertions)]
             inside: AtomicUsize::new(0),
         }
     }
 
+    /// Takes the state for the duration of the guard, or hands back the refusal: `None` when the
+    /// cell is already entered, from this thread (a nested entry) or from another. Never waits.
+    pub fn try_enter(&self) -> Option<SourceGuard<'_, T>> {
+        self.claim().ok()
+    }
+
     /// Takes the state for the duration of the guard.
-    ///
-    /// # Safety
-    ///
-    /// The caller is inside this source's `pull` or `request`, or in an action `serialize` runs,
-    /// and holds no other guard of this cell.
     ///
     /// # Panics
     ///
-    /// In debug builds, if the cell is already entered.
+    /// If the cell is already entered: "again on the same thread (a nested entry)" or "from
+    /// another thread while one is inside". The check is made in every build.
     #[track_caller]
-    pub unsafe fn enter(&self) -> SourceGuard<'_, T> {
-        #[cfg(debug_assertions)]
-        {
-            let token = thread_token();
-            if let Err(holder) =
-                self.inside
-                    .compare_exchange(0, token, Ordering::AcqRel, Ordering::Acquire)
-            {
-                if holder == token {
-                    panic!("SourceCell entered again on the same thread (a nested entry)");
-                }
-                panic!("SourceCell entered from another thread while one is inside");
-            }
+    pub fn enter(&self) -> SourceGuard<'_, T> {
+        match self.claim() {
+            Ok(guard) => guard,
+            Err(true) => panic!("SourceCell entered again on the same thread (a nested entry)"),
+            Err(false) => panic!("SourceCell entered from another thread while one is inside"),
         }
-        SourceGuard {
-            cell: self,
-            marker: PhantomData,
+    }
+
+    /// The claim: `Err(true)` when this thread holds it, `Err(false)` when another does.
+    fn claim(&self) -> Result<SourceGuard<'_, T>, bool> {
+        let token = thread_token();
+        match self
+            .inside
+            .compare_exchange(0, token, Ordering::SeqCst, Ordering::SeqCst)
+        {
+            Ok(_) => Ok(SourceGuard {
+                cell: self,
+                marker: PhantomData,
+            }),
+            Err(holder) => Err(holder == token),
         }
     }
 
@@ -101,8 +108,7 @@ impl<T: Default> Default for SourceCell<T> {
 /// fn needs_sync<T: Sync>(_: &T) {}
 ///
 /// let cell = SourceCell::new(Cell::new(0));
-/// // SAFETY: a doctest on one thread.
-/// let guard = unsafe { cell.enter() };
+/// let guard = cell.enter();
 /// needs_sync(&guard); // a guard over a `Cell` is not `Sync`
 /// ```
 ///
@@ -112,8 +118,7 @@ impl<T: Default> Default for SourceCell<T> {
 /// fn needs_send_sync<T: Send + Sync>(_: &T) {}
 ///
 /// let cell = SourceCell::new(0u64);
-/// // SAFETY: a doctest on one thread.
-/// let guard = unsafe { cell.enter() };
+/// let guard = cell.enter();
 /// needs_send_sync(&guard);
 /// ```
 pub struct SourceGuard<'a, T> {
@@ -132,7 +137,7 @@ impl<T> Deref for SourceGuard<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        // SAFETY: `enter`'s contract makes this guard the only access to the value.
+        // SAFETY: the guard holds the cell's claim, so it is the only access to the value.
         unsafe { &*self.cell.value.get() }
     }
 }
@@ -144,15 +149,13 @@ impl<T> DerefMut for SourceGuard<'_, T> {
     }
 }
 
-#[cfg(debug_assertions)]
 impl<T> Drop for SourceGuard<'_, T> {
     fn drop(&mut self) {
-        self.cell.inside.store(0, Ordering::Release);
+        self.cell.inside.store(0, Ordering::SeqCst);
     }
 }
 
 /// A non-zero value unique to the calling thread while it lives: the address of a thread-local.
-#[cfg(debug_assertions)]
 fn thread_token() -> usize {
     thread_local! {
         static TOKEN: u8 = const { 0 };
@@ -163,11 +166,8 @@ fn thread_token() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(debug_assertions)]
     use crate::frames::Frame;
-    #[cfg(debug_assertions)]
     use crate::generics::{LatticeReceiver, LatticeSource};
-    #[cfg(debug_assertions)]
     use std::sync::Barrier;
     use std::sync::{Arc, Mutex};
     use std::thread;
@@ -176,37 +176,30 @@ mod tests {
     fn a_guard_reads_and_writes_the_value() {
         let cell = SourceCell::new(vec![1, 2]);
         {
-            // SAFETY: the test is the only thread.
-            let mut guard = unsafe { cell.enter() };
+            let mut guard = cell.enter();
             guard.push(3);
             assert_eq!(guard.len(), 3);
         }
-        // SAFETY: the test is the only thread, and the first guard dropped.
-        assert_eq!(*unsafe { cell.enter() }, [1, 2, 3]);
+        assert_eq!(*cell.enter(), [1, 2, 3]);
     }
 
-    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "nested entry")]
-    fn a_nested_enter_panics_in_debug() {
+    fn a_nested_enter_panics_in_every_build() {
         let cell = SourceCell::new(0);
-        // SAFETY: the test breaks the contract on purpose; the debug check is what it exercises.
-        let _first = unsafe { cell.enter() };
-        // SAFETY: as above.
-        let _second = unsafe { cell.enter() };
+        let _first = cell.enter();
+        let _second = cell.enter();
     }
 
-    #[cfg(debug_assertions)]
     #[test]
-    fn a_second_thread_entering_while_one_is_inside_panics_in_debug() {
+    fn a_second_thread_entering_while_one_is_inside_panics_in_every_build() {
         let cell = Arc::new(SourceCell::new(0u32));
         let first = Arc::new(Barrier::new(2));
         let second = Arc::new(Barrier::new(2));
         let holder = {
             let (cell, first, second) = (cell.clone(), first.clone(), second.clone());
             thread::spawn(move || {
-                // SAFETY: the only legitimate entry; the other thread's entry is the violation.
-                let mut guard = unsafe { cell.enter() };
+                let mut guard = cell.enter();
                 *guard += 1;
                 first.wait();
                 second.wait();
@@ -217,8 +210,7 @@ mod tests {
             let cell = cell.clone();
             thread::spawn(move || {
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    // SAFETY: the test breaks the contract on purpose.
-                    drop(unsafe { cell.enter() });
+                    drop(cell.enter());
                 }))
             })
             .join()
@@ -233,9 +225,7 @@ mod tests {
         assert!(message.contains("from another thread"), "{message}");
         second.wait();
         holder.join().unwrap();
-
-        // SAFETY: the holder has finished; the test is the only thread.
-        let guard = unsafe { cell.enter() };
+        let guard = cell.enter();
         assert_eq!(
             *guard, 1,
             "the refused entry left the state alone, and the check does not stick"
@@ -243,14 +233,12 @@ mod tests {
     }
 
     /// A source whose `request` sits inside its state until the test lets it go.
-    #[cfg(debug_assertions)]
     struct Blocking {
         state: SourceCell<u64>,
         inside: Barrier,
         release: Barrier,
     }
 
-    #[cfg(debug_assertions)]
     impl LatticeSource for Blocking {
         fn add_downstream(self: Arc<Self>, _downstream: Arc<dyn LatticeReceiver>) {}
 
@@ -264,9 +252,7 @@ mod tests {
         }
 
         fn request(&self, demand: u64) {
-            // SAFETY: the lattice serializes `request`; the test below calls it directly from two
-            // threads to see the debug check catch exactly that.
-            let mut state = unsafe { self.state.enter() };
+            let mut state = self.state.enter();
             *state += demand;
             self.inside.wait();
             self.release.wait();
@@ -279,9 +265,8 @@ mod tests {
         }
     }
 
-    #[cfg(debug_assertions)]
     #[test]
-    fn a_direct_request_racing_the_lattice_is_caught_in_debug() {
+    fn a_direct_request_racing_the_lattice_is_refused_in_every_build() {
         let source = Arc::new(Blocking {
             state: SourceCell::new(0),
             inside: Barrier::new(2),
@@ -321,8 +306,7 @@ mod tests {
                 thread::spawn(move || {
                     for _ in 0..1000 {
                         let _turn = turn.lock().unwrap();
-                        // SAFETY: the mutex admits one thread at a time, as the lattice's claim does.
-                        *unsafe { cell.enter() } += 1;
+                        *cell.enter() += 1;
                     }
                 })
             })
@@ -330,8 +314,7 @@ mod tests {
         for thread in threads {
             thread.join().unwrap();
         }
-        // SAFETY: every thread has finished.
-        assert_eq!(*unsafe { cell.enter() }, 8000);
+        assert_eq!(*cell.enter(), 8000);
     }
 
     #[test]
@@ -339,5 +322,41 @@ mod tests {
         let mut cell = SourceCell::new(String::from("a"));
         cell.get_mut().push('b');
         assert_eq!(cell.into_inner(), "ab");
+    }
+
+    #[test]
+    fn try_enter_hands_back_the_refusal_and_the_claim_frees_on_drop() {
+        let cell = SourceCell::new(5u32);
+        let first = cell.try_enter().expect("free");
+        assert!(
+            cell.try_enter().is_none(),
+            "nested: refused, never two guards"
+        );
+        drop(first);
+        assert_eq!(*cell.try_enter().expect("freed by the drop"), 5);
+    }
+
+    #[test]
+    fn a_racing_try_enter_never_gives_two_threads_the_state() {
+        let cell = Arc::new(SourceCell::new(0u64));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let cell = cell.clone();
+                thread::spawn(move || {
+                    let mut entered = 0u64;
+                    for _ in 0..20_000 {
+                        if let Some(mut guard) = cell.try_enter() {
+                            // A plain read-modify-write: a second guard would lose updates.
+                            let v = *guard;
+                            *guard = v + 1;
+                            entered += 1;
+                        }
+                    }
+                    entered
+                })
+            })
+            .collect();
+        let total: u64 = threads.into_iter().map(|t| t.join().unwrap()).sum();
+        assert_eq!(*cell.enter(), total);
     }
 }

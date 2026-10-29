@@ -151,7 +151,55 @@ impl LanePool {
     }
 }
 
-/// The port of Euhedral-Inference's `LanePool` placement rules.
+/// Composes a [`LanePool`] from the queues of one or several backends.
+///
+/// A backend takes a range of lane ids with [`reserve`](Self::reserve), opens its queues at those
+/// ids, and [`set`](Self::set)s each one. The builder is plain and single-threaded; the pool it
+/// builds is immutable.
+#[derive(Debug, Default)]
+pub struct LanePoolBuilder {
+    lanes: Vec<Option<Arc<dyn DeviceQueue>>>,
+}
+
+impl LanePoolBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The first of `count` consecutive lane ids, reserved for one backend's queues. Panics past
+    /// 64 lanes.
+    pub fn reserve(&mut self, count: usize) -> LaneId {
+        let first = self.lanes.len();
+        assert!(
+            first + count <= 64,
+            "a lane pool holds at most 64 lanes ({first} reserved, {count} more asked)"
+        );
+        self.lanes.resize_with(first + count, || None);
+        LaneId(u16::try_from(first).expect("at most 64 lanes"))
+    }
+
+    /// Puts `queue` at a reserved `lane`. Panics if the lane was not reserved or is already set.
+    pub fn set(&mut self, lane: LaneId, queue: Arc<dyn DeviceQueue>) {
+        let slot = self
+            .lanes
+            .get_mut(usize::from(lane.0))
+            .unwrap_or_else(|| panic!("lane {} was not reserved", lane.0));
+        assert!(slot.is_none(), "lane {} is already set", lane.0);
+        *slot = Some(queue);
+    }
+
+    /// The pool: lane `i` is the queue set at `i`. Panics if a reserved lane is unset.
+    pub fn build(self) -> Arc<LanePool> {
+        let queues = self
+            .lanes
+            .into_iter()
+            .enumerate()
+            .map(|(i, queue)| queue.unwrap_or_else(|| panic!("reserved lane {i} was never set")))
+            .collect();
+        Arc::new(LanePool::new(queues))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -250,5 +298,71 @@ mod tests {
             assert!(a.get() > 0);
             assert!(ids[i + 1..].iter().all(|b| a != b));
         }
+    }
+
+    #[test]
+    fn a_built_pool_holds_each_reserved_lane_at_its_id() {
+        let mut builder = LanePoolBuilder::new();
+        let a = builder.reserve(2);
+        let b = builder.reserve(3);
+        assert_eq!((a, b), (LaneId(0), LaneId(2)));
+        let queues: Vec<Arc<dyn DeviceQueue>> = (0..5)
+            .map(|_| Arc::new(Idle(QueueId::next())) as Arc<dyn DeviceQueue>)
+            .collect();
+        // Set out of order: ids, not call order, place a queue.
+        for i in [3usize, 0, 4, 1, 2] {
+            builder.set(LaneId(i as u16), queues[i].clone());
+        }
+        let pool = builder.build();
+        assert_eq!(pool.len(), 5);
+        for (i, queue) in queues.iter().enumerate() {
+            assert_eq!(pool.lane(LaneId(i as u16)).id(), queue.id());
+        }
+    }
+
+    #[test]
+    fn a_pool_of_two_backends_reaches_markers_of_both() {
+        let mut builder = LanePoolBuilder::new();
+        let first = builder.reserve(1);
+        let second = builder.reserve(1);
+        let (x, y) = (
+            Arc::new(Idle(QueueId::next())),
+            Arc::new(Idle(QueueId::next())),
+        );
+        builder.set(first, x.clone());
+        builder.set(second, y.clone());
+        let pool = builder.build();
+        assert!(pool.reached(Marker::new(x.id(), first, 0)));
+        assert!(pool.reached(Marker::new(y.id(), second, 0)));
+        assert!(
+            !pool.reached(Marker::new(x.id(), second, 0)),
+            "a queue at another lane"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "never set")]
+    fn building_with_an_unset_lane_panics() {
+        let mut builder = LanePoolBuilder::new();
+        builder.reserve(2);
+        builder.set(LaneId(0), Arc::new(Idle(QueueId::next())));
+        let _ = builder.build();
+    }
+
+    #[test]
+    #[should_panic(expected = "already set")]
+    fn setting_a_lane_twice_panics() {
+        let mut builder = LanePoolBuilder::new();
+        let lane = builder.reserve(1);
+        builder.set(lane, Arc::new(Idle(QueueId::next())));
+        builder.set(lane, Arc::new(Idle(QueueId::next())));
+    }
+
+    #[test]
+    #[should_panic(expected = "at most 64")]
+    fn reserving_past_64_lanes_panics() {
+        let mut builder = LanePoolBuilder::new();
+        builder.reserve(60);
+        builder.reserve(5);
     }
 }
