@@ -68,6 +68,7 @@ jobs:
         run: |
           cargo test -p euhedral-data-structures --release --lib sync::set_once::loom
           cargo test -p euhedral-data-structures --release --lib sync::claim_cell::loom
+          cargo test -p euhedral-data-structures --release --lib queues::chunk::loom
           cargo test -p euhedral-data-structures --release --lib sync::one_shot::tests::loom
           cargo test -p euhedral-graph --release --lib join::loom
 

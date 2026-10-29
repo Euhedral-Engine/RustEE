@@ -15,6 +15,8 @@ against Java is in the pull request; the remaining rows are not changed here.
 - Benchmark: `--pooled` frames come from, and return to, the pool of the thread that runs them, the nearest Rust has to
   Java's sink re-pushing one array (a frame crosses no core between two uses).
 - Other repos' names are gone from doc comments and READMEs; the behaviour is described instead.
+- A loom model of the `ChunkPool` ring: one freeing side and one allocating side lose and duplicate no chunk, and the freeing
+  side's writes are visible to the taker (weakening the tail store to `Relaxed` makes it fail).
 
 ## High-contention throughput benchmark (2026-10-29)
 

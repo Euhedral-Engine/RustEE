@@ -1,9 +1,10 @@
 //! Ring-buffer chunks, their slots, and the pool that recycles them.
 
 use crate::atomics::CachePadded;
+use crate::sync::loom as shim;
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicPtr, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU8, Ordering};
 
 /// Nothing published. A consumer that sees this stops.
 pub(crate) const EMPTY: u8 = 0;
@@ -125,10 +126,10 @@ pub(crate) struct ChunkPool<T> {
 
 struct Ring<T> {
     /// The next cell [`pop`](Self::pop) takes. Written by the allocating side only.
-    head: CachePadded<AtomicUsize>,
+    head: CachePadded<shim::AtomicUsize>,
     /// The next cell [`push`](Self::push) fills. Written by the freeing side only.
-    tail: CachePadded<AtomicUsize>,
-    cells: Box<[AtomicPtr<Chunk<T>>]>,
+    tail: CachePadded<shim::AtomicUsize>,
+    cells: Box<[shim::AtomicPtr<Chunk<T>>]>,
 }
 
 impl<T> ChunkPool<T> {
@@ -136,10 +137,10 @@ impl<T> ChunkPool<T> {
         Self {
             max,
             ring: Box::new(Ring {
-                head: CachePadded::new(AtomicUsize::new(0)),
-                tail: CachePadded::new(AtomicUsize::new(0)),
+                head: CachePadded::new(shim::AtomicUsize::new(0)),
+                tail: CachePadded::new(shim::AtomicUsize::new(0)),
                 cells: (0..max)
-                    .map(|_| AtomicPtr::new(std::ptr::null_mut()))
+                    .map(|_| shim::AtomicPtr::new(std::ptr::null_mut()))
                     .collect(),
             }),
         }
@@ -193,10 +194,13 @@ impl<T> ChunkPool<T> {
 impl<T> Drop for ChunkPool<T> {
     fn drop(&mut self) {
         let ring = &mut *self.ring;
-        let (head, tail) = (*ring.head.get_mut(), *ring.tail.get_mut());
+        let (head, tail) = (
+            ring.head.load(Ordering::Relaxed),
+            ring.tail.load(Ordering::Relaxed),
+        );
         let mut at = head;
         while at != tail {
-            let chunk = *ring.cells[at % self.max].get_mut();
+            let chunk = ring.cells[at % self.max].load(Ordering::Relaxed);
             // SAFETY: each cell between head and tail holds a pointer from `Box::into_raw` in `push`.
             drop(unsafe { Box::from_raw(chunk) });
             at = at.wrapping_add(1);
@@ -289,5 +293,83 @@ mod tests {
         }
         freeing.join().unwrap();
         assert!(taken > 0);
+    }
+}
+
+#[cfg(all(loom, test))]
+mod loom_tests {
+    use super::*;
+    use loom::cell::UnsafeCell as LoomCell;
+    use loom::sync::Arc;
+    use loom::thread;
+
+    /// One loom-tracked word per chunk, written by the freeing side before it retires the chunk and read by the
+    /// allocating side after it takes the chunk out: a ring that did not pass the writes on shows up as a data race.
+    struct Witness {
+        words: Vec<LoomCell<u32>>,
+        addresses: Vec<usize>,
+    }
+
+    // SAFETY: a word is written before its chunk is retired and read after the chunk is taken out, which is the
+    // ordering under test.
+    unsafe impl Sync for Witness {}
+    unsafe impl Send for Witness {}
+
+    // The freeing side retires two chunks into a ring of one while the allocating side takes: a chunk taken is a
+    // chunk retired, no chunk comes out twice, one that finds the ring full is freed, and the retiring side's writes
+    // are visible to the taker.
+    #[test]
+    fn loom_one_freeing_side_and_one_allocating_side_lose_and_duplicate_nothing() {
+        loom::model(|| {
+            let pool = Arc::new(ChunkPool::<u32>::new(1));
+            let chunks = [Chunk::<u32>::new(1), Chunk::<u32>::new(1)];
+            let witness = Arc::new(Witness {
+                addresses: chunks
+                    .iter()
+                    .map(|c| &**c as *const Chunk<u32> as usize)
+                    .collect(),
+                words: (0..2).map(|_| LoomCell::new(0)).collect(),
+            });
+            let freeing = {
+                let (pool, witness) = (pool.clone(), witness.clone());
+                thread::spawn(move || {
+                    for (i, chunk) in chunks.into_iter().enumerate() {
+                        witness.words[i].with_mut(|w| unsafe { *w = 7 + i as u32 });
+                        pool.push(chunk);
+                    }
+                })
+            };
+            let allocating = {
+                let (pool, witness) = (pool.clone(), witness.clone());
+                thread::spawn(move || {
+                    let mut taken = Vec::new();
+                    for _ in 0..2 {
+                        if let Some(chunk) = pool.pop() {
+                            let address = &*chunk as *const Chunk<u32> as usize;
+                            let i = witness
+                                .addresses
+                                .iter()
+                                .position(|&a| a == address)
+                                .unwrap();
+                            let seen = witness.words[i].with(|w| unsafe { *w });
+                            assert_eq!(seen, 7 + i as u32, "the retiring side's write is visible");
+                            taken.push(i);
+                        }
+                        thread::yield_now();
+                    }
+                    taken
+                })
+            };
+            freeing.join().unwrap();
+            let taken = allocating.join().unwrap();
+            let mut distinct = taken.clone();
+            distinct.sort_unstable();
+            distinct.dedup();
+            assert_eq!(distinct.len(), taken.len(), "no chunk comes out twice");
+            assert!(
+                taken.len() + pool.len() <= 2,
+                "a chunk is taken, kept or freed"
+            );
+        });
     }
 }
