@@ -3,6 +3,23 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## High-contention throughput benchmark (2026-10-29)
+
+**What.** A new workspace member, `euhedral-benchmarks`, with the binary `high_contention_throughput`: the average time
+and throughput of a lattice that many sources feed with no-op frames.
+
+**Why.** An end-to-end figure for the control plane, to check each change of the hot path against.
+
+**How.** `cargo run --release -p euhedral-benchmarks --bin high_contention_throughput` (see the crate's README for the
+flags and `EUHEDRAL_HCT_SOURCES`).
+
+**Semantics.** 3 forks (processes) of 3 warm-up iterations of 3 s and 5 measured iterations of 5 s; one invocation
+waits for 32,000,000 completions. The harness thread has a core of its own. The output is one line per iteration and a
+summary of the mean and standard deviation of the measured iterations.
+
+**Tests.** The harness-core selection, the worker CPU set, the completion target and its bounded wait, the sources
+default, the output lines, and a smoke run of a fork with a tiny target on a real lattice.
+
 ## Routing, cache and edges without locks (2026-10-29)
 
 **What.**

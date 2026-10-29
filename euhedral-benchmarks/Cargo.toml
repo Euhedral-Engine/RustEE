@@ -1,0 +1,12 @@
+[package]
+name = "euhedral-benchmarks"
+version = "0.1.0"
+edition = "2024"
+description = "End-to-end benchmarks of the Euhedral control plane"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+euhedral-core = { path = "../euhedral-core" }
+euhedral-data-structures = { path = "../euhedral-data-structures" }
+euhedral-hardware-utils = { path = "../euhedral-hardware-utils" }
