@@ -46,7 +46,7 @@ pub mod testing;
 pub use completions::{Completions, Pending, Ready};
 pub use join::{Join, Round};
 pub use lake::{Lake, LakeClosed, UnitGuard};
-pub use lanes::{DeviceQueue, LaneId, LanePool, Marker, QueueId};
+pub use lanes::{DeviceQueue, LaneId, LanePool, LanePoolBuilder, Marker, QueueId};
 pub use latch::{Latch, LatchSetter, LatchWaiter};
 pub use sequencer::{Sequencer, Slot};
 pub use stage_graph::{
