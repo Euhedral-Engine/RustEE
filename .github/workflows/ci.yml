@@ -95,4 +95,4 @@ jobs:
 
       - name: Hot source, stop watch, body cost
         run: |
-          cargo +nightly miri test -p euhedral-core --lib -- flow_control::hot_source utils::stop_watch control_plane::decision_tree::tests::body_cost control_plane::decision_tree::tests::recalibrating
+          cargo +nightly miri test -p euhedral-core --lib -- flow_control::hot_source utils::stop_watch control_plane::decision_tree::tests::the_estimate control_plane::decision_tree::tests::recalibrating

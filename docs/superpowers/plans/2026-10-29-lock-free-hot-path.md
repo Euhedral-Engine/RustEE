@@ -460,35 +460,37 @@ unsafe impl<T: Send> Sync for ClaimCell<T> {}
 
 ## Chunk 3 (draft PR, `hot-path-3-hot-source`): the hot source and the fragment's output (C1, C2, C3, C10)
 
-### Task 3.1: `StopWatch` and `BodyCost` as relaxed atomics (C2, C3)
+### Task 3.1: `StopWatch` and `BodyCost` as plain state of the worker (C2, C3)
 
-**Files:** `euhedral-core/src/utils/stop_watch.rs`, `control_plane/decision_tree.rs`; tests in
-`control_plane/decision_tree/tests.rs` and `stop_watch.rs`.
+**Files:** `euhedral-core/src/utils/stop_watch.rs`, `control_plane/decision_tree.rs`, `control_plane/fragment.rs`; tests in
+`control_plane/decision_tree/tests.rs`, `control_plane/fragment/tests.rs` and `stop_watch.rs`.
 
 **Interfaces:**
-- `StopWatch::{start, stop}` take `&self`. The fields `started: AtomicBool`, `ticks: AtomicU64` and `last_ns:
-  AtomicU64` use `Relaxed` loads and stores only.
-- `BodyCost::Window` fields become `samples: [AtomicU64; WINDOW]` (`f64::to_bits`), `expensive_threshold_ns:
-  AtomicU64` and `confirmations: AtomicU32`, all `Relaxed`. `record`, `calibrate` and `reset` keep their logic.
+- `StopWatch::{start, stop}` take `&mut self`; the fields are plain.
+- `BodyCost` is owned by the worker's `DecisionTree`; `record`, `calibrate`, `reset` and `timed` take `&mut self`. The
+  worker times its own pushes with `BodyCost::timed` (a guard stops the watch also on a panic). A `BodyCostView`
+  (estimate and "has a window") is published once per window and on reset; `ControlPlaneFragment::body_cost_ns` reads
+  it.
 
 - [ ] **Step 1: Write the failing tests.**
-  - `a_shared_stop_watch_times_one_call_in_256`: through `&self`, 1024 start/stop pairs give 4 samples.
-  - `body_cost_estimate_is_unchanged_by_the_atomics`: feed the existing test's sample series; the estimate equals the
-    pre-change value (copy the expected number from the current test).
-- [ ] **Step 2: Run them and see the first fail** (`start` takes `&mut self` today).
+  - `a_stop_watch_times_one_call_in_256`: 1024 start/stop pairs give 4 samples.
+  - `the_estimate_follows_expensive_and_cheap_windows`: feed the existing test's sample series; the estimate equals the
+    pre-change value.
+  - `the_policy_times_a_sample_of_bodies`: `BodyCost::timed` around pushes publishes a history after 32 samples.
+- [ ] **Step 2: Run them and see them fail** (the API does not exist yet).
 - [ ] **Step 3: Implement.** Delete `HOT-FIX(C2)`, `(C3)`; ratchet -2.
 - [ ] **Step 4: Run** `mise exec -- cargo test -p euhedral-core control_plane`. PASS.
-- [ ] **Step 5: Commit.** `git commit -m "StopWatch and body cost: Java's plain fields as relaxed atomics (C2, C3)"`
+- [ ] **Step 5: Commit.** `git commit -m "StopWatch and body cost: plain state of the worker (C2, C3)"`
 
 ### Task 3.2: Final hooks (C1)
 
-**Files:** `euhedral-core/src/flow_control/hot_source.rs`, `control_plane/fragment.rs` (`timed_output`).
+**Files:** `euhedral-core/src/flow_control/hot_source.rs`, `control_plane/fragment.rs` (the output's hooks).
 
 **Interfaces:**
 - `before_each(self, hook: impl Fn(&dyn Frame) + Send + Sync + 'static) -> Self`.
 - `after_each(self, hook: impl Fn() + Send + Sync + 'static) -> Self`.
 - Fields `Option<Box<dyn Fn ...>>`, called without a lock.
-- `timed_output(body_cost: Arc<BodyCost>)` shares one `Arc<StopWatch>` between the hooks.
+- The fragment's output carries no hooks: the worker times its pushes with `BodyCost::timed`.
 
 - [ ] **Step 1: Write the failing test** `hooks_run_around_each_push_from_one_pusher`: hooks count into atomics;
   1000 accepts; both counts are 1000 and the before-count leads at each push.
