@@ -44,8 +44,9 @@ The coordinator gives the checkout paths.
   all ready work within the banked demand. `pull` may never be called and never banks demand.
 - **Selective admission:** no "has work" flags and no wake paths beyond Java's own.
 - **Long calls** run on the worker that needs them. There is no blocking-work facility and no thread of ours for them.
-- **Layering:** utilities → `euhedral-core` → `euhedral-graph`, `euhedral-io` → `euhedral-memory`. No upward
-  dependency, dev-dependency or feature.
+- **Layering:** `euhedral-data-structures`, `euhedral-hashing` → `euhedral-hardware-utils` (which uses the lifecycle
+  locks) → `euhedral-core` → `euhedral-graph`, `euhedral-io` → `euhedral-memory` → `euhedral-gpu`. No upward
+  dependency, dev-dependency or feature; `euhedral-gpu/tests/layering.rs` checks it.
 - **Unsafe:**
   - every `unsafe` block has a `// SAFETY:` comment;
   - `euhedral-graph` stays `#![deny(unsafe_code)]`, and a module that needs `unsafe` carries a reasoned module-level
@@ -63,22 +64,23 @@ The coordinator gives the checkout paths.
 - **Build directory.** `CARGO_TARGET_DIR` is set to the machine's build directory. No scratch in `/tmp`.
 - **Docs.** Each chunk ends with a CHANGELOG entry (What, Why, How, Tests), GLOSSARY terms for new public concepts, and
   crate README rows.
-- **PRs.** One draft PR per chunk: `gh pr create --draft --base main`. No agent marks a PR ready. Commits end with the
-  session line the coordinator gives.
-- **Ratchet.** Each PR lowers `HOT_FIX_TAGS` in `euhedral-core/tests/hot_fix_ratchet.rs` by exactly the tags it
-  removes.
+- **PRs.** One draft PR per chunk, stacked on the newest open PR: `gh pr create --draft --base <that PR's branch>`
+  (`main` once the stack below it has merged). No agent marks a PR ready. Commits end with the session line the
+  coordinator gives.
+- **Ratchet.** Each PR deletes from `HOT_FIX_IDS` in `euhedral-core/tests/hot_fix_ratchet.rs` exactly the ids whose
+  tags it removes.
 
 ## Ordering with the lane-source plan
 
 | This plan | Waits for | Why |
 |---|---|---|
-| Chunk 1 (and so every chunk) | lane-source Part 1 (PR #11, at `29c97af` or later) **and** Part 2 merged to `main` | Chunk 1 edits `euhedral-data-structures/src/sync/mod.rs`, `src/lib.rs`, `Cargo.toml` and `euhedral-core/src/flow_control/vertex.rs` (Part 1), and tags sites in `euhedral-graph` after `join.rs` lost its `Mutex` (Part 2). |
+| Chunk 1 (and so every chunk) | lane-source Parts 1-4 in the stack it is based on (PRs #11-#15; chunk 1 is #16 on `lane-source-gpu`) | Chunk 1 edits `euhedral-data-structures/src/sync/mod.rs`, `src/lib.rs`, `Cargo.toml` and `euhedral-core/src/flow_control/vertex.rs` (Part 1), and tags sites in `euhedral-graph` after `join.rs` lost its `Mutex` (Part 2). |
 | Chunks 2-11 | chunk 1, then the dependencies below | — |
 | Every chunk's docs task | no open lane-source PR editing `CHANGELOG.md`, `GLOSSARY.md` or the same crate README | Parts 3 and 4 edit those files. |
 
-- No chunk edits a file of lane-source Parts 3 and 4: `euhedral-graph/src/lanes.rs`, `src/lane_source/`,
-  `src/testing.rs`, `src/lib.rs`, `tests/lane_*.rs`, `euhedral-gpu/`. Tests that need helpers keep them in their own
-  test file.
+- Chunks stack on the newest open PR, so the lane-source files (`euhedral-graph/src/lanes.rs`, `src/lane_source/`,
+  `src/testing.rs`, `src/lib.rs`, `tests/lane_*.rs`, `euhedral-gpu/`) are already in a chunk's base and a chunk may
+  edit them. A chunk that rebases onto a merge re-checks them.
 - Chunk dependencies:
   - chunk 4 needs chunk 2 (`ClaimCell`);
   - chunk 7 needs chunk 2 (the `AsyncIo` front);
@@ -147,7 +149,9 @@ The coordinator gives the checkout paths.
 pub struct LifecycleMutex<T>(std::sync::Mutex<T>);
 impl<T> LifecycleMutex<T> {
     pub const fn new(value: T) -> Self;
-    /// Debug: panics "lifecycle lock taken inside a hot scope" when `HotScope::active()`. Poison is ignored.
+    /// Debug: prints "lifecycle lock taken inside a hot scope, at <location>" and aborts when `HotScope::active()`
+    /// (a panic would be caught by the frame runners); `HotScope::set_violation_hook` replaces the abort in tests.
+    /// Poison is ignored.
     pub fn lock(&self) -> std::sync::MutexGuard<'_, T>;
     pub fn get_mut(&mut self) -> &mut T;
     pub fn into_inner(self) -> T;
@@ -163,14 +167,15 @@ impl HotScope {
 
 - [ ] **Step 1: Write the failing tests** in `lifecycle.rs`.
   - `a_lifecycle_lock_outside_a_hot_scope_locks`.
-  - `#[cfg(debug_assertions)] #[should_panic(expected = "inside a hot scope")] a_lifecycle_lock_inside_a_hot_scope_panics`.
+  - `#[cfg(debug_assertions)] a_lifecycle_lock_inside_a_hot_scope_reaches_the_hook_and_then_locks` (a recorder installed
+    with `HotScope::set_violation_hook`), and `the_default_report_aborts_even_inside_catch_unwind` (a child process).
   - `leaving_the_hot_scope_allows_the_lock_and_restores_the_depth`: enter, enter, `leave` → `!active()`, lock;
     drop → `active()`.
   - `a_poisoned_lifecycle_lock_still_locks`.
 - [ ] **Step 2: Run them and see them fail.** `mise exec -- cargo test -p euhedral-data-structures sync::lifecycle`.
   Expected: FAIL (no module).
 - [ ] **Step 3: Implement.**
-- [ ] **Step 4: Run them.** PASS in debug; `--release` PASS with the panic test compiled out.
+- [ ] **Step 4: Run them.** PASS in debug; `--release` PASS with the hook tests compiled out.
 - [ ] **Step 5: Commit.** `git commit -m "euhedral-data-structures: LifecycleMutex, LifecycleRwLock and HotScope"`
 
 ### Task 1.2: Hot scopes on the worker and producer paths
@@ -249,20 +254,22 @@ impl HotScope {
   `euhedral-data-structures/README.md`
 
 **Interfaces:**
-- `const HOT_FIX_TAGS: usize = 57;`
+- `const HOT_FIX_IDS: &[&str]`: the 57 ids. Each PR deletes the ids whose tags it removes.
 - `fn tags() -> BTreeSet<String>`:
   - walks `<workspace>/*/src/**/*.rs`, the workspace being `CARGO_MANIFEST_DIR/..`;
   - skips `tests.rs`, `testing.rs` and any `tests/` directory;
   - collects the distinct ids of `HOT-FIX(<id>)`.
 
 - [ ] **Step 1: Write the tests.**
-  - `the_hot_fix_tags_are_exactly_the_ratchet`: `assert_eq!(tags().len(), HOT_FIX_TAGS, "lower HOT_FIX_TAGS by the
-    tags this change removed: {:?}", tags())`.
-  - `every_tag_names_a_finding_of_the_audit`: each id matches `^(C|G|I|H|M)\d+$|^S(1|2|6a)$`.
+  - `the_hot_fix_tags_are_exactly_the_listed_ids`: `tags()` equals `HOT_FIX_IDS`.
+  - `every_listed_id_is_a_finding_of_the_audit`: each id is a row of the audit's tables.
+  - `every_disallowed_allow_is_explained_and_no_alias_hides_a_lock`: every `allow` of a disallowed type or call in the
+    library sources carries a `HOT-FIX(`, `LIFECYCLE(` or `JAVA-BACKOFF` reason (or is a test-only `cfg_attr`, or a
+    file-level allow of an exempt file), and no `type` alias names a lock type.
 - [ ] **Step 2: Run.** `mise exec -- cargo test -p euhedral-core --test hot_fix_ratchet`. PASS at 57.
 - [ ] **Step 3: Write the docs and run the gate** (Global Constraints).
 - [ ] **Step 4: Commit, push, open the draft PR.** `git commit -m "Ratchet test for hot-path lock tags"`; `gh pr create
-  --draft --base main --title "Hot-path guard rails: lifecycle locks, hot scopes, lint, ratchet"`.
+  --draft --base <the newest open PR's branch> --title "Hot-path guard rails: lifecycle locks, hot scopes, lint, ratchet"`.
 
 ---
 
@@ -656,7 +663,7 @@ reset) loops on `try_claim` with `spin_wait` (lifecycle; allowed by its reason t
 - [ ] **Step 1: Write the failing test** `the_last_reader_of_a_retired_generation_closes_its_dropped_downstreams_once`:
   a downstream dropped by a remap is closed exactly once, after its last push, with 8 pushers.
 - [ ] **Step 2: Run it; Step 3: implement** (delete `HOT-FIX(C7)`, ratchet -1); **Step 4: run** the vertex tests in
-  debug (no hot-scope panic).
+  debug (no hot-scope violation).
 - [ ] **Step 5: Commit.** `git commit -m "Vertex routing retirement under the rebalance lock, as Java (C7)"`
 
 ### Task 4.7: Edge downstream and parent (C8, C9)
@@ -785,7 +792,7 @@ consumer")`).
   - `offers_racing_an_idle_detach_land_in_exactly_one_set`: `idle_release` 1 ms; 8 threads `admit`, `offer` and
     terminate in bursts with idle gaps; every offered frame runs once; `attachments() > 1`.
   - `offers_on_an_attached_set_take_no_lock`: inside `HotScope::enter()`, 10 000 offers to an attached lake; no
-    debug panic.
+    debug violation.
   - `an_attached_for_life_lake_never_detaches`: `Duration::ZERO`; idle 50 ms; `is_attached()` stays true and
     `attachments() == 1`.
   - `offers_from_8_threads_racing_complete_finish_every_admitted_unit`.
@@ -1191,7 +1198,7 @@ pumps and hands over at most its own demand.
 - The `close` gate and `updating` locks go. `State` keeps lifecycle-only fields under a `LifecycleMutex`.
 
 - [ ] **Step 1: Write the failing test** `10_000_ticks_take_no_lifecycle_lock`: the dispatcher thread inside
-  `HotScope::enter()` calls `update` 10 000 times; no panic in debug.
+  `HotScope::enter()` calls `update` 10 000 times; no violation in debug.
 - [ ] **Step 2-4: Implement and run.** Delete `HOT-FIX(C16)`, `(C17)`, `(C18)`; ratchet -3.
 - [ ] **Step 5: Commit.** `git commit -m "Lattice update on Java's atomics (C16-C18)"`
 
