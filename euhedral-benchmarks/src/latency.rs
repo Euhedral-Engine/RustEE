@@ -173,7 +173,7 @@ impl Histogram {
     }
 }
 
-/// A worker's histogram: written with relaxed atomic increments, read by the harness at any time.
+/// A worker's histogram: written with relaxed atomics, read by the harness at any time.
 pub struct Recorder {
     counts: Vec<AtomicU64>,
 }
@@ -185,8 +185,14 @@ impl Recorder {
         }
     }
 
-    pub fn record(&self, nanos: u64) {
-        self.counts[bucket_of(nanos)].fetch_add(1, Ordering::Relaxed);
+    /// Counts `nanos`. An `owned` recorder has one writing thread, so the count is a load and a store.
+    pub fn record(&self, nanos: u64, owned: bool) {
+        let count = &self.counts[bucket_of(nanos)];
+        if owned {
+            count.store(count.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+        } else {
+            count.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     fn add_to(&self, histogram: &mut Histogram) {
@@ -306,10 +312,10 @@ mod tests {
     #[test]
     fn recorders_merge_their_slots_and_snapshots_subtract() {
         let recorders = Recorders::new(3);
-        recorders.slot(0).record(100);
+        recorders.slot(0).record(100, true);
         let before = recorders.snapshot();
-        recorders.slot(1).record(300);
-        recorders.slot(4).record(300);
+        recorders.slot(1).record(300, true);
+        recorders.slot(4).record(300, false);
         let during = recorders.snapshot().since(&before);
         assert_eq!(during.count(), 2);
         assert_eq!(during.quantile(0.5), Some(300));
