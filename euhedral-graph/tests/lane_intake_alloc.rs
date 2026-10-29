@@ -59,7 +59,7 @@ impl LaneWork<FakeLane, ()> for Item {
         &[]
     }
 
-    fn run(&mut self, _cx: &mut Cx<'_>) -> Outcome<std::convert::Infallible> {
+    fn run(&mut self, _cx: &mut Cx<'_>) -> Outcome<std::convert::Infallible, FakeLaneError> {
         Outcome::Submitted {
             retire: self.retire,
         }

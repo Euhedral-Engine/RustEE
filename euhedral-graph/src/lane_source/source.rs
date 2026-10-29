@@ -263,6 +263,10 @@ impl<S: LaneSubmit, X: LaneState, W: LaneWork<S, X>> LaneSource<S, X, W> {
                 item.wait = Some(wait);
                 Flow::Waits(item)
             }
+            Outcome::Failed(error) => {
+                self.fail(inner, now, item.work, error);
+                Flow::Done
+            }
         }
     }
 
@@ -315,7 +319,13 @@ impl<S: LaneSubmit, X: LaneState, W: LaneWork<S, X>> LaneSource<S, X, W> {
             let Some(position) = inner.armed.iter().position(|armed| armed.0 == retired.seq) else {
                 continue;
             };
-            inner.armed.drain(..position);
+            if position > 0 {
+                // Entries that can never arrive: an item took their retirements from the submitter.
+                self.metrics
+                    .stranded
+                    .fetch_add(position as u64, Ordering::Relaxed);
+                inner.armed.drain(..position);
+            }
             let (_, work, marker) = inner.armed.pop_front().expect("the match is at the front");
             let mut cx = self.cx(inner, now);
             work.retired(marker, retired.failure, &mut cx);
