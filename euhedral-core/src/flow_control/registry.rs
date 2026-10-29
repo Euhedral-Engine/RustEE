@@ -1,7 +1,7 @@
 use super::upstream_queue::{Entry, UpstreamHandle, UpstreamQueue};
 use euhedral_data_structures::atomics::PaddedAtomicLong;
 use euhedral_data_structures::queues::{MpscQueue, Multi, Producer};
-use euhedral_data_structures::sync::LifecycleMutex;
+use euhedral_data_structures::sync::{EpochDomain, EpochGuard, EpochSlot, LifecycleMutex};
 use euhedral_hardware_utils::affinity;
 use euhedral_hardware_utils::topology::Topology;
 use euhedral_hardware_utils::util::CpuSet;
@@ -29,6 +29,8 @@ struct ThreadQueue {
     cpu: Option<usize>,
     queue: Rc<RefCell<UpstreamQueue>>,
     producer: Producer<Entry, Multi>,
+    /// The thread's announcement in the registry's epoch domain.
+    epoch: Rc<EpochSlot>,
 }
 
 impl Drop for ThreadQueue {
@@ -60,8 +62,13 @@ struct State {
 /// added before it registered included. The queue of a thread that never registers stays empty.
 ///
 /// The edges of one lattice share its registry.
+///
+/// The registry also owns the lattice's [`EpochDomain`]: every thread that uses it has one slot there, and a
+/// worker announces a quiescent point once per cycle. A lattice's published values (the cache directory, an edge's
+/// parent) are freed once every worker has passed the epoch that replaced them.
 pub struct UpstreamRegistry {
     id: u64,
+    epochs: Arc<EpochDomain>,
     upstream_count: Arc<PaddedAtomicLong>,
     thread_count: AtomicUsize,
     /// One past each CPU's rank among the workers' CPUs, or zero for a CPU without workers.
@@ -82,6 +89,7 @@ impl UpstreamRegistry {
     pub fn with_topology(cpu_span: usize, p_cpus: CpuSet) -> Arc<Self> {
         Arc::new(Self {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            epochs: EpochDomain::new(cpu_span),
             upstream_count: Arc::new(PaddedAtomicLong::new(0)),
             thread_count: AtomicUsize::new(0),
             ranks: (0..cpu_span).map(|_| AtomicUsize::new(0)).collect(),
@@ -102,6 +110,31 @@ impl UpstreamRegistry {
         let queue = self.thread_queue(affinity::current_cpu, |queue| queue.queue.clone())?;
         let mut queue = queue.try_borrow_mut().ok()?;
         Some(f(&mut queue))
+    }
+
+    /// The epoch domain of the lattice's published values.
+    pub fn epochs(&self) -> &Arc<EpochDomain> {
+        &self.epochs
+    }
+
+    /// The calling thread's slot in [`epochs`](Self::epochs), created with its queue on first use. A worker keeps
+    /// it for its cycles ([`EpochSlot::quiescent`], [`EpochSlot::idle`]); [`with_pinned`](Self::with_pinned) uses
+    /// the same slot. `None` while the thread is exiting.
+    pub fn thread_epoch(self: &Arc<Self>) -> Option<Rc<EpochSlot>> {
+        self.thread_queue(affinity::current_cpu, |queue| queue.epoch.clone())
+    }
+
+    /// Runs `f` with a guard that keeps the values the calling thread loads from the lattice's [`Published`]
+    /// cells valid for the call. Inside a worker's cycle that costs one load of the slot; any other thread
+    /// announces itself for the call. A thread that is exiting, and has no slot of its own any more, uses a
+    /// temporary one.
+    ///
+    /// [`Published`]: euhedral_data_structures::sync::Published
+    pub fn with_pinned<R>(self: &Arc<Self>, f: impl FnOnce(&EpochGuard<'_>) -> R) -> R {
+        match self.thread_epoch() {
+            Some(slot) => f(&slot.pin()),
+            None => f(&self.epochs.register().pin()),
+        }
     }
 
     /// Makes the calling thread a worker. Does nothing if it already is one.
@@ -226,6 +259,7 @@ impl UpstreamRegistry {
             cpu,
             queue: Rc::new(RefCell::new(queue)),
             producer: handles.producer(),
+            epoch: Rc::new(self.epochs.register()),
         }
     }
 

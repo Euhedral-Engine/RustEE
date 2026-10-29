@@ -1211,3 +1211,40 @@ fn metrics_cost_per_cycle() {
         );
     }
 }
+
+#[test]
+fn a_parked_worker_does_not_hold_back_a_retirement() {
+    let Some(fixture) = Fixture::single() else {
+        return;
+    };
+    let fixture = fixture.started();
+    // The worker has nothing to run: it parks between short cycles.
+    thread::sleep(Duration::from_millis(50));
+    let epochs = fixture.registry().epochs().clone();
+    assert!(epochs.slot_count() >= 1);
+    let cell = euhedral_data_structures::sync::Published::new(epochs, Some(Arc::new(7_u32)));
+    let started = Instant::now();
+    cell.store(None)
+        .wait(Instant::now() + Duration::from_secs(1))
+        .unwrap_or_else(|_| panic!("an idle worker holds nothing back"));
+    assert!(
+        started.elapsed() < Duration::from_millis(250),
+        "the retirement waited {:?} for a parked worker",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn a_stopped_worker_withdraws_its_announcement() {
+    let Some(fixture) = Fixture::single() else {
+        return;
+    };
+    let epochs = fixture.registry().epochs().clone();
+    let fixture = fixture.started();
+    fixture.fragment.close();
+    wait_until("the worker to stop", || !fixture.fragment.ready());
+    let cell = euhedral_data_structures::sync::Published::new(epochs, Some(Arc::new(7_u32)));
+    cell.store(None)
+        .wait(Instant::now() + Duration::from_secs(1))
+        .unwrap_or_else(|_| panic!("a stopped worker holds nothing back"));
+}
