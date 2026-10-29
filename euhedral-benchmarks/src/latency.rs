@@ -6,8 +6,11 @@
 //! iteration and takes the difference from the start's.
 //!
 //! The buckets are fixed and log-linear: values below 128 ns are exact, and every power of two above has 128 equal
-//! buckets, so a value is known to within 0.8%. The range is 1 ns to about 2^36 ns (68 s); larger values land in the
+//! buckets, so a value is known to within 0.8%. The range is 1 ns to about 2^37 ns (137 s); larger values land in the
 //! last bucket.
+//!
+//! The latency measured is the time from a source handing a frame out to a worker starting to execute it. It excludes
+//! the way back: the finished frame's return to its source (`recycle`) is not in it.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 

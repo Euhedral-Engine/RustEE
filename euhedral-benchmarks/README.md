@@ -30,3 +30,15 @@ EUHEDRAL_HCT_SOURCES=4 cargo run --release -p euhedral-benchmarks --bin high_con
 ```
 
 Run it alone on the machine: it keeps every core busy. The sources default to the physical cores minus one.
+
+## Where it differs from Java
+
+- Java's `RepeatingSink` re-pushes a fixed array and takes nothing back. A Rust `Box<dyn Frame>` cannot be aliased, so
+  each finished frame returns to its source through a queue (`recycle`) and is pushed again: a harness cost with no
+  Java counterpart. The queue has many producers (the workers) and one consumer, held with the banked demand in a
+  `SourceCell`.
+- Java counts completions with `PaddedLongAdder.getAndAdd`. Here the counter has one cell per CPU id, written by the
+  one worker pinned to that CPU with a load and a store (a deviation asked for, so that the counting takes no locked
+  instruction). A thread that is not alone on its CPU uses a shared cell with the add.
+- The latency measured runs from the source handing a frame out to a worker starting it; the way back is not in it.
+- A claimed counter cell is never released: a tally lives for one fork.
