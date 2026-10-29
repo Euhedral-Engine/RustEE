@@ -840,7 +840,13 @@ fn pushes_racing_remaps_reach_only_validated_downstreams_once() {
     assert!(race.sent >= PUSHERS, "every pusher pushed");
     assert!(
         race.fates.lock().unwrap().is_empty(),
-        "no frame was refused"
+        "no frame was refused: {:?}",
+        race.fates
+            .lock()
+            .unwrap()
+            .iter()
+            .take(3)
+            .collect::<Vec<_>>()
     );
     let delivered: usize = race
         .receivers
@@ -938,6 +944,53 @@ fn a_held_generation_is_not_rewritten_and_the_pool_shrinks_back_to_use() {
         3,
         "the freed state is reused, not added to"
     );
+}
+
+#[test]
+fn a_late_release_of_a_rewritten_state_changes_nothing() {
+    let registry = registry();
+    let vertex = LatticeVertex::new(&registry, "late", 2);
+    let (first, _) = receiving_edge(&registry);
+    let (second, _) = receiving_edge(&registry);
+    let handles = [node(&first), node(&second)];
+    assert!(map(&vertex, &[0], &handles));
+    let first_state = vertex.book.lock().arena.states[0];
+    // The next remap rewrites the first state for its generation.
+    assert!(map(&vertex, &[1], &handles));
+    assert_eq!(vertex.book.lock().arena.states.len(), 2);
+
+    // A reader that decided in the state's last life, and is late: the state is published again, so nothing is
+    // released and the generation keeps routing.
+    // SAFETY: states live until the vertex drops.
+    vertex.release_handles_when_quiescent(unsafe { first_state.as_ref() });
+    assert_eq!(vertex.routing_state().mappings(), [1]);
+    assert!(!second.is_closed());
+    assert!(
+        first.is_closed(),
+        "the first generation was released by its remap"
+    );
+    assert_eq!(vertex.book.lock().references.len(), 1);
+}
+
+#[test]
+fn a_generation_is_released_once_however_often_it_is_asked() {
+    let registry = registry();
+    let vertex = LatticeVertex::new(&registry, "once", 1);
+    let (edge, receiver) = receiving_edge(&registry);
+    assert!(map(&vertex, &[0], &[node(&edge)]));
+    let held = vertex.routing_state();
+    let state = ptr::from_ref(&*held);
+    assert!(map(&vertex, &[], &[]));
+    assert!(!edge.is_closed(), "a reader still holds the generation");
+
+    drop(held);
+    assert!(edge.is_closed());
+    // SAFETY: states live until the vertex drops.
+    let state = unsafe { &*state };
+    vertex.release_handles_when_quiescent(state);
+    vertex.release_handles_when_quiescent(state);
+    assert!(receiver.is_completed());
+    assert_eq!(vertex.book.lock().references.len(), 0);
 }
 
 #[test]

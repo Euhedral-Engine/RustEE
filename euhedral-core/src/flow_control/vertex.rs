@@ -108,12 +108,14 @@ impl Table {
 pub struct RoutingState {
     /// Java's `admission`: the readers' count, with the retired bit set once the state is no longer the one to read.
     admission: CachePadded<Admission>,
-    /// Java's `handlesReleased`: taken by the one thread that releases the state's handles.
-    handles_released: AtomicBool,
-    /// Set, under the vertex's book, once the handles are released: the state may be rewritten.
-    handles_done: AtomicBool,
-    /// Rewritten only by a remap, while the state is retired and idle and `handles_done` is set, and read by a
-    /// thread that holds a count or, to release the handles, by the one that took `handles_released`.
+    /// Whether the state's handles are released. Read and written under the vertex's book. Java guards the release
+    /// with a once-only flag taken before the lock (`handlesReleased`); a state that is rewritten and published
+    /// again could be released a second time, in its next life, by a thread that decided in its last, so the check
+    /// is made under the lock instead.
+    released: AtomicBool,
+    /// Rewritten only by a remap, while the state is retired, idle and released, and read by a thread that holds a
+    /// count or, to release the handles, by the one that finds the state retired, idle and not yet released, under
+    /// the book.
     table: UnsafeCell<Table>,
 }
 
@@ -125,8 +127,7 @@ impl RoutingState {
     fn new(table: Table) -> Self {
         Self {
             admission: CachePadded::new(Admission::new()),
-            handles_released: AtomicBool::new(false),
-            handles_done: AtomicBool::new(false),
+            released: AtomicBool::new(false),
             table: UnsafeCell::new(table),
         }
     }
@@ -209,7 +210,7 @@ impl Arena {
         self.states.iter().copied().find(|state| {
             // SAFETY: states live as long as the arena.
             let state = unsafe { state.as_ref() };
-            state.admission.is_retired_and_idle() && state.handles_done.load(Ordering::Acquire)
+            state.admission.is_retired_and_idle() && state.released.load(Ordering::Acquire)
         })
     }
 
@@ -225,8 +226,7 @@ impl Arena {
         // released, so no thread reads the table; the caller holds the vertex's book, which keeps the other
         // writers out.
         unsafe { *state.table.get() = table };
-        state.handles_released.store(false, Ordering::Relaxed);
-        state.handles_done.store(false, Ordering::Relaxed);
+        state.released.store(false, Ordering::Relaxed);
         // Opens the state to readers: the rewrite above is visible to whoever acquires a count.
         state.admission.reopen();
         found
@@ -485,14 +485,12 @@ impl LatticeVertex {
     /// downstreams no other generation routes to and runs their retirements, then, once the vertex is closed and
     /// nothing routes anywhere, the close retirements. Rebalance work, run by whichever thread gets here first,
     /// once per generation.
+    ///
+    /// The callers are the remapper and the reader whose release left the state retired and idle; either may be
+    /// late, and the state may have been released, rewritten and published again by then. The lock settles it: a
+    /// state is released only while it is retired, idle and not released.
     fn release_handles_when_quiescent(&self, state: &RoutingState) {
-        if !state.admission.is_retired()
-            || state.admission.has_readers()
-            || state
-                .handles_released
-                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                .is_err()
-        {
+        if !state.admission.is_retired() || state.admission.has_readers() {
             return;
         }
         // The last reader of a retired generation retires it: rebalance work on whichever thread that is.
@@ -503,8 +501,12 @@ impl LatticeVertex {
         let finished;
         {
             let mut book = self.book.lock();
-            // SAFETY: the state is retired with no readers, and this thread took `handles_released`, so no one
-            // else reads or rewrites the table until `handles_done` is set below.
+            if state.released.load(Ordering::Acquire) || !state.admission.is_retired_and_idle() {
+                return;
+            }
+            // SAFETY: the state is retired and idle, so no reader holds a count and none can take one, and it is
+            // not yet released, so no remap has rewritten it: under the book, no one else reads or rewrites the
+            // table until `released` is set below.
             let table = unsafe { &mut *state.table.get() };
             for handle in table.unique_handles() {
                 let key = key(handle.edge());
@@ -521,7 +523,7 @@ impl LatticeVertex {
             // The generation is over: let go of its handles (dropped below, outside the lock), and let a remap
             // reuse the state.
             finished = std::mem::take(table);
-            state.handles_done.store(true, Ordering::Release);
+            state.released.store(true, Ordering::Release);
             if self.is_closed() && book.references.is_empty() && !book.routing_closed {
                 book.routing_closed = true;
                 close_retirements = std::mem::take(&mut book.close_retirements);
