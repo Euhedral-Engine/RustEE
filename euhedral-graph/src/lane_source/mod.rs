@@ -179,6 +179,13 @@ impl<S: LaneSubmit, X, W: Send + 'static> LaneCx<'_, S, X, W> {
         self.lane
     }
 
+    /// The lane's submitter, for the item's own submissions.
+    ///
+    /// An item must not call `poll_retired` or `arm_retirement` on it: retirements belong to the
+    /// lane source, which arms them for items that ask (`Outcome::Submitted { retire: true }`) and
+    /// pairs each arrival with its item by sequence number. A retirement an item polls away is never
+    /// seen by the source, so the item that armed it never gets its `retired` call (the source drops
+    /// it when the next retirement arrives, or with the source).
     pub fn submitter(&mut self) -> &mut S {
         self.submitter
     }

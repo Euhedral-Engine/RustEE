@@ -624,6 +624,60 @@ fn a_retirement_armed_from_inside_an_item_is_not_paired_with_a_continuation() {
 }
 
 #[test]
+fn a_retirement_taken_by_an_item_strands_only_that_continuation() {
+    let rig = Rig::new(1, &[]);
+    rig.deliver(rig.job(1).submit(true), rig.lane(0));
+    rig.sources[0].request(1);
+    // Item 2 makes item 1's retirement arrive and polls it away, then arms its own.
+    rig.deliver(rig.job(2).steal().submit(true), rig.lane(0));
+    rig.sources[0].request(1);
+    rig.fake.retire_all();
+    rig.deliver(rig.job(3).submit(true), rig.lane(0));
+    rig.sources[0].request(1);
+    rig.fake.retire_all();
+    rig.sources[0].request(1);
+    let tags: Vec<u64> = lock(&rig.probe.retired).iter().map(|(t, _)| *t).collect();
+    assert_eq!(
+        tags,
+        vec![2, 3],
+        "item 1's continuation is gone; the others are paired right"
+    );
+    assert_eq!(
+        rig.probe.dropped.load(Ordering::SeqCst),
+        3,
+        "the stranded item was dropped, not kept"
+    );
+}
+
+#[test]
+fn a_request_made_by_the_consumer_of_a_pull_is_served_when_the_pull_lets_go() {
+    let rig = Rig::new(1, &[]);
+    rig.deliver(rig.job(1).frame(), rig.lane(0));
+    rig.deliver(rig.job(2).frame(), rig.lane(0));
+    rig.sources[0].request(1);
+    assert_eq!(rig.received(0), vec![1]);
+    rig.deliver(rig.job(3).frame(), rig.lane(0));
+    let source = rig.sources[0].clone();
+    let mut pulled = Vec::new();
+    let n = rig.sources[0].pull(
+        &mut |frame| {
+            pulled.push(frame.header().id_hash());
+            // The claim is held: this banks its demand and leaves a wakeup.
+            source.request(1);
+        },
+        &mut |_| false,
+        1,
+    );
+    assert_eq!((n, pulled), (1, vec![2]));
+    assert_eq!(
+        rig.probe.ran(),
+        vec![1, 2, 3],
+        "the pull served the wakeup before it returned"
+    );
+    assert_eq!(rig.received(0), vec![1, 3]);
+}
+
+#[test]
 fn a_failed_mark_ends_the_item_with_failed_and_the_lane_goes_on() {
     let rig = Rig::new(1, &[]);
     rig.fake.fail_marks(LaneId(0), 1);
@@ -751,6 +805,26 @@ fn a_delivery_to_a_completed_or_dropped_lane_is_refused_and_handed_back() {
     drop(dropped);
     let refused = rig.intakes.deliver(rig.job(3), rig.lane(1));
     assert_eq!(refused.expect_err("lane 1 was dropped").0.tag, 3);
+}
+
+#[test]
+fn a_group_whose_lanes_all_closed_refuses_work() {
+    let rig = Rig::new(2, &[&[0, 1]]);
+    let group = Deliver::Group(GroupId(0));
+    rig.sources[0].complete();
+    assert!(
+        rig.intakes.deliver(rig.job(1), group).is_ok(),
+        "one lane is still open"
+    );
+    rig.sources[1].complete();
+    let refused = rig.intakes.deliver(rig.job(2), group);
+    assert_eq!(
+        refused
+            .expect_err("every lane of the group is closed")
+            .0
+            .tag,
+        2
+    );
 }
 
 #[test]

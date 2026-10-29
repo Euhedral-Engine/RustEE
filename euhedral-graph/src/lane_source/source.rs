@@ -308,18 +308,15 @@ impl<S: LaneSubmit, X: LaneState, W: LaneWork<S, X>> LaneSource<S, X, W> {
     /// sequence number. One the lane did not arm (an item armed it itself) pairs with nothing.
     fn drain_retirements(&self, inner: &mut Inner<S, X, W>, now: Instant) {
         while let Some(retired) = inner.submitter.poll_retired() {
-            let position = if inner
-                .armed
-                .front()
-                .is_some_and(|armed| armed.0 == retired.seq)
-            {
-                Some(0)
-            } else {
-                inner.armed.iter().position(|armed| armed.0 == retired.seq)
-            };
-            let Some((_, work, marker)) = position.and_then(|at| inner.armed.remove(at)) else {
+            // The match is at the front unless an earlier retirement was taken from the submitter
+            // by something else. Retirements arrive in arm order, so those entries can never
+            // arrive: drop them, and the front of `armed` is the next to arrive again. An arrival
+            // with no entry is not the lane's (an item armed it itself) and pairs with nothing.
+            let Some(position) = inner.armed.iter().position(|armed| armed.0 == retired.seq) else {
                 continue;
             };
+            inner.armed.drain(..position);
+            let (_, work, marker) = inner.armed.pop_front().expect("the match is at the front");
             let mut cx = self.cx(inner, now);
             work.retired(marker, retired.failure, &mut cx);
         }
@@ -563,6 +560,9 @@ impl<S: LaneSubmit, X: LaneState, W: LaneWork<S, X>> LatticeSource for LaneSourc
         self.publish(&inner);
         drop(inner);
         self.metrics.service_ns.record(ns(started.elapsed()));
+        // A request made while this pull held the claim (from the consumer) left a wakeup: serve it
+        // now, as the ingest sinks' pull does in its `finally`.
+        self.drain_requests();
         pulled
     }
 

@@ -47,9 +47,12 @@ needs it, and other sources of the group take the shared intake meanwhile.
   demand is lost. A `pull` that finds the claim taken hands over nothing, as the sinks' `pull` does when their drain is
   taken.
 - A retirement is paired with its item by the sequence number `arm_retirement` returned, in every build. A retirement an
-  item armed itself (through `LaneCx::submitter`) pairs with no continuation.
-- `LaneIntakes::deliver` to a lane that completed or was dropped returns the work in `Err(LaneClosed)`, to be ended with
-  an error. A delivery that races the closing can land after the lane drained its intake; that item is dropped with the
+  item armed itself (through `LaneCx::submitter`) pairs with no continuation. Items must not call `poll_retired` or `arm_retirement`; a retirement an item polls away strands that item's
+  continuation, and the item is dropped when a later retirement arrives (arrivals are in arm order).
+- A `pull` serves the wakeups left by requests made while it held the claim (from its consumer), as the ingest sinks'
+  `pull` does in its `finally`.
+- `LaneIntakes::deliver` to a lane that completed or was dropped, or to a group whose lanes all did, returns the work in
+  `Err(LaneClosed)`, to be ended with an error. A delivery that races the closing can land after the lane drained its intake; that item is dropped with the
   intakes.
 - Work an item answers `Wait` for stays in the source that took it, also when it came from a group's shared intake.
 - Delivery is an enqueue. It spends no demand and runs nothing. The shared intake is taken one item at a time and its

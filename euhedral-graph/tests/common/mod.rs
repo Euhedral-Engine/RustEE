@@ -119,6 +119,8 @@ pub struct Job {
     pub retired_deliver: Option<(Box<Job>, Deliver)>,
     /// `run` requests this source (a re-entry the debug check must refuse).
     pub reenter: Option<Arc<dyn LatticeSource>>,
+    /// `run` makes every armed retirement arrive and polls one away (a stolen retirement).
+    pub steal: bool,
     /// `run` arms a retirement of its own through the submitter (a stray call).
     pub stray_arm: bool,
     /// `run` blocks on these barriers (a long item).
@@ -139,6 +141,7 @@ impl Job {
             retired_deliver: None,
             reenter: None,
             stray_arm: false,
+            steal: false,
             hold: None,
         }
     }
@@ -175,6 +178,11 @@ impl Job {
 
     pub fn retired_deliver(mut self, job: Job, to: Deliver) -> Self {
         self.retired_deliver = Some((Box::new(job), to));
+        self
+    }
+
+    pub fn steal(mut self) -> Self {
+        self.steal = true;
         self
     }
 
@@ -231,6 +239,10 @@ impl LaneWork<FakeLane, Gate> for Job {
             if cx.bridges(marker) {
                 lock(&self.probe.bridged).push((self.tag, marker));
             }
+        }
+        if self.steal {
+            lock(&self.probe.fake).as_ref().expect("a rig").retire_all();
+            let _ = cx.submitter().poll_retired();
         }
         if self.stray_arm {
             let _ = cx.submitter().arm_retirement().unwrap();

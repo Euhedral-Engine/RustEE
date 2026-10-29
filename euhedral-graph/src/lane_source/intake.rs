@@ -66,6 +66,8 @@ pub struct LaneIntakes<W> {
     own: Box<[Producer<Envelope<W>, Multi>]>,
     shared: Box<[Producer<Envelope<W>, Multi>]>,
     group_of: Box<[Option<GroupId>]>,
+    /// Each group's lanes.
+    members: Box<[Box<[LaneId]>]>,
     /// A consumer of each shared intake, for tests that watch it from outside a source.
     #[cfg(feature = "testing")]
     probes: Box<[Consumer<Envelope<W>, Multi>]>,
@@ -170,6 +172,10 @@ impl<W: Send + 'static> LaneIntakes<W> {
             own: own.into_boxed_slice(),
             shared: shared.into_boxed_slice(),
             group_of: group_of.into_boxed_slice(),
+            members: groups
+                .iter()
+                .map(|g| g.to_vec().into_boxed_slice())
+                .collect(),
             #[cfg(feature = "testing")]
             probes: shared_queues.iter().map(MpmcQueue::consumer).collect(),
         });
@@ -179,8 +185,8 @@ impl<W: Send + 'static> LaneIntakes<W> {
     /// Queues `work` in a lane's own intake or a group's shared intake. It never runs the work and
     /// never waits.
     ///
-    /// A lane that completed or was dropped refuses the work: it comes back as `Err`, so the
-    /// deliverer ends it with an error. A delivery that races the lane's closing can still land in
+    /// A lane that completed or was dropped refuses the work, and so does a group whose lanes all
+    /// did: it comes back as `Err`, so the deliverer ends it with an error. A delivery that races the lane's closing can still land in
     /// the intake just after the lane drained it; that item is dropped with the intakes.
     ///
     /// # Panics
@@ -198,10 +204,19 @@ impl<W: Send + 'static> LaneIntakes<W> {
                 }
                 producer
             }
-            Deliver::Group(group) => self
-                .shared
-                .get(usize::from(group.0))
-                .unwrap_or_else(|| panic!("group {} does not exist", group.0)),
+            Deliver::Group(group) => {
+                let producer = self
+                    .shared
+                    .get(usize::from(group.0))
+                    .unwrap_or_else(|| panic!("group {} does not exist", group.0));
+                if self.members[usize::from(group.0)]
+                    .iter()
+                    .all(|&lane| self.is_closed(lane))
+                {
+                    return Err(LaneClosed(work));
+                }
+                producer
+            }
         };
         let envelope = Envelope {
             work,
