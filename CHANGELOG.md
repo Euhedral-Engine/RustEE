@@ -36,6 +36,13 @@ semantics and the tests that pin it.
 - `euhedral-io`: the `AsyncIo` front (I1, I2) keeps the continuations a pull's `stop` held back in a `SourceCell` and its
   downstream in a `DownstreamSlot`; a `request` banks its demand with the same wakeup. The engines lock their tables
   through a `lock!` macro (the function it replaces named the lock type).
+- State one thread owns is plain, or a load and a store, instead of a read-modify-write:
+  - `Histogram::record_owned` records with plain loads and stores for a histogram with one recording thread at a time
+    (`record` stays for any number of threads). A worker's service-time and throughput summaries, `Completions`'
+    lateness (recorded under the poll claim) use it;
+  - a worker's frame count and its in-progress count change by a load and a release store (the worker is the only
+    writer; other threads read);
+  - a pipeline's seed counter, drawn by the one owner of its frame manager, is a load and a store.
 - `HOT_FIX_TAGS` loses 8 ids (C11, C12, C13, G1, G2, G3, I1, I2) and lists 49. The ratchet also counts the engines' `lock!(` call sites per file (5 in `uring.rs`, 31 in `win/mod.rs`), so the macro cannot hide a new lock.
 
 **Why.** A source's `request` and `pull` are serialized by the lattice, and its lifecycle calls (`complete`, `clear`,

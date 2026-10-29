@@ -513,6 +513,12 @@ impl<I: Send + 'static, O: Send + 'static> PipelineBuilder<I, O> {
         let span = (definition.stages.len() as u64 - 1).max(1);
         let create_seeds = Arc::new(AtomicU64::new(random::next_u64()));
         let replace_seeds = Arc::clone(&create_seeds);
+        // The manager's owner calls both closures, one at a time, so a draw is a load and a store.
+        fn draw(seeds: &AtomicU64, span: u64) -> u64 {
+            let seed = seeds.load(Ordering::Relaxed);
+            seeds.store(seed.wrapping_add(span), Ordering::Relaxed);
+            seed
+        }
 
         let mut manager = FrameManager::new();
         let recycler = manager.recycler();
@@ -524,11 +530,11 @@ impl<I: Send + 'static, O: Send + 'static> PipelineBuilder<I, O> {
                     Arc::clone(&definition),
                     recycler.clone(),
                     Arc::clone(&kill_switch),
-                    create_seeds.fetch_add(span, Ordering::Relaxed),
+                    draw(&create_seeds, span),
                 )
             },
             move |input, chain: &mut PipelineFrame<I>| {
-                chain.refill(input, replace_seeds.fetch_add(span, Ordering::Relaxed));
+                chain.refill(input, draw(&replace_seeds, span));
             },
         );
         manager

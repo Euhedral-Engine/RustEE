@@ -499,8 +499,9 @@ impl Completions {
             // The frame leaves the source here: it is off `pending` (and its lateness recorded)
             // before the consumer sees it, so a consumer that unwinds leaves both exact.
             self.pending.fetch_sub(1, Ordering::AcqRel);
+            // The poll claim is held, so one thread records at a time.
             self.lateness
-                .record(now.saturating_duration_since(since).as_micros() as f64);
+                .record_owned(now.saturating_duration_since(since).as_micros() as f64);
             emitted += 1;
             consumer(frame);
         }

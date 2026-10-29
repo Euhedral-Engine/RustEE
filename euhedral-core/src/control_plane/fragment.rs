@@ -893,19 +893,21 @@ struct Run {
     elapsed: Duration,
 }
 
-/// Counts an execution in progress until dropped.
+/// Counts an execution in progress until dropped. The fragment's worker is the only writer, so each change is a
+/// load and a release store; other threads read the count.
 struct InProgress<'a>(&'a AtomicU64);
 
 impl<'a> InProgress<'a> {
     fn enter(count: &'a AtomicU64) -> Self {
-        count.fetch_add(1, Ordering::AcqRel);
+        count.store(count.load(Ordering::Relaxed) + 1, Ordering::Release);
         Self(count)
     }
 }
 
 impl Drop for InProgress<'_> {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
+        self.0
+            .store(self.0.load(Ordering::Relaxed) - 1, Ordering::Release);
     }
 }
 
