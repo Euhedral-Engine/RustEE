@@ -18,10 +18,9 @@ so it needs no thread of its own. It does not re-export `euhedral-core`: import 
 | Module | Main types |
 |---|---|
 | [`completions`](src/completions.rs) | `Completions`, a `LatticeSource` of continuation frames behind completions: markers, timers, `Ready` tokens and `Pending` operations. |
-| [`sequencer`](src/sequencer.rs) | `Sequencer` and `Slot`: execute in any order, release in admission order. |
+| [`sequencer`](src/sequencer.rs) | `Sequencer` and `Slot`: execute in any order, release in admission order (Java's order queue and work-in-progress drain, no lock). |
 | [`join`](src/join.rs) | `Join`, `Round`: a re-armable fan-in cell; the continuation runs when its last part arrives. |
-| [`lake`](src/lake.rs) | `Lake`, `UnitGuard` and `LakeClosed`: the pool of ready work of one kind, as several ingest sinks that attach to the lattice for a busy period. A `FrameSink`. |
-| [`latch`](src/latch.rs) | `Latch`, `LatchSetter` and `LatchWaiter`: a frame hands one value to the main thread, which parks until it arrives. |
+| [`lake`](src/lake.rs) | `Lake`, `UnitGuard` and `LakeClosed`: the pool of ready work of one kind, as several ingest sinks that attach to the lattice for a busy period; offering reads the attached set with no lock. A `FrameSink`. |
 | [`lanes`](src/lanes.rs) | `LanePool`, `LanePoolBuilder`, `LaneId`, `Marker` and the trait `DeviceQueue`: device timelines that are queried, never waited on. |
 | [`lane_source`](src/lane_source/mod.rs) | `LaneSource`, a `LatticeSource` per device lane; the traits it drives (`LaneSubmit`, `LaneState`, `LaneWork` with `Outcome` and `LaneCx`); `LaneIntakes`, `LaneInputs`, `Deliver` and `GroupId` for delivery; `LaneMetrics`. |
 | [`stage_graph`](src/stage_graph.rs) | `StageGraph` and its spec (`StageGraphSpec`, `StageSpec`, `StageId`, `EdgeKind`), the `Stage` trait with `StageCx`, `Submitted` and `StageError`, `QuantumOutcome`, `ExternalEdge`, `QuantumRef`, `GraphRuntime`, `RetryCounts`, `GraphError` and `DEFAULT_RETRY_BACKSTOP`. |
@@ -84,7 +83,7 @@ let (lanes, _devices) = FakeDevice::pool(&["compute"]);
 let completions = Completions::new(lanes);
 
 let released = Arc::new(Mutex::new(Vec::new()));
-let sequencer = Sequencer::new({
+let (sequencer, mut registrar) = Sequencer::new(8, {
     let released = released.clone();
     move |seq: u32| released.lock().unwrap().push(seq)
 });
@@ -93,7 +92,7 @@ let sequencer = Sequencer::new({
 let fired = Arc::new(Mutex::new(Vec::new()));
 let now = Instant::now();
 for (seq, after_ms) in [(0u32, 6), (1, 0), (2, 3)] {
-    let slot = Mutex::new(Some(sequencer.register()));
+    let slot = Mutex::new(registrar.register());
     let fired = fired.clone();
     let task = Arc::new(move || {
         fired.lock().unwrap().push(seq);
@@ -231,7 +230,7 @@ last marker (its retirement boundary, armed as a `Completions` edge). `retire` t
 quantum and its `QuantumOutcome`: `Completed`, `Failed` or `Killed`. `live()` counts quanta not
 retired yet.
 
-### Lakes and latches
+### Lakes
 
 A `Lake` is where ready work waits for the lattice: `sinks` queue ingest sinks of one partition
 each, every one a source the workers poll. `offer` takes a frame and puts it in the sink its
@@ -255,44 +254,48 @@ use std::time::Duration;
 use euhedral_core::config::LatticeConfig;
 use euhedral_core::control_plane::ControlPlaneLattice;
 use euhedral_core::frames::RunnableFrame;
-use euhedral_graph::{Lake, Latch};
+use euhedral_data_structures::sync::one_shot;
+use euhedral_graph::Lake;
 
 let lattice = ControlPlaneLattice::new(LatticeConfig::default()).unwrap();
 let lake = Lake::new(lattice.clone(), NonZeroUsize::new(2).unwrap(), Duration::from_secs(1));
 
-// The main thread starts the work and waits for it; nothing else blocks.
-let (done, finished) = Latch::new();
+// The main thread starts the work and checks on it; nothing blocks.
+let (done, mut finished) = one_shot();
 let unit = lake.admit().unwrap(); // attaches the sinks
 let done = Mutex::new(Some(done));
 let frame = RunnableFrame::new(7, Arc::new(move || {
     if let Some(done) = done.lock().unwrap().take() {
-        done.set("ran");
+        done.send("ran");
     }
 }));
 assert!(lake.offer(Box::new(frame)).is_ok());
-assert_eq!(finished.wait(), "ran");
+while !finished.is_set() {
+    std::thread::sleep(Duration::from_millis(1));
+}
+assert_eq!(finished.try_take(), Ok(Some("ran")));
 
 drop(unit);
 lake.complete_gracefully();
 lattice.close();
 ```
 
-A `Latch` is the hand-off back to the main thread: `Latch::new()` returns a `LatchSetter` to move
-into a frame and a `LatchWaiter` for `main`. `LatchWaiter::wait` parks the thread until the value
-is set (at once if it already was) and is the one call in the crate that blocks; nothing on the
-lattice may call it. A setter dropped without setting makes `wait` panic.
+A frame hands a result back to the main thread with a `one_shot` (`euhedral_data_structures::sync`): the frame
+`send`s, and the main thread checks `is_set` or `try_take` periodically. Nothing in the crate blocks.
 
 ### Sequencer and Join
 
-A `Sequencer<T>` hands values out in admission order. `register()` takes a slot, in the order the
-caller admits work; the slot is completed with a value, or abandoned (dropping it abandons it),
-from any thread. One releaser at a time (a work-in-progress counter) releases the prefix of
+A `Sequencer<T>` hands values out in admission order. `Sequencer::new(capacity, emit)` returns it with
+its one `Registrar`; `registrar.register()` takes a slot, in the order the caller admits work (and
+returns `None` while `capacity` slots are unreleased); the slot is completed with a value, or abandoned
+(dropping it abandons it), from any thread. A registration allocates nothing and takes no
+read-modify-write. One releaser at a time (a work-in-progress counter) releases the prefix of
 finished slots to `emit`, on its own thread, and `emit` must not wait: it offers the next frame.
 
 A `Join<T>` is a continuation that runs on the thread of its last arrival, after `parts` parts
-arrived or were abandoned. Neither is a queue, and neither blocks. `Join::new` makes a join of one
-round. `Join::with_capacity` makes a cell for a pooled unit: `reset(parts)` arms a round, and the
-continuation receives a `Round` of the values and calls `rearm(parts)` for the next one. Arming and
+arrived or were abandoned. Neither is a queue, and neither blocks. `Join::once` makes a join of one
+round and hands out its `Part`s. A `Part` is a token moved to its branch: `arrive(value)` or `abandon()` consumes it, so a part ends once (a second arrival does not compile), and dropping it abandons. `Join::with_capacity` makes a cell (an `Arc<Join>`) for a pooled unit: `reset(parts)` arms a round and returns its parts, and the
+continuation receives a `Round` of the values and calls `rearm(parts)` for the next one (it returns the next round's parts). Arming and
 arriving take no lock and allocate nothing.
 
 ## Build and test

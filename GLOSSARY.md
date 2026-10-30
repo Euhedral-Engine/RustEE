@@ -124,6 +124,17 @@ read-modify-write, no reference count. The last holder of a replaced value drops
 registers) holds the values themselves; any other thread that reads gets a light mailbox on its first read and holds a
 weak reference, which it upgrades for the length of a call, so an idle thread never keeps a replaced value alive.
 
+**OneShot** ([`one_shot`](euhedral-data-structures/src/sync/one_shot.rs)): Java's `CompletableFuture` for one
+result, with one completer and one reader. The sender writes the value and publishes it with
+one store with release ordering; the receiver polls (`try_take`, `is_set`). A sender dropped
+without sending abandons it. `PipelineRunner::submit` returns one. Nothing waits on it: the owner checks `is_set` or
+`try_take` periodically, as it checks on the lattice's work.
+
+**idle detach** ([`Lake`](euhedral-graph/src/lake.rs)): a lake's sinks stay attached while a unit is admitted and for
+the idle time after the last one ended; then the watch detaches them, and the next unit attaches a fresh set.
+`Duration::ZERO` keeps them attached for life. Reading the attached set takes no lock; attaching and detaching are
+rebalance work.
+
 **ingest sink** ([`IngestSink`](euhedral-core/src/ingest/mod.rs)): a ready-made `LatticeSource` that
 feeds a lattice from outside it. Hand its `delegate()` to `ControlPlaneLattice::add_upstream`;
 `complete()` finishes it at once.
@@ -456,12 +467,6 @@ attached to the lattice only while it has units. Beside the sinks a lake attache
 source the workers poll that holds no frames; when no unit has been admitted for the lake's idle
 release time, the watch detaches the sinks and itself, so the lattice has nothing left to poll.
 The next `admit` attaches a fresh set. An idle release of `Duration::ZERO` keeps the sinks attached.
-
-**latch** ([`Latch`](euhedral-graph/src/latch.rs), [`LatchSetter`](euhedral-graph/src/latch.rs),
-[`LatchWaiter`](euhedral-graph/src/latch.rs)): a one-shot hand-off from a frame to the main thread.
-`Latch::new()` makes the two ends; a frame sets the `LatchSetter`, and the main thread parks in
-`LatchWaiter::wait` until it does. `wait` is the one blocking call in the crate, for `main` (or a
-test) only; a setter dropped without setting makes the wait panic instead of hang.
 
 ## Metrics
 

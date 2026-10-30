@@ -44,7 +44,19 @@ pub struct DownstreamSlot {
 }
 
 impl DownstreamSlot {
+    #[cfg(not(loom))]
     pub const fn new() -> Self {
+        Self {
+            attached: AtomicBool::new(false),
+            complete: AtomicBool::new(false),
+            live: AtomicBool::new(false),
+            receiver: SetOnce::new(),
+        }
+    }
+
+    /// An empty slot (`SetOnce::new` is not `const` under the model checker).
+    #[cfg(loom)]
+    pub fn new() -> Self {
         Self {
             attached: AtomicBool::new(false),
             complete: AtomicBool::new(false),

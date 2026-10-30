@@ -1,4 +1,4 @@
-//! Lakes and latches on a real lattice of one CPU.
+//! Lakes on a real lattice of one CPU.
 //!
 //! CI runners have two cores, so nothing here assumes more than one: the lattice is given a single
 //! CPU, one the process may run on, and the tests assert structure (order, attachment, counts), not
@@ -8,12 +8,12 @@
     reason = "test fixtures: the test thread locks its records"
 )]
 // The test thread is the harness, not a frame: it polls for what the lattice did, and waits on a
-// latch, with sleeps no frame may make.
+// one-shot, with sleeps no frame may make.
 #![allow(clippy::disallowed_methods)]
 
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Barrier, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use euhedral_core::config::LatticeConfig;
@@ -21,9 +21,53 @@ use euhedral_core::control_plane::ControlPlaneLattice;
 use euhedral_core::frames::{Frame, FrameError, FrameHeader, RunnableFrame};
 use euhedral_core::generics::FrameSink;
 use euhedral_core::impls::DefaultExecutor;
-use euhedral_graph::{Lake, Latch, LatchSetter};
+use euhedral_data_structures::sync::HotScope;
+use euhedral_data_structures::sync::{OneShotSender, one_shot};
+use euhedral_graph::Lake;
 use euhedral_hardware_utils::affinity;
 use euhedral_hardware_utils::util::CpuSet;
+
+/// The tests build lattices on the same CPU, whose pinned executor is one per process: a lattice that closes leaves the
+/// executor closed with a worker still winding down, and a lattice built meanwhile cannot get it. The tests therefore
+/// take turns, and a turn begins and ends only when the CPU accepts an executor again.
+fn turn() -> Turn {
+    static TURN: Mutex<()> = Mutex::new(());
+    let turn = Turn(TURN.lock().unwrap_or_else(PoisonError::into_inner));
+    settle();
+    turn
+}
+
+struct Turn(#[allow(dead_code)] MutexGuard<'static, ()>);
+
+impl Drop for Turn {
+    fn drop(&mut self) {
+        settle();
+    }
+}
+
+/// Waits until the lattice CPU's executor is not closed with tasks left. A wind-down that takes more than 100 ms is
+/// reported, so that a stall in a close is not absorbed by the wait; one that takes more than 1 s fails the test.
+fn settle() {
+    let Some(cpu) = affinity::base_mask().first() else {
+        return;
+    };
+    let started = Instant::now();
+    let settled = affinity::PinnedThreadExecutor::get_or_create_within(
+        cpu,
+        "lake-test-settle",
+        Duration::from_secs(1),
+    )
+    .map(|executor| executor.release());
+    let waited = started.elapsed();
+    if waited > Duration::from_millis(100) {
+        eprintln!("the executor of CPU {cpu} took {waited:?} to wind down");
+    }
+    if let Err(error) = settled
+        && !std::thread::panicking()
+    {
+        panic!("the executor of CPU {cpu} did not wind down in 1 s: {error}");
+    }
+}
 
 /// A lattice of the first CPU this process may run on.
 fn one_cpu_lattice() -> Arc<ControlPlaneLattice> {
@@ -83,6 +127,7 @@ fn counting(hash: u64, ran: &Arc<AtomicU64>) -> Box<dyn Frame> {
 
 #[test]
 fn frames_of_one_hash_keep_order() {
+    let _turn = turn();
     const LANE: u64 = 0x1a4e;
     const FRAMES: u64 = 500;
     let lattice = one_cpu_lattice();
@@ -113,6 +158,7 @@ fn frames_of_one_hash_keep_order() {
 
 #[test]
 fn sinks_detach_after_idle_and_reattach_on_admit() {
+    let _turn = turn();
     const IDLE: Duration = Duration::from_millis(30);
     let lattice = one_cpu_lattice();
     let lake = Lake::new(lattice.clone(), sinks(2), IDLE);
@@ -158,6 +204,7 @@ fn sinks_detach_after_idle_and_reattach_on_admit() {
 
 #[test]
 fn a_lake_with_no_idle_time_never_detaches() {
+    let _turn = turn();
     let lattice = one_cpu_lattice();
     let lake = Lake::new(lattice.clone(), sinks(1), Duration::ZERO);
     drop(lake.admit().expect("a unit"));
@@ -170,6 +217,7 @@ fn a_lake_with_no_idle_time_never_detaches() {
 
 #[test]
 fn offer_without_admitted_unit_is_refused() {
+    let _turn = turn();
     let lattice = one_cpu_lattice();
     let lake = Lake::new(lattice.clone(), sinks(2), Duration::ZERO);
     let ran = Arc::new(AtomicU64::new(0));
@@ -197,6 +245,7 @@ fn offer_without_admitted_unit_is_refused() {
 
 #[test]
 fn complete_gracefully_drains_then_completes() {
+    let _turn = turn();
     const FRAMES: u64 = 200;
     let lattice = one_cpu_lattice();
     let lake = Lake::new(lattice.clone(), sinks(2), Duration::ZERO);
@@ -240,6 +289,7 @@ fn complete_gracefully_drains_then_completes() {
 
 #[test]
 fn a_frame_that_completes_its_sink_does_not_panic() {
+    let _turn = turn();
     let lattice = one_cpu_lattice();
     let lake = Lake::new(lattice.clone(), sinks(2), Duration::ZERO);
     let unit = Arc::new(Mutex::new(Some(lake.admit().expect("a unit"))));
@@ -265,14 +315,167 @@ fn a_frame_that_completes_its_sink_does_not_panic() {
     lattice.close();
 }
 
-/// A frame that sets a latch when it runs.
-struct SetLatch {
+#[test]
+fn offers_racing_an_idle_detach_land_in_exactly_one_set() {
+    const THREADS: u64 = 8;
+    const BURSTS: u64 = 25;
+    const PER_BURST: u64 = 20;
+    let _turn = turn();
+    let lattice = one_cpu_lattice();
+    let lake = Lake::new(lattice.clone(), sinks(3), Duration::from_millis(1));
+    let ran = Arc::new(AtomicU64::new(0));
+    let offered = Arc::new(AtomicU64::new(0));
+    // The threads end each burst together, so every unit is over at one moment and the lake really is idle. Without
+    // that the eight threads' gaps overlap and some thread's unit is nearly always open: the set may never detach.
+    let ended = Arc::new(Barrier::new(THREADS as usize));
+    let threads: Vec<_> = (0..THREADS)
+        .map(|thread| {
+            let (lake, ran, offered, ended) =
+                (lake.clone(), ran.clone(), offered.clone(), ended.clone());
+            std::thread::spawn(move || {
+                for burst in 0..BURSTS {
+                    let unit = lake.admit().expect("a unit");
+                    for frame in 0..PER_BURST {
+                        let lane = thread * 1000 + burst * 31 + frame;
+                        if lake.offer(counting(lane, &ran)).is_ok() {
+                            offered.fetch_add(1, Ordering::AcqRel);
+                        }
+                    }
+                    drop(unit);
+                    ended.wait();
+                    if burst % 2 == 0 {
+                        // Idle until the watch has detached the set, so the next burst attaches another.
+                        if thread == 0 {
+                            eventually("the idle set to detach", || !lake.is_attached());
+                        }
+                    }
+                    // On the other bursts the next one starts at once and races the watch's detach.
+                    ended.wait();
+                }
+            })
+        })
+        .collect();
+    for thread in threads {
+        thread.join().unwrap();
+    }
+    let offered = offered.load(Ordering::Acquire);
+    assert_eq!(
+        offered,
+        THREADS * BURSTS * PER_BURST,
+        "a unit holds the lake open"
+    );
+    eventually("every offered frame to run", || {
+        ran.load(Ordering::Acquire) == offered
+    });
+    assert!(
+        lake.attachments() > 1,
+        "the idle gaps detached the set and the next burst attached another ({} attachments)",
+        lake.attachments()
+    );
+    std::thread::sleep(Duration::from_millis(20));
+    assert_eq!(ran.load(Ordering::Acquire), offered, "each frame ran once");
+    lake.complete_gracefully();
+    lattice.close();
+}
+
+#[test]
+fn offers_on_an_attached_set_take_no_lock() {
+    let _turn = turn();
+    let lattice = one_cpu_lattice();
+    let lake = Lake::new(lattice.clone(), sinks(2), Duration::ZERO);
+    let unit = lake.admit().expect("a unit");
+    let ran = Arc::new(AtomicU64::new(0));
+    {
+        // A lifecycle lock taken in here ends a debug run.
+        let _hot = HotScope::enter();
+        for index in 0..10_000 {
+            assert!(lake.offer(counting(index, &ran)).is_ok());
+        }
+    }
+    eventually("the frames to run", || {
+        ran.load(Ordering::Acquire) == 10_000
+    });
+    drop(unit);
+    lake.complete_gracefully();
+    lattice.close();
+}
+
+#[test]
+fn an_attached_for_life_lake_never_detaches() {
+    let _turn = turn();
+    let lattice = one_cpu_lattice();
+    let lake = Lake::new(lattice.clone(), sinks(2), Duration::ZERO);
+    drop(lake.admit().expect("a unit"));
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(lake.is_attached());
+    assert_eq!(lake.attachments(), 1);
+    lake.complete_gracefully();
+    lattice.close();
+}
+
+#[test]
+fn offers_from_8_threads_racing_complete_finish_every_admitted_unit() {
+    let _turn = turn();
+    const THREADS: u64 = 8;
+    for _ in 0..5 {
+        let lattice = one_cpu_lattice();
+        let lake = Lake::new(lattice.clone(), sinks(2), Duration::from_millis(1));
+        let ran = Arc::new(AtomicU64::new(0));
+        let accepted = Arc::new(AtomicU64::new(0));
+        let units = Arc::new(AtomicU64::new(0));
+        let threads: Vec<_> = (0..THREADS)
+            .map(|thread| {
+                let (lake, ran, accepted, units) =
+                    (lake.clone(), ran.clone(), accepted.clone(), units.clone());
+                std::thread::spawn(move || {
+                    for round in 0..200 {
+                        let Ok(unit) = lake.admit() else { return };
+                        units.fetch_add(1, Ordering::AcqRel);
+                        for frame in 0..4 {
+                            if lake
+                                .offer(counting(thread * 100_000 + round * 10 + frame, &ran))
+                                .is_ok()
+                            {
+                                accepted.fetch_add(1, Ordering::AcqRel);
+                            }
+                        }
+                        // A unit may fork while the lake drains.
+                        let forked = unit.fork();
+                        drop(unit);
+                        drop(forked);
+                    }
+                })
+            })
+            .collect();
+        std::thread::sleep(Duration::from_millis(5));
+        lake.complete_gracefully();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert!(
+            units.load(Ordering::Acquire) > 0,
+            "some units were admitted"
+        );
+        eventually("the lake to complete", || lake.is_complete());
+        assert_eq!(lake.active(), 0, "every admitted unit terminated");
+        let accepted = accepted.load(Ordering::Acquire);
+        eventually("every accepted frame to run", || {
+            ran.load(Ordering::Acquire) == accepted
+        });
+        eventually("the sinks to complete", || !lake.is_attached());
+        assert_eq!(ran.load(Ordering::Acquire), accepted, "each ran once");
+        lattice.close();
+    }
+}
+
+/// A frame that sends a value through a one-shot when it runs.
+struct SendOnce {
     header: FrameHeader,
-    setter: Option<LatchSetter<u64>>,
+    sender: Option<OneShotSender<u64>>,
     value: u64,
 }
 
-impl Frame for SetLatch {
+impl Frame for SendOnce {
     fn header(&self) -> &FrameHeader {
         &self.header
     }
@@ -282,42 +485,46 @@ impl Frame for SetLatch {
     }
 
     fn execute(&mut self) -> Result<(), FrameError> {
-        if let Some(setter) = self.setter.take() {
-            setter.set(self.value);
+        if let Some(sender) = self.sender.take() {
+            sender.send(self.value);
         }
         Ok(())
     }
 }
 
 #[test]
-fn latch_set_before_wait_returns() {
-    let (setter, waiter) = Latch::new();
-    setter.set(41_u64 + 1);
-    assert_eq!(waiter.wait(), 42);
+fn a_value_sent_before_the_check_is_there() {
+    let _turn = turn();
+    let (sender, mut receiver) = one_shot();
+    sender.send(41_u64 + 1);
+    assert!(receiver.is_set());
+    assert_eq!(receiver.try_take(), Ok(Some(42)));
 }
 
 #[test]
-#[should_panic(expected = "dropped without setting")]
-fn a_latch_whose_setter_was_dropped_does_not_park_forever() {
-    let (setter, waiter) = Latch::<u64>::new();
-    drop(setter);
-    waiter.wait();
+fn a_one_shot_whose_sender_was_dropped_reports_it_instead_of_staying_empty() {
+    let _turn = turn();
+    let (sender, mut receiver) = one_shot::<u64>();
+    drop(sender);
+    assert!(receiver.try_take().is_err());
 }
 
 #[test]
-fn latch_set_from_frame_wakes_waiter() {
+fn a_value_sent_from_a_frame_arrives_for_a_main_thread_that_checks() {
+    let _turn = turn();
     let lattice = one_cpu_lattice();
     let lake = Lake::new(lattice.clone(), sinks(1), Duration::ZERO);
     let unit = lake.admit().expect("a unit");
-    let (setter, waiter) = Latch::new();
-    let frame = SetLatch {
+    let (sender, mut receiver) = one_shot();
+    let frame = SendOnce {
         header: FrameHeader::new(3),
-        setter: Some(setter),
+        sender: Some(sender),
         value: 1234,
     };
     assert!(lake.offer(Box::new(frame)).is_ok());
-    // The test thread parks here until the frame runs on the lattice's worker.
-    assert_eq!(waiter.wait(), 1234);
+    // The test thread checks until the frame has run on the lattice's worker.
+    eventually("the frame to send", || receiver.is_set());
+    assert_eq!(receiver.try_take(), Ok(Some(1234)));
     drop(unit);
     lake.complete_gracefully();
     lattice.close();

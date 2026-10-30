@@ -3,13 +3,12 @@ use super::queue::{DEFAULT_CHUNK, Ending, Owner, QueueSource};
 use crate::frames::{Completion, Frame, FrameError, Outcome, PipelineBuilder, PipelineFrame};
 use crate::generics::{FrameSink, LatticeSource};
 use crate::impls::FrameManager;
+use euhedral_data_structures::sync::{OneShotReceiver, one_shot};
 use std::error::Error;
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-#[allow(clippy::disallowed_types, reason = "HOT-FIX(C14)")]
-use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Weak};
 
 /// Set in the admission word once admission closes; the rest counts accepted chains that have not
@@ -35,13 +34,11 @@ impl<I> Error for AdmissionClosed<I> {}
 
 type Observer = Box<dyn FnOnce(Outcome) + Send>;
 
-/// A channel that hears how a chain ended, and the observer that tells it.
-#[allow(clippy::disallowed_types, reason = "HOT-FIX(C14)")]
-fn observed() -> (Receiver<Outcome>, Observer) {
-    let (sender, outcome) = mpsc::sync_channel(1);
-    let observer = Box::new(move |result| {
-        let _ = sender.send(result);
-    });
+/// A one-shot that hears how a chain ended, and the observer that tells it (Java's `CompletableFuture` the chain
+/// completes). A chain dropped without ending drops the observer, which abandons the receiver.
+fn observed() -> (OneShotReceiver<Outcome>, Observer) {
+    let (sender, outcome) = one_shot();
+    let observer = Box::new(move |result| sender.send(result));
     (outcome, observer)
 }
 
@@ -205,8 +202,7 @@ impl<I: Send + 'static> PipelineRunner<I> {
     }
 
     /// Like [`run`](Self::run), and reports how the chain ended.
-    #[allow(clippy::disallowed_types, reason = "HOT-FIX(C14)")]
-    pub fn submit(&mut self, data: I) -> Result<Receiver<Outcome>, AdmissionClosed<I>> {
+    pub fn submit(&mut self, data: I) -> Result<OneShotReceiver<Outcome>, AdmissionClosed<I>> {
         let (outcome, observer) = observed();
         let root = self.checkout(data, Some(observer))?;
         self.publish(root, |source, root| source.offer(root));
@@ -214,12 +210,11 @@ impl<I: Send + 'static> PipelineRunner<I> {
     }
 
     /// Like [`run_seeded`](Self::run_seeded), and reports how the chain ended.
-    #[allow(clippy::disallowed_types, reason = "HOT-FIX(C14)")]
     pub fn submit_seeded(
         &mut self,
         seed: u64,
         data: I,
-    ) -> Result<Receiver<Outcome>, AdmissionClosed<I>> {
+    ) -> Result<OneShotReceiver<Outcome>, AdmissionClosed<I>> {
         let (outcome, observer) = observed();
         let root = self.checkout(data, Some(observer))?;
         self.publish(root, |source, root| source.offer_seeded(seed, root));
@@ -231,12 +226,11 @@ impl<I: Send + 'static> PipelineRunner<I> {
     /// # Panics
     ///
     /// If `partition` is not below the partition count; no chain is checked out then.
-    #[allow(clippy::disallowed_types, reason = "HOT-FIX(C14)")]
     pub fn submit_on(
         &mut self,
         partition: usize,
         data: I,
-    ) -> Result<Receiver<Outcome>, AdmissionClosed<I>> {
+    ) -> Result<OneShotReceiver<Outcome>, AdmissionClosed<I>> {
         self.check_partition(partition);
         let (outcome, observer) = observed();
         let root = self.checkout(data, Some(observer))?;

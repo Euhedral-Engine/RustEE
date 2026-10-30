@@ -226,7 +226,7 @@ impl<S: LaneSubmit, X: LaneState, W: LaneWork<S, X>> LaneSource<S, X, W> {
             }
             self.metrics
                 .intake_to_run_ns
-                .record(ns(clock.saturating_duration_since(item.delivered)));
+                .record_owned(ns(clock.saturating_duration_since(item.delivered)));
         }
         item.wait = None;
         // One clock read per item: the end of the previous item is the start of this one.
@@ -237,7 +237,7 @@ impl<S: LaneSubmit, X: LaneState, W: LaneWork<S, X>> LaneSource<S, X, W> {
         };
         *clock = Instant::now();
         if let Some(histogram) = self.metrics.item_ns.get(item.work.kind()) {
-            histogram.record(ns(clock.saturating_duration_since(started)));
+            histogram.record_owned(ns(clock.saturating_duration_since(started)));
         }
         match outcome {
             Outcome::Submitted { retire } => match inner.submitter.mark() {
@@ -482,15 +482,18 @@ impl<S: LaneSubmit, X: LaneState, W: LaneWork<S, X>> LaneSource<S, X, W> {
                     .expect("n is at most the queue's length");
                 receiver.push(frame);
             }
-            if n > 0 {
+            // Unbounded demand is never spent, so it costs no read-modify-write.
+            if n > 0 && banked != u64::MAX {
                 let _ = self
                     .demand
-                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                    .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                         Some(spend(current, n))
                     });
             }
         }
-        self.metrics.ready_depth.record(inner.ready.len() as f64);
+        self.metrics
+            .ready_depth
+            .record_owned(inner.ready.len() as f64);
         self.publish(inner);
         self.metrics.service_ns.record(ns(started.elapsed()));
     }
@@ -505,14 +508,20 @@ fn ns(d: std::time::Duration) -> f64 {
     d.as_nanos() as f64
 }
 
-/// Adds banked demand: saturating, with `u64::MAX` meaning unbounded.
-fn bank(current: u64, add: u64) -> u64 {
-    current.saturating_add(add)
-}
-
 /// Spends banked demand: floors at zero.
 fn spend(current: u64, spent: u64) -> u64 {
     current.saturating_sub(spent)
+}
+
+impl<S: LaneSubmit, X: LaneState, W> LaneSource<S, X, W> {
+    /// Banks `demand` (non-zero): one `fetch_add` with release ordering, saturating at `u64::MAX`, which means
+    /// unbounded. A sum that wrapped, or a bank that was already unbounded, is made unbounded again at once.
+    fn bank(&self, demand: u64) {
+        let before = self.demand.fetch_add(demand, Ordering::Release);
+        if before.checked_add(demand).is_none() {
+            self.demand.store(u64::MAX, Ordering::Release);
+        }
+    }
 }
 
 impl<S: LaneSubmit, X: LaneState, W> Drop for LaneSource<S, X, W> {
@@ -580,15 +589,13 @@ impl<S: LaneSubmit, X: LaneState, W: LaneWork<S, X>> LatticeSource for LaneSourc
         if self.is_complete() || demand == 0 || self.downstream.receiver().is_none() {
             return;
         }
-        let _ = self
-            .demand
-            .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
-                Some(bank(current, demand))
-            });
+        self.bank(demand);
         // The wakeup is published before the claim is tried: the holder either sees it when it
         // lets go, or this caller gets the claim itself. Nothing waits, and the demand is banked
-        // either way.
-        self.pending.store(true, Ordering::SeqCst);
+        // either way. The store is a plain release store: the claim attempt that follows is a
+        // sequentially consistent read-modify-write, the full barrier this caller pays anyway, and the
+        // holder reads the flag after its own sequentially consistent release of the claim.
+        self.pending.store(true, Ordering::Release);
         self.drain_requests();
     }
 

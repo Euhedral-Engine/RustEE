@@ -321,7 +321,7 @@ mod tests {
     }
 }
 
-#[cfg(loom)]
+#[cfg(all(loom, test))]
 mod loom_tests {
     use super::*;
     use loom::cell::UnsafeCell as LoomCell;

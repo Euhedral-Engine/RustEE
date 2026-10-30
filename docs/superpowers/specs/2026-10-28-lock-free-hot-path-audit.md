@@ -100,7 +100,7 @@ counterpart):
 | CONST | C1, G2 | 2 |
 | ATOMIC | C13 | 1 |
 | OWNED | C2, C3 | 2 |
-| FAN-IN | C14, G5, G6, G10, G11, G12, G13, G14, G15 | 9 |
+| FAN-IN | C14, G5, G6, G10, G11, G12, G13, G14, G15, G16, G17 | 11 |
 | THREAD | I4, I14, I15 | 3 |
 | SPLIT | I3, I6, I7, I8, I9, I13 | 6 |
 | MOVE | C7, I11, I12 | 3 |
@@ -252,6 +252,8 @@ request-side drain may also run after its `pull` releases the queue, as Java's `
 | G4 | HOT | LANE-SOURCE | The lane-source plan's Part 2 rebuilds `Join` on Java's `Join` (`pending` count, per-part slots). |
 | G5 | HOT | FAN-IN | No Java graph counterpart; Java waits for a result with a `CompletableFuture`: a one-shot. |
 | G6 | HOT | FAN-IN | Java `Sequencer`: an MPSC order queue and a `wip` counter; whoever wins `wip` drains the ready prefix. |
+| G16 | BARRIER | FAN-IN | A lane source's `request` banks demand and sets its wake flag with `SeqCst` operations on every call, once per source per lattice cycle: three full barriers (the bank's compare-and-set, the flag's exchange, the claim). Added after the audit, with the lane sources. Java's `QueueIngestSink.hookOnRequest` banks with `accumulateAndGet` and `requestPending.set(true)` (volatile: a barrier too); the rule for a frame's path is stricter than Java's. |
+| G17 | BARRIER | FAN-IN | A `Join` arrival costs a `swap` on the part's closed flag plus a `SeqCst` `fetch_sub`; `reset` a `SeqCst` compare-and-set, a `SeqCst` store and a release store per part. Java's `Join.arrive` is one `decrementAndGet` and `expect` two plain volatile stores. |
 | G10 | HOT | FAN-IN | Java `StageGraph.quantum` is a plain field ordered by the live and arrival counts. |
 | G11 | HOT | FAN-IN | Java `AbstractQuantum.failure`: `compareAndSet(null, cause)`, the first wins. |
 | G12 | HOT | FAN-IN | Java: a successor reads its predecessors' plain `marker` and `lane` after its final arrival (`ARRIVALS.getAndAdd`). |
@@ -456,7 +458,7 @@ workspace offers it:
    - A reader that stops reading keeps the values it last saw until it reads again, exits, or calls `remove_reader`;
      a worker drains at every cycle start and its parks are timed.
    - Deviation (missing Rust equivalent): Java's volatile read of a field the collector keeps alive. Later chunks that
-     planned a `Published` cell (the lake's generation, the shard's arrays, the monitor and the mapper) use a cell
+     planned a `Published` cell (the shard's arrays, the monitor and the mapper) use a cell
      where they have a registry and a queue of updates where they have not.
 3. **`OneShot<T>`** (chunk 5): Java's `CompletableFuture` as `PipelineRunner.submit` uses it. `state: AtomicU8`
    (empty, waiting, set, abandoned), the value in an `UnsafeCell`, and a `SetOnce<Thread>` waiter. The setter writes,
@@ -599,7 +601,7 @@ Java `LatticeHotSource`, `ControlPlaneFragment`'s output, `StopWatch`, `Fragment
 - **C14** (Java `PipelineRunner.submit` → `CompletableFuture`, `root.observe(future)`): `submit*` returns a
   `OneShot<Outcome>` receiver; one is allocated per submission, as Java allocates its future.
 - **G4**: rebuilt by the lane-source plan's Part 2 on Java's `Join`; nothing left here.
-- **G5** `Latch`: a wrapper of `OneShot` (Java waits for results with `CompletableFuture`).
+- **G5** `Latch`: removed. The main thread checks a `OneShot` periodically instead of blocking on it.
 - **G6** `Sequencer` (Java `Sequencer`):
   - `order`: an `MpscQueue` of `Arc<Entry>`, offered by `register` in order. An entry holds `ready: AtomicBool`
     (Java's entry `ready()`) and its value in an `UnsafeCell`.
@@ -608,12 +610,30 @@ Java `LatticeHotSource`, `ControlPlaneFragment`'s output, `StopWatch`, `Fragment
     emit it and pop it; `missed = wip.fetch_sub(missed, SeqCst) - missed`; return at 0. The order consumer is owned
     by the `wip` winner (an `UnsafeCell`, `// SAFETY:` the `wip` count), as Java's `peek`/`poll`.
   - A failing emit is logged and the drain continues (Java's catch).
+- **G16** lane source `request` (Java `QueueIngestSink.hookOnRequest`): bank the demand with one `fetch_add(Release)`
+  (saturating: a sum that wrapped is stored back as unbounded), only for a non-zero demand; set the wake flag with a
+  plain release store; the claim attempt that follows is the requester's one full barrier, and the holder reads the flag
+  after its sequentially consistent release of the claim and takes it with `swap(false, SeqCst)`. Unbounded demand
+  is never spent, so serving it takes no read-modify-write; spending is one `AcqRel` compare-and-set.
+  Deviation (Java bug against the frame-path rule): Java's volatile bank and volatile flag store are full barriers.
+- **G17** `Join` (Java `Join`): an arrival writes its slot and does one `fetch_sub(AcqRel)`. Java has no check that a part
+  ends once; here a part is a **move-only token** (`Part`, handed out by `reset`, `Round::rearm`, `Join::once` and
+  `arm_owned`), consumed by `arrive` or `abandon`, and dropping it abandons. A double arrival does not compile, there is
+  no range check and no debug-only flag, and a killed unit drops its tokens so its round completes with `None`s.
+  Deviation (missing Rust equivalent): Java's `Join` is a shared object whose parts are bare indexes, safe only by the
+  caller's contract; in Rust that contract is undefined behaviour from safe code, so ending is by ownership, and a
+  part holds the join (an `Arc`) because there is no collector to keep it alive. `Join::arm_owned` is Java's `expect`
+  for a cell whose owner proved the previous round over: a release store of the count after the values a cut-short
+  round left are dropped; `unsafe`, because only the caller knows that no token of the old round will end.
+  `Join::discard_round(&mut self)` is the safe form for an owner with exclusive access (`Arc::get_mut`): no token
+  exists then. `is_idle` says whether a round is armed. `reset` keeps its check (one `AcqRel` compare-and-set).
 - **G7, G8, G9: the lake's two modes** (Java's lake, the `FrameLake` implementation). `idle_release` stays:
   `Duration::ZERO` keeps the sinks attached for life (Java `idleDetachNanos <= 0`); a positive value detaches them once
   no unit has been active for that long, and the next offer re-attaches a fresh set. The hot side is Java's:
-  - `generation: Published<Generation>` (Java `volatile Generation generation`). `offer` and `admit` read it with one
-    pinned `load()`: no lock and no `Arc` clone. Deviation: `Published` stands in for the collector, because an
-    offering thread may hold a set that is being detached.
+  - `generation: Cell<Generation>` (Java `volatile Generation generation`). `offer` and `admit` read it from the
+    thread's view: no lock and no `Arc` clone for a registered reader. Deviation: a cell stands in for the collector,
+    because an offering thread may hold a set that is being detached; the set is released when the last view that
+    holds it drains.
   - `offer` (Java `publish`): read the set; offer to the sink its routing hash picks; a detached set's sinks refuse
     (publication closed), and the offer then calls `attach` and tries the set attached since, as Java's loop; a lake
     that finished, or an `attach` that returns the same set, refuses.
@@ -802,7 +822,7 @@ runtime" is the Java runtime `euhedral-graph` is derived from (its `runtime/grap
 | C8, C9 edges | core `LatticeEdge.DOWNSTREAM`, `PARENT` | Downstream kept until drop; a receiver added to a closed edge is told complete once, taken or refused (a Java race: `close` nulls `DOWNSTREAM`, so a later compare-and-set attaches a receiver that is never told); parent a cell (no GC). |
 | C11, C12 ingest | core `ingest/AbstractIngestSink`, `QueueIngestSink` | `clear` claims (Java bug: unclaimed single-consumer drain); demand is unsigned and saturates at the top (`add_demand`, `take_demand`) where Java's `accumulate` takes a signed step; the queue is finished when its source drops (no GC); `clear` cancels the frames (`do_finally_with_error`) where Java's `clear` drops them silently; `pull`'s stop also matches once the source has completed. |
 | C13 single use | core `ingest/SingleUseSource` | `complete` cancels an untaken frame (Java bug: `complete` leaves it takeable); a `pull` whose stop condition matches gives the frame back (Java ignores the stop condition); a frame nobody took is cancelled when the source drops. |
-| C14 pipeline outcome | core `ingest/PipelineRunner`, `CompletableFuture` | None. |
+| C14 pipeline outcome | core `ingest/PipelineRunner`, `CompletableFuture` | One reader that polls, not Java's many waiters and callbacks; a chain dropped without ending abandons the receiver where Java's future would stay incomplete (missing Rust equivalent: no collector notices a dropped future). |
 | C15 hot receiver | core `flow_control/LatticeHotReceiver`, `utils/SpinWait` | None (already mirrored). |
 | C16-C19 lattice, shard | core `ControlPlaneLattice`, `ControlPlaneShard` | `Published` for the arrays (no GC). |
 | C20 task pool | core `controlPlaneExecutor` (JDK fixed pool) | Lock-free job queue: the JDK queue locks, and ticks are hot. |
@@ -811,9 +831,11 @@ runtime" is the Java runtime `euhedral-graph` is derived from (its `runtime/grap
 | H6, H7 mapper | hardware-utils `TopologyMapper` | `Published` (no GC). |
 | G1-G3 completions | none; nearest core `QueueIngestSink` | A request that finds the poll held leaves a wakeup for the holder (`request_pending`, as `QueueIngestSink`'s); the lane pool lives with the source (a marker is reached when its lane says so, also after `complete`, as in Java); the poll state is a `SourceCell`, the state a holder mutates; a registration whose marker is still unreached is leaked and counted instead of finished when it is cancelled (at drop, by a sweep, or refused after `complete`), because the device may still use what it holds. |
 | G4 join | graph runtime `Join` | In the lane-source plan. |
-| G5 latch | none; `CompletableFuture` | — |
-| G6 sequencer | graph runtime `Sequencer` | None. |
-| G7-G9 lake | graph runtime `FrameLake` implementation (both modes) | `Published` for the generation (no GC); retirements held in `retiring`. |
+| G5 latch | none; `CompletableFuture` | Removed with `Latch` (user decision: a blocking wait for the lattice's work is not needed; the main thread checks periodically with a one-shot). It was the last blocking call in `euhedral-graph`. |
+| G6 sequencer | graph runtime `Sequencer` | A panic in `emit` resumes on the releasing thread once the drain ended; Java logs it (the Rust caller of `complete` sees it). Entries are `Arc`s (no GC); `len` is the order queue's length. `ready` is release/acquire and the work-in-progress count is the one read-modify-write (the claim). |
+| G16 lane source request | core `QueueIngestSink.hookOnRequest` | A release-ordered bank and flag; the claim attempt is the barrier (Java: volatile bank and flag). |
+| G17 join | graph runtime `Join` | Debug-only double-arrival check (Java: none); `arm_owned` is Java's `expect` and `unsafe` (no collector); `is_idle`. |
+| G7-G9 lake | graph runtime `FrameLake` implementation (both modes) | A cell for the generation (no GC), with the attach lock's own strong reference to the set for the lifecycle side; retirements held in `retiring`. The terminating unit stores `idle_since` before it lowers the count and the watch reads the count before the time (Java stores after the decrement, so a watch that sees the count at zero can read the previous idle time and detach a set that just went idle: a Java bug). The watch's downstream is a `DownstreamSlot`. |
 | G10-G15 stage graph | graph runtime `StageGraph`, `StageFrame`, `AbstractQuantum` | Wider-than-64-lane masks. |
 | I1-I6 io_uring | graph runtime `AsyncReads`, `UringBackend` | Operations written in place behind a reserve step (no allocation per operation). I1, I2: a request that finds the front entered leaves a wakeup for the holder (`request_pending`, as `QueueIngestSink`'s). |
 | I7-I15 Windows | graph runtime `CompletionPortBackend`, `IoRingBackend` | `register` for sockets (Java reads files only); pool-job results have no counterpart. |

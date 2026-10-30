@@ -5,9 +5,9 @@ Java `euhedral-data-structures`, padded the same way: where Java pads with dead 
 `#[repr(align(128))]` wrapper ([`CachePadded`](src/atomics/padding.rs)) pads the same groups of
 fields in the same order.
 
-**Where it sits.** No dependencies. `euhedral-core` builds on it: each partition of a
-`ControlPlaneCache`, the upstream registry's per-worker handle queues, the `QueueIngestSink` and
-the `FrameManager`'s recycle queue are queues from this crate.
+**Where it sits.** No dependencies except `loom` under `--cfg loom`. It holds the padded atomics, the chunked
+queues in the four producer/consumer role pairs (single or multiple on each side), partitioned queues, and the
+cells and claims that threads meet at (`sync`).
 
 ## Modules
 
@@ -18,7 +18,7 @@ the `FrameManager`'s recycle queue are queues from this crate.
 | `queues::PlainQueue` ([source](src/queues/plain_queue.rs)) | A single-thread FIFO with the same batch API and no synchronisation. |
 | [`queues::queue_utils`](src/queues/queue_utils.rs) | Sizing helpers: `MAX_SIZE`, `round_chunk_size`, `chunk_mask`, `unsigned_multiply_high`. |
 | `queues` internals: [`core`](src/queues/core.rs), [`chunk`](src/queues/chunk.rs) | The chunked ring buffer behind every queue, its slots, and the pool that recycles retired chunks. Private. |
-| [`sync`](src/sync/mod.rs) | `SetOnce<T>`: a lock-free cell installed at most once by a compare-and-set and read with an acquire load (its loom model runs with `RUSTFLAGS="--cfg loom"`). `ClaimCell<T>`: plain state one thread at a time claims with a compare-and-set that fails instead of waiting (Java's `draining` flag), released by a drop or `release_seq_cst`; it has a loom model too. `LifecycleMutex<T>` and `LifecycleRwLock<T>`: the locks for start, stop and rebalance state. `HotScope`: the debug check that aborts when one is taken inside code that runs once per unit of work. |
+| [`sync`](src/sync/mod.rs) | `SetOnce<T>`: a lock-free cell installed at most once by a compare-and-set and read with an acquire load (its loom model runs with `RUSTFLAGS="--cfg loom"`). `one_shot`: Java's `CompletableFuture` for one result (one sender, one receiver that polls or parks; loom models). `ClaimCell<T>`: plain state one thread at a time claims with a compare-and-set that fails instead of waiting (Java's `draining` flag), released by a drop or `release_seq_cst`; it has a loom model too. `LifecycleMutex<T>` and `LifecycleRwLock<T>`: the locks for start, stop and rebalance state. `HotScope`: the debug check that aborts when one is taken inside code that runs once per unit of work. |
 | [`atomics`](src/atomics/mod.rs) | `CachePadded<T>`; `AtomicDouble`; `PaddedAtomicLong`, `PaddedAtomicDouble`; `PaddedAtomicLongArray`, `PaddedAtomicDoubleArray` (each element on its own cache line); `PaddedLongAdder`, `PaddedDoubleAdder` (striped counters). |
 
 ## Key concepts
@@ -47,9 +47,7 @@ A consumer can `poll` one element, `peek` at it, `drain` up to a limit into a cl
 up to the first element a `stop` predicate matches (leaving it queued), or `drain_to` another
 queue's producer or a `Vec`. A `Multi` consumer takes a consumer lock for each call: `poll` returns
 `None` and `drain` stops early if another consumer holds it. `with_max_consume_batch` caps how many
-elements one consumer takes per lock hold. Here `drain*` means taking items out of a container;
-in `euhedral-core`, "drain" means stopping work and finishing what is in flight (see
-[`GLOSSARY.md`](../GLOSSARY.md)).
+elements one consumer takes per lock hold. Here `drain*` means taking items out of a container.
 
 ### Partitioned queues
 

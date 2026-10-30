@@ -4,10 +4,9 @@ xxHash64-based hashing for RustEE's routing keys, ordered-chain ids and vector f
 port of the upstream Java `AbstractHasher`, `ByteHasher`, `StringHasher` and `HasherApi`, and gives
 the same hashes as the Java code for the same input.
 
-**Where it sits.** No dependencies. `euhedral-core` uses it to build a frame's routing hash
-([`FrameHeader::randomize_hash`](../euhedral-core/src/frames/mod.rs) mixes the seed with
-`mix_with_zero_check`), for the id hash a `FrameFactory` picks, and for the seed of the upstream
-queue's shuffle.
+**Where it sits.** No dependencies. It hashes bytes, strings and float slices, and mixes and combines hashes
+(`mix`, `mix_with_zero_check`, `combine`), which is what a caller needs to build a routing key, an ordered-chain
+id or a vector fingerprint from parts. A hash is a function of its input and seed alone, on every platform.
 
 ## Modules
 

@@ -2,9 +2,9 @@
 //! them for the `loom` model checker's, which explores every interleaving the memory model allows.
 
 #[cfg(loom)]
-pub(crate) use loom::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+pub(crate) use loom::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(not(loom))]
-pub(crate) use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+pub(crate) use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// An `UnsafeCell` whose accesses are closures over a raw pointer, the shape `loom`'s cell has, so the
 /// model checker sees each access and can report an unordered one. The checker tracks the closure's

@@ -35,6 +35,73 @@ the source handing a frame out to a worker starting it, and excludes the recycle
 **Tests.** The harness-core selection, the worker CPU set, the completion target and its bounded wait, the sources
 default, the output lines, and a smoke run of a fork with a tiny target on a real lattice.
 
+## Fan-in without locks: one-shot, sequencer, lake; `Latch` removed (2026-10-29)
+
+**What.**
+- `one_shot` / `OneShotSender` / `OneShotReceiver` / `RecvError` (`euhedral-data-structures::sync`): Java's
+  `CompletableFuture` for one result. The sender writes the value and publishes it with one release store; the receiver
+  checks with `try_take` and `is_set`. A sender dropped without sending abandons the hand-off. **Nothing waits:** there
+  is no blocking receive, no park and no wake.
+- `PipelineRunner::submit`, `submit_seeded` and `submit_on` (audit C14) return `OneShotReceiver<Outcome>` instead of
+  an `mpsc::Receiver` (**breaking**): poll with `try_take()` (`Ok(None)` while the chain runs).
+- **`Latch`, `LatchSetter` and `LatchWaiter` are removed** (**breaking**; G5). A latch let the main thread block until
+  the lattice's work was done; the main thread can check on it periodically instead, with a one-shot. It was the last
+  blocking call in `euhedral-graph`.
+- `Sequencer` (G6) is Java's: a ring of cells indexed by sequence number, each with a ready state word, and the thread
+  that raises the work-in-progress count from zero concludes the ready prefix. **Breaking:** `Sequencer::new(capacity,
+  emit)` returns the sequencer with its one `Registrar` (not `Clone`; `register(&mut self)` returns `None` while
+  `capacity` slots are unreleased). A registration allocates nothing and takes no read-modify-write; the registrar
+  keeps the order, so registration is by one thread at a time. A slot still holds an `Arc` of the sequencer.
+- `Lake` (G7-G9): the attached set is a cell of the lattice's registry; `offer` and `admit` read it from the calling
+  thread's view (a producer thread that offers every frame calls `register_reader` once, to hold the set and read it
+  with no reference-count update). Attach and detach run under a lifecycle lock off the hot scope. The idle watch's downstream
+  is a `DownstreamSlot`. `ControlPlaneLattice::registry()` is new.
+- Lane sources and `Join` (G16, G17; barriers, not locks): `LaneSource::request` banks demand with one release
+  `fetch_add` (and spends unbounded demand with none) and sets its wake flag with a release store, where it did
+  three sequentially consistent read-modify-writes per call. `euhedral-data-structures` now builds the loom crate as a
+  dependency under `--cfg loom` (the graph's join models run again).
+- **`Join` API change (breaking).** A part is a move-only token: `Join::reset`, `Round::rearm`, `Join::once` (was
+  `Join::new`) and the unsafe `Join::arm_owned` return the round's `Parts`, an iterator of `Part`s;
+  `Part::arrive(value)` and `Part::abandon()` consume a part, and dropping one abandons. `Join::arrive(index, value)`
+  and `Join::abandon(index)` are gone. A part ends once because it is consumed, so a double arrival does not compile,
+  and the debug-only `closed` flag and the range check are gone; an arrival stays one `fetch_sub(AcqRel)`. A killed
+  unit drops its parts and the round completes with `None`s. `Join::with_capacity` returns an `Arc<Join>` (a part holds
+  its join, because there is no collector to keep it alive). `Join::discard_round(&mut self)` (for an `Arc::get_mut`
+  owner), `Join::arm_owned` (unsafe: only the caller knows that no part of the old round will end) and `Join::is_idle`
+  remain; `Join::reset` keeps its check. Reason: the earlier contract ("each part ends exactly once") was undefined
+  behaviour reachable from safe code.
+
+- `HOT_FIX_TAGS` loses C14, G5, G6 and G7 and lists 35.
+
+**Why.** An outcome crossed a channel whose waker took a mutex on the worker that finished the chain; a latch took a
+mutex per set; the sequencer took a mutex per registration, completion and released slot; and every offer to a lake
+took the read lock of its generation and cloned its `Arc`. Locking is a failure of the dependency chain, and a frame's
+path should hit no memory barrier.
+
+**How.**
+- `let mut outcome = runner.submit(x)?; ... outcome.try_take()` from the thread that wants the result, on its own
+  schedule (a short sleep between checks is fine outside the lattice).
+- A frame that hands a value to the main thread holds an `OneShotSender` and `send`s; the main thread checks `is_set`.
+- A lake is used as before; its `offer` takes no lock while a set is attached.
+
+**Semantics.**
+- A one-shot has one receiver and one value. `try_take` returns the value once; a later call reports
+  `RecvError::Abandoned`; `is_set` stays true after the take.
+- The sequencer's drain is one thread at a time; a completion that arrives during a drain makes it look again. A
+  panic in `emit` does not stop the slots behind it and resumes on the releasing thread once the drain ended. The
+  `ready` flag is stored with release and loaded with acquire; the work-in-progress count is the only read-modify-write
+  (the claim).
+- A lake that finished, or an attach that returns the set that just refused a frame, hands the frame back. A set
+  detached while an offer was on its way stays allocated until the offer has passed.
+- The lake's watch stores the time a unit ended before it lowers the count, and reads the count before the time.
+
+**Tests.** `send_before_take_and_take_before_send_both_deliver`, `a_dropped_sender_abandons`,
+`ten_thousand_pairs_across_two_threads_each_deliver_once`, `loom_try_take_never_sees_a_value_before_it_is_complete`,
+`outcomes_of_1000_chains_from_4_submitters_each_arrive_once`,
+`registrations_from_4_threads_complete_in_reverse_and_emit_in_order`, `an_emit_that_panics_does_not_stop_the_ones_behind_it`,
+`offers_racing_an_idle_detach_land_in_exactly_one_set`, `offers_on_an_attached_set_take_no_lock`,
+`an_attached_for_life_lake_never_detaches`, `offers_from_8_threads_racing_complete_finish_every_admitted_unit`.
+
 ## Routing, cache and edges without locks (2026-10-29)
 
 **What.**

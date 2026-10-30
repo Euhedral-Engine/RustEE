@@ -4,9 +4,9 @@ CPU topology, thread affinity, pinned executors and resource-pressure monitoring
 a port of the upstream Java `euhedral-hardware-utils`. The Java native library is replaced by direct
 system calls, so there is nothing to extract or load at run time.
 
-**Where it sits.** Depends only on `log`, plus `libc` on Unix and `windows-sys` on Windows.
-`euhedral-core` builds on it: the lattice follows a `ResourceMonitor` and a `TopologyMapper`, each
-fragment worker runs on a `PinnedThreadExecutor`, and frames carry a `CpuInfo` as their origin.
+**Where it sits.** Depends only on `log` and `euhedral-data-structures` (for its lifecycle locks), plus `libc` on Unix and
+`windows-sys` on Windows. A `ResourceMonitor` samples the machine's pressure, a `TopologyMapper` places work on cores,
+a `PinnedThreadExecutor` runs tasks on a fixed CPU, and a `CpuInfo` describes where a thread runs.
 
 **Platforms.** The back end is chosen at compile time:
 
@@ -116,7 +116,7 @@ thermal and low-power state) becomes a ratio in `[0, 1]`, is smoothed with a fas
 release, and the smoothed cells combine by `max`. A failed or unsupported read is never a zero: it
 carries its validity and resolves as unavailable, and a counter that fails for a moment repeats its
 last interval within a TTL rather than dropping the pressure.
-`euhedral-core` lowers a worker's batch cap and its cache's cap factor as its CPU's pressure rises.
+A caller can scale its work by this value: lower a batch cap as the CPU's pressure rises.
 
 ```rust,no_run
 use euhedral_hardware_utils::monitor::{MonitorError, ResourceMonitor};
