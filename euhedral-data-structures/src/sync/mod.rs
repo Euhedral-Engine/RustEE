@@ -13,7 +13,7 @@
 
 mod claim_cell;
 mod lifecycle;
-mod loom;
+pub(crate) mod loom;
 mod one_shot;
 mod set_once;
 

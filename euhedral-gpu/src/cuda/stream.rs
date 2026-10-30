@@ -499,6 +499,21 @@ impl Stream for CudaStream {
     type Gpu = CudaGpu;
     type Enqueue<'a> = CudaEnqueue<'a>;
 
+    /// Synchronizes the stream (and its shadow stream): the work submitted so far and its callbacks have ended on return,
+    /// unless the context is lost.
+    fn quiesce(&mut self) {
+        if let Ok(_c) = self.gpu.device().enter() {
+            let f = &self.gpu.device().driver.fns;
+            // SAFETY: streams made by this value; the context is current.
+            unsafe {
+                (f.stream_synchronize)(self.raw);
+                if let Some(shadow) = self.shadow {
+                    (f.stream_synchronize)(shadow);
+                }
+            }
+        }
+    }
+
     fn gpu(&self) -> &Arc<CudaGpu> {
         &self.gpu
     }

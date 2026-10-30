@@ -4,9 +4,11 @@
 #[cfg(loom)]
 pub(crate) use loom::cell::UnsafeCell;
 #[cfg(loom)]
-pub(crate) use loom::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU64, Ordering, fence};
+pub(crate) use loom::sync::atomic::{
+    AtomicBool, AtomicPtr, AtomicU8, AtomicUsize, Ordering, fence,
+};
 #[cfg(not(loom))]
-pub(crate) use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, Ordering, fence};
+pub(crate) use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicUsize, Ordering, fence};
 
 /// `std`'s `UnsafeCell` with loom's closure-based access, so one body serves both builds.
 #[cfg(not(loom))]

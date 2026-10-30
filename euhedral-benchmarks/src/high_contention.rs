@@ -25,6 +25,9 @@ pub const TASKS: u64 = 32_000_000;
 pub const SOURCES_VARIABLE: &str = "EUHEDRAL_HCT_SOURCES";
 
 /// How long one invocation may take (`TimeUnit.MINUTES.toNanos(1)`).
+/// Spins between two sums of the completion counter in the upstream harness.
+pub const POLL_SPINS: u32 = 32;
+
 pub const INVOCATION_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The sources when nothing overrides them: one fewer than the physical cores, at least one.
@@ -69,8 +72,9 @@ pub fn completed(counters: &PaddedLongAdder) -> u64 {
     counters.sum() as u64
 }
 
-/// Waits until the completion count reaches `target`, or fails at `timeout` (`await`): spins, checks the sum every 32
-/// spins, yields every 128, logs progress every 3 seconds.
+/// Waits until the completion count reaches `target`, or fails at `timeout` (`await`): spins, checks the sum every
+/// `poll_spins` spins (upstream: 32), yields every 128, logs progress every 3 seconds. Each sum reads every
+/// worker's counter line, so a short interval takes those lines from the workers that are writing them.
 #[allow(
     clippy::disallowed_methods,
     reason = "JAVA-BACKOFF: the harness thread waits for the lattice as the upstream harness does, spinning and yielding"
@@ -79,13 +83,15 @@ pub fn await_completions(
     counters: &PaddedLongAdder,
     target: u64,
     timeout: Duration,
+    poll_spins: u32,
 ) -> Result<(), AwaitTimeout> {
+    let poll_mask = poll_spins.max(1).next_power_of_two() - 1;
     let start = Instant::now();
     let mut log = start;
     let mut spin: u32 = 0;
     let mut now = start;
     while now.duration_since(start) < timeout {
-        if spin & 31 == 0 {
+        if spin & poll_mask == 0 {
             let sum = completed(counters);
             if now.duration_since(log) >= Duration::from_secs(3) {
                 eprintln!("progress: {sum}");
@@ -206,6 +212,11 @@ pub struct Options {
     pub pin_harness: bool,
     /// Sample the latency of one frame in 64.
     pub latency: bool,
+    /// Frames come from, and return to, the pool of the thread that runs them, instead of circulating through each
+    /// source's return queue (see [`RepeatingSource::pooled`]).
+    pub pooled_frames: bool,
+    /// Spins between two sums of the completion counter (rounded up to a power of two); upstream's value is 32.
+    pub poll_spins: u32,
 }
 
 impl Options {
@@ -220,6 +231,8 @@ impl Options {
             tasks: TASKS,
             pin_harness: true,
             latency: true,
+            pooled_frames: false,
+            poll_spins: POLL_SPINS,
         }
     }
 }
@@ -262,11 +275,11 @@ impl fmt::Display for ForkError {
 impl std::error::Error for ForkError {}
 
 /// One invocation: waits for `tasks` more completions.
-fn invoke(counters: &PaddedLongAdder, tasks: u64) -> Result<(), ForkError> {
+fn invoke(counters: &PaddedLongAdder, tasks: u64, poll_spins: u32) -> Result<(), ForkError> {
     let target = completed(counters)
         .checked_add(tasks)
         .ok_or(ForkError::Wrapped)?;
-    await_completions(counters, target, INVOCATION_TIMEOUT).map_err(ForkError::Timeout)
+    await_completions(counters, target, INVOCATION_TIMEOUT, poll_spins).map_err(ForkError::Timeout)
 }
 
 /// One iteration: invocations for at least `time`, as the harness counts them.
@@ -274,6 +287,7 @@ fn iterate(
     counters: &PaddedLongAdder,
     recorders: Option<&Recorders>,
     tasks: u64,
+    poll_spins: u32,
     time: Duration,
     measured: bool,
     index: u32,
@@ -282,7 +296,7 @@ fn iterate(
     let start = Instant::now();
     let mut invocations = 0_u64;
     while invocations == 0 || start.elapsed() < time {
-        invoke(counters, tasks)?;
+        invoke(counters, tasks, poll_spins)?;
         invocations += 1;
     }
     let elapsed = start.elapsed();
@@ -348,13 +362,18 @@ pub fn run_fork(
         .then(|| Arc::new(Recorders::new(tally.cells())));
     let sources: Vec<_> = (0..options.sources)
         .map(|source| {
-            RepeatingSource::new(
-                id_hash(),
-                FRAMES_PER_SOURCE,
-                id_hash().wrapping_add((source * FRAMES_PER_SOURCE) as u64),
-                &tally,
-                recorders.as_ref(),
-            )
+            let seed = id_hash().wrapping_add((source * FRAMES_PER_SOURCE) as u64);
+            if options.pooled_frames {
+                RepeatingSource::pooled(id_hash(), seed, &tally, recorders.as_ref())
+            } else {
+                RepeatingSource::new(
+                    id_hash(),
+                    FRAMES_PER_SOURCE,
+                    seed,
+                    &tally,
+                    recorders.as_ref(),
+                )
+            }
         })
         .collect();
 
@@ -378,6 +397,7 @@ pub fn run_fork(
                 counters,
                 recorders.as_deref(),
                 options.tasks,
+                options.poll_spins,
                 options.warmup_time,
                 false,
                 index,
@@ -390,6 +410,7 @@ pub fn run_fork(
                 counters,
                 recorders.as_deref(),
                 options.tasks,
+                options.poll_spins,
                 options.iteration_time,
                 true,
                 index,
@@ -497,12 +518,12 @@ mod tests {
         let counters = PaddedLongAdder::with_options(1, true, false);
         counters.add_at(0, 32_000_123);
         assert_eq!(
-            await_completions(&counters, 32_000_123, Duration::from_millis(1)),
+            await_completions(&counters, 32_000_123, Duration::from_millis(1), 32),
             Ok(())
         );
         let empty = PaddedLongAdder::with_options(1, true, false);
         assert_eq!(
-            await_completions(&empty, 32_000_000, Duration::ZERO),
+            await_completions(&empty, 32_000_000, Duration::ZERO, 32),
             Err(AwaitTimeout {
                 target: 32_000_000,
                 observed: 0

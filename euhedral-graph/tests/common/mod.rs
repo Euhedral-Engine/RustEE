@@ -82,11 +82,20 @@ impl Probe {
     }
 }
 
+/// What a lane state's `close` saw.
+pub type Closings = Arc<std::sync::Mutex<Vec<(bool, Option<u64>)>>>;
+/// Where `close` looks to see whether the submitter is gone.
+pub type Watch = Arc<std::sync::Mutex<Option<(euhedral_graph::testing::FakeLanes, LaneId)>>>;
+
 /// The lane state: a gate the test opens, and a count of `check` calls.
 #[derive(Clone, Default)]
 pub struct Gate {
     pub value: Arc<AtomicU64>,
     pub checks: Arc<AtomicUsize>,
+    /// What `close` saw: whether the lane's submitter was already dropped, and the raw handle it was given.
+    pub closed: Closings,
+    /// Where `close` looks to see whether the submitter is gone.
+    pub watch: Watch,
 }
 
 impl LaneState for Gate {
@@ -98,6 +107,13 @@ impl LaneState for Gate {
 
     fn met(&mut self, wait: &u64, _now: std::time::Instant) -> bool {
         *wait <= self.value.load(Ordering::SeqCst)
+    }
+
+    fn close(&mut self, raw: &dyn std::any::Any) {
+        let gone = lock(&self.watch)
+            .as_ref()
+            .is_some_and(|(fake, lane)| fake.dropped(*lane));
+        lock(&self.closed).push((gone, raw.downcast_ref::<u64>().copied()));
     }
 }
 

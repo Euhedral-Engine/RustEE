@@ -63,6 +63,8 @@ fn a_fork_with_a_tiny_target_completes_and_reports_every_iteration() {
         // The test thread is the harness; pinning it would leave it pinned for the rest of the process.
         pin_harness: false,
         latency: true,
+        pooled_frames: false,
+        poll_spins: 32,
     };
     let mut announced = 0;
     let mut reported = 0;
@@ -98,8 +100,30 @@ fn a_fork_without_latency_reports_no_quantiles() {
         tasks: 5_000,
         pin_harness: false,
         latency: false,
+        pooled_frames: false,
+        poll_spins: 32,
     };
     let outcome = run_fork(&options, |_| {}, |_| {}).unwrap_or_else(|e| panic!("{} {e}", file!()));
     assert!(outcome.samples[0].latency.is_none());
     assert!(outcome.measured_latency.quantiles().is_none());
+}
+
+#[test]
+fn a_fork_with_pooled_frames_completes_and_records_latency() {
+    let _turn = turn();
+    let options = Options {
+        sources: 2,
+        warmup_iterations: 0,
+        warmup_time: Duration::ZERO,
+        iterations: 1,
+        iteration_time: Duration::from_millis(100),
+        tasks: 20_000,
+        pin_harness: false,
+        latency: true,
+        pooled_frames: true,
+        poll_spins: 32,
+    };
+    let outcome = run_fork(&options, |_| {}, |_| {}).unwrap_or_else(|e| panic!("{} {e}", file!()));
+    assert!(outcome.samples[0].invocations >= 1);
+    assert!(outcome.measured_latency.quantiles().is_some());
 }

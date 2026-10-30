@@ -46,12 +46,16 @@ enum Flow<W, A> {
     Waits(Waiting<W, A>),
 }
 
+/// The items a lane source makes room for when it is built with [`LaneSource::new`].
+pub const DEFAULT_BOUND: usize = 1024;
+
 /// Everything a worker touches only while it is inside `request` or `pull`.
 struct Inner<S: LaneSubmit, X: LaneState, W> {
-    /// Dropped first (see the `Drop`): its shutdown waits for the device work the items still hold.
+    /// Dropped last, after the state (see the `Drop`): its shutdown waits for the device work the items still hold.
     submitter: ManuallyDrop<S>,
     queue_id: QueueId,
-    state: X,
+    /// Closed, then dropped, before the submitter: it may hold what was made against the submitter's queue.
+    state: ManuallyDrop<X>,
     own: Consumer<Envelope<W>, Single>,
     shared: Option<Consumer<Envelope<W>, Multi>>,
     /// Frames made by items, in the order they were made.
@@ -72,8 +76,19 @@ struct Inner<S: LaneSubmit, X: LaneState, W> {
 
 impl<S: LaneSubmit, X: LaneState, W> Drop for Inner<S, X, W> {
     fn drop(&mut self) {
-        // The submitter goes first: its shutdown waits for the device work the items still hold.
-        // If that panics, everything else is still released before the panic goes on.
+        // Order: the device work ends (`quiesce`), the state closes against the queue's raw handle and is dropped, and
+        // the submitter, which owns the queue, goes last (its shutdown waits for what the items still hold). A panic in
+        // any step is held back until the rest is released.
+        let ended = panic::catch_unwind(AssertUnwindSafe(|| {
+            self.submitter.quiesce();
+            // SAFETY: the lane's work has ended, and the source is being dropped, so no item runs.
+            let raw = unsafe { self.submitter.raw() };
+            self.state.close(&raw);
+        }));
+        // SAFETY: `state` is dropped here only, and no field is used again.
+        let state = panic::catch_unwind(AssertUnwindSafe(|| unsafe {
+            ManuallyDrop::drop(&mut self.state);
+        }));
         // SAFETY: `submitter` is dropped here only, and no field is used again.
         let shutdown = panic::catch_unwind(AssertUnwindSafe(|| unsafe {
             ManuallyDrop::drop(&mut self.submitter);
@@ -87,10 +102,12 @@ impl<S: LaneSubmit, X: LaneState, W> Drop for Inner<S, X, W> {
         while let Some(frame) = self.ready.pop_front() {
             frame.do_finally_with_error(FrameError::failed("the lane source was dropped"));
         }
-        if let Err(payload) = shutdown
-            && !std::thread::panicking()
-        {
-            panic::resume_unwind(payload);
+        for result in [ended, state, shutdown] {
+            if let Err(payload) = result
+                && !std::thread::panicking()
+            {
+                panic::resume_unwind(payload);
+            }
         }
     }
 }
@@ -140,6 +157,23 @@ impl<S: LaneSubmit, X: LaneState, W: LaneWork<S, X>> LaneSource<S, X, W> {
         inputs: LaneInputs<W>,
         intakes: Arc<LaneIntakes<W>>,
     ) -> Arc<Self> {
+        Self::with_bound(submitter, state, inputs, intakes, DEFAULT_BOUND)
+    }
+
+    /// Like [`new`](Self::new), for a lane that holds at most `bound` items at once (waiting, armed or ready): the
+    /// queues the source keeps for them are allocated for `bound` at construction, so a request allocates nothing
+    /// while the lane stays within it.
+    ///
+    /// # Panics
+    ///
+    /// As [`new`](Self::new).
+    pub fn with_bound(
+        submitter: S,
+        state: X,
+        inputs: LaneInputs<W>,
+        intakes: Arc<LaneIntakes<W>>,
+        bound: usize,
+    ) -> Arc<Self> {
         let lane = submitter.lane();
         assert_eq!(
             inputs.lane(),
@@ -169,15 +203,15 @@ impl<S: LaneSubmit, X: LaneState, W: LaneWork<S, X>> LaneSource<S, X, W> {
             cell: SourceCell::new(Inner {
                 submitter: ManuallyDrop::new(submitter),
                 queue_id,
-                state,
+                state: ManuallyDrop::new(state),
                 own: inputs.own,
                 shared: inputs.shared,
-                ready: VecDeque::new(),
-                waiting: VecDeque::new(),
-                keep: VecDeque::new(),
-                armed: VecDeque::new(),
+                ready: VecDeque::with_capacity(bound),
+                waiting: VecDeque::with_capacity(bound),
+                keep: VecDeque::with_capacity(bound),
+                armed: VecDeque::with_capacity(bound),
                 unmarked: None,
-                blocked_keys: Vec::new(),
+                blocked_keys: Vec::with_capacity(bound),
             }),
         })
     }

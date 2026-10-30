@@ -8,10 +8,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use euhedral_data_structures::queues::{Consumer, MpmcQueue, Multi, Producer};
 
-use super::{CuEvent, CuStream, CudaError, Device, STREAM_NON_BLOCKING};
+use super::{CuEvent, CuStream, CudaError, Device, Memcpy2D, STREAM_NON_BLOCKING};
 use crate::backend::Retired;
 use crate::planner::LocationId;
-use crate::tiers::{Copier, CopyError};
+use crate::tiers::{Copier, CopyError, PitchedCopy};
 
 /// `CU_EVENT_DISABLE_TIMING`: the events only mark completion.
 const EVENT_DISABLE_TIMING: u32 = 2;
@@ -21,6 +21,8 @@ const SUCCESS: i32 = 0;
 struct Inner {
     device: Arc<Device>,
     stream: CuStream,
+    /// Whether this copier made the stream (and so synchronizes and destroys it), or borrows the caller's.
+    owns_stream: bool,
     events: Vec<CuEvent>,
     free: (Producer<u32, Multi>, Consumer<u32, Multi>),
     copies: AtomicU64,
@@ -36,13 +38,19 @@ impl Drop for Inner {
     fn drop(&mut self) {
         let Ok(_c) = self.device.enter() else { return };
         let f = &self.device.driver.fns;
-        // SAFETY: handles created in `StreamCopier::new`; every copy's test held an `Arc` of this, so none is in use.
+        // SAFETY: handles created in `StreamCopier::new` or `on_stream`; every copy's test held an `Arc` of this, so
+        // none is in use. A borrowed stream is left to its owner; a pending event is released by the driver once the
+        // stream passes it.
         unsafe {
-            (f.stream_synchronize)(self.stream);
+            if self.owns_stream {
+                (f.stream_synchronize)(self.stream);
+            }
             for e in &self.events {
                 (f.event_destroy)(*e);
             }
-            (f.stream_destroy)(self.stream);
+            if self.owns_stream {
+                (f.stream_destroy)(self.stream);
+            }
         }
     }
 }
@@ -77,7 +85,6 @@ impl StreamCopier {
         host_locations: impl IntoIterator<Item = LocationId>,
         events: u32,
     ) -> Result<Self, CudaError> {
-        let n = events.max(1);
         let _c = device.enter()?;
         let f = &device.driver.fns;
         let mut stream = std::ptr::null_mut();
@@ -85,6 +92,51 @@ impl StreamCopier {
         device.check("cuStreamCreate", unsafe {
             (f.stream_create)(&mut stream, STREAM_NON_BLOCKING)
         })?;
+        drop(_c);
+        Self::build(
+            device,
+            stream,
+            true,
+            device_locations.into_iter().collect(),
+            host_locations.into_iter().collect(),
+            events,
+        )
+    }
+
+    /// A copier that queues its copies on the caller's `stream` instead of one of its own, so they order with the
+    /// caller's other work on it. The copier never synchronizes or destroys the stream.
+    ///
+    /// # Safety
+    /// `stream` is a live stream of `device`'s primary context, and stays alive until every copy this copier
+    /// started has retired and the copier has dropped.
+    pub unsafe fn on_stream(
+        device: Arc<Device>,
+        stream: CuStream,
+        device_locations: impl IntoIterator<Item = LocationId>,
+        host_locations: impl IntoIterator<Item = LocationId>,
+        events: u32,
+    ) -> Result<Self, CudaError> {
+        Self::build(
+            device,
+            stream,
+            false,
+            device_locations.into_iter().collect(),
+            host_locations.into_iter().collect(),
+            events,
+        )
+    }
+
+    fn build(
+        device: Arc<Device>,
+        stream: CuStream,
+        owns_stream: bool,
+        device_locations: Vec<LocationId>,
+        host_locations: Vec<LocationId>,
+        events: u32,
+    ) -> Result<Self, CudaError> {
+        let n = events.max(1);
+        let _c = device.enter()?;
+        let f = &device.driver.fns;
         let q = MpmcQueue::<u32>::new((n as usize).next_power_of_two());
         let (p, c) = (q.producer(), q.consumer());
         let mut list = Vec::with_capacity(n as usize);
@@ -100,7 +152,9 @@ impl StreamCopier {
                     for e in &list {
                         (f.event_destroy)(*e);
                     }
-                    (f.stream_destroy)(stream);
+                    if owns_stream {
+                        (f.stream_destroy)(stream);
+                    }
                 }
                 return Err(err);
             }
@@ -112,12 +166,13 @@ impl StreamCopier {
             inner: Arc::new(Inner {
                 device,
                 stream,
+                owns_stream,
                 events: list,
                 free: (p, c),
                 copies: AtomicU64::new(0),
             }),
-            device_locations: device_locations.into_iter().collect(),
-            host_locations: host_locations.into_iter().collect(),
+            device_locations,
+            host_locations,
         })
     }
 
@@ -174,6 +229,49 @@ impl Drop for EventRetired {
     }
 }
 
+impl StreamCopier {
+    /// Takes an event from the ring for a copy, or refuses when every one is in use.
+    fn take_event(&self) -> Result<EventRetired, CopyError> {
+        let index = self.inner.free.1.poll().ok_or_else(|| CopyError {
+            what: "every completion event is in use".into(),
+        })?;
+        Ok(EventRetired {
+            inner: self.inner.clone(),
+            index,
+            returned: AtomicBool::new(false),
+        })
+    }
+
+    /// Queues a copy on the stream through `copy` (which makes the driver call), then records the copy's event.
+    ///
+    /// # Safety
+    /// `copy` calls the driver with ranges that satisfy the contract of [`Copier::start`] or
+    /// [`Copier::start_pitched`].
+    unsafe fn queue(
+        &self,
+        what: &'static str,
+        copy: impl FnOnce(&super::Fns, CuStream) -> i32,
+    ) -> Result<Box<dyn Retired>, CopyError> {
+        let fail = |e: CudaError| CopyError {
+            what: e.to_string(),
+        };
+        let test = self.take_event()?;
+        let d = &self.inner.device;
+        let f = &d.driver.fns;
+        let s = self.inner.stream;
+        let _c = d.enter().map_err(fail)?;
+        d.check(what, copy(f, s)).map_err(fail)?;
+        // SAFETY: the ring's event, this copy's alone until given back; the stream is this copier's (or the one the
+        // caller lent it).
+        d.check("cuEventRecord", unsafe {
+            (f.event_record)(self.inner.events[test.index as usize], s)
+        })
+        .map_err(fail)?;
+        self.inner.copies.fetch_add(1, Ordering::AcqRel);
+        Ok(Box::new(test))
+    }
+}
+
 impl Copier for StreamCopier {
     fn joins(&self, from: LocationId, to: LocationId) -> bool {
         let known = |l| self.on_device(l) || self.host_locations.contains(&l);
@@ -188,43 +286,48 @@ impl Copier for StreamCopier {
         dst: u64,
         bytes: u64,
     ) -> Result<Box<dyn Retired>, CopyError> {
-        let fail = |e: CudaError| CopyError {
-            what: e.to_string(),
-        };
-        let index = self.inner.free.1.poll().ok_or_else(|| CopyError {
-            what: "every completion event is in use".into(),
-        })?;
-        let test = EventRetired {
-            inner: self.inner.clone(),
-            index,
-            returned: AtomicBool::new(false),
-        };
-        let d = &self.inner.device;
-        let f = &d.driver.fns;
-        let s = self.inner.stream;
         let n = bytes as usize;
-        let _c = d.enter().map_err(fail)?;
+        let (from_device, to_device) = (self.on_device(from), self.on_device(to));
+        if !from_device && !to_device {
+            return Err(CopyError {
+                what: "host to host: not this copier's".into(),
+            });
+        }
         // SAFETY: the caller's contract (valid, non-overlapping ranges untouched until retired); the context is
-        // current; the stream is this copier's.
-        let code = unsafe {
-            match (self.on_device(from), self.on_device(to)) {
+        // current inside `queue`; the stream is this copier's.
+        unsafe {
+            self.queue("cuMemcpyAsync", |f, s| match (from_device, to_device) {
                 (true, true) => (f.memcpy_dtod_async)(dst, src, n, s),
                 (true, false) => (f.memcpy_dtoh_async)(dst as *mut c_void, src, n, s),
-                (false, true) => (f.memcpy_htod_async)(dst, src as *const c_void, n, s),
-                (false, false) => {
-                    return Err(CopyError {
-                        what: "host to host: not this copier's".into(),
-                    });
-                }
-            }
-        };
-        d.check("cuMemcpyAsync", code).map_err(fail)?;
-        // SAFETY: the ring's event, this copy's alone until given back; the stream is this copier's.
-        d.check("cuEventRecord", unsafe {
-            (f.event_record)(self.inner.events[index as usize], s)
-        })
-        .map_err(fail)?;
-        self.inner.copies.fetch_add(1, Ordering::AcqRel);
-        Ok(Box::new(test))
+                _ => (f.memcpy_htod_async)(dst, src as *const c_void, n, s),
+            })
+        }
+    }
+
+    unsafe fn start_pitched(
+        &self,
+        from: LocationId,
+        to: LocationId,
+        copy: PitchedCopy,
+    ) -> Result<Box<dyn Retired>, CopyError> {
+        let (from_device, to_device) = (self.on_device(from), self.on_device(to));
+        if !from_device && !to_device {
+            return Err(CopyError {
+                what: "host to host: not this copier's".into(),
+            });
+        }
+        if copy.src_pitch < copy.row_bytes || copy.dst_pitch < copy.row_bytes {
+            return Err(CopyError {
+                what: "a row pitch is shorter than the row".into(),
+            });
+        }
+        let description = Memcpy2D::pitched(from_device, to_device, &copy);
+        // SAFETY: the caller's contract for every row; the description is read by the call, which returns before
+        // `description` drops.
+        unsafe {
+            self.queue("cuMemcpy2DAsync", |f, s| {
+                (f.memcpy_2d_async)(&description, s)
+            })
+        }
     }
 }

@@ -399,17 +399,7 @@ impl LatticeVertex {
             // may close a clone and wait for its workers, which for this very worker is waiting for itself, and for any
             // other stalls its frames. Java runs it here, on the last reader of the retired state; here it goes to a
             // thread of its own. The writer's own drop of a replaced generation, on a lifecycle thread, runs it inline.
-            let name = self.name.clone();
-            let task = Arc::new(LifecycleMutex::new(Some(deferred)));
-            let spawned = {
-                let (task, name) = (task.clone(), name.clone());
-                thread::Builder::new()
-                    .name(format!("{name}-retire"))
-                    .spawn(move || run_retirements(&name, &task))
-            };
-            if spawned.is_err() {
-                run_retirements(&name, &task);
-            }
+            hand_off(&self.name, deferred);
         } else {
             for action in deferred {
                 run_retirement(&self.name, action);
@@ -508,8 +498,27 @@ impl LatticeVertex {
 
 impl Drop for LatticeVertex {
     fn drop(&mut self) {
+        // The retirements still waiting for a generation to be released will never be released by one: the release of a
+        // generation upgrades this vertex's `Weak`, which does not upgrade now. No frame can route through a dropped
+        // vertex, so what was waiting for the routes to retire has nothing left to wait for. Run them on a thread of
+        // their own: one of them can be the close of a clone that no one else will close.
+        let pending: Vec<Retirement> = {
+            let book = self.book.get_mut();
+            let mut pending: Vec<Retirement> = book
+                .references
+                .values_mut()
+                .flat_map(|reference| std::mem::take(&mut reference.retirements))
+                .collect();
+            pending.append(&mut book.close_retirements);
+            pending
+        };
         // The registry holds the generation, and the generation holds the downstreams: let go of it with the vertex.
+        // This can be the last hold on a generation, on a frame-path thread that held the last upgraded `Weak`, but it
+        // runs no retirement itself, for the same reason.
         self.edge.registry().set_cell(&self.routing, None);
+        if !pending.is_empty() {
+            hand_off(&self.name, pending);
+        }
     }
 }
 
@@ -569,6 +578,21 @@ impl LatticeNode for LatticeVertex {
 fn run_retirement(name: &str, action: Retirement) {
     if panic::catch_unwind(AssertUnwindSafe(action)).is_err() {
         log::error!(target: name, "failed to retire a downstream owner");
+    }
+}
+
+/// Runs `deferred` on a thread of its own (inline if the thread cannot be spawned, as the lattice's close does).
+fn hand_off(name: &str, deferred: Vec<Retirement>) {
+    let name = name.to_owned();
+    let task = Arc::new(LifecycleMutex::new(Some(deferred)));
+    let spawned = {
+        let (task, name) = (task.clone(), name.clone());
+        thread::Builder::new()
+            .name(format!("{name}-retire"))
+            .spawn(move || run_retirements(&name, &task))
+    };
+    if spawned.is_err() {
+        run_retirements(&name, &task);
     }
 }
 

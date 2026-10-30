@@ -670,6 +670,34 @@ fn a_removed_clone_closes_only_after_the_routes_to_it_return() {
     eventually("the removed clone to close", || removed.is_closed());
 }
 
+/// A clone removed by a rebalance leaves the shard's clones; the retirement that closes it waits for the routes to it. If
+/// the shard stops and the distributor drops while a route still holds the generation, the retirement must not be lost
+/// with the vertex: no one else would close that clone, and its worker would live for the life of the process.
+#[test]
+fn a_removed_clone_is_closed_even_if_the_distributor_drops_before_the_routes_to_it_return() {
+    let fixture = Fixture::started(&[0, 2]);
+    let removed = fixture.clone_on(2);
+    let distributor = fixture.shard.lock().distributor.clone().unwrap();
+    let held = distributor.hold_routing();
+    fixture.rebalance(2, &[0]);
+    thread::sleep(Duration::from_millis(10));
+    assert!(!removed.is_closed(), "a held generation still routes to it");
+
+    let weak = Arc::downgrade(&distributor);
+    drop(distributor);
+    fixture.shard.close();
+    // The upstream edge holds the distributor as its downstream node, as the lattice's own vertex does in production.
+    let Fixture { upstream, .. } = fixture;
+    drop(upstream);
+    assert!(
+        weak.upgrade().is_none(),
+        "the distributor dropped with its upstream"
+    );
+    // The shard's close closes the clones it still has; this one it no longer has.
+    drop(held);
+    eventually("the removed clone to close", || removed.is_closed());
+}
+
 #[test]
 fn a_shard_draining_a_removed_clone_is_not_drained() {
     let fixture = Fixture::started(&[0, 1]);

@@ -3,6 +3,89 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## `Join` removed: fan-in is a count on the shared object (2026-10-29)
+
+**What.** `euhedral-graph`'s `Join`, `Part`, `Parts` and `Round` are gone (**breaking**), with `tests/join_alloc.rs` and
+the `join::loom` CI step.
+
+**Why.** A fan-in needs nothing more than a counter the branches share. Java's `Join` is 49 lines (`pending`, the first
+failure, a continuation); the Rust one had grown to 578 lines of value slots, move-only part tokens, rounds and re-arming.
+Each of those is already given elsewhere: the frame lifecycle runs `do_finally` exactly once whether the frame finished
+or was killed, so it is the arrival and needs no token; results belong in fields of the object the branches share;
+re-arming is one store of the count before the branches are published.
+
+**How to use it.** Put `pending: AtomicU32` and the result fields on the shared object (a picture, a pair, a lease).
+Store the branch count before publishing the branches. Each branch writes its field, then
+`if pending.fetch_sub(1, Ordering::AcqRel) == 1 { /* run the next step */ }` where its frame ends. The read-modify-write
+chain makes every branch's write visible to the last one, as an `Arc`'s last drop sees every earlier write.
+
+**Tests.** `tests/credit_graph.rs`' pool lease is now such a count (`Lease`: the item's drop is its retirement end, the
+staged item's drop its sent-or-dropped end), and the test no longer takes a `Mutex` around the lease's parts.
+
+## Sequencer on Java's terms: any thread offers, the order grows, the entry is the caller's (2026-10-29)
+
+**What.** `Sequencer<E: Entry>` is Java's `Sequencer` again. **Breaking:** `Registrar`, the fixed ring with its capacity
+and `register` returning `None` are gone.
+- The order is a growing multi-producer queue: `offer(entry)` from any thread, never refused (`MpscQueue`, whose chunks
+  are recycled).
+- The entry is the caller's own object and carries `Entry::ready`; the sequencer allocates nothing for it. `Progress` is
+  the readiness word an entry embeds (pending, ready or abandoned; an abandoned entry is ready and concludes with
+  nothing; its owner abandons it when it dies, or the order waits for it, and only a `Slot` does that by itself when it
+  is dropped). A caller that pools its entries allocates nothing
+  on the whole path (`tests/sequencer_alloc.rs`: 0 allocations over 20 000 rounds after warm-up).
+- `drain()` is unchanged: the work-in-progress count, the `missed` loop, and a panic in the conclusion is the entry's own
+  (the entries behind it still conclude; the first panic resumes on the draining thread once the drain ended). The
+  conclusion takes `&E` and the entry is polled after it, as Java's `finally`.
+- For callers without an entry type: `Ticket<T>` (an entry that carries a value), `Slot<T>` (its holder's handle: complete
+  it, abandon it, or drop it), `Sequencer::ordered(emit)` and `register()`, which allocates the ticket.
+
+**Why.** The ring needed one registering thread (a `Registrar` that is not `Clone`), so a consumer that admits from more
+than one thread put a lock around it (`tests/credit_graph.rs`), and a full ring refused. Java's order is a queue any
+thread offers to, and its entry is the caller's.
+
+**Tests.** The reference ports, growth to 100 000 entries, offers from four threads, the caller's own entry type, loom
+models of an offer racing a drain, two completions racing, and a dropped slot racing a completion (each fails if the
+`missed` loop is removed; the order queue is not modelled).
+
+## Lane source gaps from the first consumer (2026-10-29)
+
+**What.**
+- Teardown order. `LaneSubmit::quiesce` (default empty; the CUDA stream synchronizes) and `LaneState::close(&mut self,
+  raw: &dyn Any)` (default empty) run when a lane source drops: quiesce the submitter, close the state against the
+  submitter's raw handle (`LaneSubmit::Raw` is now `Copy + 'static`), drop the state, then drop the submitter. A state
+  that holds device resources releases them while the stream still exists.
+- `LaneSource::request` no longer allocates: `LaneSource::with_bound` sizes the waiting, armed, ready and scratch queues
+  for a bound (`new` uses `DEFAULT_BOUND`, 1024).
+- `euhedral_memory::cuda::StreamCopier::on_stream` (unsafe) queues its copies on a stream the caller made, so they order
+  with the caller's other work on it; the copier never synchronizes or destroys that stream.
+- Pitched copies: `Copier::start_pitched(from, to, PitchedCopy { src, src_pitch, dst, dst_pitch, row_bytes, rows })`
+  copies rows between layouts with their own row pitches (padded pictures). The default refuses; `HostCopier` copies
+  row by row; `StreamCopier` issues one `cuMemcpy2DAsync`.
+
+**Why.** The first consumer of lane sources dropped a state that owned device memory after its stream was gone, grew
+the source's queues on the request path, and had to copy padded pictures row by row.
+
+**Semantics.** A pitch shorter than the row is refused before any copy starts.
+
+## Queue fidelity, step 1: the audit and the first weakening (2026-10-29)
+
+**What.** `mp_reserve` reads the producer's tail chunk with a relaxed load (Java reads it plain); the acquire load of the
+tail that precedes it already orders it after the resizing producer's store. The field-by-field audit of the queues
+against Java is in the pull request; the remaining rows are not changed here.
+- `ChunkPool` is a wait-free single-producer single-consumer ring of chunk pointers (Java's `ChunkAllocator`), where it was
+  a try-lock stack: the queue's consumer retires chunks into it, the growing producer takes them out, and neither waits.
+- `StopWatch` counts its skipped pairs down instead of dividing a running count by the interval: the common start is a
+  compare and a decrement.
+- Benchmark: `--pooled` frames come from, and return to, the pool of the thread that runs them, the nearest Rust has to
+  Java's sink re-pushing one array (a frame crosses no core between two uses).
+- Other repos' names are gone from doc comments and READMEs; the behaviour is described instead.
+- Benchmark: `--poll-spins N` sets how many spins the harness thread makes between two sums of the completion counter
+  (default 32, upstream's). Each sum reads every worker's counter line (`perf c2c`: the harness thread is the loader of
+  the hottest shared lines, 95 to 97% of their loads); at 1024 spins or more throughput is 5% higher (447, 443, 449 M
+  against 424, 422, 424 M at 32, interleaved, same session).
+- A loom model of the `ChunkPool` ring: one freeing side and one allocating side lose and duplicate no chunk, and the freeing
+  side's writes are visible to the taker (weakening the tail store to `Relaxed` makes it fail).
+
 ## High-contention throughput benchmark (2026-10-29)
 
 **What.** A new workspace member, `euhedral-benchmarks`, with the binary `high_contention_throughput`: the average time
@@ -157,6 +240,10 @@ they drain.
 - **Cost per push, exactly.** Inside the interceptor's `request` the routing state is read from the view: a worker pays no
   read-modify-write, a light reader one reference-count pair (the state's upgrade). Outside a request every push also
   upgrades the interceptor's `Weak` of its vertex, one more pair for any thread (a worker one, a light reader two).
+- A dropped vertex runs the retirements still waiting for a generation to be released, on a thread of their own: the release
+  of a generation needs the vertex, so nothing else would run them (a clone removed by a rebalance and closed by such a
+  retirement would otherwise live, with its pinned worker, for the life of the process). No frame can route through a
+  dropped vertex, so nothing is left to wait for.
 - Cells are freed: a dropped `Cell` returns its id to the registry and tells every reader to forget its value, so
   rebalances no longer grow the store and every view. Each id carries a reuse epoch (in the `Cell`, the updates and the
   views): a read in progress cannot drain, so its view may still hold the dead cell's value for a recycled id, and a read

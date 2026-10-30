@@ -2,7 +2,7 @@
 name = "euhedral-graph"
 version = "0.1.0"
 edition = "2024"
-description = "No-wait dataflow on the Euhedral control plane: completions, sequencing, joins, device lanes and stage graphs"
+description = "No-wait dataflow on the Euhedral control plane: completions, sequencing, device lanes and stage graphs"
 readme = "README.md"
 license = "Apache-2.0"
 
@@ -14,6 +14,8 @@ testing = []
 euhedral-core = { path = "../euhedral-core" }
 # `MpscQueue`: any thread registers, the polling thread drains.
 euhedral-data-structures = { path = "../euhedral-data-structures" }
+# A panic in a conclusion that cannot be resumed (the draining thread is already unwinding) is logged.
+log = "0.4.29"
 
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 libc = "0.2.174"
@@ -23,8 +25,10 @@ libc = "0.2.174"
 euhedral-graph = { path = ".", default-features = false, features = ["testing"] }
 # The credit-graph test checks the CPUs this process may run on.
 euhedral-hardware-utils = { path = "../euhedral-hardware-utils" }
+# The lake tests hash their lane ids as real ids are hashed.
+euhedral-hashing = { path = "../euhedral-hashing" }
 
-# The model checker behind `--cfg loom` (`RUSTFLAGS="--cfg loom" cargo test -p euhedral-graph --release --lib join::loom`).
+# The model checker behind `--cfg loom` (`RUSTFLAGS="--cfg loom" cargo test -p euhedral-graph --release --lib sequencer::loom`).
 # A build without that flag never sees it. It is a regular dependency because the library's own atomics are
 # what the model swaps, and the crate's self dev-dependency below builds the library without dev-dependencies.
 [target.'cfg(loom)'.dependencies]

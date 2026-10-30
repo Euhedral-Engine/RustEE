@@ -68,8 +68,9 @@ jobs:
         run: |
           cargo test -p euhedral-data-structures --release --lib sync::set_once::loom
           cargo test -p euhedral-data-structures --release --lib sync::claim_cell::loom
+          cargo test -p euhedral-data-structures --release --lib queues::chunk::loom
           cargo test -p euhedral-data-structures --release --lib sync::one_shot::tests::loom
-          cargo test -p euhedral-graph --release --lib join::loom
+          cargo test -p euhedral-graph --release --lib sequencer::loom
 
       - name: CUDA backend (built and linted; its tests skip with no device)
         if: runner.os == 'Linux'
@@ -113,4 +114,4 @@ jobs:
       - name: One-shot, sequencer
         run: |
           cargo +nightly miri test -p euhedral-data-structures --lib -- sync::one_shot
-          cargo +nightly miri test -p euhedral-graph --lib -- sequencer::tests::values_are sequencer::tests::a_completion sequencer::tests::the_first sequencer::tests::abandoned sequencer::tests::a_slot_registered sequencer::tests::a_panicking_emit sequencer::tests::a_full_ring sequencer::tests::the_ring_wraps sequencer::tests::an_emit_that_panics join::tests
+          cargo +nightly miri test -p euhedral-graph --lib -- sequencer::tests

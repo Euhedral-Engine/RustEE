@@ -178,7 +178,11 @@ impl Views {
             None => {
                 store.values.push(None);
                 store.epochs.push(0);
-                (store.values.len() - 1, 0)
+                let id = store.values.len() - 1;
+                // Readers get an (empty) entry for the new id at their next drain, so that a read of a cell nobody has
+                // set yet finds one; a read that began before the drain finds none and reads under the lock.
+                drop(store.replace(id, None));
+                (id, 0)
             }
         }
     }
@@ -228,19 +232,25 @@ struct ViewState {
 
 impl Drop for ThreadView {
     fn drop(&mut self) {
-        // The thread's last hold on a generation goes here, as a reader: a retirement must not wait on this thread.
-        {
-            let _reader = ReaderContext::enter();
-            if let Ok(mut values) = self.view.values.try_borrow_mut() {
-                let old = std::mem::take(&mut *values);
-                drop(values);
-                drop(old);
-            }
-        }
+        // First stop the writer from offering to this mailbox.
         if let Some(registry) = self.registry.upgrade() {
             let _cold = HotScope::leave();
             let mut store = registry.views().store.lock();
             store.readers.retain(|reader| reader.id != self.reader_id);
+        }
+        // The thread's last holds on generations go here, as a reader: the values of the view and the updates still in
+        // the mailbox. A retirement a release runs must not wait on this thread (this may be a worker's thread-local
+        // destructor).
+        let _reader = ReaderContext::enter();
+        if let Ok(mut values) = self.view.values.try_borrow_mut() {
+            let old = std::mem::take(&mut *values);
+            drop(values);
+            drop(old);
+        }
+        if let Ok(mut mailbox) = self.view.mailbox.try_borrow_mut() {
+            while let Some(update) = mailbox.poll() {
+                drop(update);
+            }
         }
     }
 }
@@ -591,7 +601,6 @@ impl View<'_> {
                     Slot::Full(value) => value.downcast_ref::<T>(),
                     Slot::Empty | Slot::Light(_) => None,
                 },
-                None if cell.epoch == 0 => None,
                 _ => self.cold_get(cell),
             },
             Source::Light { state, held } => {
@@ -644,7 +653,6 @@ impl View<'_> {
     fn upgrade<T>(state: &ViewState, cell: &Cell<T>) -> Found {
         loop {
             let dead = match state.values.borrow().get(cell.id) {
-                None if cell.epoch == 0 => return Found::Nothing,
                 Some(entry) if entry.epoch == cell.epoch => match &entry.slot {
                     Slot::Empty | Slot::Full(_) => return Found::Nothing,
                     Slot::Light(weak) => match weak.upgrade() {
@@ -811,8 +819,10 @@ mod tests {
     }
 
     /// A read in progress does not drain, so its view still holds the value of a cell that was dropped; a cell that
-    /// took the dropped one's id must not be given that value.
-    fn a_nested_read_of_a_cell_that_reused_an_id_sees_the_new_cells_value(full: bool) {
+    /// took the dropped one's id must not be given that value. Run by
+    /// `a_full_readers_nested_read_does_not_see_a_dropped_cells_value_in_a_reused_id` and
+    /// `a_light_readers_nested_read_does_not_see_a_dropped_cells_value_in_a_reused_id`.
+    fn check_nested_read_of_a_reused_id(full: bool) {
         let registry = registry();
         let old = registry.cell::<u64>();
         registry.set_cell(&old, Some(Arc::new(7)));
@@ -838,12 +848,12 @@ mod tests {
 
     #[test]
     fn a_full_readers_nested_read_does_not_see_a_dropped_cells_value_in_a_reused_id() {
-        a_nested_read_of_a_cell_that_reused_an_id_sees_the_new_cells_value(true);
+        check_nested_read_of_a_reused_id(true);
     }
 
     #[test]
     fn a_light_readers_nested_read_does_not_see_a_dropped_cells_value_in_a_reused_id() {
-        a_nested_read_of_a_cell_that_reused_an_id_sees_the_new_cells_value(false);
+        check_nested_read_of_a_reused_id(false);
     }
 
     /// The writer drops a light reader whose mailbox backed up and skips the offers after that; a read that was
@@ -862,6 +872,32 @@ mod tests {
         });
         assert_eq!(seen, Some(LIGHT_BACKLOG + 10));
         registry.remove_reader();
+    }
+
+    /// A cell made while a read is in progress is unknown to the view of that read: a nested read of it finds the value
+    /// under the lock instead of nothing. Run by `a_full_readers_nested_read_of_a_new_cell_finds_its_value` and
+    /// `a_light_readers_nested_read_of_a_new_cell_finds_its_value`.
+    fn check_nested_read_of_a_new_cell(full: bool) {
+        let registry = registry();
+        if full {
+            registry.register_reader();
+        }
+        registry.with_view(|_| {
+            let cell = registry.cell::<u64>();
+            registry.set_cell(&cell, Some(Arc::new(5)));
+            assert_eq!(registry.with_view(|v| v.get(&cell).copied()), Some(5));
+        });
+        registry.remove_reader();
+    }
+
+    #[test]
+    fn a_full_readers_nested_read_of_a_new_cell_finds_its_value() {
+        check_nested_read_of_a_new_cell(true);
+    }
+
+    #[test]
+    fn a_light_readers_nested_read_of_a_new_cell_finds_its_value() {
+        check_nested_read_of_a_new_cell(false);
     }
 
     #[test]

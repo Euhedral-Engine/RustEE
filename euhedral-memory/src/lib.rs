@@ -49,7 +49,7 @@ pub use planner::{
 };
 pub use tiers::{
     Copier, CopyError, HostCopier, MarkerRetired, MoveDone, MoveError, MoveHandler, Mover, Moves,
-    ResidentId, TierPool,
+    PitchedCopy, ResidentId, TierPool,
 };
 
 /// Compiles and runs the examples in the crate README as doctests.

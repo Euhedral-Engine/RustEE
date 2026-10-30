@@ -1,5 +1,5 @@
 //! Static stage DAGs run per quantum, with submission, completion and external edges
-//! (Euhedral-Inference `StageGraph`).
+//! (the upstream Java `StageGraph`).
 
 use euhedral_data_structures::sync::HotScope;
 use std::collections::VecDeque;
@@ -433,7 +433,7 @@ impl Topology {
     /// lane placement keeps a graph's critical chain on one lane and every other branch of a
     /// fan-out takes a lane in turn. Entry `s` of the result is the stage whose lane `s` continues.
     ///
-    /// Port of Euhedral-Inference's `StageGraph.markPaths`, with its tie-breaks:
+    /// Port of the upstream `StageGraph.markPaths`, with its tie-breaks:
     /// - only submission edges count (the Java `submittedSuccessors`); a completion edge never
     ///   carries a lane;
     /// - a stage's critical successor is the one with the greatest height (the number of stages on
@@ -1296,7 +1296,7 @@ impl<Q: Send + Sync + 'static> Frame for Retirement<Q> {
     }
 }
 
-/// The port of Euhedral-Inference's `StageGraphTest`, `StageGraphHostStageTest` and
+/// The port of the upstream `StageGraphTest`, `StageGraphHostStageTest` and
 /// `CrossGraphEdgesTest` (the parts that apply: CUDA capture, transfer lanes, workspaces and graph
 /// recycling have no counterpart here). Frames are run by hand, the way an executor runs them, from
 /// the stage sink and the completions.

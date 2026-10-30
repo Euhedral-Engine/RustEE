@@ -20,7 +20,7 @@ link-time dependency).
 | [`planner`](src/planner.rs) | `Planner`, `LocationSpec` / `LocationKind` / `LocationId`, `OwnerSpec` / `OwnerId`, `Priority`, `Scope`, `Claim`, `Elastic`, `ClaimResult`, `GiveBack` and the `GiveBacks` lattice source, `Snapshot`, `LeakReport`. |
 | [`admission`](src/admission.rs) | `PlanRequest`, `PlanItem`, `Admission`, `Placed`, `Reservation`. |
 | [`arena`](src/arena.rs) | `SlotArena` / `SlotLease`, `ScratchArena` / `ScratchLease`, `BackendCalls`. |
-| [`tiers`](src/tiers.rs) | `TierPool`, `Mover` and the `Moves` lattice source, `ResidentId`, `MoveDone`, the `Copier` trait, `HostCopier`, `MarkerRetired`. |
+| [`tiers`](src/tiers.rs) | `TierPool`, `Mover` and the `Moves` lattice source, `ResidentId`, `MoveDone`, the `Copier` trait (plain and `start_pitched` copies), `PitchedCopy`, `HostCopier`, `MarkerRetired`. |
 | [`backend`](src/backend.rs) | The `Backend` trait, `Block`, `Allocation`, `Reaper` and `Retired`. |
 | [`cuda`](src/cuda/mod.rs) (feature `cuda`) | `Driver` (`Driver::shared()`: the process's one loaded driver; `Driver::symbol`: entry points beyond its table), `Device` (primary context, `import_fd` for Vulkan-exported memory), `DeviceMemory`, `StreamPool`, `Vmm` (POSIX-fd export), `PinnedHost`, `StreamCopier` (the tiers' device copies). |
 

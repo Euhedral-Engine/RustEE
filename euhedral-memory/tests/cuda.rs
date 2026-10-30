@@ -201,3 +201,145 @@ fn symbols_beyond_the_table_are_found() {
     assert!(!d.symbol(c"cuLaunchKernel").is_null());
     assert!(d.symbol(c"cuNoSuchCall").is_null());
 }
+
+/// Rows with padding go host -> device -> host through pitched copies, on a stream the caller made: only the row bytes
+/// move, the padding stays what it was, and the stream is still the caller's (and alive) after the copier drops.
+#[test]
+fn pitched_copies_on_a_borrowed_stream_move_only_the_rows_and_leave_the_stream_alone() {
+    use euhedral_memory::cuda::StreamCopier;
+    use euhedral_memory::{Copier, PitchedCopy};
+
+    let Some(dev) = device() else { return };
+    const ROW: usize = 100;
+    const HOST_PITCH: usize = 128;
+    const DEVICE_PITCH: usize = 256;
+    const ROWS: usize = 17;
+    let (device_loc, host_loc) = (LocationId(0), LocationId(1));
+    let mut stream = std::ptr::null_mut();
+    {
+        let _c = dev.enter().unwrap();
+        // SAFETY: out pointer; the context is current; destroyed below.
+        dev.check("cuStreamCreate", unsafe {
+            (dev.driver.fns.stream_create)(&mut stream, 1)
+        })
+        .unwrap();
+    }
+    let device_mem = DeviceMemory {
+        device: dev.clone(),
+        location: device_loc,
+    };
+    let pinned = PinnedHost::new(dev.clone(), host_loc, 0);
+    let on_device = device_mem.alloc((DEVICE_PITCH * ROWS) as u64).unwrap();
+    let source = pinned.alloc((HOST_PITCH * ROWS) as u64).unwrap();
+    let back = pinned.alloc((HOST_PITCH * ROWS) as u64).unwrap();
+    // SAFETY: two pinned blocks of HOST_PITCH * ROWS bytes, used by this thread only.
+    let (source_bytes, back_bytes) = unsafe {
+        (
+            std::slice::from_raw_parts_mut(source.addr as *mut u8, HOST_PITCH * ROWS),
+            std::slice::from_raw_parts_mut(back.addr as *mut u8, HOST_PITCH * ROWS),
+        )
+    };
+    for (i, b) in source_bytes.iter_mut().enumerate() {
+        *b = (i % 251) as u8;
+    }
+    back_bytes.fill(0xEE);
+
+    // SAFETY: `stream` is live, made on the device's primary context, and outlives the copier (destroyed below).
+    let copier =
+        unsafe { StreamCopier::on_stream(dev.clone(), stream, [device_loc], [host_loc], 4) }
+            .unwrap();
+    let wait = |test: Box<dyn euhedral_memory::Retired>| {
+        let mut spins = 0u64;
+        while !test.retired() {
+            std::thread::yield_now();
+            spins += 1;
+            assert!(spins < 50_000_000, "the copy never retired");
+        }
+    };
+    // SAFETY: the ranges are the blocks above; nothing else touches them until the tests retire.
+    unsafe {
+        wait(
+            copier
+                .start_pitched(
+                    host_loc,
+                    device_loc,
+                    PitchedCopy {
+                        src: source.addr,
+                        src_pitch: HOST_PITCH as u64,
+                        dst: on_device.addr,
+                        dst_pitch: DEVICE_PITCH as u64,
+                        row_bytes: ROW as u64,
+                        rows: ROWS as u64,
+                    },
+                )
+                .unwrap(),
+        );
+        wait(
+            copier
+                .start_pitched(
+                    device_loc,
+                    host_loc,
+                    PitchedCopy {
+                        src: on_device.addr,
+                        src_pitch: DEVICE_PITCH as u64,
+                        dst: back.addr,
+                        dst_pitch: HOST_PITCH as u64,
+                        row_bytes: ROW as u64,
+                        rows: ROWS as u64,
+                    },
+                )
+                .unwrap(),
+        );
+    }
+    for row in 0..ROWS {
+        let (s, b) = (
+            &source_bytes[row * HOST_PITCH..][..HOST_PITCH],
+            &back_bytes[row * HOST_PITCH..][..HOST_PITCH],
+        );
+        assert_eq!(&b[..ROW], &s[..ROW], "row {row}'s bytes arrived");
+        assert!(
+            b[ROW..].iter().all(|&x| x == 0xEE),
+            "row {row}'s padding was not written"
+        );
+    }
+    assert_eq!(copier.copies(), 2);
+    // A pitch shorter than the row is refused before the driver is called.
+    // SAFETY: refused before any range is used.
+    let refused = unsafe {
+        copier.start_pitched(
+            host_loc,
+            device_loc,
+            PitchedCopy {
+                src: source.addr,
+                src_pitch: 10,
+                dst: on_device.addr,
+                dst_pitch: DEVICE_PITCH as u64,
+                row_bytes: ROW as u64,
+                rows: 1,
+            },
+        )
+    };
+    assert!(refused.is_err());
+
+    drop(copier);
+    // The caller's stream is still usable and is the caller's to destroy.
+    {
+        let _c = dev.enter().unwrap();
+        // SAFETY: the stream made above, idle.
+        dev.check("cuStreamSynchronize", unsafe {
+            (dev.driver.fns.stream_synchronize)(stream)
+        })
+        .unwrap();
+        // SAFETY: as above; nothing uses it afterwards.
+        dev.check("cuStreamDestroy", unsafe {
+            (dev.driver.fns.stream_destroy)(stream)
+        })
+        .unwrap();
+    }
+    // SAFETY: unused.
+    unsafe {
+        device_mem.free(on_device);
+        pinned.free(source);
+        pinned.free(back);
+    }
+}
