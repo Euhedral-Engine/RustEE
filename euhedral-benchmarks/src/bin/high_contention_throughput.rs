@@ -7,7 +7,7 @@
 //!
 //! The defaults are upstream's: 3 forks (separate processes, each with its own lattice), 3 warm-up iterations of 3
 //! seconds and 5 measured iterations of 5 seconds, each invocation waiting for 32,000,000 completions. The sources
-//! default to the physical cores minus one; `EUHEDRAL_HCT_SOURCES` or `--sources` overrides them. Run it alone on the
+//! default to the logical CPU count; `EUHEDRAL_HCT_SOURCES` or `--sources` overrides them. Run it alone on the
 //! machine: it keeps every core busy.
 
 use euhedral_benchmarks::high_contention::{
@@ -29,8 +29,8 @@ struct Arguments {
 }
 
 fn parse(arguments: impl Iterator<Item = String>) -> Result<Arguments, String> {
-    let cores = Topology::system().core_count();
-    let sources = sources_from(std::env::var(SOURCES_VARIABLE).ok().as_deref(), cores);
+    let cpus = Topology::system().cpu_count();
+    let sources = sources_from(std::env::var(SOURCES_VARIABLE).ok().as_deref(), cpus);
     let mut parsed = Arguments {
         forks: 3,
         child: false,

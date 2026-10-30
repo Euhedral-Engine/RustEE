@@ -3,6 +3,16 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## `high_contention_throughput` defaults to one source per logical CPU (2026-10-30)
+
+**What.** The default source count is the logical CPU count (was the physical cores minus one). `--sources` and
+`EUHEDRAL_HCT_SOURCES` still override it.
+
+**Why.** With fewer sources than CPUs some workers have no source of their own to serve: on a 32-CPU machine 23 sources
+measured 441.6 +- 3.2 M operations per second (p50 23 ns, p99 70 ns) and 32 measured 626.9 +- 39 M (p50 24 ns, p99 64 ns).
+
+**Tests.** `the_sources_default_to_the_logical_cpus_and_can_be_overridden`.
+
 ## `euhedral-gpu`: texture objects over pitched device memory (2026-10-30)
 
 **What.** `cuda::texture`: `View`, `Format`, `Filter`, `Address`, `TexObject`, `alignments` and `check_alignment`. Additive.
