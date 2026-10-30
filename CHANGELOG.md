@@ -3,6 +3,31 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## `one_shot` and `SetOnce` removed; users hold what they hand over (2026-10-30)
+
+**What.** `euhedral-data-structures::sync` loses `one_shot`, `OneShotSender`, `OneShotReceiver`, `RecvError` and `SetOnce<T>`
+(**breaking**), with their loom models and the shims only they used. `PipelineRunner::submit`, `submit_seeded` and `submit_on` return
+`Arc<OutcomeSlot>` (new, `euhedral_core::ingest`) instead of `OneShotReceiver<Outcome>`.
+
+**Why.** Each was a type around one atomic pointer. A user that hands one value over holds an `AtomicPtr<T>` itself: a boxed value,
+published with a release swap, taken with an acquire swap, a leftover freed in `Drop`. `SetOnce` boxed its value behind an atomic
+pointer and carried a loom duplicate of its constructor, a `swap_exclusive` helper and a `get_mut` that swapped twice to read.
+`one_shot` kept a state byte and a cell, and an abandoned state that a rebuild on a pointer could only keep by counting handles.
+
+**Semantics.**
+- `OutcomeSlot::take()` is `None` until the chain ended, then the `Outcome` once; `is_set()` says whether one is waiting. A chain
+  that is dropped without ending (a lattice closed under it, a drain that failed) publishes `Outcome::Cancelled`, so a reader never
+  infers anything from a missing value; "abandoned" is not a concept any more.
+- The frame-hand-off tests (`tests/lake.rs`) and the `graph_replay` example hold a `Handoff` of their own (an `AtomicPtr`).
+- `LatticeEdge::downstream` and `UpstreamInterceptor::identity` are an `AtomicPtr` to a leaked `Box`, installed by a
+  compare-and-set (sequentially consistent, as Java's `compareAndSet`; the edge's close pairs with it), read with an acquire
+  load and freed in `Drop`. `DownstreamSlot` keeps the receiver inline with no atomic of its own: `attached` admits one writer
+  and `live` publishes the write, so a read is the `live` load and no pointer hop. The process-wide driver and compiler handles
+  use `std::sync::OnceLock`.
+
+**Tests.** The pipeline runner's tests read `OutcomeSlot` (the chain a failing drain dropped now reports `Cancelled`); `tests/lake.rs`
+hands a value from a frame to the main thread through a `Handoff`; the edge, interceptor and slot tests are unchanged.
+
 ## `high_contention_throughput` defaults to one source per logical CPU (2026-10-30)
 
 **What.** The default source count is the logical CPU count (was the physical cores minus one). `--sources` and

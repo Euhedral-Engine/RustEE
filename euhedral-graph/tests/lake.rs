@@ -12,7 +12,8 @@
 #![allow(clippy::disallowed_methods)]
 
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::ptr;
+use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -22,7 +23,6 @@ use euhedral_core::frames::{Frame, FrameError, FrameHeader, RunnableFrame};
 use euhedral_core::generics::FrameSink;
 use euhedral_core::impls::DefaultExecutor;
 use euhedral_data_structures::sync::HotScope;
-use euhedral_data_structures::sync::{OneShotSender, one_shot};
 use euhedral_graph::Lake;
 use euhedral_hardware_utils::affinity;
 use euhedral_hardware_utils::util::CpuSet;
@@ -470,10 +470,47 @@ fn offers_from_8_threads_racing_complete_finish_every_admitted_unit() {
     }
 }
 
-/// A frame that sends a value through a one-shot when it runs.
+/// A value a frame hands to the main thread: a boxed value behind an `AtomicPtr`, published with release ordering and taken with
+/// acquire ordering. Nothing waits; the main thread checks.
+struct Handoff(AtomicPtr<u64>);
+
+impl Handoff {
+    fn new() -> Arc<Handoff> {
+        Arc::new(Handoff(AtomicPtr::new(ptr::null_mut())))
+    }
+
+    fn send(&self, value: u64) {
+        let old = self
+            .0
+            .swap(Box::into_raw(Box::new(value)), Ordering::Release);
+        assert!(old.is_null(), "a hand-off carries one value");
+    }
+
+    fn is_set(&self) -> bool {
+        !self.0.load(Ordering::Acquire).is_null()
+    }
+
+    fn take(&self) -> Option<u64> {
+        let value = self.0.swap(ptr::null_mut(), Ordering::Acquire);
+        // SAFETY: a pointer from `Box::into_raw` in `send`; the swap handed its ownership to this call alone.
+        (!value.is_null()).then(|| *unsafe { Box::from_raw(value) })
+    }
+}
+
+impl Drop for Handoff {
+    fn drop(&mut self) {
+        let value = *self.0.get_mut();
+        if !value.is_null() {
+            // SAFETY: as in `take`; `&mut self` rules out any other access.
+            drop(unsafe { Box::from_raw(value) });
+        }
+    }
+}
+
+/// A frame that hands a value to the main thread when it runs.
 struct SendOnce {
     header: FrameHeader,
-    sender: Option<OneShotSender<u64>>,
+    handoff: Arc<Handoff>,
     value: u64,
 }
 
@@ -487,9 +524,7 @@ impl Frame for SendOnce {
     }
 
     fn execute(&mut self) -> Result<(), FrameError> {
-        if let Some(sender) = self.sender.take() {
-            sender.send(self.value);
-        }
+        self.handoff.send(self.value);
         Ok(())
     }
 }
@@ -497,18 +532,11 @@ impl Frame for SendOnce {
 #[test]
 fn a_value_sent_before_the_check_is_there() {
     let _turn = turn();
-    let (sender, mut receiver) = one_shot();
-    sender.send(41_u64 + 1);
-    assert!(receiver.is_set());
-    assert_eq!(receiver.try_take(), Ok(Some(42)));
-}
-
-#[test]
-fn a_one_shot_whose_sender_was_dropped_reports_it_instead_of_staying_empty() {
-    let _turn = turn();
-    let (sender, mut receiver) = one_shot::<u64>();
-    drop(sender);
-    assert!(receiver.try_take().is_err());
+    let handoff = Handoff::new();
+    handoff.send(41_u64 + 1);
+    assert!(handoff.is_set());
+    assert_eq!(handoff.take(), Some(42));
+    assert_eq!(handoff.take(), None);
 }
 
 #[test]
@@ -517,16 +545,16 @@ fn a_value_sent_from_a_frame_arrives_for_a_main_thread_that_checks() {
     let lattice = one_cpu_lattice();
     let lake = Lake::new(lattice.clone(), sinks(1), Duration::ZERO);
     let unit = lake.admit().expect("a unit");
-    let (sender, mut receiver) = one_shot();
+    let handoff = Handoff::new();
     let frame = SendOnce {
         header: FrameHeader::new(3),
-        sender: Some(sender),
+        handoff: handoff.clone(),
         value: 1234,
     };
     assert!(lake.offer(Box::new(frame)).is_ok());
     // The test thread checks until the frame has run on the lattice's worker.
-    eventually("the frame to send", || receiver.is_set());
-    assert_eq!(receiver.try_take(), Ok(Some(1234)));
+    eventually("the frame to send", || handoff.is_set());
+    assert_eq!(handoff.take(), Some(1234));
     drop(unit);
     lake.complete_gracefully();
     lattice.close();

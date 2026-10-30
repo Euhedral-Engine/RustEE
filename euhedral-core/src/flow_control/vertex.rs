@@ -23,7 +23,7 @@ use crate::generics::{LatticeReceiver, LatticeSource, LatticeTerminal, SourceCel
 use crate::utils::math::unsigned_multiply_high;
 use euhedral_data_structures::atomics::CachePadded;
 use euhedral_data_structures::queues::{Consumer, MpscQueue, Multi, Producer, Single};
-use euhedral_data_structures::sync::{HotScope, LifecycleMutex, SetOnce};
+use euhedral_data_structures::sync::{HotScope, LifecycleMutex};
 use euhedral_hardware_utils::util::CpuSet;
 use std::collections::HashMap;
 use std::error::Error;
@@ -833,9 +833,21 @@ pub struct UpstreamInterceptor {
     drain: SourceCell<Consumer<Action, Single>>,
     upstream: UpstreamSlot,
     /// The source taken, for identity only.
-    identity: SetOnce<Weak<dyn LatticeSource>>,
+    ///
+    /// A leaked `Box` installed once by a compare-and-set and freed when the interceptor drops; null until then.
+    identity: AtomicPtr<Weak<dyn LatticeSource>>,
     complete: AtomicBool,
     this: Weak<UpstreamInterceptor>,
+}
+
+impl Drop for UpstreamInterceptor {
+    fn drop(&mut self) {
+        let raw = *self.identity.get_mut();
+        if !raw.is_null() {
+            // SAFETY: as in `identity`; `&mut self` rules out any reader.
+            drop(unsafe { Box::from_raw(raw) });
+        }
+    }
 }
 
 impl UpstreamInterceptor {
@@ -854,16 +866,41 @@ impl UpstreamInterceptor {
             actions: actions.producer(),
             drain: SourceCell::new(actions.consumer()),
             upstream: UpstreamSlot::new(),
-            identity: SetOnce::new(),
+            identity: AtomicPtr::new(ptr::null_mut()),
             complete: AtomicBool::new(false),
             this: this.clone(),
         })
     }
 
+    /// Installs the source's identity unless one is installed already, in which case it is handed back.
+    fn install_identity(
+        &self,
+        weak: Weak<dyn LatticeSource>,
+    ) -> Result<(), Weak<dyn LatticeSource>> {
+        let raw = Box::into_raw(Box::new(weak));
+        match self.identity.compare_exchange(
+            ptr::null_mut(),
+            raw,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => Ok(()),
+            // SAFETY: `raw` came from `Box::into_raw` just above and was not published.
+            Err(_) => Err(*unsafe { Box::from_raw(raw) }),
+        }
+    }
+
+    /// The identity, if a source was taken: an acquire load. It lives as long as the interceptor.
+    fn identity(&self) -> Option<&Weak<dyn LatticeSource>> {
+        // SAFETY: a non-null pointer came from `Box::into_raw` in `install_identity`, is never replaced, and is
+        // freed only when the interceptor drops, which the borrow of `self` rules out.
+        unsafe { self.identity.load(Ordering::Acquire).as_ref() }
+    }
+
     /// Whether `source` is the source this interceptor took. The interceptor lets its source go
     /// when it finishes, and still answers for it.
     pub fn has_upstream(&self, source: &Arc<dyn LatticeSource>) -> bool {
-        self.identity.get().is_some_and(|attached| {
+        self.identity().is_some_and(|attached| {
             attached.as_ptr().cast::<()>() == Arc::as_ptr(source).cast::<()>()
         })
     }
@@ -872,8 +909,8 @@ impl UpstreamInterceptor {
     /// source again does nothing; a different source is completed and left out.
     fn attach(&self, source: Arc<dyn LatticeSource>) {
         let weak = Arc::downgrade(&source);
-        if let Err(other) = self.identity.set(weak) {
-            let attached = self.identity.get().expect("set above");
+        if let Err(other) = self.install_identity(weak) {
+            let attached = self.identity().expect("set above");
             if !Weak::ptr_eq(attached, &other) {
                 log::error!(target: &self.log_target, "an interceptor takes one source");
                 source.complete();

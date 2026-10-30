@@ -3,12 +3,12 @@ use super::queue::{DEFAULT_CHUNK, Ending, Owner, QueueSource};
 use crate::frames::{Completion, Frame, FrameError, Outcome, PipelineBuilder, PipelineFrame};
 use crate::generics::{FrameSink, LatticeSource};
 use crate::impls::FrameManager;
-use euhedral_data_structures::sync::{OneShotReceiver, one_shot};
 use std::error::Error;
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::ptr;
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
 /// Set in the admission word once admission closes; the rest counts accepted chains that have not
@@ -34,12 +34,92 @@ impl<I> Error for AdmissionClosed<I> {}
 
 type Observer = Box<dyn FnOnce(Outcome) + Send>;
 
-/// A one-shot that hears how a chain ended, and the observer that tells it (Java's `CompletableFuture` the chain
-/// completes). A chain dropped without ending drops the observer, which abandons the receiver.
-fn observed() -> (OneShotReceiver<Outcome>, Observer) {
-    let (sender, outcome) = one_shot();
-    let observer = Box::new(move |result| sender.send(result));
-    (outcome, observer)
+/// How a submitted chain ended, as the submitter reads it: a boxed [`Outcome`] behind an `AtomicPtr`, published once with release
+/// ordering by the chain's last frame and taken with acquire ordering by whoever checks (Java's `CompletableFuture` the chain
+/// completes, with one completer and one reader). Nothing waits: [`take`](Self::take) is `None` until the chain has ended.
+///
+/// A chain that is dropped without ending (a lattice closed under it) publishes [`Outcome::Cancelled`], so a reader never has to
+/// infer that nothing is coming.
+pub struct OutcomeSlot {
+    outcome: AtomicPtr<Outcome>,
+}
+
+impl OutcomeSlot {
+    fn publish(&self, outcome: Outcome) {
+        let published = self
+            .outcome
+            .swap(Box::into_raw(Box::new(outcome)), Ordering::Release);
+        debug_assert!(published.is_null(), "a chain ends once");
+        if !published.is_null() {
+            // SAFETY: a pointer from `Box::into_raw` in an earlier `publish`, taken out of the slot by this swap.
+            drop(unsafe { Box::from_raw(published) });
+        }
+    }
+
+    /// Whether the chain has ended and its outcome has not been taken.
+    pub fn is_set(&self) -> bool {
+        !self.outcome.load(Ordering::Acquire).is_null()
+    }
+
+    /// The outcome, once the chain has ended; `None` before, and after it was taken.
+    pub fn take(&self) -> Option<Outcome> {
+        let outcome = self.outcome.swap(ptr::null_mut(), Ordering::Acquire);
+        // SAFETY: a pointer from `Box::into_raw` in `publish`; the swap handed its ownership to this call alone, and the acquire
+        // makes the chain's writes to the outcome visible.
+        (!outcome.is_null()).then(|| *unsafe { Box::from_raw(outcome) })
+    }
+}
+
+impl Drop for OutcomeSlot {
+    fn drop(&mut self) {
+        let outcome = *self.outcome.get_mut();
+        if !outcome.is_null() {
+            // SAFETY: as in `take`; `&mut self` rules out any other access.
+            drop(unsafe { Box::from_raw(outcome) });
+        }
+    }
+}
+
+impl fmt::Debug for OutcomeSlot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OutcomeSlot")
+            .field("set", &self.is_set())
+            .finish()
+    }
+}
+
+/// The chain's end of an [`OutcomeSlot`]: it tells the outcome, or publishes `Cancelled` when the observer is dropped untold.
+struct Report {
+    slot: Arc<OutcomeSlot>,
+    told: bool,
+}
+
+impl Report {
+    fn tell(mut self, outcome: Outcome) {
+        self.slot.publish(outcome);
+        self.told = true;
+    }
+}
+
+impl Drop for Report {
+    fn drop(&mut self) {
+        if !self.told {
+            self.slot.publish(Outcome::Cancelled);
+        }
+    }
+}
+
+/// The slot that hears how a chain ended, and the observer that tells it.
+fn observed() -> (Arc<OutcomeSlot>, Observer) {
+    let slot = Arc::new(OutcomeSlot {
+        outcome: AtomicPtr::new(ptr::null_mut()),
+    });
+    let report = Report {
+        slot: slot.clone(),
+        told: false,
+    };
+    let observer = Box::new(move |result| report.tell(result));
+    (slot, observer)
 }
 
 /// What a runner shares with its chains and with whoever closes it.
@@ -202,7 +282,7 @@ impl<I: Send + 'static> PipelineRunner<I> {
     }
 
     /// Like [`run`](Self::run), and reports how the chain ended.
-    pub fn submit(&mut self, data: I) -> Result<OneShotReceiver<Outcome>, AdmissionClosed<I>> {
+    pub fn submit(&mut self, data: I) -> Result<Arc<OutcomeSlot>, AdmissionClosed<I>> {
         let (outcome, observer) = observed();
         let root = self.checkout(data, Some(observer))?;
         self.publish(root, |source, root| source.offer(root));
@@ -214,7 +294,7 @@ impl<I: Send + 'static> PipelineRunner<I> {
         &mut self,
         seed: u64,
         data: I,
-    ) -> Result<OneShotReceiver<Outcome>, AdmissionClosed<I>> {
+    ) -> Result<Arc<OutcomeSlot>, AdmissionClosed<I>> {
         let (outcome, observer) = observed();
         let root = self.checkout(data, Some(observer))?;
         self.publish(root, |source, root| source.offer_seeded(seed, root));
@@ -230,7 +310,7 @@ impl<I: Send + 'static> PipelineRunner<I> {
         &mut self,
         partition: usize,
         data: I,
-    ) -> Result<OneShotReceiver<Outcome>, AdmissionClosed<I>> {
+    ) -> Result<Arc<OutcomeSlot>, AdmissionClosed<I>> {
         self.check_partition(partition);
         let (outcome, observer) = observed();
         let root = self.checkout(data, Some(observer))?;

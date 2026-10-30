@@ -5,9 +5,9 @@
 
 use std::ffi::{CStr, CString, OsString, c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
-use euhedral_data_structures::sync::{HotScope, LifecycleMutex, SetOnce};
+use euhedral_data_structures::sync::{HotScope, LifecycleMutex};
 
 use crate::{CompileOptions, GpuError};
 
@@ -251,8 +251,8 @@ fn build_name(path: &Path) -> String {
     format!("{name}:{len}:{modified}")
 }
 
-/// The process's compiler once loaded; read with an acquire load.
-static LOADED: SetOnce<Arc<Nvrtc>> = SetOnce::new();
+/// The process's compiler once loaded; a read is one acquire load.
+static LOADED: OnceLock<Arc<Nvrtc>> = OnceLock::new();
 /// Serializes the first load.
 static LOADING: LifecycleMutex<()> = LifecycleMutex::new(());
 

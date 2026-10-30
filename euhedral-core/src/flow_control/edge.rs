@@ -4,8 +4,8 @@ use super::views::Cell;
 use crate::frames::{Failure, Frame, FrameError};
 use crate::generics::LatticeReceiver;
 use crate::utils::spin_wait;
-use euhedral_data_structures::sync::SetOnce;
-use std::sync::atomic::{AtomicBool, Ordering, fence};
+use std::ptr;
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering, fence};
 use std::sync::{Arc, Weak};
 
 /// Work to run once a retiring edge can no longer receive frames.
@@ -67,7 +67,9 @@ pub struct LatticeEdge {
     /// The node built on this edge, handed to children as their parent.
     node: Weak<dyn LatticeNode>,
     parent: Cell<ParentRef>,
-    downstream: SetOnce<Downstream>,
+    /// The downstream, a leaked `Box` installed once by a compare-and-set and freed when the edge drops (Java's
+    /// `DOWNSTREAM`); null until then.
+    downstream: AtomicPtr<Downstream>,
     closed: AtomicBool,
     /// Whether the receiver below was told the edge completed: the closing thread and an attach that finds the
     /// edge closed both try, and the first to take the flag tells.
@@ -91,10 +93,34 @@ impl LatticeEdge {
             drain,
             node,
             parent: registry.cell(),
-            downstream: SetOnce::new(),
+            downstream: AtomicPtr::new(ptr::null_mut()),
             closed: AtomicBool::new(false),
             told: AtomicBool::new(false),
         }
+    }
+
+    /// Installs `downstream` unless one is installed already, in which case it is handed back. Sequentially
+    /// consistent, as Java's `compareAndSet` is: [`close_edge`](Self::close_edge) pairs with it.
+    fn install_downstream(&self, downstream: Downstream) -> Result<(), Downstream> {
+        let raw = Box::into_raw(Box::new(downstream));
+        match self.downstream.compare_exchange(
+            ptr::null_mut(),
+            raw,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => Ok(()),
+            // SAFETY: `raw` came from `Box::into_raw` just above and was not published.
+            Err(_) => Err(*unsafe { Box::from_raw(raw) }),
+        }
+    }
+
+    /// The downstream, if one is installed (Java's `getAcquire`). It lives as long as the edge: nothing replaces or
+    /// frees it before the edge drops.
+    fn downstream(&self) -> Option<&Downstream> {
+        // SAFETY: a non-null pointer came from `Box::into_raw` in `install_downstream`, is never replaced, and is
+        // freed only in `drop`, which the borrow of `self` rules out.
+        unsafe { self.downstream.load(Ordering::Acquire).as_ref() }
     }
 
     pub fn registry(&self) -> &Arc<UpstreamRegistry> {
@@ -214,7 +240,7 @@ impl LatticeEdge {
     /// instead. A receiver added to an edge that has closed is told it completed, once, whether the edge took it or
     /// refused it.
     pub fn add_downstream(&self, receiver: Arc<dyn LatticeReceiver>) {
-        let receiver = match self.downstream.set(Downstream::Receiver(receiver)) {
+        let receiver = match self.install_downstream(Downstream::Receiver(receiver)) {
             Ok(()) => {
                 // The close may have run before the receiver was installed and found nobody to tell.
                 if self.closed.load(Ordering::SeqCst) {
@@ -225,7 +251,7 @@ impl LatticeEdge {
             Err(Downstream::Receiver(receiver)) => receiver,
             Err(Downstream::Node(_)) => unreachable!("the value handed back is the receiver set"),
         };
-        match self.downstream.get() {
+        match self.downstream() {
             Some(Downstream::Node(node)) => node.edge().add_downstream(receiver),
             // A refused receiver of a closed edge hears the edge completed, once: it was never installed, so
             // nothing else tells it.
@@ -244,9 +270,9 @@ impl LatticeEdge {
     ///
     /// Panics if `node` belongs to another registry.
     pub fn add_downstream_node(&self, node: Arc<dyn LatticeNode>) {
-        let node = match self.downstream.set(Downstream::Node(node)) {
+        let node = match self.install_downstream(Downstream::Node(node)) {
             Ok(()) => {
-                if let Some(Downstream::Node(node)) = self.downstream.get() {
+                if let Some(Downstream::Node(node)) = self.downstream() {
                     let parent = self.node.upgrade().expect("a live node owns its edge");
                     node.edge().set_parent(Some(&parent));
                 }
@@ -255,7 +281,7 @@ impl LatticeEdge {
             Err(Downstream::Node(node)) => node,
             Err(Downstream::Receiver(_)) => unreachable!("the value handed back is the node set"),
         };
-        match self.downstream.get() {
+        match self.downstream() {
             Some(Downstream::Node(below)) => below.edge().add_downstream_node(node),
             Some(Downstream::Receiver(_)) | None => node.on_error(already_attached()),
         }
@@ -285,12 +311,12 @@ impl LatticeEdge {
         if self.closed.load(Ordering::Relaxed) {
             return None;
         }
-        self.downstream.get()
+        self.downstream()
     }
 
     /// Tells the receiver below, if any, that the edge completed, unless something did already.
     fn tell_complete(&self) {
-        if let Some(Downstream::Receiver(receiver)) = self.downstream.get()
+        if let Some(Downstream::Receiver(receiver)) = self.downstream()
             && !self.told.swap(true, Ordering::SeqCst)
         {
             receiver.on_complete();
@@ -316,6 +342,16 @@ impl LatticeEdge {
         match self.parent() {
             Some(parent) => parent.defer_child_retirement(self, action),
             None => action(),
+        }
+    }
+}
+
+impl Drop for LatticeEdge {
+    fn drop(&mut self) {
+        let raw = *self.downstream.get_mut();
+        if !raw.is_null() {
+            // SAFETY: as in `downstream`; `&mut self` rules out any reader.
+            drop(unsafe { Box::from_raw(raw) });
         }
     }
 }

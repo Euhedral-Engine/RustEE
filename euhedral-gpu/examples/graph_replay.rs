@@ -17,6 +17,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicPtr, Ordering};
 use std::time::Duration;
 
 use euhedral_core::config::LatticeConfig;
@@ -24,7 +25,6 @@ use euhedral_core::control_plane::ControlPlaneLattice;
 use euhedral_core::frames::Frame;
 use euhedral_core::generics::LatticeSource;
 use euhedral_core::impls::DefaultExecutor;
-use euhedral_data_structures::sync::{OneShotReceiver, OneShotSender, one_shot};
 use euhedral_gpu::cuda::{CudaGpu, CudaGraph, CudaKernel, CudaModule, CudaStream};
 use euhedral_gpu::{
     Args, CompileOptions, Enqueue, Gpu, GpuError, Graph, Launch, Module, OnceFrame, Sequence,
@@ -85,22 +85,55 @@ struct Outcome {
     parts: Option<(CudaStream, CudaGraph)>,
 }
 
+/// A value handed from a frame to the main thread: a boxed value behind an `AtomicPtr`, published with release ordering and
+/// taken with acquire ordering. Nothing waits; the main thread checks.
+struct Handoff<T>(AtomicPtr<T>);
+
+impl<T> Handoff<T> {
+    fn new() -> Arc<Self> {
+        Arc::new(Self(AtomicPtr::new(std::ptr::null_mut())))
+    }
+
+    fn send(&self, value: T) {
+        let old = self
+            .0
+            .swap(Box::into_raw(Box::new(value)), Ordering::Release);
+        assert!(old.is_null(), "a hand-off carries one value");
+    }
+
+    fn take(&self) -> Option<T> {
+        let value = self.0.swap(std::ptr::null_mut(), Ordering::Acquire);
+        // SAFETY: a pointer from `Box::into_raw` in `send`; the swap handed its ownership to this call alone.
+        (!value.is_null()).then(|| *unsafe { Box::from_raw(value) })
+    }
+}
+
+impl<T> Drop for Handoff<T> {
+    fn drop(&mut self) {
+        let value = *self.0.get_mut();
+        if !value.is_null() {
+            // SAFETY: as in `take`; `&mut self` rules out any other access.
+            drop(unsafe { Box::from_raw(value) });
+        }
+    }
+}
+
 /// The way out of the chain. If the chain is dropped without finishing (a retirement that could not be armed, a
-/// lattice that closed early), the guard still ends the main thread's wait.
-struct Finish(Option<OneShotSender<Outcome>>);
+/// lattice that closed early), the guard still ends the main thread's wait with an outcome that says so.
+struct Finish(Option<Arc<Handoff<Outcome>>>);
 
 impl Finish {
     fn with(mut self, outcome: Outcome) {
-        if let Some(sender) = self.0.take() {
-            sender.send(outcome);
+        if let Some(handoff) = self.0.take() {
+            handoff.send(outcome);
         }
     }
 }
 
 impl Drop for Finish {
     fn drop(&mut self) {
-        if let Some(sender) = self.0.take() {
-            sender.send(Outcome {
+        if let Some(handoff) = self.0.take() {
+            handoff.send(Outcome {
                 result: Err("the chain ended before it finished".into()),
                 parts: None,
             });
@@ -111,22 +144,21 @@ impl Drop for Finish {
 /// How long the main thread checks for the lattice's work before it gives up.
 const PATIENCE: Duration = Duration::from_secs(120);
 
-/// The main thread checks `receiver` periodically, as the owner of a lattice checks on its work: nothing parks.
+/// The main thread checks `handoff` periodically, as the owner of a lattice checks on its work: nothing parks.
 #[allow(
     clippy::disallowed_methods,
     reason = "the main thread of the example has nothing to run while the lattice works: it checks, then sleeps"
 )]
-fn check_until_set<T: Send>(mut receiver: OneShotReceiver<T>, what: &str) -> Result<T, String> {
+fn check_until_set<T>(handoff: &Handoff<T>, what: &str) -> Result<T, String> {
     let deadline = std::time::Instant::now() + PATIENCE;
     loop {
-        match receiver.try_take() {
-            Ok(Some(value)) => return Ok(value),
-            Ok(None) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            Ok(None) => return Err(format!("{what} did not finish in {PATIENCE:?}")),
-            Err(error) => return Err(format!("{what}: {error}")),
+        if let Some(value) = handoff.take() {
+            return Ok(value);
         }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!("{what} did not finish in {PATIENCE:?}"));
+        }
+        std::thread::sleep(Duration::from_millis(1));
     }
 }
 
@@ -354,7 +386,8 @@ fn run() -> Result<(), String> {
             unsafe { q.copy_to_device(x.addr, staging.addr as *const u8, BYTES) }
         })
         .map_err(|e| e.to_string())?;
-    let (uploaded_set, uploaded) = one_shot();
+    let uploaded = Handoff::new();
+    let uploaded_set = uploaded.clone();
     retire_into(lane_a, &completions, move |mut stream, ticket| {
         let failure = stream.confirm_retired(ticket);
         Box::new(OnceFrame::new(LANE, move || {
@@ -362,7 +395,7 @@ fn run() -> Result<(), String> {
         }))
     })
     .map_err(|e| e.error.to_string())?;
-    let (mut lane_a, failure) = check_until_set(uploaded, "the upload")?;
+    let (mut lane_a, failure) = check_until_set(&uploaded, "the upload")?;
     if let Some(error) = failure {
         return Err(format!("the upload: {error}"));
     }
@@ -373,18 +406,18 @@ fn run() -> Result<(), String> {
         .record(&mut [&mut lane_a, &mut lane_b], |q| shared.sequence(q, 0))
         .map_err(|e| e.to_string())?;
     drop(lane_b);
-    let (setter, waiter) = one_shot();
+    let waiter = Handoff::new();
     arm(
         Chain {
             shared: shared.clone(),
             stream: lane_a,
             graph,
-            finish: Finish(Some(setter)),
+            finish: Finish(Some(waiter.clone())),
         },
         0,
     );
 
-    let outcome = check_until_set(waiter, "the chain")?;
+    let outcome = check_until_set(&waiter, "the chain")?;
 
     // Shut down: nothing is pending once the last frame ran. The streams and the graph come home to be dropped here.
     let (p50, p99, max) = completions.lateness_us();
