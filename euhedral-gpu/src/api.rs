@@ -28,10 +28,11 @@ use std::any::Any;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use euhedral_graph::{DeviceQueue, LaneId, LanePool, Marker, QueueId};
 
-use crate::{Args, Fingerprint, GpuError, Launch};
+use crate::{Args, Fingerprint, GpuError, Launch, Span};
 
 /// The pool and the streams that [`Gpu::open_lanes`] makes: stream `i` is lane `i` of the pool.
 pub type Lanes<G> = (Arc<LanePool>, Vec<<G as Gpu>::Stream>);
@@ -187,6 +188,34 @@ pub trait Stream: Send + Sized + 'static {
     /// [`poll_retired`](Self::poll_retired) yet. [`retire_into`](crate::retire_into) refuses a stream with any
     /// outstanding: their tickets would reach its continuation in place of its own.
     fn outstanding_tickets(&self) -> usize;
+
+    /// Opens a timed span: the device time of the work submitted from here to the matching [`span_end`](Self::span_end).
+    /// The span's start is recorded behind the work submitted so far. `Err(Busy)` (retry; this never waits) when every
+    /// span of the stream's ring is open or unread. A stream opened with no spans refuses.
+    fn span_begin(&mut self) -> Result<Span, GpuError> {
+        Err(GpuError::Invalid("this stream keeps no timed spans".into()))
+    }
+
+    /// Closes `span`: its end is recorded behind the work submitted since [`span_begin`](Self::span_begin).
+    fn span_end(&mut self, span: Span) -> Result<(), GpuError> {
+        let _ = span;
+        Err(GpuError::Invalid("this stream keeps no timed spans".into()))
+    }
+
+    /// The duration of a closed span, once its end was reached; `None` while the work is still to run. It reads the end
+    /// once and never waits. A read span is freed: its slot serves another, and the handle is stale.
+    fn span_poll(&mut self, span: Span) -> Result<Option<Duration>, GpuError> {
+        let _ = span;
+        Err(GpuError::Invalid("this stream keeps no timed spans".into()))
+    }
+
+    /// Gives up a span (an item that was killed between its begin and end, or whose time is not wanted): its slot is
+    /// freed at once. A span the device may still be recording into is safe to free: its events are recorded again
+    /// before the slot's next use.
+    fn span_cancel(&mut self, span: Span) -> Result<(), GpuError> {
+        let _ = span;
+        Err(GpuError::Invalid("this stream keeps no timed spans".into()))
+    }
 
     /// Settles a retirement: the device failure behind it, or `None`. Never panics. Values kept for the retirement are
     /// released. A ticket armed on another stream is refused with `Some(Invalid)` and releases nothing.
@@ -395,6 +424,9 @@ pub struct StreamOptions {
     pub markers: u32,
     /// The stream's priority on the device.
     pub priority: StreamPriority,
+    /// Timed spans a stream can have open or unread at once: the size of its span ring (two timing events each).
+    /// 0: none.
+    pub spans: u32,
 }
 
 impl Default for StreamOptions {
@@ -402,6 +434,7 @@ impl Default for StreamOptions {
         Self {
             markers: 256,
             priority: StreamPriority::Normal,
+            spans: 16,
         }
     }
 }

@@ -966,8 +966,9 @@ fn metrics_overhead_per_frame() {
     }
 }
 
-/// Records whether it was a long call (unordered) and the CPU it ran on.
-type Ran = Arc<Mutex<Vec<(bool, Option<usize>)>>>;
+/// Records whether it was a long call (unordered), the CPU it ran on (`affinity::current_cpu`: the OS's processor number when the
+/// platform reports one the topology knows, else the CPU the worker was bound to) and the name of the thread that ran it.
+type Ran = Arc<Mutex<Vec<(bool, Option<usize>, String)>>>;
 
 struct Classified {
     header: FrameHeader,
@@ -985,10 +986,11 @@ impl Frame for Classified {
 
     fn execute(&mut self) -> Result<(), FrameError> {
         let long = !self.header.is_ordered();
-        self.ran
-            .lock()
-            .unwrap()
-            .push((long, affinity::current_cpu()));
+        self.ran.lock().unwrap().push((
+            long,
+            affinity::current_cpu(),
+            thread::current().name().unwrap_or("?").to_owned(),
+        ));
         // Work to do, so that every core that can take a frame is busy and the others look for more.
         let until = Instant::now() + Duration::from_micros(20);
         while Instant::now() < until {
@@ -1000,7 +1002,9 @@ impl Frame for Classified {
 
 /// A worker's pull from an ingest sink takes frames straight from the source, without the lattice's routing, so the
 /// interceptor's pull places them: a long call (an unordered frame) belongs on the cores of set A, an ordered frame on
-/// those of set B. The sink is full of long calls first, which are what the cores pull directly.
+/// those of set B. The sink is full of long calls first, which are what the cores pull directly. Every core also steals,
+/// and in poll mode a stealer looks at one frame at a time while others are being queued: it must leave every frame
+/// placed on another core, also one that arrives as it looks.
 #[test]
 fn a_placement_policy_also_places_the_frames_a_worker_pulls_from_a_sink() {
     use crate::control_plane::PlacementPicker;
@@ -1013,6 +1017,7 @@ fn a_placement_policy_also_places_the_frames_a_worker_pulls_from_a_sink() {
     let cpus: Vec<usize> = set_a.iter().chain(&set_b).copied().collect();
     for fragment in [FragmentConfig::default(), polling()] {
         let _turn = pinned_turn();
+        let fragment_label = format!("{fragment:?}");
         let mut config = LatticeConfig::new(Arc::new(BaseCloneableObject::new(
             fragment,
             DefaultExecutor::new(),
@@ -1035,6 +1040,17 @@ fn a_placement_policy_also_places_the_frames_a_worker_pulls_from_a_sink() {
             .unwrap();
         let sink = QueueIngestSink::new();
         let ran = Ran::default();
+        lattice.add_upstream(sink.delegate()).unwrap();
+        // The frames are offered once both cores are active: a frame placed on a core the routing does not have yet goes to a
+        // core it has (a cache-local frame's fallback), and this test asserts where every frame ran.
+        let deadline = Instant::now() + PATIENCE;
+        while lattice.active_workers() < 2 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        if lattice.active_workers() < 2 {
+            lattice.close();
+            return;
+        }
         for id in 0..FRAMES {
             let mut header = FrameHeader::new(id + 1);
             // The long calls first: they are what the cores pull directly.
@@ -1048,37 +1064,40 @@ fn a_placement_policy_also_places_the_frames_a_worker_pulls_from_a_sink() {
             .ok()
             .expect("the sink takes the frame");
         }
-        lattice.add_upstream(sink.delegate()).unwrap();
-        // Frames sent before both cores are in the routing are routed by hash, as they should be.
-        let deadline = Instant::now() + PATIENCE;
-        while lattice.active_workers() < 2 && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(1));
-        }
-        if lattice.active_workers() < 2 {
-            lattice.close();
-            return;
-        }
         wait_until("every frame to run", || {
             ran.lock().unwrap().len() == FRAMES as usize
         });
+        let active = lattice.active_workers();
         lattice.close();
         let ran = ran.lock().unwrap().clone();
+        // What a failure prints: the sets, the lattice and the platform, and where each kind of frame ran, by CPU and thread.
+        let mut seen = std::collections::BTreeMap::new();
+        for (long, cpu, thread) in &ran {
+            *seen.entry((*long, *cpu, thread.clone())).or_insert(0_usize) += 1;
+        }
+        let topology = Topology::system();
+        let dump = format!(
+            "fragment {fragment_label}\nset A {set_a:?}, set B {set_b:?}, active workers {active}\naffinity {:?}, base mask {:?}, topology: {} cpus, {} cores\n(long call, cpu, thread) -> frames: {seen:#?}",
+            affinity::capability(),
+            affinity::base_mask(),
+            topology.cpu_count(),
+            topology.core_count(),
+        );
         let on = |set: &[usize], cpu: Option<usize>| cpu.is_some_and(|cpu| set.contains(&cpu));
         assert_eq!(
-            ran.iter().filter(|(long, _)| *long).count(),
+            ran.iter().filter(|(long, _, _)| *long).count(),
             FRAMES as usize / 2
         );
-        assert!(
+        // Placement is exact: not one frame runs off the set the policy placed it on.
+        let misplaced = |kind: bool, set: &[usize]| {
             ran.iter()
-                .filter(|(long, _)| *long)
-                .all(|(_, cpu)| on(&set_a, *cpu)),
-            "a long call ran off set A"
-        );
-        assert!(
-            ran.iter()
-                .filter(|(long, _)| !*long)
-                .all(|(_, cpu)| on(&set_b, *cpu)),
-            "an ordered frame ran on set A"
+                .filter(|(long, cpu, _)| *long == kind && !on(set, *cpu))
+                .count()
+        };
+        assert_eq!(
+            (misplaced(true, &set_a), misplaced(false, &set_b)),
+            (0, 0),
+            "(long calls off set A, ordered frames off set B)\n{dump}"
         );
     }
 }

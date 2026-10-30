@@ -3,6 +3,131 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## A polling stealer takes only the frame its stop looked at: placement is exact in poll mode (2026-10-30)
+
+**What.** `ControlPlaneCache`'s one-frame take (the owner's `poll` and the stealer's `work_steal_polled`) returns nothing when the
+partition it looks at is empty. It used to take the front anyway, right after the look.
+
+**Why.** The take looked at the front, let `stop` judge it, and then polled. When the look found the partition empty and a producer
+queued a frame before the poll, the poll took a frame `stop` never saw. For a stealer `stop` is what keeps ordered frames and frames
+bound to the victim's core where they are, so a stealer on another core could run a frame the placement policy put on the victim's
+core (1 in about 3,000 frames in the sink-pull placement test under CI load, always through `work_steal_polled`), or run an ordered
+frame off its owner. Greedy takes were never affected: they check and take the same slot in one drain.
+
+**Semantics.** The take holds the partition, so it is the partition's only consumer: the front it looked at is the front it takes,
+and a frame published meanwhile queues behind it. A frame that arrives after a look at an empty partition stays for the next look.
+Nothing is added to the frame path; an empty partition now costs one look instead of a look and a poll.
+
+**Tests.** `a_polling_thief_never_takes_a_frame_that_arrived_after_its_look` forces the window (a cache-local and an ordered frame
+queued between the look and the take; it fails on the old take); `a_placement_policy_also_places_the_frames_a_worker_pulls_from_a_sink`
+asserts that no frame runs off its set.
+
+## `one_shot` and `SetOnce` removed; users hold what they hand over (2026-10-30)
+
+**What.** `euhedral-data-structures::sync` loses `one_shot`, `OneShotSender`, `OneShotReceiver`, `RecvError` and `SetOnce<T>`
+(**breaking**), with their loom models and the shims only they used. `PipelineRunner::submit`, `submit_seeded` and `submit_on` return
+`Arc<OutcomeSlot>` (new, `euhedral_core::ingest`) instead of `OneShotReceiver<Outcome>`.
+
+**Why.** Each was a type around one atomic pointer. A user that hands one value over holds an `AtomicPtr<T>` itself: a boxed value,
+published with a release swap, taken with an acquire swap, a leftover freed in `Drop`. `SetOnce` boxed its value behind an atomic
+pointer and carried a loom duplicate of its constructor, a `swap_exclusive` helper and a `get_mut` that swapped twice to read.
+`one_shot` kept a state byte and a cell, and an abandoned state that a rebuild on a pointer could only keep by counting handles.
+
+**Semantics.**
+- `OutcomeSlot::take()` is `None` until the chain ended, then the `Outcome` once; `is_set()` says whether one is waiting. A chain
+  that is dropped without ending (a lattice closed under it, a drain that failed) publishes `Outcome::Cancelled`, so a reader never
+  infers anything from a missing value; "abandoned" is not a concept any more.
+- The frame-hand-off tests (`tests/lake.rs`) and the `graph_replay` example hold a `Handoff` of their own (an `AtomicPtr`).
+- `LatticeEdge::downstream` and `UpstreamInterceptor::identity` are an `AtomicPtr` to a leaked `Box`, installed by a
+  compare-and-set (sequentially consistent, as Java's `compareAndSet`; the edge's close pairs with it), read with an acquire
+  load and freed in `Drop`. `DownstreamSlot` keeps the receiver inline with no atomic of its own: `attached` admits one writer
+  and `live` publishes the write, so a read is the `live` load and no pointer hop. The process-wide driver and compiler handles
+  use `std::sync::OnceLock`.
+
+**Tests.** The pipeline runner's tests read `OutcomeSlot` (the chain a failing drain dropped now reports `Cancelled`); `tests/lake.rs`
+hands a value from a frame to the main thread through a `Handoff`; the edge, interceptor and slot tests are unchanged.
+
+## `high_contention_throughput` defaults to one source per logical CPU (2026-10-30)
+
+**What.** The default source count is the logical CPU count (was the physical cores minus one). `--sources` and
+`EUHEDRAL_HCT_SOURCES` still override it.
+
+**Why.** With fewer sources than CPUs some workers have no source of their own to serve: on a 32-CPU machine 23 sources
+measured 441.6 +- 3.2 M operations per second (p50 23 ns, p99 70 ns) and 32 measured 626.9 +- 39 M (p50 24 ns, p99 64 ns).
+
+**Tests.** `the_sources_default_to_the_logical_cpus_and_can_be_overridden`.
+
+## `euhedral-gpu`: texture objects over pitched device memory (2026-10-30)
+
+**What.** `cuda::texture`: `View`, `Format`, `Filter`, `Address`, `TexObject`, `alignments` and `check_alignment`. Additive.
+
+**Why.** A kernel that reads 2D memory through the texture units gets the hardware's filtering, clamping and normalised
+coordinates for free, and the driver call that makes the object needs the descriptor structures and the device's alignment
+rules, which every user would otherwise rewrite.
+
+**How to use it.** Describe the memory and the sampling in a `View`, check it against `alignments(&device)` when the memory is
+planned, and `TexObject::create` it in a prepare; pass `handle()` as a 64-bit kernel argument and read it with `tex2D<float>`
+(normalised formats) or `tex2D<unsigned>` with `read_as_integer`. Drop the object in a prepare, after its last reader retired.
+
+**Semantics.** The object is a 2D pitched resource (`CU_RESOURCE_TYPE_PITCH2D`) with one address mode on all axes, point or
+linear filtering, and normalised or texel coordinates. It does not own the memory. A view whose base or pitch misses the device's
+alignment, or whose pitch is less than a row, is an `Err` before the driver is asked.
+
+**Tests.** `tests/cuda_texture.rs` on a real device: misaligned views are refused; point sampling in texels reads exact values
+and clamps outside the image; linear normalised reads match the exact bilinear value to within the fixed-point weights' step.
+Descriptor sizes and the alignment check are unit tests.
+
+## `euhedral-gpu`: a lane's graph cache (2026-10-30)
+
+**What.** `GraphCache<G, K>`, `GraphBody`, `Ran` and `GraphStats`: a lane's recorded graphs by key `K`, with `run(gpu, stream, key,
+body)`, `warm`, `retain` and `free_stale`. Additive.
+
+**Why.** A lane that runs the same short sequence of launches for each unit of work (a stage of several kernels) pays for each
+launch separately. Recording the sequence once and replaying it with the unit's arguments costs one update and one launch, and
+`euhedral-gpu` already records, fingerprints, updates and re-records; the cache is the bookkeeping that every such lane would
+otherwise write: which key has a graph, what a changed shape does, when a stale graph may go.
+
+**How to use it.** Keep a `GraphCache` in the lane's state beside its submitter (a lane context's `parts()` lends both), and put the
+sequence in one `GraphBody::enqueue` that serves the direct run, the recording and the update. Warm each key ahead of the first
+unit with `warm`. When a key goes stale (a new shape, a released prepare) call `retain`, and `free_stale` from the continuation
+of the retirement armed after the lane's last replay.
+
+**Semantics.** A hit runs the body as an update pass (it touches no device) and replays the graph: launch *n* of the pass gives
+launch *n* of the graph its arguments. A miss runs the body for real once and records it. A body whose shape no longer matches
+the recording is run for real and the graph is recorded again, in place when the driver can. A warm-up records a missing key and
+leaves a recorded one alone. The cache holds at most `capacity` graphs: at the bound the oldest goes to the stale list. After the
+first record of a key, a hit allocates nothing.
+
+**Tests.** `graph_cache::tests` on the fake backend (hit, miss, shape change, warm-up, stale and bound), and
+`tests/cuda_launch_alloc.rs`: 200 warm hits on a real device allocate 0.
+
+## `euhedral-gpu`: timed spans around a lane item, and arguments reused in place (2026-10-30)
+
+**What.** Two additions, no breaking change (`StreamOptions` gains a field: build it with `..Default::default()`).
+- `Stream::span_begin` / `span_end` / `span_poll` / `span_cancel` and `Span`: a timed span of one stream's work. A stream keeps
+  `StreamOptions::spans` of them (default 16, two timing events each); `span_begin` is `Err(Busy)` when the ring is full of open or
+  unread spans, and a stream opened with 0 refuses them.
+- `Args::clear`, `push`, `push_device`, `set`, `set_device` and `assign`: an argument list rewritten in place. `Args::layout` and a
+  launch list their arguments on the stack (`MAX_ARGS`, 64).
+
+**Why.** An item that launches the same kernels on every run would otherwise allocate a list of arguments per launch, a
+vector of pointers per launch and, on a graph update, a clone of every launch's arguments. And a lane source that times its items
+needs a duration it can read at its next entry without ever waiting on the device.
+
+**How to use it.** Keep an `Args` for each launch the lane repeats, and refill it (`clear`, then `push`) or change one argument
+(`set`). Bracket an item's launches with `span_begin`/`span_end`; at the next entry call `span_poll`: `None` means the end is not
+reached yet (nothing was waited for), `Some(duration)` frees the slot. A killed item calls `span_cancel`.
+
+**Semantics.** A span is two events recorded on the stream, one behind the work submitted before `span_begin` and one behind the
+work before `span_end`; `span_poll` queries the end event once (`cuEventQuery`) and reads the elapsed time between the two. The
+fake backend times a span in its own clock: one microsecond per operation the device ran. A graph's update pass keeps its staged
+arguments, hasher and recording in the graph and reuses them, so after the first update it allocates nothing; a recording that
+kept no values holds no allocation for them (`Frozen` is an `Option`).
+
+**Tests.** `tests/cuda_launch_alloc.rs` counts every allocation of the process: 200 launches of a reused `Args` and 200 updates
+with replays allocate 0, and a span around a 2e9-cycle kernel reads `None` at once, then its duration, and its slot is freed.
+`tests/fake_streams.rs` pins the span ring on the fake backend, `src/args.rs` the in-place API.
+
 ## `Join` removed: fan-in is a count on the shared object (2026-10-29)
 
 **What.** `euhedral-graph`'s `Join`, `Part`, `Parts` and `Round` are gone (**breaking**), with `tests/join_alloc.rs` and

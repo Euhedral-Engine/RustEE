@@ -247,40 +247,41 @@ once the last unit ends.
 
 ```rust,no_run
 use std::num::NonZeroUsize;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use euhedral_core::config::LatticeConfig;
 use euhedral_core::control_plane::ControlPlaneLattice;
 use euhedral_core::frames::RunnableFrame;
-use euhedral_data_structures::sync::one_shot;
+use std::ptr;
+use std::sync::atomic::{AtomicPtr, Ordering};
 use euhedral_graph::Lake;
 
 let lattice = ControlPlaneLattice::new(LatticeConfig::default()).unwrap();
 let lake = Lake::new(lattice.clone(), NonZeroUsize::new(2).unwrap(), Duration::from_secs(1));
 
 // The main thread starts the work and checks on it; nothing blocks.
-let (done, mut finished) = one_shot();
+let finished: Arc<AtomicPtr<&str>> = Arc::new(AtomicPtr::new(ptr::null_mut()));
 let unit = lake.admit().unwrap(); // attaches the sinks
-let done = Mutex::new(Some(done));
+let done = finished.clone();
 let frame = RunnableFrame::new(7, Arc::new(move || {
-    if let Some(done) = done.lock().unwrap().take() {
-        done.send("ran");
-    }
+    done.store(Box::into_raw(Box::new("ran")), Ordering::Release);
 }));
 assert!(lake.offer(Box::new(frame)).is_ok());
-while !finished.is_set() {
+while finished.load(Ordering::Acquire).is_null() {
     std::thread::sleep(Duration::from_millis(1));
 }
-assert_eq!(finished.try_take(), Ok(Some("ran")));
+// SAFETY: the frame boxed the value and published the pointer; this swap takes it out, once.
+let ran = *unsafe { Box::from_raw(finished.swap(ptr::null_mut(), Ordering::Acquire)) };
+assert_eq!(ran, "ran");
 
 drop(unit);
 lake.complete_gracefully();
 lattice.close();
 ```
 
-A frame hands a result back to the main thread with a `one_shot` (`euhedral_data_structures::sync`): the frame
-`send`s, and the main thread checks `is_set` or `try_take` periodically. Nothing in the crate blocks.
+A frame hands a result back to the main thread through an `AtomicPtr` to a boxed value: the frame publishes it with a release
+store, and the main thread checks with an acquire load periodically and takes it. Nothing in the crate blocks.
 
 ### Sequencer and fan-in
 

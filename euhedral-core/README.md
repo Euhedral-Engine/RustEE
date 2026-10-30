@@ -280,10 +280,10 @@ let builder = PipelineFrame::<u32>::builder()
 let mut runner = PipelineRunner::new(&builder, |text: String| println!("{text}"), false);
 lattice.add_upstream(runner.delegate()).unwrap();
 
-// The outcome is a one-shot: check on it from the thread that wants it, whenever that suits it.
-let Ok(mut outcome) = runner.submit(21) else { panic!("admission closed") };
+// The outcome is an `OutcomeSlot`: check on it from the thread that wants it, whenever that suits it.
+let Ok(outcome) = runner.submit(21) else { panic!("admission closed") };
 let outcome = loop {
-    if let Ok(Some(outcome)) = outcome.try_take() {
+    if let Some(outcome) = outcome.take() {
         break outcome;
     }
     std::thread::sleep(std::time::Duration::from_millis(1));

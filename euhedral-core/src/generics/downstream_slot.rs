@@ -2,7 +2,7 @@
 
 use super::{LatticeReceiver, LatticeSource};
 use crate::frames::Failure;
-use euhedral_data_structures::sync::SetOnce;
+use std::cell::UnsafeCell;
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
@@ -32,6 +32,10 @@ impl Error for AlreadyAttached {}
 /// [`receiver`](Self::receiver) when the source completes, and clearing it under that reader would
 /// need reclamation; `live` is what ends its use.
 ///
+/// The `Arc` sits inline in the slot, with no atomic of its own: `attached` admits one writer, which writes it before
+/// it stores `live` (sequentially consistent, so a release), and every reader gets to it through a `live` it saw set
+/// (an acquire load, or the swap in `complete`). A read costs the `live` load and no pointer hop.
+///
 /// Every method touches atomics only. A source's lifecycle calls (`complete`, and any clear or kill
 /// it offers) may arrive from any thread while a worker is inside its `request` or `pull`, so they
 /// set atomic state, and the work that needs the source's plain state ([`SourceCell`](super::SourceCell))
@@ -40,28 +44,21 @@ pub struct DownstreamSlot {
     attached: AtomicBool,
     complete: AtomicBool,
     live: AtomicBool,
-    receiver: SetOnce<Arc<dyn LatticeReceiver>>,
+    /// Written once, by the attach that won `attached`, before it sets `live`; read only after a `live` that was set.
+    receiver: UnsafeCell<Option<Arc<dyn LatticeReceiver>>>,
 }
 
+// SAFETY: the receiver is written once, before the release store of `live` that every reader acquires, and is
+// shared as `&Arc<dyn LatticeReceiver>` after that, which `LatticeReceiver: Send + Sync` allows.
+unsafe impl Sync for DownstreamSlot {}
+
 impl DownstreamSlot {
-    #[cfg(not(loom))]
     pub const fn new() -> Self {
         Self {
             attached: AtomicBool::new(false),
             complete: AtomicBool::new(false),
             live: AtomicBool::new(false),
-            receiver: SetOnce::new(),
-        }
-    }
-
-    /// An empty slot (`SetOnce::new` is not `const` under the model checker).
-    #[cfg(loom)]
-    pub fn new() -> Self {
-        Self {
-            attached: AtomicBool::new(false),
-            complete: AtomicBool::new(false),
-            live: AtomicBool::new(false),
-            receiver: SetOnce::new(),
+            receiver: UnsafeCell::new(None),
         }
     }
 
@@ -87,8 +84,8 @@ impl DownstreamSlot {
             receiver.on_complete();
             return;
         }
-        let installed = self.receiver.set(receiver.clone());
-        debug_assert!(installed.is_ok(), "the attach flag admits one receiver");
+        // SAFETY: `attached` admitted this call alone, and no reader looks before `live` is set below.
+        unsafe { *self.receiver.get() = Some(receiver.clone()) };
         self.live.store(true, Ordering::SeqCst);
         // `complete` may have run between the check above and the store. Whichever side clears
         // `live` owns the notification.
@@ -106,7 +103,8 @@ impl DownstreamSlot {
     /// The receiver while the slot is live: installed and not completed.
     pub fn receiver(&self) -> Option<&Arc<dyn LatticeReceiver>> {
         if self.live.load(Ordering::Acquire) {
-            self.receiver.get()
+            // SAFETY: `live` was set after the receiver was written, and nothing writes it again.
+            unsafe { (*self.receiver.get()).as_ref() }
         } else {
             None
         }
@@ -122,10 +120,11 @@ impl DownstreamSlot {
         {
             return false;
         }
-        if self.live.swap(false, Ordering::SeqCst)
-            && let Some(receiver) = self.receiver.get()
-        {
-            receiver.on_complete();
+        if self.live.swap(false, Ordering::SeqCst) {
+            // SAFETY: the swap saw `live` set, which was after the receiver was written; nothing writes it again.
+            if let Some(receiver) = unsafe { (*self.receiver.get()).as_ref() } {
+                receiver.on_complete();
+            }
         }
         true
     }

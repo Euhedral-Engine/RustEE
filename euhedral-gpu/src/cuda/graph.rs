@@ -9,7 +9,7 @@ use std::sync::Arc;
 use euhedral_memory::cuda::{CuEvent, CuStream, STREAM_NON_BLOCKING};
 
 use crate::kept::{Frozen, freeze};
-use crate::{Args, Fingerprint, GpuError, Graph, Launch, Rerecorded, Sequence};
+use crate::{Args, Fingerprint, GpuError, Graph, Kernel, Launch, MAX_ARGS, Rerecorded, Sequence};
 
 use super::enqueue::{Mode, Node, Recording, Target};
 use super::fns::{
@@ -29,6 +29,8 @@ pub struct CudaGraph {
     exec: CuGraphExec,
     nodes: Vec<Node>,
     launches: Vec<(CudaKernel, Launch, Args)>,
+    /// The pass an update collects its arguments in, kept so the next update reuses its storage.
+    scratch: Recording,
     fingerprint: Fingerprint,
     /// The number of streams the recording ran over.
     streams: usize,
@@ -98,27 +100,38 @@ impl CudaGraph {
     }
 
     /// Runs `f` as an update pass: new argument values, launch `n` of `f` to launch `n` of the recording. A sequence
-    /// of another shape is `Err(ShapeChanged)` and applies nothing.
+    /// of another shape is `Err(ShapeChanged)` and applies nothing. After the first update of a graph it allocates
+    /// nothing: the pass, its staged arguments and its hasher are the graph's, reused.
     pub(crate) fn update<F>(&mut self, f: F) -> Result<(), GpuError>
     where
         F: FnOnce(&mut CudaSequence<'_>) -> Result<(), GpuError>,
     {
         let gpu = self.gpu.clone();
-        let rec = gpu.probe(Mode::Update, self.streams, f)?;
+        let mut rec = std::mem::replace(&mut self.scratch, Recording::new(Mode::Update));
+        rec.reset(Mode::Update);
+        let rec = gpu.probe_with(rec, self.streams, f)?;
         let now = rec.hasher.finish();
-        if now != self.fingerprint || rec.staged.len() != self.launches.len() {
+        if now != self.fingerprint || rec.staged_len != self.launches.len() {
+            self.scratch = rec;
             return Err(GpuError::ShapeChanged {
                 recorded: self.fingerprint,
                 now,
             });
         }
         let _c = gpu.device().enter().map_err(from_cuda)?;
-        for (n, staged) in rec.staged.into_iter().enumerate() {
+        for (n, staged) in rec.staged[..rec.staged_len].iter().enumerate() {
             let (kernel, launch, args) = &mut self.launches[n];
-            if *args == staged {
+            if *args == *staged {
                 continue;
             }
-            let mut pointers = staged.pointers();
+            let mut pointers = [std::ptr::null_mut::<std::ffi::c_void>(); MAX_ARGS];
+            if staged.pointers_into(&mut pointers).is_none() {
+                return Err(GpuError::Args(format!(
+                    "{}: {} arguments, at most {MAX_ARGS}",
+                    kernel.name(),
+                    staged.len()
+                )));
+            }
             let params = KernelNodeParams {
                 func: kernel.raw(),
                 grid_x: launch.grid.x,
@@ -138,8 +151,9 @@ impl CudaGraph {
             gpu.check("cuGraphExecKernelNodeSetParams", unsafe {
                 (gpu.fns.graph_exec_kernel_node_set_params)(self.exec, self.nodes[n].0, &params)
             })?;
-            *args = staged;
+            args.assign(staged);
         }
+        self.scratch = rec;
         Ok(())
     }
 }
@@ -165,9 +179,9 @@ impl Graph for CudaGraph {
         })?;
         // The replay reads the recording's buffers when it runs, which may be after this graph dropped: the stream
         // keeps them until the next retirement armed on it after this replay is confirmed.
-        if !self.kept.is_empty() {
+        if let Some(kept) = &self.kept {
             let seq = stream.retire.next_seq();
-            stream.kept.push(seq, Box::new(self.kept.clone()));
+            stream.kept.push(seq, Box::new(kept.clone()));
         }
         Ok(())
     }
@@ -205,12 +219,12 @@ impl CudaSequence<'_> {
         }
         self.handed_over = true;
         self.rec.frozen = freeze(std::mem::take(&mut self.rec.kept));
-        if self.rec.frozen.is_empty() {
+        let Some(frozen) = self.rec.frozen.clone() else {
             return;
-        }
+        };
         for r in &mut self.real {
             let seq = r.stream.retire.next_seq();
-            r.stream.kept.push(seq, Box::new(self.rec.frozen.clone()));
+            r.stream.kept.push(seq, Box::new(frozen.clone()));
         }
     }
 
@@ -389,10 +403,23 @@ impl CudaGpu {
     where
         F: FnOnce(&mut CudaSequence<'_>) -> Result<(), GpuError>,
     {
+        self.probe_with(Recording::new(mode), streams, f)
+    }
+
+    /// As [`probe`](Self::probe), collecting into `rec` (an earlier pass's, reset): its storage is reused.
+    pub(crate) fn probe_with<F>(
+        &self,
+        rec: Recording,
+        streams: usize,
+        f: F,
+    ) -> Result<Recording, GpuError>
+    where
+        F: FnOnce(&mut CudaSequence<'_>) -> Result<(), GpuError>,
+    {
         self.poison.check()?;
         let mut seq = CudaSequence {
             gpu: self,
-            rec: Recording::new(mode),
+            rec,
             streams,
             real: Vec::new(),
             events: Vec::new(),
@@ -509,6 +536,7 @@ impl CudaGpu {
             exec,
             nodes: rec.nodes,
             launches: rec.launches,
+            scratch: Recording::new(Mode::Update),
             fingerprint: rec.hasher.finish(),
             streams,
             kept: rec.frozen,

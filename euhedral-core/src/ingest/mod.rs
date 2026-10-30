@@ -14,7 +14,7 @@ mod queue;
 mod single_use;
 
 pub use array::ArrayIngestSink;
-pub use pipeline_runner::{AdmissionClosed, PipelineControl, PipelineRunner};
+pub use pipeline_runner::{AdmissionClosed, OutcomeSlot, PipelineControl, PipelineRunner};
 pub use queue::QueueIngestSink;
 pub use single_use::SingleUseSource;
 

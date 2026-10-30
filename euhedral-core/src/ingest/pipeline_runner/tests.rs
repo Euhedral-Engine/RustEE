@@ -4,7 +4,6 @@ use crate::flow_control::testing::TestReceiver;
 use crate::frames::{Failure, Status};
 use crate::generics::{AbstractExecutor, CloneableObject, LatticeReceiver, LatticeTerminal};
 use crate::impls::DefaultExecutor;
-use euhedral_data_structures::sync::RecvError;
 use std::sync::{Barrier, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -59,35 +58,27 @@ fn hold(source: &Arc<dyn LatticeSource>) -> Box<dyn Frame> {
     held.unwrap()
 }
 
-/// Checks `outcome` until the chain has ended or been dropped, or fails after [`PATIENCE`]: nothing waits on a
-/// one-shot.
-fn resolve(mut outcome: OneShotReceiver<Outcome>) -> Result<Outcome, RecvError> {
+/// Checks `outcome` until the chain has ended, or fails after [`PATIENCE`]: nothing waits on a slot.
+fn outcome_of(outcome: Arc<OutcomeSlot>) -> Outcome {
     let deadline = Instant::now() + PATIENCE;
     loop {
-        match outcome.try_take() {
-            Ok(Some(outcome)) => return Ok(outcome),
-            Ok(None) => {
-                assert!(
-                    Instant::now() < deadline,
-                    "timed out waiting for an outcome"
-                );
-                thread::sleep(Duration::from_millis(1));
-            }
-            Err(error) => return Err(error),
+        if let Some(outcome) = outcome.take() {
+            return outcome;
         }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for an outcome"
+        );
+        thread::sleep(Duration::from_millis(1));
     }
 }
 
-fn outcome_of(outcome: OneShotReceiver<Outcome>) -> Outcome {
-    resolve(outcome).expect("an outcome")
-}
-
-fn status(outcome: OneShotReceiver<Outcome>) -> Status {
+fn status(outcome: Arc<OutcomeSlot>) -> Status {
     outcome_of(outcome).status()
 }
 
-fn pending(outcome: &mut OneShotReceiver<Outcome>) -> bool {
-    matches!(outcome.try_take(), Ok(None))
+fn pending(outcome: &Arc<OutcomeSlot>) -> bool {
+    !outcome.is_set()
 }
 
 fn refused<I, T>(result: Result<T, AdmissionClosed<I>>) -> I {
@@ -151,9 +142,9 @@ fn submissions_report_success_once_the_consumer_takes_the_output() {
         true,
     );
     let source = executed(&runner);
-    let mut first = runner.submit(3).unwrap();
+    let first = runner.submit(3).unwrap();
     runner.run(4).unwrap();
-    assert!(pending(&mut first));
+    assert!(pending(&first));
     drive(&runner, &source);
     assert_eq!(status(first), Status::Success);
     assert_eq!(sorted(&output), [7, 9]);
@@ -316,7 +307,7 @@ fn completing_cancels_queued_chains_and_held_ones_when_they_return() {
             true,
         );
         let source = recorded(&runner);
-        let mut active = runner.submit(1).unwrap();
+        let active = runner.submit(1).unwrap();
         let stage = hold(&source);
         let queued = runner.submit(2).unwrap();
 
@@ -324,7 +315,7 @@ fn completing_cancels_queued_chains_and_held_ones_when_they_return() {
         assert!(runner.is_complete());
         assert!(!stage.is_alive());
         assert_eq!(status(queued), Status::Cancelled);
-        assert!(pending(&mut active));
+        assert!(pending(&active));
         assert_eq!(runner.size(), 0);
 
         DefaultExecutor::new().run(stage);
@@ -339,14 +330,14 @@ fn completing_cancels_queued_chains_and_held_ones_when_they_return() {
 fn completing_inside_a_pull_cancels_once_the_pull_lets_go() {
     let mut runner = PipelineRunner::new(&PipelineFrame::<i32>::builder(), drop, true);
     let source = recorded(&runner);
-    let mut outcome = runner.submit(1).unwrap();
+    let outcome = runner.submit(1).unwrap();
     let control = runner.control();
     let mut cancelled_inside = None;
     let pulled = source.pull(
         &mut |_| panic!("the pull should stop"),
         &mut |_| {
             control.complete();
-            cancelled_inside = Some(!pending(&mut outcome));
+            cancelled_inside = Some(!pending(&outcome));
             true
         },
         1,
@@ -482,15 +473,15 @@ fn completing_while_a_stage_runs_cancels_its_chain_when_it_returns() {
         true,
     );
     let source = executed(&runner);
-    let mut active = runner.submit(1).unwrap();
-    let mut queued = runner.submit(2).unwrap();
+    let active = runner.submit(1).unwrap();
+    let queued = runner.submit(2).unwrap();
     thread::scope(|scope| {
         let source = source.clone();
         let requesting = scope.spawn(move || source.request(1));
         gate.await_entered();
         runner.complete();
-        assert!(pending(&mut active));
-        assert!(pending(&mut queued));
+        assert!(pending(&active));
+        assert!(pending(&queued));
         gate.release();
         requesting.join().unwrap();
     });
@@ -651,7 +642,8 @@ fn a_drain_that_fails_after_a_kill_still_cancels_the_chains_behind_it() {
     let pushed = runner.submit(1).unwrap();
     let behind = runner.submit(2).unwrap();
     assert!(panic::catch_unwind(AssertUnwindSafe(|| source.request(2))).is_err());
-    assert!(resolve(pushed).is_err());
+    // The chain the failing drain dropped unended reports itself cancelled, as the one behind it does.
+    assert_eq!(status(pushed), Status::Cancelled);
     assert_eq!(status(behind), Status::Cancelled);
     assert_eq!(runner.size(), 0);
     assert!(runner.is_complete());

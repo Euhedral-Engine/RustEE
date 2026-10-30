@@ -30,17 +30,18 @@ pub const POLL_SPINS: u32 = 32;
 
 pub const INVOCATION_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// The sources when nothing overrides them: one fewer than the physical cores, at least one.
-pub fn default_sources(physical_cores: usize) -> usize {
-    physical_cores.saturating_sub(1).max(1)
+/// The sources when nothing overrides them: one per logical CPU, at least one. Fewer leave workers without a source of
+/// their own to serve (23 sources of 32 CPUs measured 442 M operations per second, and 32 measured 627 M).
+pub fn default_sources(logical_cpus: usize) -> usize {
+    logical_cpus.max(1)
 }
 
 /// The sources: `variable` if it holds a positive number, else [`default_sources`].
-pub fn sources_from(variable: Option<&str>, physical_cores: usize) -> usize {
+pub fn sources_from(variable: Option<&str>, logical_cpus: usize) -> usize {
     variable
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|&sources| sources > 0)
-        .unwrap_or_else(|| default_sources(physical_cores))
+        .unwrap_or_else(|| default_sources(logical_cpus))
 }
 
 /// The next absolute completion target, or `None` if the count would wrap (`completionTarget`).
@@ -540,14 +541,14 @@ mod tests {
     }
 
     #[test]
-    fn the_sources_default_to_one_fewer_than_the_cores_and_can_be_overridden() {
-        assert_eq!(default_sources(8), 7);
-        assert_eq!(default_sources(1), 1);
-        assert_eq!(sources_from(None, 8), 7);
+    fn the_sources_default_to_the_logical_cpus_and_can_be_overridden() {
+        assert_eq!(default_sources(32), 32);
+        assert_eq!(default_sources(0), 1);
+        assert_eq!(sources_from(None, 8), 8);
         assert_eq!(sources_from(Some("3"), 8), 3);
         assert_eq!(sources_from(Some(" 5 "), 8), 5);
-        assert_eq!(sources_from(Some("0"), 8), 7);
-        assert_eq!(sources_from(Some("many"), 8), 7);
+        assert_eq!(sources_from(Some("0"), 8), 8);
+        assert_eq!(sources_from(Some("many"), 8), 8);
     }
 
     #[test]

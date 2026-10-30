@@ -16,10 +16,10 @@ mod copier;
 pub use backends::{DeviceMemory, PinnedHost, StreamPool, Vmm, VmmBlock};
 pub use copier::StreamCopier;
 
-use euhedral_data_structures::sync::{HotScope, LifecycleMutex, SetOnce};
+use euhedral_data_structures::sync::{HotScope, LifecycleMutex};
 use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 pub type CuResult = c_int;
 pub type CuDevicePtr = u64;
@@ -317,7 +317,7 @@ impl Driver {
     /// is one loaded library and, through [`Device::open`], one primary context. A failed load is not remembered: a
     /// later call tries again.
     pub fn shared() -> Result<Arc<Self>, String> {
-        static LOADED: SetOnce<Arc<Driver>> = SetOnce::new();
+        static LOADED: OnceLock<Arc<Driver>> = OnceLock::new();
         static LOADING: LifecycleMutex<()> = LifecycleMutex::new(());
         // After the first load every call is one acquire load.
         if let Some(driver) = LOADED.get() {

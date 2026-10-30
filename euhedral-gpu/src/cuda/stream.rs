@@ -9,6 +9,7 @@ use euhedral_memory::cuda::{CuEvent, CuStream, Device, STREAM_NON_BLOCKING};
 
 use crate::kept::Kept;
 use crate::retire::{RetireSink, Retirements};
+use crate::spans::{Span, SpanBook};
 use crate::{
     GpuError, POISONED_STATUS, RetireListener, RetireTicket, Stream, StreamOptions, StreamPriority,
 };
@@ -21,6 +22,8 @@ const PROBE_EVERY: Duration = Duration::from_millis(1);
 
 /// `CU_EVENT_DISABLE_TIMING`: the events only mark completion.
 const EVENT_DISABLE_TIMING: u32 = 2;
+/// `CU_EVENT_DEFAULT`: events that keep their time stamp, for spans.
+const EVENT_DEFAULT: u32 = 0;
 /// `CUDA_ERROR_NOT_READY`, from `cuEventQuery` while the work before the event runs.
 const NOT_READY: i32 = 600;
 
@@ -176,6 +179,58 @@ impl Drop for LaneRing {
     }
 }
 
+/// The timing events of a stream's spans: a start and an end for each slot of the ring.
+#[derive(Debug)]
+struct SpanEvents {
+    device: Arc<Device>,
+    events: Vec<(CuEvent, CuEvent)>,
+}
+
+impl SpanEvents {
+    fn new(device: &Arc<Device>, slots: u32) -> Result<Self, GpuError> {
+        let mut made = SpanEvents {
+            device: device.clone(),
+            events: Vec::with_capacity(slots as usize),
+        };
+        if slots == 0 {
+            return Ok(made);
+        }
+        let _c = device.enter().map_err(from_cuda)?;
+        let f = &device.driver.fns;
+        for _ in 0..slots {
+            let (mut start, mut end) = (std::ptr::null_mut(), std::ptr::null_mut());
+            // SAFETY: an out pointer; the context is current.
+            let code = unsafe { (f.event_create)(&mut start, EVENT_DEFAULT) };
+            device.check("cuEventCreate", code).map_err(from_cuda)?;
+            // The slot owns the start event from here, so a failure making the end destroys it.
+            made.events.push((start, end));
+            // SAFETY: as above.
+            let code = unsafe { (f.event_create)(&mut end, EVENT_DEFAULT) };
+            device.check("cuEventCreate", code).map_err(from_cuda)?;
+            made.events.last_mut().expect("just pushed").1 = end;
+        }
+        Ok(made)
+    }
+}
+
+// SAFETY: events of the primary context, usable from any thread with it current; the owner (one stream) is their only user.
+unsafe impl Send for SpanEvents {}
+
+impl Drop for SpanEvents {
+    fn drop(&mut self) {
+        let Ok(_c) = self.device.enter() else { return };
+        let f = &self.device.driver.fns;
+        for (start, end) in &self.events {
+            for event in [start, end] {
+                if !event.is_null() {
+                    // SAFETY: events made in `new`; destroying one with work recorded on it is deferred by the driver.
+                    unsafe { (f.event_destroy)(*event) };
+                }
+            }
+        }
+    }
+}
+
 /// The query side of a CUDA stream: what the pool and `Completions` hold. It reads the marker ring's atomics and asks
 /// the driver whether an event completed; it never waits and takes no lock.
 #[derive(Debug)]
@@ -239,6 +294,9 @@ pub struct CudaStream {
     pub(crate) kept: Kept,
     /// When the stream last queried its marker events for a fault with retirements outstanding.
     last_probe: Option<Instant>,
+    /// The ring of timed spans: its slots, and the timing events behind them.
+    spans: SpanBook,
+    span_events: SpanEvents,
 }
 
 // SAFETY: the stream belongs to the primary context and is usable from any thread with it current. A submitter has
@@ -301,6 +359,7 @@ impl CudaStream {
             gpu.check("cuStreamCreateWithPriority", code)?;
             let lane = LaneId(u16::try_from(first + i).expect("at most 64 lanes"));
             let ring = rings[i].clone();
+            let ring_id = ring.id;
             let (retire, sink) = Retirements::new(ring.id, lane);
             streams.push(CudaStream {
                 gpu: gpu.clone(),
@@ -319,6 +378,8 @@ impl CudaStream {
                 retire,
                 kept: Kept::default(),
                 last_probe: None,
+                spans: SpanBook::new(ring_id, options[i].spans),
+                span_events: SpanEvents::new(device, options[i].spans)?,
             });
         }
         Ok(streams)
@@ -544,6 +605,68 @@ impl Stream for CudaStream {
     fn mark(&mut self) -> Result<Marker, GpuError> {
         let _c = self.enter()?;
         self.mark_now()
+    }
+
+    fn span_begin(&mut self) -> Result<Span, GpuError> {
+        self.gpu.poison.check()?;
+        let span = self.spans.begin()?;
+        let (start, _) = self.span_events.events[span.slot()];
+        let gpu = self.gpu.clone();
+        let _c = gpu.device().enter().map_err(from_cuda)?;
+        // SAFETY: an event of this stream's ring and this stream; the context is current.
+        let recorded = self.gpu.check("cuEventRecord", unsafe {
+            (self.gpu.device().driver.fns.event_record)(start, self.raw)
+        });
+        if let Err(e) = recorded {
+            let _ = self.spans.release(span);
+            return Err(e);
+        }
+        Ok(span)
+    }
+
+    fn span_end(&mut self, span: Span) -> Result<(), GpuError> {
+        self.gpu.poison.check()?;
+        let at = self.spans.end(span)?;
+        let (_, end) = self.span_events.events[at];
+        let gpu = self.gpu.clone();
+        let _c = gpu.device().enter().map_err(from_cuda)?;
+        // SAFETY: as in `span_begin`.
+        self.gpu.check("cuEventRecord", unsafe {
+            (self.gpu.device().driver.fns.event_record)(end, self.raw)
+        })
+    }
+
+    fn span_poll(&mut self, span: Span) -> Result<Option<Duration>, GpuError> {
+        let at = self.spans.closed(span)?;
+        if self.gpu.poison.get().is_some() {
+            self.spans.release(span)?;
+            return Err(GpuError::Poisoned(Box::new(
+                self.gpu.poison.get().expect("checked"),
+            )));
+        }
+        let (start, end) = self.span_events.events[at];
+        let gpu = self.gpu.clone();
+        let _c = gpu.device().enter().map_err(from_cuda)?;
+        let f = &gpu.device().driver.fns;
+        // SAFETY: an event of this stream's ring; the context is current.
+        match unsafe { (f.event_query)(end) } {
+            0 => {}
+            NOT_READY => return Ok(None),
+            other => return Err(self.gpu.fail("cuEventQuery", other)),
+        }
+        let mut ms = 0f32;
+        // SAFETY: two completed events of this stream's ring, recorded on one stream; an out pointer.
+        self.gpu.check("cuEventElapsedTime", unsafe {
+            (f.event_elapsed_time)(&mut ms, start, end)
+        })?;
+        self.spans.release(span)?;
+        Ok(Some(Duration::from_secs_f64(
+            f64::from(ms.max(0.0)) / 1000.0,
+        )))
+    }
+
+    fn span_cancel(&mut self, span: Span) -> Result<(), GpuError> {
+        self.spans.release(span)
     }
 
     fn await_marker(&mut self, marker: Marker) -> Result<(), GpuError> {

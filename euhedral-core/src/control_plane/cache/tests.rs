@@ -1341,3 +1341,70 @@ fn closing_or_dropping_a_cache_takes_its_meters_out_of_the_registry() {
     assert!(registry.is_empty());
     assert!(registry.snapshot().meters().is_empty());
 }
+
+thread_local! {
+    /// What runs once on this thread between a poll's look at a partition's front and its take (see `take_one`).
+    static BETWEEN_LOOK_AND_TAKE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Runs, once, what the test installed to happen between a poll's look at a partition and its take.
+pub(super) fn between_look_and_take() {
+    let installed = BETWEEN_LOOK_AND_TAKE.with(|hook| hook.borrow_mut().take());
+    if let Some(run) = installed {
+        run();
+    }
+}
+
+/// A frame like `local`'s, whose routing hash puts it in `partition` of 2: the hash picks the partition by its top bit.
+fn local_in(
+    partition: usize,
+    id: u64,
+    policy: RoutingPolicy,
+    origin_core: usize,
+) -> Box<dyn Frame> {
+    let mut frame = local(id, policy, origin_core, 0);
+    frame
+        .header_mut()
+        .set_routing_hash(if partition == 0 { 0 } else { u64::MAX });
+    assert_eq!(route_by_hash(&*frame, 2), partition);
+    frame
+}
+
+/// A frame queued at the moment a polling thief looks at an empty partition is one its stop never saw: the thief must
+/// leave it. Here a frame the thief may not take (cache-local to the victim's core, or ordered) arrives in the
+/// partition the thief has just found empty (the window between the look and the take, forced deterministically), next
+/// to a frame the thief may take.
+#[test]
+fn a_polling_thief_never_takes_a_frame_that_arrived_after_its_look() {
+    for kind in ["cache-local", "ordered"] {
+        let directory = directory();
+        let victim = cache_on(&directory, &config(2), 1);
+        let thief = cache_on(&directory, &config(2), 2);
+        // The victim's walk starts at partition 0. Partition 1 holds a frame anyone may take, so the victim counts one
+        // frame and the walk begins; partition 0 is empty.
+        victim.push(local_in(1, 1, RoutingPolicy::Anywhere, 1));
+        // A frame the thief may not take, for partition 0.
+        let frame = if kind == "ordered" {
+            ordered(2)
+        } else {
+            local_in(0, 2, RoutingPolicy::CacheLocal, 1)
+        };
+        assert_eq!(route_by_hash(&*frame, 2), 0);
+        let late = victim.clone();
+        BETWEEN_LOOK_AND_TAKE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || late.push(frame)));
+        });
+        let mut stolen = Vec::new();
+        thief.work_steal_polled(|frame| stolen.push(frame), 10, victim.cpu());
+        BETWEEN_LOOK_AND_TAKE.with(|hook| hook.borrow_mut().take());
+        assert_eq!(
+            ids(&stolen),
+            [1],
+            "the thief took the {kind} frame it never looked at"
+        );
+        let mut left = Vec::new();
+        victim.poll(|frame| left.push(frame), 10);
+        assert_eq!(ids(&left), [2], "the {kind} frame waits for the victim");
+    }
+}

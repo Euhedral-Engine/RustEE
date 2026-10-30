@@ -10,6 +10,7 @@ mod module;
 pub mod nvrtc;
 mod retire;
 mod stream;
+pub mod texture;
 
 pub use enqueue::CudaEnqueue;
 pub use graph::{CudaGraph, CudaSequence};
@@ -18,6 +19,7 @@ pub use nvrtc::{Nvrtc, Target};
 #[cfg(feature = "test-hooks")]
 pub use stream::leaked_shared_sides;
 pub use stream::{CudaQueue, CudaStream};
+pub use texture::{Address, Filter, Format, TexObject, View};
 
 use std::sync::Arc;
 

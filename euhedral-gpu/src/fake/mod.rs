@@ -183,6 +183,10 @@ pub(crate) enum QOp {
         seq: u64,
         sink: Arc<RetireSink>,
     },
+    /// A time stamp of a timed span's edge: the device's tick when the lane reaches it.
+    Stamp {
+        id: u64,
+    },
 }
 
 pub(crate) struct Queued {
@@ -213,6 +217,11 @@ pub(crate) struct State {
     /// The device's fault, as the hardware has it: work behind it never runs and its markers never complete. The
     /// host does not know until something observes it (see [`FakeGpu::observe_fault`]), as with a driver.
     pub(crate) faulted: Option<GpuError>,
+    /// The fake device's clock: one tick (a microsecond) for each operation run. The time stamps of spans are read from it.
+    ticks: u64,
+    stamps: HashMap<u64, u64>,
+    /// The next span edge's id.
+    next_stamp: u64,
 }
 
 /// The fake device.
@@ -256,6 +265,18 @@ impl FakeGpu {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(name.to_owned(), Arc::new(f));
+    }
+
+    /// A new id for a span edge.
+    pub(crate) fn new_stamp(&self) -> u64 {
+        let mut st = self.lock();
+        st.next_stamp += 1;
+        st.next_stamp
+    }
+
+    /// The tick at which stamp `id` ran, once it has.
+    pub(crate) fn stamp(&self, id: u64) -> Option<u64> {
+        self.lock().stamps.get(&id).copied()
     }
 
     pub(crate) fn kernel_fn(&self, name: &str) -> Option<FakeKernelFn> {
@@ -390,7 +411,13 @@ impl FakeGpu {
                 _ => None,
             };
         }
+        st.ticks += 1;
         let outcome: Result<(), FakeFault> = match op {
+            QOp::Stamp { id } => {
+                let now = st.ticks;
+                st.stamps.insert(id, now);
+                Ok(())
+            }
             QOp::Launch {
                 kernel,
                 launch,
@@ -526,7 +553,14 @@ impl Gpu for FakeGpu {
                     index: i,
                     count,
                 };
-                FakeStream::new(self.clone(), ids[i], name, place, options[i].priority)
+                FakeStream::new(
+                    self.clone(),
+                    ids[i],
+                    name,
+                    place,
+                    options[i].priority,
+                    options[i].spans,
+                )
             })
             .collect())
     }

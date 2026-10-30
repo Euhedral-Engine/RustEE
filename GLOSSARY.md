@@ -113,9 +113,6 @@ a source pushes to, read without a lock. A second attach is told `on_error`; the
 `on_complete` exactly once however attach and completion race; the receiver's `Arc` stays in the slot
 until the slot drops, and a `live` flag ends its use. Every method touches atomics only.
 
-**SetOnce** ([`SetOnce`](euhedral-data-structures/src/sync/set_once.rs)): a cell installed at most once
-by a compare-and-set and read with an acquire load; the value lives until the cell drops.
-
 **cell, view** ([`Cell`](euhedral-core/src/flow_control/views.rs)): a slot of lattice state that changes only when the lattice is
 rebuilt (a vertex's routing generation, an edge's parent, a CPU's cache). The writer keeps the current value under a
 lifecycle lock and sends it, through a queue, to the mailbox of every registered reader; a reader drains its mailbox in
@@ -124,11 +121,10 @@ read-modify-write, no reference count. The last holder of a replaced value drops
 registers) holds the values themselves; any other thread that reads gets a light mailbox on its first read and holds a
 weak reference, which it upgrades for the length of a call, so an idle thread never keeps a replaced value alive.
 
-**OneShot** ([`one_shot`](euhedral-data-structures/src/sync/one_shot.rs)): Java's `CompletableFuture` for one
-result, with one completer and one reader. The sender writes the value and publishes it with
-one store with release ordering; the receiver polls (`try_take`, `is_set`). A sender dropped
-without sending abandons it. `PipelineRunner::submit` returns one. Nothing waits on it: the owner checks `is_set` or
-`try_take` periodically, as it checks on the lattice's work.
+**OutcomeSlot** ([`OutcomeSlot`](euhedral-core/src/ingest/pipeline_runner.rs)): how a submitted chain ended, as the
+submitter reads it: a boxed `Outcome` behind an `AtomicPtr`, published once with release ordering by the chain's end and taken with
+acquire ordering by whoever checks (Java's `CompletableFuture` the chain completes). `PipelineRunner::submit` returns one. Nothing waits
+on it: the owner checks `is_set` or `take` periodically, as it checks on the lattice's work. A chain dropped unended publishes `Cancelled`.
 
 **idle detach** ([`Lake`](euhedral-graph/src/lake.rs)): a lake's sinks stay attached while a unit is admitted and for
 the idle time after the last one ended; then the watch detaches them, and the next unit attaches a fresh set.
