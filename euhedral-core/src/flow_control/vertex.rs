@@ -175,7 +175,8 @@ pub struct LatticeVertex {
     route: RoutingFunction,
     /// The placement policy that runs on every frame before the routing function, if this vertex has one.
     placement: Option<Arc<Placement>>,
-    /// Whether a policy is set: the one thing a push reads of the placement when there is none.
+    /// Whether a policy is set. A push without a policy reads this flag and nothing of the placement; it is a plain flag
+    /// of the vertex rather than a field of the placement so that no second object is followed to find it out.
     placed: AtomicBool,
     /// Java's `routingState`: the published generation, a cell of the registry that each worker reads from its view.
     routing: Cell<RoutingState>,

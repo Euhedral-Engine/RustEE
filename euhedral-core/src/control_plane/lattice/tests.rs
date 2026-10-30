@@ -876,7 +876,7 @@ fn frames_land_on_the_core_the_picker_chose() {
 }
 
 #[test]
-fn ordered_lanes_never_land_on_the_long_call_cores() {
+fn with_every_core_active_ordered_lanes_never_land_on_the_long_call_cores() {
     let fixture = Fixture::new(&ALL, |_| {});
     // Long calls (every third id) go to the cores of set A (2 and 3); everything else, the ordered lanes, to B (0, 1).
     fixture

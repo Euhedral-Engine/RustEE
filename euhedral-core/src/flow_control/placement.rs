@@ -7,9 +7,10 @@
 //! The policy runs on the frame path, from every thread that routes at once. It must be re-entrant, take no lock,
 //! not allocate and not block; whatever it reads is the caller's to make safe to read from many threads.
 //!
-//! The policy and the CPU set are cells of the lattice's registry, so a thread reads them from its view with no lock
-//! and no reference-count update (a light reader pays the reference-count pair a view read costs). A vertex pays one
-//! relaxed load of its own flag per frame when no policy is set.
+//! The policy and the CPU set are cells of the lattice's registry, so a thread reads them from its view with no lock.
+//! A worker (a full reader) pays nothing for either. A light reader (a producer thread that is not registered) upgrades
+//! one weak reference per cell, so with a policy set it pays two extra reference-count pairs per frame, one for the
+//! policy and one for the CPU set. A vertex without a policy set pays one relaxed load of its own flag per frame.
 
 use super::registry::UpstreamRegistry;
 use super::views::Cell;

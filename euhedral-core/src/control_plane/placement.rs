@@ -12,6 +12,12 @@
 //! allocates nothing and locks nothing.
 //!
 //! A frame that cannot be placed (the chosen set has no CPU in common with the lattice's) keeps the origin it had.
+//!
+//! **The routing that follows can still move a frame out of its set.** The picker chooses among the CPUs the lattice
+//! reports as effective. A cache-local frame goes to the core of its origin only while that core is active; when it is
+//! not (during a rebalance, or after a clone failed to start), the routing falls back to a hash over the active cores,
+//! which can land in the other set. The guarantee that a set's frames stay in the set therefore holds while every core of
+//! the set is active.
 
 use crate::flow_control::RoutingPolicy;
 use crate::frames::Frame;

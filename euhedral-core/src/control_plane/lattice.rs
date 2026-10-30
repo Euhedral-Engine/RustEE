@@ -327,6 +327,11 @@ impl ControlPlaneLattice {
     ///
     /// It can be set while the lattice is shut down (not started, or closed), and replaces the previous one.
     ///
+    /// The routing honours the origin only while the origin's core is active. During a rebalance, or after a clone failed
+    /// to start, a frame placed on an inactive core falls back to a hash over the active cores (and sockets), which can
+    /// move it out of the set the policy chose; the policy chooses among the CPUs the lattice reports as effective, not
+    /// among those of cores that are running a clone.
+    ///
     /// # Errors
     ///
     /// [`LatticeError::Running`] while the lattice is running.

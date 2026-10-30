@@ -68,12 +68,18 @@ models of an offer racing a drain, two completions racing, and a dropped slot ra
 - `TopologyMapper::effective_cpus()`: the effective CPU set, public.
 - `LatticeVertex::with_placement` / `flow_control::Placement`: the hook a vertex runs before its routing function.
 
-**Cost.** A lattice with no policy pays a relaxed load and a branch per frame.
+**Limit.** The routing honours the origin only while the origin's core is active; during a rebalance, or after a clone failed to
+start, a frame placed on an inactive core falls back to a hash, which can leave the chosen set. The policy chooses among the
+CPUs the lattice reports as effective, not among those of cores that run a clone (publishing the latter would need the
+shards to tell the lattice when a core starts or stops, which is not small and is left out).
+
+**Cost.** A lattice with no policy pays one relaxed load of the vertex's own flag per frame; with a policy set, a light reader
+(an unregistered producer thread) pays two reference-count pairs more (the policy and the CPU set), a worker none.
 
 **Java.** None of this exists in Java (frames are routed by hash and routing policy only); there is nothing to mirror.
 
 **Tests.** The policy is settable only while shut down; it runs first and sees the unrouted frame and the effective CPUs;
-frames land on the picked core; long calls land in set A and ordered lanes never do; eight threads route at once;
+frames land on the picked core; long calls land in set A and ordered lanes never do while every core is active; eight threads route at once;
 placing allocates nothing (`tests/placement_alloc.rs`: the picker, and the policy read from a registered and from a light
 reader).
 
