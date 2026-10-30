@@ -966,8 +966,9 @@ fn metrics_overhead_per_frame() {
     }
 }
 
-/// Records whether it was a long call (unordered) and the CPU it ran on.
-type Ran = Arc<Mutex<Vec<(bool, Option<usize>)>>>;
+/// Records whether it was a long call (unordered), the CPU it ran on (`affinity::current_cpu`: the OS's processor number when the
+/// platform reports one the topology knows, else the CPU the worker was bound to) and the name of the thread that ran it.
+type Ran = Arc<Mutex<Vec<(bool, Option<usize>, String)>>>;
 
 struct Classified {
     header: FrameHeader,
@@ -985,10 +986,11 @@ impl Frame for Classified {
 
     fn execute(&mut self) -> Result<(), FrameError> {
         let long = !self.header.is_ordered();
-        self.ran
-            .lock()
-            .unwrap()
-            .push((long, affinity::current_cpu()));
+        self.ran.lock().unwrap().push((
+            long,
+            affinity::current_cpu(),
+            thread::current().name().unwrap_or("?").to_owned(),
+        ));
         // Work to do, so that every core that can take a frame is busy and the others look for more.
         let until = Instant::now() + Duration::from_micros(20);
         while Instant::now() < until {
@@ -1013,6 +1015,7 @@ fn a_placement_policy_also_places_the_frames_a_worker_pulls_from_a_sink() {
     let cpus: Vec<usize> = set_a.iter().chain(&set_b).copied().collect();
     for fragment in [FragmentConfig::default(), polling()] {
         let _turn = pinned_turn();
+        let fragment_label = format!("{fragment:?}");
         let mut config = LatticeConfig::new(Arc::new(BaseCloneableObject::new(
             fragment,
             DefaultExecutor::new(),
@@ -1064,24 +1067,38 @@ fn a_placement_policy_also_places_the_frames_a_worker_pulls_from_a_sink() {
         wait_until("every frame to run", || {
             ran.lock().unwrap().len() == FRAMES as usize
         });
+        let active = lattice.active_workers();
         lattice.close();
         let ran = ran.lock().unwrap().clone();
+        // What a failure prints: the sets, the lattice and the platform, and where each kind of frame ran, by CPU and thread.
+        let mut seen = std::collections::BTreeMap::new();
+        for (long, cpu, thread) in &ran {
+            *seen.entry((*long, *cpu, thread.clone())).or_insert(0_usize) += 1;
+        }
+        let topology = Topology::system();
+        let dump = format!(
+            "fragment {fragment_label}\nset A {set_a:?}, set B {set_b:?}, active workers {active}\naffinity {:?}, base mask {:?}, topology: {} cpus, {} cores\n(long call, cpu, thread) -> frames: {seen:#?}",
+            affinity::capability(),
+            affinity::base_mask(),
+            topology.cpu_count(),
+            topology.core_count(),
+        );
         let on = |set: &[usize], cpu: Option<usize>| cpu.is_some_and(|cpu| set.contains(&cpu));
         assert_eq!(
-            ran.iter().filter(|(long, _)| *long).count(),
+            ran.iter().filter(|(long, _, _)| *long).count(),
             FRAMES as usize / 2
         );
         assert!(
             ran.iter()
-                .filter(|(long, _)| *long)
-                .all(|(_, cpu)| on(&set_a, *cpu)),
-            "a long call ran off set A"
+                .filter(|(long, _, _)| *long)
+                .all(|(_, cpu, _)| on(&set_a, *cpu)),
+            "a long call ran off set A\n{dump}"
         );
         assert!(
             ran.iter()
-                .filter(|(long, _)| !*long)
-                .all(|(_, cpu)| on(&set_b, *cpu)),
-            "an ordered frame ran on set A"
+                .filter(|(long, _, _)| !*long)
+                .all(|(_, cpu, _)| on(&set_b, *cpu)),
+            "an ordered frame ran on set A\n{dump}"
         );
     }
 }
