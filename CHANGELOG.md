@@ -3,6 +3,26 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## `euhedral-gpu`: texture objects over pitched device memory (2026-10-30)
+
+**What.** `cuda::texture`: `View`, `Format`, `Filter`, `Address`, `TexObject`, `alignments` and `check_alignment`. Additive.
+
+**Why.** A kernel that reads 2D memory through the texture units gets the hardware's filtering, clamping and normalised
+coordinates for free, and the driver call that makes the object needs the descriptor structures and the device's alignment
+rules, which every user would otherwise rewrite.
+
+**How to use it.** Describe the memory and the sampling in a `View`, check it against `alignments(&device)` when the memory is
+planned, and `TexObject::create` it in a prepare; pass `handle()` as a 64-bit kernel argument and read it with `tex2D<float>`
+(normalised formats) or `tex2D<unsigned>` with `read_as_integer`. Drop the object in a prepare, after its last reader retired.
+
+**Semantics.** The object is a 2D pitched resource (`CU_RESOURCE_TYPE_PITCH2D`) with one address mode on all axes, point or
+linear filtering, and normalised or texel coordinates. It does not own the memory. A view whose base or pitch misses the device's
+alignment, or whose pitch is less than a row, is an `Err` before the driver is asked.
+
+**Tests.** `tests/cuda_texture.rs` on a real device: misaligned views are refused; point sampling in texels reads exact values
+and clamps outside the image; linear normalised reads match the exact bilinear value to within the fixed-point weights' step.
+Descriptor sizes and the alignment check are unit tests.
+
 ## `euhedral-gpu`: a lane's graph cache (2026-10-30)
 
 **What.** `GraphCache<G, K>`, `GraphBody`, `Ran` and `GraphStats`: a lane's recorded graphs by key `K`, with `run(gpu, stream, key,
