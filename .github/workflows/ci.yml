@@ -109,7 +109,7 @@ jobs:
       - name: Cells and views, routing generations, vertex and edge races
         run: |
           cargo +nightly miri test -p euhedral-core --lib -- flow_control::views
-          cargo +nightly miri test -p euhedral-core --lib -- control_plane::placement
+          cargo +nightly miri test -p euhedral-core --lib -- control_plane::placement flow_control::placement
           cargo +nightly miri test -p euhedral-hardware-utils --lib -- util::cpu_set
           cargo +nightly miri test -p euhedral-core --lib -- flow_control::vertex::tests::pushes_racing flow_control::vertex::tests::the_last_reader flow_control::vertex::tests::a_panicking_routing_function flow_control::vertex::tests::close_retirements flow_control::edge::tests::close_while_pushing flow_control::edge::tests::a_closed_edge_refuses flow_control::edge::tests::a_receiver_refused flow_control::edge::tests::attaches_racing flow_control::edge::tests::racing_attaches flow_control::edge::tests::pushes_and_set_parent
 

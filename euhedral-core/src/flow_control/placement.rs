@@ -133,3 +133,53 @@ impl std::fmt::Debug for Placement {
         f.debug_struct("Placement").finish_non_exhaustive()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frames::BenchmarkFrame;
+    use std::thread;
+
+    fn registry() -> Arc<UpstreamRegistry> {
+        UpstreamRegistry::with_topology(4, CpuSet::new())
+    }
+
+    #[test]
+    fn a_placement_places_nothing_until_a_policy_is_set() {
+        let registry = registry();
+        let placement = Placement::new(&registry);
+        let mut frame = BenchmarkFrame::new(1, None);
+        assert!(!placement.apply(&registry, &mut frame));
+        assert!(frame.header().origin().is_none());
+    }
+
+    #[test]
+    fn a_policy_set_before_the_threads_start_runs_on_every_thread_with_the_published_cpus() {
+        let registry = registry();
+        let placement = Placement::new(&registry);
+        placement.publish_cpus(&registry, [1usize, 3].into_iter().collect());
+        // SAFETY: no other thread exists yet; the threads below are spawned after the call.
+        unsafe {
+            placement.set_policy(|frame, cpus| {
+                frame.header_mut().set_routing_hash(cpus.len() as u64);
+                true
+            });
+        }
+        thread::scope(|scope| {
+            for _ in 0..3 {
+                scope.spawn(|| {
+                    for round in 0..20 {
+                        let mut frame = BenchmarkFrame::new(round, None);
+                        assert!(placement.apply(&registry, &mut frame));
+                        assert_eq!(frame.header().routing_hash(), 2);
+                        let seen = placement.within(&registry, |view| {
+                            let mut frame = BenchmarkFrame::new(round, None);
+                            (view.apply(&mut frame), frame.header().routing_hash())
+                        });
+                        assert_eq!(seen, (true, 2));
+                    }
+                });
+            }
+        });
+    }
+}
