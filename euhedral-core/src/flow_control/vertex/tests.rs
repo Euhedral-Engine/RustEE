@@ -831,11 +831,12 @@ fn race_remaps(pushers: u64, remaps: usize) -> RemapRace {
 #[test]
 fn pushes_racing_remaps_reach_only_validated_downstreams() {
     for _ in 0..RACES {
-        pushes_racing_remaps_reach_only_validated_downstreams_once();
+        check_pushes_racing_remaps_reach_only_validated_downstreams();
     }
 }
 
-fn pushes_racing_remaps_reach_only_validated_downstreams_once() {
+/// One race of `pushes_racing_remaps_reach_only_validated_downstreams`.
+fn check_pushes_racing_remaps_reach_only_validated_downstreams() {
     let race = race_remaps(PUSHERS, REMAPS);
     assert!(race.sent >= PUSHERS, "every pusher pushed");
     assert!(
@@ -865,11 +866,12 @@ fn pushes_racing_remaps_reach_only_validated_downstreams_once() {
 #[test]
 fn the_last_reader_of_a_retired_generation_closes_its_dropped_downstreams_once() {
     for _ in 0..RACES {
-        the_last_reader_closes_its_dropped_downstreams_once();
+        check_the_last_reader_closes_its_dropped_downstreams();
     }
 }
 
-fn the_last_reader_closes_its_dropped_downstreams_once() {
+/// One race of `the_last_reader_of_a_retired_generation_closes_its_dropped_downstreams_once`.
+fn check_the_last_reader_closes_its_dropped_downstreams() {
     let race = race_remaps(PUSHERS, REMAPS);
     let (last, dropped) = race.receivers.split_at(race.receivers.len() - 2);
     for receiver in last {

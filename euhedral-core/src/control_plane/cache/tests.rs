@@ -370,7 +370,7 @@ fn work_stealing_takes_unordered_frames_and_leaves_ordered_heads() {
 
 /// The owner runs the front frame of a one-partition victim on another thread and blocks in it;
 /// returns how many of the frames behind it a polling thief steals meanwhile.
-fn stolen_while_the_owner_runs_a_frame(owner_polls: bool) -> u64 {
+fn count_stolen_while_the_owner_runs_a_frame(owner_polls: bool) -> u64 {
     let directory = directory();
     let thief = cache_on(&directory, &config(1), 0);
     let victim = cache_on(&directory, &config(1), 1);
@@ -404,12 +404,12 @@ fn stolen_while_the_owner_runs_a_frame(owner_polls: bool) -> u64 {
 
 #[test]
 fn a_poll_frees_the_partition_while_its_frame_runs() {
-    assert_eq!(stolen_while_the_owner_runs_a_frame(true), 3);
+    assert_eq!(count_stolen_while_the_owner_runs_a_frame(true), 3);
 }
 
 #[test]
 fn a_greedy_take_holds_the_partition_while_its_frames_run() {
-    assert_eq!(stolen_while_the_owner_runs_a_frame(false), 0);
+    assert_eq!(count_stolen_while_the_owner_runs_a_frame(false), 0);
 }
 
 #[test]

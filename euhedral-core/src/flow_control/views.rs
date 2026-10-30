@@ -819,8 +819,10 @@ mod tests {
     }
 
     /// A read in progress does not drain, so its view still holds the value of a cell that was dropped; a cell that
-    /// took the dropped one's id must not be given that value.
-    fn a_nested_read_of_a_cell_that_reused_an_id_sees_the_new_cells_value(full: bool) {
+    /// took the dropped one's id must not be given that value. Run by
+    /// `a_full_readers_nested_read_does_not_see_a_dropped_cells_value_in_a_reused_id` and
+    /// `a_light_readers_nested_read_does_not_see_a_dropped_cells_value_in_a_reused_id`.
+    fn check_nested_read_of_a_reused_id(full: bool) {
         let registry = registry();
         let old = registry.cell::<u64>();
         registry.set_cell(&old, Some(Arc::new(7)));
@@ -846,12 +848,12 @@ mod tests {
 
     #[test]
     fn a_full_readers_nested_read_does_not_see_a_dropped_cells_value_in_a_reused_id() {
-        a_nested_read_of_a_cell_that_reused_an_id_sees_the_new_cells_value(true);
+        check_nested_read_of_a_reused_id(true);
     }
 
     #[test]
     fn a_light_readers_nested_read_does_not_see_a_dropped_cells_value_in_a_reused_id() {
-        a_nested_read_of_a_cell_that_reused_an_id_sees_the_new_cells_value(false);
+        check_nested_read_of_a_reused_id(false);
     }
 
     /// The writer drops a light reader whose mailbox backed up and skips the offers after that; a read that was
@@ -873,8 +875,9 @@ mod tests {
     }
 
     /// A cell made while a read is in progress is unknown to the view of that read: a nested read of it finds the value
-    /// under the lock instead of nothing.
-    fn a_nested_read_of_a_cell_made_during_the_outer_read_finds_its_value(full: bool) {
+    /// under the lock instead of nothing. Run by `a_full_readers_nested_read_of_a_new_cell_finds_its_value` and
+    /// `a_light_readers_nested_read_of_a_new_cell_finds_its_value`.
+    fn check_nested_read_of_a_new_cell(full: bool) {
         let registry = registry();
         if full {
             registry.register_reader();
@@ -889,12 +892,12 @@ mod tests {
 
     #[test]
     fn a_full_readers_nested_read_of_a_new_cell_finds_its_value() {
-        a_nested_read_of_a_cell_made_during_the_outer_read_finds_its_value(true);
+        check_nested_read_of_a_new_cell(true);
     }
 
     #[test]
     fn a_light_readers_nested_read_of_a_new_cell_finds_its_value() {
-        a_nested_read_of_a_cell_made_during_the_outer_read_finds_its_value(false);
+        check_nested_read_of_a_new_cell(false);
     }
 
     #[test]
