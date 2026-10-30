@@ -240,6 +240,10 @@ they drain.
 - **Cost per push, exactly.** Inside the interceptor's `request` the routing state is read from the view: a worker pays no
   read-modify-write, a light reader one reference-count pair (the state's upgrade). Outside a request every push also
   upgrades the interceptor's `Weak` of its vertex, one more pair for any thread (a worker one, a light reader two).
+- A dropped vertex runs the retirements still waiting for a generation to be released, on a thread of their own: the release
+  of a generation needs the vertex, so nothing else would run them (a clone removed by a rebalance and closed by such a
+  retirement would otherwise live, with its pinned worker, for the life of the process). No frame can route through a
+  dropped vertex, so nothing is left to wait for.
 - Cells are freed: a dropped `Cell` returns its id to the registry and tells every reader to forget its value, so
   rebalances no longer grow the store and every view. Each id carries a reuse epoch (in the `Cell`, the updates and the
   views): a read in progress cannot drain, so its view may still hold the dead cell's value for a recycled id, and a read

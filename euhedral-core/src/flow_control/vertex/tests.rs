@@ -1108,21 +1108,31 @@ fn a_retirement_never_runs_on_a_light_reader_that_let_go_of_the_generation_last(
 }
 
 /// The vertex's own drop can be the last hold on its generation, on a frame-path thread that held the last upgraded
-/// `Weak`. It runs no retirement and waits for nothing: the release of a generation needs the vertex, which is gone.
+/// `Weak`. The retirements still waiting for a generation to be released would never run (the release needs the vertex,
+/// which is gone), so the drop hands them to a thread of their own, and waits for nothing.
 #[test]
-fn dropping_a_vertex_runs_no_retirement_and_waits_for_nothing() {
+fn dropping_a_vertex_hands_its_pending_retirements_to_a_thread_and_waits_for_nothing() {
     const WAIT: Duration = Duration::from_millis(400);
     let registry = registry();
     let vertex = Arc::new(LatticeVertex::new(&registry, "retire-drop", 1));
     let (child, _) = receiving_edge(&registry);
     assert!(map(&vertex, &[0], &[node(&child)]));
-    let ran = Arc::new(AtomicBool::new(false));
+    // A route holds the generation, so the retirements wait for it.
+    let held = vertex.hold_routing();
+    let ran_on = Arc::new(Mutex::new(None));
+    let done = Arc::new(AtomicBool::new(false));
     {
-        let ran = ran.clone();
+        let (ran_on, done) = (ran_on.clone(), done.clone());
         child.defer_retirement(Box::new(move || {
+            *ran_on.lock().unwrap() = thread::current().name().map(str::to_owned);
             thread::sleep(WAIT);
-            ran.store(true, Ordering::Release);
+            done.store(true, Ordering::Release);
         }));
+    }
+    let closed = Arc::new(AtomicBool::new(false));
+    {
+        let closed = closed.clone();
+        vertex.close_after_routes_retire(move || closed.store(true, Ordering::Release));
     }
     let worker = thread::Builder::new()
         .name("worker-d".into())
@@ -1141,10 +1151,15 @@ fn dropping_a_vertex_runs_no_retirement_and_waits_for_nothing() {
         dropping < WAIT / 4,
         "dropping the vertex took {dropping:?}: a retirement ran on the dropping thread"
     );
-    thread::sleep(WAIT * 2);
-    assert!(
-        !ran.load(Ordering::Acquire),
-        "a dropped vertex abandons its retirements"
+    drop(held);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !(done.load(Ordering::Acquire) && closed.load(Ordering::Acquire)) {
+        assert!(Instant::now() < deadline, "the retirements never ran");
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(
+        ran_on.lock().unwrap().as_deref(),
+        Some("retire-drop-retire")
     );
 }
 
