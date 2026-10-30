@@ -16,6 +16,7 @@ use super::placement::Placement;
 use super::registry::UpstreamRegistry;
 use super::upstream_queue::{Claim, UpstreamHandle, note_routed_push};
 use super::views::Cell;
+use super::views::View;
 use crate::frames::{Failure, Frame, FrameError};
 use crate::generics::{LatticeReceiver, LatticeSource, LatticeTerminal, SourceCell};
 use crate::utils::math::unsigned_multiply_high;
@@ -317,13 +318,13 @@ impl LatticeVertex {
     /// Runs `f` on the published generation, unless the vertex is closed. Java's `acquireRoutingState`, with the
     /// worker's view in the place of the count: one acquire load of the closed flag and a read of the view.
     #[inline]
-    fn with_route<R>(&self, f: impl FnOnce(&RoutingState) -> R) -> Option<R> {
+    fn with_route<R>(&self, f: impl FnOnce(&View<'_>, &RoutingState) -> R) -> Option<R> {
         if self.closed.load(Ordering::Acquire) {
             return None;
         }
         self.edge
             .registry()
-            .with_view(|view| view.get(&self.routing).map(f))
+            .with_view(|view| view.get(&self.routing).map(|state| f(view, state)))
     }
 
     /// Publishes a new routing generation in which the downstreams with ids in `active` are
@@ -484,16 +485,23 @@ impl LatticeVertex {
     ///
     /// Panics if the routing function returns an index outside the active downstreams.
     pub fn try_push(&self, frame: Box<dyn Frame>) -> Result<(), Box<dyn Frame>> {
+        self.route_frame(frame, true)
+    }
+
+    /// Routes `frame`, running the placement policy first if `place` and the vertex has one set. A frame the policy has
+    /// placed already (an interceptor's pull did) is routed with `place` false.
+    fn route_frame(&self, frame: Box<dyn Frame>, place: bool) -> Result<(), Box<dyn Frame>> {
         let _hot = HotScope::enter();
         // The frame moves into the closure, and comes back out if the vertex is closed or nothing is active.
         let mut slot = Some(frame);
-        let routed = self.with_route(|state| {
+        let routed = self.with_route(|view, state| {
             let mut frame = slot.take().expect("routed once");
             // The very first thing a routed frame meets: the placement policy, if the vertex has one and it is set.
-            if self.placed.load(Ordering::Relaxed)
+            if place
+                && self.placed.load(Ordering::Relaxed)
                 && let Some(placement) = &self.placement
             {
-                placement.apply(self.edge.registry(), &mut *frame);
+                placement.apply_in(view, &mut *frame);
             }
             if state.is_empty() {
                 return Err(frame);
@@ -587,7 +595,7 @@ impl LatticeNode for LatticeVertex {
 
     /// Passes `error` to every active downstream once.
     fn on_error(&self, error: Failure) {
-        let _ = self.with_route(|state| {
+        let _ = self.with_route(|_, state| {
             let targets: Vec<_> = state.table().unique_handles().collect();
             match targets.as_slice() {
                 [] => {}
@@ -983,11 +991,34 @@ impl UpstreamHandle for UpstreamInterceptor {
         demand: u64,
     ) -> Option<u64> {
         self.assert_own(claim);
-        self.serviceable(demand)?;
+        let vertex = self.serviceable(demand)?;
         // SAFETY: `claim` proves this caller holds the claim: it is the only one, so no action
         // runs and no other `pull` or `request` is in progress.
         let upstream = unsafe { self.upstream.get() }?;
-        match panic::catch_unwind(AssertUnwindSafe(|| upstream.pull(consumer, stop, demand))) {
+        let pulled = panic::catch_unwind(AssertUnwindSafe(|| {
+            // With a placement policy set, each frame the source hands over is placed before the fragment's consumer
+            // sees it, and one that now has an origin goes through the routing, which honours it, instead. The wrapper
+            // is a closure on this stack; without a policy the fragment's consumer goes straight through.
+            if vertex.placed.load(Ordering::Relaxed)
+                && let Some(placement) = &vertex.placement
+            {
+                let mut place_or_route = |mut frame: Box<dyn Frame>| {
+                    placement.apply(vertex.edge.registry(), &mut *frame);
+                    if frame.header().origin().is_some() {
+                        match vertex.route_frame(frame, false) {
+                            Ok(()) => note_routed_push(),
+                            Err(frame) => frame.do_finally_with_error(unroutable()),
+                        }
+                    } else {
+                        consumer(frame);
+                    }
+                };
+                upstream.pull(&mut place_or_route, stop, demand)
+            } else {
+                upstream.pull(consumer, stop, demand)
+            }
+        }));
+        match pulled {
             Ok(pulled) => Some(pulled),
             Err(_) => {
                 log::error!(target: &self.log_target, "an upstream panicked during a pull");

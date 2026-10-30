@@ -71,7 +71,7 @@ fn placing_a_frame_allocates_nothing() {
         .collect();
     let before = ALLOCATIONS.load(Ordering::Relaxed);
     for route in 0..ROUTES {
-        picker.place(&mut *frames[(route % 1024) as usize], &all);
+        picker.pick(&mut *frames[(route % 1024) as usize], &all);
     }
     assert_eq!(
         ALLOCATIONS.load(Ordering::Relaxed) - before,

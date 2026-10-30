@@ -327,6 +327,12 @@ impl ControlPlaneLattice {
     ///
     /// It can be set while the lattice is shut down (not started, or closed), and replaces the previous one.
     ///
+    /// The policy covers pushed and pulled frames alike: a frame a source pushes is placed when the lattice routes it,
+    /// and a frame a worker pulls from a source is placed as it comes out of the source's pull, before the worker's
+    /// own consumer sees it. A frame the policy gives an origin goes through the routing, which honours the origin;
+    /// the others reach the worker's consumer as they would without a policy. Producers do not have to place their
+    /// frames.
+    ///
     /// The routing honours the origin only while the origin's core is active. During a rebalance, or after a clone failed
     /// to start, a frame placed on an inactive core falls back to a hash over the active cores (and sockets), which can
     /// move it out of the set the policy chose; the policy chooses among the CPUs the lattice reports as effective, not

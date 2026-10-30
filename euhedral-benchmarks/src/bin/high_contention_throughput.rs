@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! high_contention_throughput [--forks N] [--sources N] [--warmup-iterations N] [--warmup-seconds S]
-//!                            [--iterations N] [--seconds S] [--tasks N] [--no-pin] [--no-latency] [--pooled] [--poll-spins N]
+//!                            [--iterations N] [--seconds S] [--tasks N] [--no-pin] [--no-latency] [--pooled] [--poll-spins N] [--trivial-placement]
 //! ```
 //!
 //! The defaults are upstream's: 3 forks (separate processes, each with its own lattice), 3 warm-up iterations of 3
@@ -62,6 +62,7 @@ fn parse(arguments: impl Iterator<Item = String>) -> Result<Arguments, String> {
             "--no-pin" => parsed.options.pin_harness = false,
             "--no-latency" => parsed.options.latency = false,
             "--pooled" => parsed.options.pooled_frames = true,
+            "--trivial-placement" => parsed.options.trivial_placement = true,
             "--poll-spins" => parsed.options.poll_spins = (number("--poll-spins")? as u32).max(1),
             "--child" => parsed.child = true,
             "--help" | "-h" => return Err(String::new()),
@@ -123,6 +124,11 @@ fn drive(arguments: &Arguments) -> Result<(), String> {
                 vec![]
             })
             .args(["--poll-spins", &options.poll_spins.to_string()])
+            .args(if options.trivial_placement {
+                vec!["--trivial-placement"]
+            } else {
+                vec![]
+            })
             .stdout(Stdio::piped())
             .spawn()
             .map_err(|error| format!("cannot start fork {fork}: {error}"))?;
@@ -159,7 +165,7 @@ fn main() -> ExitCode {
             }
             eprintln!(
                 "usage: high_contention_throughput [--forks N] [--sources N] [--warmup-iterations N] \
-                 [--warmup-seconds S] [--iterations N] [--seconds S] [--tasks N] [--no-pin] [--no-latency] [--pooled] [--poll-spins N]"
+                 [--warmup-seconds S] [--iterations N] [--seconds S] [--tasks N] [--no-pin] [--no-latency] [--pooled] [--poll-spins N] [--trivial-placement]"
             );
             return ExitCode::from(2);
         }

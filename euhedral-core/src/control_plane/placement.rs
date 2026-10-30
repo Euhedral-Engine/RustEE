@@ -13,11 +13,8 @@
 //!
 //! A frame that cannot be placed (the chosen set has no CPU in common with the lattice's) keeps the origin it had.
 //!
-//! **The routing that follows can still move a frame out of its set.** The picker chooses among the CPUs the lattice
-//! reports as effective. A cache-local frame goes to the core of its origin only while that core is active; when it is
-//! not (during a rebalance, or after a clone failed to start), the routing falls back to a hash over the active cores,
-//! which can land in the other set. The guarantee that a set's frames stay in the set therefore holds while every core of
-//! the set is active.
+//! The policy covers pushed and pulled frames alike (see
+//! [`set_placement_policy`](super::ControlPlaneLattice::set_placement_policy)); producers need not call the picker.
 
 use crate::flow_control::RoutingPolicy;
 use crate::frames::Frame;
@@ -45,8 +42,9 @@ impl<P: Fn(&dyn Frame) -> bool + Send + Sync + 'static> PlacementPicker<P> {
         }
     }
 
-    /// Places `frame` among `lattice_cpus`, the CPUs the lattice routes with.
-    pub fn place(&self, frame: &mut dyn Frame, lattice_cpus: &CpuSet) {
+    /// Picks a CPU for `frame` among `lattice_cpus`, the CPUs the lattice routes with, and sets the frame's origin to
+    /// it.
+    pub fn pick(&self, frame: &mut dyn Frame, lattice_cpus: &CpuSet) {
         let chosen = if (self.predicate)(&*frame) {
             &self.a
         } else {
@@ -71,13 +69,14 @@ impl<P: Fn(&dyn Frame) -> bool + Send + Sync + 'static> PlacementPicker<P> {
     /// The picker as a placement policy for
     /// [`set_placement_policy`](super::ControlPlaneLattice::set_placement_policy).
     pub fn into_policy(self) -> impl Fn(&mut dyn Frame, &CpuSet) + Send + Sync + 'static {
-        move |frame, cpus| self.place(frame, cpus)
+        move |frame, cpus| self.pick(frame, cpus)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::flow_control::RoutingPolicy;
     use crate::frames::BenchmarkFrame;
     use euhedral_hardware_utils::topology::source::{
         CoreKind, LogicalCpu, TopologyInput, normalize,
@@ -124,7 +123,7 @@ mod tests {
         let lattice = set(&[2, 4, 5, 6]);
         let origin = |id, hash| {
             let mut frame = frame(id, hash);
-            picker.place(&mut *frame, &lattice);
+            picker.pick(&mut *frame, &lattice);
             (
                 frame.header().origin().map(|info| info.cpu),
                 frame.header().routing_policy(),
@@ -144,10 +143,10 @@ mod tests {
     fn a_frame_that_cannot_be_placed_keeps_its_origin() {
         let picker = PlacementPicker::new(topology(), |_: &dyn Frame| true, set(&[0]), set(&[1]));
         let mut frame = frame(7, 3);
-        picker.place(&mut *frame, &set(&[4, 5]));
+        picker.pick(&mut *frame, &set(&[4, 5]));
         assert!(frame.header().origin().is_none());
         assert_eq!(frame.header().routing_policy(), RoutingPolicy::Anywhere);
-        picker.place(&mut *frame, &CpuSet::new());
+        picker.pick(&mut *frame, &CpuSet::new());
         assert!(frame.header().origin().is_none());
     }
 }

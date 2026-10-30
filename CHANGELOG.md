@@ -55,6 +55,11 @@ models of an offer racing a drain, two completions racing, and a dropped slot ra
   with now, and says where the frame goes by setting its origin and a cache-local routing policy; the routing that
   follows honours them. It can be set while the lattice is shut down (not started, or closed) and replaces the previous
   policy; while it runs the call returns `LatticeError::Running`.
+- **The pull path.** A worker's pull from a source takes frames without the lattice's routing, so the interceptor's pull
+  wraps the consumer the fragment passes in: each frame the source hands over is run through the policy, and one that
+  now has an origin goes through the interceptor's push, the routing, which honours it; the others reach the fragment's
+  consumer as before. The wrapper is a stack closure; without a policy the fragment's consumer goes straight through,
+  after one relaxed flag load. Ordered frames stop the fragment's pull before they reach its consumer, as before.
 - **Concurrency.** The policy is `Fn + Send + Sync + 'static`, never `FnMut`: it runs on the frame path, from every
   thread that routes frames, at the same time. It must be re-entrant, take no lock, not allocate and not block; what it
   reads is the caller's to make safe to read from many threads.

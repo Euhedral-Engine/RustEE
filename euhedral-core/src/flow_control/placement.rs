@@ -13,7 +13,7 @@
 //! policy and one for the CPU set. A vertex without a policy set pays one relaxed load of its own flag per frame.
 
 use super::registry::UpstreamRegistry;
-use super::views::Cell;
+use super::views::{Cell, View};
 use crate::frames::Frame;
 use euhedral_hardware_utils::util::CpuSet;
 use std::sync::Arc;
@@ -59,14 +59,18 @@ impl Placement {
         registry.set_cell(&self.cpus, Some(Arc::new(cpus)));
     }
 
-    /// Runs the policy on `frame`, if one is set.
+    /// Runs the policy on `frame`, reading it from `view`, the read the caller is already in (a vertex routes a frame
+    /// inside a read of its routing generation).
     #[inline]
+    pub fn apply_in(&self, view: &View<'_>, frame: &mut dyn Frame) {
+        if let Some(policy) = view.get(&self.policy) {
+            (policy.0)(frame, view.get(&self.cpus).unwrap_or(&NO_CPUS));
+        }
+    }
+
+    /// Runs the policy on `frame` in a read of its own.
     pub fn apply(&self, registry: &Arc<UpstreamRegistry>, frame: &mut dyn Frame) {
-        registry.with_view(|view| {
-            if let Some(policy) = view.get(&self.policy) {
-                (policy.0)(frame, view.get(&self.cpus).unwrap_or(&NO_CPUS));
-            }
-        });
+        registry.with_view(|view| self.apply_in(view, frame));
     }
 }
 

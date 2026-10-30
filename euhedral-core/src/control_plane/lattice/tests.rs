@@ -936,7 +936,7 @@ fn the_policy_and_the_predicate_run_from_many_threads_at_once() {
         .lattice
         .set_placement_policy(move |frame, set| {
             counted.fetch_add(1, Ordering::Relaxed);
-            picker.place(frame, set);
+            picker.pick(frame, set);
         })
         .unwrap();
     fixture.source.set(utilization(&ALL, 8.0));
