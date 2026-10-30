@@ -144,6 +144,50 @@ fn warm_launches_updates_and_replays_allocate_nothing_and_a_span_reads_without_w
     }
     let graph_allocs = allocations() - before;
 
+    // The same through a lane's graph cache: a warm hit (update and replay) allocates nothing either.
+    struct Triple<'a> {
+        add: &'a euhedral_gpu::cuda::CudaKernel,
+        args: [Args; 3],
+    }
+    impl euhedral_gpu::GraphBody<CudaGpu> for Triple<'_> {
+        fn enqueue<E: Enqueue<Kernel = euhedral_gpu::cuda::CudaKernel>>(
+            &mut self,
+            enq: &mut E,
+        ) -> Result<(), GpuError> {
+            for args in &self.args {
+                // SAFETY: matching arguments over a live block of 4 KiB, waited for below.
+                unsafe { enq.launch(self.add, Launch::linear(256, 128), args)? };
+            }
+            Ok(())
+        }
+    }
+    let mut cache = euhedral_gpu::GraphCache::<CudaGpu, u32>::new();
+    let mut triple = Triple {
+        add: &add,
+        args: a.clone(),
+    };
+    assert_eq!(
+        cache.warm(&gpu, &mut stream, 7, &mut triple).unwrap(),
+        euhedral_gpu::Ran::Recorded
+    );
+    for round in 0..8 {
+        for (i, args) in triple.args.iter_mut().enumerate() {
+            args.set(2, round + i as u32).unwrap();
+        }
+        assert_eq!(
+            cache.run(&gpu, &mut stream, 7, &mut triple).unwrap(),
+            euhedral_gpu::Ran::Replayed
+        );
+    }
+    let before = allocations();
+    for round in 8..208 {
+        for (i, args) in triple.args.iter_mut().enumerate() {
+            args.set(2, round + i as u32).unwrap();
+        }
+        cache.run(&gpu, &mut stream, 7, &mut triple).unwrap();
+    }
+    let cache_allocs = allocations() - before;
+
     let marker = stream.mark().unwrap();
     let start = Instant::now();
     while !pool.reached(marker) {
@@ -155,6 +199,10 @@ fn warm_launches_updates_and_replays_allocate_nothing_and_a_span_reads_without_w
         "200 direct launches of a reused Args allocated"
     );
     assert_eq!(graph_allocs, 0, "200 updates and replays allocated");
+    assert_eq!(
+        cache_allocs, 0,
+        "200 warm hits of the graph cache allocated"
+    );
 
     // A span around a long kernel: not ready at once, then its duration.
     let span = stream.span_begin().unwrap();

@@ -9,6 +9,7 @@
 //! | [`Gpu`], [`Stream`], [`Enqueue`] | `api` | a device, an ordered queue of device work, and what a submission enqueues |
 //! | [`Module`], [`Kernel`], [`Args`] | `api`, `args` | code loaded at run time and its typed arguments |
 //! | [`Sequence`], [`Graph`] | `api` | a recurring sequence of submissions, recorded once and replayed |
+//! | [`GraphCache`] | `graph_cache` | a lane's graphs by key: a hit updates and replays, a miss records |
 //! | [`open_lane_sources`], [`LaneSpec`] | `lanes` | a device's streams as lane sources: a pool, its intakes and a `LaneSource` per lane |
 //! | [`retire_into`], [`RetireListener`] | `retire`, `api` | retirement: the callback queues, the owner drains and dispatches, and it continues as a frame |
 //! | [`ModuleCache`] | `module_cache` | compiled modules keyed by a content hash |
@@ -33,6 +34,7 @@ pub mod cuda;
 mod error;
 #[cfg(feature = "fake")]
 pub mod fake;
+mod graph_cache;
 #[cfg(any(feature = "fake", feature = "cuda"))]
 mod kept;
 mod lanes;
@@ -48,6 +50,7 @@ pub use api::{
 };
 pub use args::{ArgMismatch, Args, Dim3, KernelArg, Launch, MAX_ARGS};
 pub use error::GpuError;
+pub use graph_cache::{DEFAULT_GRAPHS, GraphBody, GraphCache, GraphStats, Ran};
 pub use lanes::{LaneSpec, OpenedLanes, open_lane_sources};
 pub use module_cache::{CacheKey, KeyMaterial, ModuleCache, cache_key};
 pub use poison::Poison;

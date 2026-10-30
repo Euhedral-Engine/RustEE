@@ -3,6 +3,30 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## `euhedral-gpu`: a lane's graph cache (2026-10-30)
+
+**What.** `GraphCache<G, K>`, `GraphBody`, `Ran` and `GraphStats`: a lane's recorded graphs by key `K`, with `run(gpu, stream, key,
+body)`, `warm`, `retain` and `free_stale`. Additive.
+
+**Why.** A lane that runs the same short sequence of launches for each unit of work (a stage of several kernels) pays for each
+launch separately. Recording the sequence once and replaying it with the unit's arguments costs one update and one launch, and
+`euhedral-gpu` already records, fingerprints, updates and re-records; the cache is the bookkeeping that every such lane would
+otherwise write: which key has a graph, what a changed shape does, when a stale graph may go.
+
+**How to use it.** Keep a `GraphCache` in the lane's state beside its submitter (a lane context's `parts()` lends both), and put the
+sequence in one `GraphBody::enqueue` that serves the direct run, the recording and the update. Warm each key ahead of the first
+unit with `warm`. When a key goes stale (a new shape, a released prepare) call `retain`, and `free_stale` from the continuation
+of the retirement armed after the lane's last replay.
+
+**Semantics.** A hit runs the body as an update pass (it touches no device) and replays the graph: launch *n* of the pass gives
+launch *n* of the graph its arguments. A miss runs the body for real once and records it. A body whose shape no longer matches
+the recording is run for real and the graph is recorded again, in place when the driver can. A warm-up records a missing key and
+leaves a recorded one alone. The cache holds at most `capacity` graphs: at the bound the oldest goes to the stale list. After the
+first record of a key, a hit allocates nothing.
+
+**Tests.** `graph_cache::tests` on the fake backend (hit, miss, shape change, warm-up, stale and bound), and
+`tests/cuda_launch_alloc.rs`: 200 warm hits on a real device allocate 0.
+
 ## `euhedral-gpu`: timed spans around a lane item, and arguments reused in place (2026-10-30)
 
 **What.** Two additions, no breaking change (`StreamOptions` gains a field: build it with `..Default::default()`).
