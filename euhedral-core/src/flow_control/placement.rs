@@ -8,6 +8,10 @@
 //! The policy runs on the frame path, from every thread that routes at once. It must be re-entrant, take no lock,
 //! not allocate and not block; whatever it reads is the caller's to make safe to read from many threads.
 //!
+//! **A placement with no policy of its own costs a plain load.** The vertex keeps a plain `custom` flag next to its
+//! placement, written together with the policy. While it is false, a push and a pull skip everything placement-related:
+//! no policy call, no read of the view, no wrapper around a pull's consumer.
+//!
 //! **The policy is a plain field.** It is set only while nothing routes and nothing pulls (the owner sets it before
 //! the vertex has any source, see [`set_policy`](Placement::set_policy)) and is only read after that, so a frame reads
 //! it with no atomic and no view. What makes the write visible to the threads that read it is whatever hands them the
@@ -38,22 +42,51 @@ fn no_placement(_frame: &mut dyn Frame, _cpus: &CpuSet) -> bool {
     false
 }
 
+/// A plain value that is written only while nothing reads it (before the lattice that owns it starts) and read freely
+/// afterwards: no atomic, no lock.
+pub struct SetBeforeStart<T>(UnsafeCell<T>);
+
+// SAFETY: the value is written only through `set`, whose contract is that no other thread reads it during the call and
+// that every later reader has synchronised with the call; reads are shared references to a `Sync` value.
+unsafe impl<T: Send + Sync> Sync for SetBeforeStart<T> {}
+
+impl<T> SetBeforeStart<T> {
+    /// A cell holding `value`.
+    pub const fn new(value: T) -> Self {
+        Self(UnsafeCell::new(value))
+    }
+
+    /// The value.
+    #[inline]
+    pub fn get(&self) -> &T {
+        // SAFETY: `set` is the only writer, and its caller guarantees nothing reads while it runs.
+        unsafe { &*self.0.get() }
+    }
+
+    /// Replaces the value.
+    ///
+    /// # Safety
+    ///
+    /// No thread may be reading the cell during the call, and every thread that reads it afterwards must have
+    /// synchronised with the call.
+    pub unsafe fn set(&self, value: T) {
+        // SAFETY: the caller's contract: no reader exists, so this is the only access.
+        unsafe { *self.0.get() = value };
+    }
+}
+
 /// The placement of one vertex: its policy and the CPUs it is given.
 pub struct Placement {
     /// Written only by [`set_policy`](Self::set_policy), while nothing reads it.
-    policy: UnsafeCell<Box<PlacementPolicy>>,
+    policy: SetBeforeStart<Box<PlacementPolicy>>,
     cpus: Cell<CpuSet>,
 }
-
-// SAFETY: the policy is `Send + Sync`, and the field is written only through `set_policy`, whose contract is that no
-// other thread reads the placement while it runs; the CPU set is a cell of the registry, which is shared by design.
-unsafe impl Sync for Placement {}
 
 impl Placement {
     /// A placement whose policy places nothing.
     pub fn new(registry: &UpstreamRegistry) -> Arc<Self> {
         Arc::new(Self {
-            policy: UnsafeCell::new(Box::new(no_placement)),
+            policy: SetBeforeStart::new(Box::new(no_placement)),
             cpus: registry.cell(),
         })
     }
@@ -69,8 +102,8 @@ impl Placement {
         &self,
         policy: impl Fn(&mut dyn Frame, &CpuSet) -> bool + Send + Sync + 'static,
     ) {
-        // SAFETY: the caller's contract: no reader exists, so this is the only access to the field.
-        unsafe { *self.policy.get() = Box::new(policy) };
+        // SAFETY: the caller's contract, passed on.
+        unsafe { self.policy.set(Box::new(policy)) };
     }
 
     /// Publishes the CPUs the policy is given from now on.
@@ -80,8 +113,7 @@ impl Placement {
 
     #[inline]
     fn policy(&self) -> &PlacementPolicy {
-        // SAFETY: the field is written only by `set_policy`, whose caller guarantees nothing reads while it runs.
-        unsafe { &**self.policy.get() }
+        &**self.policy.get()
     }
 
     /// Runs the policy on `frame`, reading the CPUs from `view`, the read the caller is already in (a vertex routes a

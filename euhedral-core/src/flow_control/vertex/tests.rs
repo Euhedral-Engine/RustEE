@@ -2297,6 +2297,38 @@ fn the_policys_return_decides_which_frames_a_pull_may_route() {
     interceptor.release(claim);
 }
 
+/// Reading the routing view makes the reading thread a reader of the registry, so a thread that is not one afterwards
+/// did not read it.
+#[test]
+fn with_no_policy_set_a_pull_reads_no_view_and_with_one_it_does() {
+    for policy in [false, true] {
+        let registry = registry();
+        let receiver = TestReceiver::new();
+        let vertex = placing_vertex(&registry, policy, receiver.clone());
+        let source = Arc::new(PullSource::default());
+        source
+            .frames
+            .lock()
+            .unwrap()
+            .extend((1..=6).map(unordered_frame));
+        let interceptor = vertex.ingest(source).unwrap();
+        assert!(!registry.is_reader());
+        let mut claim = interceptor.try_acquire().unwrap();
+        let mut direct = 0;
+        interceptor.pull(&mut claim, &mut |_| direct += 1, &mut |_| false, 10);
+        interceptor.release(claim);
+        assert_eq!(
+            registry.is_reader(),
+            policy,
+            "a pull reads the routing view exactly when a policy is set"
+        );
+        assert_eq!(direct + receiver.received().len(), 6);
+        if !policy {
+            assert_eq!(direct, 6);
+        }
+    }
+}
+
 #[test]
 fn without_a_policy_a_pull_hands_every_frame_to_the_fragments_consumer() {
     let registry = registry();

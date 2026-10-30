@@ -360,7 +360,7 @@ impl ControlPlaneLattice {
             return Err(LatticeError::Running);
         }
         // SAFETY: the lattice has not started, so no source has been ingested (`add_upstream` starts first and ingests
-        // after, and the controller is reachable by no other path): nothing routes through or pulls from the controller.
+        // after, and the controller is reachable by no other path): nothing routes through or pulls from the controller, and nothing reads the policy or the flag that says it was set.
         // The unlock below releases this write, and the lock that `start` takes in any `add_upstream` that follows
         // acquires it before the ingest, from which every thread that learns of the source follows.
         unsafe { self.controller.set_placement_policy(policy) };

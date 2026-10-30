@@ -87,14 +87,15 @@ start, a frame placed on an inactive core falls back to a hash, which can leave 
 CPUs the lattice reports as effective, not among those of cores that run a clone (publishing the latter would need the
 shards to tell the lattice when a core starts or stops, which is not small and is left out).
 
-**Cost.** Every lattice now has a policy (the default places nothing), so a push calls it through a plain pointer and a
-worker's pull holds one read of the routing view and wraps its consumer, where before a lattice with no policy paid one
-relaxed flag load. A light reader (an unregistered producer thread) pays one reference-count pair more per push, for the CPU
-set, and one per pull; a worker pays no read-modify-write on anything shared. Measured with the high-contention benchmark
-(23 sources, 31 workers, `system-run --system`, interleaved, three runs each): the head below this change, 437, 434, 436
-million ops/s; with this change and the default policy, 394, 412, 410 million (about 6% lower); with a policy that returns
-`false` (`--trivial-placement`), 411, 410, 407 million. The cost of the default is the wrapper, the held read and the
-indirect call; it is reported here and not worked around.
+**Cost.** Every lattice has a policy (the default places nothing), but the vertex keeps a plain `custom` flag, written with
+the policy before the start: while it is false a push and a pull skip everything placement-related (no policy call, no read of
+the view, no wrapper around the pull's consumer), and cost that one load. With a policy of its own set, a light reader (an
+unregistered producer thread) pays one reference-count pair more per push, for the CPU set, and one per pull; a worker pays no
+read-modify-write on anything shared. Measured with the high-contention benchmark (23 sources, 31 workers, `system-run
+--system`, interleaved): before the flag, with the default policy always run, the head below this change gave 437, 434, 436
+million ops/s and the default policy 394, 412, 410 (about 6% lower). After the flag, one interleaved round gave 420 for the head
+below, 443 with no policy set and 418 with a policy that returns `false` (`--trivial-placement`); the remaining rounds were not
+run, so the no-policy difference from the head below is still to be measured with three runs each.
 
 **Java.** None of this exists in Java (frames are routed by hash and routing policy only); there is nothing to mirror.
 
