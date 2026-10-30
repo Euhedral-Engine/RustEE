@@ -1035,6 +1035,19 @@ fn a_placement_policy_also_places_the_frames_a_worker_pulls_from_a_sink() {
             .unwrap();
         let sink = QueueIngestSink::new();
         let ran = Ran::default();
+        lattice.add_upstream(sink.delegate()).unwrap();
+        // A frame pulled before both cores are in the routing is placed for a core the routing does not have yet, and goes to
+        // the one it has: right for a frame in flight during a start-up, wrong for this test, which asserts where every frame
+        // ran. So the frames are offered only once both cores are active (a second worker can take longer to start than the
+        // first one's whole pull of a full sink: it did on Windows).
+        let deadline = Instant::now() + PATIENCE;
+        while lattice.active_workers() < 2 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        if lattice.active_workers() < 2 {
+            lattice.close();
+            return;
+        }
         for id in 0..FRAMES {
             let mut header = FrameHeader::new(id + 1);
             // The long calls first: they are what the cores pull directly.
@@ -1047,16 +1060,6 @@ fn a_placement_policy_also_places_the_frames_a_worker_pulls_from_a_sink() {
             }))
             .ok()
             .expect("the sink takes the frame");
-        }
-        lattice.add_upstream(sink.delegate()).unwrap();
-        // Frames sent before both cores are in the routing are routed by hash, as they should be.
-        let deadline = Instant::now() + PATIENCE;
-        while lattice.active_workers() < 2 && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(1));
-        }
-        if lattice.active_workers() < 2 {
-            lattice.close();
-            return;
         }
         wait_until("every frame to run", || {
             ran.lock().unwrap().len() == FRAMES as usize
