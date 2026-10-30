@@ -625,6 +625,26 @@ impl View<'_> {
         }
     }
 
+    /// The value in `cell` as an `Arc` the caller keeps beyond this read (one reference-count pair, once), for a
+    /// caller that would otherwise open a read for every use of it. Read like [`get`](Self::get).
+    pub fn get_arc<T: Send + Sync + 'static>(&self, cell: &Cell<T>) -> Option<Arc<T>> {
+        let value = match &self.source {
+            Source::Full(entries) => match entries.get(cell.id) {
+                Some(entry) if entry.epoch == cell.epoch => match &entry.slot {
+                    Slot::Full(value) => Some(value.clone()),
+                    Slot::Empty | Slot::Light(_) => None,
+                },
+                _ => cell.views.value(cell.id, cell.epoch),
+            },
+            Source::Light { state, .. } => match Self::upgrade(state, cell) {
+                Found::Value(value) => Some(value),
+                Found::Cold => cell.views.value(cell.id, cell.epoch),
+                Found::Nothing => None,
+            },
+        }?;
+        value.downcast::<T>().ok()
+    }
+
     /// The cell's current value under the lock, kept for the rest of the call.
     fn cold_get<T: Send + Sync + 'static>(&self, cell: &Cell<T>) -> Option<&T> {
         let mut cold = self.cold.take().unwrap_or_default();
@@ -898,6 +918,33 @@ mod tests {
     #[test]
     fn a_light_readers_nested_read_of_a_new_cell_finds_its_value() {
         check_nested_read_of_a_new_cell(false);
+    }
+
+    #[test]
+    fn get_arc_keeps_a_value_beyond_the_read_for_full_and_light_readers() {
+        for full in [true, false] {
+            let registry = registry();
+            let cell = registry.cell::<u64>();
+            registry.set_cell(&cell, Some(Arc::new(11)));
+            if full {
+                registry.register_reader();
+            }
+            let kept = registry.with_view(|view| view.get_arc(&cell));
+            assert_eq!(kept.as_deref(), Some(&11));
+            registry.set_cell(&cell, Some(Arc::new(12)));
+            assert_eq!(
+                kept.as_deref(),
+                Some(&11),
+                "the Arc outlives the replacement"
+            );
+            assert_eq!(
+                registry.with_view(|view| view.get_arc(&cell)).as_deref(),
+                Some(&12)
+            );
+            let empty = registry.cell::<u64>();
+            assert!(registry.with_view(|view| view.get_arc(&empty)).is_none());
+            registry.remove_reader();
+        }
     }
 
     #[test]

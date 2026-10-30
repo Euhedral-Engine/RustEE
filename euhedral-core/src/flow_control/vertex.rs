@@ -1001,9 +1001,10 @@ impl UpstreamHandle for UpstreamInterceptor {
             // is a closure on this stack; without a policy the fragment's consumer goes straight through.
             if vertex.placed.load(Ordering::Relaxed)
                 && let Some(placement) = &vertex.placement
+                && let Some(snapshot) = placement.snapshot(vertex.edge.registry())
             {
                 let mut place_or_route = |mut frame: Box<dyn Frame>| {
-                    placement.apply(vertex.edge.registry(), &mut *frame);
+                    snapshot.apply(&mut *frame);
                     if frame.header().origin().is_some() {
                         match vertex.route_frame(frame, false) {
                             Ok(()) => note_routed_push(),

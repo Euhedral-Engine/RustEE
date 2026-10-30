@@ -68,9 +68,35 @@ impl Placement {
         }
     }
 
+    /// The policy and the CPUs as of the calling thread's view now, kept for a stretch of work that places many frames
+    /// (a pull): two reference-count pairs once, instead of a read of the view for every frame. `None` while no policy
+    /// is set.
+    pub fn snapshot(&self, registry: &Arc<UpstreamRegistry>) -> Option<PlacementSnapshot> {
+        registry.with_view(|view| {
+            Some(PlacementSnapshot {
+                policy: view.get_arc(&self.policy)?,
+                cpus: view.get_arc(&self.cpus),
+            })
+        })
+    }
+
     /// Runs the policy on `frame` in a read of its own.
     pub fn apply(&self, registry: &Arc<UpstreamRegistry>, frame: &mut dyn Frame) {
         registry.with_view(|view| self.apply_in(view, frame));
+    }
+}
+
+/// A policy and the CPUs it was given, held for a stretch of work.
+pub struct PlacementSnapshot {
+    policy: Arc<PolicyBox>,
+    cpus: Option<Arc<CpuSet>>,
+}
+
+impl PlacementSnapshot {
+    /// Runs the policy on `frame`: no view is read.
+    #[inline]
+    pub fn apply(&self, frame: &mut dyn Frame) {
+        (self.policy.0)(frame, self.cpus.as_deref().unwrap_or(&NO_CPUS));
     }
 }
 
