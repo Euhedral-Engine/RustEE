@@ -10,13 +10,16 @@ mod decision_tree;
 mod fragment;
 mod lattice;
 mod participation;
+mod placement;
 mod shard;
 #[cfg(test)]
 pub(crate) mod testing;
 
+pub(crate) use cache::locality_allows;
 pub use cache::{CacheDirectory, ControlPlaneCache};
 pub use fragment::{ControlPlaneFragment, FragmentError};
 pub use lattice::{
     CacheReset, ControlPlaneLattice, LatticeError, UtilizationListener, UtilizationSource,
 };
+pub use placement::PlacementPicker;
 pub use shard::{ControlPlaneShard, RebalanceTimedOut};

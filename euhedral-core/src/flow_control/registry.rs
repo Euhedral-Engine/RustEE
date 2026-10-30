@@ -6,7 +6,7 @@ use euhedral_data_structures::sync::LifecycleMutex;
 use euhedral_hardware_utils::affinity;
 use euhedral_hardware_utils::topology::Topology;
 use euhedral_hardware_utils::util::CpuSet;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -30,6 +30,8 @@ struct ThreadQueue {
     cpu: Option<usize>,
     queue: Rc<RefCell<UpstreamQueue>>,
     producer: Producer<Entry, Multi>,
+    /// The (core, socket) the worker runs on, if it said (see [`UpstreamRegistry::set_worker_location`]).
+    location: Cell<Option<(usize, usize)>>,
 }
 
 impl Drop for ThreadQueue {
@@ -170,6 +172,27 @@ impl UpstreamRegistry {
         self.remove_reader();
     }
 
+    /// Records the (core, socket) the calling worker runs on, for the pull that reads it while its queue is in use (a
+    /// placement policy's wrapper asks where it is running). Call it after [`register`](Self::register).
+    pub fn set_worker_location(self: &Arc<Self>, core: usize, socket: usize) {
+        let _ = self.thread_queue(|| None, |queue| queue.location.set(Some((core, socket))));
+    }
+
+    /// The (core, socket) the calling thread said it runs on, if it did. Reads the thread's record without taking its
+    /// queue, so it works from inside a pull.
+    pub fn worker_location(&self) -> Option<(usize, usize)> {
+        THREAD_QUEUES
+            .try_with(|queues| {
+                queues
+                    .borrow()
+                    .iter()
+                    .find(|queue| queue.registry_id == self.id)
+                    .and_then(|queue| queue.location.get())
+            })
+            .ok()
+            .flatten()
+    }
+
     /// The number of live upstream handles.
     pub fn upstream_handle_count(&self) -> u64 {
         self.upstream_count.get_opaque().max(0) as u64
@@ -243,6 +266,7 @@ impl UpstreamRegistry {
             cpu,
             queue: Rc::new(RefCell::new(queue)),
             producer: handles.producer(),
+            location: Cell::new(None),
         }
     }
 

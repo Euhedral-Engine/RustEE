@@ -217,6 +217,8 @@ pub struct Options {
     pub pooled_frames: bool,
     /// Spins between two sums of the completion counter (rounded up to a power of two); upstream's value is 32.
     pub poll_spins: u32,
+    /// Sets a placement policy that places nothing, to measure what having one costs the frame path.
+    pub trivial_placement: bool,
 }
 
 impl Options {
@@ -233,6 +235,7 @@ impl Options {
             latency: true,
             pooled_frames: false,
             poll_spins: POLL_SPINS,
+            trivial_placement: false,
         }
     }
 }
@@ -382,6 +385,11 @@ pub fn run_fork(
     config.startup_timeout = Duration::from_secs(60);
     config.shutdown_timeout = Duration::from_secs(60);
     let lattice = ControlPlaneLattice::new(config).map_err(ForkError::Lattice)?;
+    if options.trivial_placement {
+        lattice
+            .set_placement_policy(|_, _| false)
+            .map_err(ForkError::Lattice)?;
+    }
     lattice.start().map_err(ForkError::Lattice)?;
     for source in &sources {
         lattice

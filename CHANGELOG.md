@@ -47,6 +47,63 @@ thread offers to, and its entry is the caller's.
 models of an offer racing a drain, two completions racing, and a dropped slot racing a completion (each fails if the
 `missed` loop is removed; the order queue is not modelled).
 
+## Placement policy (2026-10-29)
+
+**What.**
+- `ControlPlaneLattice::set_placement_policy(policy)`: one callback (not a registry) that runs first on every frame the
+  lattice routes, before the shard and the core are chosen. It sees the frame and `&CpuSet`, the CPUs the lattice routes
+  with now, and says where the frame goes by setting its origin and a cache-local routing policy; the routing that
+  follows honours them. **The policy returns a `bool`: `true` when it placed the frame.** A lattice always has a policy:
+  until one is set, it is a function that places nothing and returns `false`. It can be set only before the lattice
+  starts (`LatticeError::Running` once started, `LatticeError::Closed` once closed, since a close returns while frames it
+  admitted may still be winding down); a later call before the start replaces the earlier one. The policy is a plain
+  field of the controller vertex, written before any source is ingested, so a frame reads it with no atomic and no view;
+  the start, which every ingest follows, is what makes the write visible to the threads that read it.
+- **The pull path.** A worker's pull from a source takes frames without the lattice's routing, so the interceptor's pull
+  wraps the consumer the fragment passes in: each frame the source hands over is run through the policy. A frame the
+  policy placed (it returned `true`) on a core other than the puller's, and kept there (a cache-local or socket-local frame whose origin the
+  puller does not match), goes through the interceptor's push, the routing, which honours the origin; every other frame
+  reaches the fragment's consumer on the core it is already on. The pull runs inside one read of the routing view
+  (`Placement::within`), so a worker reads the CPUs once per pull, with no read-modify-write on anything
+  shared. Where the puller runs is the (core, socket) its fragment recorded when it registered
+  (`UpstreamRegistry::set_worker_location`); a thread that did not say routes every frame the policy placed. The wrapper
+  is a stack closure. Ordered frames stop the fragment's pull before they reach its consumer, as before.
+- **Concurrency.** The policy is `Fn + Send + Sync + 'static`, never `FnMut`: it runs on the frame path, from every
+  thread that routes frames, at the same time. It must be re-entrant, take no lock, not allocate and not block; what it
+  reads is the caller's to make safe to read from many threads.
+- **The CPU set** is passed by reference, from the lattice's current routing snapshot, not by value: `CpuSet` is
+  vector-backed, so a clone per frame would allocate on the frame path. The snapshot is a cell of the registry, republished
+  when the effective topology changes, and the policy reads it from the thread's view with no lock.
+- `PlacementPicker` implements the common policy (it returns `true` when it set an origin): a predicate on the frame chooses CPU set A or B; the chosen set is
+  intersected with the lattice's; the nth CPU of the intersection is picked by `unsigned_multiply_high(routing_hash,
+  count)`, and the frame's origin becomes that CPU, cache-local. No lock, no allocation (`CpuSet::intersection_len` and
+  `nth_of_intersection` work word by word). A frame whose chosen set shares no CPU with the lattice's keeps its origin.
+- `TopologyMapper::effective_cpus()`: the effective CPU set, public.
+- `LatticeVertex::with_placement` / `flow_control::Placement`: the hook a vertex runs before its routing function.
+  `set_policy` and `LatticeVertex::set_placement_policy` are `unsafe`: the caller guarantees nothing reads while they run.
+
+**Limit.** The routing honours the origin only while the origin's core is active; during a rebalance, or after a clone failed to
+start, a frame placed on an inactive core falls back to a hash, which can leave the chosen set. The policy chooses among the
+CPUs the lattice reports as effective, not among those of cores that run a clone (publishing the latter would need the
+shards to tell the lattice when a core starts or stops, which is not small and is left out).
+
+**Cost.** Every lattice has a policy (the default places nothing), but the vertex keeps a plain `custom` flag, written with
+the policy before the start: while it is false a push and a pull skip everything placement-related (no policy call, no read of
+the view, no wrapper around the pull's consumer), and cost that one load. With a policy of its own set, a light reader (an
+unregistered producer thread) pays one reference-count pair more per push, for the CPU set, and one per pull; a worker pays no
+read-modify-write on anything shared. Measured with the high-contention benchmark (23 sources, 31 workers, `system-run
+--system`, interleaved): before the flag, with the default policy always run, the head below this change gave 437, 434, 436
+million ops/s and the default policy 394, 412, 410 (about 6% lower). After the flag, one interleaved round gave 420 for the head
+below, 443 with no policy set and 418 with a policy that returns `false` (`--trivial-placement`); the remaining rounds were not
+run, so the no-policy difference from the head below is still to be measured with three runs each.
+
+**Java.** None of this exists in Java (frames are routed by hash and routing policy only); there is nothing to mirror.
+
+**Tests.** The policy is settable only before the start (and refused after a close); it runs first and sees the unrouted frame and the effective CPUs;
+frames land on the picked core; long calls land in set A and ordered lanes never do while every core is active; eight threads route at once;
+placing allocates nothing (`tests/placement_alloc.rs`: the picker, and the policy read from a registered and from a light
+reader).
+
 ## Lane source gaps from the first consumer (2026-10-29)
 
 **What.**

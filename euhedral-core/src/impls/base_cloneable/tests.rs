@@ -965,3 +965,120 @@ fn metrics_overhead_per_frame() {
         );
     }
 }
+
+/// Records whether it was a long call (unordered) and the CPU it ran on.
+type Ran = Arc<Mutex<Vec<(bool, Option<usize>)>>>;
+
+struct Classified {
+    header: FrameHeader,
+    ran: Ran,
+}
+
+impl Frame for Classified {
+    fn header(&self) -> &FrameHeader {
+        &self.header
+    }
+
+    fn header_mut(&mut self) -> &mut FrameHeader {
+        &mut self.header
+    }
+
+    fn execute(&mut self) -> Result<(), FrameError> {
+        let long = !self.header.is_ordered();
+        self.ran
+            .lock()
+            .unwrap()
+            .push((long, affinity::current_cpu()));
+        // Work to do, so that every core that can take a frame is busy and the others look for more.
+        let until = Instant::now() + Duration::from_micros(20);
+        while Instant::now() < until {
+            std::hint::spin_loop();
+        }
+        Ok(())
+    }
+}
+
+/// A worker's pull from an ingest sink takes frames straight from the source, without the lattice's routing, so the
+/// interceptor's pull places them: a long call (an unordered frame) belongs on the cores of set A, an ordered frame on
+/// those of set B. The sink is full of long calls first, which are what the cores pull directly.
+#[test]
+fn a_placement_policy_also_places_the_frames_a_worker_pulls_from_a_sink() {
+    use crate::control_plane::PlacementPicker;
+    use crate::ingest::QueueIngestSink;
+
+    const FRAMES: u64 = if cfg!(miri) { 40 } else { 6_000 };
+    let Some([(_, set_a), (_, set_b)]) = two_cores() else {
+        return;
+    };
+    let cpus: Vec<usize> = set_a.iter().chain(&set_b).copied().collect();
+    for fragment in [FragmentConfig::default(), polling()] {
+        let _turn = pinned_turn();
+        let mut config = LatticeConfig::new(Arc::new(BaseCloneableObject::new(
+            fragment,
+            DefaultExecutor::new(),
+        )));
+        config.name = "placed".into();
+        config.allowed_cpus = cpus.iter().copied().collect();
+        config.startup_timeout = PATIENCE;
+        config.shutdown_timeout = PATIENCE;
+        let lattice = ControlPlaneLattice::new(config).unwrap();
+        lattice
+            .set_placement_policy(
+                PlacementPicker::new(
+                    Topology::system().clone(),
+                    |frame: &dyn Frame| !frame.header().is_ordered(),
+                    set_a.iter().copied().collect(),
+                    set_b.iter().copied().collect(),
+                )
+                .into_policy(),
+            )
+            .unwrap();
+        let sink = QueueIngestSink::new();
+        let ran = Ran::default();
+        for id in 0..FRAMES {
+            let mut header = FrameHeader::new(id + 1);
+            // The long calls first: they are what the cores pull directly.
+            if id < FRAMES / 2 {
+                header.randomize_hash(id + 7);
+            }
+            sink.offer(Box::new(Classified {
+                header,
+                ran: ran.clone(),
+            }))
+            .ok()
+            .expect("the sink takes the frame");
+        }
+        lattice.add_upstream(sink.delegate()).unwrap();
+        // Frames sent before both cores are in the routing are routed by hash, as they should be.
+        let deadline = Instant::now() + PATIENCE;
+        while lattice.active_workers() < 2 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        if lattice.active_workers() < 2 {
+            lattice.close();
+            return;
+        }
+        wait_until("every frame to run", || {
+            ran.lock().unwrap().len() == FRAMES as usize
+        });
+        lattice.close();
+        let ran = ran.lock().unwrap().clone();
+        let on = |set: &[usize], cpu: Option<usize>| cpu.is_some_and(|cpu| set.contains(&cpu));
+        assert_eq!(
+            ran.iter().filter(|(long, _)| *long).count(),
+            FRAMES as usize / 2
+        );
+        assert!(
+            ran.iter()
+                .filter(|(long, _)| *long)
+                .all(|(_, cpu)| on(&set_a, *cpu)),
+            "a long call ran off set A"
+        );
+        assert!(
+            ran.iter()
+                .filter(|(long, _)| !*long)
+                .all(|(_, cpu)| on(&set_b, *cpu)),
+            "an ordered frame ran on set A"
+        );
+    }
+}

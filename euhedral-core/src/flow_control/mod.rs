@@ -13,6 +13,7 @@
 mod edge;
 mod hot_receiver;
 mod hot_source;
+mod placement;
 mod registry;
 #[cfg(test)]
 pub(crate) mod testing;
@@ -23,6 +24,7 @@ mod views;
 pub use edge::{LatticeEdge, LatticeNode, Retirement};
 pub use hot_receiver::{LatticeHotReceiver, PushHook, Response};
 pub use hot_source::LatticeHotSource;
+pub use placement::{Placement, PlacementPolicy, PlacementView, SetBeforeStart};
 pub use registry::UpstreamRegistry;
 pub use upstream_queue::{
     Claim, PullBucketDivisionMode, UpstreamHandle, UpstreamQueue, decay_contention,

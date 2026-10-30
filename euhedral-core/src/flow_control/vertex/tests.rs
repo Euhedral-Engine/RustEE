@@ -1,8 +1,9 @@
 use super::*;
-use crate::flow_control::LatticeHotSource;
 use crate::flow_control::testing::{Fate, Fates, TestReceiver, Tracked, frame};
+use crate::flow_control::{LatticeHotSource, RoutingPolicy};
 use crate::frames::BenchmarkFrame;
 use crate::generics::{DownstreamSlot, LatticeTerminal, SourceCell};
+use euhedral_hardware_utils::topology::CpuInfo;
 use euhedral_hardware_utils::util::CpuSet;
 use std::sync::atomic::AtomicUsize;
 use std::sync::mpsc;
@@ -2079,4 +2080,369 @@ fn lifecycle_calls_from_another_thread_touch_only_atomics_and_take_effect_on_the
     source.hold.wait();
     second.join().unwrap();
     assert_eq!(Arc::strong_count(&source), 1, "released with the claim");
+}
+
+// ---------------------------------------------------------------------------------------------
+// The placement policy on a source's pull.
+
+/// A source whose pull hands out the frames it was given, as an ingest sink does, and whose request pushes nothing.
+#[derive(Default)]
+struct PullSource {
+    frames: Mutex<std::collections::VecDeque<Box<dyn Frame>>>,
+}
+
+impl LatticeSource for PullSource {
+    fn add_downstream(self: Arc<Self>, _downstream: Arc<dyn LatticeReceiver>) {}
+
+    fn pull(
+        &self,
+        consumer: &mut dyn FnMut(Box<dyn Frame>),
+        stop: &mut dyn FnMut(&dyn Frame) -> bool,
+        demand: u64,
+    ) -> u64 {
+        let mut frames = self.frames.lock().unwrap();
+        let mut pulled = 0;
+        while pulled < demand {
+            match frames.front() {
+                Some(frame) if !stop(&**frame) => {
+                    consumer(frames.pop_front().unwrap());
+                    pulled += 1;
+                }
+                _ => break,
+            }
+        }
+        pulled
+    }
+
+    fn request(&self, _demand: u64) {}
+
+    fn complete(&self) {}
+
+    fn is_complete(&self) -> bool {
+        false
+    }
+}
+
+/// A vertex with a placement, one active downstream below `receiver`, and a policy that places the frames by id (see the
+/// comment in the policy).
+fn placing_vertex(
+    registry: &Arc<UpstreamRegistry>,
+    policy: bool,
+    receiver: Arc<dyn LatticeReceiver>,
+) -> Arc<LatticeVertex> {
+    let vertex = LatticeVertex::with_placement(
+        registry,
+        "placing",
+        1,
+        Placement::new(registry),
+        |frame, state| route_by_hash(frame, state.len()),
+    );
+    let edge = LatticeEdge::new(registry, Arc::new(AtomicBool::new(false)));
+    edge.add_downstream(receiver);
+    assert!(map(&vertex, &[0], &[node(&edge)]));
+    if policy {
+        // The even ids go to core 1, which the puller (core 0) is not on, and must stay there; the ids 1 and 5 go to the
+        // puller's own core; the ids 3 and 9 go to core 1 but may run anywhere.
+        // SAFETY: the vertex has no source yet.
+        assert!(unsafe {
+            vertex.set_placement_policy(|frame, _| {
+                let id = frame.header().id_hash();
+                let (core, policy) = if id.is_multiple_of(2) {
+                    (1, RoutingPolicy::CacheLocal)
+                } else if id.is_multiple_of(3) {
+                    (1, RoutingPolicy::Anywhere)
+                } else {
+                    (0, RoutingPolicy::CacheLocal)
+                };
+                let header = frame.header_mut();
+                header.set_origin(Some(CpuInfo {
+                    cpu: core,
+                    core,
+                    socket: 0,
+                }));
+                header.set_routing_policy(policy);
+                true
+            })
+        });
+    }
+    vertex
+}
+
+/// Keeps the frames that reach it, to hand them back.
+#[derive(Default)]
+struct Recycler {
+    frames: Mutex<Vec<Box<dyn Frame>>>,
+}
+
+impl LatticeTerminal for Recycler {
+    fn add_upstream(&self, _upstream: Arc<dyn LatticeSource>) {}
+}
+
+impl LatticeReceiver for Recycler {
+    fn push(&self, frame: Box<dyn Frame>) {
+        self.frames.lock().unwrap().push(frame);
+    }
+
+    fn on_complete(&self) {}
+
+    fn on_error(&self, _error: Failure) {}
+}
+
+fn unordered_frame(id: u64) -> Box<dyn Frame> {
+    let mut frame = BenchmarkFrame::new(id, None);
+    frame.header_mut().randomize_hash(1);
+    Box::new(frame)
+}
+
+#[test]
+fn a_pull_runs_the_frames_placed_on_its_core_and_routes_the_ones_placed_elsewhere() {
+    let registry = registry();
+    registry.register();
+    registry.set_worker_location(0, 0);
+    let receiver = TestReceiver::new();
+    let vertex = placing_vertex(&registry, true, receiver.clone());
+    let source = Arc::new(PullSource::default());
+    source
+        .frames
+        .lock()
+        .unwrap()
+        .extend((1..=6).map(unordered_frame));
+    let interceptor = vertex.ingest(source.clone()).unwrap();
+    let mut claim = interceptor.try_acquire().unwrap();
+    let mut direct = Vec::new();
+    let pulled = interceptor.pull(
+        &mut claim,
+        &mut |frame| direct.push(frame.header().id_hash()),
+        &mut |_| false,
+        10,
+    );
+    assert_eq!(pulled, Some(6));
+    // The frames placed on the puller's core, and the one that may run anywhere, reached the fragment's consumer; the
+    // even ones, placed on another core and kept there, went through the routing.
+    assert_eq!(direct, [1, 3, 5]);
+    let mut routed = receiver.received();
+    routed.sort_unstable();
+    assert_eq!(routed, [2, 4, 6]);
+    interceptor.release(claim);
+}
+
+#[test]
+fn a_pull_whose_thread_did_not_say_where_it_runs_routes_every_frame_that_has_an_origin() {
+    let registry = registry();
+    registry.register();
+    let receiver = TestReceiver::new();
+    let vertex = placing_vertex(&registry, true, receiver.clone());
+    let source = Arc::new(PullSource::default());
+    source
+        .frames
+        .lock()
+        .unwrap()
+        .extend((1..=6).map(unordered_frame));
+    let interceptor = vertex.ingest(source).unwrap();
+    let mut claim = interceptor.try_acquire().unwrap();
+    let mut direct = Vec::new();
+    interceptor.pull(
+        &mut claim,
+        &mut |frame| direct.push(frame.header().id_hash()),
+        &mut |_| false,
+        10,
+    );
+    assert!(direct.is_empty());
+    let mut routed = receiver.received();
+    routed.sort_unstable();
+    assert_eq!(routed, [1, 2, 3, 4, 5, 6]);
+    interceptor.release(claim);
+}
+
+#[test]
+fn the_policys_return_decides_which_frames_a_pull_may_route() {
+    let registry = registry();
+    registry.register();
+    registry.set_worker_location(0, 0);
+    let receiver = TestReceiver::new();
+    let vertex = placing_vertex(&registry, false, receiver.clone());
+    // SAFETY: the vertex has no source yet.
+    assert!(unsafe {
+        vertex.set_placement_policy(|frame, _| {
+            // Every frame gets an origin on another core, but the policy says it placed only the ones above 3.
+            let header = frame.header_mut();
+            header.set_origin(Some(CpuInfo {
+                cpu: 1,
+                core: 1,
+                socket: 0,
+            }));
+            header.set_routing_policy(RoutingPolicy::CacheLocal);
+            header.id_hash() > 3
+        })
+    });
+    let source = Arc::new(PullSource::default());
+    source
+        .frames
+        .lock()
+        .unwrap()
+        .extend((1..=6).map(unordered_frame));
+    let interceptor = vertex.ingest(source).unwrap();
+    let mut claim = interceptor.try_acquire().unwrap();
+    let mut direct = Vec::new();
+    interceptor.pull(
+        &mut claim,
+        &mut |frame| direct.push(frame.header().id_hash()),
+        &mut |_| false,
+        10,
+    );
+    assert_eq!(direct, [1, 2, 3]);
+    let mut routed = receiver.received();
+    routed.sort_unstable();
+    assert_eq!(routed, [4, 5, 6]);
+    interceptor.release(claim);
+}
+
+/// Reading the routing view makes the reading thread a reader of the registry, so a thread that is not one afterwards
+/// did not read it.
+#[test]
+fn with_no_policy_set_a_pull_reads_no_view_and_with_one_it_does() {
+    for policy in [false, true] {
+        let registry = registry();
+        let receiver = TestReceiver::new();
+        let vertex = placing_vertex(&registry, policy, receiver.clone());
+        let source = Arc::new(PullSource::default());
+        source
+            .frames
+            .lock()
+            .unwrap()
+            .extend((1..=6).map(unordered_frame));
+        let interceptor = vertex.ingest(source).unwrap();
+        assert!(!registry.is_reader());
+        let mut claim = interceptor.try_acquire().unwrap();
+        let mut direct = 0;
+        interceptor.pull(&mut claim, &mut |_| direct += 1, &mut |_| false, 10);
+        interceptor.release(claim);
+        assert_eq!(
+            registry.is_reader(),
+            policy,
+            "a pull reads the routing view exactly when a policy is set"
+        );
+        assert_eq!(direct + receiver.received().len(), 6);
+        if !policy {
+            assert_eq!(direct, 6);
+        }
+    }
+}
+
+#[test]
+fn without_a_policy_a_pull_hands_every_frame_to_the_fragments_consumer() {
+    let registry = registry();
+    registry.register();
+    let receiver = TestReceiver::new();
+    let vertex = placing_vertex(&registry, false, receiver.clone());
+    let source = Arc::new(PullSource::default());
+    source
+        .frames
+        .lock()
+        .unwrap()
+        .extend((1..=6).map(unordered_frame));
+    let interceptor = vertex.ingest(source).unwrap();
+    let mut claim = interceptor.try_acquire().unwrap();
+    let mut direct = Vec::new();
+    interceptor.pull(
+        &mut claim,
+        &mut |frame| direct.push(frame.header().id_hash()),
+        &mut |_| false,
+        10,
+    );
+    assert_eq!(direct, [1, 2, 3, 4, 5, 6]);
+    assert!(receiver.received().is_empty());
+    interceptor.release(claim);
+}
+
+/// Counts the allocations of the thread that asks, so that tests running beside it do not disturb the count.
+mod counting {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    thread_local! {
+        static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) struct Counting;
+
+    // SAFETY: every call is forwarded unchanged to the system allocator; the counter is a thread-local cell.
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let _ = ALLOCATIONS.try_with(|count| count.set(count.get() + 1));
+            // SAFETY: the caller's contract, forwarded.
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            // SAFETY: the caller's contract, forwarded.
+            unsafe { System.dealloc(ptr, layout) }
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            let _ = ALLOCATIONS.try_with(|count| count.set(count.get() + 1));
+            // SAFETY: the caller's contract, forwarded.
+            unsafe { System.realloc(ptr, layout, new_size) }
+        }
+    }
+
+    pub(super) fn allocations() -> usize {
+        ALLOCATIONS.with(Cell::get)
+    }
+}
+
+#[global_allocator]
+static COUNTING: counting::Counting = counting::Counting;
+
+/// A pull allocates what it did without a policy, which is nothing: placing and routing a pulled frame add no allocation.
+#[test]
+fn placing_a_pulled_frame_allocates_nothing() {
+    fn allocations_of_pulls(policy: bool) -> usize {
+        let registry = registry();
+        registry.register();
+        registry.set_worker_location(0, 0);
+        let receiver = Arc::new(Recycler::default());
+        receiver.frames.lock().unwrap().reserve(512);
+        let vertex = placing_vertex(&registry, policy, receiver.clone());
+        let source = Arc::new(PullSource::default());
+        source.frames.lock().unwrap().reserve(512);
+        let interceptor = vertex.ingest(source.clone()).unwrap();
+        let mut pool: Vec<Box<dyn Frame>> = (1..=512).map(unordered_frame).collect();
+        let mut direct: Vec<Box<dyn Frame>> = Vec::with_capacity(512);
+        let mut claim = interceptor.try_acquire().unwrap();
+        let mut round = |pool: &mut Vec<Box<dyn Frame>>, direct: &mut Vec<Box<dyn Frame>>| {
+            source.frames.lock().unwrap().extend(pool.drain(..));
+            interceptor.pull(
+                &mut claim,
+                &mut |frame| direct.push(frame),
+                &mut |_| false,
+                512,
+            );
+            // The frames come back: the ones the fragment got, and the ones the routing delivered.
+            pool.append(direct);
+            pool.append(&mut receiver.frames.lock().unwrap());
+        };
+        // Warm-up: the first pulls make the worker's queue, grow the buffers.
+        for _ in 0..3 {
+            round(&mut pool, &mut direct);
+        }
+        let before = counting::allocations();
+        for _ in 0..30 {
+            round(&mut pool, &mut direct);
+        }
+        counting::allocations() - before
+    }
+    // The counter sees allocations at all.
+    let probe = counting::allocations();
+    drop(std::hint::black_box(Box::new(7u64)));
+    assert!(
+        counting::allocations() > probe,
+        "the counting allocator is live"
+    );
+    assert_eq!(allocations_of_pulls(false), 0, "a pull allocates nothing");
+    assert_eq!(
+        allocations_of_pulls(true),
+        0,
+        "and placing and routing the frames it pulls allocate nothing"
+    );
 }

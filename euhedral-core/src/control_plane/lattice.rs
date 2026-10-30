@@ -3,8 +3,8 @@ use super::countdown::Countdown;
 use super::shard::{ControlPlaneShard, RebalanceTimedOut, nodes};
 use crate::config::LatticeConfig;
 use crate::flow_control::{
-    LatticeEdge, LatticeNode, LatticeVertex, RoutingPolicy, RoutingState, UpstreamInterceptor,
-    UpstreamRegistry, route_by_hash,
+    LatticeEdge, LatticeNode, LatticeVertex, Placement, RoutingPolicy, RoutingState,
+    UpstreamInterceptor, UpstreamRegistry, route_by_hash,
 };
 use crate::frames::Frame;
 use crate::generics::LatticeSource;
@@ -18,9 +18,10 @@ use euhedral_hardware_utils::monitor::{
 use euhedral_hardware_utils::topology::{
     EffectiveSocketTopology, EffectiveSystemTopology, TopologyMapper,
 };
+use euhedral_hardware_utils::util::CpuSet;
 use std::error::Error;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 #[allow(
     clippy::disallowed_types,
@@ -83,6 +84,8 @@ pub enum LatticeError {
     ZeroTimeout,
     /// The lattice or one of its shards was still rebalancing at a reset's deadline.
     RebalanceTimedOut(RebalanceTimedOut),
+    /// The lattice is running, and the operation needs it shut down.
+    Running,
 }
 
 impl fmt::Display for LatticeError {
@@ -95,6 +98,7 @@ impl fmt::Display for LatticeError {
             Self::ResetInProgress => f.write_str("a lattice reset is already in progress"),
             Self::ZeroTimeout => f.write_str("a reset needs a positive timeout"),
             Self::RebalanceTimedOut(error) => error.fmt(f),
+            Self::Running => f.write_str("the lattice is running; it must be shut down first"),
         }
     }
 }
@@ -142,6 +146,10 @@ pub struct ControlPlaneLattice {
     mapper: Arc<TopologyMapper>,
     source: Arc<dyn UtilizationSource>,
     controller: Arc<LatticeVertex>,
+    /// The placement policy that runs first on every frame the global distributor routes, and the CPUs it is given.
+    placement: Arc<Placement>,
+    /// The topology version whose effective CPUs the placement was last given. Written under `updating`.
+    placed_version: AtomicU64,
     shards: Vec<Arc<ControlPlaneShard>>,
     pool: TaskPool,
     #[allow(clippy::disallowed_types, reason = "HOT-FIX(C18)")]
@@ -200,10 +208,12 @@ impl ControlPlaneLattice {
                 )
             })
             .collect();
-        let controller = LatticeVertex::with_routing(
+        let placement = Placement::new(&registry);
+        let controller = LatticeVertex::with_placement(
             &registry,
             format!("{name}-GlobalDistributor"),
             sockets,
+            placement.clone(),
             route_to_socket,
         );
         let lattice = Arc::new_cyclic(|this| Self {
@@ -212,6 +222,8 @@ impl ControlPlaneLattice {
             config,
             source: source.clone(),
             controller,
+            placement,
+            placed_version: AtomicU64::new(u64::MAX),
             shards,
             state: Mutex::new(State {
                 primed: false,
@@ -304,6 +316,57 @@ impl ControlPlaneLattice {
         self.controller.edge().registry()
     }
 
+    /// Sets the placement policy: one callback that runs first on every frame the lattice routes, before the shard and
+    /// the core are chosen. It sees the frame and the CPUs the lattice routes with now (a snapshot that is not cloned
+    /// per frame), and says where the frame goes by setting its origin and a cache-local routing policy, which the
+    /// routing that follows honours. [`PlacementPicker`](super::PlacementPicker) builds the common policy.
+    ///
+    /// The policy runs on the frame path, from every thread that routes frames, at the same time: it is `Fn`, not
+    /// `FnMut`, and must be re-entrant, take no lock, not allocate and not block. Anything it reads is the caller's to
+    /// make safe to read from many threads.
+    ///
+    /// The policy returns `true` when it placed the frame (set its origin and routing policy). Until one is set, the
+    /// lattice has a policy that places nothing and returns `false`.
+    ///
+    /// It can be set only before the lattice starts, once or more (the last one stands): it is a plain field the frame
+    /// path reads with no atomic. A lattice that is running, or has been closed (close returns while frames it admitted
+    /// may still be winding down), refuses it.
+    ///
+    /// The policy covers pushed and pulled frames alike: a frame a source pushes is placed when the lattice routes it,
+    /// and a frame a worker pulls from a source is placed as it comes out of the source's pull, before the worker's
+    /// own consumer sees it. A frame the policy gives an origin goes through the routing, which honours the origin;
+    /// the others reach the worker's consumer as they would without a policy. Producers do not have to place their
+    /// frames.
+    ///
+    /// The routing honours the origin only while the origin's core is active. During a rebalance, or after a clone failed
+    /// to start, a frame placed on an inactive core falls back to a hash over the active cores (and sockets), which can
+    /// move it out of the set the policy chose; the policy chooses among the CPUs the lattice reports as effective, not
+    /// among those of cores that are running a clone.
+    ///
+    /// # Errors
+    ///
+    /// [`LatticeError::Running`] once the lattice has started, [`LatticeError::Closed`] once it is closed.
+    pub fn set_placement_policy(
+        &self,
+        policy: impl Fn(&mut dyn Frame, &CpuSet) -> bool + Send + Sync + 'static,
+    ) -> Result<(), LatticeError> {
+        // `start` holds this lock from before it ever starts the source until it has set the flag, and nothing sets the
+        // flag back.
+        let started = self.started.lock();
+        if self.closed.load(Ordering::Acquire) {
+            return Err(LatticeError::Closed);
+        }
+        if *started {
+            return Err(LatticeError::Running);
+        }
+        // SAFETY: the lattice has not started, so no source has been ingested (`add_upstream` starts first and ingests
+        // after, and the controller is reachable by no other path): nothing routes through or pulls from the controller, and nothing reads the policy or the flag that says it was set.
+        // The unlock below releases this write, and the lock that `start` takes in any `add_upstream` that follows
+        // acquires it before the ingest, from which every thread that learns of the source follows.
+        unsafe { self.controller.set_placement_policy(policy) };
+        Ok(())
+    }
+
     /// Starts the lattice if needed, then feeds it from `source`.
     pub fn add_upstream(
         &self,
@@ -328,6 +391,13 @@ impl ControlPlaneLattice {
         let _updating = self.updating.lock().unwrap_or_else(PoisonError::into_inner);
         self.mapper.update_from(utilization);
         let topology = self.mapper.effective_topology();
+        // The placement policy is given the CPUs the lattice routes with now. `updating` makes this the only writer.
+        if self.placed_version.load(Ordering::Relaxed) != topology.global_version {
+            self.placement
+                .publish_cpus(self.registry(), topology.effective_cpus.clone());
+            self.placed_version
+                .store(topology.global_version, Ordering::Relaxed);
+        }
         let (version, active) = {
             let state = self.lock();
             (state.version, state.active.clone())
