@@ -1,6 +1,6 @@
 use super::*;
-use crate::flow_control::LatticeHotSource;
 use crate::flow_control::testing::{Fate, Fates, TestReceiver, Tracked, frame};
+use crate::flow_control::{LatticeHotSource, RoutingPolicy};
 use crate::frames::BenchmarkFrame;
 use crate::generics::{DownstreamSlot, LatticeTerminal, SourceCell};
 use euhedral_hardware_utils::topology::CpuInfo;
@@ -2123,7 +2123,8 @@ impl LatticeSource for PullSource {
     }
 }
 
-/// A vertex with a placement, one active downstream below `receiver`, and a policy that places the even ids.
+/// A vertex with a placement, one active downstream below `receiver`, and a policy that places the frames by id (see the
+/// comment in the policy).
 fn placing_vertex(
     registry: &Arc<UpstreamRegistry>,
     policy: bool,
@@ -2140,15 +2141,29 @@ fn placing_vertex(
     edge.add_downstream(receiver);
     assert!(map(&vertex, &[0], &[node(&edge)]));
     if policy {
-        assert!(vertex.set_placement_policy(|frame, _| {
-            if frame.header().id_hash().is_multiple_of(2) {
-                frame.header_mut().set_origin(Some(CpuInfo {
-                    cpu: 0,
-                    core: 0,
+        // The even ids go to core 1, which the puller (core 0) is not on, and must stay there; the ids 1 and 5 go to the
+        // puller's own core; the ids 3 and 9 go to core 1 but may run anywhere.
+        // SAFETY: the vertex has no source yet.
+        assert!(unsafe {
+            vertex.set_placement_policy(|frame, _| {
+                let id = frame.header().id_hash();
+                let (core, policy) = if id.is_multiple_of(2) {
+                    (1, RoutingPolicy::CacheLocal)
+                } else if id.is_multiple_of(3) {
+                    (1, RoutingPolicy::Anywhere)
+                } else {
+                    (0, RoutingPolicy::CacheLocal)
+                };
+                let header = frame.header_mut();
+                header.set_origin(Some(CpuInfo {
+                    cpu: core,
+                    core,
                     socket: 0,
                 }));
-            }
-        }));
+                header.set_routing_policy(policy);
+                true
+            })
+        });
     }
     vertex
 }
@@ -2180,9 +2195,10 @@ fn unordered_frame(id: u64) -> Box<dyn Frame> {
 }
 
 #[test]
-fn a_pull_places_each_frame_and_routes_the_ones_the_policy_gave_an_origin() {
+fn a_pull_runs_the_frames_placed_on_its_core_and_routes_the_ones_placed_elsewhere() {
     let registry = registry();
     registry.register();
+    registry.set_worker_location(0, 0);
     let receiver = TestReceiver::new();
     let vertex = placing_vertex(&registry, true, receiver.clone());
     let source = Arc::new(PullSource::default());
@@ -2201,11 +2217,83 @@ fn a_pull_places_each_frame_and_routes_the_ones_the_policy_gave_an_origin() {
         10,
     );
     assert_eq!(pulled, Some(6));
-    // The odd ids reached the fragment's consumer as before; the even ones, placed, went through the routing.
+    // The frames placed on the puller's core, and the one that may run anywhere, reached the fragment's consumer; the
+    // even ones, placed on another core and kept there, went through the routing.
     assert_eq!(direct, [1, 3, 5]);
     let mut routed = receiver.received();
     routed.sort_unstable();
     assert_eq!(routed, [2, 4, 6]);
+    interceptor.release(claim);
+}
+
+#[test]
+fn a_pull_whose_thread_did_not_say_where_it_runs_routes_every_frame_that_has_an_origin() {
+    let registry = registry();
+    registry.register();
+    let receiver = TestReceiver::new();
+    let vertex = placing_vertex(&registry, true, receiver.clone());
+    let source = Arc::new(PullSource::default());
+    source
+        .frames
+        .lock()
+        .unwrap()
+        .extend((1..=6).map(unordered_frame));
+    let interceptor = vertex.ingest(source).unwrap();
+    let mut claim = interceptor.try_acquire().unwrap();
+    let mut direct = Vec::new();
+    interceptor.pull(
+        &mut claim,
+        &mut |frame| direct.push(frame.header().id_hash()),
+        &mut |_| false,
+        10,
+    );
+    assert!(direct.is_empty());
+    let mut routed = receiver.received();
+    routed.sort_unstable();
+    assert_eq!(routed, [1, 2, 3, 4, 5, 6]);
+    interceptor.release(claim);
+}
+
+#[test]
+fn the_policys_return_decides_which_frames_a_pull_may_route() {
+    let registry = registry();
+    registry.register();
+    registry.set_worker_location(0, 0);
+    let receiver = TestReceiver::new();
+    let vertex = placing_vertex(&registry, false, receiver.clone());
+    // SAFETY: the vertex has no source yet.
+    assert!(unsafe {
+        vertex.set_placement_policy(|frame, _| {
+            // Every frame gets an origin on another core, but the policy says it placed only the ones above 3.
+            let header = frame.header_mut();
+            header.set_origin(Some(CpuInfo {
+                cpu: 1,
+                core: 1,
+                socket: 0,
+            }));
+            header.set_routing_policy(RoutingPolicy::CacheLocal);
+            header.id_hash() > 3
+        })
+    });
+    let source = Arc::new(PullSource::default());
+    source
+        .frames
+        .lock()
+        .unwrap()
+        .extend((1..=6).map(unordered_frame));
+    let interceptor = vertex.ingest(source).unwrap();
+    let mut claim = interceptor.try_acquire().unwrap();
+    let mut direct = Vec::new();
+    interceptor.pull(
+        &mut claim,
+        &mut |frame| direct.push(frame.header().id_hash()),
+        &mut |_| false,
+        10,
+    );
+    assert_eq!(direct, [1, 2, 3]);
+    let mut routed = receiver.received();
+    routed.sort_unstable();
+    assert_eq!(routed, [4, 5, 6]);
     interceptor.release(claim);
 }
 
@@ -2280,6 +2368,7 @@ fn placing_a_pulled_frame_allocates_nothing() {
     fn allocations_of_pulls(policy: bool) -> usize {
         let registry = registry();
         registry.register();
+        registry.set_worker_location(0, 0);
         let receiver = Arc::new(Recycler::default());
         receiver.frames.lock().unwrap().reserve(512);
         let vertex = placing_vertex(&registry, policy, receiver.clone());

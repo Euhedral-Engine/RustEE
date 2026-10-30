@@ -11,7 +11,8 @@
 //! re-entrant, take no lock, not allocate and not block. The picker itself reads only its own immutable sets. It
 //! allocates nothing and locks nothing.
 //!
-//! A frame that cannot be placed (the chosen set has no CPU in common with the lattice's) keeps the origin it had.
+//! A frame that cannot be placed (the chosen set has no CPU in common with the lattice's) keeps the origin it had, and
+//! the picker returns `false` for it; it returns `true` for a frame whose origin it set.
 //!
 //! The policy covers pushed and pulled frames alike (see
 //! [`set_placement_policy`](super::ControlPlaneLattice::set_placement_policy)); producers need not call the picker.
@@ -43,8 +44,8 @@ impl<P: Fn(&dyn Frame) -> bool + Send + Sync + 'static> PlacementPicker<P> {
     }
 
     /// Picks a CPU for `frame` among `lattice_cpus`, the CPUs the lattice routes with, and sets the frame's origin to
-    /// it.
-    pub fn pick(&self, frame: &mut dyn Frame, lattice_cpus: &CpuSet) {
+    /// it. Returns whether it did: `false` when the frame cannot be placed and keeps the origin it had.
+    pub fn pick(&self, frame: &mut dyn Frame, lattice_cpus: &CpuSet) -> bool {
         let chosen = if (self.predicate)(&*frame) {
             &self.a
         } else {
@@ -52,23 +53,24 @@ impl<P: Fn(&dyn Frame) -> bool + Send + Sync + 'static> PlacementPicker<P> {
         };
         let count = chosen.intersection_len(lattice_cpus);
         if count == 0 {
-            return;
+            return false;
         }
         let nth = unsigned_multiply_high(frame.header().routing_hash(), count as u64) as usize;
         let Some(cpu) = chosen.nth_of_intersection(lattice_cpus, nth) else {
-            return;
+            return false;
         };
         let Some(info) = self.topology.cpu_info(cpu) else {
-            return;
+            return false;
         };
         let header = frame.header_mut();
         header.set_origin(Some(*info));
         header.set_routing_policy(RoutingPolicy::CacheLocal);
+        true
     }
 
     /// The picker as a placement policy for
     /// [`set_placement_policy`](super::ControlPlaneLattice::set_placement_policy).
-    pub fn into_policy(self) -> impl Fn(&mut dyn Frame, &CpuSet) + Send + Sync + 'static {
+    pub fn into_policy(self) -> impl Fn(&mut dyn Frame, &CpuSet) -> bool + Send + Sync + 'static {
         move |frame, cpus| self.pick(frame, cpus)
     }
 }
@@ -123,7 +125,7 @@ mod tests {
         let lattice = set(&[2, 4, 5, 6]);
         let origin = |id, hash| {
             let mut frame = frame(id, hash);
-            picker.pick(&mut *frame, &lattice);
+            assert!(picker.pick(&mut *frame, &lattice));
             (
                 frame.header().origin().map(|info| info.cpu),
                 frame.header().routing_policy(),
@@ -143,10 +145,10 @@ mod tests {
     fn a_frame_that_cannot_be_placed_keeps_its_origin() {
         let picker = PlacementPicker::new(topology(), |_: &dyn Frame| true, set(&[0]), set(&[1]));
         let mut frame = frame(7, 3);
-        picker.pick(&mut *frame, &set(&[4, 5]));
+        assert!(!picker.pick(&mut *frame, &set(&[4, 5])));
         assert!(frame.header().origin().is_none());
         assert_eq!(frame.header().routing_policy(), RoutingPolicy::Anywhere);
-        picker.pick(&mut *frame, &CpuSet::new());
+        assert!(!picker.pick(&mut *frame, &CpuSet::new()));
         assert!(frame.header().origin().is_none());
     }
 }

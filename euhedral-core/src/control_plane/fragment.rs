@@ -339,6 +339,8 @@ impl ControlPlaneFragment {
         }
         affinity::set_timer_resolution(1);
         self.registry.register();
+        self.registry
+            .set_worker_location(self.cache.core(), self.cache.socket());
         exit.registered = true;
         let looped = panic::catch_unwind(AssertUnwindSafe(|| self.run_owner_loop()));
         if looped.is_err() {

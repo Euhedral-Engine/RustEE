@@ -17,6 +17,7 @@ use super::registry::UpstreamRegistry;
 use super::upstream_queue::{Claim, UpstreamHandle, note_routed_push};
 use super::views::Cell;
 use super::views::View;
+use crate::control_plane::locality_allows;
 use crate::frames::{Failure, Frame, FrameError};
 use crate::generics::{LatticeReceiver, LatticeSource, LatticeTerminal, SourceCell};
 use crate::utils::math::unsigned_multiply_high;
@@ -174,11 +175,9 @@ pub struct LatticeVertex {
     name: String,
     downstream_count: usize,
     route: RoutingFunction,
-    /// The placement policy that runs on every frame before the routing function, if this vertex has one.
+    /// The placement policy that runs on every frame before the routing function, if this vertex has a placement.
+    /// Its policy is always there: until one is set it places nothing.
     placement: Option<Arc<Placement>>,
-    /// Whether a policy is set. A push without a policy reads this flag and nothing of the placement; it is a plain flag
-    /// of the vertex rather than a field of the placement so that no second object is followed to find it out.
-    placed: AtomicBool,
     /// Java's `routingState`: the published generation, a cell of the registry that each worker reads from its view.
     routing: Cell<RoutingState>,
     /// Java's `routingUpdateLock` and the state it guards.
@@ -223,17 +222,22 @@ impl LatticeVertex {
     }
 
     /// Sets the placement policy of a vertex made with [`with_placement`](Self::with_placement); returns whether it has
-    /// one. Lifecycle work: the caller does it while nothing routes. See
+    /// a placement. See
     /// [`ControlPlaneLattice::set_placement_policy`](crate::control_plane::ControlPlaneLattice::set_placement_policy).
-    pub fn set_placement_policy(
+    ///
+    /// # Safety
+    ///
+    /// As [`Placement::set_policy`]: nothing routes through or pulls from this vertex during the call, and every source
+    /// is ingested by an operation that happens after it.
+    pub unsafe fn set_placement_policy(
         &self,
-        policy: impl Fn(&mut dyn Frame, &CpuSet) + Send + Sync + 'static,
+        policy: impl Fn(&mut dyn Frame, &CpuSet) -> bool + Send + Sync + 'static,
     ) -> bool {
         let Some(placement) = &self.placement else {
             return false;
         };
-        placement.set_policy(self.edge.registry(), policy);
-        self.placed.store(true, Ordering::Release);
+        // SAFETY: the caller's contract, passed on.
+        unsafe { placement.set_policy(policy) };
         true
     }
 
@@ -252,7 +256,6 @@ impl LatticeVertex {
             downstream_count,
             route: Arc::new(route),
             placement,
-            placed: AtomicBool::new(false),
             routing,
             book: LifecycleMutex::new(Book {
                 references: HashMap::new(),
@@ -488,7 +491,7 @@ impl LatticeVertex {
         self.route_frame(frame, true)
     }
 
-    /// Routes `frame`, running the placement policy first if `place` and the vertex has one set. A frame the policy has
+    /// Routes `frame`, running the placement policy first if `place` and the vertex has a placement. A frame the policy has
     /// placed already (an interceptor's pull did) is routed with `place` false.
     fn route_frame(&self, frame: Box<dyn Frame>, place: bool) -> Result<(), Box<dyn Frame>> {
         let _hot = HotScope::enter();
@@ -496,11 +499,9 @@ impl LatticeVertex {
         let mut slot = Some(frame);
         let routed = self.with_route(|view, state| {
             let mut frame = slot.take().expect("routed once");
-            // The very first thing a routed frame meets: the placement policy, if the vertex has one and it is set.
-            if place
-                && self.placed.load(Ordering::Relaxed)
-                && let Some(placement) = &self.placement
-            {
+            // The very first thing a routed frame meets: the placement policy, if the vertex has a placement. Whether the
+            // policy placed the frame changes nothing here: the routing honours whatever origin the frame has.
+            if place && let Some(placement) = &self.placement {
                 placement.apply_in(view, &mut *frame);
             }
             if state.is_empty() {
@@ -996,25 +997,32 @@ impl UpstreamHandle for UpstreamInterceptor {
         // runs and no other `pull` or `request` is in progress.
         let upstream = unsafe { self.upstream.get() }?;
         let pulled = panic::catch_unwind(AssertUnwindSafe(|| {
-            // With a placement policy set, each frame the source hands over is placed before the fragment's consumer
-            // sees it, and one that now has an origin goes through the routing, which honours it, instead. The wrapper
-            // is a closure on this stack; without a policy the fragment's consumer goes straight through.
-            if vertex.placed.load(Ordering::Relaxed)
-                && let Some(placement) = &vertex.placement
-                && let Some(snapshot) = placement.snapshot(vertex.edge.registry())
-            {
-                let mut place_or_route = |mut frame: Box<dyn Frame>| {
-                    snapshot.apply(&mut *frame);
-                    if frame.header().origin().is_some() {
-                        match vertex.route_frame(frame, false) {
-                            Ok(()) => note_routed_push(),
-                            Err(frame) => frame.do_finally_with_error(unroutable()),
+            // With a placement, each frame the source hands over is placed before the fragment's consumer sees it. A
+            // frame the policy placed on a core other than the puller's, and kept there (a cache-local or socket-local
+            // frame whose origin the puller does not match), goes through the routing, which honours the origin; every
+            // other frame reaches the fragment's consumer on the core it is already on. The pull runs inside one read of
+            // the routing view, so the CPUs are read once and held with no reference-count traffic for a worker; the
+            // wrapper is a closure on this stack. A vertex without a placement hands the fragment's consumer straight
+            // through.
+            if let Some(placement) = &vertex.placement {
+                let registry = vertex.edge.registry();
+                // Where this worker runs; a thread that did not say routes every frame that was placed.
+                let here = registry.worker_location();
+                placement.within(registry, |placement| {
+                    let mut place_or_route = |mut frame: Box<dyn Frame>| {
+                        if placement.apply(&mut *frame)
+                            && !here.is_some_and(|here| locality_allows(&*frame, here, None))
+                        {
+                            match vertex.route_frame(frame, false) {
+                                Ok(()) => note_routed_push(),
+                                Err(frame) => frame.do_finally_with_error(unroutable()),
+                            }
+                        } else {
+                            consumer(frame);
                         }
-                    } else {
-                        consumer(frame);
-                    }
-                };
-                upstream.pull(&mut place_or_route, stop, demand)
+                    };
+                    upstream.pull(&mut place_or_route, stop, demand)
+                })
             } else {
                 upstream.pull(consumer, stop, demand)
             }

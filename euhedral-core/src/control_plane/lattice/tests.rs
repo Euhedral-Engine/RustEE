@@ -780,28 +780,29 @@ fn cpus(list: &[usize]) -> CpuSet {
 }
 
 #[test]
-fn the_placement_policy_can_only_be_set_while_the_lattice_is_shut_down() {
+fn the_placement_policy_can_only_be_set_before_the_lattice_starts() {
     let fixture = Fixture::new(&ALL, |_| {});
     // Not started: allowed, and a second call replaces the first.
     fixture
         .lattice
-        .set_placement_policy(|_, _| {})
+        .set_placement_policy(|_, _| false)
         .expect("not started");
     fixture
         .lattice
-        .set_placement_policy(|_, _| {})
+        .set_placement_policy(|_, _| false)
         .expect("still not started");
     fixture.source.set(utilization(&ALL, 8.0));
     fixture.lattice.start().unwrap();
     assert!(matches!(
-        fixture.lattice.set_placement_policy(|_, _| {}),
+        fixture.lattice.set_placement_policy(|_, _| false),
         Err(LatticeError::Running)
     ));
+    // A closed lattice may still have frames winding down: refused too.
     fixture.lattice.close();
-    fixture
-        .lattice
-        .set_placement_policy(|_, _| {})
-        .expect("closed");
+    assert!(matches!(
+        fixture.lattice.set_placement_policy(|_, _| false),
+        Err(LatticeError::Closed)
+    ));
 }
 
 #[test]
@@ -824,6 +825,7 @@ fn the_placement_policy_runs_first_and_sees_the_cpus_the_lattice_routes_with() {
             frame
                 .header_mut()
                 .set_routing_policy(RoutingPolicy::CacheLocal);
+            true
         })
         .unwrap();
     fixture
@@ -844,7 +846,7 @@ fn picker_policy(
     long: impl Fn(&dyn Frame) -> bool + Send + Sync + 'static,
     a: &[usize],
     b: &[usize],
-) -> impl Fn(&mut dyn Frame, &CpuSet) + Send + Sync + 'static {
+) -> impl Fn(&mut dyn Frame, &CpuSet) -> bool + Send + Sync + 'static {
     PlacementPicker::new(two_sockets(), long, cpus(a), cpus(b)).into_policy()
 }
 
@@ -936,7 +938,7 @@ fn the_policy_and_the_predicate_run_from_many_threads_at_once() {
         .lattice
         .set_placement_policy(move |frame, set| {
             counted.fetch_add(1, Ordering::Relaxed);
-            picker.pick(frame, set);
+            picker.pick(frame, set)
         })
         .unwrap();
     fixture.source.set(utilization(&ALL, 8.0));

@@ -15,6 +15,7 @@ mod shard;
 #[cfg(test)]
 pub(crate) mod testing;
 
+pub(crate) use cache::locality_allows;
 pub use cache::{CacheDirectory, ControlPlaneCache};
 pub use fragment::{ControlPlaneFragment, FragmentError};
 pub use lattice::{

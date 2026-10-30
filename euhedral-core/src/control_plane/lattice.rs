@@ -325,7 +325,12 @@ impl ControlPlaneLattice {
     /// `FnMut`, and must be re-entrant, take no lock, not allocate and not block. Anything it reads is the caller's to
     /// make safe to read from many threads.
     ///
-    /// It can be set while the lattice is shut down (not started, or closed), and replaces the previous one.
+    /// The policy returns `true` when it placed the frame (set its origin and routing policy). Until one is set, the
+    /// lattice has a policy that places nothing and returns `false`.
+    ///
+    /// It can be set only before the lattice starts, once or more (the last one stands): it is a plain field the frame
+    /// path reads with no atomic. A lattice that is running, or has been closed (close returns while frames it admitted
+    /// may still be winding down), refuses it.
     ///
     /// The policy covers pushed and pulled frames alike: a frame a source pushes is placed when the lattice routes it,
     /// and a frame a worker pulls from a source is placed as it comes out of the source's pull, before the worker's
@@ -340,16 +345,25 @@ impl ControlPlaneLattice {
     ///
     /// # Errors
     ///
-    /// [`LatticeError::Running`] while the lattice is running.
+    /// [`LatticeError::Running`] once the lattice has started, [`LatticeError::Closed`] once it is closed.
     pub fn set_placement_policy(
         &self,
-        policy: impl Fn(&mut dyn Frame, &CpuSet) + Send + Sync + 'static,
+        policy: impl Fn(&mut dyn Frame, &CpuSet) -> bool + Send + Sync + 'static,
     ) -> Result<(), LatticeError> {
+        // `start` holds this lock from before it ever starts the source until it has set the flag, and nothing sets the
+        // flag back.
         let started = self.started.lock();
-        if *started && !self.closed.load(Ordering::Acquire) {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(LatticeError::Closed);
+        }
+        if *started {
             return Err(LatticeError::Running);
         }
-        self.controller.set_placement_policy(policy);
+        // SAFETY: the lattice has not started, so no source has been ingested (`add_upstream` starts first and ingests
+        // after, and the controller is reachable by no other path): nothing routes through or pulls from the controller.
+        // The unlock below releases this write, and the lock that `start` takes in any `add_upstream` that follows
+        // acquires it before the ingest, from which every thread that learns of the source follows.
+        unsafe { self.controller.set_placement_policy(policy) };
         Ok(())
     }
 

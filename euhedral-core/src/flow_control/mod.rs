@@ -24,7 +24,7 @@ mod views;
 pub use edge::{LatticeEdge, LatticeNode, Retirement};
 pub use hot_receiver::{LatticeHotReceiver, PushHook, Response};
 pub use hot_source::LatticeHotSource;
-pub use placement::{Placement, PlacementPolicy, PlacementSnapshot};
+pub use placement::{Placement, PlacementPolicy, PlacementView};
 pub use registry::UpstreamRegistry;
 pub use upstream_queue::{
     Claim, PullBucketDivisionMode, UpstreamHandle, UpstreamQueue, decay_contention,

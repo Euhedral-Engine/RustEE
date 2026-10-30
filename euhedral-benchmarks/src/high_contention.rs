@@ -387,7 +387,7 @@ pub fn run_fork(
     let lattice = ControlPlaneLattice::new(config).map_err(ForkError::Lattice)?;
     if options.trivial_placement {
         lattice
-            .set_placement_policy(|_, _| {})
+            .set_placement_policy(|_, _| false)
             .map_err(ForkError::Lattice)?;
     }
     lattice.start().map_err(ForkError::Lattice)?;

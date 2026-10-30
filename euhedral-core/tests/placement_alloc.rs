@@ -83,7 +83,8 @@ fn placing_a_frame_allocates_nothing() {
     let registry = UpstreamRegistry::new();
     let placement = Placement::new(&registry);
     placement.publish_cpus(&registry, all.clone());
-    placement.set_policy(&registry, picker.into_policy());
+    // SAFETY: nothing else uses the placement.
+    unsafe { placement.set_policy(picker.into_policy()) };
     registry.register_reader();
     placement.apply(&registry, &mut *frames[0]);
     let before = ALLOCATIONS.load(Ordering::Relaxed);
