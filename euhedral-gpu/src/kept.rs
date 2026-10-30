@@ -24,11 +24,14 @@ impl std::fmt::Debug for Held {
 
 /// The values a recording keeps, frozen: shared by the recording's own run, its graph and every replay. Each holds a
 /// handle through the streams it ran on, so the buffers live until the last of them retired.
-pub(crate) type Frozen = Arc<[Held]>;
+pub(crate) type Frozen = Option<Arc<[Held]>>;
 
-/// Freezes the values a recording collected.
+/// Freezes the values a recording collected: `None` for none, which allocates nothing.
 pub(crate) fn freeze(values: Vec<Box<dyn Any + Send>>) -> Frozen {
-    values.into_iter().map(Held).collect()
+    if values.is_empty() {
+        return None;
+    }
+    Some(values.into_iter().map(Held).collect())
 }
 
 /// Values held until a retirement is confirmed: `(retirement seq, value)`, released in order. Owned by one submitter:
@@ -103,6 +106,10 @@ mod tests {
     fn frozen_values_live_until_the_last_handle_drops() {
         let token = Arc::new(());
         let frozen = freeze(vec![Box::new(token.clone())]);
+        assert!(
+            freeze(Vec::new()).is_none(),
+            "nothing kept, nothing allocated"
+        );
         let second = frozen.clone();
         drop(frozen);
         assert_eq!(Arc::strong_count(&token), 2);

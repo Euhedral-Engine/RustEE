@@ -3,6 +3,33 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## `euhedral-gpu`: timed spans around a lane item, and arguments reused in place (2026-10-30)
+
+**What.** Two additions, no breaking change (`StreamOptions` gains a field: build it with `..Default::default()`).
+- `Stream::span_begin` / `span_end` / `span_poll` / `span_cancel` and `Span`: a timed span of one stream's work. A stream keeps
+  `StreamOptions::spans` of them (default 16, two timing events each); `span_begin` is `Err(Busy)` when the ring is full of open or
+  unread spans, and a stream opened with 0 refuses them.
+- `Args::clear`, `push`, `push_device`, `set`, `set_device` and `assign`: an argument list rewritten in place. `Args::layout` and a
+  launch list their arguments on the stack (`MAX_ARGS`, 64).
+
+**Why.** An item that launches the same kernels on every run would otherwise allocate a list of arguments per launch, a
+vector of pointers per launch and, on a graph update, a clone of every launch's arguments. And a lane source that times its items
+needs a duration it can read at its next entry without ever waiting on the device.
+
+**How to use it.** Keep an `Args` for each launch the lane repeats, and refill it (`clear`, then `push`) or change one argument
+(`set`). Bracket an item's launches with `span_begin`/`span_end`; at the next entry call `span_poll`: `None` means the end is not
+reached yet (nothing was waited for), `Some(duration)` frees the slot. A killed item calls `span_cancel`.
+
+**Semantics.** A span is two events recorded on the stream, one behind the work submitted before `span_begin` and one behind the
+work before `span_end`; `span_poll` queries the end event once (`cuEventQuery`) and reads the elapsed time between the two. The
+fake backend times a span in its own clock: one microsecond per operation the device ran. A graph's update pass keeps its staged
+arguments, hasher and recording in the graph and reuses them, so after the first update it allocates nothing; a recording that
+kept no values holds no allocation for them (`Frozen` is an `Option`).
+
+**Tests.** `tests/cuda_launch_alloc.rs` counts every allocation of the process: 200 launches of a reused `Args` and 200 updates
+with replays allocate 0, and a span around a 2e9-cycle kernel reads `None` at once, then its duration, and its slot is freed.
+`tests/fake_streams.rs` pins the span ring on the fake backend, `src/args.rs` the in-place API.
+
 ## `Join` removed: fan-in is a count on the shared object (2026-10-29)
 
 **What.** `euhedral-graph`'s `Join`, `Part`, `Parts` and `Round` are gone (**breaking**), with `tests/join_alloc.rs` and

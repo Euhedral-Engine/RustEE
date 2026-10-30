@@ -578,3 +578,66 @@ fn one_options_entry_per_name_is_required() {
     let r = gpu.open_lanes_at(LaneId(63), &["a", "b"], &[StreamOptions::default(); 2]);
     assert!(matches!(r, Err(GpuError::Invalid(_))), "past lane 63");
 }
+
+#[test]
+fn a_span_reads_none_until_its_end_ran_then_the_ticks_between_and_frees_its_slot() {
+    let gpu = gpu_with_kernels();
+    let m = module(&gpu);
+    let (_pool, mut s) = gpu
+        .open_lanes(
+            &["a"],
+            StreamOptions {
+                spans: 2,
+                ..StreamOptions::default()
+            },
+        )
+        .unwrap();
+    let a = m.kernel("a").unwrap();
+    let span = s[0].span_begin().unwrap();
+    for _ in 0..3 {
+        // SAFETY: the fake kernel reads nothing.
+        s[0].submit(|q| unsafe { q.launch(&a, Launch::linear(1, 1), &Args::new()) })
+            .unwrap();
+    }
+    s[0].span_end(span).unwrap();
+    assert_eq!(
+        s[0].span_poll(span).unwrap(),
+        None,
+        "the device has not run the span's end"
+    );
+    gpu.run_until_idle();
+    // The begin stamp, three launches and the end stamp: four ticks from the first stamp to the last.
+    assert_eq!(
+        s[0].span_poll(span).unwrap(),
+        Some(std::time::Duration::from_micros(4))
+    );
+    assert!(
+        s[0].span_poll(span).is_err(),
+        "read once: the handle is stale"
+    );
+    // The slot is free again.
+    let (x, y) = (s[0].span_begin().unwrap(), s[0].span_begin().unwrap());
+    assert_eq!(
+        s[0].span_begin(),
+        Err(GpuError::Busy),
+        "two slots, both held"
+    );
+    s[0].span_cancel(x).unwrap();
+    assert!(s[0].span_begin().is_ok());
+    let _ = y;
+}
+
+#[test]
+fn a_stream_opened_with_no_spans_refuses_them() {
+    let gpu = gpu_with_kernels();
+    let (_pool, mut s) = gpu
+        .open_lanes(
+            &["a"],
+            StreamOptions {
+                spans: 0,
+                ..StreamOptions::default()
+            },
+        )
+        .unwrap();
+    assert!(matches!(s[0].span_begin(), Err(GpuError::Invalid(_))));
+}

@@ -1,11 +1,13 @@
 //! Fake streams: a shared query side and a single-owner submitter.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use euhedral_graph::{DeviceQueue, LaneId, Marker, QueueId};
 
 use crate::kept::Kept;
 use crate::retire::{RetireSink, Retirements};
+use crate::spans::{Span, SpanBook};
 use crate::{Gpu, GpuError, POISONED_STATUS, RetireListener, RetireTicket, Stream, StreamPriority};
 
 use crate::lanes::Probe;
@@ -81,6 +83,9 @@ pub struct FakeStream {
     /// The owner's end of the retirement queue, and the retirements armed.
     pub(crate) retire: Retirements,
     pub(crate) kept: Kept,
+    /// The ring of timed spans, and the ids of each slot's two edges on the fake device's clock.
+    spans: SpanBook,
+    span_edges: Vec<(u64, u64)>,
 }
 
 impl FakeStream {
@@ -90,6 +95,7 @@ impl FakeStream {
         name: &str,
         place: Placement,
         priority: StreamPriority,
+        spans: u32,
     ) -> Self {
         let Placement {
             base,
@@ -117,6 +123,8 @@ impl FakeStream {
             priority,
             retire,
             kept: Kept::default(),
+            spans: SpanBook::new(id, spans),
+            span_edges: vec![(0, 0); spans as usize],
         }
     }
 
@@ -258,6 +266,43 @@ impl Stream for FakeStream {
 
     fn mark(&mut self) -> Result<Marker, GpuError> {
         self.mark_now()
+    }
+
+    fn span_begin(&mut self) -> Result<Span, GpuError> {
+        self.gpu.alive()?;
+        let span = self.spans.begin()?;
+        let id = self.gpu.new_stamp();
+        self.span_edges[span.slot()].0 = id;
+        self.push(QOp::Stamp { id });
+        Ok(span)
+    }
+
+    fn span_end(&mut self, span: Span) -> Result<(), GpuError> {
+        self.gpu.alive()?;
+        let at = self.spans.end(span)?;
+        let id = self.gpu.new_stamp();
+        self.span_edges[at].1 = id;
+        self.push(QOp::Stamp { id });
+        Ok(())
+    }
+
+    fn span_poll(&mut self, span: Span) -> Result<Option<Duration>, GpuError> {
+        let at = self.spans.closed(span)?;
+        let (start, end) = self.span_edges[at];
+        self.gpu.observe_fault();
+        if let Some(cause) = self.gpu.poisoned() {
+            self.spans.release(span)?;
+            return Err(GpuError::Poisoned(Box::new(cause)));
+        }
+        let (Some(a), Some(b)) = (self.gpu.stamp(start), self.gpu.stamp(end)) else {
+            return Ok(None);
+        };
+        self.spans.release(span)?;
+        Ok(Some(Duration::from_micros(b - a)))
+    }
+
+    fn span_cancel(&mut self, span: Span) -> Result<(), GpuError> {
+        self.spans.release(span)
     }
 
     fn await_marker(&mut self, marker: Marker) -> Result<(), GpuError> {

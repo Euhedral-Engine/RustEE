@@ -80,9 +80,9 @@ impl Graph for FakeGraph {
         }
         // A replay runs after this graph may have dropped: the stream keeps the recording's buffers until the next
         // retirement armed after it is confirmed.
-        if !self.kept.is_empty() {
+        if let Some(kept) = &self.kept {
             let seq = stream.retire.next_seq();
-            stream.kept.push(seq, Box::new(self.kept.clone()));
+            stream.kept.push(seq, Box::new(kept.clone()));
         }
         Ok(())
     }
@@ -172,8 +172,7 @@ impl FakeGpu {
         // until that stream's next retirement is confirmed, whatever becomes of the recording. The graph shares the
         // same values.
         seq.rec.frozen = freeze(std::mem::take(&mut seq.rec.kept));
-        if !seq.rec.frozen.is_empty() {
-            let frozen = seq.rec.frozen.clone();
+        if let Some(frozen) = seq.rec.frozen.clone() {
             for stream in &mut seq.real {
                 let at = stream.retire.next_seq();
                 stream.kept.push(at, Box::new(frozen.clone()));

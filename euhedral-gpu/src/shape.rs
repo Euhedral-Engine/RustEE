@@ -67,6 +67,11 @@ impl ShapeHasher {
         self.put(TAG_ORDER, &[after as u64, before as u64]);
     }
 
+    /// Forgets the operations and keeps the storage: a hasher reused for each update allocates only once.
+    pub fn clear(&mut self) {
+        self.bytes.clear();
+    }
+
     pub fn finish(&self) -> Fingerprint {
         Fingerprint(
             hash_bytes_with_seed(&self.bytes, 0x6770_7573_6861_7065),

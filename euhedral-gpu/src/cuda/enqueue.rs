@@ -7,7 +7,7 @@ use euhedral_memory::cuda::CuStream;
 
 use crate::kept::{Frozen, freeze};
 use crate::shape::{CopyKind, ShapeHasher};
-use crate::{Args, Enqueue, GpuError, Kernel, Launch};
+use crate::{Args, Enqueue, GpuError, Kernel, Launch, MAX_ARGS};
 
 use super::fns::{CAPTURE_STATUS_ACTIVE, CaptureInfo, CuGraph, CuGraphNode};
 use super::{CudaGpu, CudaKernel, CudaStream};
@@ -47,8 +47,10 @@ pub(crate) struct Recording {
     pub(crate) kept: Vec<Box<dyn Any + Send>>,
     /// The same, frozen once the run ended, to be shared by the streams, the graph and every replay.
     pub(crate) frozen: Frozen,
-    /// The arguments of each launch (an update pass).
+    /// The arguments of each launch (an update pass): the first `staged_len` are this pass's. The values are reused from one
+    /// pass to the next, so an update allocates only when a graph has more launches than any before it.
     pub(crate) staged: Vec<Args>,
+    pub(crate) staged_len: usize,
     /// The first reason the capture cannot be used. The real work is unaffected.
     pub(crate) failed: Option<GpuError>,
 }
@@ -63,8 +65,21 @@ impl Recording {
             kept: Vec::new(),
             frozen: freeze(Vec::new()),
             staged: Vec::new(),
+            staged_len: 0,
             failed: None,
         }
+    }
+
+    /// Readies a recording kept from an earlier pass for another: the collections are emptied and their storage stays.
+    pub(crate) fn reset(&mut self, mode: Mode) {
+        self.mode = mode;
+        self.launches.clear();
+        self.nodes.clear();
+        self.hasher.clear();
+        self.kept.clear();
+        self.frozen = None;
+        self.staged_len = 0;
+        self.failed = None;
     }
 }
 
@@ -169,26 +184,42 @@ impl Enqueue for CudaEnqueue<'_> {
                 .launch(*stream, kernel.id(), &launch, args.layout());
             match rec.mode {
                 Mode::Record => rec.launches.push((kernel.clone(), launch, args.clone())),
-                Mode::Update => rec.staged.push(args.clone()),
+                Mode::Update => {
+                    match rec.staged.get_mut(rec.staged_len) {
+                        Some(slot) => slot.assign(args),
+                        None => rec.staged.push(args.clone()),
+                    }
+                    rec.staged_len += 1;
+                }
                 Mode::Probe => {}
             }
         }
         if self.target.is_none() {
             return Ok(());
         }
-        if let Some(expected) = kernel.parameter_sizes() {
+        if let Some(expected) = kernel.parameter_sizes()
+            && (expected.len() != args.len()
+                || expected
+                    .iter()
+                    .zip(args.sizes())
+                    .any(|(e, g)| *e as usize != g))
+        {
             let got: Vec<usize> = args.sizes().collect();
-            if expected.len() != got.len()
-                || expected.iter().zip(&got).any(|(e, g)| *e as usize != *g)
-            {
-                return Err(GpuError::Args(format!(
-                    "{}: expected sizes {expected:?}, got {got:?}",
-                    kernel.name()
-                )));
-            }
+            return Err(GpuError::Args(format!(
+                "{}: expected sizes {expected:?}, got {got:?}",
+                kernel.name()
+            )));
         }
         let fns = &self.gpu.fns;
-        let mut pointers = args.pointers();
+        // The argument addresses go on the stack: a launch allocates nothing.
+        let mut pointers = [std::ptr::null_mut::<c_void>(); MAX_ARGS];
+        if args.pointers_into(&mut pointers).is_none() {
+            return Err(GpuError::Args(format!(
+                "{}: {} arguments, at most {MAX_ARGS}",
+                kernel.name(),
+                args.len()
+            )));
+        }
         let (func, params) = (kernel.raw(), pointers.as_mut_ptr());
         // SAFETY: the caller's contract (arguments match the kernel; addresses valid until retired); the pointers
         // address `args`, which outlives the call; the context is current.

@@ -17,9 +17,9 @@ Asynchronous, backend-neutral GPU access for the RustEE control plane. A lattice
 
 | Module | Main types |
 |---|---|
-| [`api`](src/api.rs) | The traits: `Gpu`, `Stream`, `Enqueue`, `Module`, `Kernel`, `Sequence`, `Graph`, `RetireListener`; `RetireTicket`, `StreamOptions`, `StreamPriority`, `CompileOptions`, `Rerecorded`. |
+| [`api`](src/api.rs) | The traits: `Gpu`, `Stream`, `Enqueue`, `Module`, `Kernel`, `Sequence`, `Graph`, `RetireListener`; `RetireTicket`, `StreamOptions`, `StreamPriority`, `CompileOptions`, `Rerecorded`, `Span` (timed spans, `Stream::span_*`). |
 | [`lanes`](src/lanes.rs) | `LaneSubmit` for the backends' streams, and `open_lane_sources`: a device's lanes as a pool, its intakes and a `LaneSource` per lane (`LaneSpec`, `OpenedLanes`). |
-| [`args`](src/args.rs) | `KernelArg`, `Args` (the typed argument builder), `Launch`, `Dim3`. |
+| [`args`](src/args.rs) | `KernelArg`, `Args` (the typed argument builder, rewritable in place), `Launch`, `Dim3`. |
 | [`error`](src/error.rs) | `GpuError`, the one error type. |
 | [`poison`](src/poison.rs) | `Poison`: a device's first fault, set once. |
 | [`kept`](src/kept.rs) | The values a submitter keeps until a retirement is confirmed (a `PlainQueue`), and the frozen values a recording shares. |

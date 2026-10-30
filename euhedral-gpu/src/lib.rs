@@ -40,18 +40,20 @@ mod module_cache;
 mod poison;
 mod retire;
 mod shape;
+mod spans;
 
 pub use api::{
     CompileOptions, Enqueue, Gpu, Graph, Kernel, Lanes, Module, POISONED_STATUS, Rerecorded,
     RetireListener, RetireTicket, Sequence, Stream, StreamOptions, StreamPriority,
 };
-pub use args::{Args, Dim3, KernelArg, Launch};
+pub use args::{ArgMismatch, Args, Dim3, KernelArg, Launch, MAX_ARGS};
 pub use error::GpuError;
 pub use lanes::{LaneSpec, OpenedLanes, open_lane_sources};
 pub use module_cache::{CacheKey, KeyMaterial, ModuleCache, cache_key};
 pub use poison::Poison;
 pub use retire::{OnceFrame, RetireError, UNPOLLED_RETIREMENTS, retire_into, retire_into_with};
 pub use shape::{CopyKind, Fingerprint, ShapeHasher};
+pub use spans::Span;
 
 /// Compiles and runs the examples in the crate README as doctests.
 #[cfg(doctest)]
