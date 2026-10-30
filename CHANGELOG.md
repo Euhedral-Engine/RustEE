@@ -3,6 +3,25 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## A polling stealer takes only the frame its stop looked at: placement is exact in poll mode (2026-10-30)
+
+**What.** `ControlPlaneCache`'s one-frame take (the owner's `poll` and the stealer's `work_steal_polled`) returns nothing when the
+partition it looks at is empty. It used to take the front anyway, right after the look.
+
+**Why.** The take looked at the front, let `stop` judge it, and then polled. When the look found the partition empty and a producer
+queued a frame before the poll, the poll took a frame `stop` never saw. For a stealer `stop` is what keeps ordered frames and frames
+bound to the victim's core where they are, so a stealer on another core could run a frame the placement policy put on the victim's
+core (1 in about 3,000 frames in the sink-pull placement test under CI load, always through `work_steal_polled`), or run an ordered
+frame off its owner. Greedy takes were never affected: they check and take the same slot in one drain.
+
+**Semantics.** The take holds the partition, so it is the partition's only consumer: the front it looked at is the front it takes,
+and a frame published meanwhile queues behind it. A frame that arrives after a look at an empty partition stays for the next look.
+Nothing is added to the frame path; an empty partition now costs one look instead of a look and a poll.
+
+**Tests.** `a_polling_thief_never_takes_a_frame_that_arrived_after_its_look` forces the window (a cache-local and an ordered frame
+queued between the look and the take; it fails on the old take); `a_placement_policy_also_places_the_frames_a_worker_pulls_from_a_sink`
+asserts that no frame runs off its set.
+
 ## `one_shot` and `SetOnce` removed; users hold what they hand over (2026-10-30)
 
 **What.** `euhedral-data-structures::sync` loses `one_shot`, `OneShotSender`, `OneShotReceiver`, `RecvError` and `SetOnce<T>`

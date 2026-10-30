@@ -1002,7 +1002,9 @@ impl Frame for Classified {
 
 /// A worker's pull from an ingest sink takes frames straight from the source, without the lattice's routing, so the
 /// interceptor's pull places them: a long call (an unordered frame) belongs on the cores of set A, an ordered frame on
-/// those of set B. The sink is full of long calls first, which are what the cores pull directly.
+/// those of set B. The sink is full of long calls first, which are what the cores pull directly. Every core also steals,
+/// and in poll mode a stealer looks at one frame at a time while others are being queued: it must leave every frame
+/// placed on another core, also one that arrives as it looks.
 #[test]
 fn a_placement_policy_also_places_the_frames_a_worker_pulls_from_a_sink() {
     use crate::control_plane::PlacementPicker;
@@ -1039,10 +1041,8 @@ fn a_placement_policy_also_places_the_frames_a_worker_pulls_from_a_sink() {
         let sink = QueueIngestSink::new();
         let ran = Ran::default();
         lattice.add_upstream(sink.delegate()).unwrap();
-        // A frame pulled before both cores are in the routing is placed for a core the routing does not have yet, and goes to
-        // the one it has: right for a frame in flight during a start-up, wrong for this test, which asserts where every frame
-        // ran. So the frames are offered only once both cores are active (a second worker can take longer to start than the
-        // first one's whole pull of a full sink: it did on Windows).
+        // The frames are offered once both cores are active: a frame placed on a core the routing does not have yet goes to a
+        // core it has (a cache-local frame's fallback), and this test asserts where every frame ran.
         let deadline = Instant::now() + PATIENCE;
         while lattice.active_workers() < 2 && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(1));
@@ -1088,17 +1088,16 @@ fn a_placement_policy_also_places_the_frames_a_worker_pulls_from_a_sink() {
             ran.iter().filter(|(long, _, _)| *long).count(),
             FRAMES as usize / 2
         );
-        assert!(
+        // Placement is exact: not one frame runs off the set the policy placed it on.
+        let misplaced = |kind: bool, set: &[usize]| {
             ran.iter()
-                .filter(|(long, _, _)| *long)
-                .all(|(_, cpu, _)| on(&set_a, *cpu)),
-            "a long call ran off set A\n{dump}"
-        );
-        assert!(
-            ran.iter()
-                .filter(|(long, _, _)| !*long)
-                .all(|(_, cpu, _)| on(&set_b, *cpu)),
-            "an ordered frame ran on set A\n{dump}"
+                .filter(|(long, cpu, _)| *long == kind && !on(set, *cpu))
+                .count()
+        };
+        assert_eq!(
+            (misplaced(true, &set_a), misplaced(false, &set_b)),
+            (0, 0),
+            "(long calls off set A, ordered frames off set B)\n{dump}"
         );
     }
 }

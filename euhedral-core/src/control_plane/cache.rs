@@ -725,16 +725,23 @@ pub(crate) fn locality_allows(
     true
 }
 
-/// The partition's front frame, unless another consumer holds the partition or `stop` matches the
-/// frame; the hold ends before the frame is returned.
+/// The partition's front frame, unless another consumer holds the partition, the partition is empty, or `stop` matches
+/// the frame; the hold ends before the frame is returned.
+///
+/// The frame taken is the frame `stop` was asked about. The hold makes this the partition's only consumer, so the front
+/// it looked at is still the front when it takes it: a frame published meanwhile queues behind it. A partition that
+/// looked empty yields nothing, even if a frame arrives before the take would have run: `stop` never saw that frame,
+/// and taking it would hand a stealer a frame that is ordered or bound to the victim's core.
 fn take_one(
     partition: &ClaimCell<Partition>,
     stop: &mut impl FnMut(&dyn Frame) -> bool,
 ) -> Option<Box<dyn Frame>> {
     let mut partition = try_hold(partition)?;
-    if partition.peek().is_some_and(|frame| stop(&**frame)) {
+    if stop(&**partition.peek()?) {
         return None;
     }
+    #[cfg(test)]
+    tests::between_look_and_take();
     partition.poll()
 }
 
