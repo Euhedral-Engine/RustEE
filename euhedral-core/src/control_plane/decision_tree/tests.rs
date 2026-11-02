@@ -414,3 +414,157 @@ fn calibration_measures_both_thresholds() {
     assert!(threshold > 0.0);
     assert!(threshold.is_finite());
 }
+
+/// A source with nothing to hand over: every pull finds 0, and a request pushes nothing (it would,
+/// were there work, push from the request, as a source that only pushes does).
+struct PushOnly {
+    sequence: u64,
+    claimed: std::sync::atomic::AtomicBool,
+}
+
+impl PushOnly {
+    fn new(sequence: u64) -> Arc<Self> {
+        Arc::new(Self {
+            sequence,
+            claimed: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+}
+
+impl UpstreamHandle for PushOnly {
+    fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    fn pull(
+        &self,
+        _claim: &mut Claim,
+        _consumer: &mut dyn FnMut(Box<dyn Frame>),
+        _stop: &mut dyn FnMut(&dyn Frame) -> bool,
+        _demand: u64,
+    ) -> Option<u64> {
+        Some(0)
+    }
+
+    fn request(&self, _claim: &mut Claim, _demand: u64) {}
+
+    fn is_complete(&self) -> bool {
+        false
+    }
+
+    fn try_acquire(&self) -> Option<Claim> {
+        (!self.claimed.swap(true, Ordering::Acquire)).then(|| Claim::new(self.sequence))
+    }
+
+    fn release(&self, _claim: Claim) {
+        self.claimed.store(false, Ordering::Release);
+    }
+}
+
+/// What the workers of a lattice with no work did, cycle by cycle.
+#[derive(Debug, PartialEq, Eq)]
+struct Idling {
+    /// Cycles that ended in a park, in the unproductive park or the idle path.
+    parks: u64,
+    /// Workers that did not park in their last cycle.
+    awake: u64,
+    /// The productive handle count each worker saw in its last cycle, by rank.
+    productive: Vec<u64>,
+}
+
+/// Runs `cycles` cycles of each of `workers` workers in turn, over `lanes` sources that have
+/// nothing and `push_only` more that only push, with the choices of the worker loop (the
+/// productive count, `should_idle`, the path, the parks of a cycle that processed nothing) made by
+/// the real queue and tree. Bodies cost `body_ns`, which sets the path.
+fn idle_workers(workers: usize, lanes: u64, push_only: u64, body_ns: u64, cycles: u64) -> Idling {
+    let registry = UpstreamRegistry::with_topology(workers + 1, CpuSet::new());
+    for sequence in 0..lanes + push_only {
+        registry.add_handle(PushOnly::new(sequence));
+    }
+    let mut idling = Idling {
+        parks: 0,
+        awake: 0,
+        productive: Vec::new(),
+    };
+    for rank in 1..=workers {
+        let registry = registry.clone();
+        let (parks, awake, productive) = std::thread::spawn(move || {
+            registry.register_with(|| Some(rank));
+            let mut tree = tree();
+            record_all(tree.body_cost_mut(), [body_ns; 32]);
+            let now = Instant::now();
+            let (mut parks, mut awake, mut productive) = (0, false, 0);
+            for _ in 0..cycles {
+                (awake, productive) = registry
+                    .with_thread_queue(|queue| {
+                        let contention = queue.adaptive_contention(now, nanos(1_000_000));
+                        let productive = queue.productive_handle_count();
+                        let upstreams = queue.cached_upstream_count();
+                        let path = if tree.should_idle(contention, productive, workers, Some(rank))
+                        {
+                            ExecutionPath::Idle
+                        } else {
+                            tree.select_path(productive, upstreams, workers, contention)
+                        };
+                        match path {
+                            ExecutionPath::Direct => {
+                                queue.pull(&mut |_| {}, &mut |_| false, 64);
+                                queue.request(64);
+                            }
+                            ExecutionPath::Staged => queue.request(64),
+                            ExecutionPath::Idle => {}
+                        }
+                        let parked =
+                            path == ExecutionPath::Idle || queue.productive_handle_count() == 0;
+                        (!parked, productive)
+                    })
+                    .unwrap();
+                parks += u64::from(!awake);
+            }
+            registry.remove_thread();
+            (parks, awake, productive)
+        })
+        .join()
+        .unwrap();
+        idling.parks += parks;
+        idling.awake += u64::from(awake);
+        idling.productive.push(productive);
+    }
+    idling
+}
+
+/// A source that only pushes (its pull always finds 0) is one more handle in the productive count
+/// of a worker, and no more than any other handle: it never keeps a worker awake that an empty
+/// source with the same view would let park. Where a worker pulls, the pull finds the source empty
+/// and it stops counting; where a worker only requests (the staged path), a request that pushed
+/// nothing shows nothing, and the source counts as productive, as every handle does, until a pull
+/// finds it empty. That is the rule of the original (see `a_request_is_not_evidence_of_an_empty_source`).
+/// A source that only pushes (its pull always finds 0, and it pushes from `request`) counts in the
+/// productive count like any other handle, and keeps no worker awake that a lane source with the
+/// same view would not.
+///
+/// Workers with no work alternate a pull and a request, and each takes the whole demand from the
+/// handle at the head of the queue and sends it to the back. With an even number of handles the pull
+/// always lands on the same half and the request on the other: the requested half is never pulled,
+/// so no worker finds it empty and it stays productive (a request that routes nothing shows
+/// nothing). Those workers never reach the unproductive park. With an odd number every handle is
+/// pulled in turn, all become unproductive, and the workers park. So one more source of any kind
+/// flips the workers between spinning and parking, as the original's queue and cycle do. The test
+/// pins that a push-only source takes part in this as one more handle, whatever its kind.
+#[test]
+fn a_source_that_only_pushes_counts_like_any_other_handle() {
+    // Even: the requested half stays productive and every worker stays awake.
+    for (lanes, push_only) in [(8, 0), (7, 1), (0, 8)] {
+        let idling = idle_workers(8, lanes, push_only, 250, 400);
+        assert_eq!(idling.awake, 8, "{lanes}+{push_only}: {idling:?}");
+        assert_eq!(idling.parks, 0, "{lanes}+{push_only}: {idling:?}");
+        assert_eq!(idling.productive, [4; 8], "{lanes}+{push_only}: {idling:?}");
+    }
+    // Odd: every handle is found empty and every worker parks.
+    for (lanes, push_only) in [(9, 0), (8, 1), (0, 9)] {
+        let idling = idle_workers(8, lanes, push_only, 250, 400);
+        assert_eq!(idling.awake, 0, "{lanes}+{push_only}: {idling:?}");
+        assert_eq!(idling.productive, [0; 8], "{lanes}+{push_only}: {idling:?}");
+        assert!(idling.parks > 0, "{lanes}+{push_only}: {idling:?}");
+    }
+}
