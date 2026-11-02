@@ -364,17 +364,20 @@ impl DeferredCalls {
         #[cfg(test)]
         Hooks::run(&self.hooks.after_count);
         self.bytes_of(place).fetch_add(bytes, Ordering::Relaxed);
-        if let Err(call) = self.producer.offer(Call {
-            place,
-            bytes,
-            at,
-            run,
-        }) {
-            // The queue never refuses; if it did, the call runs here rather than being lost, and is not counted.
-            self.bytes_of(place).fetch_sub(bytes, Ordering::Relaxed);
-            self.queued.fetch_sub(1, Ordering::AcqRel);
-            run_call(&self.panicked, call.run);
-            return self.last_ticket();
+        // `MpscQueue::with_pool` is unbounded and `offer` hands an item back only when a bounded queue is full, so it cannot
+        // refuse. There is no recovery path on purpose: a call that was counted and not queued would never be made, and a
+        // `run_through` that read the count would wait for it for ever.
+        if self
+            .producer
+            .offer(Call {
+                place,
+                bytes,
+                at,
+                run,
+            })
+            .is_err()
+        {
+            unreachable!("an unbounded queue never refuses a call");
         }
         // After the offer, and a full fence between the two sides: either the consumer that just emptied the queue sees this call
         // when it looks for the next oldest, or this store comes after its reset.
