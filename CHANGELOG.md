@@ -13,14 +13,16 @@ leaves the cell between tries.
 therefore stopped at that place and found the queue "empty" although the caller's own, later, call was already published behind it.
 `reclaim` goes through `run_through` and had the same hole. `run_through_under_contention_never_returns_early` failed in most runs.
 
-**Semantics.** On its first time in the cell the caller reads the number of places claimed since the start of the queue (calls made
-plus `Consumer::size_long`); the ticket's call was offered before, so it is among them. It returns once that many calls have been made
-(`completed`, published with release), by itself or by another drain. A claimed place is published by a running thread within a few
-instructions, so the wait is short. Tickets are unchanged: they are still taken after the offer, so ticket order is not queue order,
-and the count is of the queue, not of the ticket.
+**Semantics.** `defer` counts its call (`queued`) before it claims a place in the queue. `run_through` reads `queued` once, when it is
+called, and returns once that many calls have been made (`completed`, published with release), by itself or by another drain. Every place
+claimed before that read was counted before it, so the ticket's call is among them; nothing walks or counts the queue, and a call counted
+and not yet published is made as soon as its thread, which is running, publishes it. `pending` (`queued - completed`) now includes calls
+on their way into the queue, so it is never below the calls that wait; before, it could read 0 while one waited behind a stalled
+producer. Tickets are unchanged: they are the count at the call's own increment, so ticket order is not queue order and the target is the
+count at the wait, not the ticket.
 
-**Tests.** `deferred::tests::run_through_under_contention_never_returns_early` (12 of 20 runs failed before; 0 of 60 after) and
-`run_through_never_returns_before_the_tickets_call_was_made`.
+**Tests.** `deferred::tests::run_through_under_contention_never_returns_early` (12 of 20 runs failed before; 0 of 80 after) and
+`run_through_never_returns_before_the_tickets_call_was_made` (a producer parked between its count and its offer: `run_through` waits for it, `pending` counts it).
 
 ## A worker's view of a handle changes by one service of it, and a push counts only through the handle (2026-11-02)
 
