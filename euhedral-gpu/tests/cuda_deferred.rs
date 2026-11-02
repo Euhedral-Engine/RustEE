@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use common::cuda_support::{device_word, gpu, module, wait_until};
 use euhedral_gpu::{Args, Enqueue, Gpu, Launch, Module, Stream, StreamOptions};
 use euhedral_memory::cuda::{DeviceMemory, PinnedHost};
-use euhedral_memory::{Backend, Bounds, DeferredCalls, LocationId};
+use euhedral_memory::{Backend, Bounds, DeferredCalls, LocationId, Place};
 
 /// The tests share the device: the second one's frees would hold up the first one's marker.
 #[allow(
@@ -62,7 +62,7 @@ fn deferred_frees_and_unloads_leave_a_marker_alone_and_are_made_when_the_lanes_a
     let (pool, mut s) = gpu
         .open_lanes(&["a", "b"], StreamOptions::default())
         .unwrap();
-    calls.attach_pool(pool.clone()).expect("the pool");
+    calls.attach_pool(&pool).expect("the pool");
     s[0].submit(|q| {
         // SAFETY: `spin` takes one 64-bit argument and touches no memory.
         unsafe { q.launch(&spin, Launch::linear(1, 1), &Args::new().arg(cycles(600))) }
@@ -102,7 +102,8 @@ fn deferred_frees_and_unloads_leave_a_marker_alone_and_are_made_when_the_lanes_a
         3,
         "the device free, the pinned free, the unload"
     );
-    assert!(calls.pending_bytes() >= 256 + (1 << 20));
+    assert!(calls.pending_bytes(Place::Device) >= 256);
+    assert!(calls.pending_bytes(Place::Host) >= 1 << 20);
     // The kernel ends: the lanes are idle, the calls are made.
     assert!(wait_until(Duration::from_secs(30), || pool.idle()));
     assert_eq!(calls.drain(), 3);
@@ -143,4 +144,45 @@ fn an_allocation_that_runs_out_of_memory_makes_the_deferred_frees_and_tries_agai
     // SAFETY: as above.
     unsafe { mem.free(second) };
     calls.drain();
+}
+
+#[test]
+fn a_device_does_not_keep_its_deferral_alive_and_the_owner_letting_go_makes_the_calls() {
+    let _serial = serial();
+    let Some(gpu) = gpu() else { return };
+    let device = gpu.device().clone();
+    let calls = DeferredCalls::new(Bounds::default());
+    device
+        .attach_deferral(calls.handle())
+        .expect("the first deferral");
+    let weak = std::sync::Arc::downgrade(&calls);
+    // A queued call owns the device, as the backends' calls do.
+    let (d2, made) = (
+        device.clone(),
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    );
+    let m = made.clone();
+    device.defer_or_run(Place::Device, 0, move |_| {
+        let _owns = &d2;
+        m.store(true, std::sync::atomic::Ordering::Release);
+    });
+    assert_eq!(calls.pending(), 1);
+    assert!(device.deferral().is_some());
+    drop(calls);
+    assert!(
+        made.load(std::sync::atomic::Ordering::Acquire),
+        "the source's drop made the call"
+    );
+    assert!(weak.upgrade().is_none(), "and the source is gone");
+    assert!(
+        device.deferral().is_none(),
+        "so the device defers nothing more"
+    );
+    // A drop now is made where it is dropped.
+    let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let r = ran.clone();
+    device.defer_or_run(Place::Device, 0, move |_| {
+        r.store(true, std::sync::atomic::Ordering::Release);
+    });
+    assert!(ran.load(std::sync::atomic::Ordering::Acquire));
 }

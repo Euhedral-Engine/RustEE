@@ -49,7 +49,7 @@ pub mod tiers;
 pub use admission::{Admission, Placed, PlanItem, PlanRequest, Reservation, Tiers};
 pub use arena::{BackendCalls, SCRATCH_MIN, ScratchArena, ScratchLease, SlotArena, SlotLease};
 pub use backend::{AllocError, Allocation, Backend, Block, Reaper, Retired};
-pub use deferred::{Bounds, Deferral, DeferredCalls, Ticket};
+pub use deferred::{Bounds, Deferral, DeferredCalls, Place, PoolAttached, Ticket, WeakDeferral};
 pub use planner::{
     Claim, ClaimResult, DEFAULT_OWNERS, Elastic, GiveBack, GiveBackHandler, GiveBacks, Leak,
     LeakReport, LocationId, LocationKind, LocationSpec, LocationUse, MAX_LOCATIONS, OwnerId,

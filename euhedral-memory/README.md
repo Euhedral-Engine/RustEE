@@ -24,7 +24,7 @@ link-time dependency).
 | [`arena`](src/arena.rs) | `SlotArena` / `SlotLease`, `ScratchArena` / `ScratchLease`, `BackendCalls`. |
 | [`tiers`](src/tiers.rs) | `TierPool`, `Mover` and the `Moves` lattice source, `ResidentId`, `MoveDone`, the `Copier` trait (plain and `start_pitched` copies), `PitchedCopy`, `HostCopier`, `MarkerRetired`. |
 | [`backend`](src/backend.rs) | The `Backend` trait, `Block`, `Allocation`, `Reaper` and `Retired`. |
-| [`deferred`](src/deferred.rs) | `DeferredCalls` (a `LatticeSource` of key frames), `Deferral` (its producer handle), `Ticket`, `Bounds`: blocking driver calls held for a moment with nothing in flight. |
+| [`deferred`](src/deferred.rs) | `DeferredCalls` (a `LatticeSource` of key frames), `Deferral`/`WeakDeferral` (its producer handles), `Ticket`, `Place`, `Bounds`: blocking driver calls held for a moment with nothing in flight. |
 | [`cuda`](src/cuda/mod.rs) (feature `cuda`) | `Driver` (`Driver::shared()`: the process's one loaded driver; `Driver::symbol`: entry points beyond its table), `Device` (primary context, `import_fd` for Vulkan-exported memory), `DeviceMemory`, `StreamPool`, `Vmm` (POSIX-fd export), `PinnedHost`, `StreamCopier` (the tiers' device copies). |
 
 ## Key concepts
@@ -73,10 +73,10 @@ link-time dependency).
   `DeviceMemory::free`, `PinnedHost::trim`, dropping an `Imported` mapping and euhedral-gpu's module unload then queue
   their call (with the bytes it gives back) instead of making it where the memory is dropped. The source makes the queue
   as one blocking key frame when its lane pool has nothing in flight (`LanePool::idle`: every lane's last marker reached),
-  or when queued bytes or the oldest call's age pass a bound (that drain stalls the markers for as long as the kernels
+  or when queued device bytes or the oldest call's age pass a bound, or when a thread asked with `drain_soon` (a forced drain stalls the markers for as long as the kernels
   running at that moment). An allocation that fails with out-of-memory (`DeviceMemory`, `PinnedHost`, `Vmm::alloc_vmm`,
-  `StreamPool`) makes the queued calls through a ticket and tries once more; `pending_bytes` is the memory a planner may
-  count as certain reclaim; `free_blocks` reports that a free no longer waits when a deferral is attached. Measured not to
+  `StreamPool`) makes the queued calls through a ticket and tries once more; `pending_bytes(Place)` is the memory a planner may
+  count as certain reclaim (a lane's worker counts it and calls `drain_soon`, it does not drain); `free_blocks` reports that a free no longer waits when a deferral is attached. Measured not to
   hold up another stream's marker: `cuMemAlloc`, `cuMemAllocAsync`/`cuMemFreeAsync`, stream and event create/destroy,
   `cuGraphInstantiateWithFlags`/`cuGraphExecDestroy`/`cuGraphDestroy`, `cuTexObjectCreate`/`Destroy`, the VMM calls and
   `cuMemGetInfo`.

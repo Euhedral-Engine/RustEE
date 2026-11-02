@@ -61,7 +61,7 @@ impl Drop for ModuleInner {
     fn drop(&mut self) {
         let (gpu, raw) = (Arc::clone(&self.gpu), RawModule(self.raw));
         let device: &Device = self.gpu.device();
-        device.defer_or_run(0, move |device| {
+        device.defer_or_run(euhedral_memory::Place::Device, 0, move |device| {
             if let Ok(_c) = device.enter() {
                 // SAFETY: the module loaded in `load_image`, unloaded once; the kernels hold an `Arc` of this.
                 unsafe { (gpu.fns.module_unload)(raw.get()) };

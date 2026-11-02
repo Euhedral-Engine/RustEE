@@ -369,7 +369,7 @@ pub struct Device {
     /// This device's own `Arc`, so a deferred call can keep the context alive until it runs.
     me: std::sync::Weak<Device>,
     /// Where the device's blocking frees and unloads wait for a moment with nothing in flight, once attached.
-    deferral: std::sync::OnceLock<crate::Deferral>,
+    deferral: std::sync::OnceLock<crate::deferred::WeakDeferral>,
 }
 
 // SAFETY: a primary context is process-wide and usable from any thread once pushed.
@@ -421,22 +421,35 @@ impl Device {
     /// `DeviceMemory::free`, `PinnedHost::trim`, dropping an [`Imported`] and euhedral-gpu's module unload queue their driver
     /// call on it instead of making it where the memory is dropped, an allocation that runs out of memory asks it to make
     /// the calls queued so far and tries once more (`DeviceMemory`, `PinnedHost`, `Vmm::alloc_vmm`, `StreamPool`), and
-    /// `free_blocks` of the backends reports that a free no longer waits. A queued call keeps the device alive until it runs,
-    /// and the device keeps the deferral: the owner drains it (`DeferredCalls::drain`) when it stops.
+    /// `free_blocks` of the backends reports that a free no longer waits.
+    ///
+    /// The device holds the deferral **weakly**: the owner keeps the `DeferredCalls` (a queued call keeps the device alive, and
+    /// the device must not keep the source alive). When the owner drops it, the source makes what is queued and the device makes
+    /// its calls where they are dropped again.
     pub fn attach_deferral(&self, deferral: crate::Deferral) -> Result<(), crate::Deferral> {
-        self.deferral.set(deferral)
+        self.deferral
+            .set(deferral.downgrade())
+            .map_err(|_| deferral)
     }
 
-    /// The device's deferral, if one is attached.
-    pub fn deferral(&self) -> Option<&crate::Deferral> {
-        self.deferral.get()
+    /// The device's deferral, while its owner holds the source.
+    pub fn deferral(&self) -> Option<crate::Deferral> {
+        self.deferral
+            .get()
+            .and_then(crate::deferred::WeakDeferral::upgrade)
     }
 
-    /// Makes `call` where the memory is dropped, or queues it on the device's deferral with `bytes` it gives back.
-    pub fn defer_or_run(&self, bytes: u64, call: impl FnOnce(&Device) + Send + 'static) {
+    /// Makes `call` where the memory is dropped, or queues it on the device's deferral with the `bytes` it gives back at
+    /// `place`.
+    pub fn defer_or_run(
+        &self,
+        place: crate::Place,
+        bytes: u64,
+        call: impl FnOnce(&Device) + Send + 'static,
+    ) {
         match (self.deferral(), self.arc()) {
             (Some(deferral), Some(device)) => {
-                deferral.defer(bytes, move || call(&device));
+                deferral.defer(place, bytes, move || call(&device));
             }
             _ => call(self),
         }
@@ -445,7 +458,7 @@ impl Device {
     /// For an allocation that failed for lack of memory: makes the deferred calls queued so far and says whether any were
     /// waiting (so the allocation is worth one more try). A second failure is the caller's error.
     pub(crate) fn reclaim_deferred(&self) -> bool {
-        self.deferral().is_some_and(crate::Deferral::reclaim)
+        self.deferral().is_some_and(|d| d.reclaim())
     }
 
     /// Makes the context current on this thread until the guard drops.
@@ -559,16 +572,17 @@ impl Handle {
 impl Drop for Imported<'_> {
     fn drop(&mut self) {
         let (ptr, ext) = (self.ptr, Handle(self.ext));
-        self.device.defer_or_run(self.size, move |device| {
-            let f = &device.driver.fns;
-            if let Ok(_c) = device.enter() {
-                // SAFETY: the mapping and the import made in `import_fd`, unused.
-                unsafe {
-                    (f.mem_free)(ptr);
-                    (f.destroy_external_memory)(ext.get());
+        self.device
+            .defer_or_run(crate::Place::Device, self.size, move |device| {
+                let f = &device.driver.fns;
+                if let Ok(_c) = device.enter() {
+                    // SAFETY: the mapping and the import made in `import_fd`, unused.
+                    unsafe {
+                        (f.mem_free)(ptr);
+                        (f.destroy_external_memory)(ext.get());
+                    }
                 }
-            }
-        });
+            });
     }
 }
 

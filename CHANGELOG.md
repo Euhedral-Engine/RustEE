@@ -20,23 +20,25 @@ stream. `Reaper` queues a free behind the device work that last used the memory,
 streams' markers on whatever thread it runs. The call has to be made when no lane has work in flight.
 
 **How to use.** Make a `DeferredCalls`, give it a receiver that feeds a lattice that may block (`add_downstream`) and frames to push (`request`),
-`attach_pool` the device's `LanePool`, `Device::attach_deferral(calls.handle())`, and call `calls.poll()` from a tick the owner has:
-a frame leaves when calls are queued and the pool is idle, or a bound is passed. A drain forced by `Bounds` stalls every stream's
-markers for as long as the kernels running at that moment. `Deferral::pending_bytes` is memory a planner may count as certain
-reclaim. At a stop, `stop()` (from then on `defer` makes its call at once) and then `drain()` once the last user of the device has let go.
+`attach_pool(&pool)` the device's `LanePool` (held weakly), `Device::attach_deferral(calls.handle())` (the device holds it weakly: the owner
+keeps the `Arc<DeferredCalls>`, so a queued call that owns the device does not keep the source alive), and call `calls.poll()` from a tick the
+owner has: a frame leaves when calls are queued and the pool is idle, a bound is passed, or a thread asked with `drain_soon()`. `Bounds` counts device bytes only. A drain forced by a bound stalls every stream's
+markers for as long as the kernels running at that moment. `Deferral::pending_bytes(Place)` is memory a planner may count as certain
+reclaim; a thread that must not block (a lane's worker) counts it and calls `drain_soon()`, which pushes the drain frame without waiting. At a stop, `stop()` (from then on `defer` makes its call at once) and then `drain()` once the last user of the device has let go.
 The drain frame is marked `RoutingPolicy::CacheLocal`, which a placement policy may read to keep blocking work off the workers that
 run short work.
 
 **Semantics.** One consumer: the calls are made by one thread at a time, in queue order, each exactly once, inside the source's
 `SourceCell`. `drain()` returns 0 at once when another drain is running (the queue is busy, not empty); `run_through(ticket)` makes
-the calls up to the ticket on the calling thread, waiting for a drain that is running, and returns `false` only when called from
-inside a call. An allocation that fails with `CUDA_ERROR_OUT_OF_MEMORY` (`DeviceMemory`, `PinnedHost`, `Vmm::alloc_vmm`,
+every call queued when it is called, which includes the ticket's, on the calling thread: it becomes the consumer as soon as the cell is
+free (a thread that offered a call and has not yet taken its ticket cannot make a counter overtake a call that has not run), and
+returns `false` only when called from inside a call. An allocation that fails with `CUDA_ERROR_OUT_OF_MEMORY` (`DeviceMemory`, `PinnedHost`, `Vmm::alloc_vmm`,
 `StreamPool`) makes the calls queued so far and tries once more; a second failure is returned. A call that panics is counted
-(`panicked`) and the rest still run. Dropping the source makes the calls still queued. `pull` hands out nothing. `free_blocks`
+(`panicked`) and the rest still run. Dropping the source (when the owner lets go) makes the calls still queued. `pull` hands out nothing. `free_blocks`
 of `DeviceMemory` is `false` once a deferral is attached. `LanePool::idle` sees marked work only: a lane that submitted and has
 not marked yet is not seen.
 
-`DeviceMemory::free_block` and `PinnedHost::free_host` free at once whatever the deferral, for an owner that queues the free itself to
+`unsafe DeviceMemory::free_block` and `unsafe PinnedHost::free_host` free at once whatever the deferral, for an owner that queues the free itself to
 keep something alive (a planner's claim) until the memory is really free.
 
 **Tests.** `deferred::tests` (order, a drain in progress is busy not empty and the wait ends in order, a panic, drop, a call

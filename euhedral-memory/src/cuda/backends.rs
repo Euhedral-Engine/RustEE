@@ -87,10 +87,11 @@ impl Backend for DeviceMemory {
     /// With a deferral attached to the device ([`Device::attach_deferral`]) the free is queued and made at a moment with
     /// nothing in flight; without one it is made here and waits for the device.
     unsafe fn free(&self, block: Block) {
-        self.device.defer_or_run(block.bytes, move |d| {
-            // SAFETY: the caller's contract (a block of this backend, unused).
-            unsafe { Self::free_block(d, block) };
-        });
+        self.device
+            .defer_or_run(crate::Place::Device, block.bytes, move |d| {
+                // SAFETY: the caller's contract (a block of this backend, unused).
+                unsafe { Self::free_block(d, block) };
+            });
     }
 
     fn free_blocks(&self) -> bool {
@@ -493,15 +494,21 @@ impl PinnedHost {
         // The frees wait for the device: with a deferral attached to the device they are queued and made at a moment with
         // nothing in flight, else now.
         self.device
-            .defer_or_run(bytes, move |d| Self::free_host(d, &gone));
+            .defer_or_run(crate::Place::Host, bytes, move |d| {
+                // SAFETY: released buffers of this backend, unused.
+                unsafe { Self::free_host(d, &gone) };
+            });
     }
 
     /// Frees the buffers at `released` (address, bytes) on `device` now, whatever the device's deferral, as
     /// [`DeviceMemory::free_block`]. Waits for the device.
-    pub fn free_host(device: &Device, released: &[(u64, u64)]) {
+    ///
+    /// # Safety
+    /// Buffers of a `PinnedHost` of this device (address, bytes), each freed once and unused by host and device.
+    pub unsafe fn free_host(device: &Device, released: &[(u64, u64)]) {
         if let Ok(_c) = device.enter() {
             for &(a, _) in released {
-                // SAFETY: released buffers of a `PinnedHost` of this device, unused.
+                // SAFETY: the caller's contract.
                 unsafe { (device.driver.fns.mem_free_host)(a as *mut c_void) };
             }
         }
