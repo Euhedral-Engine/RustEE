@@ -72,6 +72,13 @@ pub trait DeviceQueue: Send + Sync + fmt::Debug {
     /// `cuEventQuery`); never blocks.
     fn completed(&self) -> u64;
 
+    /// The highest value of a marker issued on this queue: the lane's work up to it has been submitted. When
+    /// [`completed`](Self::completed) has reached it, the queue has no marked work in flight. One cheap atomic read. The
+    /// default is [`completed`](Self::completed): a queue that cannot say what it issued reports itself idle.
+    fn issued(&self) -> u64 {
+        self.completed()
+    }
+
     /// A short name for logs and metrics.
     fn name(&self) -> &str;
 }
@@ -128,6 +135,14 @@ impl LanePool {
         self.lanes
             .get(usize::from(marker.lane.0))
             .is_some_and(|queue| queue.id() == marker.queue && queue.completed() >= marker.value)
+    }
+
+    /// Whether no lane has marked work in flight: every lane's [`completed`](DeviceQueue::completed) has reached its
+    /// [`issued`](DeviceQueue::issued) marker. A moment of this reading is not a hold: a lane may submit the next instant.
+    /// Work a lane has submitted but not yet marked is not seen; a lane that marks after each unit of work (as the lane
+    /// sources do) has none outside a unit.
+    pub fn idle(&self) -> bool {
+        self.lanes.iter().all(|q| q.completed() >= q.issued())
     }
 
     /// The lane for a stage: `continued` (the lane of the predecessor it is the critical successor
@@ -203,6 +218,7 @@ impl LanePoolBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
 
     #[derive(Debug)]
     struct Idle(QueueId);
@@ -219,6 +235,58 @@ mod tests {
         fn name(&self) -> &str {
             "idle"
         }
+    }
+
+    /// A queue with a settable issued and completed value.
+    #[derive(Debug)]
+    struct Counting {
+        id: QueueId,
+        issued: std::sync::atomic::AtomicU64,
+        completed: std::sync::atomic::AtomicU64,
+    }
+
+    impl DeviceQueue for Counting {
+        fn id(&self) -> QueueId {
+            self.id
+        }
+
+        fn completed(&self) -> u64 {
+            self.completed.load(Ordering::Acquire)
+        }
+
+        fn issued(&self) -> u64 {
+            self.issued.load(Ordering::Acquire)
+        }
+
+        fn name(&self) -> &str {
+            "counting"
+        }
+    }
+
+    #[test]
+    fn a_pool_is_idle_when_every_lane_reached_what_it_issued() {
+        let make = || {
+            Arc::new(Counting {
+                id: QueueId::next(),
+                issued: 0.into(),
+                completed: 0.into(),
+            })
+        };
+        let (a, b) = (make(), make());
+        let pool = LanePool::new(vec![a.clone(), b.clone()]);
+        assert!(pool.idle(), "nothing issued");
+        a.issued.store(3, Ordering::Release);
+        assert!(!pool.idle(), "lane a has marked work in flight");
+        a.completed.store(2, Ordering::Release);
+        assert!(!pool.idle());
+        a.completed.store(3, Ordering::Release);
+        assert!(pool.idle());
+        b.issued.store(1, Ordering::Release);
+        assert!(!pool.idle(), "lane b has");
+        assert!(
+            LanePool::new(vec![Arc::new(Idle(QueueId::next()))]).idle(),
+            "the default issued is completed"
+        );
     }
 
     fn pool(lanes: usize) -> LanePool {

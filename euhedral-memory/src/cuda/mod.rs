@@ -366,6 +366,10 @@ pub struct Device {
     pub driver: Arc<Driver>,
     pub ordinal: c_int,
     pub ctx: CuContext,
+    /// This device's own `Arc`, so a deferred call can keep the context alive until it runs.
+    me: std::sync::Weak<Device>,
+    /// Where the device's blocking frees and unloads wait for a moment with nothing in flight, once attached.
+    deferral: std::sync::OnceLock<crate::deferred::WeakDeferral>,
 }
 
 // SAFETY: a primary context is process-wide and usable from any thread once pushed.
@@ -399,11 +403,62 @@ impl Device {
         driver.check("cuDevicePrimaryCtxRetain", unsafe {
             (driver.fns.primary_ctx_retain)(&mut ctx, dev)
         })?;
-        Ok(Arc::new(Device {
+        Ok(Arc::new_cyclic(|me| Device {
             driver,
             ordinal: dev,
             ctx,
+            me: me.clone(),
+            deferral: std::sync::OnceLock::new(),
         }))
+    }
+
+    /// This device's `Arc` (`None` only while it is being dropped).
+    pub fn arc(&self) -> Option<Arc<Device>> {
+        self.me.upgrade()
+    }
+
+    /// Makes `deferral` the place this device's blocking calls wait (once; a second is refused and returned). From then on
+    /// `DeviceMemory::free`, `PinnedHost::trim`, dropping an [`Imported`] and euhedral-gpu's module unload queue their driver
+    /// call on it instead of making it where the memory is dropped, an allocation that runs out of memory asks it to make
+    /// the calls queued so far and tries once more (`DeviceMemory`, `PinnedHost`, `Vmm::alloc_vmm`, `StreamPool`), and
+    /// `free_blocks` of the backends reports that a free no longer waits.
+    ///
+    /// The device holds the deferral **weakly**: the owner keeps the `DeferredCalls` (a queued call keeps the device alive, and
+    /// the device must not keep the source alive). When the owner drops it, the source makes what is queued and the device makes
+    /// its calls where they are dropped again.
+    pub fn attach_deferral(&self, deferral: crate::Deferral) -> Result<(), crate::Deferral> {
+        self.deferral
+            .set(deferral.downgrade())
+            .map_err(|_| deferral)
+    }
+
+    /// The device's deferral, while its owner holds the source.
+    pub fn deferral(&self) -> Option<crate::Deferral> {
+        self.deferral
+            .get()
+            .and_then(crate::deferred::WeakDeferral::upgrade)
+    }
+
+    /// Makes `call` where the memory is dropped, or queues it on the device's deferral with the `bytes` it gives back at
+    /// `place`.
+    pub fn defer_or_run(
+        &self,
+        place: crate::Place,
+        bytes: u64,
+        call: impl FnOnce(&Device) + Send + 'static,
+    ) {
+        match (self.deferral(), self.arc()) {
+            (Some(deferral), Some(device)) => {
+                deferral.defer(place, bytes, move || call(&device));
+            }
+            _ => call(self),
+        }
+    }
+
+    /// For an allocation that failed for lack of memory: makes the deferred calls queued so far and says whether any were
+    /// waiting (so the allocation is worth one more try). A second failure is the caller's error.
+    pub(crate) fn reclaim_deferred(&self) -> bool {
+        self.deferral().is_some_and(|d| d.reclaim())
     }
 
     /// Makes the context current on this thread until the guard drops.
@@ -484,30 +539,50 @@ impl Device {
         Ok(Imported {
             device: self,
             ext,
+            size,
             ptr,
         })
     }
 }
 
 /// Memory imported from another API, mapped at `ptr`. Dropping it unmaps (`cuMemFree`) and destroys the import:
-/// both may synchronize the device, so drop it where blocking is allowed.
+/// both wait for the device and make every stream's enqueue wait with them. With a deferral attached to the device
+/// ([`Device::attach_deferral`]) they are queued with the rest and made at a moment with nothing in flight.
 #[derive(Debug)]
 pub struct Imported<'a> {
     device: &'a Device,
     ext: CuExternalMemory,
+    size: u64,
     pub ptr: CuDevicePtr,
+}
+
+/// A raw driver handle that moves to the thread that makes a deferred call.
+struct Handle(*mut c_void);
+
+// SAFETY: a handle of the primary context, usable from any thread with that context current.
+unsafe impl Send for Handle {}
+
+impl Handle {
+    /// The handle. A method, so a closure captures the whole `Handle` (which is `Send`), not its raw pointer field.
+    fn get(&self) -> *mut c_void {
+        self.0
+    }
 }
 
 impl Drop for Imported<'_> {
     fn drop(&mut self) {
-        let f = &self.device.driver.fns;
-        if let Ok(_c) = self.device.enter() {
-            // SAFETY: the mapping and the import made in `import_fd`, unused.
-            unsafe {
-                (f.mem_free)(self.ptr);
-                (f.destroy_external_memory)(self.ext);
-            }
-        }
+        let (ptr, ext) = (self.ptr, Handle(self.ext));
+        self.device
+            .defer_or_run(crate::Place::Device, self.size, move |device| {
+                let f = &device.driver.fns;
+                if let Ok(_c) = device.enter() {
+                    // SAFETY: the mapping and the import made in `import_fd`, unused.
+                    unsafe {
+                        (f.mem_free)(ptr);
+                        (f.destroy_external_memory)(ext.get());
+                    }
+                }
+            });
     }
 }
 
