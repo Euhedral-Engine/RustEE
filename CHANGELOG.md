@@ -34,7 +34,7 @@ every call queued when it is called, which includes the ticket's, on the calling
 free (a thread that offered a call and has not yet taken its ticket cannot make a counter overtake a call that has not run), and
 returns `false` only when called from inside a call. An allocation that fails with `CUDA_ERROR_OUT_OF_MEMORY` (`DeviceMemory`, `PinnedHost`, `Vmm::alloc_vmm`,
 `StreamPool`) makes the calls queued so far and tries once more; a second failure is returned. A call that panics is counted
-(`panicked`) and the rest still run. Dropping the source (when the owner lets go) makes the calls still queued. `pull` hands out nothing. `free_blocks`
+(`panicked`) and the rest still run. Dropping the source (when the owner lets go) makes the calls still queued. `can_drain()` says whether a frame can still leave (not stopped, downstream not completed): a thread that waits for memory the queue holds checks it first. `pull` hands out nothing. `free_blocks`
 of `DeviceMemory` is `false` once a deferral is attached. `LanePool::idle` sees marked work only: a lane that submitted and has
 not marked yet is not seen.
 
