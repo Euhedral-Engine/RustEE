@@ -24,14 +24,17 @@ thread_local! {
     static SERVICING: Cell<Option<Servicing>> = const { Cell::new(None) };
 }
 
-/// Records that a frame was routed downstream through the handle `owner`. It counts as evidence for
-/// the service this thread is performing on that handle, and for no other handle and no other thread.
-pub(crate) fn note_routed_push(owner: u64) {
+/// Records that a frame was pushed through the handle `owner`, and whether it was routed (`routed`)
+/// or found no downstream to take it. It counts as evidence for the service this thread is
+/// performing on that handle, and for no other handle and no other thread. The last push of a
+/// service decides: a frame that could not be routed leaves the handle unproductive for the
+/// service, even after one that could.
+pub(crate) fn note_routed_push(owner: u64, routed: bool) {
     SERVICING.with(|servicing| {
         if let Some(mut observed) = servicing.get()
             && observed.owner == owner
         {
-            observed.pushed = true;
+            observed.pushed = routed;
             servicing.set(Some(observed));
         }
     });
@@ -39,6 +42,10 @@ pub(crate) fn note_routed_push(owner: u64) {
 
 /// The span of one service of a handle, in which [`note_routed_push`] marks the handle. Ends when
 /// dropped, even by a panic, and gives back the observation of the service it interrupted.
+///
+/// A service nested in another one on the same thread through a different registry's queue would
+/// lose the outer handle's pushes made while it ran; that is unreachable through
+/// `UpstreamRegistry::with_thread_queue`, which refuses a queue already in use on the thread.
 struct Observing {
     outer: Option<Servicing>,
 }

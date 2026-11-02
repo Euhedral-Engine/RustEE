@@ -7,7 +7,8 @@
 //! The lattice gets `--lanes` sources that have nothing to hand over (their `pull` finds 0 and their `request`
 //! pushes nothing) and `--push-only` sources whose `pull` always finds 0 and whose `request` pushes a frame on every
 //! `--push-every`th call (never, by default). Nothing else runs. For `--seconds` the process samples the CPU time of
-//! every worker thread from `/proc/self/task/*/stat` once a second and reads each source's call counters at the end.
+//! every thread that started after the lattice did (its workers, and what else the process started) from
+//! `/proc/self/task/*/stat` once a second and reads each source's call counters at the end.
 //!
 //! The summary reports, over (worker thread, second) samples, the share of a CPU each worker used (mean and
 //! P0, P25, P50, P90, P99, P100), and over the lane sources the polls per second (mean, throughput, same quantiles).
@@ -255,7 +256,11 @@ fn main() {
         let ticks = thread_ticks();
         let elapsed = now.duration_since(last_at).as_secs_f64();
         for tid in &workers {
-            let delta = ticks.get(tid).copied().unwrap_or(0) - last.get(tid).copied().unwrap_or(0);
+            let delta = ticks
+                .get(tid)
+                .copied()
+                .unwrap_or(0)
+                .saturating_sub(last.get(tid).copied().unwrap_or(0));
             shares.push(delta as f64 / TICKS_PER_SECOND / elapsed);
         }
         last = ticks;
@@ -266,7 +271,10 @@ fn main() {
     let per_worker_cpu_s: Vec<f64> = workers
         .iter()
         .map(|tid| {
-            (last.get(tid).copied().unwrap_or(0) - first.get(tid).copied().unwrap_or(0)) as f64
+            last.get(tid)
+                .copied()
+                .unwrap_or(0)
+                .saturating_sub(first.get(tid).copied().unwrap_or(0)) as f64
                 / TICKS_PER_SECOND
         })
         .collect();

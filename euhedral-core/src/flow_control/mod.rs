@@ -18,6 +18,8 @@ mod registry;
 #[cfg(test)]
 pub(crate) mod testing;
 mod upstream_queue;
+#[cfg(test)]
+pub(crate) use upstream_queue::note_routed_push;
 mod vertex;
 mod views;
 

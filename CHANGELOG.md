@@ -6,32 +6,42 @@ semantics and the tests that pin it.
 ## A worker's view of a handle changes by one service of it, and a push counts only through the handle (2026-11-02)
 
 **What.** `UpstreamQueue` marks a handle productive or unproductive, per worker, by what one service of it showed. Pushes are
-attributed to the handle they are routed through: `note_routed_push` takes the handle's claim owner, and counts only for the
-service of that handle in progress on the thread. A pull that finds nothing but routed a frame through its handle shows it
-productive. Before, a request counted any frame routed on the thread during it, and a pull that found nothing was unproductive
-whatever was routed.
+attributed to the handle they are pushed through: `note_routed_push(owner, routed)` takes the handle's claim owner and whether the
+frame was routed, and counts only for the service of that handle in progress on the thread; the last push of a service decides
+(a frame that finds no downstream leaves the handle unproductive for it). A pull that finds nothing but routed a frame through its
+handle shows it productive. Before, a request counted any frame routed on the thread during it, and a pull that found nothing was
+unproductive whatever was routed.
 
 **Why.** This is the productivity observation of the original (`LatticeVertex.UpstreamInterceptor`, per worker and handle: begin
-at acquisition, a routed push or a pull that finds frames sets it, an early exit restores it), with the one rule `UpstreamQueue`
-adds on top: a request that routes nothing keeps the worker's last view. The marking was already that rule; the thread-wide push
-counter was not, since it also counted frames routed through other handles. The productive count steers idling and the park of a
-cycle that ran nothing (`should_idle`, the Idle path's park, the unproductive park, `plentiful`).
+at acquisition, a push sets it by whether it was routed, a pull that finds frames sets it, an early exit restores it), with the one
+rule `UpstreamQueue` adds on top: a request that routes nothing keeps the worker's last view. The marking was already that rule; the
+thread-wide push counter was not, since it also counted frames routed through other handles. The productive count steers idling and
+the park of a cycle that ran nothing (`should_idle`, the Idle path's park, the unproductive park, `plentiful`).
+
+**Where it differs from the original.** A push counts only inside the service of its own handle. The original sets the observation
+of the pushing thread whenever a push happens, including one outside a service of that handle on that thread. Such a push can leave
+a handle's observation productive when the next service's `begin` has not run, and then the queue's `nonproductiveCount` can end one
+too high, so one handle counts as unproductive that the worker's view calls productive. Rust's scoping has no such bookkeeping, and is
+kept; whether the original should be fixed is the owner's call.
 
 **How to use.** Nothing changes for a source that pushes through its own receiver inside `request` or `pull`.
 
 **Semantics.**
 - A new handle is productive. `reset_for_next_trial` makes every live handle productive again.
-- Pull: frames found, productive; none found, unproductive unless a frame was routed through the handle during the call; a pull that
-  stopped at a frame with none found, or that could not be made (complete, no demand, no work in progress, a panic), keeps the view.
-- Request: a frame routed through the handle, or frames delivered against the thread's request, productive; otherwise the view is kept.
+- Pull: frames found, productive; none found, productive only if the last push through the handle during the call was routed; a pull
+  that stopped at a frame with none found, or that could not be made (complete, no demand, the lattice closed or draining, a panic),
+  keeps the view.
+- Request: frames delivered against the thread's request, or a last push that was routed, productive; otherwise the view is kept.
 - The view is plain state in the worker's queue: another worker's pull does not change it, and a push by another thread does not
   mark it. The span of one service is a thread-local owner and flag that the push of that owner sets.
 - A handle that a worker only requests, never pulls (a worker on the Staged path), stays productive for that worker, as a request that
   routes nothing shows nothing. This is the original's behaviour and is not changed here.
 
-**Tests.** `an_acquisition_marks_the_handle_by_what_it_showed`, `a_push_through_another_handle_is_no_evidence_about_this_one`,
-`each_worker_has_its_own_view_of_a_handle` (`flow_control::upstream_queue`); `a_source_that_only_pushes_counts_like_any_other_handle`
-(`control_plane::decision_tree`). Benchmark: `idle_polls`.
+**Tests.** `an_acquisition_marks_the_handle_by_what_it_showed`, `the_last_push_through_a_handle_wins`,
+`a_push_through_another_handle_is_no_evidence_about_this_one`, `each_worker_has_its_own_view_of_a_handle`
+(`flow_control::upstream_queue`); `a_source_that_only_pushes_is_productive_when_it_pushes` (`control_plane::decision_tree`: a push-only
+source that does not push is counted as a lane source is; one that pushes on every request is the one productive handle where workers
+pull, and counts as any handle where they only request). Benchmark: `idle_polls`.
 
 ## Blocking frees and unloads wait in a device's `DeferredCalls` until its lanes are idle (2026-11-02)
 

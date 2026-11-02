@@ -49,12 +49,12 @@ round-robin, in a shuffled order.
 serviced it. Each worker has its own view of each handle, plain state in the worker's queue, and one service
 of a handle (one acquisition) changes it by what that service showed:
 - a new handle is productive until the worker finds it empty;
-- a **pull** that finds frames shows it productive; a pull that finds none shows it unproductive, unless a frame
-  was routed through the handle during the call;
-- a **request** that routes a frame through the handle (or satisfies the thread's request) shows it productive.
+- a **pull** that finds frames shows it productive; a pull that finds none shows it unproductive, unless the last frame
+  pushed through the handle during the call was routed (a frame that finds no downstream shows nothing);
+- a **request** whose last push through the handle was routed (or that satisfies the thread's request) shows it productive.
   A request that routes nothing shows nothing, because a request has no empty result: the view stays as it was;
 - a pull that stopped at a frame, and a service that could not be made (the handle was complete, had no
-  demand or no work in progress, or its source panicked), leave the view as it was.
+  demand, its lattice was closed or was draining, or its source panicked), leave the view as it was.
 
 A frame routed through some other handle, or by another thread, is no evidence about this one. The decision tree
 and idle timing use the count of productive handles per worker. A handle that a worker only requests, never

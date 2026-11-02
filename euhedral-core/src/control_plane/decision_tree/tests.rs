@@ -1,9 +1,11 @@
 use super::*;
 use crate::config::TimingProvider;
+use crate::flow_control::note_routed_push;
 use crate::flow_control::{Claim, UpstreamHandle, UpstreamRegistry};
 use crate::frames::Frame;
 use euhedral_hardware_utils::util::CpuSet;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 fn nanos(nanos: u64) -> Duration {
     Duration::from_nanos(nanos)
@@ -415,23 +417,32 @@ fn calibration_measures_both_thresholds() {
     assert!(threshold.is_finite());
 }
 
-/// A source with nothing to hand over: every pull finds 0, and a request pushes nothing (it would,
-/// were there work, push from the request, as a source that only pushes does).
-struct PushOnly {
+/// A source whose every pull finds 0. A lane source never pushes. A push-only one pushes from
+/// `request`, routing a frame through its handle on every `push_every`th request (the frame itself
+/// is not made: the handle only reports the push, as the vertex does for one it routes).
+struct Source {
     sequence: u64,
-    claimed: std::sync::atomic::AtomicBool,
+    push_every: u64,
+    requests: AtomicU64,
+    claimed: AtomicBool,
 }
 
-impl PushOnly {
-    fn new(sequence: u64) -> Arc<Self> {
+impl Source {
+    fn lane(sequence: u64) -> Arc<Self> {
+        Self::push_only(sequence, 0)
+    }
+
+    fn push_only(sequence: u64, push_every: u64) -> Arc<Self> {
         Arc::new(Self {
             sequence,
-            claimed: std::sync::atomic::AtomicBool::new(false),
+            push_every,
+            requests: AtomicU64::new(0),
+            claimed: AtomicBool::new(false),
         })
     }
 }
 
-impl UpstreamHandle for PushOnly {
+impl UpstreamHandle for Source {
     fn sequence(&self) -> u64 {
         self.sequence
     }
@@ -446,7 +457,12 @@ impl UpstreamHandle for PushOnly {
         Some(0)
     }
 
-    fn request(&self, _claim: &mut Claim, _demand: u64) {}
+    fn request(&self, claim: &mut Claim, _demand: u64) {
+        let requests = self.requests.fetch_add(1, Ordering::Relaxed) + 1;
+        if self.push_every != 0 && requests.is_multiple_of(self.push_every) {
+            note_routed_push(claim.owner(), true);
+        }
+    }
 
     fn is_complete(&self) -> bool {
         false
@@ -476,13 +492,23 @@ struct Idling {
 }
 
 /// Runs `cycles` cycles of each of `workers` workers in turn, over `lanes` sources that have
-/// nothing and `push_only` more that only push, with the choices of the worker loop (the
+/// nothing and `push_only` more that only push (every `push_every`th request), with the choices of the worker loop (the
 /// productive count, `should_idle`, the path, the parks of a cycle that processed nothing) made by
 /// the real queue and tree. Bodies cost `body_ns`, which sets the path.
-fn idle_workers(workers: usize, lanes: u64, push_only: u64, body_ns: u64, cycles: u64) -> Idling {
+fn idle_workers(
+    workers: usize,
+    lanes: u64,
+    push_only: u64,
+    push_every: u64,
+    body_ns: u64,
+    cycles: u64,
+) -> Idling {
     let registry = UpstreamRegistry::with_topology(workers + 1, CpuSet::new());
-    for sequence in 0..lanes + push_only {
-        registry.add_handle(PushOnly::new(sequence));
+    for sequence in 0..lanes {
+        registry.add_handle(Source::lane(sequence));
+    }
+    for sequence in lanes..lanes + push_only {
+        registry.add_handle(Source::push_only(sequence, push_every));
     }
     let mut idling = Idling {
         parks: 0,
@@ -536,45 +562,57 @@ fn idle_workers(workers: usize, lanes: u64, push_only: u64, body_ns: u64, cycles
     idling
 }
 
-/// A source that only pushes (its pull always finds 0) is one more handle in the productive count
-/// of a worker, and no more than any other handle: it never keeps a worker awake that an empty
-/// source with the same view would let park. Where a worker pulls, the pull finds the source empty
-/// and it stops counting; where a worker only requests (the staged path), a request that pushed
-/// nothing shows nothing, and the source counts as productive, as every handle does, until a pull
-/// finds it empty. That is the rule of the original (see `a_request_is_not_evidence_of_an_empty_source`).
-/// A source that only pushes (its pull always finds 0, and it pushes from `request`) counts in the
-/// productive count like any other handle: a lattice of eight workers and no work behaves the same
-/// with one more lane source as with one more push-only source, and the push-only source keeps no
-/// worker awake that a lane source would let park.
+/// A source that only pushes (its pull always finds 0, and it pushes from `request`) is one more
+/// handle in the productive count, and it is productive exactly when its requests push.
 ///
 /// - Where workers pull (cheap bodies, the Direct path), a pull that finds a handle empty ends its
 ///   productivity, so every handle is found empty in turn, the count falls to 0 and all workers park.
+///   A push-only source that does not push in these cycles is found empty like a lane source, so the
+///   lattice is the same as one with one more lane source. One that pushes on every request is
+///   made productive again by each request that follows the pull, so the count stays at 1 and no
+///   worker reaches the unproductive park.
 /// - Where they only request (costly bodies, the Staged path), nothing is found empty, so every handle
-///   counts as productive: the count is the number of handles, up to the one below the number of
-///   workers, where a worker that has a handle per worker pulls (the Direct path) and finds one
-///   empty. A request that routes nothing is no evidence of an empty source.
+///   counts as productive whether it pushes or not: the count is the number of handles, up to the one
+///   below the number of workers, where a worker that has a handle per worker pulls (the Direct
+///   path) and finds one empty. A request that routes nothing is no evidence of an empty source.
 #[test]
-fn a_source_that_only_pushes_counts_like_any_other_handle() {
+fn a_source_that_only_pushes_is_productive_when_it_pushes() {
+    // Never reached in the cycles run.
+    const QUIET: u64 = 1 << 40;
     for total in 3..=9 {
-        // Cheap bodies: the push-only source is found empty like the others, and every worker parks.
-        let lanes = idle_workers(8, total, 0, 250, 100);
-        let mixed = idle_workers(8, total - 1, 1, 250, 100);
+        // Cheap bodies, a source that does not push: found empty like the others, every worker parks.
+        let lanes = idle_workers(8, total, 0, 0, 250, 100);
+        let quiet = idle_workers(8, total - 1, 1, QUIET, 250, 100);
         assert_eq!(
             (lanes.awake, &lanes.productive),
             (0, &vec![0; 8]),
             "{lanes:?}"
         );
         assert_eq!(
-            (mixed.awake, &mixed.productive),
+            (quiet.awake, &quiet.productive),
             (0, &vec![0; 8]),
-            "{mixed:?}"
+            "{quiet:?}"
         );
 
-        // Costly bodies: a push-only source counts exactly as a lane source does.
-        let lanes = idle_workers(8, total, 0, 1_200, 100);
-        let mixed = idle_workers(8, total - 1, 1, 1_200, 100);
+        // Cheap bodies, a source that pushes on every request: it is the one productive handle, and
+        // the unproductive park, which needs none, never comes.
+        let pushing = idle_workers(8, total - 1, 1, 1, 250, 100);
+        assert_eq!(pushing.productive, [1; 8], "{pushing:?}");
+        assert!(
+            pushing.parks < lanes.parks,
+            "{pushing:?} parks as often as {lanes:?}"
+        );
+
+        // Costly bodies: a push-only source counts as a lane source does, pushing or not.
+        let lanes = idle_workers(8, total, 0, 0, 1_200, 100);
+        let quiet = idle_workers(8, total - 1, 1, QUIET, 1_200, 100);
+        let pushing = idle_workers(8, total - 1, 1, 1, 1_200, 100);
         assert_eq!(lanes.productive, [total.min(7); 8], "{lanes:?}");
-        assert_eq!(mixed.productive, lanes.productive, "{mixed:?} {lanes:?}");
-        assert_eq!(mixed.awake, lanes.awake, "{mixed:?} {lanes:?}");
+        assert_eq!(quiet.productive, lanes.productive, "{quiet:?} {lanes:?}");
+        assert_eq!(quiet.awake, lanes.awake, "{quiet:?} {lanes:?}");
+        assert_eq!(
+            pushing.productive, lanes.productive,
+            "{pushing:?} {lanes:?}"
+        );
     }
 }

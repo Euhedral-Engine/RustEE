@@ -3,7 +3,7 @@ use crate::frames::BenchmarkFrame;
 use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 /// A handle that records what it is asked for and can be made contended, empty or broken.
 #[derive(Default)]
@@ -158,7 +158,7 @@ impl UpstreamHandle for SourceHandle {
             };
             self.routed.lock().unwrap().push(frame.header().id_hash());
             if !self.silent {
-                note_routed_push(claim.owner());
+                note_routed_push(claim.owner(), true);
             }
             if self.counts_against_request {
                 FlowContext::with(|context| context.unwrap().add_satisfied_request(1));
@@ -1373,6 +1373,9 @@ struct Scripted {
     stops: AtomicBool,
     pushes_in_pull: AtomicBool,
     pushes_in_request: AtomicBool,
+    /// What a push does: it is routed, or it is routed and then another finds no downstream, or only
+    /// one that finds none is made.
+    unroutable: AtomicU8,
 }
 
 impl Scripted {
@@ -1385,6 +1388,7 @@ impl Scripted {
             stops: AtomicBool::new(false),
             pushes_in_pull: AtomicBool::new(false),
             pushes_in_request: AtomicBool::new(false),
+            unroutable: AtomicU8::new(ROUTED),
         })
     }
 
@@ -1406,6 +1410,26 @@ impl Scripted {
     }
 }
 
+/// A scripted push is routed.
+const ROUTED: u8 = 0;
+/// A scripted push is routed, then another finds no downstream.
+const ROUTED_THEN_UNROUTABLE: u8 = 1;
+/// A scripted push finds no downstream.
+const UNROUTABLE: u8 = 2;
+
+impl Scripted {
+    fn push(&self) {
+        let owner = self.push_as.load(Ordering::Relaxed);
+        let kind = self.unroutable.load(Ordering::Relaxed);
+        if kind != UNROUTABLE {
+            note_routed_push(owner, true);
+        }
+        if kind != ROUTED {
+            note_routed_push(owner, false);
+        }
+    }
+}
+
 impl UpstreamHandle for Scripted {
     fn sequence(&self) -> u64 {
         self.owner
@@ -1422,7 +1446,7 @@ impl UpstreamHandle for Scripted {
             return None;
         }
         if self.pushes_in_pull.load(Ordering::Relaxed) {
-            note_routed_push(self.push_as.load(Ordering::Relaxed));
+            self.push();
         }
         if self.stops.load(Ordering::Relaxed) {
             assert!(stop(&*ordered(1)), "the stop condition matches the frame");
@@ -1432,7 +1456,7 @@ impl UpstreamHandle for Scripted {
 
     fn request(&self, _claim: &mut Claim, _demand: u64) {
         if self.pushes_in_request.load(Ordering::Relaxed) {
-            note_routed_push(self.push_as.load(Ordering::Relaxed));
+            self.push();
         }
     }
 
@@ -1636,8 +1660,18 @@ fn a_push_through_another_handle_is_no_evidence_about_this_one() {
         "reported against 8"
     );
 
-    // Outside any acquisition nothing is observing, and the push is dropped.
-    note_routed_push(7);
+    // Outside any acquisition nothing is observing, and the push is dropped: the next request, which
+    // pushes nothing, finds the view as it was.
+    note_routed_push(7, true);
+    handle.script(0, false, false, false, false);
+    fixture.queue.request(8);
+    assert_eq!(
+        fixture.queue.productive_handle_count(),
+        0,
+        "a push outside a service"
+    );
+
+    handle.script(0, false, false, false, true);
     handle.push_as.store(7, Ordering::Relaxed);
     fixture.queue.request(8);
     assert_eq!(
@@ -1671,4 +1705,51 @@ fn each_worker_has_its_own_view_of_a_handle() {
         0,
         "the push was first's"
     );
+}
+
+/// The last push through a handle in a service decides what the service showed, so a frame that
+/// finds no downstream leaves the handle unproductive for it (the original sets the observation
+/// false on an unroutable push and true on a routed one, in the order they come).
+#[test]
+fn the_last_push_through_a_handle_wins() {
+    // (kind of push, in a pull, view after from an unproductive start, from a productive start)
+    let cases = [
+        // A request that pushes only what finds no downstream shows nothing: the view is kept.
+        (UNROUTABLE, false, false, true),
+        // A routed push and then an unroutable one: the unroutable one is the last, so nothing shown.
+        (ROUTED_THEN_UNROUTABLE, false, false, true),
+        // A pull that finds nothing, with a push that finds no downstream: unproductive.
+        (UNROUTABLE, true, false, false),
+        (ROUTED_THEN_UNROUTABLE, true, false, false),
+        // The routed push alone shows the handle productive.
+        (ROUTED, false, true, true),
+        (ROUTED, true, true, true),
+    ];
+    for (kind, in_pull, from_unproductive, from_productive) in cases {
+        for (start_productive, expected) in [(false, from_unproductive), (true, from_productive)] {
+            let mut fixture = Fixture::new();
+            let handle = fixture.add(Scripted::new(7));
+            if !start_productive {
+                handle.script(0, false, false, false, false);
+                fixture.pull(1);
+            }
+            handle.unroutable.store(kind, Ordering::Relaxed);
+            handle.script(0, false, false, in_pull, !in_pull);
+            if in_pull {
+                fixture.pull(8);
+            } else {
+                fixture.queue.request(8);
+            }
+            assert_eq!(
+                fixture.queue.productive_handle_count() == 1,
+                expected,
+                "push kind {kind}, in a pull: {in_pull}, from a{} view",
+                if start_productive {
+                    " productive"
+                } else {
+                    "n unproductive"
+                }
+            );
+        }
+    }
 }
