@@ -2,9 +2,12 @@
 //!
 //! A backend allocates at one location and frees what it allocated. The planner never calls a backend: an owner
 //! claims first, then allocates, and keeps the claim with the memory ([`Allocation`]). A free that may block (CUDA's
-//! `cuMemFree` and `cuMemFreeHost` synchronize the device; Vulkan's adapters drain before a free) never runs on a
-//! lattice worker: it is queued in a [`Reaper`] behind the device work that last used the memory, and the reaper is
-//! run where blocking is allowed (a thread of its own, or a lattice set aside for blocking work).
+//! `cuMemFree` and `cuMemFreeHost` synchronize the device; Vulkan's adapters drain before a free) is queued in a
+//! [`Reaper`] behind the device work that last used the memory, so it is not freed while the device may still use it.
+//! [`Reaper::reap`] makes the frees on the thread that calls it: when that is a lattice worker, the blocking free runs
+//! on that worker and counts as the service time of the work that called `reap` (the `HOT-FIX` id M1 marks it). A caller whose
+//! frees are long enough to starve other work reaps from a thread of its own, or from a lattice set aside for
+//! blocking work.
 
 use std::fmt;
 
@@ -50,7 +53,8 @@ pub trait Backend: Send + Sync + fmt::Debug {
     /// # Safety
     /// The block came from this backend's `alloc`, is freed once, and nothing (host or device) uses it any more.
     unsafe fn free(&self, block: Block);
-    /// Whether `free` may wait for the device (then it must run on a [`Reaper`], never on a lattice worker).
+    /// Whether `free` may wait for the device (then queue the block in a [`Reaper`] so it is freed only after the
+    /// device work that used it retired; `reap` runs the free on the thread that calls it).
     fn free_blocks(&self) -> bool;
 }
 

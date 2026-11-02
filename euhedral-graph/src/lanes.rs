@@ -59,7 +59,7 @@ impl Marker {
 }
 
 /// A device queue that runs its submissions in order: a Vulkan queue with a timeline semaphore, a
-/// CUDA stream with an event ring, a hardware codec engine behind a session, or a fake.
+/// CUDA stream with an event ring, a fixed-function hardware engine behind a session, or a fake.
 ///
 /// Submitting is technology-specific and lives in the adapter that owns the queue; what is generic
 /// is the query. An adapter's submit takes the [`Marker`]s its work must wait for on the device and
@@ -132,7 +132,7 @@ impl LanePool {
 
     /// The lane for a stage: `continued` (the lane of the predecessor it is the critical successor
     /// of) when given and among `allowed`, otherwise one of `allowed` in turn. `allowed` lists the lanes able to run
-    /// the stage's kind of work (compute, copy, a codec engine). Panics if `allowed` is empty (a
+    /// the stage's kind of work (compute, copy, a hardware engine). Panics if `allowed` is empty (a
     /// CPU-only stage chooses no lane).
     pub fn choose(&self, allowed: &[LaneId], continued: Option<LaneId>) -> LaneId {
         assert!(

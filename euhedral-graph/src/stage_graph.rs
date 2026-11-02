@@ -39,7 +39,7 @@ pub enum EdgeKind {
 pub struct StageSpec {
     pub name: &'static str,
     /// `Some(id_hash)`: the stage's frames run on that ordered lane, in the order they are offered
-    /// (a stateful codec, a socket). `None`: unordered.
+    /// (a stateful device session, a socket). `None`: unordered.
     pub ordered: Option<u64>,
     /// The device lanes able to run the stage's work; empty for a CPU-only stage.
     pub lanes: Vec<LaneId>,

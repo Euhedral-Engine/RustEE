@@ -10,11 +10,11 @@
 //! - **The pool lease** of an item is a count of two ends shared by the item and what it hands on:
 //!   its retirement (boundary reached) and its sent-or-dropped end. The end that brings the count to
 //!   zero frees the pool slot, which may admit the next item.
-//! - **Admission** = credit horizon and pool (16), from the control lane (credits, seeks) and from
+//! - **Admission** = credit horizon and pool (16), from the control lane (credits, jumps to a new generation) and from
 //!   lease releases.
-//! - **The fake consumer** (the harness, on the test thread) plays 120 items a second, credits 1 s
-//!   ahead, starts after 0.5 s, seeks at 1.5 s to seq 480 (a new generation, with a new kill
-//!   switch), pauses 0.4 s and plays to the end of the 6 s stream.
+//! - **The fake consumer** (the harness, on the test thread) takes 120 items a second, credits 1 s
+//!   ahead, starts after 0.5 s, jumps at 1.5 s to seq 480 (a `Seek`: a new generation, with a new kill
+//!   switch), pauses 0.4 s and takes items to the end of the 6 s stream.
 //! - **Order at every hop** (fetch, parse, sequencer release, pack, send, sent) is checked within
 //!   each generation.
 //! - **The no-wait check:** a timing executor measures every frame callback (execute + finalizer)

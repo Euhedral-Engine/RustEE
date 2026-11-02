@@ -1,7 +1,8 @@
 # euhedral-graph
 
 No-wait dataflow on the RustEE lattice: completions, in-order release, joins,
-device lanes and per-item stage graphs. Nothing in it waits and nothing in it owns a thread. See
+device lanes and per-item stage graphs. Its dataflow has no waits by design (a stage graph's tagged locks, below,
+are the exception) and nothing in it owns a thread. See
 the [top-level glossary](../GLOSSARY.md) for the terms a user meets and [`GLOSSARY.md`](GLOSSARY.md) for this
 crate's implementation-level terms.
 
@@ -46,6 +47,11 @@ entering the kernel.
 
 The crate's clippy bans (see [`clippy.toml`](clippy.toml)) keep it that way: no threads, sleeps,
 channels, `Condvar`, blocking `std::fs` or `std::net` calls.
+
+The one exception is a lock, not a wait in the dataflow: the per-quantum state of a `StageGraph`
+(`src/stage_graph.rs`) sits behind `Mutex` and `RwLock` fields tagged with the `HOT-FIX` ids G10 to G15, which
+stage frames take. They stay until the lock plan replaces them. A `Lake` keeps its generation lists in
+`LifecycleMutex`es, which start, stop and rebalance take, not frames.
 
 ### Completions
 
@@ -282,7 +288,7 @@ lattice.close();
 ```
 
 A frame hands a result back to the main thread through an `AtomicPtr` to a boxed value: the frame publishes it with a release
-store, and the main thread checks with an acquire load periodically and takes it. Nothing in the crate blocks.
+store, and the main thread checks with an acquire load periodically and takes it. Nothing in this hand-off blocks.
 
 ### Sequencer and fan-in
 
@@ -315,7 +321,7 @@ Windows.
 
 The tests are unit tests in each module (the stage graph's drives its sources by hand), the fake
 device's, and `tests/credit_graph.rs`: one lattice of 4 workers, with a per-item
-stage graph, a `Sequencer`, a two-end count as the pool lease, credit-bounded admission, a seek and a
+stage graph, a `Sequencer`, a two-end count as the pool lease, credit-bounded admission, a jump to a new generation and a
 pause, and a timing executor that fails the test if any frame callback runs over 200 µs without
 the OS preempting it. It takes a few seconds and runs on the CPUs in `EUHEDRAL_TEST_CPUS` (default
 `0,1,2,3`); as with `euhedral-core`'s tests that need particular hardware, it passes without

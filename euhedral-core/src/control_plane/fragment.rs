@@ -23,10 +23,10 @@ use std::time::{Duration, Instant};
 
 /// Converts a rate per nanosecond to one per second.
 const NANOS_PER_SECOND: f64 = 1_000_000_000.0;
-/// How long a worker with neither upstreams nor cached frames parks.
 /// How long building a fragment waits for the CPU's previous executor, closed but with workers still winding down.
 const EXECUTOR_WAIT: Duration = Duration::from_secs(5);
 
+/// How long a worker with neither upstreams nor cached frames parks.
 const EMPTY_PARK: Duration = Duration::from_micros(15);
 /// The last snapshot timestamp before any snapshot is followed: older than any real one.
 const NO_SNAPSHOT: i64 = i64::MIN;

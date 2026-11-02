@@ -25,7 +25,7 @@ pub trait Ready: Send {
 }
 
 /// An operation in flight and what continues it: polled until it yields the continuation frame. Use
-/// it when the completion carries a result (an encoded packet fetched from a driver without
+/// it when the completion carries a result (a result fetched from a driver without
 /// waiting, a model's output); use [`Completions::after`] when it doesn't.
 pub trait Pending: Send {
     /// `Some(frame)` once the operation completed (the frame carries its result or its error);
@@ -51,8 +51,10 @@ pub trait Pending: Send {
 ///
 /// Complete it ([`LatticeSource::complete`]) only once [`pending`](Self::pending) is zero. A
 /// registration after that is a bug that fails visibly: its frame finishes at once through
-/// `do_finally` without running (as a frame refused by a completed RustEE ingest queue is
-/// cancelled), so whatever it holds still ends, and debug builds then panic. A [`Pending`]
+/// `do_finally` without running, so whatever it holds still ends, and debug builds then panic. (An
+/// ingest queue that has completed behaves differently: its `offer` hands the refused frame back to the
+/// caller as `Err(frame)`, and a frame is cancelled only when the queue is cleared or dropped. These
+/// registration methods return nothing, so there is no caller to hand the frame back to.) A [`Pending`]
 /// registered after completion has no frame to finish: it is dropped.
 ///
 /// A registration that races `complete` (the flag was not yet visible to it) lands in the queue
@@ -127,7 +129,7 @@ enum Waits {
 
 impl Drop for Completions {
     /// The last owner lets go: no thread can register any more, and none will poll. What is still
-    /// in the queue, and what was absorbed and never emitted, ends here through [`Completions::cancel`]
+    /// in the queue, and what was absorbed and never emitted, ends here through `Completions::cancel`
     /// (finished, or leaked when its marker is unreached), so no registration is left without an end.
     fn drop(&mut self) {
         let poll = self.poll.get_mut();
