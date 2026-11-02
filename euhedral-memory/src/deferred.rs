@@ -233,6 +233,12 @@ impl Deferral {
         self.0.drain_soon();
     }
 
+    /// Whether a drain can still be asked for: the source is not stopped and its downstream has not completed. A thread that waits
+    /// for memory the queue holds checks it, so that it does not wait for a drain that no frame will make (at a shutdown).
+    pub fn can_drain(&self) -> bool {
+        self.0.can_drain()
+    }
+
     /// How many calls wait.
     pub fn pending(&self) -> usize {
         self.0.pending()
@@ -299,6 +305,12 @@ impl DeferredCalls {
     /// when the source drops.
     pub fn stop(&self) {
         self.stopped.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether frames can still leave: not [stopped](Self::stop), and the downstream has not completed (`complete`, which the owner
+    /// calls when the lattice that makes the drains is closing). Calls queued before then wait for the owner's `drain` or the drop.
+    pub fn can_drain(&self) -> bool {
+        !self.stopped.load(Ordering::Relaxed) && !self.downstream.is_complete()
     }
 
     /// How many calls wait.
@@ -1116,6 +1128,24 @@ mod tests {
             device.deferral.get().unwrap().upgrade().is_none(),
             "so the device defers nothing more"
         );
+    }
+
+    #[test]
+    fn a_stopped_or_completed_source_cannot_drain_and_says_so() {
+        let calls = calls();
+        let frames = Arc::new(Frames::default());
+        calls.clone().add_downstream(frames.clone());
+        let d = calls.handle();
+        assert!(d.can_drain());
+        calls.complete();
+        assert!(
+            !d.can_drain(),
+            "the downstream completed: no frame will leave"
+        );
+        let calls = self::calls();
+        assert!(calls.handle().can_drain());
+        calls.stop();
+        assert!(!calls.handle().can_drain());
     }
 
     #[test]
