@@ -36,6 +36,9 @@ inside a call. An allocation that fails with `CUDA_ERROR_OUT_OF_MEMORY` (`Device
 of `DeviceMemory` is `false` once a deferral is attached. `LanePool::idle` sees marked work only: a lane that submitted and has
 not marked yet is not seen.
 
+`DeviceMemory::free_block` and `PinnedHost::free_host` free at once whatever the deferral, for an owner that queues the free itself to
+keep something alive (a planner's claim) until the memory is really free.
+
 **Tests.** `deferred::tests` (order, a drain in progress is busy not empty and the wait ends in order, a panic, drop, a call
 cannot wait for itself, reclaim, eight producers, the frame leaves when the pool is idle and not before, the byte and age bounds,
 no frame without demand, a dropped frame frees the slot); `lanes::tests::a_pool_is_idle_when_every_lane_reached_what_it_issued`;

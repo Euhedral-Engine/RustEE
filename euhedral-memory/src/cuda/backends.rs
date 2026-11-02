@@ -36,6 +36,20 @@ pub struct DeviceMemory {
     pub location: LocationId,
 }
 
+impl DeviceMemory {
+    /// Frees `block` on `device` now, whatever the device's deferral: for a call the owner queued itself (to keep something alive
+    /// until the memory is really free). Waits for the device.
+    ///
+    /// # Safety
+    /// A block of a `DeviceMemory` of this device, freed once, unused by host and device.
+    pub unsafe fn free_block(device: &Device, block: Block) {
+        if let Ok(_c) = device.enter() {
+            // SAFETY: the caller's contract.
+            unsafe { (device.driver.fns.mem_free)(block.addr) };
+        }
+    }
+}
+
 impl Backend for DeviceMemory {
     fn location(&self) -> LocationId {
         self.location
@@ -74,10 +88,8 @@ impl Backend for DeviceMemory {
     /// nothing in flight; without one it is made here and waits for the device.
     unsafe fn free(&self, block: Block) {
         self.device.defer_or_run(block.bytes, move |d| {
-            if let Ok(_c) = d.enter() {
-                // SAFETY: the caller's contract (a block of this backend, unused).
-                unsafe { (d.driver.fns.mem_free)(block.addr) };
-            }
+            // SAFETY: the caller's contract (a block of this backend, unused).
+            unsafe { Self::free_block(d, block) };
         });
     }
 
@@ -480,14 +492,19 @@ impl PinnedHost {
         let bytes = gone.iter().map(|&(_, bytes)| bytes).sum();
         // The frees wait for the device: with a deferral attached to the device they are queued and made at a moment with
         // nothing in flight, else now.
-        self.device.defer_or_run(bytes, move |d| {
-            if let Ok(_c) = d.enter() {
-                for (a, _) in gone {
-                    // SAFETY: released buffers of this backend, unused.
-                    unsafe { (d.driver.fns.mem_free_host)(a as *mut c_void) };
-                }
+        self.device
+            .defer_or_run(bytes, move |d| Self::free_host(d, &gone));
+    }
+
+    /// Frees the buffers at `released` (address, bytes) on `device` now, whatever the device's deferral, as
+    /// [`DeviceMemory::free_block`]. Waits for the device.
+    pub fn free_host(device: &Device, released: &[(u64, u64)]) {
+        if let Ok(_c) = device.enter() {
+            for &(a, _) in released {
+                // SAFETY: released buffers of a `PinnedHost` of this device, unused.
+                unsafe { (device.driver.fns.mem_free_host)(a as *mut c_void) };
             }
-        });
+        }
     }
 }
 
