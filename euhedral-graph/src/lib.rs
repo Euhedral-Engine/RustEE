@@ -1,12 +1,17 @@
 //! No-wait dataflow on the Euhedral control plane: completions, sequencing, joins, device lanes
 //! and stage graphs.
 //!
-//! Nothing here waits. Work is *submitted* and returns at once, and what follows it starts on one
-//! of two events:
+//! The dataflow has no waits by design. Work is *submitted* and returns at once, and what follows it
+//! starts on one of two events:
 //! - **the submission** (a device successor orders itself behind the predecessor's [`Marker`] on
 //!   the device);
 //! - **the completion**, found when a lattice worker polls [`Completions`] or `euhedral-io`'s
 //!   `AsyncIo`.
+//!
+//! One exception remains, and it is not part of the design: the per-quantum state of a [`StageGraph`]
+//! (`stage_graph.rs`) sits behind `Mutex` and `RwLock` fields tagged with the `HOT-FIX` ids G10 to G15,
+//! which stage frames take. They stay until the lock plan replaces them. (A [`Lake`] holds its generation lists in `LifecycleMutex`es, which start, stop and rebalance
+//! take, not frames.)
 //!
 //! No piece owns a thread. The sources ([`Completions`], and `euhedral-io`'s `AsyncIo`) are
 //! `LatticeSource`s that the lattice's own polls drive, and the rest are structures run from frame

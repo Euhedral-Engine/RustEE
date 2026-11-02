@@ -52,7 +52,7 @@ impl fmt::Display for CopyError {
 impl std::error::Error for CopyError {}
 
 /// A copy of `rows` rows of `row_bytes` bytes each between two layouts that have their own row pitches (the distance in
-/// bytes between the starts of consecutive rows), such as a picture with padded rows.
+/// bytes between the starts of consecutive rows), such as a 2D buffer with padded rows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PitchedCopy {
     /// The first byte of the first source row.

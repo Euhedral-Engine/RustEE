@@ -164,7 +164,7 @@ Each of those is already given elsewhere: the frame lifecycle runs `do_finally` 
 or was killed, so it is the arrival and needs no token; results belong in fields of the object the branches share;
 re-arming is one store of the count before the branches are published.
 
-**How to use it.** Put `pending: AtomicU32` and the result fields on the shared object (a picture, a pair, a lease).
+**How to use it.** Put `pending: AtomicU32` and the result fields on the shared object (a record, a pair, a lease).
 Store the branch count before publishing the branches. Each branch writes its field, then
 `if pending.fetch_sub(1, Ordering::AcqRel) == 1 { /* run the next step */ }` where its frame ends. The read-modify-write
 chain makes every branch's write visible to the last one, as an `Arc`'s last drop sees every earlier write.
@@ -266,11 +266,11 @@ reader).
 - `euhedral_memory::cuda::StreamCopier::on_stream` (unsafe) queues its copies on a stream the caller made, so they order
   with the caller's other work on it; the copier never synchronizes or destroys that stream.
 - Pitched copies: `Copier::start_pitched(from, to, PitchedCopy { src, src_pitch, dst, dst_pitch, row_bytes, rows })`
-  copies rows between layouts with their own row pitches (padded pictures). The default refuses; `HostCopier` copies
+  copies rows between layouts with their own row pitches (padded 2D buffers). The default refuses; `HostCopier` copies
   row by row; `StreamCopier` issues one `cuMemcpy2DAsync`.
 
 **Why.** The first consumer of lane sources dropped a state that owned device memory after its stream was gone, grew
-the source's queues on the request path, and had to copy padded pictures row by row.
+the source's queues on the request path, and had to copy padded 2D buffers row by row.
 
 **Semantics.** A pitch shorter than the row is refused before any copy starts.
 
@@ -1352,7 +1352,7 @@ Android keep io_uring. The portable half of `io` (the public API, the `LatticeSo
 `stop` holds back) moved to `io/mod.rs`; the Linux engine and its tests are otherwise unchanged. The default feature is
 now `async-io` (it was `io-uring`).
 
-**Why.** MySphere's players run on Windows too, and `AsyncIo` was Linux-only.
+**Why.** Applications need `AsyncIo` on Windows too, and it was Linux-only.
 
 **API additions, on every platform.**
 - `RawFile`, `RawSock`, `OwnedFile` and `OwnedSock`: the platform's handles (descriptors on Linux and Android, `HANDLE` and
@@ -1451,7 +1451,7 @@ completions.after_marker(marker, Box::new(next_frame)); // next_frame runs once 
 
 **Tests.** 75 unit tests at that point (`Completions`, `AsyncIo`, `Sequencer`, `Join`, `LanePool`, `StageGraph`, `FakeDevice`), the
 README doctests, and `tests/credit_graph.rs`: a 4-worker lattice running a per-item stage graph with a `Sequencer`, a
-`Join`, credit-bounded admission, a seek and a pause, which fails if a frame callback runs over 200 µs without the OS
+`Join`, credit-bounded admission, a jump to a new generation and a pause, which fails if a frame callback runs over 200 µs without the OS
 preempting it.
 
 ## Metrics restored (2026-10-24)

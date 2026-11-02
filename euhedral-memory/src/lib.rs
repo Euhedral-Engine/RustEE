@@ -11,13 +11,16 @@
 //!   ([`SlotArena`]) and scratch pieces ([`ScratchArena`]) through lock-free free lists; in the steady state no
 //!   allocation or free reaches a backend ([`BackendCalls`] counts the ones that do).
 //! - [`backend`]: the allocation side. The planner accounts and decides; a [`Backend`] allocates and frees, and a
-//!   [`Reaper`] runs frees that may block off the lattice's workers.
-//! - [`cuda`] (feature `cuda`): the CUDA driver backends: device memory (`cuMemAlloc`), the stream-ordered pool
+//!   [`Reaper`] queues frees behind the device work that last used the memory, and [`Reaper::reap`] runs the ones that
+//!   may block on the thread that calls it (a lattice worker, if a worker calls it: the `HOT-FIX` id M1).
+//! - `cuda` (feature `cuda`): the CUDA driver backends: device memory (`cuMemAlloc`), the stream-ordered pool
 //!   (`cuMemAllocAsync`), VMM allocations exportable as POSIX file descriptors (`cuMemCreate`, imported by Vulkan as
 //!   external memory) and pinned host memory with a capacity cache.
 //!
-//! Nothing here owns a thread, takes a lock or waits: budgets and owner totals are atomics, and owner slots, give-back
-//! orders, the reaper and the pinned cache go through RustEE's lock-free queues. Give-back orders reach their owners
+//! Nothing here owns a thread or takes a lock, and the planner waits for nothing: budgets and owner totals are
+//! atomics, and owner slots, give-back orders, the reaper and the pinned cache go through RustEE's lock-free queues.
+//! The one place that blocks is a driver free that waits for the device: [`Reaper::reap`] makes it on the calling
+//! thread (the `HOT-FIX` id M1). Give-back orders reach their owners
 //! as frames of a `LatticeSource` ([`GiveBacks`]). Residency is planned, not discovered: every consumer's room is
 //! reserved, what spills to pinned host memory is decided up front, and what cannot fit is refused; released pinned
 //! buffers stay in a capacity cache.

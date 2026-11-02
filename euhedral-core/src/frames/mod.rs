@@ -222,7 +222,10 @@ pub trait Frame: Any + Send {
         Ok(())
     }
 
-    /// Liveness check: an executor may skip a frame that is not alive.
+    /// Whether the frame is alive: false once its kill switch is set (see [`FrameHeader::is_alive`]). The default
+    /// [`AbstractExecutor::run`](crate::generics::AbstractExecutor::run) checks it before [`execute`](Self::execute)
+    /// and, for a frame that is not alive, skips `execute` and finishes it with [`do_finally`](Self::do_finally). An
+    /// executor that overrides `run` decides for itself.
     fn is_alive(&self) -> bool {
         self.header().is_alive()
     }

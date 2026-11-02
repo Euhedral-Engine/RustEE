@@ -46,6 +46,10 @@ enum Downstream {
     Node(Arc<dyn LatticeNode>),
 }
 
+/// An edge's parent as the registry's cell holds it: a weak reference to the node above, so a child never keeps
+/// its parent alive. [`LatticeEdge::parent`] upgrades it and returns `None` once the parent has dropped.
+pub(crate) struct ParentRef(Weak<dyn LatticeNode>);
+
 /// The link every lattice node is built on, and the plain node that only links.
 ///
 /// An edge has at most one downstream: a receiver, which is the floor of the edge's branch, or
@@ -53,9 +57,6 @@ enum Downstream {
 /// downstream is set once, by a compare-and-set (Java's `DOWNSTREAM`), and stays until the edge drops: an edge
 /// closes for good, so nothing attaches again, and a push that read it just before the close may still be using it.
 ///
-/// An edge's parent, as its cell holds it.
-pub(crate) struct ParentRef(Weak<dyn LatticeNode>);
-
 /// An edge may have a parent, the node above it. Demand from a request or pull climbs from parent
 /// to parent, skipped by any closed or draining edge on the way, and the topmost edge serves it
 /// from the calling thread's [`UpstreamQueue`](super::UpstreamQueue). Upstream handles are added
