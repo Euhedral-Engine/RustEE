@@ -354,21 +354,21 @@ fn fault_run(retire_steps: bool) {
     }
     let retired = lock(&plan.probe.retired).clone();
     let step = |n: u32| retired.iter().find(|(_, step, _)| *step == n);
+    let cause = gpu.poisoned().expect("the failure poisoned the device");
+    assert!(
+        matches!(&cause, GpuError::Fault { code: 700, .. }),
+        "{cause:?}"
+    );
+    let expected = GpuError::Poisoned(Box::new(cause));
     let Some((_, _, Some(read))) = step(1) else {
         panic!("step 1's retirement was stranded or carried no failure: {retired:?}");
     };
-    assert!(
-        matches!(read, GpuError::Poisoned(_) | GpuError::Fault { .. }),
-        "{read:?}"
-    );
+    assert_eq!(read, &expected);
     if retire_steps {
         let Some((_, _, Some(first))) = step(0) else {
             panic!("step 0's retirement is missing: {retired:?}");
         };
-        assert!(
-            matches!(first, GpuError::Fault { code: 700, .. }),
-            "{first:?}"
-        );
+        assert_eq!(first, &expected);
     } else {
         assert!(step(0).is_none());
     }

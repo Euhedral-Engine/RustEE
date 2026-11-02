@@ -259,11 +259,15 @@ fn a_fault_surfaces_through_confirm_retired_and_poisons_the_device() {
     let ticket = seen.lock().unwrap()[0];
     assert!(!ticket.ok());
     assert_eq!(ticket.status(), 700);
-    assert!(matches!(
-        s[0].confirm_retired(ticket),
-        Some(GpuError::Fault { code: 700, .. })
-    ));
-    assert!(matches!(gpu.poisoned(), Some(GpuError::Fault { .. })));
+    // Confirming the ticket is the call that reaches the device and learns of the fault; it reports the same value as a
+    // retirement behind the fault: `Poisoned` of the device's recorded fault.
+    let confirmed = s[0].confirm_retired(ticket);
+    let cause = gpu.poisoned().expect("the failure poisoned the device");
+    assert!(
+        matches!(cause, GpuError::Fault { code: 700, .. }),
+        "{cause:?}"
+    );
+    assert_eq!(confirmed, Some(GpuError::Poisoned(Box::new(cause))));
     assert!(matches!(
         s[1].submit(|_| Ok(())),
         Err(GpuError::Poisoned(_))

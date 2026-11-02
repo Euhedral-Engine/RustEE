@@ -3,6 +3,31 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## A failed retirement reports one value: `Poisoned(cause)`, and the cause does not name the call that saw it (2026-11-02)
+
+**What.** `Stream::confirm_retired` on the CUDA backend returns `Some(Poisoned(cause))` for every retirement that ends because
+of a device fault, the faulting work's own included. It used to return `Fault { call: "device work", .. }` for a retirement whose
+callback carried the fault status, and `Poisoned(Fault { call: "cuEventQuery", .. })` for one the idle look at the device reported
+first. `cause` is exactly `Gpu::poisoned()`. The device's recorded fault is now the same on every route: `Fault { call: "device
+work", code, name }` (the CUDA backend), with the driver's code and its name; the call that noticed it is not recorded. The fake
+backend does the same with its own label (`"fake kernel"`). Direct calls (a launch, a copy) still return the `Fault` of their own call.
+
+**Why.** The driver's callback thread and the owner's idle look race to see a fault first, so the value depended on timing:
+`cuda_lanes_fault::a_poisoned_device_fails_armed_items` saw `Fault` or `Poisoned` from run to run. A retirement that ends in a fault
+now has one value however the fault was learned.
+
+**Semantics.** A retirement whose status is a device fault code poisons the device first, if the look has not, and reports
+`Poisoned(poison)`. A status that is not a device fault (the work failed, the device is intact) is still `Call`. `Poisoned`
+retirements (status `POISONED_STATUS`) and retirements that arrive with status 0 on a poisoned device are unchanged.
+
+**Migrating.** Code that matched `Some(Fault { .. })` on a confirmed retirement matches `Some(Poisoned(cause))` and reads the
+fault from `cause`.
+
+**Tests.** `cuda_lanes_fault` and `cuda_lanes_stranded` (the device), `fake_lanes::*fault*`, `fake_streams::a_fault_surfaces_through_
+confirm_retired_and_poisons_the_device` and `cuda_fault` assert `Poisoned(cause)` with `cause == gpu.poisoned()` exactly; `cuda::tests`
+pins that a fault from two different calls records the same cause. `a_full_marker_ring_is_busy_and_old_markers_need_no_wait` moved to
+`tests/cuda_marker_ring.rs`, a process of its own (the file says why).
+
 ## A polling stealer takes only the frame its stop looked at: placement is exact in poll mode (2026-10-30)
 
 **What.** `ControlPlaneCache`'s one-frame take (the owner's `poll` and the stealer's `work_steal_polled`) returns nothing when the

@@ -115,14 +115,22 @@ fn a_device_fault_surfaces_through_confirm_retired_and_poisons_the_device() {
     assert_eq!(seen.lock().unwrap().len(), 1);
     assert!(!ticket.ok());
     assert_eq!(ticket.status(), 700);
-    assert!(matches!(
-        s[0].confirm_retired(ticket),
-        Some(GpuError::Fault { code: 700, .. })
-    ));
-    assert!(matches!(
-        gpu.poisoned(),
-        Some(GpuError::Fault { code: 700, .. })
-    ));
+    // The ticket's status is the driver's report of the fault. Confirming it poisons the device if nothing has, and
+    // reports what every retirement of a fault reports: `Poisoned` of the device's recorded fault.
+    let owner_confirmed = s[0].confirm_retired(ticket);
+    let cause = gpu.poisoned().expect("the failure poisoned the device");
+    assert!(
+        matches!(
+            &cause,
+            GpuError::Fault {
+                call: "device work",
+                code: 700,
+                ..
+            }
+        ),
+        "{cause:?}"
+    );
+    assert_eq!(owner_confirmed, Some(GpuError::Poisoned(Box::new(cause))));
 
     // Later calls fail fast with the cause.
     assert!(matches!(
@@ -153,7 +161,13 @@ fn a_device_fault_surfaces_through_confirm_retired_and_poisons_the_device() {
     let confirmed = confirmed.lock().unwrap();
     assert_eq!(confirmed.len(), 1);
     let (failure, submit_refused, mark_refused) = &confirmed[0];
-    assert!(failure.is_some(), "the fault is known to the continuation");
+    assert_eq!(
+        failure,
+        &Some(GpuError::Poisoned(Box::new(
+            gpu.poisoned().expect("the device is poisoned")
+        ))),
+        "the continuation is told the same value"
+    );
     assert!(
         *submit_refused && *mark_refused,
         "the stream fails fast with the cause"

@@ -702,32 +702,36 @@ impl Stream for CudaStream {
                 "a retirement ticket of another stream".into(),
             ));
         }
-        if ticket.status() == POISONED_STATUS {
+        let poisoned = || {
             self.gpu
                 .poison
                 .get()
                 .map(|cause| GpuError::Poisoned(Box::new(cause)))
+        };
+        if ticket.status() == POISONED_STATUS {
+            return poisoned();
+        }
+        // Release only what this retirement covered; a poisoned ticket does not say which that was.
+        self.kept.release_through(ticket.seq());
+        if ticket.status() == 0 {
+            return poisoned();
+        }
+        // Asking the driver for the error's name is a plain call. A device fault poisons the device there, so the
+        // retirement that carries the fault reports what a retirement behind it reports, whichever of the callback
+        // and the idle look at the device saw the fault first.
+        let err = self
+            .gpu
+            .check("device work", ticket.status())
+            .err()
+            .unwrap_or(GpuError::Call {
+                call: "device work",
+                code: ticket.status(),
+                name: "unknown".into(),
+            });
+        if matches!(err, GpuError::Fault { .. }) {
+            poisoned()
         } else {
-            // Release only what this retirement covered; a poisoned ticket does not say which that was.
-            self.kept.release_through(ticket.seq());
-            if ticket.status() != 0 {
-                // Asking the driver for the error's name is a plain call.
-                let err = self
-                    .gpu
-                    .check("device work", ticket.status())
-                    .err()
-                    .unwrap_or(GpuError::Call {
-                        call: "device work",
-                        code: ticket.status(),
-                        name: "unknown".into(),
-                    });
-                Some(err)
-            } else {
-                self.gpu
-                    .poison
-                    .get()
-                    .map(|cause| GpuError::Poisoned(Box::new(cause)))
-            }
+            Some(err)
         }
     }
 }
