@@ -2,7 +2,8 @@
 
 Asynchronous file and socket I/O on the RustEE lattice. `AsyncIo` is a `LatticeSource` of
 continuations: each operation returns at once, and the lattice's own polls reap the completions and
-emit the continuation frames. See [`GLOSSARY.md`](../GLOSSARY.md) for every term used here.
+emit the continuation frames. See the [top-level glossary](../GLOSSARY.md) for the terms a user meets and
+[`GLOSSARY.md`](GLOSSARY.md) for this crate's implementation-level terms.
 
 Its operations are reads, writes, sends, receives, accepts and connects.
 

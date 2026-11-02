@@ -6,6 +6,8 @@ A location-agnostic memory and residency planner for the RustEE control plane, a
 - spill to pinned host memory by plan, not by failure;
 - keep released pinned buffers in a capacity cache.
 
+**Terms.** The [top-level glossary](../GLOSSARY.md) covers the terms a user meets; this crate's [`GLOSSARY.md`](GLOSSARY.md) covers its implementation-level terms.
+
 **Where it sits.** It builds on [`euhedral-core`](../euhedral-core) (`LatticeSource`, `RunnableFrame`: give-back orders are
 frames), [`euhedral-data-structures`](../euhedral-data-structures) (lock-free queues) and
 [`euhedral-hashing`](../euhedral-hashing), and [`euhedral-graph`](../euhedral-graph) for markers. [`euhedral-gpu`](../euhedral-gpu)

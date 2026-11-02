@@ -1,6 +1,6 @@
 # euhedral-benchmarks
 
-End-to-end benchmarks of the control plane. Nothing depends on this crate.
+End-to-end benchmarks of the control plane. Nothing depends on this crate. Its terms are in [`GLOSSARY.md`](GLOSSARY.md); the layers it measures are in the [top-level glossary](../GLOSSARY.md).
 
 ## High-contention throughput
 

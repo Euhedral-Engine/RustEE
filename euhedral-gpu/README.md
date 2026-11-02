@@ -7,6 +7,8 @@ Asynchronous, backend-neutral GPU access for the RustEE control plane. A lattice
 - load kernels the application brings with it, from source or from a prebuilt image;
 - record a recurring sequence of submissions once and replay it.
 
+**Terms.** The [top-level glossary](../GLOSSARY.md) covers the terms a user meets; this crate's [`GLOSSARY.md`](GLOSSARY.md) covers its implementation-level terms.
+
 **Where it sits.** It is the top layer of the workspace. It builds on [`euhedral-core`](../euhedral-core) (frames),
 [`euhedral-graph`](../euhedral-graph) (`DeviceQueue`, `Marker`, `LanePool` and `Completions`),
 [`euhedral-memory`](../euhedral-memory) (the CUDA driver, device and allocations) and

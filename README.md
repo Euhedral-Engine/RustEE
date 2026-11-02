@@ -26,15 +26,17 @@ arm64 (Linux, macOS and Windows back ends) and is untested on mobile.
 The crates form layers, and a crate builds only on lower ones. No cycles: nothing below `euhedral-gpu` depends on it,
 not even through a dev-dependency or a feature (`euhedral-gpu/tests/layering.rs` checks every manifest).
 
-1. Utilities: `euhedral-data-structures` and `euhedral-hashing`.
-2. `euhedral-hardware-utils`, on `euhedral-data-structures` (its lifecycle locks).
-3. `euhedral-core`, on the utilities.
-4. `euhedral-graph` and `euhedral-io`, on `euhedral-core` (and the utilities they use).
-5. `euhedral-memory`, on `euhedral-core`, `euhedral-graph` and the utilities.
-6. `euhedral-gpu`, on `euhedral-core`, `euhedral-graph`, `euhedral-memory` and `euhedral-hashing`.
-7. `euhedral-benchmarks`, on `euhedral-core` and the utilities; nothing depends on it (layer 6 in `layering.rs`).
+0. Utilities: `euhedral-data-structures` and `euhedral-hashing`.
+1. `euhedral-hardware-utils`, on `euhedral-data-structures` (its lifecycle locks).
+2. `euhedral-core`, on the utilities.
+3. `euhedral-graph` and `euhedral-io`, on `euhedral-core` (and the utilities they use).
+4. `euhedral-memory`, on `euhedral-core`, `euhedral-graph` and the utilities.
+5. `euhedral-gpu`, on `euhedral-core`, `euhedral-graph`, `euhedral-memory` and `euhedral-hashing`.
+6. `euhedral-benchmarks`, on `euhedral-core` and the utilities.
 
-- [`GLOSSARY.md`](GLOSSARY.md): every term a user of RustEE meets, with links to the code.
+The numbers are the layers of `layering.rs`, and the [glossary](GLOSSARY.md) orders its terms by them.
+
+- [`GLOSSARY.md`](GLOSSARY.md): the layers, what RustEE handles for you, the lifecycles and invariants, and every term a user of RustEE meets, with links to the code. Each crate's own `GLOSSARY.md` holds its implementation-level terms.
 - [`CHANGELOG.md`](CHANGELOG.md): changes to the lattice's execution model, newest first.
 
 ## Build and test
