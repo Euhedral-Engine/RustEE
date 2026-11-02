@@ -16,6 +16,12 @@ and up) up to a byte limit and frees them only on `trim`.
 that calls it, and a second thread reaping at the same moment returns early instead of waiting. A free is
 ordinary work: run `reap` on the owner's lane, so its blocking time counts as that work's service time.
 
+**deferred calls** ([`DeferredCalls`](src/deferred.rs), `Deferral`, `Ticket`): a device's blocking driver calls (a free, an
+unload) queued instead of made where the memory is dropped, because on the CUDA driver such a call makes every stream's
+enqueue wait for the running kernels, whichever thread makes it. A `LatticeSource` with one consumer: the queue's end sits in
+its `SourceCell`, the calls leave as blocking key frames (request and push), when the lane pool is idle or a byte or age bound
+forces them. A `Ticket` names a position in the queue; an allocation that ran out of memory makes the calls through one.
+
 **tiered item** ([`PlanItem::tiered`](src/admission.rs)): an admission item of equal units over an ordered
 list of locations, fastest first: its required units go to the first, the rest to the first location with
 free room, then the next; units that fit nowhere are left out.

@@ -269,6 +269,10 @@ impl DeviceQueue for CudaQueue {
         self.ring.done.load(Ordering::Acquire)
     }
 
+    fn issued(&self) -> u64 {
+        self.ring.marked.load(Ordering::Acquire)
+    }
+
     fn name(&self) -> &str {
         &self.name
     }

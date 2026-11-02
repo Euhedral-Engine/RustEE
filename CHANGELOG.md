@@ -3,6 +3,43 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## Blocking frees and unloads wait in a device's `DeferredCalls` until its lanes are idle (2026-11-02)
+
+**What.** `euhedral-memory` gains `DeferredCalls`, a `LatticeSource` of blocking key frames that holds a device's blocking driver
+calls, `Deferral` (its producer handle), `Ticket` and `Bounds`. `Device::attach_deferral` gives a device one (once).
+`DeviceMemory::free`, `PinnedHost::trim`, dropping an `Imported` mapping and euhedral-gpu's module unload then queue their call, with
+the bytes it gives back, instead of making it where the memory is dropped. Without a deferral attached every call runs where it
+is made, as before. `DeviceQueue` gains `issued()` (default `completed()`) and `LanePool` gains `idle()`; `CudaQueue::issued` is
+the last marker. `Device` carries a weak handle to its own `Arc` (`Device::arc`).
+
+**Why.** On the CUDA driver (615.71, RTX 5070 Ti) `cuModuleLoadDataEx`, `cuMemFree`, `cuMemFreeHost` and `cuMemHostUnregister`
+make every other thread's `cuEventRecord` wait for the kernels running at that moment (370 ms for a 400 ms spin, each);
+`cuMemHostAlloc` and `cuMemHostRegister` hold the driver for their own length (14.5 and 5.7 ms for 64 MiB); `cuModuleUnload` and
+`cuCtxSynchronize` make only their caller wait; the allocation, stream, event, graph, texture and VMM calls do not stall another
+stream. `Reaper` queues a free behind the device work that last used the memory, which does not help: the call stalls the other
+streams' markers on whatever thread it runs. The call has to be made when no lane has work in flight.
+
+**How to use.** Make a `DeferredCalls`, attach it to a lattice that may block (`add_downstream`) and give it frames (`request`),
+`attach_pool` the device's `LanePool`, `Device::attach_deferral(calls.handle())`, and call `calls.poll()` from a tick the owner has:
+a frame leaves when calls are queued and the pool is idle, or a bound is passed. A drain forced by `Bounds` stalls every stream's
+markers for as long as the kernels running at that moment. `Deferral::pending_bytes` is memory a planner may count as certain
+reclaim. At a stop, `drain()`.
+
+**Semantics.** One consumer: the calls are made by one thread at a time, in queue order, each exactly once, inside the source's
+`SourceCell`. `drain()` returns 0 at once when another drain is running (the queue is busy, not empty); `run_through(ticket)` makes
+the calls up to the ticket on the calling thread, waiting for a drain that is running, and returns `false` only when called from
+inside a call. An allocation that fails with `CUDA_ERROR_OUT_OF_MEMORY` (`DeviceMemory`, `PinnedHost`, `Vmm::alloc_vmm`,
+`StreamPool`) makes the calls queued so far and tries once more; a second failure is returned. A call that panics is counted
+(`panicked`) and the rest still run. Dropping the source makes the calls still queued. `pull` hands out nothing. `free_blocks`
+of `DeviceMemory` is `false` once a deferral is attached. `LanePool::idle` sees marked work only: a lane that submitted and has
+not marked yet is not seen.
+
+**Tests.** `deferred::tests` (order, a drain in progress is busy not empty and the wait ends in order, a panic, drop, a call
+cannot wait for itself, reclaim, eight producers, the frame leaves when the pool is idle and not before, the byte and age bounds,
+no frame without demand, a dropped frame frees the slot); `lanes::tests::a_pool_is_idle_when_every_lane_reached_what_it_issued`;
+`euhedral-gpu/tests/cuda_deferred.rs` (a drop while a kernel spins returns at once, the marker is made in microseconds, the calls
+are made when the pool is idle; an out-of-memory allocation makes the deferred free and succeeds).
+
 ## A failed retirement reports one value: `Poisoned(cause)`, and the cause does not name the call that saw it (2026-11-02)
 
 **What.** `Stream::confirm_retired` on the CUDA backend returns `Some(Poisoned(cause))` for every retirement that ends because

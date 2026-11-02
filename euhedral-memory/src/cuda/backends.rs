@@ -16,6 +16,13 @@ use super::{
 use crate::backend::{AllocError, Backend, Block};
 use crate::planner::LocationId;
 
+/// `CUDA_ERROR_OUT_OF_MEMORY`.
+const OUT_OF_MEMORY: i32 = 2;
+
+fn is_out_of_memory(e: &CudaError) -> bool {
+    e.code == OUT_OF_MEMORY
+}
+
 fn err(e: CudaError) -> AllocError {
     AllocError {
         what: e.to_string(),
@@ -44,11 +51,18 @@ impl Backend for DeviceMemory {
         let d = &self.device;
         let _c = d.enter().map_err(err)?;
         let mut ptr = 0;
-        // SAFETY: out pointer; the context is current.
-        d.check("cuMemAlloc", unsafe {
-            (d.driver.fns.mem_alloc)(&mut ptr, bytes as usize)
-        })
-        .map_err(err)?;
+        let make = |ptr: &mut CuDevicePtr| {
+            // SAFETY: out pointer; the context is current.
+            d.check("cuMemAlloc", unsafe {
+                (d.driver.fns.mem_alloc)(ptr, bytes as usize)
+            })
+        };
+        let mut made = make(&mut ptr);
+        if made.as_ref().is_err_and(is_out_of_memory) && d.reclaim_deferred() {
+            // The memory was waiting in the device's deferred calls, which are made now: an allocation is a build-time call.
+            made = make(&mut ptr);
+        }
+        made.map_err(err)?;
         Ok(Block {
             addr: ptr,
             bytes,
@@ -56,16 +70,20 @@ impl Backend for DeviceMemory {
         })
     }
 
+    /// With a deferral attached to the device ([`Device::attach_deferral`]) the free is queued and made at a moment with
+    /// nothing in flight; without one it is made here and waits for the device.
     unsafe fn free(&self, block: Block) {
-        let d = &self.device;
-        if let Ok(_c) = d.enter() {
-            // SAFETY: the caller's contract (a block of this backend, unused).
-            unsafe { (d.driver.fns.mem_free)(block.addr) };
-        }
+        self.device.defer_or_run(block.bytes, move |d| {
+            if let Ok(_c) = d.enter() {
+                // SAFETY: the caller's contract (a block of this backend, unused).
+                unsafe { (d.driver.fns.mem_free)(block.addr) };
+            }
+        });
     }
 
     fn free_blocks(&self) -> bool {
-        true
+        // A free waits for the device unless the device defers it.
+        self.device.deferral().is_none()
     }
 }
 
@@ -141,11 +159,17 @@ impl Backend for StreamPool {
         let d = &self.device;
         let _c = d.enter().map_err(err)?;
         let mut ptr = 0;
-        // SAFETY: out pointer; our stream.
-        d.check("cuMemAllocAsync", unsafe {
-            (d.driver.fns.mem_alloc_async)(&mut ptr, bytes as usize, self.stream)
-        })
-        .map_err(err)?;
+        let make = |ptr: &mut CuDevicePtr| {
+            // SAFETY: out pointer; our stream.
+            d.check("cuMemAllocAsync", unsafe {
+                (d.driver.fns.mem_alloc_async)(ptr, bytes as usize, self.stream)
+            })
+        };
+        let mut made = make(&mut ptr);
+        if made.as_ref().is_err_and(is_out_of_memory) && d.reclaim_deferred() {
+            made = make(&mut ptr);
+        }
+        made.map_err(err)?;
         Ok(Block {
             addr: ptr,
             bytes,
@@ -244,7 +268,18 @@ impl Vmm {
         }
     }
 
+    /// A block of at least `bytes`. When the device is out of memory and calls are waiting in its deferral, they are made
+    /// and the allocation is tried once more.
     pub fn alloc_vmm(&self, bytes: u64) -> Result<VmmBlock, CudaError> {
+        match self.alloc_vmm_once(bytes) {
+            Err(e) if is_out_of_memory(&e) && self.device.reclaim_deferred() => {
+                self.alloc_vmm_once(bytes)
+            }
+            other => other,
+        }
+    }
+
+    fn alloc_vmm_once(&self, bytes: u64) -> Result<VmmBlock, CudaError> {
         let d = &self.device;
         let f = &d.driver.fns;
         let size = bytes.max(1).next_multiple_of(self.granularity) as usize;
@@ -427,23 +462,32 @@ impl PinnedHost {
     /// Frees the released buffers beyond the limit (and all of them with `everything`). Synchronizes the device.
     pub fn trim(&self, everything: bool) {
         let mut gone = Vec::new();
-        self.overflow.1.drain_all(|(a, _)| gone.push(a));
+        self.overflow
+            .1
+            .drain_all(|(a, bytes)| gone.push((a, bytes)));
         if everything {
             for (i, (_, c)) in self.classes.iter().enumerate() {
                 let class = PINNED_MIN_CLASS << i;
                 c.drain_all(|a| {
                     self.cached.fetch_sub(class, Ordering::AcqRel);
-                    gone.push(a);
+                    gone.push((a, class));
                 });
             }
         }
-        let d = &self.device;
-        if let Ok(_c) = d.enter() {
-            for a in gone {
-                // SAFETY: released buffers of this backend, unused.
-                unsafe { (d.driver.fns.mem_free_host)(a as *mut c_void) };
-            }
+        if gone.is_empty() {
+            return;
         }
+        let bytes = gone.iter().map(|&(_, bytes)| bytes).sum();
+        // The frees wait for the device: with a deferral attached to the device they are queued and made at a moment with
+        // nothing in flight, else now.
+        self.device.defer_or_run(bytes, move |d| {
+            if let Ok(_c) = d.enter() {
+                for (a, _) in gone {
+                    // SAFETY: released buffers of this backend, unused.
+                    unsafe { (d.driver.fns.mem_free_host)(a as *mut c_void) };
+                }
+            }
+        });
     }
 }
 
@@ -473,11 +517,17 @@ impl Backend for PinnedHost {
         let d = &self.device;
         let _c = d.enter().map_err(err)?;
         let mut p = std::ptr::null_mut();
-        // SAFETY: out pointer; flags 0 (portable to this context).
-        d.check("cuMemHostAlloc", unsafe {
-            (d.driver.fns.mem_host_alloc)(&mut p, class as usize, 0)
-        })
-        .map_err(err)?;
+        let make = |p: &mut *mut c_void| {
+            // SAFETY: out pointer; flags 0 (portable to this context).
+            d.check("cuMemHostAlloc", unsafe {
+                (d.driver.fns.mem_host_alloc)(p, class as usize, 0)
+            })
+        };
+        let mut made = make(&mut p);
+        if made.as_ref().is_err_and(is_out_of_memory) && d.reclaim_deferred() {
+            made = make(&mut p);
+        }
+        made.map_err(err)?;
         Ok(Block {
             addr: p as u64,
             bytes: class,
