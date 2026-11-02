@@ -155,6 +155,11 @@ impl Deferral {
         self.0.run_through(ticket)
     }
 
+    /// Pushes the drain frame if its conditions hold; see [`DeferredCalls::poll`].
+    pub fn poll(&self) {
+        self.0.poll();
+    }
+
     /// How many calls wait.
     pub fn pending(&self) -> usize {
         self.0.pending()
