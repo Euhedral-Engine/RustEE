@@ -48,17 +48,34 @@ pub(crate) fn is_fault(code: i32) -> bool {
     )
 }
 
+/// The `call` of a device fault recorded as the device's cause. The cause says what failed (the code and its name), not
+/// which call noticed: the callback that reports the faulting work and the look at the device that finds the fault
+/// first are two routes to the same fault, and the cause must not depend on which came first.
+pub(crate) const FAULT_CALL: &str = "device work";
+
+/// What the device records for `err`: a device fault without the observing call, anything else as it is.
+fn cause_of(err: &GpuError) -> GpuError {
+    match err {
+        GpuError::Fault { code, name, .. } => GpuError::Fault {
+            call: FAULT_CALL,
+            code: *code,
+            name: name.clone(),
+        },
+        other => other.clone(),
+    }
+}
+
 /// Records `err` as the device's cause when it is a device fault.
 pub(crate) fn note_fault(poison: &Poison, err: &GpuError) {
     if matches!(err, GpuError::Fault { .. }) {
-        poison.set(err.clone());
+        poison.set(cause_of(err));
     }
 }
 
 /// Records `err` as the device's cause whatever it is: for a query that fails in a way nobody can recover from, where
 /// carrying on would strand the continuations behind it.
 pub(crate) fn note_unrecoverable(poison: &Poison, err: &GpuError) {
-    poison.set(err.clone());
+    poison.set(cause_of(err));
 }
 
 /// The error for driver `code` of `call`: a [`GpuError::Fault`] for a device fault, else a [`GpuError::Call`].
@@ -267,10 +284,19 @@ mod tests {
             "an ordinary error leaves the device usable"
         );
         note_fault(&poison, &classify("k", 700, "ILLEGAL_ADDRESS".into()));
-        assert!(matches!(
-            poison.get(),
-            Some(GpuError::Fault { code: 700, .. })
-        ));
+        let cause = Some(GpuError::Fault {
+            call: FAULT_CALL,
+            code: 700,
+            name: "ILLEGAL_ADDRESS".into(),
+        });
+        assert_eq!(poison.get(), cause);
+        // The cause does not name the call that noticed: the same fault from another call records the same value.
+        let again = Poison::new();
+        note_unrecoverable(
+            &again,
+            &classify("cuEventQuery", 700, "ILLEGAL_ADDRESS".into()),
+        );
+        assert_eq!(again.get(), cause);
         let other = Poison::new();
         note_unrecoverable(
             &other,

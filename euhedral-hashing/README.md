@@ -4,6 +4,8 @@ xxHash64-based hashing for RustEE's routing keys, ordered-chain ids and vector f
 port of the upstream Java `AbstractHasher`, `ByteHasher`, `StringHasher` and `HasherApi`, and gives
 the same hashes as the Java code for the same input.
 
+**Terms.** The [top-level glossary](../GLOSSARY.md) covers the terms a user meets; this crate's [`GLOSSARY.md`](GLOSSARY.md) covers its implementation-level terms.
+
 **Where it sits.** No dependencies. It hashes bytes, strings and float slices, and mixes and combines hashes
 (`mix`, `mix_with_zero_check`, `combine`), which is what a caller needs to build a routing key, an ordered-chain
 id or a vector fingerprint from parts. A hash is a function of its input and seed alone, on every platform.

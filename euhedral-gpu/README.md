@@ -7,6 +7,8 @@ Asynchronous, backend-neutral GPU access for the RustEE control plane. A lattice
 - load kernels the application brings with it, from source or from a prebuilt image;
 - record a recurring sequence of submissions once and replay it.
 
+**Terms.** The [top-level glossary](../GLOSSARY.md) covers the terms a user meets; this crate's [`GLOSSARY.md`](GLOSSARY.md) covers its implementation-level terms.
+
 **Where it sits.** It is the top layer of the workspace. It builds on [`euhedral-core`](../euhedral-core) (frames),
 [`euhedral-graph`](../euhedral-graph) (`DeviceQueue`, `Marker`, `LanePool` and `Completions`),
 [`euhedral-memory`](../euhedral-memory) (the CUDA driver, device and allocations) and
@@ -134,11 +136,15 @@ Asynchronous, backend-neutral GPU access for the RustEE control plane. A lattice
   - Recording forks and joins the real streams with events of its own, and a panic in the recording closure ends the
     capture.
 - **Failures are values.** A device fault (an illegal address, a launch failure) surfaces through `confirm_retired`
-  and poisons the device: later calls return `Err(Poisoned(cause))` at once, and every marker reads as reached. The
+  as `Poisoned(cause)` and poisons the device: later calls return `Err(Poisoned(cause))` at once, and every marker
+  reads as reached. The
   driver's other unrecoverable errors (an event query that fails for any reason but "not ready") poison it the same
   way. A fault is sticky for the process, so recovery is a new process. Nothing panics on the lattice.
 - **Build-time calls.** Module loading (compile, file reads, the driver's load), dropping a stream and dropping a
   graph block. Run them in the frame or item that needs them; a worker is a CPU. Keep them out of paths that run per item.
+  Module loads and device frees also wait for the context's running kernels, and a `cuEventRecord` on another thread's
+  stream measured behind them for as long as they waited, so they belong before the work they would stall starts, not
+  beside it.
 
 ```rust
 use std::sync::{Arc, Mutex};
@@ -285,6 +291,13 @@ device cannot order on the device: open the lanes that must order each other in 
 A retirement armed behind a lane that faulted may never get its callback. `poll_retired` therefore looks at the device
 once when it finds nothing and retirements are outstanding (one event query, at most every millisecond), which poisons
 the device and has the next drain report the rest as poisoned.
+
+The value of a failed retirement does not depend on which of the two (the driver's callback or that look) saw the fault
+first. Every retirement that ends because of a device fault, the faulting work's own included, is confirmed as
+`Poisoned(cause)`, where `cause` is exactly `Gpu::poisoned()`. A callback that reports a fault status poisons the device
+first, if the look has not. The cause is route-independent too: a `Fault` with `call` `"device work"` (the cause says
+what failed, not which call noticed), the driver's `code` and its `name`. A backend with no driver call to name records
+its own label. A status that is not a device fault (the work failed, the device is intact) is confirmed as `Call`.
 
 Code that imports both `Stream` and `LaneSubmit` names the one it means with a path (`Stream::mark(&mut s)`), as both
 have `mark`, `id` and `await_marker`.

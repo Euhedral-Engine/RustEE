@@ -348,7 +348,6 @@ impl Stream for FakeStream {
         if ticket.status() != 0 {
             // The status is the device's own report of the fault.
             self.gpu.observe_fault();
-            return self.gpu.poisoned();
         }
         self.gpu
             .poisoned()

@@ -5,6 +5,8 @@ Java `euhedral-data-structures`, padded the same way: where Java pads with dead 
 `#[repr(align(128))]` wrapper ([`CachePadded`](src/atomics/padding.rs)) pads the same groups of
 fields in the same order.
 
+**Terms.** The [top-level glossary](../GLOSSARY.md) covers the terms a user meets; this crate's [`GLOSSARY.md`](GLOSSARY.md) covers its implementation-level terms.
+
 **Where it sits.** No dependencies except `loom` under `--cfg loom`. It holds the padded atomics, the chunked
 queues in the four producer/consumer role pairs (single or multiple on each side), partitioned queues, and the
 cells and claims that threads meet at (`sync`).

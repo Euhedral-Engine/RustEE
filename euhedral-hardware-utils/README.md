@@ -4,6 +4,8 @@ CPU topology, thread affinity, pinned executors and resource-pressure monitoring
 a port of the upstream Java `euhedral-hardware-utils`. The Java native library is replaced by direct
 system calls, so there is nothing to extract or load at run time.
 
+**Terms.** The [top-level glossary](../GLOSSARY.md) covers the terms a user meets; this crate's [`GLOSSARY.md`](GLOSSARY.md) covers its implementation-level terms.
+
 **Where it sits.** Depends only on `log` and `euhedral-data-structures` (for its lifecycle locks), plus `libc` on Unix and
 `windows-sys` on Windows. A `ResourceMonitor` samples the machine's pressure, a `TopologyMapper` places work on cores,
 a `PinnedThreadExecutor` runs tasks on a fixed CPU, and a `CpuInfo` describes where a thread runs.

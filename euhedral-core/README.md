@@ -1,8 +1,8 @@
 # euhedral-core
 
 The RustEE runtime: frames, the lattice that runs them, and the sources that feed it. It is a port
-of the upstream Java `euhedral-core`. See [`GLOSSARY.md`](../GLOSSARY.md) for
-every term used here.
+of the upstream Java `euhedral-core`. See the [top-level glossary](../GLOSSARY.md) for the terms a user
+meets and [`GLOSSARY.md`](GLOSSARY.md) for this crate's implementation-level terms.
 
 **Where it sits.** It depends on the other three crates of the workspace and on `log`:
 
@@ -12,7 +12,7 @@ every term used here.
   queues, ingest sinks and frame pools;
 - [`euhedral-hashing`](../euhedral-hashing) for routing hashes.
 
-Nothing in the workspace depends on it; applications do.
+`euhedral-graph`, `euhedral-io`, `euhedral-memory`, `euhedral-gpu` and `euhedral-benchmarks` build on it, and so do applications.
 
 ## How work moves
 
@@ -36,7 +36,7 @@ and routing policy, and lets idle workers steal unordered work.
 | [`ingest`](src/ingest/mod.rs) | Ready-made `LatticeSource`s behind the `IngestSink` trait: `QueueIngestSink`, `ArrayIngestSink`, `PipelineRunner` (with `PipelineControl`, `AdmissionClosed`); and `SingleUseSource`. |
 | [`control_plane`](src/control_plane/mod.rs) | `ControlPlaneLattice` (with `LatticeError`, `UtilizationSource`), `ControlPlaneShard`, `ControlPlaneFragment`, `ControlPlaneCache`, `CacheDirectory`. |
 | [`config`](src/config/mod.rs) | `LatticeConfig`, `FragmentConfig`, `CacheConfig`, `IdlePolicy` with `FixedTiming` and `IdleTimingFunction` (`TimingProvider`, `TimingModel`), `CloneConfig`, `CloneLivenessRegistry`. |
-| [`flow_control`](src/flow_control/mod.rs) | `RoutingPolicy`; `LatticeEdge` and `LatticeNode`; `LatticeVertex` and its `RoutingState` generations (read under a count, `routing_state()` returns a `RouteGuard`); `UpstreamRegistry`, `UpstreamHandle`, `UpstreamQueue`; `LatticeHotSource`, `LatticeHotReceiver`. |
+| [`flow_control`](src/flow_control/mod.rs) | `RoutingPolicy`; `LatticeEdge` and `LatticeNode`; `LatticeVertex` and its `RoutingState` generations (a push reads the one its worker's view holds; `with_routing_state` reads it); `UpstreamRegistry`, `UpstreamHandle`, `UpstreamQueue`; `LatticeHotSource`, `LatticeHotReceiver`. |
 | [`impls`](src/impls/mod.rs) | `BaseCloneableObject` (the stock per-core object: a fragment feeding an executor), `DefaultExecutor`, and frame pooling: `FrameManager`, `FrameFactory`, `Recycler`. |
 | [`metrics`](src/metrics/mod.rs) | `time_execute` (times an executor's `execute` call); `MetricsRegistry` and its `MetricsSnapshot` of `Meter`s (`MeterValue`: gauge, counter, summary, flow); `Histogram` and `HistogramSnapshot` (log2 buckets, percentiles); `FlowStats`; the metric names (`metric_name`, `DEFAULT_PREFIX`, the `*_SUFFIX` constants, `CORE_TAG`, `CPU_TAG`). |
 | [`utils`](src/utils/mod.rs) | `math`, `spin_wait`, `StopWatch`, `AverageFlow`, `FlowRecorder`, `FlowContext`, `calibration`. |
@@ -342,7 +342,7 @@ rebalance).
 A process can run one lattice of each kind, each on its own CPUs. The idle and park timings are
 tunable. The default `IdlePolicy` is adaptive: a fitted `IdleTimingFunction` picks the park from
 the contention, the productive handles per worker and the frame cost. `IdlePolicy::fixed` always
-parks for the same time; use a fixed idle timing for graphics loops, because the adaptive one is not
+parks for the same time; use a fixed idle timing for loops that need predictable timing, because the adaptive one is not
 built for predictable timing.
 
 ```rust

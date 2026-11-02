@@ -2,13 +2,14 @@
 
 No-wait dataflow on the RustEE lattice: completions, in-order release, joins,
 device lanes and per-item stage graphs. Nothing in it waits and nothing in it owns a thread. See
-[`GLOSSARY.md`](../GLOSSARY.md) for every term used here.
+the [top-level glossary](../GLOSSARY.md) for the terms a user meets and [`GLOSSARY.md`](GLOSSARY.md) for this
+crate's implementation-level terms.
 
 Asynchronous I/O (`AsyncIo`) is in [`euhedral-io`](../euhedral-io/README.md).
 
 **Where it sits.** It depends on [`euhedral-core`](../euhedral-core), on
 [`euhedral-data-structures`](../euhedral-data-structures) and, on Linux and Android, on `libc`.
-Nothing in the workspace depends on it; applications do. It adds
+`euhedral-memory` and `euhedral-gpu` build on it, and so do applications. It adds
 `LatticeSource`s that the lattice's own polls drive, and plain structures that frame callbacks run,
 so it needs no thread of its own. It does not re-export `euhedral-core`: import `Frame`,
 `LatticeSource` and the rest from there.
@@ -123,7 +124,7 @@ assert_eq!(*released.lock().unwrap(), [0, 1, 2]); // concluded in offer order
 ### Device lanes and markers
 
 A `DeviceQueue` is a device timeline that runs submissions in order: a Vulkan queue with a timeline
-semaphore, a CUDA stream with events, a hardware codec engine, or a fake. What is generic is the
+semaphore, a CUDA stream with events, a copy engine, or a fake. What is generic is the
 query, `completed()`, one cheap read. A `Marker` names the queue that made it (`QueueId`, from `DeviceQueue::id`), a lane and a value on it;
 a `LanePool` holds the lanes and answers `reached(marker)`, which is false for a marker of another queue. Submitting is technology-specific and lives with whoever
 owns the queue: it takes the markers its work must wait for on the device and returns the marker
@@ -297,7 +298,7 @@ For callers without an entry type of their own, `Sequencer::ordered(emit)` makes
 value, and `register()` offers a ticket and returns its `Slot`: complete it with a value or abandon it (dropping it
 abandons it), from any thread. `register` allocates the ticket.
 
-Fan-in needs no type of its own. The object the branches share (a picture, a pair) carries a `pending` count and
+Fan-in needs no type of its own. The object the branches share (a record, a pair) carries a `pending` count and
 plain result fields: arming is one store of the branch count before the branches are published, each branch writes
 its field and ends with one `fetch_sub(1, AcqRel)` where its frame ends (`do_finally`, which runs once whether the
 frame finished or was killed), and the branch that reads 1 runs the next step. The read-modify-write chain makes every
