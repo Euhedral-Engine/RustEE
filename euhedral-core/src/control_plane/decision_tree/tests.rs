@@ -461,6 +461,9 @@ impl UpstreamHandle for PushOnly {
     }
 }
 
+/// The demand of a cycle's request: a batch scaled by the pull multiplier, enough to reach every handle.
+const REQUEST: u64 = 1 << 16;
+
 /// What the workers of a lattice with no work did, cycle by cycle.
 #[derive(Debug, PartialEq, Eq)]
 struct Idling {
@@ -491,7 +494,7 @@ fn idle_workers(workers: usize, lanes: u64, push_only: u64, body_ns: u64, cycles
         let (parks, awake, productive) = std::thread::spawn(move || {
             registry.register_with(|| Some(rank));
             let mut tree = tree();
-            record_all(tree.body_cost_mut(), [body_ns; 32]);
+            record_all(tree.body_cost_mut(), [body_ns; 64]);
             let now = Instant::now();
             let (mut parks, mut awake, mut productive) = (0, false, 0);
             for _ in 0..cycles {
@@ -508,10 +511,10 @@ fn idle_workers(workers: usize, lanes: u64, push_only: u64, body_ns: u64, cycles
                         };
                         match path {
                             ExecutionPath::Direct => {
-                                queue.pull(&mut |_| {}, &mut |_| false, 64);
-                                queue.request(64);
+                                queue.pull(&mut |_| {}, &mut |_| false, 2);
+                                queue.request(REQUEST);
                             }
-                            ExecutionPath::Staged => queue.request(64),
+                            ExecutionPath::Staged => queue.request(REQUEST),
                             ExecutionPath::Idle => {}
                         }
                         let parked =
@@ -540,31 +543,38 @@ fn idle_workers(workers: usize, lanes: u64, push_only: u64, body_ns: u64, cycles
 /// nothing shows nothing, and the source counts as productive, as every handle does, until a pull
 /// finds it empty. That is the rule of the original (see `a_request_is_not_evidence_of_an_empty_source`).
 /// A source that only pushes (its pull always finds 0, and it pushes from `request`) counts in the
-/// productive count like any other handle, and keeps no worker awake that a lane source with the
-/// same view would not.
+/// productive count like any other handle: a lattice of eight workers and no work behaves the same
+/// with one more lane source as with one more push-only source, and the push-only source keeps no
+/// worker awake that a lane source would let park.
 ///
-/// Workers with no work alternate a pull and a request, and each takes the whole demand from the
-/// handle at the head of the queue and sends it to the back. With an even number of handles the pull
-/// always lands on the same half and the request on the other: the requested half is never pulled,
-/// so no worker finds it empty and it stays productive (a request that routes nothing shows
-/// nothing). Those workers never reach the unproductive park. With an odd number every handle is
-/// pulled in turn, all become unproductive, and the workers park. So one more source of any kind
-/// flips the workers between spinning and parking, as the original's queue and cycle do. The test
-/// pins that a push-only source takes part in this as one more handle, whatever its kind.
+/// - Where workers pull (cheap bodies, the Direct path), a pull that finds a handle empty ends its
+///   productivity, so every handle is found empty in turn, the count falls to 0 and all workers park.
+/// - Where they only request (costly bodies, the Staged path), nothing is found empty, so every handle
+///   counts as productive: the count is the number of handles, up to the one below the number of
+///   workers, where a worker that has a handle per worker pulls (the Direct path) and finds one
+///   empty. A request that routes nothing is no evidence of an empty source.
 #[test]
 fn a_source_that_only_pushes_counts_like_any_other_handle() {
-    // Even: the requested half stays productive and every worker stays awake.
-    for (lanes, push_only) in [(8, 0), (7, 1), (0, 8)] {
-        let idling = idle_workers(8, lanes, push_only, 250, 400);
-        assert_eq!(idling.awake, 8, "{lanes}+{push_only}: {idling:?}");
-        assert_eq!(idling.parks, 0, "{lanes}+{push_only}: {idling:?}");
-        assert_eq!(idling.productive, [4; 8], "{lanes}+{push_only}: {idling:?}");
-    }
-    // Odd: every handle is found empty and every worker parks.
-    for (lanes, push_only) in [(9, 0), (8, 1), (0, 9)] {
-        let idling = idle_workers(8, lanes, push_only, 250, 400);
-        assert_eq!(idling.awake, 0, "{lanes}+{push_only}: {idling:?}");
-        assert_eq!(idling.productive, [0; 8], "{lanes}+{push_only}: {idling:?}");
-        assert!(idling.parks > 0, "{lanes}+{push_only}: {idling:?}");
+    for total in 3..=9 {
+        // Cheap bodies: the push-only source is found empty like the others, and every worker parks.
+        let lanes = idle_workers(8, total, 0, 250, 100);
+        let mixed = idle_workers(8, total - 1, 1, 250, 100);
+        assert_eq!(
+            (lanes.awake, &lanes.productive),
+            (0, &vec![0; 8]),
+            "{lanes:?}"
+        );
+        assert_eq!(
+            (mixed.awake, &mixed.productive),
+            (0, &vec![0; 8]),
+            "{mixed:?}"
+        );
+
+        // Costly bodies: a push-only source counts exactly as a lane source does.
+        let lanes = idle_workers(8, total, 0, 1_200, 100);
+        let mixed = idle_workers(8, total - 1, 1, 1_200, 100);
+        assert_eq!(lanes.productive, [total.min(7); 8], "{lanes:?}");
+        assert_eq!(mixed.productive, lanes.productive, "{mixed:?} {lanes:?}");
+        assert_eq!(mixed.awake, lanes.awake, "{mixed:?} {lanes:?}");
     }
 }

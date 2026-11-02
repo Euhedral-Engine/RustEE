@@ -672,7 +672,6 @@ impl<'a> Acquired<'a> {
     /// Pulls or requests up to `demand` frames from the handle and records what that showed about
     /// its source: this worker's view of the handle, for this one service.
     ///
-    /// The view is the one the source's owner defines (the handle's `begin`/`restore` observation):
     /// - A pull that finds frames shows a productive source. One that finds none shows an empty
     ///   source, unless a frame was routed through the handle during the call.
     /// - A request that routes a frame through the handle, or satisfies the thread's request, shows

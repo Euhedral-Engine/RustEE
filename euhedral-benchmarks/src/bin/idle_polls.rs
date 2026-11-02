@@ -165,6 +165,10 @@ fn number(arguments: &mut impl Iterator<Item = String>, name: &str) -> f64 {
         .unwrap_or_else(|| panic!("{name} takes a number"))
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "JAVA-BACKOFF: the harness thread waits between samples of the workers' CPU time, outside any worker's cycle"
+)]
 fn main() {
     let (mut lanes, mut push_only, mut push_every, mut seconds, mut pin) =
         (16_usize, 0_usize, 0_u64, 60_u64, true);

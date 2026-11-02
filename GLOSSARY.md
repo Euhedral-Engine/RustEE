@@ -490,6 +490,12 @@ frames behind a blocked one. Ordered frames still run only on their owning CPU, 
 largest batch a worker grows to, 4096 by default. It also selects greedy or poll mode. The worker cycle,
 idle parks and batch caps: [`euhedral-core` glossary](euhedral-core/GLOSSARY.md#the-worker-cycle).
 
+**productive source** ([`euhedral-core` glossary](euhedral-core/GLOSSARY.md#flow-control-what-workers-read)): a source that, the last time a
+worker took from it, gave that worker frames. Workers that find every source empty park for the unproductive park;
+workers do not park while one source looks productive to them. A pull that finds nothing shows a source empty. A
+request that pushes nothing shows nothing either way, so a source whose frames only arrive through `request` and
+whose `pull` hands over nothing looks productive to a worker that never pulls it.
+
 #### Metrics
 
 **metrics, MetricsRegistry** ([`metrics`](euhedral-core/src/metrics/mod.rs),
