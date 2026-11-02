@@ -12,6 +12,7 @@ use euhedral_data_structures::atomics::CachePadded;
 use euhedral_data_structures::sync::{HotScope, LifecycleMutex};
 use euhedral_hardware_utils::affinity::{self, ExecutorError, PinnedThreadExecutor, TaskInterrupt};
 use euhedral_hardware_utils::monitor::CoreSnapshot;
+use euhedral_hardware_utils::util::Deadline;
 use std::error::Error;
 use std::fmt;
 use std::panic::{self, AssertUnwindSafe};
@@ -671,9 +672,10 @@ impl CloneableObject for ControlPlaneFragment {
         let cleared = if self.running.load(Ordering::Acquire) {
             let request = self.reset_requested.fetch_add(1, Ordering::AcqRel) + 1;
             self.unpark_worker();
+            let mut patience = Deadline::at(deadline);
             while self.reset_completed.load(Ordering::Acquire) < request
                 && self.running.load(Ordering::Acquire)
-                && Instant::now() < deadline
+                && !patience.expired()
             {
                 #[allow(clippy::disallowed_methods, reason = "LIFECYCLE(C25)")]
                 thread::park_timeout(RESET_POLL);

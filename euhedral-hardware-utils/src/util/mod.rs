@@ -1,11 +1,13 @@
-//! Small shared types (upstream `util`).
+//! Small shared types (upstream `util`), and [`Deadline`], a deadline checked on a cheap coarse clock.
 //!
 //! `UnmodifiableDoubleArray` has no counterpart: a `Box<[f64]>` handed out as `&[f64]` is already
 //! immutable, so the records that carried one expose slices instead.
 
 pub(crate) mod cpu_set;
+mod deadline;
 
 pub use cpu_set::{CpuSet, Iter as CpuSetIter};
+pub use deadline::{Deadline, coarse_bound};
 
 use std::fmt;
 

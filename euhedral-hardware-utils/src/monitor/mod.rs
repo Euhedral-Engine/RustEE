@@ -18,6 +18,7 @@ pub use utilization::{
 };
 
 use crate::topology::TopologyMapper;
+use crate::util::Deadline;
 use compat::LegacyAdapter;
 use dispatcher::LatestValueDispatcher;
 use engine::SampleStateEngine;
@@ -488,20 +489,22 @@ impl ResourceMonitor {
 
     fn close_within(&self, timeout: Option<Duration>) -> bool {
         let shared = &self.shared;
-        let deadline = timeout.and_then(|timeout| Instant::now().checked_add(timeout));
+        let mut deadline = timeout
+            .and_then(|timeout| Instant::now().checked_add(timeout))
+            .map(Deadline::at);
         let mut life = shared.life();
         shared.begin_close(&mut life);
         if shared.is_own_thread(&life) {
             return shared.fully_closed(&life);
         }
         while !shared.fully_closed(&life) {
-            life = match (timeout, deadline) {
-                (None, _) | (Some(_), None) => shared
+            life = match deadline.as_mut() {
+                None => shared
                     .changed
                     .wait(life)
                     .unwrap_or_else(PoisonError::into_inner),
-                (Some(_), Some(deadline)) => {
-                    let remaining = deadline.saturating_duration_since(Instant::now());
+                Some(deadline) => {
+                    let remaining = deadline.remaining();
                     if remaining.is_zero() {
                         return false;
                     }

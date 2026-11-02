@@ -14,6 +14,8 @@ testing = []
 euhedral-core = { path = "../euhedral-core" }
 # `MpscQueue`: any thread registers, the polling thread drains.
 euhedral-data-structures = { path = "../euhedral-data-structures" }
+# `Deadline`: the backstop of a retried stage.
+euhedral-hardware-utils = { path = "../euhedral-hardware-utils" }
 # A panic in a conclusion that cannot be resumed (the draining thread is already unwinding) is logged.
 log = "0.4.29"
 
@@ -23,8 +25,6 @@ libc = "0.2.174"
 [dev-dependencies]
 # The crate's own integration tests and unit tests use the fake device.
 euhedral-graph = { path = ".", default-features = false, features = ["testing"] }
-# The credit-graph test checks the CPUs this process may run on.
-euhedral-hardware-utils = { path = "../euhedral-hardware-utils" }
 # The lake tests hash their lane ids as real ids are hashed.
 euhedral-hashing = { path = "../euhedral-hashing" }
 

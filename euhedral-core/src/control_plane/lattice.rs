@@ -18,7 +18,7 @@ use euhedral_hardware_utils::monitor::{
 use euhedral_hardware_utils::topology::{
     EffectiveSocketTopology, EffectiveSystemTopology, TopologyMapper,
 };
-use euhedral_hardware_utils::util::CpuSet;
+use euhedral_hardware_utils::util::{CpuSet, Deadline};
 use std::error::Error;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -29,7 +29,7 @@ use std::sync::mpsc;
 )]
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, Weak};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// A listener for each new [`HardwareUtilization`].
 pub type UtilizationListener = Box<dyn Fn(&Arc<HardwareUtilization>) + Send + Sync>;
@@ -284,8 +284,8 @@ impl ControlPlaneLattice {
         self.update(&utilization);
 
         log::trace!(target: &self.name, "awaiting readiness");
-        let deadline = Instant::now() + self.config.startup_timeout;
-        spin_wait::await_while(|| !self.ready() && Instant::now() < deadline);
+        let mut deadline = Deadline::after(self.config.startup_timeout);
+        spin_wait::await_while(|| !self.ready() && !deadline.expired());
         if !self.ready() {
             return Err(LatticeError::StartTimedOut);
         }
@@ -594,8 +594,8 @@ impl ControlPlaneLattice {
         }
         let _resetting = Resetting(self);
 
-        let deadline = Instant::now() + timeout;
-        spin_wait::await_while(|| self.is_rebalancing() && Instant::now() < deadline);
+        let mut deadline = Deadline::after(timeout);
+        spin_wait::await_while(|| self.is_rebalancing() && !deadline.expired());
         if self.is_rebalancing() {
             return Err(LatticeError::RebalanceTimedOut(RebalanceTimedOut {
                 name: self.name.clone(),
@@ -607,7 +607,7 @@ impl ControlPlaneLattice {
         let mut cleared_frames = 0;
         for shard in &self.shards {
             cleared_frames += shard
-                .reset_for_next_trial(deadline)
+                .reset_for_next_trial(deadline.exact())
                 .map_err(LatticeError::RebalanceTimedOut)?;
         }
         reset_while_drained();

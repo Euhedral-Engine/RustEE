@@ -3,6 +3,31 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## Timeouts, patience and throttles read a coarse clock: `Deadline` over `fast_time` (2026-11-02)
+
+**What.** `euhedral_hardware_utils::util::Deadline` (new) is a deadline checked on `fast_time`'s coarse clock. Startup, rebalance,
+reset and shutdown patience (`ControlPlaneLattice`, `ControlPlaneShard`, `ControlPlaneFragment::reset`, `CloneLivenessRegistry::await_termination`),
+the executor and monitor close waits (`PinnedThreadExecutor::await_termination`, `acquire_within`, `ResourceMonitor::close_timeout`), a retried
+graph stage's backstop and a CUDA stream's idle fault-probe throttle use it instead of `Instant::now()`. Public signatures are unchanged:
+a deadline still arrives as a `std::time::Instant` or a `Duration`. `fast_time` 0.1.35 is a workspace dependency.
+
+**Why.** The coarse clock reads in about 3 ns here against 9 ns for `Instant::now()` (6 against 19 in the crate's own figures), which
+matters in the spin loops that wait on a deadline. Nothing that measures or decides in microseconds moved.
+
+**Semantics.** `fast_time` reads `CLOCK_MONOTONIC_COARSE` on Linux (a tick of `1/CONFIG_HZ`: 1 ms here) and `GetTickCount64` on Windows (10 to 16
+ms), and anchors it to a `std::time::Instant` taken when the clock is made, so a reading is within a tick of the monotonic clock in
+either direction. `Deadline` is exact in spite of that: it keeps a coarse threshold `coarse_bound()` before the deadline (twice the platform's
+tick and more: twice `clock_getres(CLOCK_MONOTONIC_COARSE)` plus 1 ms on Linux, 32 ms on Windows, zero where `fast_time` wraps `std`).
+A coarse reading below the threshold proves the deadline is ahead and no `Instant` is read; from the threshold on, `expired()` is
+`Instant::now() >= deadline`. So it is never early and never later than `Instant` would see it; the last few milliseconds before a
+deadline cost one `Instant::now()` per check, as before. `remaining()` is a lower bound of the true remainder far from the deadline (never
+zero, never past it) and the true remainder near it. A `Deadline` owns its clock, so reading takes `&mut self`; it is made on the waiting thread, once per wait. The sites that measure (service time, latency, the flow
+recorders, the idle policy, the decision tree, completion timers and their lateness) keep `Instant`.
+
+**Tests.** `util::deadline::tests`: never early; expiry seen by the first check after `Instant` passes the deadline, across the phases of
+the coarse tick and after `restart`; `remaining` never past the deadline and zero exactly when expired; the bound covers the skew measured
+on the platform.
+
 ## A polling stealer takes only the frame its stop looked at: placement is exact in poll mode (2026-10-30)
 
 **What.** `ControlPlaneCache`'s one-frame take (the owner's `poll` and the stealer's `work_steal_polled`) returns nothing when the

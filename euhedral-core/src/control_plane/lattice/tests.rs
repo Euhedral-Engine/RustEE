@@ -8,6 +8,7 @@ use euhedral_hardware_utils::topology::CpuInfo;
 use euhedral_hardware_utils::topology::source::{CoreKind, LogicalCpu, TopologyInput, normalize};
 use euhedral_hardware_utils::util::CpuSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 
 /// Two sockets of two cores each; core `c` has CPUs `2c` and `2c + 1` and sits on socket `c / 2`.
 fn two_sockets() -> euhedral_hardware_utils::topology::Topology {

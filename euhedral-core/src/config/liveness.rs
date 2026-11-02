@@ -1,5 +1,5 @@
 use euhedral_data_structures::sync::LifecycleMutex;
-use euhedral_hardware_utils::util::CpuSet;
+use euhedral_hardware_utils::util::{CpuSet, Deadline};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, Thread};
 use std::time::{Duration, Instant};
@@ -46,14 +46,15 @@ impl CloneLivenessRegistry {
     /// Waits until every participating worker has stopped running. False if `deadline` passes
     /// first.
     pub fn await_termination(&self, deadline: Instant) -> bool {
+        let mut deadline = Deadline::at(deadline);
         for slot in self.participants() {
             while slot.running() {
-                let now = Instant::now();
-                if now >= deadline {
+                let remaining = deadline.remaining();
+                if remaining.is_zero() {
                     return false;
                 }
                 #[allow(clippy::disallowed_methods, reason = "LIFECYCLE(C29)")]
-                thread::sleep(POLL.min(deadline - now));
+                thread::sleep(POLL.min(remaining));
             }
         }
         true

@@ -16,6 +16,7 @@
 //!   set a flag the task reads with [`is_interrupted`] and unpark the task's thread.
 //! - A CPU that is a hole in a sparse topology is rejected up front.
 
+use crate::util::Deadline;
 use euhedral_data_structures::sync::LifecycleMutex;
 use std::any::Any;
 use std::cell::RefCell;
@@ -183,10 +184,10 @@ impl Control {
     }
 
     /// Waits until no task is left, or `deadline`; whether none is.
-    fn wait_empty(&self, deadline: Instant) -> bool {
+    fn wait_empty(&self, deadline: &mut Deadline) -> bool {
         let mut control = self.lock();
         while !control.tasks.is_empty() {
-            let remaining = deadline.saturating_duration_since(Instant::now());
+            let remaining = deadline.remaining();
             if remaining.is_zero() {
                 return false;
             }
@@ -389,7 +390,7 @@ impl Registry {
         name: &str,
         timeout: Duration,
     ) -> Result<PinnedThreadExecutor, ExecutorError> {
-        let deadline = Instant::now() + timeout;
+        let mut deadline = Deadline::after(timeout);
         loop {
             match self.acquire(cpu, name) {
                 Err(ExecutorError::ClosedWithActiveTasks(busy)) => {
@@ -403,11 +404,11 @@ impl Registry {
                         // Wait only for the closed executor `acquire` refused. If another executor has replaced it
                         // since, or it ended, the next `acquire` decides; do not wait on a running one's tasks.
                         Some(control) if control.state() == State::Closed => {
-                            if !control.wait_empty(deadline) {
+                            if !control.wait_empty(&mut deadline) {
                                 return Err(ExecutorError::ClosedWithActiveTasks(busy));
                             }
                         }
-                        _ if Instant::now() >= deadline => {
+                        _ if deadline.expired() => {
                             return Err(ExecutorError::ClosedWithActiveTasks(busy));
                         }
                         _ => {}
@@ -709,7 +710,7 @@ impl PinnedThreadExecutor {
 
     /// Waits until terminated; `false` on timeout, or at once while running.
     pub fn await_termination(&self, timeout: Duration) -> bool {
-        let deadline = Instant::now().checked_add(timeout);
+        let mut deadline = Instant::now().checked_add(timeout).map(Deadline::at);
         let mut control = self.inner.control.lock();
         loop {
             if control.state == State::Running {
@@ -718,8 +719,8 @@ impl PinnedThreadExecutor {
             if control.tasks.is_empty() {
                 return true;
             }
-            let remaining = match deadline {
-                Some(deadline) => deadline.saturating_duration_since(Instant::now()),
+            let remaining = match deadline.as_mut() {
+                Some(deadline) => deadline.remaining(),
                 None => Duration::MAX,
             };
             if remaining.is_zero() {

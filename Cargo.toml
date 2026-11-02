@@ -1,3 +1,7 @@
 [workspace]
 members = ["euhedral-hashing", "euhedral-data-structures", "euhedral-hardware-utils", "euhedral-core", "euhedral-graph", "euhedral-io", "euhedral-memory", "euhedral-gpu", "euhedral-benchmarks"]
 resolver = "3"
+
+[workspace.dependencies]
+# A cheap, coarse clock for timeouts and rate limits; never for measurement (see `euhedral_hardware_utils::util::Deadline`).
+fast_time = "=0.1.35"

@@ -9,7 +9,7 @@ use crate::utils::math::unsigned_multiply_high;
 use crate::utils::spin_wait;
 use euhedral_hardware_utils::monitor::{CoreSnapshot, SocketSnapshot};
 use euhedral_hardware_utils::topology::EffectiveSocketTopology;
-use euhedral_hardware_utils::util::CpuSet;
+use euhedral_hardware_utils::util::{CpuSet, Deadline};
 use std::error::Error;
 use std::fmt;
 use std::panic::{self, AssertUnwindSafe};
@@ -445,7 +445,8 @@ impl ControlPlaneShard {
             generation,
         } = task;
         let deadline = self.deadline();
-        spin_wait::await_while(|| !clone.is_drained() && Instant::now() < deadline);
+        let mut patience = Deadline::at(deadline);
+        spin_wait::await_while(|| !clone.is_drained() && !patience.expired());
         let close = dead || !clone.is_drained();
 
         let mut state = self.lock();
@@ -539,7 +540,8 @@ impl ControlPlaneShard {
             let (name, tick) = (self.name.clone(), Tick(countdown.clone()));
             run_on(stopped.pool.as_deref(), move || {
                 let _tick = tick;
-                spin_wait::await_while(|| !clone.is_drained() && Instant::now() < deadline);
+                let mut patience = Deadline::at(deadline);
+                spin_wait::await_while(|| !clone.is_drained() && !patience.expired());
                 if !clone.is_drained() {
                     log::error!(target: &name, "the clone on core {core} timed out; forcing shutdown");
                 }
@@ -605,7 +607,8 @@ impl ControlPlaneShard {
     /// Drains every clone, clears what each holds for the current trial, and reopens ingest.
     /// Returns how many buffered frames the clones dropped.
     pub fn reset_for_next_trial(&self, deadline: Instant) -> Result<u64, RebalanceTimedOut> {
-        spin_wait::await_while(|| self.is_rebalancing() && Instant::now() < deadline);
+        let mut patience = Deadline::at(deadline);
+        spin_wait::await_while(|| self.is_rebalancing() && !patience.expired());
         let (distributor, clones) = {
             let state = self.lock();
             if !state.started {

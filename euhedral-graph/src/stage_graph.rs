@@ -11,10 +11,11 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering}
     reason = "HOT-FIX(G11), HOT-FIX(G12), HOT-FIX(G13), HOT-FIX(G14), HOT-FIX(G15), HOT-FIX(G10)"
 )]
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use euhedral_core::frames::{Frame, FrameError, FrameHeader};
 use euhedral_core::generics::FrameSink;
+use euhedral_hardware_utils::util::Deadline;
 
 use crate::completions::{Completions, Ready};
 use crate::lanes::{LaneId, LanePool, Marker};
@@ -139,6 +140,10 @@ pub enum StageError {
 /// anything for that long: a stalled lane, or a busy resource outside the pool. A backstop shorter
 /// than a pass fires on every pass, and a firing then means nothing. Twenty milliseconds suits
 /// passes of up to about ten.
+///
+/// The deadline is exact: the poll that first finds the monotonic clock at or past it fires the backstop, never one
+/// before (see [`Deadline`](euhedral_hardware_utils::util::Deadline), which reads a coarse clock only while the
+/// deadline is still far off).
 pub const DEFAULT_RETRY_BACKSTOP: Duration = Duration::from_millis(20);
 
 /// Retried stages, counted by how they ran again (all graphs of a runtime).
@@ -730,7 +735,7 @@ struct BoundarySet {
 struct Progress {
     lanes: Arc<LanePool>,
     seen: Vec<u64>,
-    deadline: Instant,
+    deadline: Deadline,
     counts: Arc<RetryCounts>,
 }
 
@@ -742,7 +747,7 @@ impl Progress {
         Progress {
             lanes,
             seen,
-            deadline: Instant::now() + backstop,
+            deadline: Deadline::after(backstop),
             counts,
         }
     }
@@ -760,7 +765,7 @@ impl Ready for Progress {
             self.counts.progress.fetch_add(1, Ordering::Relaxed);
             return true;
         }
-        if Instant::now() >= self.deadline {
+        if self.deadline.expired() {
             self.counts.backstops.fetch_add(1, Ordering::Relaxed);
             return true;
         }
@@ -1303,6 +1308,7 @@ impl<Q: Send + Sync + 'static> Frame for Retirement<Q> {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::AtomicU64;
+    use std::time::Instant;
 
     use euhedral_core::generics::LatticeSource;
     use euhedral_core::ingest::{IngestSink, QueueIngestSink};

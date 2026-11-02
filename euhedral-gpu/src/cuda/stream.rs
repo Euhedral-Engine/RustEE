@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use euhedral_graph::{DeviceQueue, LaneId, Marker, QueueId};
+use euhedral_hardware_utils::util::Deadline;
 use euhedral_memory::cuda::{CuEvent, CuStream, Device, STREAM_NON_BLOCKING};
 
 use crate::kept::Kept;
@@ -292,8 +293,9 @@ pub struct CudaStream {
     /// The owner's end of the retirement queue, and the retirements armed.
     pub(crate) retire: Retirements,
     pub(crate) kept: Kept,
-    /// When the stream last queried its marker events for a fault with retirements outstanding.
-    last_probe: Option<Instant>,
+    /// Expires when the stream may next query its marker events for a fault with retirements outstanding: [`PROBE_EVERY`]
+    /// after the last idle query, never earlier.
+    probe_gate: Deadline,
     /// The ring of timed spans: its slots, and the timing events behind them.
     spans: SpanBook,
     span_events: SpanEvents,
@@ -377,7 +379,7 @@ impl CudaStream {
                 shadow: None,
                 retire,
                 kept: Kept::default(),
-                last_probe: None,
+                probe_gate: Deadline::at(Instant::now()),
                 spans: SpanBook::new(ring_id, options[i].spans),
                 span_events: SpanEvents::new(device, options[i].spans)?,
             });
@@ -474,14 +476,10 @@ impl CudaStream {
             return;
         }
         if mode == Probe::Idle {
-            let now = Instant::now();
-            if self
-                .last_probe
-                .is_some_and(|last| now.duration_since(last) < PROBE_EVERY)
-            {
+            if !self.probe_gate.expired() {
                 return;
             }
-            self.last_probe = Some(now);
+            self.probe_gate.restart(PROBE_EVERY);
         }
         let _ = DeviceQueue::completed(&*self.queue);
     }
