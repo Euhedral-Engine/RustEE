@@ -33,9 +33,11 @@
 //! - **Bytes.** A call carries the bytes it gives back and where ([`Place`]): [`DeferredCalls::pending_bytes`] says how
 //!   much, per place, for a planner that counts it as certain reclaim.
 //! - **Tickets.** `defer` returns a [`Ticket`]. [`DeferredCalls::run_through`] makes every call that is queued when it is
-//!   called, which includes the ticket's, on the calling thread: it becomes the consumer as soon as the cell is free, so it
-//!   cannot return before the ticket's call has been made. It is for the owner that cannot go on without the memory (an
-//!   allocation that ran out of it), never for a thread that must not block: those use `drain_soon`.
+//!   called, which includes the ticket's, on the calling thread: it becomes the consumer as soon as the cell is free and
+//!   makes as many calls as the queue had claimed by then (a place claimed and not yet published ends what a drain can see,
+//!   so it waits for that too), so it cannot return before the ticket's call has been made. It is for the owner that
+//!   cannot go on without the memory (an allocation that ran out of it), never for a thread that must not block: those use
+//!   `drain_soon`.
 //! - **Panics.** Each call runs under `catch_unwind`; a panic is counted ([`DeferredCalls::panicked`]) and the rest still run.
 //! - **Drop.** Dropping the source makes the calls still queued, on the dropping thread: a deferred free is a promise to free,
 //!   and the values a call owns (a mapping that must be unmapped after it is unregistered) are never dropped unrun. A call
@@ -471,7 +473,7 @@ impl DeferredCalls {
             ran += 1;
             self.bytes_of(call.place)
                 .fetch_sub(call.bytes, Ordering::Relaxed);
-            self.completed.store(drain.made, Ordering::Relaxed);
+            self.completed.store(drain.made, Ordering::Release);
             #[cfg(test)]
             Hooks::run(&self.hooks.after_made);
         }
@@ -485,9 +487,11 @@ impl DeferredCalls {
     }
 
     /// Makes every call that is queued when it is called, which includes `ticket`'s, on this thread, waiting for a drain
-    /// another thread is running: it becomes the consumer as soon as the cell is free, so it never returns before the
-    /// ticket's call has been made. Returns `false` only when called from inside a call (it cannot wait for itself). For an
-    /// allocation that ran out of memory: a build-time call, which may block.
+    /// another thread is running and for a producer that has claimed its place in the queue and not yet published it: it
+    /// becomes the consumer as soon as the cell is free, and it does not return before it has made as many calls as the
+    /// queue had claimed when it got in, so it never returns before the ticket's call has been made. Returns `false` only
+    /// when called from inside a call (it cannot wait for itself). For an allocation that ran out of memory: a build-time
+    /// call, which may block.
     #[allow(
         clippy::disallowed_methods,
         reason = "LIFECYCLE(deferred-wait): a build-time call waits for the drain that holds the calls it needs"
@@ -497,17 +501,29 @@ impl DeferredCalls {
             return true;
         }
         let _cold = HotScope::leave();
+        // The calls claimed when this thread first got in, counted from the start of the queue. The ticket's call was offered
+        // before, so it is among them.
+        let mut through = None;
         loop {
             if DRAINING.get() {
                 return false;
             }
-            // A drain that enters after this thread's call was queued finds it queued or made: the calls are made inside the
-            // cell, so a thread that gets in has seen the queue the ticket's call was offered to.
+            if let Some(through) = through
+                && self.completed.load(Ordering::Acquire) >= through
+            {
+                return true;
+            }
             if let Some(mut drain) = self.drain.try_enter() {
+                // The queue ends at the first place that is claimed and not yet published, so a drain can stop short of calls
+                // that are queued: `through` says how many to wait for. A claimed place is published in a moment by a thread
+                // that is running; the cell is left between tries so that a drain or another waiter is not held up.
+                let target = *through.get_or_insert(drain.made + drain.consumer.size_long());
                 let was = DRAINING.replace(true);
                 self.make_all(&mut drain);
                 DRAINING.set(was);
-                return true;
+                if drain.made >= target {
+                    return true;
+                }
             }
             std::thread::yield_now();
         }
