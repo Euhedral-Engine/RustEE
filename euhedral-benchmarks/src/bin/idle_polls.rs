@@ -129,6 +129,39 @@ fn thread_ticks() -> BTreeMap<u32, u64> {
     ticks
 }
 
+/// The voluntary and involuntary context switches of every thread of this process, by thread id.
+fn thread_switches() -> BTreeMap<u32, (u64, u64)> {
+    let mut switches = BTreeMap::new();
+    let Ok(entries) = std::fs::read_dir("/proc/self/task") else {
+        return switches;
+    };
+    for entry in entries.flatten() {
+        let Some(tid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse().ok())
+        else {
+            continue;
+        };
+        let Ok(status) = std::fs::read_to_string(entry.path().join("status")) else {
+            continue;
+        };
+        let field = |name: &str| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix(name))
+                .and_then(|value| value.trim().parse::<u64>().ok())
+        };
+        if let (Some(voluntary), Some(involuntary)) = (
+            field("voluntary_ctxt_switches:"),
+            field("nonvoluntary_ctxt_switches:"),
+        ) {
+            switches.insert(tid, (voluntary, involuntary));
+        }
+    }
+    switches
+}
+
 struct Summary {
     mean: f64,
     quantiles: [f64; 6],
@@ -211,6 +244,7 @@ fn main() {
     let push_before: Vec<u64> = push_sources.iter().map(|source| source.polls()).collect();
     let mut last = thread_ticks();
     let first = last.clone();
+    let switches_first = thread_switches();
     let start = Instant::now();
     let mut last_at = start;
     let mut shares = Vec::new();
@@ -228,6 +262,7 @@ fn main() {
         last_at = now;
     }
     let window = start.elapsed().as_secs_f64();
+    let switches_last = thread_switches();
     let per_worker_cpu_s: Vec<f64> = workers
         .iter()
         .map(|tid| {
@@ -235,6 +270,23 @@ fn main() {
                 / TICKS_PER_SECOND
         })
         .collect();
+    // The threads that did work: more than half a CPU-second over the window.
+    let active: Vec<u32> = workers
+        .iter()
+        .zip(&per_worker_cpu_s)
+        .filter(|(_, cpu)| **cpu > 0.5)
+        .map(|(tid, _)| *tid)
+        .collect();
+    let active_cpu_s: Vec<f64> = per_worker_cpu_s
+        .iter()
+        .copied()
+        .filter(|cpu| *cpu > 0.5)
+        .collect();
+    let (voluntary, involuntary) = workers.iter().fold((0, 0), |(v, i), tid| {
+        let (v0, i0) = switches_first.get(tid).copied().unwrap_or_default();
+        let (v1, i1) = switches_last.get(tid).copied().unwrap_or_default();
+        (v + v1.saturating_sub(v0), i + i1.saturating_sub(i0))
+    });
     let polls: Vec<f64> = lane_sources
         .iter()
         .zip(&polls_before)
@@ -259,6 +311,17 @@ fn main() {
         "worker_cpu_total_s (CPU seconds per worker over the window) {} sum={:.3}",
         fields(&summarize(per_worker_cpu_s.clone())),
         per_worker_cpu_s.iter().sum::<f64>()
+    );
+    println!(
+        "active_threads (CPU > 0.5 s) count={} cpu_total_s {} sum={:.3}",
+        active.len(),
+        fields(&summarize(active_cpu_s.clone())),
+        active_cpu_s.iter().sum::<f64>()
+    );
+    println!(
+        "context_switches_per_s (all new threads) voluntary={:.0} involuntary={:.0}",
+        voluntary as f64 / window,
+        involuntary as f64 / window
     );
     println!(
         "lane_polls_per_s (per lane source) {} throughput_total={:.0}",
