@@ -1,0 +1,103 @@
+[
+ {
+  "name": "data-structures: claims",
+  "crate": "euhedral-data-structures",
+  "commands": [
+   "cargo +nightly miri test -p euhedral-data-structures --lib sync::claim_cell"
+  ]
+ },
+ {
+  "name": "hardware-utils: CPU sets",
+  "crate": "euhedral-hardware-utils",
+  "commands": [
+   "cargo +nightly miri test -p euhedral-hardware-utils --lib -- util::cpu_set"
+  ]
+ },
+ {
+  "name": "core: single use, histogram, placement",
+  "crate": "euhedral-core",
+  "commands": [
+   "cargo +nightly miri test -p euhedral-core --lib ingest::single_use",
+   "cargo +nightly miri test -p euhedral-core --lib -- metrics::histogram::tests::an_owner metrics::histogram::tests::a_reader",
+   "cargo +nightly miri test -p euhedral-core --lib -- control_plane::placement flow_control::placement"
+  ]
+ },
+ {
+  "name": "core: hot source, stop watch, decision tree",
+  "crate": "euhedral-core",
+  "commands": [
+   "cargo +nightly miri test -p euhedral-core --lib -- flow_control::hot_source utils::stop_watch control_plane::decision_tree::tests::the_estimate control_plane::decision_tree::tests::recalibrating"
+  ]
+ },
+ {
+  "name": "core: views",
+  "crate": "euhedral-core",
+  "commands": [
+   "cargo +nightly miri test -p euhedral-core --lib -- flow_control::views"
+  ]
+ },
+ {
+  "name": "core: ingest queue, panics",
+  "crate": "euhedral-core",
+  "commands": [
+   "cargo +nightly miri test -p euhedral-core --lib -- ingest::queue::tests::a_panicking"
+  ]
+ },
+ {
+  "name": "core: ingest queue, requests",
+  "crate": "euhedral-core",
+  "commands": [
+   "cargo +nightly miri test -p euhedral-core --lib -- ingest::queue::tests::a_request_while ingest::queue::tests::a_request_refused ingest::queue::tests::request_pushes"
+  ]
+ },
+ {
+  "name": "core: ingest queue, drivers",
+  "crate": "euhedral-core",
+  "commands": [
+   "cargo +nightly miri test -p euhedral-core --lib -- ingest::queue::tests::a_source_driven ingest::queue::tests::a_publish_after ingest::queue::tests::clear_racing"
+  ]
+ },
+ {
+  "name": "core: ingest queue, publishers",
+  "crate": "euhedral-core",
+  "commands": [
+   "cargo +nightly miri test -p euhedral-core --lib -- ingest::queue::tests::concurrent_publishers ingest::queue::tests::frames_queued"
+  ]
+ },
+ {
+  "name": "core: edge, close",
+  "crate": "euhedral-core",
+  "commands": [
+   "cargo +nightly miri test -p euhedral-core --lib -- flow_control::edge::tests::close_while_pushing flow_control::edge::tests::a_closed_edge_refuses flow_control::edge::tests::a_receiver_refused"
+  ]
+ },
+ {
+  "name": "core: edge, attach",
+  "crate": "euhedral-core",
+  "commands": [
+   "cargo +nightly miri test -p euhedral-core --lib -- flow_control::edge::tests::attaches_racing flow_control::edge::tests::racing_attaches flow_control::edge::tests::pushes_and_set_parent"
+  ]
+ },
+ {
+  "name": "core: vertex, pushes",
+  "crate": "euhedral-core",
+  "commands": [
+   "cargo +nightly miri test -p euhedral-core --lib -- flow_control::vertex::tests::pushes_racing"
+  ]
+ },
+ {
+  "name": "core: vertex, retirements",
+  "crate": "euhedral-core",
+  "commands": [
+   "cargo +nightly miri test -p euhedral-core --lib -- flow_control::vertex::tests::the_last_reader flow_control::vertex::tests::a_panicking_routing_function flow_control::vertex::tests::close_retirements"
+  ]
+ },
+ {
+  "name": "graph: completions, sequencer",
+  "crate": "euhedral-graph",
+  "commands": [
+   "cargo +nightly miri test -p euhedral-graph --lib -- completions::tests::registrations_racing completions::tests::a_request_while completions::tests::a_sweep_that completions::tests::a_consumer_that completions::tests::a_panicking completions::tests::a_late_registration completions::tests::a_marker_registration completions::tests::dropping_",
+   "cargo +nightly miri test -p euhedral-graph --lib -- sequencer::tests"
+  ]
+ }
+]

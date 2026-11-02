@@ -32,6 +32,8 @@ jobs:
       any: ${{ steps.affected.outputs.any }}
       everything: ${{ steps.affected.outputs.everything }}
       args: ${{ steps.affected.outputs.args }}
+      miri: ${{ steps.affected.outputs.miri }}
+      miri_matrix: ${{ steps.affected.outputs.miri_matrix }}
       euhedral_data_structures: ${{ steps.affected.outputs.euhedral_data_structures }}
       euhedral_hashing: ${{ steps.affected.outputs.euhedral_hashing }}
       euhedral_hardware_utils: ${{ steps.affected.outputs.euhedral_hardware_utils }}
@@ -79,13 +81,16 @@ jobs:
         os: [ubuntu-latest, windows-2025]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
+    # Bash everywhere: it stops at the first failing command of a multi-line step, which PowerShell does not.
+    defaults:
+      run:
+        shell: bash
     env:
       AFFECTED: ${{ needs.changes.outputs.args }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Install the toolchain pinned in mise.toml
-        shell: bash
         run: |
           version=$(sed -n 's/^rust = .*version = "\([^"]*\)".*/\1/p' mise.toml)
           rustup toolchain install "$version" --profile minimal --component rustfmt --component clippy
@@ -98,11 +103,9 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Clippy
-        shell: bash
         run: cargo clippy $AFFECTED --all-targets -- -D warnings
 
       - name: Test
-        shell: bash
         run: cargo test $AFFECTED
 
       - name: Which ring did the runner offer (euhedral-io on Windows)
@@ -155,19 +158,21 @@ jobs:
           cargo test -p euhedral-gpu --features cuda
 
   # The lock-free sources' handshakes (a claim, a wakeup flag, a re-check after release) under Miri's weak-memory
-  # emulation with several seeds. The tests scale their rounds down under `cfg(miri)`. One group of steps per
-  # crate, each run only when that crate is affected (a change in a lower layer affects the groups above it).
+  # emulation with several seeds. The tests scale their rounds down under `cfg(miri)`. The tests are split into
+  # shards (scripts/ci/miri-shards.json), one job each, so they run in parallel; `changes` keeps only the shards of
+  # affected crates (a change in a lower layer affects the crates above it), and the job is skipped if none is left.
   miri:
+    name: miri (${{ matrix.name }})
     needs: changes
-    if: >-
-      needs.changes.outputs.euhedral_data_structures == 'true'
-      || needs.changes.outputs.euhedral_hardware_utils == 'true'
-      || needs.changes.outputs.euhedral_core == 'true'
-      || needs.changes.outputs.euhedral_graph == 'true'
+    if: needs.changes.outputs.miri == 'true'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.changes.outputs.miri_matrix) }}
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
     env:
       MIRIFLAGS: -Zmiri-many-seeds=0..16 -Zmiri-ignore-leaks
+      COMMANDS: ${{ matrix.commands }}
     steps:
       - uses: actions/checkout@v4
 
@@ -176,30 +181,9 @@ jobs:
           rustup toolchain install nightly --profile minimal --component miri --component rust-src
           cargo +nightly miri setup
 
-      - name: Miri, euhedral-data-structures (claims)
-        if: needs.changes.outputs.euhedral_data_structures == 'true'
-        run: cargo +nightly miri test -p euhedral-data-structures --lib sync::claim_cell
-
-      - name: Miri, euhedral-hardware-utils (CPU sets)
-        if: needs.changes.outputs.euhedral_hardware_utils == 'true'
-        run: cargo +nightly miri test -p euhedral-hardware-utils --lib -- util::cpu_set
-
-      - name: Miri, euhedral-core (ingest sources, hot source, cells and views, routing, vertex and edge races)
-        if: needs.changes.outputs.euhedral_core == 'true'
-        run: |
-          cargo +nightly miri test -p euhedral-core --lib ingest::single_use
-          cargo +nightly miri test -p euhedral-core --lib -- metrics::histogram::tests::an_owner metrics::histogram::tests::a_reader
-          cargo +nightly miri test -p euhedral-core --lib -- ingest::queue::tests::a_request_while ingest::queue::tests::a_request_refused ingest::queue::tests::request_pushes ingest::queue::tests::a_source_driven ingest::queue::tests::a_publish_after ingest::queue::tests::clear_racing ingest::queue::tests::a_panicking ingest::queue::tests::concurrent_publishers ingest::queue::tests::frames_queued
-          cargo +nightly miri test -p euhedral-core --lib -- flow_control::hot_source utils::stop_watch control_plane::decision_tree::tests::the_estimate control_plane::decision_tree::tests::recalibrating
-          cargo +nightly miri test -p euhedral-core --lib -- flow_control::views
-          cargo +nightly miri test -p euhedral-core --lib -- control_plane::placement flow_control::placement
-          cargo +nightly miri test -p euhedral-core --lib -- flow_control::vertex::tests::pushes_racing flow_control::vertex::tests::the_last_reader flow_control::vertex::tests::a_panicking_routing_function flow_control::vertex::tests::close_retirements flow_control::edge::tests::close_while_pushing flow_control::edge::tests::a_closed_edge_refuses flow_control::edge::tests::a_receiver_refused flow_control::edge::tests::attaches_racing flow_control::edge::tests::racing_attaches flow_control::edge::tests::pushes_and_set_parent
-
-      - name: Miri, euhedral-graph (completions, sequencer)
-        if: needs.changes.outputs.euhedral_graph == 'true'
-        run: |
-          cargo +nightly miri test -p euhedral-graph --lib -- completions::tests::registrations_racing completions::tests::a_request_while completions::tests::a_sweep_that completions::tests::a_consumer_that completions::tests::a_panicking completions::tests::a_late_registration completions::tests::a_marker_registration completions::tests::dropping_
-          cargo +nightly miri test -p euhedral-graph --lib -- sequencer::tests
+      # -e stops at the first failing command; -x logs each command as it starts.
+      - name: Miri
+        run: bash -ex -c "$COMMANDS"
 
   # Always runs, and fails only if a job failed or was cancelled: a job skipped because no crate it covers
   # was affected counts as success. This is the one check to require on a branch.

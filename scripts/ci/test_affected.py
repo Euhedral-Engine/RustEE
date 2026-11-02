@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Tests for affected.py on a synthetic graph shaped like the workspace's layers. Run: python3 scripts/ci/test_affected.py"""
 
+import json
 import os
 import sys
 import unittest
@@ -88,6 +89,45 @@ class Affected(unittest.TestCase):
         self.assertEqual(out["core"], "true")
         crates, everything, reason = A.affected(G, ["README.md"])
         self.assertEqual(A.outputs(G, crates, everything, reason)["any"], "false")
+
+
+class Miri(unittest.TestCase):
+    SHARDS = [
+        {"name": "a", "crate": "core", "commands": ["c1", "c2"]},
+        {"name": "b", "crate": "graph", "commands": ["c3"]},
+        {"name": "c", "crate": "ds", "commands": ["c4"]},
+    ]
+
+    def matrix(self, *files):
+        crates, everything, reason = A.affected(G, list(files))
+        return A.outputs(G, crates, everything, reason, self.SHARDS)
+
+    def test_only_affected_crates_have_shards(self):
+        out = self.matrix("euhedral-graph/src/a.rs")
+        self.assertEqual(json.loads(out["miri_matrix"]), {"include": [{"name": "b", "commands": "c3"}]})
+        self.assertEqual(out["miri"], "true")
+
+    def test_a_lower_layer_brings_the_shards_above(self):
+        names = [s["name"] for s in json.loads(self.matrix("euhedral-ds/src/a.rs")["miri_matrix"])["include"]]
+        self.assertEqual(names, ["a", "b", "c"])
+
+    def test_no_shard_when_none_is_affected(self):
+        for f in ["README.md", "euhedral-io/src/a.rs"]:
+            out = self.matrix(f)
+            self.assertEqual((out["miri"], json.loads(out["miri_matrix"])), ("false", {"include": []}), f)
+
+    def test_commands_are_newline_joined(self):
+        self.assertEqual(json.loads(self.matrix("euhedral-core/src/a.rs")["miri_matrix"])["include"][0]["commands"], "c1\nc2")
+
+    def test_the_real_shards_name_workspace_crates_only(self):
+        here = os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(here, "miri-shards.json")) as f:
+            shards = json.load(f)
+        self.assertTrue(shards)
+        for s in shards:
+            self.assertTrue(s["name"] and s["commands"], s)
+            self.assertTrue(all(c.startswith("cargo +nightly miri test ") for c in s["commands"]), s)
+            self.assertTrue(all(f"-p {s['crate']} " in c for c in s["commands"]), s)
 
 
 class Metadata(unittest.TestCase):

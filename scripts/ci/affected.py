@@ -24,6 +24,8 @@ Outputs (stdout as `key=value`, and to --github-output):
   packages     `-p a -p b ...` always
   crates       the affected crate names, space separated
   <crate>      `true` or `false` per workspace crate, the name with `-` as `_` (euhedral_core)
+  miri         `true` if any Miri shard runs
+  miri_matrix  a `{"include": [...]}` matrix of the Miri shards (scripts/ci/miri-shards.json) whose crate is affected
   reason       one line saying why
 """
 
@@ -145,7 +147,15 @@ def affected(graph, files):
     return out, out == set(graph.dirs), "changed: " + " ".join(sorted(seed))
 
 
-def outputs(graph, crates, everything, reason):
+def miri_matrix(shards, crates):
+    """The matrix for the Miri jobs: one entry per shard whose crate is affected."""
+    include = [
+        {"name": s["name"], "commands": "\n".join(s["commands"])} for s in shards if s["crate"] in crates
+    ]
+    return {"include": include}
+
+
+def outputs(graph, crates, everything, reason, shards=()):
     names = sorted(crates)
     packages = " ".join(f"-p {n}" for n in names)
     out = {
@@ -157,6 +167,9 @@ def outputs(graph, crates, everything, reason):
     }
     for n in sorted(graph.dirs):
         out[n.replace("-", "_")] = str(n in crates).lower()
+    matrix = miri_matrix(shards, crates)
+    out["miri"] = str(bool(matrix["include"])).lower()
+    out["miri_matrix"] = json.dumps(matrix, separators=(",", ":"))
     out["reason"] = reason
     return out
 
@@ -175,6 +188,7 @@ def main(argv=None):
     ap.add_argument("--merge-base", action="store_true")
     ap.add_argument("--files", nargs="*")
     ap.add_argument("--all", action="store_true")
+    ap.add_argument("--miri-shards", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "miri-shards.json"))
     ap.add_argument("--github-output")
     args = ap.parse_args(argv)
     root = os.path.realpath(args.root)
@@ -197,7 +211,12 @@ def main(argv=None):
         else:
             crates, everything, reason = affected(graph, files)
 
-    out = outputs(graph, crates, everything, reason)
+    with open(args.miri_shards) as f:
+        shards = json.load(f)
+    unknown = {s["crate"] for s in shards} - set(graph.dirs)
+    if unknown:
+        ap.error(f"{args.miri_shards} names crates that are not in the workspace: {sorted(unknown)}")
+    out = outputs(graph, crates, everything, reason, shards)
     lines = [f"{k}={v}" for k, v in out.items()]
     print("\n".join(lines))
     if args.github_output:
