@@ -23,7 +23,9 @@ streams' markers on whatever thread it runs. The call has to be made when no lan
 `attach_pool` the device's `LanePool`, `Device::attach_deferral(calls.handle())`, and call `calls.poll()` from a tick the owner has:
 a frame leaves when calls are queued and the pool is idle, or a bound is passed. A drain forced by `Bounds` stalls every stream's
 markers for as long as the kernels running at that moment. `Deferral::pending_bytes` is memory a planner may count as certain
-reclaim. At a stop, `drain()`.
+reclaim. At a stop, `stop()` (from then on `defer` makes its call at once) and then `drain()` once the last user of the device has let go.
+The drain frame is marked `RoutingPolicy::CacheLocal`, which a placement policy may read to keep blocking work off the workers that
+run short work.
 
 **Semantics.** One consumer: the calls are made by one thread at a time, in queue order, each exactly once, inside the source's
 `SourceCell`. `drain()` returns 0 at once when another drain is running (the queue is busy, not empty); `run_through(ticket)` makes

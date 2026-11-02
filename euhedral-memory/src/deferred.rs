@@ -39,6 +39,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use euhedral_core::flow_control::RoutingPolicy;
 use euhedral_core::frames::{Frame, RunnableFrame};
 use euhedral_core::generics::{DownstreamSlot, LatticeReceiver, LatticeSource, SourceCell};
 use euhedral_data_structures::queues::{Consumer, MpscQueue, Multi, Producer, Single};
@@ -105,6 +106,8 @@ pub struct DeferredCalls {
     oldest: AtomicU64,
     epoch: Instant,
     panicked: AtomicU64,
+    /// After `stop`, `defer` makes its call at once.
+    stopped: AtomicBool,
     bounds: Bounds,
     pool: OnceLock<Arc<LanePool>>,
     downstream: DownstreamSlot,
@@ -189,6 +192,7 @@ impl DeferredCalls {
             oldest: AtomicU64::new(0),
             epoch: Instant::now(),
             panicked: AtomicU64::new(0),
+            stopped: AtomicBool::new(false),
             bounds,
             pool: OnceLock::new(),
             downstream: DownstreamSlot::new(),
@@ -206,6 +210,13 @@ impl DeferredCalls {
     /// The lane pool whose idle moments release the calls (once; a second pool is refused and returned).
     pub fn attach_pool(&self, pool: Arc<LanePool>) -> Result<(), Arc<LanePool>> {
         self.pool.set(pool)
+    }
+
+    /// Ends deferral: from now on `defer` makes its call at once, on the calling thread. The owner's stop is `stop()`, then
+    /// `drain()` once the last user of the device has let go; a call that raced `stop` and was queued after that drain is made
+    /// when the source drops.
+    pub fn stop(&self) {
+        self.stopped.store(true, Ordering::Release);
     }
 
     /// How many calls wait.
@@ -232,6 +243,10 @@ impl DeferredCalls {
     }
 
     fn push(&self, bytes: u64, run: Box<dyn FnOnce() + Send>) -> Ticket {
+        if self.stopped.load(Ordering::Acquire) {
+            run_call(&self.panicked, run);
+            return self.last_ticket();
+        }
         self.bytes.fetch_add(bytes, Ordering::Relaxed);
         let now = self.epoch.elapsed().as_millis() as u64 + 1;
         let _ = self
@@ -312,7 +327,12 @@ impl DeferredCalls {
                 out.0.drain();
             }),
         );
-        receiver.push(Box::new(frame) as Box<dyn Frame>);
+        let mut frame = Box::new(frame) as Box<dyn Frame>;
+        // A drain blocks: the mark a placement policy reads to keep such a frame off the workers that run short work.
+        frame
+            .header_mut()
+            .set_routing_policy(RoutingPolicy::CacheLocal);
+        receiver.push(frame);
     }
 
     /// Makes the calls that are queued, in order, on this thread, and returns how many it made. Returns 0 at once, having
@@ -540,6 +560,23 @@ mod tests {
         drop(d);
         drop(calls);
         assert_eq!(*log.lock().unwrap(), vec![0, 1]);
+    }
+
+    #[test]
+    fn after_stop_a_deferral_makes_its_call_at_once() {
+        let calls = calls();
+        let d = calls.handle();
+        let (log, call) = recorder();
+        d.defer(0, call(0));
+        calls.stop();
+        d.defer(0, call(1));
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec![1],
+            "made at once; the earlier one still waits"
+        );
+        assert_eq!(calls.drain(), 1);
+        assert_eq!(*log.lock().unwrap(), vec![1, 0]);
     }
 
     #[test]
