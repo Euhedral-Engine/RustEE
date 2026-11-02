@@ -3,6 +3,41 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## Blocking frees and unloads wait in a deferred list, and run at a quiet moment (2026-11-02)
+
+**What.** `euhedral-memory` gains `Deferred` and the process-wide `deferred()`, a lock-free list of blocking driver calls.
+With `deferred().enable(true)`, the CUDA backends queue their blocking calls instead of making them where the memory is
+dropped: `DeviceMemory::free` (`cuMemFree`), `PinnedHost::trim` (`cuMemFreeHost`, which also runs when the cache drops),
+dropping an `Imported` mapping (`cuMemFree`, `cuDestroyExternalMemory`) and euhedral-gpu's module unload (`cuModuleUnload`).
+`deferred().run_all()` makes the queued calls, in order, on the calling thread. Disabled (the default) every call runs where
+it is made, exactly as before. `Device` carries a weak handle to its own `Arc` (`Device::arc`) so a queued call keeps the
+context alive until it runs.
+
+**Why.** On the CUDA driver (615.71, RTX 5070 Ti) `cuModuleLoadDataEx`, `cuMemFree`, `cuMemFreeHost` and
+`cuMemHostUnregister` make every other thread's `cuEventRecord` wait for the kernels running at that moment (measured: 370 ms
+for a 400 ms spin, for each of them; `cuModuleUnload` made its caller wait the same time but did not hold up the other
+stream's record in the probe, so it is queued with the rest), and `cuMemHostAlloc` and `cuMemHostRegister` hold it for their
+own length (14 ms for 64 MiB, 180 ms for 1 GiB). `Reaper` queues a free behind the device work that last used the memory,
+which does not help: the call stalls the other streams' markers on whatever thread it runs. The call has to run when no lane
+has work in flight, and only the owner knows when that is. The unaffected calls were measured too (the README of
+`euhedral-memory` lists them): the allocation, stream, event, graph, texture and VMM calls do not stall another stream.
+
+**How to use.** An owner that has quiet moments (every lane drained, a stop, a rebuild) calls `deferred().enable(true)` once
+and `deferred().run_all()` at those moments (and at stop, before the device goes). `deferred().pending()` says how many calls
+wait. An allocation that fails with `CUDA_ERROR_OUT_OF_MEMORY` runs the list and tries once more (an allocation is a build-time
+call); memory in the list is not available to a planner's books until it runs, so the owner drains before it refuses a plan.
+`Deferred::new()` makes a list of your own for other blocking drops (`defer` takes any `FnOnce() + Send`).
+
+**Semantics.** `defer` never waits and makes one allocation (the boxed call). `run_all` runs what is queued and what is queued
+while it runs, and returns how many ran; a second thread calling it at the same moment returns early. Turning the list off does
+not run what is queued. `Imported` and `PinnedHost` keep the context retained until their queued calls run; a queued call
+that finds the context gone does nothing (the context's destruction frees what it held).
+
+**Tests.** `deferred::tests` (inline when disabled, in order, from eight threads, off with work queued);
+`euhedral-gpu/tests/cuda_deferred.rs` (a thread that drops device memory, pinned memory and a module while a kernel spins
+returns at once and another stream's marker is made in microseconds; `run_all` then makes the three calls; it fails with
+deferral off, where the drop takes the rest of the spin).
+
 ## A failed retirement reports one value: `Poisoned(cause)`, and the cause does not name the call that saw it (2026-11-02)
 
 **What.** `Stream::confirm_retired` on the CUDA backend returns `Some(Poisoned(cause))` for every retirement that ends because

@@ -41,14 +41,32 @@ impl std::fmt::Debug for ModuleInner {
     }
 }
 
+/// A module handle that moves to the thread that runs the deferred unload.
+struct RawModule(CuModule);
+
+// SAFETY: a module of the primary context, usable from any thread with that context current.
+unsafe impl Send for RawModule {}
+
+impl RawModule {
+    /// The handle. A method, so a closure captures the whole `RawModule` (which is `Send`), not its raw pointer field.
+    fn get(&self) -> CuModule {
+        self.0
+    }
+}
+
 impl Drop for ModuleInner {
-    /// A shutdown call: unloading may wait for the device.
+    /// Unloading waits for the device and makes every stream's enqueue wait with it (`cuModuleUnload`, like
+    /// `cuModuleLoadDataEx`). It goes through the process-wide deferred list of `euhedral-memory`: with deferral enabled it
+    /// runs at the owner's next quiet moment, else here.
     fn drop(&mut self) {
-        let device: &Device = self.gpu.device();
-        if let Ok(_c) = device.enter() {
-            // SAFETY: the module loaded in `load_image`, unloaded once; the kernels hold an `Arc` of this.
-            unsafe { (self.gpu.fns.module_unload)(self.raw) };
-        }
+        let (gpu, raw) = (Arc::clone(&self.gpu), RawModule(self.raw));
+        euhedral_memory::deferred().defer(move || {
+            let device: &Device = gpu.device();
+            if let Ok(_c) = device.enter() {
+                // SAFETY: the module loaded in `load_image`, unloaded once; the kernels hold an `Arc` of this.
+                unsafe { (gpu.fns.module_unload)(raw.get()) };
+            }
+        });
     }
 }
 

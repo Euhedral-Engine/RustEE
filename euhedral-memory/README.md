@@ -24,6 +24,7 @@ link-time dependency).
 | [`arena`](src/arena.rs) | `SlotArena` / `SlotLease`, `ScratchArena` / `ScratchLease`, `BackendCalls`. |
 | [`tiers`](src/tiers.rs) | `TierPool`, `Mover` and the `Moves` lattice source, `ResidentId`, `MoveDone`, the `Copier` trait (plain and `start_pitched` copies), `PitchedCopy`, `HostCopier`, `MarkerRetired`. |
 | [`backend`](src/backend.rs) | The `Backend` trait, `Block`, `Allocation`, `Reaper` and `Retired`. |
+| [`deferred`](src/deferred.rs) | `Deferred` and the process-wide `deferred()`: blocking driver calls (frees, unloads) queued for a quiet moment. |
 | [`cuda`](src/cuda/mod.rs) (feature `cuda`) | `Driver` (`Driver::shared()`: the process's one loaded driver; `Driver::symbol`: entry points beyond its table), `Device` (primary context, `import_fd` for Vulkan-exported memory), `DeviceMemory`, `StreamPool`, `Vmm` (POSIX-fd export), `PinnedHost`, `StreamCopier` (the tiers' device copies). |
 
 ## Key concepts
@@ -62,6 +63,21 @@ link-time dependency).
   - Free slots, and the slots of residents that can spill, are elastic: a higher-priority claim orders them back, and
     the mover's give-back handler retires free slots, then spills residents and retires their slots.
   - Completions reach owners as frames of the `Moves` source; releasing a resident mid-move cancels it.
+- **Blocking frees wait for a quiet moment.** On the CUDA driver, `cuMemFree`, `cuMemFreeHost`, `cuMemHostUnregister` and
+  `cuModuleUnload` (and `cuModuleLoadDataEx`) wait for the kernels running when they are called, and make every other
+  stream's `cuEventRecord` wait with them: a lane's marker takes as long as the longest running kernel, on whichever thread
+  the call is made (measured 249 ms and 1.25 s; `euhedral-gpu/tests/cuda_marker_ring.rs`). `Reaper` waits for the device to
+  finish with one buffer, which is not enough: the call stalls the others. `Deferred` queues the call instead. With
+  `deferred().enable(true)`, `DeviceMemory::free`, `PinnedHost::trim`, dropping an `Imported` mapping and euhedral-gpu's
+  module unload queue their driver call, and `deferred().run_all()` makes the queued calls where the owner knows nothing is in
+  flight (every lane drained, a stop, a rebuild). Off (the default) the calls run where they are made, as before. An
+  allocation that fails for lack of memory runs the list and tries once more. Measured on the same device and driver:
+  `cuMemAlloc`, `cuMemAllocAsync`/`cuMemFreeAsync`, `cuStreamCreate`/`Destroy`, `cuEventCreate`/`Destroy`,
+  `cuGraphInstantiateWithFlags`/`cuGraphExecDestroy`/`cuGraphDestroy`, `cuTexObjectCreate`/`Destroy`, the VMM calls
+  (`cuMemCreate`, `cuMemMap`, `cuMemSetAccess`, `cuMemUnmap`, `cuMemRelease`, `cuMemAddressReserve`/`Free`) and
+  `cuMemGetInfo` do not hold up another stream's `cuEventRecord`; `cuMemHostAlloc` and `cuMemHostRegister` hold it for their
+  own length (14 ms for 64 MiB, 180 ms for 1 GiB; 5 ms and 89 ms registering), which no deferral can move, so they belong at
+  build time and in pieces.
 - **No locks.** Budgets are CAS loops on atomics. Owner slots, give-back orders, the reaper and the caches are lock-free
   queues.
 

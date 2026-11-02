@@ -7,7 +7,9 @@
 //! [`Reaper::reap`] makes the frees on the thread that calls it: when that is a lattice worker, the blocking free runs
 //! on that worker and counts as the service time of the work that called `reap` (the `HOT-FIX` id M1 marks it). A caller whose
 //! frees are long enough to starve other work reaps from a thread of its own, or from a lattice set aside for
-//! blocking work.
+//! blocking work. A thread of its own does not stop the stall, though: on the CUDA driver a free that waits for the device also
+//! makes every other stream's enqueue wait, whichever thread makes it. The backends' blocking frees can therefore be queued for
+//! a quiet moment as well ([`crate::Deferred`]).
 
 use std::fmt;
 

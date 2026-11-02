@@ -13,6 +13,9 @@
 //! - [`backend`]: the allocation side. The planner accounts and decides; a [`Backend`] allocates and frees, and a
 //!   [`Reaper`] queues frees behind the device work that last used the memory, and [`Reaper::reap`] runs the ones that
 //!   may block on the thread that calls it (a lattice worker, if a worker calls it: the `HOT-FIX` id M1).
+//! - [`deferred`]: blocking driver calls (frees, unloads) queued for a quiet moment instead of made where the memory is
+//!   dropped: a call on another thread still makes every stream's enqueue wait for the running kernels, so it has to run when
+//!   nothing is in flight. [`Deferred::run_all`] runs them where the owner knows that.
 //! - `cuda` (feature `cuda`): the CUDA driver backends: device memory (`cuMemAlloc`), the stream-ordered pool
 //!   (`cuMemAllocAsync`), VMM allocations exportable as POSIX file descriptors (`cuMemCreate`, imported by Vulkan as
 //!   external memory) and pinned host memory with a capacity cache.
@@ -39,12 +42,14 @@ pub mod arena;
 pub mod backend;
 #[cfg(feature = "cuda")]
 pub mod cuda;
+pub mod deferred;
 pub mod planner;
 pub mod tiers;
 
 pub use admission::{Admission, Placed, PlanItem, PlanRequest, Reservation, Tiers};
 pub use arena::{BackendCalls, SCRATCH_MIN, ScratchArena, ScratchLease, SlotArena, SlotLease};
 pub use backend::{AllocError, Allocation, Backend, Block, Reaper, Retired};
+pub use deferred::{Deferred, deferred};
 pub use planner::{
     Claim, ClaimResult, DEFAULT_OWNERS, Elastic, GiveBack, GiveBackHandler, GiveBacks, Leak,
     LeakReport, LocationId, LocationKind, LocationSpec, LocationUse, MAX_LOCATIONS, OwnerId,

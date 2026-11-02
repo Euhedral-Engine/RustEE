@@ -366,6 +366,8 @@ pub struct Device {
     pub driver: Arc<Driver>,
     pub ordinal: c_int,
     pub ctx: CuContext,
+    /// This device's own `Arc`, so a call that waits for a quiet moment can keep the context alive until it runs.
+    me: std::sync::Weak<Device>,
 }
 
 // SAFETY: a primary context is process-wide and usable from any thread once pushed.
@@ -399,11 +401,17 @@ impl Device {
         driver.check("cuDevicePrimaryCtxRetain", unsafe {
             (driver.fns.primary_ctx_retain)(&mut ctx, dev)
         })?;
-        Ok(Arc::new(Device {
+        Ok(Arc::new_cyclic(|me| Device {
             driver,
             ordinal: dev,
             ctx,
+            me: me.clone(),
         }))
+    }
+
+    /// This device's `Arc` (`None` only while it is being dropped).
+    pub fn arc(&self) -> Option<Arc<Device>> {
+        self.me.upgrade()
     }
 
     /// Makes the context current on this thread until the guard drops.
@@ -490,7 +498,8 @@ impl Device {
 }
 
 /// Memory imported from another API, mapped at `ptr`. Dropping it unmaps (`cuMemFree`) and destroys the import:
-/// both may synchronize the device, so drop it where blocking is allowed.
+/// both wait for the device and make every stream's enqueue wait with them. They go through the process-wide
+/// [`deferred`](crate::deferred()) list: with deferral enabled they run at the owner's next quiet moment, else at once.
 #[derive(Debug)]
 pub struct Imported<'a> {
     device: &'a Device,
@@ -498,15 +507,38 @@ pub struct Imported<'a> {
     pub ptr: CuDevicePtr,
 }
 
+/// A raw driver handle that moves to the thread that runs a deferred call.
+struct Handle(*mut c_void);
+
+// SAFETY: a handle of the primary context, usable from any thread with that context current.
+unsafe impl Send for Handle {}
+
+impl Handle {
+    /// The handle. A method, so a closure captures the whole `Handle` (which is `Send`), not its raw pointer field.
+    fn get(&self) -> *mut c_void {
+        self.0
+    }
+}
+
+fn release_import(device: &Device, ptr: CuDevicePtr, ext: CuExternalMemory) {
+    let f = &device.driver.fns;
+    if let Ok(_c) = device.enter() {
+        // SAFETY: the mapping and the import made in `import_fd`, unused.
+        unsafe {
+            (f.mem_free)(ptr);
+            (f.destroy_external_memory)(ext);
+        }
+    }
+}
+
 impl Drop for Imported<'_> {
     fn drop(&mut self) {
-        let f = &self.device.driver.fns;
-        if let Ok(_c) = self.device.enter() {
-            // SAFETY: the mapping and the import made in `import_fd`, unused.
-            unsafe {
-                (f.mem_free)(self.ptr);
-                (f.destroy_external_memory)(self.ext);
+        let (ptr, ext) = (self.ptr, Handle(self.ext));
+        match self.device.arc() {
+            Some(device) => {
+                crate::deferred().defer(move || release_import(&device, ptr, ext.get()))
             }
+            None => release_import(self.device, ptr, ext.get()),
         }
     }
 }

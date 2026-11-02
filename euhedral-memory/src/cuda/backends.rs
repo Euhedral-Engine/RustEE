@@ -16,6 +16,13 @@ use super::{
 use crate::backend::{AllocError, Backend, Block};
 use crate::planner::LocationId;
 
+/// `CUDA_ERROR_OUT_OF_MEMORY`.
+const OUT_OF_MEMORY: i32 = 2;
+
+fn is_out_of_memory(e: &CudaError) -> bool {
+    e.code == OUT_OF_MEMORY
+}
+
 fn err(e: CudaError) -> AllocError {
     AllocError {
         what: e.to_string(),
@@ -45,10 +52,17 @@ impl Backend for DeviceMemory {
         let _c = d.enter().map_err(err)?;
         let mut ptr = 0;
         // SAFETY: out pointer; the context is current.
-        d.check("cuMemAlloc", unsafe {
+        let mut made = d.check("cuMemAlloc", unsafe {
             (d.driver.fns.mem_alloc)(&mut ptr, bytes as usize)
-        })
-        .map_err(err)?;
+        });
+        if made.as_ref().is_err_and(is_out_of_memory) && crate::deferred().run_all() > 0 {
+            // The memory may have been waiting in the deferred list: an allocation is a build-time call, so it frees now.
+            // SAFETY: as above.
+            made = d.check("cuMemAlloc", unsafe {
+                (d.driver.fns.mem_alloc)(&mut ptr, bytes as usize)
+            });
+        }
+        made.map_err(err)?;
         Ok(Block {
             addr: ptr,
             bytes,
@@ -56,12 +70,16 @@ impl Backend for DeviceMemory {
         })
     }
 
+    /// Queued on the process-wide [`deferred`](crate::deferred()) list: with deferral enabled the free runs at the owner's
+    /// next quiet moment, else at once.
     unsafe fn free(&self, block: Block) {
-        let d = &self.device;
-        if let Ok(_c) = d.enter() {
-            // SAFETY: the caller's contract (a block of this backend, unused).
-            unsafe { (d.driver.fns.mem_free)(block.addr) };
-        }
+        let device = Arc::clone(&self.device);
+        crate::deferred().defer(move || {
+            if let Ok(_c) = device.enter() {
+                // SAFETY: the caller's contract (a block of this backend, unused).
+                unsafe { (device.driver.fns.mem_free)(block.addr) };
+            }
+        });
     }
 
     fn free_blocks(&self) -> bool {
@@ -437,13 +455,20 @@ impl PinnedHost {
                 });
             }
         }
-        let d = &self.device;
-        if let Ok(_c) = d.enter() {
-            for a in gone {
-                // SAFETY: released buffers of this backend, unused.
-                unsafe { (d.driver.fns.mem_free_host)(a as *mut c_void) };
-            }
+        if gone.is_empty() {
+            return;
         }
+        let device = Arc::clone(&self.device);
+        // The frees wait for the device: queued on the process-wide list, run at the owner's next quiet moment when
+        // deferral is enabled, else now.
+        crate::deferred().defer(move || {
+            if let Ok(_c) = device.enter() {
+                for a in gone {
+                    // SAFETY: released buffers of this backend, unused.
+                    unsafe { (device.driver.fns.mem_free_host)(a as *mut c_void) };
+                }
+            }
+        });
     }
 }
 
@@ -474,10 +499,17 @@ impl Backend for PinnedHost {
         let _c = d.enter().map_err(err)?;
         let mut p = std::ptr::null_mut();
         // SAFETY: out pointer; flags 0 (portable to this context).
-        d.check("cuMemHostAlloc", unsafe {
+        let mut made = d.check("cuMemHostAlloc", unsafe {
             (d.driver.fns.mem_host_alloc)(&mut p, class as usize, 0)
-        })
-        .map_err(err)?;
+        });
+        if made.as_ref().is_err_and(is_out_of_memory) && crate::deferred().run_all() > 0 {
+            // As `DeviceMemory::alloc`: what the deferred list holds may be the memory this needs.
+            // SAFETY: as above.
+            made = d.check("cuMemHostAlloc", unsafe {
+                (d.driver.fns.mem_host_alloc)(&mut p, class as usize, 0)
+            });
+        }
+        made.map_err(err)?;
         Ok(Block {
             addr: p as u64,
             bytes: class,
