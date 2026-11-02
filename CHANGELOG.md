@@ -19,7 +19,7 @@ make every other thread's `cuEventRecord` wait for the kernels running at that m
 stream. `Reaper` queues a free behind the device work that last used the memory, which does not help: the call stalls the other
 streams' markers on whatever thread it runs. The call has to be made when no lane has work in flight.
 
-**How to use.** Make a `DeferredCalls`, attach it to a lattice that may block (`add_downstream`) and give it frames (`request`),
+**How to use.** Make a `DeferredCalls`, give it a receiver that feeds a lattice that may block (`add_downstream`) and frames to push (`request`),
 `attach_pool` the device's `LanePool`, `Device::attach_deferral(calls.handle())`, and call `calls.poll()` from a tick the owner has:
 a frame leaves when calls are queued and the pool is idle, or a bound is passed. A drain forced by `Bounds` stalls every stream's
 markers for as long as the kernels running at that moment. `Deferral::pending_bytes` is memory a planner may count as certain

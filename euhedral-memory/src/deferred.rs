@@ -17,8 +17,9 @@
 //!   makes the calls queued while it runs. A thread that finds the cell entered does not see an empty queue, it sees a
 //!   busy one: [`DeferredCalls::drain`] returns 0 at once and [`DeferredCalls::run_through`] waits.
 //! - **Key frames.** The calls leave as blocking key frames, by request and push, never by pull: [`DeferredCalls::pull`]
-//!   hands out nothing. The owner attaches the source to the lattice that may block (`add_downstream`) and requests
-//!   frames with `request`. A frame drains the whole queue.
+//!   hands out nothing. The owner gives the source a receiver that feeds the lattice that may block
+//!   (`add_downstream`; a queue the lattice already reads is enough) and asks for frames with `request`. A frame drains the whole
+//!   queue.
 //! - **When the frame leaves.** [`DeferredCalls::poll`] (also called by every `defer`) pushes one when calls are queued
 //!   and either the attached lane pool has nothing in flight ([`LanePool::idle`], every lane's last marker reached) or a
 //!   bound is passed: the queued bytes reach [`Bounds::max_bytes`], or the oldest call has waited [`Bounds::max_age`].
