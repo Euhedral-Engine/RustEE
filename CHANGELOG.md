@@ -3,6 +3,28 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## Lane items can end as skipped (2026-11-03)
+
+**What.** `LaneWork` has two opt-in methods: `is_alive(&self) -> bool` (default `true`) and `skipped(self, cx)` (default: drop the
+item). The lane source asks `is_alive` right before it runs an item: when it takes the item from an intake, and for a waiting item before it
+asks whether the wait is met. An item that is not alive is never run: it ends with `skipped`, and the items of its order key behind it go on.
+`LaneMetrics::skipped` counts them per item kind.
+
+**Why.** An item whose work is no longer wanted had to be run, or to wait for a condition that may never come, only to find that out inside
+`run`. A waiting item held its order key until then. Euhedral-Execution's `AbstractFrame.isAlive` does this for frames: a dead frame is not
+executed and is still finished (`doFinally`); `skipped` is the lane item's finish.
+
+**Semantics.** One `is_alive` call per decision, on the lane's thread, with no lock, no allocation and no shared state of the source's own; the
+count is one relaxed `fetch_add` on a skip. A waiting item that is not alive leaves without its wait being asked about (`LaneState::met` is not
+called for it) and without holding its key. An item behind a held-back key is asked when the key lets it through, so the items of one key end in
+delivery order, run or skipped. Not asked: an item armed for its retirement and an item that ran and could not be marked. Their device
+work exists, and `retired` or `failed` still ends them. No `then` and no `retired` call follows a skip. An item that never overrides the two
+methods behaves exactly as before.
+
+**Tests.** `euhedral-graph/tests/lane_item_liveness.rs`: `a_dead_item_is_skipped_once_and_never_run`,
+`a_waiting_item_that_dies_leaves_without_its_wait_and_frees_its_order_key`, `a_parked_item_that_dies_is_skipped_in_its_keys_order`,
+`an_armed_or_unmarked_item_that_dies_is_still_retired`, `items_without_liveness_run_as_before` (an item type with the defaults only).
+
 ## A worker that sits out still enters a handle every probe interval (2026-11-03)
 
 **What.** A worker on the Idle path now takes a Direct cycle once per `IdlePolicy::probe_interval` (1 ms by default): it pulls one handle,

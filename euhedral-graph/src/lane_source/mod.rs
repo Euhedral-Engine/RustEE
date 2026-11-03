@@ -12,11 +12,11 @@
 //! |---|---|
 //! | [`LaneSubmit`] | the submitter a lane drives: markers, awaits and retirements, backend-neutral |
 //! | [`LaneState`] | the lane's own hardware state, read once per request, and what an item can wait for |
-//! | [`LaneWork`] | one item of work: it runs on the lane, delivers its successors, and ends on a retirement |
+//! | [`LaneWork`] | one item of work: it runs on the lane, delivers its successors, and ends on a retirement, or is skipped once it is not alive |
 //! | [`LaneCx`] | what an item reaches while it runs |
 //! | [`LaneIntakes`] | delivery into the lanes' own intakes and the groups' shared intakes |
 //! | [`LaneSource`] | the lane as a source |
-//! | [`LaneMetrics`] | service time, per-kind item time, intake-to-run latency and ready depth |
+//! | [`LaneMetrics`] | service time, per-kind item time, intake-to-run latency, ready depth and the items skipped per kind |
 
 mod intake;
 mod metrics;
@@ -173,6 +173,28 @@ pub trait LaneWork<S: LaneSubmit, X: LaneState>: Send + Sized + 'static {
     /// The retirement armed for the item arrived.
     fn retired(self, marker: Marker, failure: Option<S::Error>, cx: &mut LaneCx<'_, S, X, Self>) {
         let _ = (marker, failure, cx);
+    }
+
+    /// Whether the item still has work to do. The source asks before it runs the item: when it takes the item from an
+    /// intake, and, for a waiting item, before it asks whether the wait is met. An item that is not alive is never
+    /// run: the source ends it with [`skipped`](Self::skipped), and the items of its order key behind it go on. The
+    /// default is `true`.
+    ///
+    /// The answer is read once per decision, on the lane's thread, and costs the lane no lock or allocation of its own:
+    /// keep it a load of a flag. An item behind a held-back order key is asked when the key lets it through, so the
+    /// items of one key end in delivery order whether they ran or were skipped. An item whose device work exists (one
+    /// armed for its retirement, or one that ran and could not be marked) is not asked: it ends with
+    /// [`retired`](Self::retired) or [`failed`](Self::failed) as before.
+    fn is_alive(&self) -> bool {
+        true
+    }
+
+    /// The source skipped the item because it was not alive: it ends what it holds. Nothing was submitted for it by
+    /// this call, and no marker covers it; if it ran before and answered [`Outcome::Wait`], what that run left is its
+    /// own to release. The item delivers no successor through [`then`](Self::then) or [`retired`](Self::retired),
+    /// since neither is called. The default drops it.
+    fn skipped(self, cx: &mut LaneCx<'_, S, X, Self>) {
+        let _ = cx;
     }
 
     /// The lane could not order, mark or arm the item, or its retirement failed to arm.

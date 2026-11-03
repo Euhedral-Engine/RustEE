@@ -59,6 +59,10 @@ pub struct Probe {
     pub ran: Mutex<Vec<u64>>,
     pub retired: Mutex<Vec<(u64, Option<FakeLaneError>)>>,
     pub failed: Mutex<Vec<u64>>,
+    /// Tags of the items the source skipped (`LaneWork::skipped`), in order.
+    pub skipped: Mutex<Vec<u64>>,
+    /// Calls of `run`, whatever it answered.
+    pub runs: AtomicUsize,
     pub bridged: Mutex<Vec<(u64, Marker)>>,
     pub dropped: AtomicUsize,
     /// Frames finished with an error (the source dropped them unpushed).
@@ -92,6 +96,8 @@ pub type Watch = Arc<std::sync::Mutex<Option<(euhedral_graph::testing::FakeLanes
 pub struct Gate {
     pub value: Arc<AtomicU64>,
     pub checks: Arc<AtomicUsize>,
+    /// Calls of `met`.
+    pub asked: Arc<AtomicUsize>,
     /// What `close` saw: whether the lane's submitter was already dropped, and the raw handle it was given.
     pub closed: Closings,
     /// Where `close` looks to see whether the submitter is gone.
@@ -106,6 +112,7 @@ impl LaneState for Gate {
     }
 
     fn met(&mut self, wait: &u64, _now: std::time::Instant) -> bool {
+        self.asked.fetch_add(1, Ordering::SeqCst);
         *wait <= self.value.load(Ordering::SeqCst)
     }
 
@@ -141,6 +148,8 @@ pub struct Job {
     pub stray_arm: bool,
     /// `run` answers `Failed` (a submission the device refused).
     pub fail: bool,
+    /// The item's switch: it is alive while this reads `true`. `None` leaves `is_alive` at its default.
+    pub switch: Option<Arc<AtomicBool>>,
     /// `run` blocks on these barriers (a long item).
     pub hold: Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
 }
@@ -161,6 +170,7 @@ impl Job {
             stray_arm: false,
             steal: false,
             fail: false,
+            switch: None,
             hold: None,
         }
     }
@@ -215,6 +225,17 @@ impl Job {
         self
     }
 
+    /// The item is alive while `switch` reads `true`.
+    pub fn switch(mut self, switch: &Arc<AtomicBool>) -> Self {
+        self.switch = Some(switch.clone());
+        self
+    }
+
+    /// The item is dead from the start.
+    pub fn dead(self) -> Self {
+        self.switch(&Arc::new(AtomicBool::new(false)))
+    }
+
     pub fn hold(mut self, a: &Arc<std::sync::Barrier>, b: &Arc<std::sync::Barrier>) -> Self {
         self.hold = Some((a.clone(), b.clone()));
         self
@@ -253,7 +274,18 @@ impl LaneWork<FakeLane, Gate> for Job {
         self.key
     }
 
+    fn is_alive(&self) -> bool {
+        self.switch
+            .as_ref()
+            .is_none_or(|switch| switch.load(Ordering::SeqCst))
+    }
+
+    fn skipped(self, _cx: &mut Cx<'_>) {
+        lock(&self.probe.skipped).push(self.tag);
+    }
+
     fn run(&mut self, cx: &mut Cx<'_>) -> Outcome<u64, FakeLaneError> {
+        self.probe.runs.fetch_add(1, Ordering::SeqCst);
         if let Some(need) = self.need
             && cx.state().value.load(Ordering::SeqCst) < need
         {

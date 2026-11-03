@@ -337,6 +337,15 @@ impl<S: LaneSubmit, X: LaneState, W: LaneWork<S, X>> LaneSource<S, X, W> {
         }
     }
 
+    /// Ends an item that is not alive: it is never run, and `skipped` takes what it holds.
+    fn skip(&self, inner: &mut Inner<S, X, W>, now: Instant, work: W) {
+        if let Some(count) = self.metrics.skipped.get(work.kind()) {
+            count.fetch_add(1, Ordering::Relaxed);
+        }
+        let mut cx = self.cx(inner, now);
+        work.skipped(&mut cx);
+    }
+
     fn fail(&self, inner: &mut Inner<S, X, W>, now: Instant, work: W, error: S::Error) {
         let mut cx = self.cx(inner, now);
         work.failed(error, &mut cx);
@@ -388,8 +397,9 @@ impl<S: LaneSubmit, X: LaneState, W: LaneWork<S, X>> LaneSource<S, X, W> {
         }
     }
 
-    /// Step 4: the waiting items, in order. An item behind a held-back key stays; an item whose
-    /// wait is unmet stays and holds back its key.
+    /// Step 4: the waiting items, in order. An item behind a held-back key stays; an item that is not alive is
+    /// skipped, without its wait asked about, and its key goes on; an item whose wait is unmet stays and holds
+    /// back its key.
     fn run_waiting(&self, inner: &mut Inner<S, X, W>, now: Instant, clock: &mut Instant) -> bool {
         let mut stalled = false;
         debug_assert!(inner.keep.is_empty());
@@ -397,6 +407,10 @@ impl<S: LaneSubmit, X: LaneState, W: LaneWork<S, X>> LaneSource<S, X, W> {
             let key = item.work.order();
             if stalled || key.is_some_and(|k| inner.blocked_keys.contains(&k)) {
                 inner.keep.push_back(item);
+                continue;
+            }
+            if !item.work.is_alive() {
+                self.skip(inner, now, item.work);
                 continue;
             }
             if let Some(wait) = &item.wait
@@ -423,8 +437,8 @@ impl<S: LaneSubmit, X: LaneState, W: LaneWork<S, X>> LaneSource<S, X, W> {
         stalled
     }
 
-    /// Runs, or parks behind its key, an envelope just taken from an intake. Returns whether the
-    /// lane stalled.
+    /// Runs, or parks behind its key, an envelope just taken from an intake; an item that is not alive is skipped
+    /// instead of run. Returns whether the lane stalled.
     fn admit(
         &self,
         inner: &mut Inner<S, X, W>,
@@ -444,6 +458,10 @@ impl<S: LaneSubmit, X: LaneState, W: LaneWork<S, X>> LaneSource<S, X, W> {
             .is_some_and(|k| inner.blocked_keys.contains(&k))
         {
             inner.waiting.push_back(item);
+            return false;
+        }
+        if !item.work.is_alive() {
+            self.skip(inner, now, item.work);
             return false;
         }
         match self.run_one(inner, now, clock, item) {
