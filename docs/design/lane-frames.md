@@ -54,7 +54,8 @@ frames included. Nothing in production calls it. It is a trap.
 - `LaneCx` keeps its methods. `ready` now offers to the source's ready queue (MPSC: frames produce into it, and the source
   drains it in `request`/`pull`).
 - The frame holds its `Arc<Lane>` from the moment it is made (§7), so no reference count moves per item.
-- `Drop for Lane` does what `Inner::drop` does today (`source.rs:77-113`), wherever the last reference drops (Q6).
+- `Drop for Lane` does what `Inner::drop` does today (`source.rs:77-113`), wherever the last reference drops, as today. It
+  happens once, at shutdown or release.
 
 ## 3. Hashes
 
@@ -116,9 +117,17 @@ only through `request` + push. Pulls hand over unordered successors.
 | `then`, `failed(S::Error)` | inside `execute` |
 | `retired` | in the cell, in the lane frame that drains it (usually the poll frame) |
 | `skipped` (6a, draft PR #47) | `do_finally` of a frame skipped as dead: enter the cell, `skipped(work, cx)` |
-| — | `do_finally_with_error` (a panic in `run`, unroutable at a closed lattice) and `Drop` of a frame that still holds its item (Q5): enter the cell, `skipped` |
+| — | `do_finally_with_error` (a panic in `run`, unroutable at a closed lattice, a push to a retired cache): enter the cell, `skipped` |
 
 `LaneFrame::is_alive` delegates to `LaneWork::is_alive`, so the header carries no kill switch.
+
+Every production path finishes a frame:
+- `close` keeps what the cache holds for its owner to drain (`cache.rs:607`);
+- a push to a retired cache gets `do_finally_with_error` (`cache.rs:626`; Java `ControlPlaneCache.java:396, 414`).
+
+The one exception is `reset_for_next_trial` (`cache.rs:595`; Java `clearLocalCacheOnOwnerThread`,
+`ControlPlaneCache.java:307`), which drops queued frames without finishing them. It is a benchmark trial boundary that
+runs once ingest is frozen, so lane frames must not run across one.
 
 ## 7. Costs and recycling (the `GrpcFrame` pattern)
 
@@ -145,7 +154,7 @@ RustEE has the same pieces: `impls::FrameManager`, `FrameFactory`, `Recycler`, `
 | New read-modify-writes | the recycle offer, and the `Weak::upgrade` in `Recycler::recycle`, which a strong producer handle would remove: +1 to +2. The partition offer and the cache count: +2 or +3. The cell's CAS: +1 (today one per pass) |
 | Lock | none |
 | CPU | about 0.2-0.5 µs per item |
-| Latency | up to one owner park (15 µs) when the lane's core is idle. Successors go out on the source's next pass (Q6) |
+| Latency | up to one owner park (15 µs) when the lane's core is idle. Successors go out on the source's next pass, one poll later: the source pushes, the Euhedral way |
 
 Compare with today's `item_ns` per kind once step 1 lands.
 
@@ -191,7 +200,7 @@ Each step can be merged on its own.
 ## 10. Tests
 
 - **core:** `ordered_frames_of_one_hash_never_overlap` (per-hash in-flight counters on a real lattice with greedy, poll,
-  stealing and SMT; at most 1 in flight, push order kept). Also `a_cleared_cache_finishes_its_frames`, if Q5 is yes.
+  stealing and SMT; at most 1 in flight, push order kept).
 - **graph:**
   - `items_of_a_lane_run_in_release_order_one_at_a_time`;
   - `an_item_is_not_released_until_its_gate_is_met`;
@@ -233,12 +242,3 @@ Costs come from the docs cited. The rows run from hottest or costliest down. MyS
   gates in table order.
 - Site 5 can move in parallel.
 - Then 7, 9 and 10.
-
-## Questions for the user
-
-- **Q5. Frames a cache drops.** `reset_for_next_trial` and a closed cache (`cache.rs:595-607`) drop their frames without
-  calling `do_finally`. Should the core finish them?
-  - *Recommendation:* yes. Lane frames end their item in `Drop` until then.
-- **Q6. Successor latency and the lane's close.** Successors go out on the source's next pass (one poll hop, as with a
-  `Lake`), and the lane closes wherever its last reference drops.
-  - *Recommendation:* accept the hop. `complete` hands the close (quiesce, then state close) to a lifecycle thread.
