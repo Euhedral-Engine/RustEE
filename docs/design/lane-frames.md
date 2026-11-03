@@ -32,24 +32,48 @@ never two at once, and in the order they were pushed, as long as the routing gen
 `ControlPlaneCache::pull` (`cache.rs:360`) fills the caller's own cache with no stop, ordered frames included. Java does the
 same (`ControlPlaneCache.java:185`, `NO_STOP`), and nothing in production calls it. It is a trap, not drift.
 
-**Where it does not hold:**
+**Where it does not hold today (both settled: fix them, §9 step 1):**
 
-- **Rebalance window (shared with Java).** The shard publishes the new core mapping (`shard.rs:329`; Java
-  `publishIngestController`, `ControlPlaneShard.java:186-202`) before the old clones drain (`shard.rs:349` → `finish_drain`,
-  which runs on the shard's pool). The global ingest drain, which is what stops sources' `request` (`vertex.rs:974-981`), is
-  lifted once `shard.update` returns (`lattice.rs:503`; Java `ControlPlaneLattice.java:377`). The shard's drain is still
-  running at that point. A push in the window can send hash *h* to a new core while the old core still holds earlier *h*
-  frames, or is running one. Two frames of one lane then run at once and out of order. A clone that misses its drain deadline
-  is closed and replaced (`shard.rs:458-468`). If its worker is stuck in a long frame, the replacement starts on the same
-  core while that frame is still running.
-- **View skew (RustEE drift).** `route_frame` reads the calling worker's view (`vertex.rs:333`), which changes only at that
-  worker's `refresh_view` at the start of its cycle (`fragment.rs:373`, `views.rs:442-444`). The source's claim orders pass
-  *N* on worker A before pass *N+1* on worker B, but it does not order their views. B can route by an older generation than
-  A did. Java reads one volatile mapping, so a later push never sees an older generation. This only matters when a
-  generation changes, but it widens the window above past the end of the rebalance.
+- **Rebalance window.** The author's rule: a rebalance closes global ingest first, gives the workers up to a minute to drain
+  fully, and only then lets work back in. Java has every piece of this, but its code at 7e76a814 reopens early, and RustEE
+  follows Java line for line. Here is the Java sequence, with RustEE's equivalent in brackets:
+  1. Global ingest closes: `ControlPlaneLattice.java:326` (`lattice.rs:457`).
+  2. Each shard drains its core distributor, `prepareIngestController`, `ControlPlaneShard.java:185, 211-222`
+     (`shard.rs:262`).
+  3. Each shard then publishes the new core mapping at once, `publishIngestController`, `ControlPlaneShard.java:189, 224-230`
+     (`shard.rs:329`). This happens **before** the old clones drain.
+  4. It sets each clone's drain mode and waits, asynchronously, until the clone is drained or `shutdownTimeout` has passed,
+     `ControlPlaneShard.java:285-317` (`shard.rs:388-449`). The bound is one minute in both
+     (`LatticeConfig.java:87`, `lattice_config.rs:41, 92`).
+  5. Once every clone has drained, it reopens its distributor, `tryRestartIngest`, `ControlPlaneShard.java:376-397`
+     (`shard.rs:487-503`).
+  6. Global ingest reopens as soon as the shards' `update` calls return, while their drains (step 4) are still running:
+     `ControlPlaneLattice.java:377, 406` (`lattice.rs:503`). Only retired sockets are waited for
+     (`ControlPlaneLattice.java:384-400`, `lattice.rs:513-530`).
 
-What the overlap breaks for lanes: two `&mut` to the lane's state (prevented in §2), and lane order (not prevented). See Q1
-and Q2.
+  The interceptor gates `request`/`pull` on the *global* drain only (`LatticeVertex.java:589-593, 621-625`,
+  `vertex.rs:974-981`), and a push is never gated (`LatticeVertex.java:359-373`, `vertex.rs:505-547`). So between step 3 and
+  step 5, sources push again, and frames of hash *h* route by the new mapping to a new core while the old core still holds or
+  runs earlier *h* frames. A clone that misses the deadline is replaced (`ControlPlaneShard.java:322-330`,
+  `shard.rs:458-468`) while its worker may still be inside a frame.
+
+  The bound is the same in both, so this is not drift between the two. It is a gap against the author's rule in both, and
+  it is fixed in RustEE first:
+  - global ingest stays closed until every shard's drain completes (a countdown, as for retired shards);
+  - the new core mapping is published in `restart_ingest`, which already republishes it, and no longer at `shard.rs:329`;
+  - a replaced clone starts only after the old worker has left its frame (the liveness await).
+
+  The same fix belongs in Java.
+- **View skew (drift).** Java routes every push by one volatile mapping (`acquireRoutingState`,
+  `LatticeVertex.java:359-373`), so a push that follows another never routes by an older generation. RustEE's `route_frame`
+  reads the calling worker's view (`vertex.rs:333`), which changes only when that worker calls `refresh_view` at the start of
+  its cycle (`fragment.rs:373`, `views.rs:442-444`). The source's claim orders pass *N* on worker A before pass *N+1* on
+  worker B, but it does not order their views, so B can route by an older generation than A did.
+
+  Fix: the interceptor refreshes the calling worker's view when it takes a source's claim. That is one load when nothing
+  changed, and the claim's acquire then makes the views monotonic across a source's passes.
+
+With both fixed, frames of one hash never overlap. Lanes keep the checked claim of §2 as a guard all the same.
 
 ## 2. The lane's state
 
@@ -195,9 +219,12 @@ Compare with today's `item_ns` per kind once step 2 lands.
 
 Each step can be merged on its own.
 
-1. **Core, one PR each, depending on Q1/Q2/Q5:** the interceptor refreshes the calling worker's view when it takes the
-   claim (Q2); the rebalance window (Q1); a cache clear finishes its frames (Q5). Only `euhedral-core` and its dependents are
-   tested.
+1. **Core, one PR each.** The two settled drift fixes from §1:
+   - the interceptor refreshes the worker's view when it takes the claim;
+   - a rebalance keeps global ingest closed until every shard has drained (bounded by `shutdown_timeout`, 60 s), publishes
+     the new core mapping only at the restart, and starts a replaced clone only after its old worker has left.
+
+   Then, if Q5 is answered yes, a cache clear finishes its frames. Only `euhedral-core` and its dependents are tested.
 2. **euhedral-graph:** `Lane`, `LaneCell`, `LaneFrame`, the poll frame, the pool, the ready queue and the return queue. The
    `LaneSource` internals are swapped. `LaneWork` gains `is_alive`/`skipped` (6a's API, minus PR #47's source-side check of
    intake items) and `needs`, and `LaneState` gains its `LaneGate`. `LaneCx` keeps its methods. `tests/lane_source*.rs`
@@ -221,8 +248,8 @@ Each step can be merged on its own.
 - **core** (each written to fail first where it pins a fix):
   - `ordered_frames_of_one_hash_never_overlap`: per-hash in-flight counters on a real lattice with greedy, poll, stealing
     and SMT. Asserts at most 1 in flight and push order kept.
-  - `pushes_after_a_claim_never_route_by_an_older_generation` (Q2).
-  - `a_shard_rebalance_never_runs_one_hash_on_two_cores` (Q1).
+  - `pushes_after_a_claim_never_route_by_an_older_generation` (view-skew fix).
+  - `a_shard_rebalance_never_runs_one_hash_on_two_cores` (rebalance fix).
   - `a_cleared_cache_finishes_its_frames` (Q5).
 - **graph**:
   - `items_of_a_lane_run_in_release_order_one_at_a_time`;
@@ -274,13 +301,9 @@ at `arch/next-4` e4a5984b.
 
 ## Questions for the user
 
-- **Q1. The rebalance window.** Ordered frames of one hash can sit on two cores while a shard drains, and Java does the
-  same. Should the core close the window, or should lanes live with it?
-  - *Recommendation:* close it in the core. Keep the global ingest drain until every shard's drain completes, and let a
-    replaced clone start only after the old worker has left its frame. Lanes keep the checked claim as a guard.
-- **Q2. View skew.** Should the interceptor refresh the worker's view when it takes a source's claim, so that a source's
-  pushes never go back to an older generation?
-  - *Recommendation:* yes. It costs one load when nothing changed, and it restores Java's guarantee.
+- **Q1 and Q2: settled by the author** (fixed in §9 step 1). The rebalance closes global ingest, drains for up to a minute,
+  then reopens; this is Java's mechanism, and its code reopens early, as RustEE's does. The view skew is drift and is fixed
+  to Java's single-mapping guarantee.
 - **Q3. Where lane frames run.** Hashed onto the lattice's cores, one lane can share a core with other lanes and other
   ordered work, and a submission blocked on a driver lock stalls that core's owner.
   - *Recommendation:* the lane source takes an optional origin per lane (a CPU with `CacheLocal`), and the engine places
