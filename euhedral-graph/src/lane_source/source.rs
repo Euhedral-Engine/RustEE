@@ -337,7 +337,7 @@ impl<S: LaneSubmit, X: LaneState, W: LaneWork<S, X>> LaneSource<S, X, W> {
         }
     }
 
-    /// Ends an item that is not alive: it is never run, and `skipped` takes what it holds.
+    /// Ends a held-back item that is not alive: it is not run again, and `skipped` takes what it holds.
     fn skip(&self, inner: &mut Inner<S, X, W>, now: Instant, work: W) {
         if let Some(count) = self.metrics.skipped.get(work.kind()) {
             count.fetch_add(1, Ordering::Relaxed);
@@ -437,8 +437,8 @@ impl<S: LaneSubmit, X: LaneState, W: LaneWork<S, X>> LaneSource<S, X, W> {
         stalled
     }
 
-    /// Runs, or parks behind its key, an envelope just taken from an intake; an item that is not alive is skipped
-    /// instead of run. Returns whether the lane stalled.
+    /// Runs, or parks behind its key, an envelope just taken from an intake. The item's liveness is not asked here:
+    /// its `run` decides what a dead item does. Returns whether the lane stalled.
     fn admit(
         &self,
         inner: &mut Inner<S, X, W>,
@@ -458,10 +458,6 @@ impl<S: LaneSubmit, X: LaneState, W: LaneWork<S, X>> LaneSource<S, X, W> {
             .is_some_and(|k| inner.blocked_keys.contains(&k))
         {
             inner.waiting.push_back(item);
-            return false;
-        }
-        if !item.work.is_alive() {
-            self.skip(inner, now, item.work);
             return false;
         }
         match self.run_one(inner, now, clock, item) {

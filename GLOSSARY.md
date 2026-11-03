@@ -189,9 +189,9 @@ A lane is a `LaneSource`, and the source owns the lane's submitter.
    demand.
 3. **Item.** `run` answers `Submitted { retire }`, `Finished`, `Wait(w)` or `Failed(e)`. After the lane
    marked the work, `then` delivers successors and queues frames; a retirement arrives in `retired`;
-   `failed` ends an item the lane could not order, mark or arm. An item that is not alive (`is_alive`,
-   asked when the item leaves an intake and before a waiting item's wait is asked about) is never run: the
-   lane ends it with `skipped`.
+   `failed` ends an item the lane could not order, mark or arm. A held-back item that is not alive
+   (`is_alive`, asked before its wait is asked about) is not run again: the lane ends it with `skipped`.
+   An item taken from an intake is run, and its `run` decides what a dead item does.
 4. **Pull.** `pull` hands over ready frames and submits nothing.
 5. **Drop.** The device work ends first (`quiesce`), then the state closes, then the submitter goes.
 
@@ -584,8 +584,8 @@ banked. See [the device lane lifecycle](#device-lane) and the
 **lane item** ([`LaneWork`](euhedral-graph/src/lane_source/mod.rs)): one unit of work on a lane. It runs on
 the lane's submitter, answers `Submitted`, `Finished`, `Wait` or `Failed`, delivers its successors after
 the lane marked it, and may ask for a retirement whose continuation runs when the device is done. An item
-can carry an order key. It may also say when it is no longer alive (`is_alive`): the lane then ends it with
-`skipped` instead of running it.
+can carry an order key. It may also say when it is no longer alive (`is_alive`): a lane that holds it back
+(waiting, or parked behind its key) then ends it with `skipped` instead of running it again.
 
 #### Lakes and stage graphs
 

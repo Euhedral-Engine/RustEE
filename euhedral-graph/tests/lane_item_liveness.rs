@@ -38,31 +38,44 @@ fn switch(alive: bool) -> Arc<AtomicBool> {
 
 #[test]
 fn a_dead_item_is_skipped_once_and_never_run() {
-    let rig = Rig::new(2, &[&[0, 1]]);
-    // Dead on arrival: in the lane's own intake, with a key, and in the group's shared intake.
-    rig.deliver(rig.job(1).dead().frame().submit(true), rig.lane(0));
-    rig.deliver(rig.job(2).dead().key(7).frame(), rig.lane(0));
-    rig.deliver(rig.job(3).key(7).frame(), rig.lane(0));
-    rig.deliver(rig.job(4).dead().frame(), Deliver::Group(GroupId(0)));
-    rig.deliver(rig.job(5).frame(), Deliver::Group(GroupId(0)));
+    let rig = Rig::new(1, &[]);
+    let first = switch(true);
+    let second = switch(true);
+    // Items 1 and 2 are held back by the gate; item 3 runs.
+    rig.deliver(rig.job(1).need(5).frame().switch(&first), rig.lane(0));
+    rig.deliver(
+        rig.job(2).need(5).key(7).frame().switch(&second),
+        rig.lane(0),
+    );
+    rig.deliver(rig.job(3).frame(), rig.lane(0));
     rig.sources[0].request(10);
-    assert_eq!(rig.probe.ran(), vec![3, 5], "the dead items never ran");
+    assert_eq!(rig.probe.ran(), vec![3]);
     assert_eq!(
         rig.probe.runs.load(Ordering::SeqCst),
-        2,
-        "not even `run` was called for them"
+        3,
+        "each ran once: 1 and 2 answered Wait"
     );
+    first.store(false, Ordering::SeqCst);
+    second.store(false, Ordering::SeqCst);
+    let asked = rig.gates[0].asked.load(Ordering::SeqCst);
+    rig.sources[0].request(10);
     assert_eq!(
         *lock(&rig.probe.skipped),
-        vec![1, 2, 4],
-        "each was ended once, in the order the source met them"
+        vec![1, 2],
+        "each was ended once, in the order they wait"
     );
-    assert_eq!(skipped(&rig, 0), 3);
+    assert_eq!(skipped(&rig, 0), 2);
     assert_eq!(
-        rig.received(0),
-        vec![3, 5],
-        "a skipped item makes no frame, and the key's next item went on"
+        rig.probe.runs.load(Ordering::SeqCst),
+        3,
+        "a dead item is not run again"
     );
+    assert_eq!(
+        rig.gates[0].asked.load(Ordering::SeqCst),
+        asked,
+        "their waits were not asked about"
+    );
+    assert_eq!(rig.received(0), vec![3], "a skipped item makes no frame");
     assert_eq!(
         marks(&rig, 0),
         0,
@@ -70,15 +83,50 @@ fn a_dead_item_is_skipped_once_and_never_run() {
     );
     assert_eq!(
         rig.probe.dropped.load(Ordering::SeqCst),
-        5,
-        "each item ended exactly once: skipped, then dropped by its default or by `skipped`"
+        3,
+        "each item ended exactly once"
     );
-    // Later requests never meet them again.
+    // Even with the gate open, later requests never meet them again.
+    rig.gates[0].value.store(5, Ordering::SeqCst);
     rig.sources[0].request(10);
-    rig.sources[1].request(10);
-    assert_eq!(*lock(&rig.probe.skipped), vec![1, 2, 4]);
-    assert_eq!(skipped(&rig, 0), 3);
-    assert_eq!(skipped(&rig, 1), 0, "counted on the lane that skipped");
+    assert_eq!(*lock(&rig.probe.skipped), vec![1, 2]);
+    assert_eq!(skipped(&rig, 0), 2);
+    assert_eq!(rig.probe.ran(), vec![3]);
+}
+
+#[test]
+fn an_item_taken_dead_from_an_intake_is_run_as_before() {
+    let rig = Rig::new(2, &[&[0, 1]]);
+    // Dead on arrival, in the lane's own intake and in the group's shared intake: `run` sees the switch.
+    rig.deliver(rig.job(1).dead().frame(), rig.lane(0));
+    rig.deliver(rig.job(2).dead().key(7).frame(), rig.lane(0));
+    rig.deliver(rig.job(3).key(7).frame(), rig.lane(0));
+    rig.deliver(rig.job(4).dead().frame(), Deliver::Group(GroupId(0)));
+    // A dead item whose `run` answers Wait is held back, and is then skipped.
+    rig.deliver(rig.job(5).dead().need(5).frame(), rig.lane(0));
+    rig.sources[0].request(10);
+    assert_eq!(
+        rig.probe.ran(),
+        vec![1, 2, 3, 4],
+        "they were run, dead or not"
+    );
+    assert_eq!(rig.received(0), vec![1, 2, 3, 4]);
+    assert!(lock(&rig.probe.skipped).is_empty());
+    assert_eq!(skipped(&rig, 0), 0);
+    assert_eq!(
+        rig.probe.runs.load(Ordering::SeqCst),
+        5,
+        "item 5 ran once and answered Wait"
+    );
+    assert_eq!(
+        rig.probe.alive_calls.load(Ordering::SeqCst),
+        0,
+        "nothing taken from an intake is asked"
+    );
+    rig.sources[0].request(10);
+    assert_eq!(*lock(&rig.probe.skipped), vec![5]);
+    assert_eq!(skipped(&rig, 0), 1);
+    assert_eq!(rig.probe.runs.load(Ordering::SeqCst), 5);
 }
 
 #[test]
@@ -175,16 +223,25 @@ fn an_armed_or_unmarked_item_that_dies_is_still_retired() {
     armed.store(false, Ordering::SeqCst);
     unmarked.store(false, Ordering::SeqCst);
     rig.sources[0].request(1);
-    assert_eq!(rig.probe.ran(), vec![1, 2], "item 3 is dead: it never runs");
-    assert_eq!(*lock(&rig.probe.skipped), vec![3]);
+    assert_eq!(
+        rig.probe.ran(),
+        vec![1, 2, 3],
+        "item 3 is dead but taken from the intake: it runs as before"
+    );
+    assert!(lock(&rig.probe.skipped).is_empty());
     rig.fake.retire_all();
     rig.sources[0].request(1);
     assert_eq!(
         *lock(&rig.probe.retired),
-        vec![(1, None), (2, None)],
+        vec![(1, None), (2, None), (3, None)],
         "dead, armed items are still retired"
     );
-    assert_eq!(skipped(&rig, 0), 1);
+    assert_eq!(skipped(&rig, 0), 0);
+    assert_eq!(
+        rig.probe.alive_calls.load(Ordering::SeqCst),
+        0,
+        "no item was held back, and armed or unmarked items are never asked"
+    );
 }
 
 #[test]

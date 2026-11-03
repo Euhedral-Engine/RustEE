@@ -61,6 +61,8 @@ pub struct Probe {
     pub failed: Mutex<Vec<u64>>,
     /// Tags of the items the source skipped (`LaneWork::skipped`), in order.
     pub skipped: Mutex<Vec<u64>>,
+    /// Calls of `is_alive`.
+    pub alive_calls: AtomicUsize,
     /// Calls of `run`, whatever it answered.
     pub runs: AtomicUsize,
     pub bridged: Mutex<Vec<(u64, Marker)>>,
@@ -275,6 +277,7 @@ impl LaneWork<FakeLane, Gate> for Job {
     }
 
     fn is_alive(&self) -> bool {
+        self.probe.alive_calls.fetch_add(1, Ordering::SeqCst);
         self.switch
             .as_ref()
             .is_none_or(|switch| switch.load(Ordering::SeqCst))

@@ -38,12 +38,13 @@ makes the immutable pool. A pool has 1 to 64 lanes.
 **order key** ([`LaneWork::order`](src/lane_source/mod.rs)): items of one order key run in delivery order,
 even across a wait.
 
-**skipped item** ([`LaneWork::is_alive`, `LaneWork::skipped`](src/lane_source/mod.rs)): an item that is not alive
-is never run. The lane asks `is_alive` once where it would run the item: when it takes the item from an intake, and for
-a waiting item before it asks whether the wait is met. It ends the item with `skipped` (the default drops it), and the
-items of its order key behind it go on. An item behind a held-back key is asked when the key lets it through. An
-armed retirement, and an item that ran and could not be marked, are not asked: their device work exists and `retired`
-or `failed` still ends them. `LaneMetrics::skipped` counts them per kind.
+**skipped item** ([`LaneWork::is_alive`, `LaneWork::skipped`](src/lane_source/mod.rs)): a held-back item (waiting, or
+parked behind its order key) that is not alive is not run again. The lane asks `is_alive` once per request for each
+such item the pass reaches, before it asks whether the wait is met, and ends the item with `skipped` (the default drops it); the items
+of its order key behind it go on. An item behind a held-back key is asked when the key lets it through. An item taken
+from an intake is run, and its `run` decides what a dead item does. An armed retirement, and an item that ran and
+could not be marked, are not asked: their device work exists and `retired` or `failed` still ends them.
+`LaneMetrics::skipped` counts them per kind.
 
 **intake, shared intake** ([`LaneIntakes`](src/lane_source/intake.rs)): where delivered work waits. A lane's
 own intake is an MPSC queue, so delivery order is kept per lane. A lane group's shared intake is an MPMC
