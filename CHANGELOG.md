@@ -13,16 +13,16 @@ handle shows it productive. Before, a request counted any frame routed on the th
 unproductive whatever was routed.
 
 **Why.** This is the productivity observation of the original (`LatticeVertex.UpstreamInterceptor`, per worker and handle: begin
-at acquisition, a push sets it by whether it was routed, a pull that finds frames sets it, an early exit restores it), with the one
+at acquisition, a push during the service sets it by whether it was routed, a pull that finds frames sets it, an early exit restores it), with the one
 rule `UpstreamQueue` adds on top: a request that routes nothing keeps the worker's last view. The marking was already that rule; the
 thread-wide push counter was not, since it also counted frames routed through other handles. The productive count steers idling and
 the park of a cycle that ran nothing (`should_idle`, the Idle path's park, the unproductive park, `plentiful`).
 
-**Where it differs from the original.** A push counts only inside the service of its own handle. The original sets the observation
-of the pushing thread whenever a push happens, including one outside a service of that handle on that thread. Such a push can leave
-a handle's observation productive when the next service's `begin` has not run, and then the queue's `nonproductiveCount` can end one
-too high, so one handle counts as unproductive that the worker's view calls productive. Rust's scoping has no such bookkeeping, and is
-kept; whether the original should be fixed is the owner's call.
+**Same as the original.** A push counts only inside the service of its own handle, and the last push of a service decides (a frame
+that finds no downstream demotes the handle for it). The original used to set the pushing thread's observation for any push,
+including one outside a service of that handle on that thread, so the queue's `nonproductiveCount` could end one too high; it was
+changed to Rust's scoping in Euhedral-Execution commit `1effc607` (`ProductivityObservation` records a push only between
+`begin()` and `releaseLock()`), and the two now agree.
 
 **How to use.** Nothing changes for a source that pushes through its own receiver inside `request` or `pull`.
 
