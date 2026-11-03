@@ -313,7 +313,8 @@ Each cycle a worker:
 1. runs frames from its own cache, up to its batch;
 2. picks an **execution path** with its decision tree: **Direct** (run frames straight from its
    upstreams), **Staged** (request a batch into the cache and run it from there next cycle) or
-   **Idle** (sit the cycle out);
+   **Idle** (sit the cycle out, except once per probe interval: then a Direct cycle, so that a worker that
+   sits out still enters a handle now and then);
 3. if that ran nothing, **steals** unordered frames that their policy lets leave, from the next
    cache of the lattice in turn;
 4. if still nothing, parks: for the **idle park** on the Idle path, for the **unproductive park**

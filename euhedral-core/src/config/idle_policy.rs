@@ -11,6 +11,7 @@ pub struct IdlePolicy {
     contention_half_life: Duration,
     function: Arc<dyn TimingProvider>,
     unproductive_park: Duration,
+    probe_interval: Duration,
 }
 
 /// A contention half-life of zero.
@@ -29,6 +30,7 @@ impl IdlePolicy {
     pub const DEFAULT_IDLE_PARK: Duration = Duration::from_micros(15);
     pub const DEFAULT_UNPRODUCTIVE_PARK: Duration = Duration::from_micros(15);
     pub const DEFAULT_CONTENTION_HALF_LIFE: Duration = Duration::from_millis(1);
+    pub const DEFAULT_PROBE_INTERVAL: Duration = Duration::from_millis(1);
 
     /// A policy whose park and half-life `function` picks, falling back to `idle_park` and
     /// `contention_half_life`, with the default unproductive park.
@@ -45,6 +47,7 @@ impl IdlePolicy {
             contention_half_life,
             function,
             unproductive_park: Self::DEFAULT_UNPRODUCTIVE_PARK,
+            probe_interval: Self::DEFAULT_PROBE_INTERVAL,
         })
     }
 
@@ -64,6 +67,14 @@ impl IdlePolicy {
     pub fn with_unproductive_park(self, unproductive_park: Duration) -> Self {
         Self {
             unproductive_park,
+            ..self
+        }
+    }
+
+    /// This policy with a different [`probe_interval`](Self::probe_interval).
+    pub fn with_probe_interval(self, probe_interval: Duration) -> Self {
+        Self {
+            probe_interval,
             ..self
         }
     }
@@ -89,6 +100,15 @@ impl IdlePolicy {
     /// to notice new work. Zero disables the park.
     pub fn unproductive_park(&self) -> Duration {
         self.unproductive_park
+    }
+
+    /// The longest a worker sits out the Idle path without entering a handle. A worker that sits out never services
+    /// a handle, so its view of them (which decides to sit out) cannot change by itself; every probe interval its
+    /// cycle takes the Direct path instead, enters one handle and so can find work. With the first-ranked worker
+    /// held inside a frame, this is how long the lattice's handles go unserved at most. Zero makes every cycle enter
+    /// a handle (the Idle path is never taken); [`Duration::MAX`] sits out for good.
+    pub fn probe_interval(&self) -> Duration {
+        self.probe_interval
     }
 }
 
@@ -118,6 +138,7 @@ mod tests {
             policy.contention_half_life(),
             Duration::from_nanos(1_000_000)
         );
+        assert_eq!(policy.probe_interval(), Duration::from_millis(1));
         let park = policy
             .function()
             .park(0.5, 2.0, 8f64.exp_m1(), Duration::ZERO);
@@ -167,5 +188,20 @@ mod tests {
         let policy = IdlePolicy::default().with_unproductive_park(Duration::ZERO);
         assert_eq!(policy.unproductive_park(), Duration::ZERO);
         assert_eq!(policy.idle_park(), IdlePolicy::DEFAULT_IDLE_PARK);
+    }
+
+    #[test]
+    fn the_probe_interval_can_be_changed_and_leaves_the_rest() {
+        let policy = IdlePolicy::default().with_probe_interval(Duration::from_millis(7));
+        assert_eq!(policy.probe_interval(), Duration::from_millis(7));
+        assert_eq!(policy.idle_park(), IdlePolicy::DEFAULT_IDLE_PARK);
+        assert_eq!(
+            policy.unproductive_park(),
+            IdlePolicy::DEFAULT_UNPRODUCTIVE_PARK
+        );
+        let fixed = IdlePolicy::fixed(Duration::from_micros(3), Duration::from_micros(40))
+            .unwrap()
+            .with_probe_interval(Duration::ZERO);
+        assert_eq!(fixed.probe_interval(), Duration::ZERO);
     }
 }

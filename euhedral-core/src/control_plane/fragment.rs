@@ -411,11 +411,18 @@ impl ControlPlaneFragment {
             .unwrap_or_default();
         let registered = cycle.registered_workers;
         let rank = self.registry.thread_rank(self.cpu);
-        let path = if policy.should_idle(contention, productive, registered, rank) {
-            ExecutionPath::Idle
-        } else {
+        let path = if !policy.should_idle(contention, productive, registered, rank) {
             policy.select_path(productive, upstreams, registered, contention)
+        } else if cycle.probe_due(policy.idle_policy().probe_interval()) {
+            // A worker that sits out sees nothing of its handles, so its view of them never changes. One
+            // that stayed out for good would leave the first-ranked worker the only one to enter any handle.
+            ExecutionPath::Direct
+        } else {
+            ExecutionPath::Idle
         };
+        if path != ExecutionPath::Idle {
+            cycle.entered = cycle.now;
+        }
 
         match path {
             ExecutionPath::Direct => {
@@ -783,6 +790,8 @@ struct Cycle {
     completed: u64,
     registered_workers: usize,
     now: Instant,
+    /// When the worker last chose a path that enters its handles (any but Idle).
+    entered: Instant,
     neighbor_cursor: usize,
     /// What the worker's meters report from, when metrics are on.
     flow: Option<ExecutionFlow>,
@@ -791,14 +800,22 @@ struct Cycle {
 impl Cycle {
     /// A cycle state; with `metrics`, keeping the flow the worker's meters report from.
     fn new(neighbor_cursor: usize, metrics: Option<&ExecutionMetrics>) -> Self {
+        let now = Instant::now();
         Self {
             batch_size: 2,
             completed: 0,
             registered_workers: 0,
-            now: Instant::now(),
+            now,
+            entered: now,
             neighbor_cursor,
             flow: metrics.map(ExecutionFlow::new),
         }
+    }
+
+    /// Whether the worker has sat out the handles for `interval` (as of the cycle's last clock read): its next cycle
+    /// enters one although the policy says to sit out.
+    fn probe_due(&self, interval: Duration) -> bool {
+        self.now.saturating_duration_since(self.entered) >= interval
     }
 
     /// Counts `run` toward the batch and its time toward `policy`, and with `metrics` toward the

@@ -1213,3 +1213,189 @@ fn metrics_cost_per_cycle() {
         );
     }
 }
+
+/// An upstream handle with nothing to give, which counts how often a worker enters it.
+#[derive(Default)]
+struct Entered {
+    entries: AtomicU64,
+}
+
+impl UpstreamHandle for Entered {
+    fn sequence(&self) -> u64 {
+        0
+    }
+
+    fn pull(
+        &self,
+        _claim: &mut Claim,
+        _consumer: &mut dyn FnMut(Box<dyn Frame>),
+        _stop: &mut dyn FnMut(&dyn Frame) -> bool,
+        _demand: u64,
+    ) -> Option<u64> {
+        self.entries.fetch_add(1, Ordering::AcqRel);
+        Some(0)
+    }
+
+    fn request(&self, _claim: &mut Claim, _demand: u64) {
+        self.entries.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn is_complete(&self) -> bool {
+        false
+    }
+}
+
+/// A rank-2 worker whose policy says Idle (it has a body-cost history and finds the only handle
+/// unproductive), cycled by the test thread. The rank-1 worker is another registered thread, held
+/// parked: it is "inside a frame" and enters no handle. Returns what the test needs to cycle.
+struct Sitting {
+    fixture: Fixture,
+    worker: Arc<ControlPlaneFragment>,
+    handle: Arc<Entered>,
+    policy: DecisionTree,
+    cycle: Cycle,
+    release: mpsc::Sender<()>,
+    anchor: Option<thread::JoinHandle<()>>,
+}
+
+impl Sitting {
+    fn new(idle: crate::config::IdlePolicy) -> Option<Self> {
+        let (core, cpus) = SMT_CORE.as_ref()?;
+        let config = FragmentConfig::default().with_idle_policy(idle.clone());
+        let fixture = Fixture::new(&config, *core, &cpus[..2]);
+        let anchor_worker = fixture.fragment.clone();
+        let worker = fixture.fragment.smt_buddy()?.clone();
+        let registry = fixture.registry().clone();
+
+        // The rank-1 worker: registered from a thread of its own, which then stays parked.
+        let (release, parked) = mpsc::channel::<()>();
+        let (registered, ready) = mpsc::channel::<()>();
+        let anchor = {
+            let (registry, cpu) = (registry.clone(), anchor_worker.cpu);
+            thread::spawn(move || {
+                registry.register_with(|| Some(cpu));
+                registered.send(()).unwrap();
+                let _ = parked.recv();
+                registry.remove_thread();
+            })
+        };
+        ready.recv().unwrap();
+        registry.register_with(|| Some(worker.cpu));
+        assert_eq!(registry.thread_rank(anchor_worker.cpu), Some(1));
+        assert_eq!(registry.thread_rank(worker.cpu), Some(2));
+
+        let handle = Arc::new(Entered::default());
+        registry.add_handle(handle.clone());
+
+        let mut policy = DecisionTree::with_thresholds(
+            idle,
+            BodyCost::new(),
+            Duration::from_micros(1),
+            Duration::from_micros(1),
+        );
+        for _ in 0..32 {
+            policy.body_cost_mut().record(Duration::from_nanos(100));
+        }
+        assert!(policy.body_cost().has_history());
+        let mut cycle = Cycle::new(0, None);
+        cycle.registered_workers = 2;
+
+        // One look at the handle shows it empty: the worker's view of it is unproductive.
+        registry.with_thread_queue(|queue| queue.pull(&mut |_| {}, &mut |_| false, 1));
+        assert_eq!(
+            registry.with_thread_queue(|queue| queue.productive_handle_count()),
+            Some(0)
+        );
+        assert!(policy.should_idle(0, 0, 2, Some(2)));
+        handle.entries.store(0, Ordering::Release);
+
+        Some(Self {
+            fixture,
+            worker,
+            handle,
+            policy,
+            cycle,
+            release,
+            anchor: Some(anchor),
+        })
+    }
+
+    fn cycle(&mut self) {
+        self.worker.run_cycle(&mut self.policy, &mut self.cycle);
+    }
+
+    fn entries(&self) -> u64 {
+        self.handle.entries.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for Sitting {
+    fn drop(&mut self) {
+        let _ = self.release.send(());
+        if let Some(anchor) = self.anchor.take() {
+            let _ = anchor.join();
+        }
+        self.fixture.registry().remove_thread();
+    }
+}
+
+fn quick_idle() -> crate::config::IdlePolicy {
+    crate::config::IdlePolicy::fixed(
+        Duration::from_micros(1),
+        crate::config::IdlePolicy::DEFAULT_CONTENTION_HALF_LIFE,
+    )
+    .unwrap()
+}
+
+/// With the first-ranked worker held inside a frame, a worker that sits out is the only one that
+/// can enter the handles; it must not sit out for good.
+#[test]
+fn a_worker_that_sits_out_still_enters_a_handle() {
+    let Some(mut sitting) = Sitting::new(quick_idle()) else {
+        return;
+    };
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while sitting.entries() == 0 && Instant::now() < deadline {
+        sitting.cycle();
+    }
+    assert!(
+        sitting.entries() > 0,
+        "an idle worker never entered the handle while the first-ranked worker was held"
+    );
+}
+
+/// The participation model is intact: within the probe interval the worker still sits out.
+#[test]
+fn a_worker_sits_out_between_probes() {
+    let idle = quick_idle().with_probe_interval(Duration::from_secs(3600));
+    let Some(mut sitting) = Sitting::new(idle) else {
+        return;
+    };
+    for _ in 0..20_000 {
+        sitting.cycle();
+    }
+    assert_eq!(sitting.entries(), 0, "the worker sat out every cycle");
+}
+
+/// A probe is one Direct cycle (a pull of one handle, then a request of the next when the pull ran
+/// nothing), and the next comes a probe interval later.
+#[test]
+fn a_worker_that_sits_out_probes_once_per_interval() {
+    const INTERVAL: Duration = Duration::from_millis(50);
+    const ENTRIES_PER_PROBE: u64 = 2;
+    let Some(mut sitting) = Sitting::new(quick_idle().with_probe_interval(INTERVAL)) else {
+        return;
+    };
+    let start = Instant::now();
+    while start.elapsed() < 4 * INTERVAL {
+        sitting.cycle();
+    }
+    let elapsed = start.elapsed();
+    let most = (elapsed.as_nanos() / INTERVAL.as_nanos() + 1) as u64 * ENTRIES_PER_PROBE;
+    let entries = sitting.entries();
+    assert!(entries >= ENTRIES_PER_PROBE, "a probe was made: {entries}");
+    assert!(
+        entries <= most,
+        "at most one probe per interval: {entries} in {elapsed:?}"
+    );
+}

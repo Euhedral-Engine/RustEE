@@ -129,7 +129,16 @@ Idle sits the cycle out and parks. Direct is taken when the worker has no upstre
 worker, before the body cost is known, while there is a productive handle per worker, or for cheap bodies
 at moderate contention (up to 85%); Staged otherwise. Idle is never chosen for the first-ranked or only
 worker, before the body cost is known, or while there is a productive handle per worker; for the others,
-it is chosen when no handle is productive or when a fitted participation model says so.
+it is chosen when no handle is productive or when a fitted participation model says so. A worker on the Idle path
+enters no handle, so its view of the handles cannot change by itself: once per **probe interval** (an
+[`IdlePolicy`](src/config/idle_policy.rs) setting, 1 ms by default) its cycle takes the Direct path instead, so it enters a
+handle and sees whether it has work. Without the probe, the first-ranked worker, which never sits out, would be the only
+one to enter any handle, and a frame that holds it would leave every source unserved while the other workers sat idle.
+
+**probe interval** ([`IdlePolicy::probe_interval`](src/config/idle_policy.rs)): the longest a worker sits out the Idle
+path without entering a handle. When it has passed, the worker's next cycle takes the Direct path (a pull of one handle, then a
+request of the next if the pull ran nothing) and the clock starts again. Zero makes every cycle enter a handle; `Duration::MAX`
+sits out for good.
 
 **park, idle park, unproductive park** ([`IdlePolicy`](src/config/idle_policy.rs)): a worker with nothing
 to do parks its thread. The idle park is how long it parks on the Idle path; the unproductive park is how
