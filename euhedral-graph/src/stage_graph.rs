@@ -1,16 +1,32 @@
 //! Static stage DAGs run per quantum, with submission, completion and external edges
 //! (the upstream Java `StageGraph`).
+//!
+//! A started quantum is a pooled [`Run`]: the state of one quantum, recycled when the quantum retires, as the graph's
+//! frames are recycled through their pool. After warm-up a quantum allocates nothing and takes no lock:
+//!
+//! - **The quantum, the cause, the markers** are plain fields of the run, handed from one stage to the next by the
+//!   counts that order the run's phases (the Java fields written before a volatile count and read after it).
+//! - **The first cause** of a quantum not completing is set by one compare-and-swap (Java `failure.compareAndSet`).
+//! - **A stage's output markers** are written by the stage and read by its successors after their final arrival
+//!   (Java's plain `marker` and `lane`); a stage merges its inputs from its predecessors when it runs.
+//! - **External edges** wait on a closable stack per stage (Java `StageFrame.externals`), sealed `Submitted` when the
+//!   stage submitted and `Swept` when its quantum quiesced without it.
+//! - **The retirement boundary** is the latest marker per used lane (Java `usedLanes`); one completion per lane, and a
+//!   host completion that no edge consumes holds a live count until it is done (Java `deferral`).
 
+#![allow(
+    unsafe_code,
+    reason = "a run's plain fields are handed from stage to stage by its counts, and external edges are the later quantum's own pooled nodes on an intrusive stack"
+)]
+
+use euhedral_data_structures::queues::{Consumer, MpmcQueue, Multi, Producer};
 use euhedral_data_structures::sync::HotScope;
 use std::collections::VecDeque;
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-#[allow(
-    clippy::disallowed_types,
-    reason = "HOT-FIX(G11), HOT-FIX(G12), HOT-FIX(G13), HOT-FIX(G14), HOT-FIX(G15), HOT-FIX(G10)"
-)]
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
+use std::ptr::NonNull;
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use euhedral_core::frames::{Frame, FrameError, FrameHeader};
@@ -18,6 +34,8 @@ use euhedral_core::generics::FrameSink;
 
 use crate::completions::{Completions, Ready};
 use crate::lanes::{LaneId, LanePool, Marker};
+use crate::sync::{AtomicU64, AtomicUsize, Ordering, Owned};
+use crate::take_all::{Link, Linked, Sealed, TakeAllStack};
 
 /// A stage's index in its [`StageGraphSpec`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -233,9 +251,9 @@ impl fmt::Debug for GraphRuntime {
 /// graph.start(..)`); to keep quantum n's results for n+1, hold n's ref until n+1's
 /// [`StageGraph::start`] has taken its edge (the edge holds its own clone until its stage used it),
 /// and drop held refs on a kill or at the end of the stream, or that quantum never retires.
-#[derive(Clone)]
 pub struct QuantumRef {
-    pin: Arc<Pin>,
+    /// The pinned quantum; taken by the drop, which lets go of one hold.
+    run: Option<Arc<dyn Upstream>>,
 }
 
 impl fmt::Debug for QuantumRef {
@@ -296,13 +314,19 @@ impl std::error::Error for GraphError {}
 ///
 /// - [`start`](Self::start) binds a quantum and publishes its roots (once its external edges
 ///   arrived). The last arrival at a stage publishes it; the graph never scans for ready work.
-/// - Each quantum counts its published frames and armed completion edges. At zero no stage can run
-///   again; the quantum's retirement boundary (every lane it used reached) is armed with
-///   [`Completions`], and the retirement frame hands the quantum and its [`QuantumOutcome`] to
-///   `retire`.
+/// - Each quantum counts its published frames, armed completion edges and host completions. At zero
+///   no stage can run again; the quantum's retirement boundary (every lane it used reached) is
+///   armed with [`Completions`], and the last lane's arrival hands the quantum and its
+///   [`QuantumOutcome`] to `retire`.
 /// - A killed quantum's frames are skipped by RustEE and their `do_finally` drops their counts; its
 ///   stages get [`Stage::abandoned`]. Device work already submitted runs to its end and is covered
 ///   by the boundary.
+/// - **A quantum is pooled.** `start` takes a retired quantum's state from the graph's pool (a
+///   bounded queue) and `retire` gives it back, as frames go back to theirs; the stage, arrival,
+///   boundary and retirement frames are pooled the same way. After warm-up, a quantum allocates
+///   nothing and takes no lock on its way. A stage that returns a host completion allocates it, and
+///   a completion that waits for both a marker and a host completion, or a retried stage, allocates
+///   its wake-up.
 ///
 /// More precisely:
 /// - **Lanes:** each stage's lane is continued by exactly one successor, its critical successor
@@ -315,8 +339,10 @@ impl std::error::Error for GraphError {}
 ///   predecessors and external edges, minus its own lane's. A stage that submitted no marker
 ///   (CPU-only) passes its inputs on, so device order is kept through it.
 /// - **The boundary** is the latest marker per lane of everything the quantum submitted (plus the
-///   markers of later quanta's stages that used it through external edges) and every host
-///   completion no completion edge consumed.
+///   markers of later quanta's stages that used it through external edges, and those of external
+///   edges into stages that never ran). It is armed as one completion per lane used. A host
+///   completion no completion edge consumed holds the quantum live until it is ready, so the
+///   quantum retires after it.
 /// - **The outcome** is the first of: a stage's failure (an `Err`, or a panic as
 ///   [`StageError::Fatal`]), or the kill switch found set before a stage or edge ran. Otherwise it
 ///   is [`QuantumOutcome::Completed`].
@@ -329,6 +355,23 @@ impl std::error::Error for GraphError {}
 ///   emitted in registration order), so an ordered predecessor's order carries over to an ordered
 ///   successor (a fetch → parse chain).
 pub struct StageGraph<Q> {
+    core: Arc<Core<Q>>,
+    /// Retired runs, for the next quanta.
+    runs: Pool<Arc<Run<Q>>>,
+}
+
+impl<Q> fmt::Debug for StageGraph<Q> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StageGraph")
+            .field("stages", &self.core.spec.stages.len())
+            .field("live", &self.core.live.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
+}
+
+/// What every run of a graph shares: the shape, the stages, the runtime, and the frame pool. Immutable but for its
+/// counters and the pool.
+struct Core<Q> {
     spec: StageGraphSpec,
     stages: Vec<Arc<dyn Stage<Q>>>,
     topology: Topology,
@@ -336,28 +379,13 @@ pub struct StageGraph<Q> {
     retire: Box<dyn Fn(Q, QuantumOutcome) + Send + Sync>,
     live: AtomicUsize,
     seeds: AtomicU64,
-}
-
-impl<Q> fmt::Debug for StageGraph<Q> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("StageGraph")
-            .field("stages", &self.spec.stages.len())
-            .field("live", &self.live.load(Ordering::Relaxed))
-            .finish_non_exhaustive()
-    }
+    /// Finished frames, for the next stages, arrivals and boundaries (of any run of the graph).
+    frames: Pool<Box<GraphFrame<Q>>>,
 }
 
 /// The id hash of a graph's unordered frames (their routing hash is randomized per frame).
 const UNORDERED: u64 = 0x5747_e6a9_0f10_77a1;
 const NO_LANE: u32 = u32::MAX;
-
-#[allow(
-    clippy::disallowed_types,
-    reason = "HOT-FIX(G11), HOT-FIX(G12), HOT-FIX(G13), HOT-FIX(G14), HOT-FIX(G15)"
-)]
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}
 
 /// Adds `marker` to `markers`, keeping the latest per queue and lane (a lane runs in order, so it covers
 /// the earlier ones).
@@ -375,6 +403,8 @@ fn merge(markers: &mut Vec<Marker>, marker: Marker) {
 #[derive(Debug)]
 struct Topology {
     successors: Vec<Vec<(StageId, EdgeKind)>>,
+    /// The stages whose submission edges lead into each stage: where it reads its input markers.
+    submission_predecessors: Vec<Vec<usize>>,
     incoming: Vec<usize>,
     has_completion_successor: Vec<bool>,
     /// The predecessor whose lane each stage continues: the one for which the stage is the critical
@@ -387,6 +417,7 @@ impl Topology {
     fn of(spec: &StageGraphSpec) -> Result<Self, GraphError> {
         let n = spec.stages.len();
         let mut successors = vec![Vec::new(); n];
+        let mut submission_predecessors: Vec<Vec<usize>> = vec![Vec::new(); n];
         let mut predecessors: Vec<Vec<StageId>> = vec![Vec::new(); n];
         let mut incoming = vec![0; n];
         let mut has_completion_successor = vec![false; n];
@@ -398,6 +429,9 @@ impl Topology {
             }
             successors[usize::from(from.0)].push((to, kind));
             predecessors[usize::from(to.0)].push(from);
+            if kind == EdgeKind::Submission {
+                submission_predecessors[usize::from(to.0)].push(usize::from(from.0));
+            }
             incoming[usize::from(to.0)] += 1;
             has_completion_successor[usize::from(from.0)] |= kind == EdgeKind::Completion;
         }
@@ -422,6 +456,7 @@ impl Topology {
         let path_predecessor = Self::path_predecessors(&successors);
         Ok(Self {
             successors,
+            submission_predecessors,
             incoming,
             has_completion_successor,
             path_predecessor,
@@ -521,6 +556,50 @@ impl Topology {
     }
 }
 
+/// A pool of finished objects for the next ones, from any thread.
+///
+/// A bounded multi-producer, multi-consumer queue, as a [`FrameManager`](euhedral_core::impls::FrameManager) keeps its
+/// returned frames (which cannot serve here: its checkout takes `&mut self`, and a quantum starts and a frame is made
+/// on any thread). An object comes back through a weak handle, so objects in the pool never keep the pool alive; a
+/// full pool drops what comes back, and a take that finds another taker active (the queue's consumer claim is a
+/// `try`, never a wait) makes a new object. Either way the pool is a speed-up: the owner of an object that is gone
+/// makes another.
+struct Pool<T> {
+    consumer: Consumer<T, Multi>,
+    producer: Arc<Producer<T, Multi>>,
+}
+
+impl<T> Pool<T> {
+    fn new(capacity: usize) -> Self {
+        let queue = MpmcQueue::<T>::bounded(capacity);
+        Self {
+            consumer: queue.consumer(),
+            producer: Arc::new(queue.producer()),
+        }
+    }
+
+    fn take(&self) -> Option<T> {
+        self.consumer.poll()
+    }
+
+    /// The handle objects come back through.
+    fn returns(&self) -> Weak<Producer<T, Multi>> {
+        Arc::downgrade(&self.producer)
+    }
+}
+
+/// Returns `item` to the pool behind `to`, or drops it when the pool is gone or full.
+fn give_back<T>(to: &Weak<Producer<T, Multi>>, item: T) {
+    if let Some(pool) = to.upgrade() {
+        let _ = pool.offer(item);
+    }
+}
+
+/// Quanta kept for reuse.
+const POOLED_RUNS: usize = 256;
+/// Frames kept for reuse.
+const POOLED_FRAMES: usize = 4096;
+
 impl<Q: Send + Sync + 'static> StageGraph<Q> {
     /// `stages[i]` implements `spec.stages()[i]`. `retire` runs once per quantum, in a frame, after
     /// its boundary.
@@ -549,86 +628,72 @@ impl<Q: Send + Sync + 'static> StageGraph<Q> {
             }
         }
         Ok(Arc::new(Self {
-            spec,
-            stages,
-            topology,
-            runtime,
-            retire: Box::new(retire),
-            live: AtomicUsize::new(0),
-            seeds: AtomicU64::new(0),
+            core: Arc::new(Core {
+                spec,
+                stages,
+                topology,
+                runtime,
+                retire: Box::new(retire),
+                live: AtomicUsize::new(0),
+                seeds: AtomicU64::new(0),
+                frames: Pool::new(POOLED_FRAMES),
+            }),
+            runs: Pool::new(POOLED_RUNS),
         }))
     }
 
     /// Starts `quantum`; its frames share `kill`.
-    #[allow(
-        clippy::disallowed_types,
-        reason = "HOT-FIX(G10), HOT-FIX(G11), HOT-FIX(G12), HOT-FIX(G13), HOT-FIX(G14), HOT-FIX(G15)"
-    )]
+    ///
+    /// The quantum is a pooled run: after warm-up, a start allocates nothing (the external edges are taken from
+    /// `external` one by one, and their records are pooled too).
     pub fn start(
-        self: &Arc<Self>,
+        &self,
         quantum: Q,
         kill: Arc<AtomicBool>,
-        external: Vec<ExternalEdge>,
+        external: impl IntoIterator<Item = ExternalEdge>,
     ) -> QuantumRef {
-        let n = self.spec.stages.len();
-        for edge in &external {
+        let core = &self.core;
+        let n = core.spec.stages.len();
+        let run = self
+            .runs
+            .take()
+            .unwrap_or_else(|| Run::new(core.clone(), self.runs.returns()));
+        run.bind(quantum, kill);
+        let mut edges = 0;
+        for edge in external {
             assert!(
                 usize::from(edge.to_stage.0) < n,
                 "an external edge to unknown stage {}",
                 edge.to_stage.0
             );
+            run.add_external(edge);
+            edges += 1;
         }
-        let run = Arc::new(Run {
-            graph: self.clone(),
-            quantum: RwLock::new(Some(quantum)),
-            kill,
-            live: AtomicUsize::new(0),
-            // The returned ref's pin, and the quantum's own token (dropped once its live count
-            // reached 0).
-            holds: AtomicUsize::new(2),
-            stopped: AtomicBool::new(false),
-            cause: Mutex::new(None),
-            stages: (0..n)
-                .map(|s| StageRun {
-                    pending: AtomicUsize::new(self.topology.incoming[s]),
-                    inputs: Mutex::new(Vec::new()),
-                    lane: AtomicU32::new(NO_LANE),
-                    ran: AtomicBool::new(false),
-                })
-                .collect(),
-            externals: Mutex::new(Externals {
-                swept: false,
-                out: vec![None; n],
-                waiters: Vec::new(),
-            }),
-            boundary: Mutex::new(BoundarySet::default()),
-            pins: Mutex::new(Vec::new()),
-        });
-        self.live.fetch_add(1, Ordering::AcqRel);
-        for edge in &external {
-            run.stages[usize::from(edge.to_stage.0)]
-                .pending
-                .fetch_add(1, Ordering::AcqRel);
-        }
-        let roots: Vec<StageId> = self
+        core.live.fetch_add(1, Ordering::AcqRel);
+        let roots = core
             .topology
             .roots
             .iter()
-            .copied()
             .filter(|s| run.stages[usize::from(s.0)].pending.load(Ordering::Acquire) == 0)
-            .collect();
+            .count();
         // The roots, admission's hold (so fast roots cannot retire the quantum before every root
         // and edge is in), and one count per external edge until it arrives.
-        run.live
-            .store(roots.len() + 1 + external.len(), Ordering::Release);
+        run.live.store(roots + 1 + edges, Ordering::Release);
+        let upstream: Arc<dyn Upstream> = run.clone();
         let reference = QuantumRef {
-            pin: Arc::new(Pin { run: run.clone() }),
+            run: Some(upstream),
         };
-        for root in roots {
-            run.offer(root);
+        for &root in &core.topology.roots {
+            if run.stages[usize::from(root.0)]
+                .pending
+                .load(Ordering::Acquire)
+                == 0
+            {
+                run.offer(root);
+            }
         }
-        for edge in external {
-            run.register_external(edge);
+        for index in 0..edges {
+            run.register_external(index);
         }
         run.finish_one();
         reference
@@ -636,93 +701,1036 @@ impl<Q: Send + Sync + 'static> StageGraph<Q> {
 
     /// Quanta started and not yet retired.
     pub fn live(&self) -> usize {
-        self.live.load(Ordering::Acquire)
-    }
-
-    fn next_seed(&self) -> u64 {
-        self.seeds.fetch_add(1, Ordering::Relaxed)
+        self.core.live.load(Ordering::Acquire)
     }
 }
 
-/// What a later quantum's external edges need of an earlier one, of any graph (type-erased).
-/// What an external edge does when its earlier stage is satisfied: arrive with the stage's markers.
-type ArriveWith = Box<dyn FnOnce(Vec<Marker>) + Send>;
+impl<Q: Send + Sync + 'static> Core<Q> {
+    fn next_seed(&self) -> u64 {
+        self.seeds.fetch_add(1, Ordering::Relaxed)
+    }
 
+    /// A frame for `run`: a finished one made over, or a new one.
+    fn frame(&self, run: &Arc<Run<Q>>, kind: Kind, header: FrameHeader) -> Box<GraphFrame<Q>> {
+        let mut frame = self
+            .frames
+            .take()
+            .unwrap_or_else(|| Box::new(GraphFrame::new(self.frames.returns())));
+        frame.run = Some(run.clone());
+        frame.kind = kind;
+        frame.header = header;
+        frame
+    }
+}
+
+/// What an external edge needs of an earlier quantum, of any graph (type-erased).
 trait Upstream: Send + Sync {
-    /// Calls `arrive` with `stage`'s markers once it submitted, or with every marker of the quantum
-    /// once it is known never to run; at once if either is already so.
-    fn subscribe(&self, stage: StageId, arrive: ArriveWith);
+    /// Delivers `node`'s edge with `stage`'s markers once it submitted, or with every marker of the quantum once it is
+    /// known never to run; at once if either is already so. Otherwise the node waits on the stage's stack until then.
+    fn subscribe(&self, stage: StageId, node: NonNull<ExtSlot>);
     /// A later quantum's stage that used this one submitted `marker`: the retirement boundary
     /// covers it.
     fn cover(&self, marker: Marker);
+    /// One more pin.
+    fn add_hold(&self);
     /// One pin less; the last lets the quantum retire.
     fn release_hold(self: Arc<Self>);
 }
 
-/// One pin of a quantum: the [`QuantumRef`] clones share one, and an external edge in use holds
-/// one.
-struct Pin {
-    run: Arc<dyn Upstream>,
+/// What an earlier quantum does to a later one whose edge it satisfies (type-erased).
+trait Downstream: Send + Sync {
+    /// The edge in slot `index` arrived, its markers already in the slot.
+    fn external_arrived(self: Arc<Self>, index: usize);
 }
 
-impl Drop for Pin {
-    fn drop(&mut self) {
-        self.run.clone().release_hold();
+impl Clone for QuantumRef {
+    /// Another pin: the quantum retires only after this one is dropped too.
+    fn clone(&self) -> Self {
+        let run = self.run.as_ref().expect("a live ref holds its quantum");
+        run.add_hold();
+        Self {
+            run: Some(run.clone()),
+        }
     }
 }
 
-/// A quantum bound to its graph.
-struct Run<Q: Send + Sync + 'static> {
-    graph: Arc<StageGraph<Q>>,
-    /// Read while stages run (concurrently); taken by the retirement frame, after every stage is
-    /// done.
-    #[allow(clippy::disallowed_types, reason = "HOT-FIX(G10)")]
-    quantum: RwLock<Option<Q>>,
-    kill: Arc<AtomicBool>,
-    /// Published frames, armed completion edges, external edges not yet arrived, and admission's
-    /// hold.
+impl Drop for QuantumRef {
+    fn drop(&mut self) {
+        if let Some(run) = self.run.take() {
+            run.release_hold();
+        }
+    }
+}
+
+impl QuantumRef {
+    fn upstream(&self) -> &Arc<dyn Upstream> {
+        self.run.as_ref().expect("a live ref holds its quantum")
+    }
+}
+
+/// One external edge of a run: the record on the earlier quantum's stack, the pin it holds, and the markers it
+/// brought. Pooled with its run.
+struct ExtSlot {
+    /// The link on the earlier quantum's stack.
+    link: Link<ExtSlot>,
+    /// This slot's place in its run.
+    index: usize,
+    to_stage: StageId,
+    from_stage: StageId,
+    kind: EdgeKind,
+    /// The markers the earlier stage brought; written by the thread that satisfied the edge, read by the stage the
+    /// edge leads to once it has arrived.
+    markers: Owned<Vec<Marker>>,
+    /// The earlier quantum, pinned until the stage used it or the quantum quiesced.
+    pin: Owned<Option<QuantumRef>>,
+    /// The run the edge leads to, until the edge arrives.
+    target: Owned<Option<Arc<dyn Downstream>>>,
+    /// Markers a completion edge still waits for.
+    left: AtomicUsize,
+}
+
+// SAFETY: the link is this node's own and only the stack uses it.
+unsafe impl Linked for ExtSlot {
+    fn link(&self) -> &Link<ExtSlot> {
+        &self.link
+    }
+}
+
+impl ExtSlot {
+    fn new() -> Self {
+        Self {
+            link: Link::new(),
+            index: 0,
+            to_stage: StageId(0),
+            from_stage: StageId(0),
+            kind: EdgeKind::Submission,
+            markers: Owned::new(Vec::new()),
+            pin: Owned::new(None),
+            target: Owned::new(None),
+            left: AtomicUsize::new(0),
+        }
+    }
+}
+
+/// The slots of a run's external edges: in use, and spare for the next quantum.
+#[derive(Default)]
+struct ExtSlots {
+    active: Vec<Arc<ExtSlot>>,
+    spare: Vec<Arc<ExtSlot>>,
+}
+
+struct StageRun {
+    /// Incoming edges (and external edges) not yet arrived. The edge that brings it to zero publishes the stage, and
+    /// sees everything the other edges' predecessors wrote before they arrived.
+    pending: AtomicUsize,
+    /// The lane it ran on, or `NO_LANE`: written by the stage, read by the successors that continue its lane after
+    /// their final arrival.
+    lane: Owned<u32>,
+    /// Whether it ran (and so is not abandoned): written by the thread that owns its frame, read at quiesce.
+    ran: Owned<bool>,
+    /// The markers its successors and the edges on it wait for, once it submitted: the marker it queued, or else the
+    /// markers it passed on.
+    out: Owned<Vec<Marker>>,
+    /// The external edges waiting for `out`.
+    waiters: TakeAllStack<ExtSlot>,
+}
+
+impl StageRun {
+    fn new() -> Self {
+        Self {
+            pending: AtomicUsize::new(0),
+            lane: Owned::new(NO_LANE),
+            ran: Owned::new(false),
+            out: Owned::new(Vec::new()),
+            waiters: TakeAllStack::new(),
+        }
+    }
+
+    /// An incoming edge arrived. True for the last: the caller publishes the stage. Whatever a predecessor wrote
+    /// before it arrived is visible to the caller that sees `true` (Java `StageFrame.arrive`: `ARRIVALS.getAndAdd`).
+    fn arrive(&self) -> bool {
+        self.pending.fetch_sub(1, Ordering::AcqRel) == 1
+    }
+}
+
+/// The first cause of a quantum not completing: one claim wins and writes it (Java
+/// `AbstractQuantum.failure.compareAndSet(null, cause)`).
+struct FirstCause<T> {
+    claimed: crate::sync::AtomicBool,
+    value: Owned<Option<T>>,
+}
+
+impl<T> FirstCause<T> {
+    fn new() -> Self {
+        Self {
+            claimed: crate::sync::AtomicBool::new(false),
+            value: Owned::new(None),
+        }
+    }
+
+    /// Forgets the cause.
+    ///
+    /// # Safety
+    ///
+    /// No thread claims or takes meanwhile, and every earlier claim happens before this call.
+    unsafe fn reset(&self) {
+        // SAFETY: the caller's contract.
+        unsafe { self.value.write(|value| *value = None) };
+        self.claimed.store(false, Ordering::Relaxed);
+    }
+
+    /// Claims the cause if no one did. True for the winner.
+    fn claim(&self, cause: T) -> bool {
+        if self.claimed.load(Ordering::Acquire)
+            || self
+                .claimed
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return false;
+        }
+        // SAFETY: the compare-and-swap made this thread the only writer; the reader (`take`) runs after every
+        // claimant is done, by the caller's contract.
+        unsafe { self.value.write(|value| *value = Some(cause)) };
+        true
+    }
+
+    /// The cause, if one was claimed.
+    ///
+    /// # Safety
+    ///
+    /// Every claimant is done, and what each did happens before this call.
+    unsafe fn take(&self) -> Option<T> {
+        // SAFETY: the caller's contract.
+        unsafe { self.value.write(Option::take) }
+    }
+}
+
+/// The lanes a quantum used, and the latest marker value on each (Java `usedLanes`, and the lane tails).
+struct LaneTable {
+    /// A bit per lane used.
+    used: AtomicU64,
+    values: Box<[AtomicU64]>,
+}
+
+impl LaneTable {
+    fn new(lanes: usize) -> Self {
+        Self {
+            used: AtomicU64::new(0),
+            values: (0..lanes).map(|_| AtomicU64::new(0)).collect(),
+        }
+    }
+
+    /// `value` on `lane` joins the table: the latest of a lane covers the earlier ones (a lane runs in order). The
+    /// value is in before the bit, so a reader that sees the bit sees at least this value.
+    fn record(&self, lane: usize, value: u64) {
+        self.values[lane].fetch_max(value, Ordering::AcqRel);
+        let bit = 1u64 << lane;
+        if self.used.load(Ordering::Acquire) & bit == 0 {
+            self.used.fetch_or(bit, Ordering::AcqRel);
+        }
+    }
+
+    /// The lanes used, a bit each.
+    fn used(&self) -> u64 {
+        self.used.load(Ordering::Acquire)
+    }
+
+    fn value(&self, lane: usize) -> u64 {
+        self.values[lane].load(Ordering::Acquire)
+    }
+
+    /// Empties the table. Only while no thread uses it.
+    fn clear(&self) {
+        let mut used = self.used.swap(0, Ordering::AcqRel);
+        while used != 0 {
+            let lane = used.trailing_zeros() as usize;
+            used &= used - 1;
+            self.values[lane].store(0, Ordering::Relaxed);
+        }
+    }
+}
+
+/// A quantum bound to its graph: pooled, and rebound to each quantum in turn.
+struct Run<Q> {
+    core: Arc<Core<Q>>,
+    /// Where the run goes when its quantum retires.
+    home: Weak<Producer<Arc<Run<Q>>, Multi>>,
+    /// Read while stages run (concurrently); taken by the retirement, after every stage is done.
+    quantum: Owned<Option<Q>>,
+    kill: Owned<Option<Arc<AtomicBool>>>,
+    /// Published frames, armed completion edges and host completions, external edges not yet arrived, and
+    /// admission's hold.
     live: AtomicUsize,
     /// The quantum's own token, its `QuantumRef` pin, and the external edges of later quanta that
     /// use it.
     holds: AtomicUsize,
     /// A stage failed, or a frame was refused: nothing more is published.
     stopped: AtomicBool,
-    /// The first reason the quantum did not complete.
-    #[allow(clippy::disallowed_types, reason = "HOT-FIX(G11)")]
-    cause: Mutex<Option<QuantumOutcome>>,
+    /// The first reason the quantum did not complete; read by the retirement, after every frame is done.
+    cause: FirstCause<QuantumOutcome>,
     stages: Box<[StageRun]>,
-    #[allow(clippy::disallowed_types, reason = "HOT-FIX(G13)")]
-    externals: Mutex<Externals>,
-    #[allow(clippy::disallowed_types, reason = "HOT-FIX(G14)")]
-    boundary: Mutex<BoundarySet>,
-    /// The pins this quantum's external edges hold on earlier quanta, by the stage that uses them.
-    #[allow(clippy::disallowed_types, reason = "HOT-FIX(G15)")]
-    pins: Mutex<Vec<(StageId, QuantumRef)>>,
+    /// The lanes the quantum submitted to, and the latest marker value on each.
+    lanes: LaneTable,
+    /// Boundary completions still to come, and one for the arming.
+    boundary_left: AtomicUsize,
+    ext: Owned<ExtSlots>,
 }
 
-struct StageRun {
-    /// Incoming edges (and external edges) not yet arrived.
-    pending: AtomicUsize,
-    /// The markers that arrived with them (latest per lane).
-    #[allow(clippy::disallowed_types, reason = "HOT-FIX(G12)")]
-    inputs: Mutex<Vec<Marker>>,
-    /// The lane it ran on, or `NO_LANE`.
-    lane: AtomicU32,
-    ran: AtomicBool,
+impl<Q: Send + Sync + 'static> Run<Q> {
+    fn new(core: Arc<Core<Q>>, home: Weak<Producer<Arc<Run<Q>>, Multi>>) -> Arc<Self> {
+        let stages = (0..core.spec.stages.len())
+            .map(|_| StageRun::new())
+            .collect();
+        let lanes = LaneTable::new(core.runtime.lanes.len());
+        Arc::new(Self {
+            core,
+            home,
+            quantum: Owned::new(None),
+            kill: Owned::new(None),
+            live: AtomicUsize::new(0),
+            holds: AtomicUsize::new(0),
+            stopped: AtomicBool::new(false),
+            cause: FirstCause::new(),
+            stages,
+            lanes,
+            boundary_left: AtomicUsize::new(0),
+            ext: Owned::new(ExtSlots::default()),
+        })
+    }
+
+    /// Binds `quantum`.
+    fn bind(&self, quantum: Q, kill: Arc<AtomicBool>) {
+        // SAFETY: this thread took the run out of the pool (or made it): nothing else holds it, and the pool's queue
+        // handed over every earlier access.
+        unsafe {
+            self.quantum.write(|q| *q = Some(quantum));
+            self.kill.write(|k| *k = Some(kill));
+        }
+        // SAFETY: as above: this thread owns the run until it publishes a frame or a reference.
+        unsafe { self.cause.reset() };
+        // The returned ref's pin, and the quantum's own token (dropped once its live count reached 0).
+        self.holds.store(2, Ordering::Relaxed);
+        self.stopped.store(false, Ordering::Relaxed);
+        for (index, state) in self.stages.iter().enumerate() {
+            state
+                .pending
+                .store(self.core.topology.incoming[index], Ordering::Relaxed);
+            // SAFETY: as above.
+            unsafe {
+                state.lane.set(NO_LANE);
+                state.ran.set(false);
+                state.out.write(Vec::clear);
+            }
+            state.waiters.reopen();
+        }
+    }
+
+    /// Ends the binding: the quantum is gone, and the run goes back to the pool.
+    fn unbind(self: &Arc<Self>) {
+        // SAFETY: the retirement is the last thing that touches a quantum's run: every frame, pin and external edge
+        // of it is done.
+        unsafe {
+            self.kill.write(|k| *k = None);
+            self.ext.write(|ext| {
+                while let Some(slot) = ext.active.pop() {
+                    slot.markers.write(Vec::clear);
+                    slot.pin.write(|pin| *pin = None);
+                    slot.target.write(|target| *target = None);
+                    ext.spare.push(slot);
+                }
+            });
+        }
+        self.lanes.clear();
+        give_back(&self.home, self.clone());
+    }
+
+    /// Takes the record of `edge`; the stage it leads to waits for it. Before any frame of the quantum is published.
+    fn add_external(self: &Arc<Self>, edge: ExternalEdge) {
+        let ExternalEdge {
+            from,
+            from_stage,
+            to_stage,
+            kind,
+        } = edge;
+        // SAFETY: bound but not yet published: this thread owns the slots.
+        unsafe {
+            self.ext.write(|ext| {
+                let mut slot = ext.spare.pop().unwrap_or_else(|| Arc::new(ExtSlot::new()));
+                {
+                    let fresh = Arc::get_mut(&mut slot).expect("a spare slot is alone");
+                    fresh.index = ext.active.len();
+                    fresh.to_stage = to_stage;
+                    fresh.from_stage = from_stage;
+                    fresh.kind = kind;
+                }
+                slot.pin.write(|pin| *pin = Some(from));
+                ext.active.push(slot);
+            });
+        }
+        self.stages[usize::from(to_stage.0)]
+            .pending
+            .fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Puts edge `index` on its earlier quantum.
+    fn register_external(self: &Arc<Self>, index: usize) {
+        // SAFETY: the slots do not change while the quantum runs, and the pin is held until the edge arrives.
+        let (upstream, from_stage, node) = unsafe {
+            self.ext.read(|ext| {
+                let slot = &ext.active[index];
+                // The edge holds its run until it arrives (a record the earlier quantum's stack leads back to).
+                let target: Arc<dyn Downstream> = self.clone();
+                slot.target.write(|t| *t = Some(target));
+                let upstream = slot.pin.read(|pin| {
+                    pin.as_ref()
+                        .expect("an edge pins its quantum until it arrives")
+                        .upstream()
+                        .clone()
+                });
+                (upstream, slot.from_stage, NonNull::from(&**slot))
+            })
+        };
+        upstream.subscribe(from_stage, node);
+    }
+
+    fn halted(&self) -> bool {
+        self.stopped.load(Ordering::Acquire) || self.kill_set()
+    }
+
+    fn kill_set(&self) -> bool {
+        // SAFETY: the flag is set by `bind`, before any frame or ref exists, and cleared by `unbind`, after the last
+        // of them; in between it is only read.
+        unsafe {
+            self.kill
+                .read(|k| k.as_ref().is_some_and(|k| k.load(Ordering::Acquire)))
+        }
+    }
+
+    /// Claims the cause if no one did.
+    fn note(&self, cause: QuantumOutcome) {
+        self.cause.claim(cause);
+    }
+
+    fn fail(&self, stage: StageId, error: StageError) {
+        self.note(QuantumOutcome::Failed { stage, error });
+        self.stopped.store(true, Ordering::Release);
+    }
+
+    fn header(&self, ordered: Option<u64>, kill: bool) -> FrameHeader {
+        let kill = kill.then(|| {
+            // SAFETY: as `kill_set`.
+            unsafe {
+                self.kill
+                    .read(|k| k.clone().expect("a bound run has its kill flag"))
+            }
+        });
+        match ordered {
+            Some(id) => FrameHeader::with_kill_switch(id, kill),
+            None => {
+                let mut header = FrameHeader::with_kill_switch(UNORDERED, kill);
+                header.randomize_hash(self.core.next_seed());
+                header
+            }
+        }
+    }
+
+    /// Offers `frame`; a refused one (the sink completed) ends in place.
+    fn offer_frame(&self, frame: Box<dyn Frame>) {
+        if let Err(frame) = self.core.runtime.stages.offer(frame) {
+            frame.do_finally();
+        }
+    }
+
+    /// Publishes `stage`, whose last incoming edge arrived (its live count is already taken).
+    fn offer(self: &Arc<Self>, stage: StageId) {
+        let ordered = self.core.spec.stages[usize::from(stage.0)].ordered;
+        let frame = self
+            .core
+            .frame(self, Kind::Stage(stage), self.header(ordered, true));
+        if let Err(frame) = self.core.runtime.stages.offer(frame) {
+            self.fail(
+                stage,
+                StageError::Fatal("the stage sink no longer takes frames".into()),
+            );
+            frame.do_finally();
+        }
+    }
+
+    /// An edge into `stage` arrived; the last one publishes it.
+    fn arrive(self: &Arc<Self>, stage: StageId) {
+        let _hot = HotScope::enter();
+        if self.stages[usize::from(stage.0)].arrive() {
+            if self.halted() {
+                if self.kill_set() {
+                    self.note(QuantumOutcome::Killed);
+                }
+                return;
+            }
+            self.live.fetch_add(1, Ordering::AcqRel);
+            self.offer(stage);
+        }
+    }
+
+    /// Drops one live count; the last one quiesces the quantum.
+    fn finish_one(self: &Arc<Self>) {
+        if self.live.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.quiesce();
+        }
+    }
+
+    /// Runs `stage` (in its frame's `execute`), unless the quantum stopped. `inputs` and `waits` are the frame's
+    /// scratch: the markers the stage's predecessors and external edges brought, and those of them on other lanes.
+    fn run_stage(
+        &self,
+        stage: StageId,
+        inputs: &mut Vec<Marker>,
+        waits: &mut Vec<Marker>,
+    ) -> Option<Result<Submitted, StageError>> {
+        let _hot = HotScope::enter();
+        if self.stopped.load(Ordering::Acquire) {
+            return None;
+        }
+        let index = usize::from(stage.0);
+        let state = &self.stages[index];
+        let topology = &self.core.topology;
+        // SAFETY: this thread owns the stage's frame: `ran` and `lane` are its to write, and every stage it reads
+        // (its predecessors, and the path predecessor among them) submitted before its final arrival, which ordered
+        // their writes before this call.
+        let lane = unsafe {
+            state.ran.set(true);
+            let spec = &self.core.spec.stages[index];
+            let lane = (!spec.lanes.is_empty()).then(|| {
+                let continued = topology.path_predecessor[index]
+                    .map(|p| self.stages[usize::from(p.0)].lane.get())
+                    .filter(|&l| l != NO_LANE)
+                    .map(|l| LaneId(l as u16));
+                self.core.runtime.lanes.choose(&spec.lanes, continued)
+            });
+            if let Some(lane) = lane {
+                state.lane.set(u32::from(lane.0));
+            }
+            inputs.clear();
+            for &predecessor in &topology.submission_predecessors[index] {
+                self.stages[predecessor].out.read(|out| {
+                    for &marker in out {
+                        merge(inputs, marker);
+                    }
+                });
+            }
+            self.ext.read(|ext| {
+                for slot in &ext.active {
+                    if slot.to_stage == stage && slot.kind == EdgeKind::Submission {
+                        slot.markers.read(|markers| {
+                            for &marker in markers {
+                                merge(inputs, marker);
+                            }
+                        });
+                    }
+                }
+            });
+            lane
+        };
+        waits.clear();
+        waits.extend(inputs.iter().copied().filter(|m| Some(m.lane) != lane));
+        let cx = StageCx {
+            stage,
+            lane,
+            waits,
+            lanes: &self.core.runtime.lanes,
+        };
+        // SAFETY: the quantum is taken by the retirement, after every stage is done.
+        Some(unsafe {
+            self.quantum.read(|quantum| {
+                self.core.stages[index]
+                    .run(quantum.as_ref().expect("a running quantum is bound"), &cx)
+            })
+        })
+    }
+
+    /// A stage frame ended with `result`. Returns whether its live count is to be dropped (a retried stage keeps it).
+    fn stage_ended(
+        self: &Arc<Self>,
+        stage: StageId,
+        result: Option<Result<Submitted, StageError>>,
+        inputs: &[Marker],
+        alive: bool,
+    ) -> bool {
+        match result {
+            Some(Ok(submitted)) => match self.foreign(&submitted) {
+                None => self.submitted(stage, submitted, inputs),
+                Some(error) => {
+                    self.fail(stage, error);
+                    self.release_pins(stage, None);
+                }
+            },
+            Some(Err(StageError::Retry)) if alive => {
+                // The live count passes to the retry, which offers the stage again.
+                self.retry(stage);
+                return false;
+            }
+            Some(Err(StageError::Retry)) => {
+                // SAFETY: this thread owns the stage's frame.
+                unsafe { self.stages[usize::from(stage.0)].ran.set(false) };
+                self.note(QuantumOutcome::Killed);
+            }
+            Some(Err(error)) => {
+                self.fail(stage, error);
+                self.release_pins(stage, None);
+            }
+            None if !alive => self.note(QuantumOutcome::Killed),
+            None => {}
+        }
+        true
+    }
+
+    /// The failure of a stage whose marker names a queue that is no lane of the pool: the boundary could never
+    /// reach it.
+    fn foreign(&self, submitted: &Submitted) -> Option<StageError> {
+        let marker = submitted.marker?;
+        (!self.is_lane_marker(marker)).then(|| {
+            StageError::Fatal(format!(
+                "a marker of {} is no lane {} of the lane pool",
+                marker.queue, marker.lane.0
+            ))
+        })
+    }
+
+    /// Whether `marker` is of a lane of this graph's pool, and of that lane's queue.
+    fn is_lane_marker(&self, marker: Marker) -> bool {
+        let lanes = &self.core.runtime.lanes;
+        usize::from(marker.lane.0) < lanes.len() && lanes.lane(marker.lane).id() == marker.queue
+    }
+
+    /// A stage frame failed outright (`execute` panicked or returned an error).
+    fn stage_errored(self: &Arc<Self>, stage: StageId, error: FrameError) {
+        let name = self.core.spec.stages[usize::from(stage.0)].name;
+        // SAFETY: this thread owns the stage's frame.
+        unsafe { self.stages[usize::from(stage.0)].ran.set(true) };
+        self.fail(
+            stage,
+            StageError::Fatal(format!("stage {name} failed: {error}")),
+        );
+        self.release_pins(stage, None);
+    }
+
+    /// `stage` answered [`StageError::Retry`]: it runs again on a lane's progress or at the
+    /// backstop (its live count is kept).
+    fn retry(self: &Arc<Self>, stage: StageId) {
+        // It has not run: a kill while it waits abandons it.
+        // SAFETY: this thread owns the stage's frame.
+        unsafe { self.stages[usize::from(stage.0)].ran.set(false) };
+        let runtime = &self.core.runtime;
+        runtime.retries.retries.fetch_add(1, Ordering::Relaxed);
+        let ready = Progress::new(
+            runtime.lanes.clone(),
+            runtime.retries.clone(),
+            runtime.retry_backstop,
+        );
+        let frame = self
+            .core
+            .frame(self, Kind::Retry(stage), self.header(None, true));
+        runtime.completions.after(Box::new(ready), frame);
+    }
+
+    /// A retried stage's wake-up arrived. Returns whether its live count is to be dropped.
+    fn retry_woke(self: &Arc<Self>, stage: StageId, alive: bool) -> bool {
+        if !alive {
+            self.note(QuantumOutcome::Killed);
+            return true;
+        }
+        if self.stopped.load(Ordering::Acquire) {
+            return true;
+        }
+        self.offer(stage);
+        false
+    }
+
+    /// The latest marker of `marker`'s lane joins the quantum's boundary.
+    fn record(&self, marker: Marker) {
+        self.lanes.record(usize::from(marker.lane.0), marker.value);
+    }
+
+    /// The latest marker of every lane the quantum used, appended to `into`.
+    fn frontier_into(&self, into: &mut Vec<Marker>) {
+        let mut used = self.lanes.used();
+        while used != 0 {
+            let lane = used.trailing_zeros() as usize;
+            used &= used - 1;
+            into.push(self.lane_marker(lane));
+        }
+    }
+
+    /// The latest marker of `lane`, a lane the quantum used.
+    fn lane_marker(&self, lane: usize) -> Marker {
+        let id = LaneId(lane as u16);
+        Marker::new(
+            self.core.runtime.lanes.lane(id).id(),
+            id,
+            self.lanes.value(lane),
+        )
+    }
+
+    /// `stage` submitted: its edges are satisfied (submission edges now, completion edges once its
+    /// work completed). `inputs` are the markers it ran after, passed on when it queued none.
+    fn submitted(self: &Arc<Self>, stage: StageId, submitted: Submitted, inputs: &[Marker]) {
+        let _hot = HotScope::enter();
+        let index = usize::from(stage.0);
+        let Submitted { marker, completion } = submitted;
+        // Device order passes through a stage that queued nothing.
+        // SAFETY: this thread owns the stage's frame; the readers of `out` come after the seal below, or after the
+        // successors' final arrival.
+        unsafe {
+            self.stages[index].out.write(|out| {
+                out.clear();
+                match marker {
+                    Some(marker) => out.push(marker),
+                    None => out.extend_from_slice(inputs),
+                }
+            });
+        }
+        if let Some(marker) = marker {
+            self.record(marker);
+        }
+        let completion_edge = self.core.topology.has_completion_successor[index];
+        self.release_pins(stage, marker);
+        self.release_waiters(stage, Sealed::Submitted);
+        if self.halted() {
+            if self.kill_set() {
+                self.note(QuantumOutcome::Killed);
+            }
+            // A host completion that no edge consumes still holds the retirement back.
+            if !completion_edge && let Some(host) = completion {
+                self.live.fetch_add(1, Ordering::AcqRel);
+                self.completes(stage, None, Some(host));
+            }
+            return;
+        }
+        if completion_edge {
+            self.live.fetch_add(1, Ordering::AcqRel);
+            self.completes(stage, marker, completion);
+        } else if let Some(host) = completion {
+            // The boundary has the marker; the host completion holds a live count until it is ready.
+            self.live.fetch_add(1, Ordering::AcqRel);
+            self.completes(stage, None, Some(host));
+        }
+        for &(successor, kind) in &self.core.topology.successors[index] {
+            if kind == EdgeKind::Submission {
+                self.arrive(successor);
+            }
+        }
+    }
+
+    /// Registers the arrival frame of `stage`'s completion: when its `marker` is reached and its `host` completion is
+    /// ready.
+    ///
+    /// On the predecessor's ordered lane, if it has one: its completions (emitted in registration order) then publish
+    /// their successors in that order, so an ordered successor keeps the predecessor's order.
+    fn completes(
+        self: &Arc<Self>,
+        stage: StageId,
+        marker: Option<Marker>,
+        host: Option<Box<dyn Ready>>,
+    ) {
+        let ordered = self.core.spec.stages[usize::from(stage.0)].ordered;
+        let frame = self
+            .core
+            .frame(self, Kind::Completions(stage), self.header(ordered, true));
+        let completions = &self.core.runtime.completions;
+        match (marker, host) {
+            (Some(marker), None) => completions.after_marker(marker, frame),
+            (None, Some(host)) => completions.after(host, frame),
+            (Some(marker), Some(host)) => completions.after(
+                Box::new(MarkerAndHost {
+                    lanes: self.core.runtime.lanes.clone(),
+                    marker,
+                    marker_reached: false,
+                    host,
+                    host_ready: false,
+                }),
+                frame,
+            ),
+            // Nothing to wait for: the next poll emits it.
+            (None, None) => completions.at(Instant::now(), frame),
+        }
+    }
+
+    /// A completion arrival of `stage`'s ended: its completion-edge successors arrive.
+    fn completed(self: &Arc<Self>, stage: StageId, alive: bool) {
+        if !alive {
+            self.note(QuantumOutcome::Killed);
+        } else if !self.stopped.load(Ordering::Acquire) {
+            for &(successor, kind) in &self.core.topology.successors[usize::from(stage.0)] {
+                if kind == EdgeKind::Completion {
+                    self.arrive(successor);
+                }
+            }
+        }
+    }
+
+    /// The marker of an external completion edge was reached. Returns whether this was the last, and the edge's live
+    /// count is to be dropped.
+    fn external_reached(self: &Arc<Self>, index: usize, alive: bool) -> bool {
+        // SAFETY: the slots do not change while the quantum runs.
+        let (to, last) = unsafe {
+            self.ext.read(|ext| {
+                let slot = &ext.active[index];
+                (slot.to_stage, slot.left.fetch_sub(1, Ordering::AcqRel) == 1)
+            })
+        };
+        if !last {
+            return false;
+        }
+        if !alive {
+            self.note(QuantumOutcome::Killed);
+        } else if !self.stopped.load(Ordering::Acquire) {
+            self.arrive(to);
+        }
+        true
+    }
+
+    /// Ends the pins this quantum's external edges into `stage` hold, the used stage's `marker`
+    /// joining the earlier quanta's boundaries.
+    fn release_pins(&self, stage: StageId, marker: Option<Marker>) {
+        // SAFETY: the slots do not change while the quantum runs, and a pin is taken by the stage it serves (once:
+        // it submits or fails once) or by the quiesce, after every stage is done.
+        let count = unsafe { self.ext.read(|ext| ext.active.len()) };
+        for index in 0..count {
+            // SAFETY: as above.
+            let pin = unsafe {
+                self.ext.read(|ext| {
+                    let slot = &ext.active[index];
+                    if slot.to_stage == stage {
+                        slot.pin.write(Option::take)
+                    } else {
+                        None
+                    }
+                })
+            };
+            if let Some(pin) = pin {
+                if let Some(marker) = marker {
+                    pin.upstream().cover(marker);
+                }
+                drop(pin);
+            }
+        }
+    }
+
+    /// Seals `stage`'s stack for `why`, and satisfies the external edges that waited on it.
+    fn release_waiters(&self, stage: StageId, why: Sealed) {
+        for node in self.stages[usize::from(stage.0)].waiters.seal(why) {
+            self.deliver(stage, why, node);
+        }
+    }
+
+    /// Satisfies the external edge in `node` with what `stage` has to give: its output markers, or (swept) the
+    /// markers of the whole quantum.
+    fn deliver(&self, stage: StageId, why: Sealed, node: NonNull<ExtSlot>) {
+        // SAFETY: the stack handed the node over (or refused it): this thread owns its markers and target until the
+        // target arrives, and the node is valid until then. `out` is final once the stack is sealed `Submitted`.
+        let (target, index) = unsafe {
+            let slot = node.as_ref();
+            slot.markers.write(|markers| {
+                markers.clear();
+                match why {
+                    Sealed::Submitted => self.stages[usize::from(stage.0)]
+                        .out
+                        .read(|out| markers.extend_from_slice(out)),
+                    Sealed::Swept => self.frontier_into(markers),
+                }
+            });
+            let target = slot
+                .target
+                .write(Option::take)
+                .expect("an edge arrives once");
+            (target, slot.index)
+        };
+        target.external_arrived(index);
+    }
+
+    /// No stage of the quantum can run again: later quanta waiting on its stages are released, its
+    /// unrun stages abandoned, and its own token dropped (the boundary is armed once no pin is
+    /// left).
+    fn quiesce(self: &Arc<Self>) {
+        self.take_over_external_waits();
+        for index in 0..self.stages.len() {
+            self.release_waiters(StageId(index as u16), Sealed::Swept);
+        }
+        // SAFETY: every stage is done: no one releases a pin any more.
+        let count = unsafe { self.ext.read(|ext| ext.active.len()) };
+        for index in 0..count {
+            // SAFETY: as above.
+            let pin = unsafe {
+                self.ext
+                    .read(|ext| ext.active[index].pin.write(Option::take))
+            };
+            drop(pin);
+        }
+        // SAFETY: every stage is done, and the quantum is taken by the retirement, after the boundary.
+        unsafe {
+            self.quantum.read(|quantum| {
+                let quantum = quantum.as_ref().expect("a quiescing quantum is bound");
+                for (index, state) in self.stages.iter().enumerate() {
+                    if !state.ran.get() {
+                        self.core.stages[index].abandoned(quantum);
+                    }
+                }
+            });
+        }
+        self.clone().release_hold();
+    }
+
+    /// A stage that never ran never waited for the markers its external edges brought: the quantum's boundary takes
+    /// them over (Java `awaitExternals`, which joins them to the home lane), so a later quantum released onto this one
+    /// still follows the quanta before it.
+    fn take_over_external_waits(&self) {
+        // SAFETY: every stage is done: the slots and their markers are no longer written, and `ran` is final.
+        let count = unsafe { self.ext.read(|ext| ext.active.len()) };
+        for index in 0..count {
+            // SAFETY: as above.
+            unsafe {
+                self.ext.read(|ext| {
+                    let slot = &ext.active[index];
+                    if !self.stages[usize::from(slot.to_stage.0)].ran.get() {
+                        slot.markers.read(|markers| {
+                            for &marker in markers {
+                                if self.is_lane_marker(marker) {
+                                    self.record(marker);
+                                }
+                            }
+                        });
+                    }
+                });
+            }
+        }
+    }
+
+    /// Every pin is gone: arms the retirement boundary, one completion per lane the quantum used.
+    fn arm_boundary(self: &Arc<Self>) {
+        let used = self.lanes.used();
+        if used == 0 {
+            self.offer_retirement();
+            return;
+        }
+        // One per lane, and one for this arming, so that the boundary cannot end before every lane is in.
+        self.boundary_left
+            .store(used.count_ones() as usize + 1, Ordering::Release);
+        let mut lanes = used;
+        while lanes != 0 {
+            let lane = lanes.trailing_zeros() as usize;
+            lanes &= lanes - 1;
+            let frame = self
+                .core
+                .frame(self, Kind::Boundary, self.header(None, false));
+            self.core
+                .runtime
+                .completions
+                .after_marker(self.lane_marker(lane), frame);
+        }
+        if self.boundary_left.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.offer_retirement();
+        }
+    }
+
+    fn offer_retirement(self: &Arc<Self>) {
+        let frame = self
+            .core
+            .frame(self, Kind::Retire, self.header(None, false));
+        self.offer_frame(frame);
+    }
+
+    fn conclude(self: &Arc<Self>) {
+        // SAFETY: the boundary is reached, every pin is gone and every frame is done: the retirement is the only
+        // thread that touches the quantum and the cause.
+        let (quantum, cause) = unsafe { (self.quantum.write(Option::take), self.cause.take()) };
+        let Some(quantum) = quantum else { return };
+        let outcome = cause.unwrap_or(QuantumOutcome::Completed);
+        let retired = catch_unwind(AssertUnwindSafe(|| (self.core.retire)(quantum, outcome)));
+        self.core.live.fetch_sub(1, Ordering::AcqRel);
+        self.unbind();
+        if let Err(panic) = retired {
+            resume_unwind(panic);
+        }
+    }
 }
 
-struct Externals {
-    /// The quantum's stages can no longer run: every later subscription arrives at once.
-    swept: bool,
-    /// Each stage's output markers, once it submitted.
-    out: Vec<Option<Vec<Marker>>>,
-    waiters: Vec<(StageId, ArriveWith)>,
+impl<Q: Send + Sync + 'static> Upstream for Run<Q> {
+    fn subscribe(&self, stage: StageId, node: NonNull<ExtSlot>) {
+        // SAFETY: the node is a later quantum's slot, valid until its edge arrives, and in no stack.
+        if let Err(why) = unsafe { self.stages[usize::from(stage.0)].waiters.push(node) } {
+            self.deliver(stage, why, node);
+        }
+    }
+
+    fn cover(&self, marker: Marker) {
+        self.record(marker);
+    }
+
+    fn add_hold(&self) {
+        self.holds.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn release_hold(self: Arc<Self>) {
+        if self.holds.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.arm_boundary();
+        }
+    }
 }
 
-#[derive(Default)]
-struct BoundarySet {
-    markers: Vec<Marker>,
-    hosts: Vec<Box<dyn Ready>>,
+impl<Q: Send + Sync + 'static> Downstream for Run<Q> {
+    fn external_arrived(self: Arc<Self>, index: usize) {
+        // SAFETY: the slots do not change while the quantum runs; the thread that satisfied the edge wrote the markers
+        // before this call.
+        let (to, kind, count) = unsafe {
+            self.ext.read(|ext| {
+                let slot = &ext.active[index];
+                (slot.to_stage, slot.kind, slot.markers.read(Vec::len))
+            })
+        };
+        if kind == EdgeKind::Completion && count > 0 && !self.halted() {
+            // The edge's live count passes to the frames that arrive once the markers are reached.
+            // SAFETY: as above.
+            unsafe {
+                self.ext
+                    .read(|ext| ext.active[index].left.store(count, Ordering::Release))
+            };
+            for at in 0..count {
+                // SAFETY: as above.
+                let marker = unsafe {
+                    self.ext
+                        .read(|ext| ext.active[index].markers.read(|m| m[at]))
+                };
+                let frame = self
+                    .core
+                    .frame(&self, Kind::External(index), self.header(None, true));
+                self.core.runtime.completions.after_marker(marker, frame);
+            }
+            return;
+        }
+        self.arrive(to);
+        self.finish_one();
+    }
+}
+
+/// A stage's completion that waits for a marker and for a host completion.
+struct MarkerAndHost {
+    lanes: Arc<LanePool>,
+    marker: Marker,
+    marker_reached: bool,
+    host: Box<dyn Ready>,
+    host_ready: bool,
+}
+
+impl Ready for MarkerAndHost {
+    fn is_ready(&mut self) -> bool {
+        if !self.marker_reached {
+            self.marker_reached = self.lanes.reached(self.marker);
+        }
+        if !self.host_ready {
+            self.host_ready = self.host.is_ready();
+        }
+        self.marker_reached && self.host_ready
+    }
 }
 
 /// A retried stage's wake-up: any lane of the pool past where it was at the retry, or the
@@ -768,405 +1776,55 @@ impl Ready for Progress {
     }
 }
 
-/// Every marker reached and every host completion ready.
-struct AllOf {
-    lanes: Arc<LanePool>,
-    markers: Vec<Marker>,
-    hosts: Vec<Box<dyn Ready>>,
+/// What a frame of a graph does.
+#[derive(Clone, Copy, Debug)]
+enum Kind {
+    /// In the pool.
+    Idle,
+    /// Runs the stage in `execute`, hands on to its successors in `do_finally`.
+    Stage(StageId),
+    /// The completion of this stage's work: its completion-edge successors arrive (a stage with none only holds the
+    /// quantum live until its host completion is ready).
+    Completions(StageId),
+    /// One marker of an external completion edge (the slot's index) was reached; the last arrives at the stage.
+    External(usize),
+    /// A retried stage runs again (its live count is the arrival's).
+    Retry(StageId),
+    /// One lane's marker of the retirement boundary was reached; the last retires the quantum.
+    Boundary,
+    /// The quantum's end, when it used no lane: hands it and its outcome to `retire`.
+    Retire,
 }
 
-impl Ready for AllOf {
-    fn is_ready(&mut self) -> bool {
-        let lanes = &self.lanes;
-        self.markers.retain(|m| !lanes.reached(*m));
-        self.hosts.retain_mut(|host| !host.is_ready());
-        self.markers.is_empty() && self.hosts.is_empty()
-    }
-}
-
-impl<Q: Send + Sync + 'static> Run<Q> {
-    fn halted(&self) -> bool {
-        self.stopped.load(Ordering::Acquire) || self.kill.load(Ordering::Acquire)
-    }
-
-    fn note(&self, cause: QuantumOutcome) {
-        lock(&self.cause).get_or_insert(cause);
-    }
-
-    fn fail(&self, stage: StageId, error: StageError) {
-        self.note(QuantumOutcome::Failed { stage, error });
-        self.stopped.store(true, Ordering::Release);
-    }
-
-    fn header(&self, ordered: Option<u64>, kill: bool) -> FrameHeader {
-        let kill = kill.then(|| self.kill.clone());
-        match ordered {
-            Some(id) => FrameHeader::with_kill_switch(id, kill),
-            None => {
-                let mut header = FrameHeader::with_kill_switch(UNORDERED, kill);
-                header.randomize_hash(self.graph.next_seed());
-                header
-            }
-        }
-    }
-
-    /// Offers `frame`; a refused one (the sink completed) ends in place.
-    fn offer_frame(&self, frame: Box<dyn Frame>) {
-        if let Err(frame) = self.graph.runtime.stages.offer(frame) {
-            frame.do_finally();
-        }
-    }
-
-    /// Publishes `stage`, whose last incoming edge arrived (its live count is already taken).
-    fn offer(self: &Arc<Self>, stage: StageId) {
-        let ordered = self.graph.spec.stages[usize::from(stage.0)].ordered;
-        let frame = StageFrame {
-            header: self.header(ordered, true),
-            run: self.clone(),
-            stage,
-            result: None,
-        };
-        if let Err(frame) = self.graph.runtime.stages.offer(Box::new(frame)) {
-            self.fail(
-                stage,
-                StageError::Fatal("the stage sink no longer takes frames".into()),
-            );
-            frame.do_finally();
-        }
-    }
-
-    /// An edge into `stage` arrived with `markers`; the last one publishes it.
-    fn arrive(self: &Arc<Self>, stage: StageId, markers: &[Marker]) {
-        let _hot = HotScope::enter();
-        let state = &self.stages[usize::from(stage.0)];
-        if !markers.is_empty() {
-            let mut inputs = lock(&state.inputs);
-            for &marker in markers {
-                merge(&mut inputs, marker);
-            }
-        }
-        if state.pending.fetch_sub(1, Ordering::AcqRel) == 1 {
-            if self.halted() {
-                if self.kill.load(Ordering::Acquire) {
-                    self.note(QuantumOutcome::Killed);
-                }
-                return;
-            }
-            self.live.fetch_add(1, Ordering::AcqRel);
-            self.offer(stage);
-        }
-    }
-
-    /// Drops one live count; the last one quiesces the quantum.
-    fn finish_one(self: &Arc<Self>) {
-        if self.live.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.quiesce();
-        }
-    }
-
-    /// Runs `stage` (in its frame's `execute`), unless the quantum stopped.
-    fn run_stage(&self, stage: StageId) -> Option<Result<Submitted, StageError>> {
-        let _hot = HotScope::enter();
-        if self.stopped.load(Ordering::Acquire) {
-            return None;
-        }
-        let index = usize::from(stage.0);
-        let state = &self.stages[index];
-        state.ran.store(true, Ordering::Release);
-        let spec = &self.graph.spec.stages[index];
-        let lanes = &*self.graph.runtime.lanes;
-        let lane = (!spec.lanes.is_empty()).then(|| {
-            let continued = self.graph.topology.path_predecessor[index]
-                .map(|p| self.stages[usize::from(p.0)].lane.load(Ordering::Acquire))
-                .filter(|&l| l != NO_LANE)
-                .map(|l| LaneId(l as u16));
-            lanes.choose(&spec.lanes, continued)
-        });
-        if let Some(lane) = lane {
-            state.lane.store(u32::from(lane.0), Ordering::Release);
-        }
-        let waits: Vec<Marker> = lock(&state.inputs)
-            .iter()
-            .copied()
-            .filter(|m| Some(m.lane) != lane)
-            .collect();
-        let quantum = self.quantum.read().unwrap_or_else(PoisonError::into_inner);
-        let quantum = quantum.as_ref().expect("a running quantum is bound");
-        let cx = StageCx {
-            stage,
-            lane,
-            waits: &waits,
-            lanes,
-        };
-        Some(self.graph.stages[index].run(quantum, &cx))
-    }
-
-    /// `stage` answered [`StageError::Retry`]: it runs again on a lane's progress or at the
-    /// backstop (its live count is kept).
-    fn retry(self: &Arc<Self>, stage: StageId) {
-        // It has not run: a kill while it waits abandons it.
-        self.stages[usize::from(stage.0)]
-            .ran
-            .store(false, Ordering::Release);
-        let runtime = &self.graph.runtime;
-        runtime.retries.retries.fetch_add(1, Ordering::Relaxed);
-        let ready = Progress::new(
-            runtime.lanes.clone(),
-            runtime.retries.clone(),
-            runtime.retry_backstop,
-        );
-        let frame = Arrival {
-            header: self.header(None, true),
-            run: self.clone(),
-            to: Target::Retry(stage),
-        };
-        runtime.completions.after(Box::new(ready), Box::new(frame));
-    }
-
-    /// `stage` submitted: its edges are satisfied (submission edges now, completion edges once its
-    /// work completed).
-    fn submitted(self: &Arc<Self>, stage: StageId, submitted: Submitted) {
-        let _hot = HotScope::enter();
-        let index = usize::from(stage.0);
-        let Submitted { marker, completion } = submitted;
-        // Device order passes through a stage that queued nothing.
-        let out = match marker {
-            Some(marker) => vec![marker],
-            None => lock(&self.stages[index].inputs).clone(),
-        };
-        let completion = {
-            let mut boundary = lock(&self.boundary);
-            if let Some(marker) = marker {
-                merge(&mut boundary.markers, marker);
-            }
-            if self.graph.topology.has_completion_successor[index] {
-                completion
-            } else {
-                boundary.hosts.extend(completion);
-                None
-            }
-        };
-        self.release_pins(stage, marker);
-        self.notify_externals(stage, &out);
-        if self.halted() {
-            if self.kill.load(Ordering::Acquire) {
-                self.note(QuantumOutcome::Killed);
-            }
-            return;
-        }
-        if self.graph.topology.has_completion_successor[index] {
-            self.live.fetch_add(1, Ordering::AcqRel);
-            let ready = AllOf {
-                lanes: self.graph.runtime.lanes.clone(),
-                markers: marker.into_iter().collect(),
-                hosts: completion.into_iter().collect(),
-            };
-            // On the predecessor's ordered lane, if it has one: its completions (emitted in
-            // registration order) then publish their successors in that order, so an ordered
-            // successor keeps the predecessor's order.
-            let ordered = self.graph.spec.stages[index].ordered;
-            let frame = Arrival {
-                header: self.header(ordered, true),
-                run: self.clone(),
-                to: Target::Completions(stage),
-            };
-            self.graph
-                .runtime
-                .completions
-                .after(Box::new(ready), Box::new(frame));
-        }
-        for &(successor, kind) in &self.graph.topology.successors[index] {
-            if kind == EdgeKind::Submission {
-                self.arrive(successor, &out);
-            }
-        }
-    }
-
-    /// Ends the pins this quantum's external edges into `stage` hold, the used stage's `marker`
-    /// joining the earlier quanta's boundaries.
-    fn release_pins(&self, stage: StageId, marker: Option<Marker>) {
-        let released: Vec<QuantumRef> = {
-            let mut pins = lock(&self.pins);
-            let (mine, rest) = std::mem::take(&mut *pins)
-                .into_iter()
-                .partition(|(to, _)| *to == stage);
-            *pins = rest;
-            mine.into_iter().map(|(_, pin)| pin).collect()
-        };
-        for pin in released {
-            if let Some(marker) = marker {
-                pin.pin.run.cover(marker);
-            }
-            drop(pin);
-        }
-    }
-
-    fn notify_externals(&self, stage: StageId, out: &[Marker]) {
-        let waiters: Vec<_> = {
-            let mut externals = lock(&self.externals);
-            externals.out[usize::from(stage.0)] = Some(out.to_vec());
-            let (mine, rest) = std::mem::take(&mut externals.waiters)
-                .into_iter()
-                .partition(|(s, _)| *s == stage);
-            externals.waiters = rest;
-            mine
-        };
-        for (_, arrive) in waiters {
-            arrive(out.to_vec());
-        }
-    }
-
-    fn register_external(self: &Arc<Self>, edge: ExternalEdge) {
-        let ExternalEdge {
-            from,
-            from_stage,
-            to_stage,
-            kind,
-        } = edge;
-        let upstream = from.pin.run.clone();
-        lock(&self.pins).push((to_stage, from));
-        let me = self.clone();
-        upstream.subscribe(
-            from_stage,
-            Box::new(move |markers| me.external_arrived(to_stage, kind, markers)),
-        );
-    }
-
-    fn external_arrived(self: &Arc<Self>, to: StageId, kind: EdgeKind, markers: Vec<Marker>) {
-        if kind == EdgeKind::Completion && !markers.is_empty() && !self.halted() {
-            // The edge's live count passes to the frame that arrives once the markers are reached.
-            let ready = AllOf {
-                lanes: self.graph.runtime.lanes.clone(),
-                markers,
-                hosts: Vec::new(),
-            };
-            let frame = Arrival {
-                header: self.header(None, true),
-                run: self.clone(),
-                to: Target::Stage(to),
-            };
-            self.graph
-                .runtime
-                .completions
-                .after(Box::new(ready), Box::new(frame));
-            return;
-        }
-        let markers = if kind == EdgeKind::Completion {
-            Vec::new()
-        } else {
-            markers
-        };
-        self.arrive(to, &markers);
-        self.finish_one();
-    }
-
-    /// No stage of the quantum can run again: later quanta waiting on its stages are released, its
-    /// unrun stages abandoned, and its own token dropped (the boundary is armed once no pin is
-    /// left).
-    fn quiesce(self: &Arc<Self>) {
-        let (waiters, frontier) = {
-            let mut externals = lock(&self.externals);
-            externals.swept = true;
-            (
-                std::mem::take(&mut externals.waiters),
-                lock(&self.boundary).markers.clone(),
-            )
-        };
-        for (_, arrive) in waiters {
-            arrive(frontier.clone());
-        }
-        let remaining: Vec<QuantumRef> = std::mem::take(&mut *lock(&self.pins))
-            .into_iter()
-            .map(|(_, p)| p)
-            .collect();
-        drop(remaining);
-        {
-            let quantum = self.quantum.read().unwrap_or_else(PoisonError::into_inner);
-            let quantum = quantum.as_ref().expect("a quiescing quantum is bound");
-            for (index, state) in self.stages.iter().enumerate() {
-                if !state.ran.load(Ordering::Acquire) {
-                    self.graph.stages[index].abandoned(quantum);
-                }
-            }
-        }
-        self.clone().release_hold();
-    }
-
-    /// Every pin is gone: arms the retirement boundary.
-    fn arm_boundary(self: &Arc<Self>) {
-        let BoundarySet { markers, hosts } = std::mem::take(&mut *lock(&self.boundary));
-        let frame = Box::new(Retirement {
-            header: self.header(None, false),
-            run: self.clone(),
-        });
-        if markers.is_empty() && hosts.is_empty() {
-            self.offer_frame(frame);
-        } else {
-            let ready = AllOf {
-                lanes: self.graph.runtime.lanes.clone(),
-                markers,
-                hosts,
-            };
-            self.graph.runtime.completions.after(Box::new(ready), frame);
-        }
-    }
-
-    fn conclude(&self) {
-        let quantum = self
-            .quantum
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
-        let Some(quantum) = quantum else { return };
-        let outcome = lock(&self.cause)
-            .take()
-            .unwrap_or(QuantumOutcome::Completed);
-        let retired = catch_unwind(AssertUnwindSafe(|| (self.graph.retire)(quantum, outcome)));
-        self.graph.live.fetch_sub(1, Ordering::AcqRel);
-        if let Err(panic) = retired {
-            resume_unwind(panic);
-        }
-    }
-}
-
-impl<Q: Send + Sync + 'static> Upstream for Run<Q> {
-    fn subscribe(&self, stage: StageId, arrive: ArriveWith) {
-        let now = {
-            let mut externals = lock(&self.externals);
-            if let Some(out) = &externals.out[usize::from(stage.0)] {
-                Some(out.clone())
-            } else if externals.swept {
-                Some(lock(&self.boundary).markers.clone())
-            } else {
-                externals.waiters.push((stage, arrive));
-                return;
-            }
-        };
-        if let Some(markers) = now {
-            arrive(markers);
-        }
-    }
-
-    fn cover(&self, marker: Marker) {
-        merge(&mut lock(&self.boundary).markers, marker);
-    }
-
-    fn release_hold(self: Arc<Self>) {
-        if self.holds.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.arm_boundary();
-        }
-    }
-}
-
-/// A stage of a quantum: runs it in `execute`, hands on to its successors in `do_finally`.
-struct StageFrame<Q: Send + Sync + 'static> {
+/// The one frame type of a graph, pooled: a stage, an arrival, a boundary or a retirement, by its [`Kind`].
+struct GraphFrame<Q> {
     header: FrameHeader,
-    run: Arc<Run<Q>>,
-    stage: StageId,
+    /// The run it serves, while it is in flight.
+    run: Option<Arc<Run<Q>>>,
+    kind: Kind,
     result: Option<Result<Submitted, StageError>>,
+    /// A stage's scratch: the markers it ran after, and those of them on other lanes. Their capacity stays with the
+    /// frame.
+    inputs: Vec<Marker>,
+    waits: Vec<Marker>,
+    pool: Weak<Producer<Box<GraphFrame<Q>>, Multi>>,
 }
 
-impl<Q: Send + Sync + 'static> Frame for StageFrame<Q> {
+impl<Q: Send + Sync + 'static> GraphFrame<Q> {
+    fn new(pool: Weak<Producer<Box<GraphFrame<Q>>, Multi>>) -> Self {
+        Self {
+            header: FrameHeader::new(0),
+            run: None,
+            kind: Kind::Idle,
+            result: None,
+            inputs: Vec::new(),
+            waits: Vec::new(),
+            pool,
+        }
+    }
+}
+
+impl<Q: Send + Sync + 'static> Frame for GraphFrame<Q> {
     fn header(&self) -> &FrameHeader {
         &self.header
     }
@@ -1176,123 +1834,159 @@ impl<Q: Send + Sync + 'static> Frame for StageFrame<Q> {
     }
 
     fn execute(&mut self) -> Result<(), FrameError> {
-        self.result = self.run.run_stage(self.stage);
+        if let (Kind::Stage(stage), Some(run)) = (self.kind, &self.run) {
+            self.result = run.run_stage(stage, &mut self.inputs, &mut self.waits);
+        }
         Ok(())
     }
 
     fn do_finally(mut self: Box<Self>) {
-        match self.result.take() {
-            Some(Ok(submitted)) => self.run.submitted(self.stage, submitted),
-            Some(Err(StageError::Retry)) if self.header.is_alive() => {
-                // The live count passes to the retry, which offers the stage again.
-                self.run.retry(self.stage);
+        let alive = self.header.is_alive();
+        let Some(run) = self.run.take() else {
+            self.recycle();
+            return;
+        };
+        let finish = match self.kind {
+            Kind::Stage(stage) => run.stage_ended(stage, self.result.take(), &self.inputs, alive),
+            Kind::Completions(stage) => {
+                run.completed(stage, alive);
+                true
+            }
+            Kind::External(index) => run.external_reached(index, alive),
+            Kind::Retry(stage) => run.retry_woke(stage, alive),
+            Kind::Boundary => {
+                let last = run.boundary_left.fetch_sub(1, Ordering::AcqRel) == 1;
+                self.recycle();
+                if last {
+                    run.conclude();
+                }
                 return;
             }
-            Some(Err(StageError::Retry)) => {
-                self.run.stages[usize::from(self.stage.0)]
-                    .ran
-                    .store(false, Ordering::Release);
-                self.run.note(QuantumOutcome::Killed);
+            Kind::Retire => {
+                self.recycle();
+                run.conclude();
+                return;
             }
-            Some(Err(error)) => {
-                self.run.fail(self.stage, error);
-                self.run.release_pins(self.stage, None);
-            }
-            None if !self.header.is_alive() => self.run.note(QuantumOutcome::Killed),
-            None => {}
+            Kind::Idle => false,
+        };
+        self.recycle();
+        if finish {
+            run.finish_one();
         }
-        self.run.finish_one();
     }
 
-    fn do_finally_with_error(self: Box<Self>, error: FrameError) {
-        let name = self.run.graph.spec.stages[usize::from(self.stage.0)].name;
-        self.run.stages[usize::from(self.stage.0)]
-            .ran
-            .store(true, Ordering::Release);
-        self.run.fail(
-            self.stage,
-            StageError::Fatal(format!("stage {name} failed: {error}")),
-        );
-        self.run.release_pins(self.stage, None);
-        self.run.finish_one();
-    }
-}
-
-enum Target {
-    /// The completion-edge successors of this stage.
-    Completions(StageId),
-    /// One stage, the target of an external completion edge.
-    Stage(StageId),
-    /// A retried stage, run again (its live count is the arrival's).
-    Retry(StageId),
-}
-
-/// A completion edge's arrival, emitted by [`Completions`] once the predecessor's work completed.
-struct Arrival<Q: Send + Sync + 'static> {
-    header: FrameHeader,
-    run: Arc<Run<Q>>,
-    to: Target,
-}
-
-impl<Q: Send + Sync + 'static> Frame for Arrival<Q> {
-    fn header(&self) -> &FrameHeader {
-        &self.header
+    fn do_finally_with_error(mut self: Box<Self>, error: FrameError) {
+        let Kind::Stage(stage) = self.kind else {
+            return self.do_finally();
+        };
+        let Some(run) = self.run.take() else {
+            return self.recycle();
+        };
+        run.stage_errored(stage, error);
+        self.recycle();
+        run.finish_one();
     }
 
-    fn header_mut(&mut self) -> &mut FrameHeader {
-        &mut self.header
-    }
-
-    fn do_finally(self: Box<Self>) {
-        if !self.header.is_alive() {
-            self.run.note(QuantumOutcome::Killed);
-        } else if !self.run.stopped.load(Ordering::Acquire) {
-            match self.to {
-                Target::Completions(stage) => {
-                    for &(successor, kind) in
-                        &self.run.graph.topology.successors[usize::from(stage.0)]
-                    {
-                        if kind == EdgeKind::Completion {
-                            self.run.arrive(successor, &[]);
-                        }
-                    }
-                }
-                Target::Stage(stage) => self.run.arrive(stage, &[]),
-                Target::Retry(stage) => {
-                    self.run.offer(stage);
-                    return;
-                }
-            }
+    /// Back to the graph's pool, serving no run.
+    fn recycle(mut self: Box<Self>) {
+        self.run = None;
+        self.kind = Kind::Idle;
+        self.result = None;
+        self.header = FrameHeader::new(0);
+        if let Some(pool) = self.pool.upgrade() {
+            let _ = pool.offer(self);
         }
-        self.run.finish_one();
-    }
-
-    fn do_finally_with_error(self: Box<Self>, _: FrameError) {
-        self.do_finally();
     }
 }
 
-/// The quantum's end, after its boundary: hands it and its outcome to `retire`.
-struct Retirement<Q: Send + Sync + 'static> {
-    header: FrameHeader,
-    run: Arc<Run<Q>>,
-}
+/// The pieces a run's phases are handed over by, under every interleaving the memory model allows: the first cause,
+/// the final arrival that reads what the other predecessors wrote, and the lane table. (The run itself is not modelled:
+/// its queues, `Arc`s and the completions use `std`'s atomics.)
+#[cfg(all(loom, test))]
+mod loom_tests {
+    use super::*;
+    use crate::QueueId;
+    use loom::sync::Arc;
+    use loom::thread;
 
-impl<Q: Send + Sync + 'static> Frame for Retirement<Q> {
-    fn header(&self) -> &FrameHeader {
-        &self.header
+    #[test]
+    fn loom_the_first_cause_stands_whoever_races() {
+        loom::model(|| {
+            let cause = Arc::new(FirstCause::<u32>::new());
+            let other = {
+                let cause = cause.clone();
+                thread::spawn(move || cause.claim(1))
+            };
+            let mine = cause.claim(2);
+            let theirs = other.join().unwrap();
+            assert_ne!(mine, theirs, "exactly one claim wins");
+            // SAFETY: both claimants joined.
+            let taken = unsafe { cause.take() };
+            assert_eq!(taken, Some(if mine { 2 } else { 1 }));
+        });
     }
 
-    fn header_mut(&mut self) -> &mut FrameHeader {
-        &mut self.header
+    // A join with two predecessors: each writes its output, then arrives. The arrival that finds it was the last
+    // reads both outputs, whichever thread it is on.
+    #[test]
+    fn loom_the_last_arrival_sees_every_predecessors_markers() {
+        loom::model(|| {
+            let stages: Arc<[StageRun; 3]> =
+                Arc::new([StageRun::new(), StageRun::new(), StageRun::new()]);
+            stages[2].pending.store(2, Ordering::Relaxed);
+            let queue = QueueId::next();
+            let arrive = move |stages: &[StageRun; 3], which: usize| -> bool {
+                // SAFETY: this thread owns predecessor `which`'s output until it arrives.
+                unsafe {
+                    stages[which]
+                        .out
+                        .write(|out| out.push(Marker::new(queue, LaneId(which as u16), 1)))
+                };
+                if !stages[2].arrive() {
+                    return false;
+                }
+                for predecessor in &stages[..2] {
+                    // SAFETY: the last arrival follows both predecessors' writes.
+                    let seen = unsafe { predecessor.out.read(Vec::len) };
+                    assert_eq!(seen, 1, "the last arrival sees every output");
+                }
+                true
+            };
+            let other = {
+                let stages = stages.clone();
+                thread::spawn(move || arrive(&stages, 1))
+            };
+            let mine = arrive(&stages, 0);
+            let theirs = other.join().unwrap();
+            assert_ne!(mine, theirs, "exactly one arrival is the last");
+        });
     }
 
-    fn do_finally(self: Box<Self>) {
-        self.run.conclude();
-    }
-
-    fn do_finally_with_error(self: Box<Self>, _: FrameError) {
-        self.run.conclude();
+    // A reader that sees a lane in the table sees at least the value recorded before the bit; the latest of two
+    // recorders stands.
+    #[test]
+    fn loom_a_reader_that_sees_a_lane_sees_its_value() {
+        loom::model(|| {
+            let table = Arc::new(LaneTable::new(2));
+            let recorders: Vec<_> = [5u64, 7]
+                .into_iter()
+                .map(|value| {
+                    let table = table.clone();
+                    thread::spawn(move || table.record(1, value))
+                })
+                .collect();
+            let used = table.used();
+            if used & 0b10 != 0 {
+                assert!(table.value(1) >= 5, "a lane in the table has its value");
+            }
+            for recorder in recorders {
+                recorder.join().unwrap();
+            }
+            assert_eq!(table.used(), 0b10);
+            assert_eq!(table.value(1), 7);
+            table.clear();
+            assert_eq!((table.used(), table.value(1)), (0, 0));
+        });
     }
 }
 
@@ -1300,15 +1994,20 @@ impl<Q: Send + Sync + 'static> Frame for Retirement<Q> {
 /// `CrossGraphEdgesTest` (the parts that apply: CUDA capture, transfer lanes, workspaces and graph
 /// recycling have no counterpart here). Frames are run by hand, the way an executor runs them, from
 /// the stage sink and the completions.
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests {
-    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::{AtomicU32, AtomicU64};
+    use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
     use euhedral_core::generics::LatticeSource;
     use euhedral_core::ingest::{IngestSink, QueueIngestSink};
 
     use super::*;
     use crate::{DeviceQueue, QueueId};
+
+    fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+        mutex.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 
     /// A lane whose work completes when the test says so.
     #[derive(Debug)]
@@ -2664,5 +3363,438 @@ mod tests {
         assert_eq!(graph.live(), 0);
         assert!((0..5).all(|q| h.retired(q) == [QuantumOutcome::Completed]));
         assert_eq!(h.runtime.completions.pending(), 0);
+    }
+
+    /// Runs frames from the harness's sink on `workers` threads, and its completions, until `stop` says so.
+    #[allow(clippy::disallowed_methods)] // The test's own threads run frames, as lattice workers do.
+    fn drive(h: &Arc<Harness>, workers: usize, stop: impl Fn() -> bool + Send + Sync + 'static) {
+        let pull = Arc::new(Mutex::new(()));
+        let stop = Arc::new(stop);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let threads: Vec<_> = (0..workers)
+            .map(|_| {
+                let (h, pull, stop) = (h.clone(), pull.clone(), stop.clone());
+                std::thread::spawn(move || {
+                    while !stop() {
+                        assert!(Instant::now() < deadline, "the workers did not finish");
+                        let mut frame = None;
+                        {
+                            let _one = lock(&pull);
+                            h.sink
+                                .delegate()
+                                .pull(&mut |f| frame = Some(f), &mut |_| false, 1);
+                            if frame.is_none() {
+                                h.runtime.completions.pull(
+                                    &mut |f| frame = Some(f),
+                                    &mut |_| false,
+                                    1,
+                                );
+                            }
+                        }
+                        match frame {
+                            Some(frame) => run_frame(frame),
+                            None => {
+                                h.finish_lanes();
+                                std::thread::yield_now();
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+    }
+
+    /// Java `AbstractQuantum.failure.compareAndSet(null, cause)`: the first cause stands.
+    #[test]
+    fn the_first_failure_wins_among_8_failing_stages() {
+        let h = Arc::new(Harness::new(1));
+        let stages: Vec<(Option<u64>, &[u16], Act)> =
+            (0..8).map(|_| (None, &[][..], Act::Fail)).collect();
+        let graph = h.graph(&stages, &[]);
+        for q in 0..50 {
+            let _ = graph.start(q, alive(), Vec::new());
+            let g = graph.clone();
+            drive(&h, 4, move || g.live() == 0);
+            let retired = h.retired(q);
+            assert!(
+                matches!(
+                    &retired[..],
+                    [QuantumOutcome::Failed {
+                        error: StageError::Corrupt(_),
+                        ..
+                    }]
+                ),
+                "one outcome, the first failure: {retired:?}"
+            );
+        }
+    }
+
+    /// A failure then a kill (and a kill then a failure) keep the first cause.
+    #[test]
+    fn a_kill_after_a_failure_keeps_the_failure_and_a_failure_after_a_kill_keeps_the_kill() {
+        let h = Harness::new(1);
+        let graph = h.graph(
+            &[(None, &[], Act::Fail), (None, &[], Act::Cpu)],
+            &[(0, 1, Submission)],
+        );
+        let kill = alive();
+        let _ = graph.start(1, kill.clone(), Vec::new());
+        h.pump_once();
+        kill.store(true, Ordering::Release);
+        h.pump();
+        assert!(matches!(
+            &h.retired(1)[..],
+            [QuantumOutcome::Failed {
+                stage: StageId(0),
+                ..
+            }]
+        ));
+        let run = h.graph(
+            &[(None, &[], Act::Cpu), (None, &[], Act::Fail)],
+            &[(0, 1, Submission)],
+        );
+        let kill = alive();
+        let _ = run.start(2, kill.clone(), Vec::new());
+        kill.store(true, Ordering::Release);
+        h.pump();
+        assert_eq!(h.retired(2), [QuantumOutcome::Killed]);
+    }
+
+    /// A diamond whose branches run on other lanes, on 8 workers: the join always sees both branches' markers.
+    #[test]
+    fn a_diamond_on_8_workers_runs_the_join_with_every_input() {
+        let h = Arc::new(Harness::new(4));
+        let graph = h.graph(
+            &[
+                (None, &[0], Act::Submit),
+                (None, &[1], Act::Submit),
+                (None, &[2], Act::Submit),
+                (None, &[3], Act::Submit),
+            ],
+            &[
+                (0, 1, Submission),
+                (0, 2, Submission),
+                (1, 3, Submission),
+                (2, 3, Submission),
+            ],
+        );
+        let total = 300;
+        for q in 0..total {
+            let _ = graph.start(q, alive(), Vec::new());
+        }
+        let g = graph.clone();
+        drive(&h, 8, move || g.live() == 0);
+        let events = h.events();
+        for q in 0..total {
+            let mut joins = events.iter().filter_map(|e| match e {
+                Event::Ran {
+                    q: eq,
+                    stage: 3,
+                    waits,
+                    ..
+                } if *eq == q => Some(waits.clone()),
+                _ => None,
+            });
+            let mut waits = joins.next().expect("the join ran");
+            assert!(joins.next().is_none(), "the join ran once");
+            waits.sort_unstable();
+            assert_eq!(
+                waits.iter().map(|w| w.0).collect::<Vec<_>>(),
+                [1, 2],
+                "the join waits for both branches: {waits:?}"
+            );
+            assert_eq!(h.retired(q), [QuantumOutcome::Completed]);
+        }
+    }
+
+    /// Java `StageFrame.externals`: an edge registered before the stage submitted, one registered while another waits,
+    /// and one registered after, each arrive once with the stage's marker.
+    #[test]
+    fn subscriptions_before_during_and_after_publication_each_arrive_once() {
+        let h = Harness::new(2);
+        let graph = crossed(&h, Act::Submit);
+        let edge = |from: &QuantumRef| ExternalEdge {
+            from: from.clone(),
+            from_stage: StageId(1),
+            to_stage: StageId(0),
+            kind: Submission,
+        };
+        let a = graph.start(1, alive(), Vec::new());
+        let _ = graph.start(2, alive(), vec![edge(&a)]);
+        assert!(h.pump_once(), "the earlier quantum's root");
+        let _ = graph.start(3, alive(), vec![edge(&a)]);
+        assert!(
+            h.pump_once(),
+            "the earlier quantum's stage 1 seals its stack"
+        );
+        let _ = graph.start(4, alive(), vec![edge(&a)]);
+        drop(a);
+        h.pump();
+        for q in 2..=4 {
+            assert_eq!(h.ran(q), [0, 1], "quantum {q}");
+            assert_eq!(h.ran_with(q, 0).unwrap().1, [(0, 1)], "quantum {q}");
+        }
+        h.finish_lanes();
+        h.pump();
+        for q in 1..=4 {
+            assert_eq!(h.retired(q), [QuantumOutcome::Completed], "quantum {q}");
+        }
+        assert_eq!(graph.live(), 0);
+    }
+
+    /// Java `CrossGraphEdgesTest`: pins are released once, whether the stage that used the quantum ran or was swept.
+    #[test]
+    fn external_pins_are_released_once_whether_the_stage_runs_or_is_swept() {
+        let h = Harness::new(2);
+        let graph = crossed(&h, Act::Submit);
+        let a = graph.start(1, alive(), Vec::new());
+        let edge = |from: &QuantumRef| ExternalEdge {
+            from: from.clone(),
+            from_stage: StageId(1),
+            to_stage: StageId(0),
+            kind: Submission,
+        };
+        let _ = graph.start(2, alive(), vec![edge(&a)]);
+        let _ = graph.start(3, Arc::new(AtomicBool::new(true)), vec![edge(&a)]);
+        drop(a);
+        h.pump();
+        h.finish_lanes();
+        h.pump();
+        assert_eq!(h.retired(1), [QuantumOutcome::Completed]);
+        assert_eq!(h.retired(2), [QuantumOutcome::Completed]);
+        assert_eq!(h.retired(3), [QuantumOutcome::Killed]);
+        assert_eq!(h.abandoned(3), [0, 1]);
+        assert_eq!(graph.live(), 0);
+        assert_eq!(h.runtime.completions.pending(), 0);
+    }
+
+    /// Java `CrossGraphEdgesTest.aCancelledGraphBetweenTwoOthersPassesTheEarlierOnesOrderOn`: a quantum killed before
+    /// its stage ran passes on the order of what its external edge named.
+    #[test]
+    fn a_cancelled_quantum_between_two_others_passes_the_earlier_ones_order_on() {
+        let h = Harness::new(2);
+        let first = h.graph(&[(None, &[0], Act::Submit)], &[]);
+        let middle = h.graph(&[(None, &[1], Act::Submit)], &[]);
+        let last = h.graph(&[(None, &[1], Act::Submit)], &[]);
+        let a = first.start(1, alive(), Vec::new());
+        let edge = |from: QuantumRef| ExternalEdge {
+            from,
+            from_stage: StageId(0),
+            to_stage: StageId(0),
+            kind: Submission,
+        };
+        let b = middle.start(2, Arc::new(AtomicBool::new(true)), vec![edge(a)]);
+        let _ = last.start(3, alive(), vec![edge(b)]);
+        h.pump();
+        assert!(h.ran(2).is_empty(), "the middle quantum was killed");
+        assert_eq!(
+            h.ran_with(3, 0).unwrap().1,
+            [(0, 1)],
+            "the last follows the first through the middle"
+        );
+        h.finish_lanes();
+        h.pump();
+        assert_eq!(h.retired(2), [QuantumOutcome::Killed]);
+        assert_eq!(h.retired(1), [QuantumOutcome::Completed]);
+        assert_eq!(h.retired(3), [QuantumOutcome::Completed]);
+    }
+
+    /// Java `StageGraphHostStageTest.aFailedQuantumStillWaitsForADeferredStageAndNeverPublishesPastIt`.
+    #[test]
+    fn a_failed_quantum_still_waits_for_a_host_completion_and_publishes_nothing_past_it() {
+        let h = Harness::new(1);
+        let token = Token::default();
+        let graph = h.graph(
+            &[
+                (None, &[], Act::Host(token.clone())),
+                (None, &[], Act::Fail),
+                (None, &[], Act::Cpu),
+            ],
+            &[(0, 1, Submission), (1, 2, Submission)],
+        );
+        let _ = graph.start(1, alive(), Vec::new());
+        h.pump();
+        assert_eq!(h.ran(1), [0, 1], "nothing runs past the failure");
+        assert!(
+            h.retired(1).is_empty(),
+            "the host completion holds the retirement back"
+        );
+        assert_eq!(h.abandoned(1), [], "the quantum has not quiesced");
+        token.0.store(true, Ordering::Release);
+        h.pump();
+        assert_eq!(h.abandoned(1), [2]);
+        assert!(matches!(
+            &h.retired(1)[..],
+            [QuantumOutcome::Failed {
+                stage: StageId(1),
+                ..
+            }]
+        ));
+        assert_eq!(graph.live(), 0);
+    }
+
+    /// Java `StageGraphTest.repeatedQuantaReuseTheSameGraphFramesAndResetReadiness`: quanta one after another reuse
+    /// one run and the same frames, and each starts with its readiness reset.
+    #[test]
+    fn repeated_quanta_reuse_the_pooled_run_and_frames_and_reset_readiness() {
+        let h = Harness::new(2);
+        let graph = h.graph(
+            &[
+                (None, &[0], Act::Submit),
+                (None, &[1], Act::Submit),
+                (None, &[], Act::Cpu),
+                (None, &[0], Act::Submit),
+            ],
+            &[
+                (0, 1, Submission),
+                (0, 2, Completion),
+                (1, 3, Submission),
+                (2, 3, Submission),
+            ],
+        );
+        let mut pooled = None;
+        for q in 0..20 {
+            let _ = graph.start(q, alive(), Vec::new());
+            for _ in 0..4 {
+                h.pump();
+                h.finish_lanes();
+            }
+            h.pump();
+            assert_eq!(h.retired(q), [QuantumOutcome::Completed], "quantum {q}");
+            let now = (
+                graph.runs.consumer.size_long(),
+                graph.core.frames.consumer.size_long(),
+            );
+            assert_eq!(now.0, 1, "one run serves every quantum");
+            match pooled {
+                None => pooled = Some(now),
+                Some(first) => assert_eq!(now, first, "no new frame after the first quantum"),
+            }
+            assert_eq!(h.ran(q).len(), 4, "every stage ran in quantum {q}");
+        }
+    }
+
+    /// A run recycled with a stack sealed `Submitted` and a stage's old markers opens clean for its next quantum.
+    #[test]
+    fn a_rebound_run_starts_with_clean_stacks_and_markers() {
+        let h = Harness::new(2);
+        let graph = crossed(&h, Act::Submit);
+        let _ = graph.start(1, alive(), Vec::new());
+        h.pump();
+        h.finish_lanes();
+        h.pump();
+        assert_eq!(h.retired(1), [QuantumOutcome::Completed]);
+        // The same run again: a later quantum names its stage 1 before it submitted.
+        let second = graph.start(2, alive(), Vec::new());
+        let edge = ExternalEdge {
+            from: second.clone(),
+            from_stage: StageId(1),
+            to_stage: StageId(0),
+            kind: Submission,
+        };
+        let _ = graph.start(3, alive(), vec![edge]);
+        drop(second);
+        assert!(
+            h.ran(3).is_empty(),
+            "it waits for quantum 2's stage 1, not the old binding's"
+        );
+        h.pump();
+        assert_eq!(
+            h.ran_with(3, 0).unwrap().1,
+            [(0, 2)],
+            "quantum 2's marker, value 2 on lane 0"
+        );
+        h.finish_lanes();
+        h.pump();
+        assert_eq!(graph.live(), 0);
+    }
+
+    /// Java `concurrentFinishersRecycleGraphsForLaterQuanta`: quanta started from several threads while workers run
+    /// and retire others each retire once, and the pool serves them.
+    #[test]
+    #[allow(clippy::disallowed_methods)] // The test's own threads start quanta.
+    fn quanta_started_on_four_threads_retire_once_each_while_the_pool_serves_them() {
+        let h = Arc::new(Harness::new(2));
+        let graph = h.graph(
+            &[
+                (None, &[0], Act::Submit),
+                (None, &[1], Act::Submit),
+                (None, &[], Act::Cpu),
+            ],
+            &[(0, 1, Submission), (1, 2, Completion)],
+        );
+        let per_thread = 100u64;
+        let started = Arc::new(AtomicU64::new(0));
+        let starters: Vec<_> = (0..4u64)
+            .map(|t| {
+                let (graph, started) = (graph.clone(), started.clone());
+                std::thread::spawn(move || {
+                    for i in 0..per_thread {
+                        let _ = graph.start(t * per_thread + i, alive(), Vec::new());
+                        started.fetch_add(1, Ordering::AcqRel);
+                    }
+                })
+            })
+            .collect();
+        let (g, s) = (graph.clone(), started.clone());
+        drive(&h, 4, move || {
+            s.load(Ordering::Acquire) == 4 * per_thread && g.live() == 0
+        });
+        for starter in starters {
+            starter.join().unwrap();
+        }
+        for q in 0..4 * per_thread {
+            assert_eq!(h.retired(q), [QuantumOutcome::Completed], "quantum {q}");
+            assert_eq!(h.ran(q).len(), 3, "quantum {q}");
+        }
+        assert_eq!(h.runtime.completions.pending(), 0);
+    }
+
+    /// The retire callback may start the next quantum: the retiring run is not yet in the pool, and the next quantum
+    /// runs on another.
+    #[test]
+    fn a_quantum_may_start_the_next_from_its_retire_callback() {
+        let h = Harness::new(1);
+        let graph: Arc<OnceLock<Arc<StageGraph<u64>>>> = Arc::default();
+        let log = h.log.clone();
+        let again = graph.clone();
+        let spec = {
+            let mut spec = StageGraphSpec::new();
+            spec.stage(StageSpec {
+                name: "probe",
+                ordered: None,
+                lanes: vec![],
+            });
+            spec
+        };
+        let built = StageGraph::new(
+            spec,
+            vec![Arc::new(Named(
+                0,
+                Probe {
+                    act: Act::Cpu,
+                    log: h.log.clone(),
+                    hands: h.hands.clone(),
+                },
+            ))],
+            h.runtime.clone(),
+            move |q: u64, outcome| {
+                lock(&log).push(Event::Retired { q, outcome });
+                if q < 3 {
+                    let _ = again.get().unwrap().start(q + 1, alive(), Vec::new());
+                }
+            },
+        )
+        .unwrap();
+        graph.set(built.clone()).ok().unwrap();
+        let _ = built.start(0, alive(), Vec::new());
+        h.pump();
+        for q in 0..=3 {
+            assert_eq!(h.retired(q), [QuantumOutcome::Completed], "quantum {q}");
+        }
+        assert_eq!(built.live(), 0);
     }
 }

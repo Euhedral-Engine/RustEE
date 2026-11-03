@@ -30,12 +30,6 @@ const HOT_FIX_TAGS: &[(&str, usize)] = &[
     ("C18", 3),
     ("C19", 3),
     ("C20", 5),
-    ("G10", 3),
-    ("G11", 4),
-    ("G12", 4),
-    ("G13", 4),
-    ("G14", 4),
-    ("G15", 4),
     ("H1", 5),
     ("H2", 4),
     ("H3", 4),
@@ -456,6 +450,56 @@ fn lock_sites_are_found_however_they_are_spelled() {
     assert_eq!(
         lock_sites("unlock!(a) block!(b) my_lock!(c) macro_rules! lock {"),
         0
+    );
+}
+
+/// The files of the stage graph's path, which take no lock at all (the ids G10 to G15 are gone, and no tag may come
+/// back for them).
+const LOCK_FREE_FILES: &[&str] = &[
+    "euhedral-graph/src/stage_graph.rs",
+    "euhedral-graph/src/take_all.rs",
+];
+
+/// The words of the code of `text`, without its comments.
+fn code_words(text: &str) -> Vec<String> {
+    text.lines()
+        .map(|line| line.split("//").next().unwrap_or(""))
+        .flat_map(|line| {
+            line.split(|character: char| !(character.is_alphanumeric() || character == '_'))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .filter(|word| !word.is_empty())
+        .collect()
+}
+
+#[test]
+fn the_stage_graph_path_names_no_lock_and_carries_no_hot_fix_tag() {
+    let sources = sources();
+    for file in LOCK_FREE_FILES {
+        let (_, text) = sources
+            .iter()
+            .find(|(path, _)| path == file)
+            .unwrap_or_else(|| panic!("{file} is a library source"));
+        let locks: Vec<String> = code_words(text)
+            .into_iter()
+            .filter(|word| LOCK_TYPES.contains(&word.as_str()) || word == "lock")
+            .collect();
+        assert!(locks.is_empty(), "{file} names a lock: {locks:?}");
+        assert!(!text.contains(HOT_FIX), "{file} carries a HOT-FIX tag");
+    }
+    let listed: BTreeSet<&str> = HOT_FIX_TAGS.iter().map(|(id, _)| *id).collect();
+    for id in ["G10", "G11", "G12", "G13", "G14", "G15"] {
+        assert!(!listed.contains(id), "{id} is fixed: it may not be listed");
+    }
+}
+
+#[test]
+fn code_words_skip_comments() {
+    assert_eq!(code_words("let a = 1; // a Mutex"), ["let", "a", "1"]);
+    assert_eq!(
+        code_words("use std::sync::Mutex;"),
+        ["use", "std", "sync", "Mutex"]
     );
 }
 

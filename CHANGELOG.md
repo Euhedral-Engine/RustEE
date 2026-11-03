@@ -3,6 +3,62 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## A stage graph's quantum takes no lock and allocates nothing after warm-up (2026-11-03)
+
+**What.** `StageGraph`'s per-quantum path no longer takes a lock (the `HOT-FIX` ids G10 to G15 are gone) and no longer allocates once
+warmed up. A quantum is a pooled run, taken by `start` and given back by `retire`; the graph's frames are one pooled type. `start` takes
+its external edges as any `IntoIterator<Item = ExternalEdge>` (a `Vec` still works; an array or an `Option` needs none). `QuantumRef` is
+unchanged to use.
+
+**Why.** A quantum cost about 12 lock acquisitions and about 14 allocations, and quanta are about to be small and frequent. Euhedral-Inference's
+`StageGraph` keeps a quantum's state without locks (volatile and atomic counts, single-writer fields, reused graph and frame objects); this
+brings the port to it. The Java graph is rebound to each quantum; here the rebound object is a pooled run, as frames are recycled through
+a `FrameManager`-style pool (a bounded multi-consumer queue: `FrameManager::get` takes `&mut self`).
+
+**What replaced each lock** (Java counterpart in brackets):
+- G10 `quantum: RwLock<Option<Q>>` becomes a plain cell set by `start` before any frame is published, read while `holds > 0`, taken by the
+  retirement (`StageGraph.quantum`, a plain field).
+- G11 `cause: Mutex` becomes one compare-and-swap that claims the first cause, whose winner writes it (`AbstractQuantum.failure.compareAndSet`).
+- G12 per-stage `inputs: Mutex<Vec<Marker>>` goes: a stage keeps its output markers (`StageFrame.marker`, `lane`), and a stage merges its inputs
+  from its predecessors' outputs when it runs, after its final arrival (the arrival count orders the reads).
+- G13 `externals: Mutex` becomes a closable stack per stage, sealed `Submitted` when the stage submitted and `Swept` when its quantum quiesced
+  without it (`StageFrame.externals`, `SUBMITTED`, `SWEPT`). New: `take_all::TakeAllStack`, intrusive over the later quantum's pooled edge
+  records, so a push allocates nothing.
+- G14 `boundary: Mutex<BoundarySet>` becomes the used-lane mask and the latest marker value per lane (`StageGraph.usedLanes`); the boundary is
+  armed as one `Completions` edge per lane, and the last one retires the quantum. A host completion no edge consumed holds a live count until
+  it is ready (`deferral`), so the boundary needs no host list.
+- G15 `pins: Mutex<Vec<(StageId, QuantumRef)>>` becomes the pin in each external-edge record, taken by the stage that used it or by the quiesce
+  (`externalIn`, `firstSlot`: fixed slots, each holding a live count).
+
+**Semantics.**
+- Quanta, frames, markers and edge records are pooled. A full pool drops what comes back; a take that finds another taker active makes a
+  new one. A stage that returns a host completion allocates it; a retried stage, and a completion that waits for both a marker and a
+  host completion, allocate their wake-ups.
+- The boundary is armed as one edge per used lane, not one edge over all of them: a retirement frame no longer travels through the stage
+  sink when the quantum used a lane (the last lane's arrival retires it in place); a quantum that used none still offers its retirement frame to
+  the sink.
+- A host completion that no completion edge consumes now holds the quantum live (as in Java), so the quantum quiesces, and abandons its
+  unrun stages, after it. Before, it only delayed the retirement.
+- The boundary edges are `Completions::after_marker` registrations, so a `Completions` dropped while a lane has not reached a quantum's marker
+  leaks the registration (as it does for any marker registration) rather than concluding the quantum: its resources are not released
+  while the device may still use them.
+- A stage whose marker names a queue that is no lane of the pool fails the quantum (`StageError::Fatal`); the boundary could never reach it.
+- **Drift from Java fixed.** An external edge into a stage that never ran (its quantum was killed or failed first) now passes the edge's
+  markers on: the quantum's boundary takes them over, so a quantum released onto it still follows the quanta before it (Java `awaitExternals`).
+  Before, a later quantum named through a killed quantum lost the order of the one before.
+
+**Tests.** `stage_graph::tests`: `the_first_failure_wins_among_8_failing_stages`, `a_kill_after_a_failure_keeps_the_failure_and_a_failure_after_a_kill_keeps_the_kill`,
+`a_diamond_on_8_workers_runs_the_join_with_every_input`, `subscriptions_before_during_and_after_publication_each_arrive_once`,
+`external_pins_are_released_once_whether_the_stage_runs_or_is_swept`, `a_cancelled_quantum_between_two_others_passes_the_earlier_ones_order_on`
+(port of `CrossGraphEdgesTest.aCancelledGraphBetweenTwoOthersPassesTheEarlierOnesOrderOn`), `a_failed_quantum_still_waits_for_a_host_completion_and_publishes_nothing_past_it`
+(`StageGraphHostStageTest.aFailedQuantumStillWaitsForADeferredStageAndNeverPublishesPastIt`),
+`repeated_quanta_reuse_the_pooled_run_and_frames_and_reset_readiness` (`StageGraphTest.repeatedQuantaReuseTheSameGraphFramesAndResetReadiness`),
+`a_rebound_run_starts_with_clean_stacks_and_markers`, `quanta_started_on_four_threads_retire_once_each_while_the_pool_serves_them`
+(`StageGraphReuseTest.concurrentFinishersRecycleGraphsForLaterQuanta`), `a_quantum_may_start_the_next_from_its_retire_callback`;
+`take_all` (pushes racing a seal, and the loom model `loom_two_pushes_and_a_seal_account_for_every_node_once`);
+`euhedral-graph/tests/stage_graph_alloc.rs` (3000 quanta of 4 stages over two lanes, each with an external edge, allocate 0 times after warm-up);
+`euhedral-core/tests/hot_fix_ratchet.rs` (the six ids are removed from `HOT_FIX_TAGS`, and `the_stage_graph_path_names_no_lock_and_carries_no_hot_fix_tag`).
+
 ## A worker that sits out still enters a handle every probe interval (2026-11-03)
 
 **What.** A worker on the Idle path now takes a Direct cycle once per `IdlePolicy::probe_interval` (1 ms by default): it pulls one handle,
