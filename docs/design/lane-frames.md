@@ -66,8 +66,8 @@ frames included. Nothing in production calls it. It is a trap.
 | The lane's poll frame | the lane's hash |
 | Successors that touch no lane state | the item's choice (`randomize_hash` for parallel work) |
 
-The caller gives each lane its hash (`LaneSource::new(.., hash)`) and never randomizes it. The engine picks hashes that map
-to different cores, and accepts that a rebalance may put two lanes on one core. Item frames are ordered, so they leave
+The caller gives each lane its hash (`LaneSource::new(.., hash)`) and never randomizes it. A dependent that wants its lanes apart picks hashes
+that map to different cores, and accepts that a rebalance may put two lanes on one core. Item frames are ordered, so they leave
 only through `request` + push. Pulls hand over unordered successors.
 
 ## 4. Waits: not released until ready
@@ -89,8 +89,7 @@ only through `request` + push. Pulls hand over unordered successors.
 - **Dead held items.** They need one look per pass (one acquire load of `is_alive`). The source then emits a dead item at
   once, the core skips it, and its `do_finally` runs `skipped` in the cell (`executor.rs:43-46`). There is no other end
   path. A released item needs no check from the lane at all.
-- **A host-written value.** The source holds the item on a gate that reads the value with one acquire load (the
-  `host_reached` pattern).
+- **A value another thread writes.** The source holds the item on a gate that reads the value with one acquire load.
   - The writer does not call `request`, which is the downstream's demand.
   - The writer's release store is the signal. The source rereads its gates on every pass, which is every worker cycle while
     the lattice is busy, and at least once per probe interval (1 ms) when workers sit out (CHANGELOG, 2026-11-03). That
@@ -116,7 +115,7 @@ only through `request` + push. Pulls hand over unordered successors.
 | `admit`/`run_waiting` → `run_one` | `execute`: enter the cell, drain retirements, `X::check`, run |
 | `then`, `failed(S::Error)` | inside `execute` |
 | `retired` | in the cell, in the lane frame that drains it (usually the poll frame) |
-| `skipped` (6a, draft PR #47) | `do_finally` of a frame skipped as dead: enter the cell, `skipped(work, cx)` |
+| `skipped` (draft PR #47) | `do_finally` of a frame skipped as dead: enter the cell, `skipped(work, cx)` |
 | — | `do_finally_with_error` (a panic in `run`, unroutable at a closed lattice, a push to a retired cache): enter the cell, `skipped` |
 
 `LaneFrame::is_alive` delegates to `LaneWork::is_alive`, so the header carries no kill switch.
@@ -179,7 +178,7 @@ Each step can be merged on its own.
 1. **euhedral-graph.** Add `Lane`, `LaneCell`, `LaneFrame`, the poll frame, the pool and the ready queue, and swap the
    `LaneSource` internals.
    - `LaneSource::new` takes the lane hash.
-   - `LaneWork` gains `is_alive`/`skipped` (6a's API, without PR #47's source-side check of intake items) and `needs`, and
+   - `LaneWork` gains `is_alive`/`skipped` (PR #47's API, without its source-side check of intake items) and `needs`, and
      loses `Outcome::Wait`. `LaneState` gains its `LaneGate`.
    - Re-pin `tests/lane_source*.rs` and `lane_intake_alloc.rs`.
 2. **euhedral-gpu.**
@@ -187,15 +186,9 @@ Each step can be merged on its own.
      `poll_retired` runs on the lane's core.
    - Re-pin `open_lane_sources` and the fake and CUDA lane tests.
    - In euhedral-benchmarks: `bin/idle_polls.rs`.
-3. **MySphere** (repin first):
-   - **dec** (`crates/lanes/src/dec.rs`): C1 (dec.rs:585-593) moves to `is_alive`, and `skipped` drops the buffer. Every
-     `DecWait` becomes a gate on what the lane publishes: room, the probe's progress, release, builds, memory.
-   - **enc**: C2 (enc.rs:350-354) moves to `is_alive`, and `skipped` calls `sink.rejected(job, Cancelled)`. Every `EncWait`
-     becomes a gate: buffers, locks run, clocks, the key frame, drained, released.
-   - **The engine's lanes** (`crates/engine/src/lanes.rs:615-733`) get hashes on different cores.
-   - **The engine's host wait** (`EngineWait::Host`) becomes a gate. Its 5 ms timer goes.
-   - `docs/design/epoch-kill-switch.md` step 6b becomes "C1/C2 move to the frame". Step 6a (PR #47) is superseded by
-     step 1.
+3. **euhedral-memory.** `Moves` as in §11 (it does not use `lane_source`).
+4. **A dependent that adopts this** repins, then moves each item kind's liveness check from `run` to `is_alive`/`skipped`,
+   turns each wait into a gate on what its lane publishes, and passes its lane hashes. Draft PR #47 is superseded by step 1.
 
 ## 10. Tests
 
@@ -220,25 +213,14 @@ Each replacement below follows the same pattern:
 - frames recycled as `GrpcFrame` is;
 - completions spawned from `do_finally` into a source.
 
-Costs come from the docs cited. The rows run from hottest or costliest down. MySphere sites are at `arch/next-4` e4a5984b.
+The rows run from hottest down.
 
 | # | Site | What runs in the pass | Replacement |
 |---|---|---|---|
-| 1 | MySphere `dec` lanes ×2 (`crates/engine/src/lanes.rs:669-739` → `source.rs:478-533`) | `cuvidDecodePicture`: p50 3.83 ms in a burst (cuda-move.md:638), and a 1-3 ms decoder tail (R-S2) | this design |
-| 2 | MySphere `enc`, `enc-vp`, `enc-aux` lanes (same sites) | `nvEncEncodePicture` (µs), and the lock item: 0.01-0.1 ms after the clock, 6-12 ms if early (cuda-move.md:661, 841) | this design |
-| 3 | MySphere compute and `ofa` lanes (same sites) | launches and graph replays, several per picture (µs; instantiation on a miss is long, R-G3); `nvOFExecute` about 20 µs (cuda-move.md:1506-1512) | this design |
-| 4 | MySphere `infer` lane | the TensorRT enqueue (µs) or ORT (about 0.3 ms) (cuda-move.md:714) | this design |
-| 5 | MySphere `LinkSource::request` → `deliver` → `make` (`crates/engine/src/admission.rs:706, 665, 415-664`) | per picture: pool slots and the lease (that is assembly), an analysis record decoded inline (`on_admit`, :615, under 0.1 ms), and a boxed `Task` | the decode moves into the admitted frame (`SOURCE_LANE`), and the `Task` frames come from a `FrameManager` |
-| 6 | MySphere `xfer` lane | copies (µs) | this design |
-| 7 | RustEE `Moves::emit` → `pump` (`euhedral-memory/src/tiers.rs:1155-1164, 866-906`) | finishes moves, starts second-hop copies (driver calls), frees slots, and allocates a `Vec` per pass | the source emits one recycled pump frame per tier, ordered on the tier's hash, when moves wait. Retired moves are spawned from its `do_finally` |
-| 8 | MySphere offline analyser lanes (`crates/bins/analyze/src/run.rs`, `ana.rs`) | decode and inference items | this design (moves with the repin) |
-| 9 | RustEE `AsyncIo` (`euhedral-io/src/lib.rs:917-957`, `uring.rs:623-651`) | reaping (fine), plus an SQE flush (`io_uring_enter`) and `EAGAIN` requeues | the flush moves to the submitting frame, or to a frame emitted when entries wait. Continuations only build frames (`lib.rs:54-55`) |
-| 10 | RustEE `IdleWatch::poll` (`euhedral-graph/src/lake.rs:562-570`) | a detach under a lock, once per idle period | a lifecycle frame (low priority) |
-| — | `QueueSource`, `SingleUseSource`, `LatticeHotSource`; `Completions` and MySphere's `Ready` impls (queries only); `DeferredCalls` (pushes one key frame); `GiveBacks` (wraps orders, though its frames are boxed per order and should be recycled) | — | fine |
-| — | MySphere `ClaimCell`/`SourceCell` state (`viewport.rs:642`, `core.rs:219`, `ring.rs:440`, cuda `restore.rs:324`, `interp.rs:214`) | entered by frames or lane items, not by a source pass | already the lane-cell pattern; the cuda books move with their lanes |
+| 1 | `LaneSource::serve` (`euhedral-graph/src/lane_source/source.rs:478-533`) | every ready item's `run`: the device submissions and whatever else the item does | this design |
+| 2 | `Moves::emit` → `pump` (`euhedral-memory/src/tiers.rs:1155-1164, 866-906`) | finishes moves, starts second-hop copies (driver calls), frees slots, and allocates a `Vec` per pass | the source emits one recycled pump frame per tier, ordered on the tier's hash, when moves wait. Retired moves are spawned from its `do_finally` |
+| 3 | `AsyncIo` (`euhedral-io/src/lib.rs:917-957`, `uring.rs:623-651`) | reaping (fine), plus an SQE flush (`io_uring_enter`) and `EAGAIN` requeues | the flush moves to the submitting frame, or to a frame emitted when entries wait. Continuations only build frames (`lib.rs:54-55`) |
+| 4 | `IdleWatch::poll` (`euhedral-graph/src/lake.rs:562-570`) | a detach under a lock, once per idle period | a lifecycle frame (low priority) |
+| — | `QueueSource`, `SingleUseSource`, `LatticeHotSource`; `Completions` (queries only); `DeferredCalls` (pushes one key frame); `GiveBacks` (wraps orders, though its frames are boxed per order and should be recycled) | — | fine |
 
-**Order.**
-- Sites 1-4, 6 and 8 all move with §9 step 1, because one `LaneSource` change moves every lane. MySphere then adopts the
-  gates in table order.
-- Site 5 can move in parallel.
-- Then 7, 9 and 10.
+**Order.** 1 (§9 step 1), then 2, 3 and 4.
