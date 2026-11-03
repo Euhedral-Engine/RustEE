@@ -33,9 +33,12 @@
 //! - **Bytes.** A call carries the bytes it gives back and where ([`Place`]): [`DeferredCalls::pending_bytes`] says how
 //!   much, per place, for a planner that counts it as certain reclaim.
 //! - **Tickets.** `defer` returns a [`Ticket`]. [`DeferredCalls::run_through`] makes every call that is queued when it is
-//!   called, which includes the ticket's, on the calling thread: it becomes the consumer as soon as the cell is free, so it
-//!   cannot return before the ticket's call has been made. It is for the owner that cannot go on without the memory (an
-//!   allocation that ran out of it), never for a thread that must not block: those use `drain_soon`.
+//!   called, which includes the ticket's, on the calling thread: it becomes the consumer as soon as the cell is free and
+//!   makes as many calls as had been counted when it was called (a producer counts before it claims its place, and a place
+//!   claimed and not yet published ends what a drain can see, so it waits for that too), so it cannot return before the
+//!   ticket's call has been made. It is for the owner that
+//!   cannot go on without the memory (an allocation that ran out of it), never for a thread that must not block: those use
+//!   `drain_soon`.
 //! - **Panics.** Each call runs under `catch_unwind`; a panic is counted ([`DeferredCalls::panicked`]) and the rest still run.
 //! - **Drop.** Dropping the source makes the calls still queued, on the dropping thread: a deferred free is a promise to free,
 //!   and the values a call owns (a mapping that must be unmapped after it is unregistered) are never dropped unrun. A call
@@ -118,7 +121,8 @@ pub struct DeferredCalls {
     _queue: MpscQueue<Call>,
     producer: Producer<Call, Multi>,
     drain: SourceCell<Drain>,
-    /// Calls queued (each `defer` adds one after its call is in the queue).
+    /// Calls queued: each `defer` adds one before it claims its place in the queue, so a call that is being offered is counted
+    /// and a place claimed is always counted.
     queued: AtomicU64,
     /// Calls made (the consumer publishes after each).
     completed: AtomicU64,
@@ -145,11 +149,11 @@ pub struct DeferredCalls {
     hooks: Hooks,
 }
 
-/// Test points between a producer's offer and its ticket, and after a call is counted made.
+/// Test points between a producer's count and its offer, and after a call is counted made.
 #[cfg(test)]
 #[derive(Default)]
 struct Hooks {
-    after_offer: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    after_count: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     after_made: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
@@ -237,7 +241,7 @@ impl Deferral {
         self.0.can_drain()
     }
 
-    /// How many calls wait.
+    /// How many calls wait, including calls on their way into the queue.
     pub fn pending(&self) -> usize {
         self.0.pending()
     }
@@ -311,7 +315,7 @@ impl DeferredCalls {
         !self.stopped.load(Ordering::Relaxed) && !self.downstream.is_complete()
     }
 
-    /// How many calls wait.
+    /// How many calls wait, including calls on their way into the queue.
     pub fn pending(&self) -> usize {
         let queued = self.queued.load(Ordering::Relaxed);
         let made = self.completed.load(Ordering::Relaxed);
@@ -354,27 +358,33 @@ impl DeferredCalls {
             return self.last_ticket();
         }
         let at = self.now();
-        self.bytes_of(place).fetch_add(bytes, Ordering::Relaxed);
-        if let Err(call) = self.producer.offer(Call {
-            place,
-            bytes,
-            at,
-            run,
-        }) {
-            // The queue never refuses; if it did, the call runs here rather than being lost.
-            self.bytes_of(place).fetch_sub(bytes, Ordering::Relaxed);
-            run_call(&self.panicked, call.run);
-            return self.last_ticket();
-        }
+        // Counted before the place is claimed: any place claimed before a thread reads `queued` was counted by then, whether or
+        // not its call is published yet (`run_through` waits for that many calls). The count is of calls being offered too.
+        let ticket = Ticket(self.queued.fetch_add(1, Ordering::AcqRel) + 1);
         #[cfg(test)]
-        Hooks::run(&self.hooks.after_offer);
+        Hooks::run(&self.hooks.after_count);
+        self.bytes_of(place).fetch_add(bytes, Ordering::Relaxed);
+        // `MpscQueue::with_pool` is unbounded and `offer` hands an item back only when a bounded queue is full, so it cannot
+        // refuse. There is no recovery path on purpose: a call that was counted and not queued would never be made, and a
+        // `run_through` that read the count would wait for it for ever.
+        if self
+            .producer
+            .offer(Call {
+                place,
+                bytes,
+                at,
+                run,
+            })
+            .is_err()
+        {
+            unreachable!("an unbounded queue never refuses a call");
+        }
         // After the offer, and a full fence between the two sides: either the consumer that just emptied the queue sees this call
         // when it looks for the next oldest, or this store comes after its reset.
         fence(Ordering::SeqCst);
         let _ = self
             .oldest
             .compare_exchange(0, at, Ordering::Relaxed, Ordering::Relaxed);
-        let ticket = Ticket(self.queued.fetch_add(1, Ordering::Relaxed) + 1);
         self.poll();
         ticket
     }
@@ -483,7 +493,7 @@ impl DeferredCalls {
             ran += 1;
             self.bytes_of(call.place)
                 .fetch_sub(call.bytes, Ordering::Relaxed);
-            self.completed.store(drain.made, Ordering::Relaxed);
+            self.completed.store(drain.made, Ordering::Release);
             #[cfg(test)]
             Hooks::run(&self.hooks.after_made);
         }
@@ -497,9 +507,11 @@ impl DeferredCalls {
     }
 
     /// Makes every call that is queued when it is called, which includes `ticket`'s, on this thread, waiting for a drain
-    /// another thread is running: it becomes the consumer as soon as the cell is free, so it never returns before the
-    /// ticket's call has been made. Returns `false` only when called from inside a call (it cannot wait for itself). For an
-    /// allocation that ran out of memory: a build-time call, which may block.
+    /// another thread is running and for a producer that has counted its call and not yet published it: it becomes the
+    /// consumer as soon as the cell is free, and it does not return before as many calls have been made as were counted when
+    /// it was called, so it never returns before the ticket's call has been made. Returns `false` only when called from
+    /// inside a call (it cannot wait for itself). For an allocation that ran out of memory: a build-time call, which may
+    /// block.
     #[allow(
         clippy::disallowed_methods,
         reason = "LIFECYCLE(deferred-wait): a build-time call waits for the drain that holds the calls it needs"
@@ -509,17 +521,27 @@ impl DeferredCalls {
             return true;
         }
         let _cold = HotScope::leave();
+        // Every call counted so far, which includes every place claimed before this load, the ticket's call's among them: a
+        // producer counts before it claims, and this thread's own claim comes after those it read from. The calls are made in
+        // the order of the places, so once this many are made the ticket's is. A call counted and not yet published is made
+        // as soon as its thread, which is running, publishes it.
+        let target = self.queued.load(Ordering::Acquire);
         loop {
             if DRAINING.get() {
                 return false;
             }
-            // A drain that enters after this thread's call was queued finds it queued or made: the calls are made inside the
-            // cell, so a thread that gets in has seen the queue the ticket's call was offered to.
+            if self.completed.load(Ordering::Acquire) >= target {
+                return true;
+            }
             if let Some(mut drain) = self.drain.try_enter() {
+                // The queue ends at the first place that is claimed and not yet published, so a drain can stop short of calls
+                // that are counted. The cell is left between tries so that a drain or another waiter is not held up.
                 let was = DRAINING.replace(true);
                 self.make_all(&mut drain);
                 DRAINING.set(was);
-                return true;
+                if drain.made >= target {
+                    return true;
+                }
             }
             std::thread::yield_now();
         }
@@ -953,80 +975,73 @@ mod tests {
         *slot.lock().unwrap() = Some(Arc::new(f));
     }
 
-    /// Producers take their tickets after they offer, so ticket order is not queue order: a producer that has offered and not yet
-    /// counted its call lets a later call take ticket 1 while the queue holds two. A thread that waits for ticket 1 while a
-    /// drain has made one call (counted: 1) must still not return before its own call was made.
+    /// Producers count their call before they claim a place, so ticket order is not queue order: a producer that has counted and
+    /// not yet offered lets a later call take ticket 2 and be published first, and a drain then makes it and stops at the
+    /// empty queue. A thread that waits for ticket 2 must not return then (the count says two calls were due), and `pending`
+    /// must not say nothing waits while one call is on its way in.
     #[test]
     fn run_through_never_returns_before_the_tickets_call_was_made() {
         let calls = calls();
-        let first_offered = Arc::new(AtomicBool::new(false));
+        let first_counted = Arc::new(AtomicBool::new(false));
         let release_producer = Arc::new(AtomicBool::new(false));
-        let drained_one = Arc::new(AtomicBool::new(false));
-        let release_drain = Arc::new(AtomicBool::new(false));
-        // The first producer stops between its offer and its ticket.
+        // The first producer stops between its count and its offer.
         let me = std::thread::current().id();
         {
-            let (offered, release) = (first_offered.clone(), release_producer.clone());
-            hook(&calls.hooks.after_offer, move || {
-                if std::thread::current().id() != me && !offered.swap(true, Ordering::AcqRel) {
+            let (counted, release) = (first_counted.clone(), release_producer.clone());
+            hook(&calls.hooks.after_count, move || {
+                if std::thread::current().id() != me && !counted.swap(true, Ordering::AcqRel) {
                     wait_for(|| release.load(Ordering::Acquire));
                 }
             });
         }
+        let first_ran = Arc::new(AtomicBool::new(false));
         let second_ran = Arc::new(AtomicBool::new(false));
-        let (log, call) = recorder();
         std::thread::scope(|scope| {
             let producer = {
-                let d = calls.handle();
-                let c = call(1);
-                scope.spawn(move || d.defer(Place::Device, 0, c))
+                let (d, ran) = (calls.handle(), first_ran.clone());
+                scope.spawn(move || {
+                    d.defer(Place::Device, 0, move || ran.store(true, Ordering::Release))
+                })
             };
-            wait_for(|| first_offered.load(Ordering::Acquire));
-            // The second call is offered behind the first and takes ticket 1: the first is not counted yet.
+            wait_for(|| first_counted.load(Ordering::Acquire));
+            // The second call is published behind nothing: the first is counted and not in the queue.
             let d = calls.handle();
             let ran = second_ran.clone();
             let ticket = d.defer(Place::Device, 0, move || ran.store(true, Ordering::Release));
-            assert_eq!(ticket, Ticket(1));
-            // A drain makes the first call (counted: 1) and stops before the second.
-            {
-                let (drained, release) = (drained_one.clone(), release_drain.clone());
-                hook(&calls.hooks.after_made, move || {
-                    if !drained.swap(true, Ordering::AcqRel) {
-                        wait_for(|| release.load(Ordering::Acquire));
-                    }
-                });
-            }
-            let drainer = {
-                let calls = calls.clone();
-                scope.spawn(move || calls.drain())
-            };
-            wait_for(|| drained_one.load(Ordering::Acquire));
-            assert_eq!(*log.lock().unwrap(), vec![1]);
-            assert!(!second_ran.load(Ordering::Acquire));
+            assert_eq!(ticket, Ticket(2));
+            assert_eq!(calls.pending(), 2, "a call on its way in is waiting");
+            // A drain makes the second call and finds the queue empty.
+            assert_eq!(calls.drain(), 1);
+            assert!(second_ran.load(Ordering::Acquire));
+            assert_eq!(calls.pending(), 1, "the first call is still due");
             let started = Arc::new(AtomicBool::new(false));
+            let returned = Arc::new(AtomicBool::new(false));
             let waiter = {
-                let (d, started, ran) = (calls.handle(), started.clone(), second_ran.clone());
+                let (d, started, returned) = (calls.handle(), started.clone(), returned.clone());
                 scope.spawn(move || {
                     started.store(true, Ordering::Release);
                     let made = d.run_through(ticket);
-                    (made, ran.load(Ordering::Acquire))
+                    returned.store(true, Ordering::Release);
+                    made
                 })
             };
             wait_for(|| started.load(Ordering::Acquire));
             for _ in 0..1000 {
                 std::thread::yield_now();
             }
-            release_drain.store(true, Ordering::Release);
-            let (made, ran_when_returned) = waiter.join().unwrap();
-            assert!(made);
             assert!(
-                ran_when_returned,
-                "run_through returned before the ticket's call was made"
+                !returned.load(Ordering::Acquire),
+                "run_through returned while a counted call was not yet in the queue"
             );
-            assert_eq!(drainer.join().unwrap(), 2);
             release_producer.store(true, Ordering::Release);
+            assert!(waiter.join().unwrap());
+            assert!(
+                first_ran.load(Ordering::Acquire),
+                "run_through returned before the call counted ahead of it was made"
+            );
             producer.join().unwrap();
         });
+        assert_eq!(calls.pending(), 0);
     }
 
     /// The same property under load: four producers each wait for their own call through a ticket while a drainer runs.
