@@ -11,22 +11,71 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// What one worker observes of the handle it is servicing: whether a frame was routed through that
+/// handle during the call.
+#[derive(Clone, Copy)]
+struct Servicing {
+    /// The handle, as its claim names it.
+    owner: u64,
+    pushed: bool,
+}
+
 thread_local! {
-    static ROUTED_PUSHES: Cell<u64> = const { Cell::new(0) };
+    static SERVICING: Cell<Option<Servicing>> = const { Cell::new(None) };
 }
 
-/// Records that a frame was routed downstream on this thread, so a request serviced on this
-/// thread can tell that its source produced work synchronously.
-pub(crate) fn note_routed_push() {
-    ROUTED_PUSHES.with(|pushes| pushes.set(pushes.get().wrapping_add(1)));
+/// Records that a frame was pushed through the handle `owner`, and whether it was routed (`routed`)
+/// or found no downstream to take it. It counts as evidence for the service this thread is
+/// performing on that handle, and for no other handle and no other thread. The last push of a
+/// service decides: a frame that could not be routed leaves the handle unproductive for the
+/// service, even after one that could.
+pub(crate) fn note_routed_push(owner: u64, routed: bool) {
+    SERVICING.with(|servicing| {
+        if let Some(mut observed) = servicing.get()
+            && observed.owner == owner
+        {
+            observed.pushed = routed;
+            servicing.set(Some(observed));
+        }
+    });
 }
 
-/// What a request can observe about its source producing work on this thread: the frames
-/// delivered against the thread's [`FlowContext`] request, and the frames routed on the thread.
-fn request_evidence() -> (u64, u64) {
-    let satisfied =
-        FlowContext::with(|context| context.map_or(0, |context| context.satisfied_request()));
-    (satisfied, ROUTED_PUSHES.with(Cell::get))
+/// The span of one service of a handle, in which [`note_routed_push`] marks the handle. Ends when
+/// dropped, even by a panic, and gives back the observation of the service it interrupted.
+///
+/// A service nested in another one on the same thread through a different registry's queue would
+/// lose the outer handle's pushes made while it ran; that is unreachable through
+/// `UpstreamRegistry::with_thread_queue`, which refuses a queue already in use on the thread.
+struct Observing {
+    outer: Option<Servicing>,
+}
+
+impl Observing {
+    fn begin(owner: u64) -> Self {
+        let observed = Servicing {
+            owner,
+            pushed: false,
+        };
+        Self {
+            outer: SERVICING.with(|servicing| servicing.replace(Some(observed))),
+        }
+    }
+
+    /// Whether a frame was routed through the handle since the span began.
+    fn pushed(&self) -> bool {
+        SERVICING.with(|servicing| servicing.get().is_some_and(|observed| observed.pushed))
+    }
+}
+
+impl Drop for Observing {
+    fn drop(&mut self) {
+        SERVICING.with(|servicing| servicing.set(self.outer));
+    }
+}
+
+/// The frames delivered against the thread's [`FlowContext`] request so far.
+fn satisfied_request() -> u64 {
+    FlowContext::with(|context| context.map_or(0, |context| context.satisfied_request()))
 }
 
 /// The proof that a worker holds a handle's claim.
@@ -628,7 +677,15 @@ impl<'a> Acquired<'a> {
     }
 
     /// Pulls or requests up to `demand` frames from the handle and records what that showed about
-    /// its source.
+    /// its source: this worker's view of the handle, for this one service.
+    ///
+    /// - A pull that finds frames shows a productive source. One that finds none shows an empty
+    ///   source, unless a frame was routed through the handle during the call.
+    /// - A request that routes a frame through the handle, or satisfies the thread's request, shows
+    ///   a productive source. A request that does not is no evidence of an empty source, since a
+    ///   request has no empty result: the view stays as it was.
+    /// - A pull that stopped at a frame, or that could not be made (the handle was closed or
+    ///   draining, had no demand, or its source panicked), changes nothing.
     fn service(mut self, pull: Option<&mut Pull<'_>>, demand: u64) -> u64 {
         let Self {
             queue,
@@ -639,6 +696,7 @@ impl<'a> Acquired<'a> {
         let entry = entry.as_mut().expect("the entry is held until dropped");
         let claim = claim.as_mut().expect("the claim is held until dropped");
         let was_productive = entry.productive;
+        let observing = Observing::begin(claim.owner());
         let (pulled, productive) = match pull {
             Some(Pull { consumer, stop }) => {
                 let mut stopped = false;
@@ -652,18 +710,21 @@ impl<'a> Acquired<'a> {
                     .pull(claim, &mut **consumer, &mut watch, demand);
                 *hold_for_request = stopped;
                 let productive = match result {
-                    Some(0) if !stopped => false,
+                    Some(0) if !stopped => observing.pushed(),
                     Some(0) | None => was_productive,
                     Some(_) => true,
                 };
                 (result.unwrap_or(0), productive)
             }
             None => {
-                let before = request_evidence();
+                let before = satisfied_request();
                 entry.handle.request(claim, demand);
-                (0, was_productive || request_evidence() != before)
+                let productive =
+                    was_productive || observing.pushed() || satisfied_request() != before;
+                (0, productive)
             }
         };
+        drop(observing);
         FlowContext::with(|context| {
             if let Some(context) = context {
                 context.add_satisfied_pull(pulled);

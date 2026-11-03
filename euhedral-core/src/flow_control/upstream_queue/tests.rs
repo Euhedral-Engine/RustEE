@@ -3,7 +3,7 @@ use crate::frames::BenchmarkFrame;
 use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 /// A handle that records what it is asked for and can be made contended, empty or broken.
 #[derive(Default)]
@@ -151,14 +151,14 @@ impl UpstreamHandle for SourceHandle {
         Some(pulled)
     }
 
-    fn request(&self, _claim: &mut Claim, demand: u64) {
+    fn request(&self, claim: &mut Claim, demand: u64) {
         for _ in 0..demand {
             let Some(frame) = self.frames.lock().unwrap().pop_front() else {
                 return;
             };
             self.routed.lock().unwrap().push(frame.header().id_hash());
             if !self.silent {
-                note_routed_push();
+                note_routed_push(claim.owner(), true);
             }
             if self.counts_against_request {
                 FlowContext::with(|context| context.unwrap().add_satisfied_request(1));
@@ -325,6 +325,9 @@ fn cached_and_true_counts_follow_the_live_handle_count() {
     assert_eq!(fixture.queue.true_upstream_count(), 2);
 }
 
+/// A new handle is productive until a worker that services it finds it empty (Java: a new
+/// `ProductivityObservation` is `productive = true`, and `UpstreamQueueTest.shouldInitiallyClassifyLiveHandlesAsProductive`
+/// pins it). A fresh worker has no evidence of an empty source, so it must not idle for want of one.
 #[test]
 fn new_handles_count_as_productive() {
     let mut fixture = Fixture::new();
@@ -350,6 +353,12 @@ fn productivity_returns_with_useful_work() {
     assert_eq!(fixture.queue.nonproductive_count, 0);
 }
 
+/// A request has no empty-source result: it either routes a frame or says nothing, so a request
+/// that routes nothing leaves the worker's view as it was. A pull that found 0 stays unproductive
+/// through it, and a handle that was never pulled stays productive. This is the rule of Java's
+/// `UpstreamQueue.serviceAcquiredHandle` ("Without a synchronous push, it supplies no new evidence
+/// and retains the worker's prior observation"), pinned there by
+/// `UpstreamQueueTest.shouldNotTreatRequestOnlyServiceAsEmptyPullEvidence`.
 #[test]
 fn a_request_is_not_evidence_of_an_empty_source() {
     let mut fixture = Fixture::new();
@@ -1347,4 +1356,400 @@ fn a_held_back_handle_counts_when_reconciling_completed_handles() {
     assert_eq!(fixture.queue.productive_handle_count(), 1);
     assert_eq!(fixture.queue.nonproductive_count, 0);
     assert_eq!(fixture.held(), 1);
+}
+
+/// A handle whose next pull or request is scripted, to mark a worker's view one acquisition at a
+/// time.
+struct Scripted {
+    /// The owner its claims name, and the one its pushes are reported against unless `push_as` says
+    /// otherwise.
+    owner: u64,
+    /// The owner a push is reported against, when it is not the handle's own.
+    push_as: AtomicU64,
+    found: AtomicU64,
+    /// The pull cannot be made.
+    unserviceable: AtomicBool,
+    /// The pull stops at a frame it leaves in the source.
+    stops: AtomicBool,
+    pushes_in_pull: AtomicBool,
+    pushes_in_request: AtomicBool,
+    /// What a push does: it is routed, or it is routed and then another finds no downstream, or only
+    /// one that finds none is made.
+    unroutable: AtomicU8,
+}
+
+impl Scripted {
+    fn new(owner: u64) -> Arc<Self> {
+        Arc::new(Self {
+            owner,
+            push_as: AtomicU64::new(owner),
+            found: AtomicU64::new(0),
+            unserviceable: AtomicBool::new(false),
+            stops: AtomicBool::new(false),
+            pushes_in_pull: AtomicBool::new(false),
+            pushes_in_request: AtomicBool::new(false),
+            unroutable: AtomicU8::new(ROUTED),
+        })
+    }
+
+    /// Scripts the next acquisitions: a pull finds `found` frames; no pull is made, stops, or pushes.
+    fn script(
+        &self,
+        found: u64,
+        unserviceable: bool,
+        stops: bool,
+        push_in_pull: bool,
+        push_in_request: bool,
+    ) {
+        self.found.store(found, Ordering::Relaxed);
+        self.unserviceable.store(unserviceable, Ordering::Relaxed);
+        self.stops.store(stops, Ordering::Relaxed);
+        self.pushes_in_pull.store(push_in_pull, Ordering::Relaxed);
+        self.pushes_in_request
+            .store(push_in_request, Ordering::Relaxed);
+    }
+}
+
+/// A scripted push is routed.
+const ROUTED: u8 = 0;
+/// A scripted push is routed, then another finds no downstream.
+const ROUTED_THEN_UNROUTABLE: u8 = 1;
+/// A scripted push finds no downstream.
+const UNROUTABLE: u8 = 2;
+
+impl Scripted {
+    fn push(&self) {
+        let owner = self.push_as.load(Ordering::Relaxed);
+        let kind = self.unroutable.load(Ordering::Relaxed);
+        if kind != UNROUTABLE {
+            note_routed_push(owner, true);
+        }
+        if kind != ROUTED {
+            note_routed_push(owner, false);
+        }
+    }
+}
+
+impl UpstreamHandle for Scripted {
+    fn sequence(&self) -> u64 {
+        self.owner
+    }
+
+    fn pull(
+        &self,
+        _claim: &mut Claim,
+        _consumer: &mut dyn FnMut(Box<dyn Frame>),
+        stop: &mut dyn FnMut(&dyn Frame) -> bool,
+        demand: u64,
+    ) -> Option<u64> {
+        if self.unserviceable.load(Ordering::Relaxed) {
+            return None;
+        }
+        if self.pushes_in_pull.load(Ordering::Relaxed) {
+            self.push();
+        }
+        if self.stops.load(Ordering::Relaxed) {
+            assert!(stop(&*ordered(1)), "the stop condition matches the frame");
+        }
+        Some(self.found.load(Ordering::Relaxed).min(demand))
+    }
+
+    fn request(&self, _claim: &mut Claim, _demand: u64) {
+        if self.pushes_in_request.load(Ordering::Relaxed) {
+            self.push();
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        false
+    }
+
+    fn try_acquire(&self) -> Option<Claim> {
+        Some(Claim::new(self.owner))
+    }
+}
+
+/// One worker's view of one handle, after each kind of acquisition, from each starting view.
+///
+/// The rule is Java's `LatticeVertex.UpstreamInterceptor` observation as `UpstreamQueue` applies it:
+/// - a routed push through the handle during the acquisition, or a pull that finds frames, shows it
+///   productive;
+/// - a pull that finds nothing shows it unproductive;
+/// - a request that routes nothing, a pull that stopped at a frame, and a pull that could not be made
+///   (Java's early exits: no demand, no work in progress, closed, draining, complete, a throw) all
+///   restore the view the worker had.
+#[test]
+fn an_acquisition_marks_the_handle_by_what_it_showed() {
+    // (what the acquisition does, is it a pull, found, unserviceable, stops, push in pull,
+    // push in request, view after from an unproductive start, view after from a productive start)
+    let cases = [
+        (
+            "a request that pushes nothing",
+            false,
+            0,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+        ),
+        (
+            "a request that pushes",
+            false,
+            0,
+            false,
+            false,
+            false,
+            true,
+            true,
+            true,
+        ),
+        (
+            "a pull that finds frames",
+            true,
+            3,
+            false,
+            false,
+            false,
+            false,
+            true,
+            true,
+        ),
+        (
+            "a pull that finds nothing",
+            true,
+            0,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        ),
+        (
+            "a pull that finds nothing, with a push during it",
+            true,
+            0,
+            false,
+            false,
+            true,
+            false,
+            true,
+            true,
+        ),
+        (
+            "a pull that stopped at a frame",
+            true,
+            0,
+            false,
+            true,
+            false,
+            false,
+            false,
+            true,
+        ),
+        (
+            "a pull that could not be made",
+            true,
+            0,
+            true,
+            false,
+            false,
+            false,
+            false,
+            true,
+        ),
+        (
+            "a pull that stopped, with a push during it",
+            true,
+            0,
+            false,
+            true,
+            true,
+            false,
+            false,
+            true,
+        ),
+        (
+            "a request, with nothing pushed",
+            false,
+            5,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+        ),
+        (
+            "a pull that found frames and stopped",
+            true,
+            2,
+            false,
+            true,
+            false,
+            false,
+            true,
+            true,
+        ),
+    ];
+    for (
+        name,
+        is_pull,
+        found,
+        unserviceable,
+        stops,
+        push_in_pull,
+        push_in_request,
+        from_unproductive,
+        from_productive,
+    ) in cases
+    {
+        for (start_productive, expected) in [(false, from_unproductive), (true, from_productive)] {
+            let mut fixture = Fixture::new();
+            let handle = fixture.add(Scripted::new(7));
+            if !start_productive {
+                handle.script(0, false, false, false, false);
+                fixture.pull(1);
+                assert_eq!(fixture.queue.productive_handle_count(), 0, "{name}: set up");
+            }
+            handle.script(found, unserviceable, stops, push_in_pull, push_in_request);
+            if is_pull {
+                fixture.pull_until_ordered(8);
+            } else {
+                fixture.queue.request(8);
+            }
+            assert_eq!(
+                fixture.queue.productive_handle_count() == 1,
+                expected,
+                "{name}, from a{} view",
+                if start_productive {
+                    " productive"
+                } else {
+                    "n unproductive"
+                }
+            );
+            assert_eq!(
+                fixture.queue.nonproductive_count,
+                u64::from(!expected),
+                "{name}: the count follows the view"
+            );
+        }
+    }
+}
+
+/// A push counts for the handle it was routed through, during that handle's own acquisition: a
+/// frame routed through some other handle while this one is serviced, or outside any acquisition,
+/// is no evidence about this handle (Java: each handle has its own observation, and a push marks
+/// only the pushing thread's).
+#[test]
+fn a_push_through_another_handle_is_no_evidence_about_this_one() {
+    let mut fixture = Fixture::new();
+    let handle = fixture.add(Scripted::new(7));
+    handle.script(0, false, false, false, false);
+    fixture.pull(1);
+    assert_eq!(fixture.queue.productive_handle_count(), 0);
+
+    handle.push_as.store(8, Ordering::Relaxed);
+    handle.script(0, false, false, false, true);
+    fixture.queue.request(8);
+    assert_eq!(
+        fixture.queue.productive_handle_count(),
+        0,
+        "reported against 8"
+    );
+
+    // Outside any acquisition nothing is observing, and the push is dropped: the next request, which
+    // pushes nothing, finds the view as it was.
+    note_routed_push(7, true);
+    handle.script(0, false, false, false, false);
+    fixture.queue.request(8);
+    assert_eq!(
+        fixture.queue.productive_handle_count(),
+        0,
+        "a push outside a service"
+    );
+
+    handle.script(0, false, false, false, true);
+    handle.push_as.store(7, Ordering::Relaxed);
+    fixture.queue.request(8);
+    assert_eq!(
+        fixture.queue.productive_handle_count(),
+        1,
+        "reported against 7"
+    );
+}
+
+/// Each worker keeps its own view of a handle: one finding it empty does not make it unproductive
+/// for another (Java: a `ThreadLocal` observation per handle).
+#[test]
+fn each_worker_has_its_own_view_of_a_handle() {
+    let mut first = Fixture::new();
+    let mut second = Fixture::new();
+    let handle = Scripted::new(7);
+    first.add(handle.clone());
+    second.add(handle.clone());
+
+    first.pull(1);
+    assert_eq!(first.queue.productive_handle_count(), 0);
+    assert_eq!(second.queue.productive_handle_count(), 1);
+    second.pull(1);
+    assert_eq!(second.queue.productive_handle_count(), 0);
+
+    handle.script(0, false, false, false, true);
+    first.queue.request(1);
+    assert_eq!(first.queue.productive_handle_count(), 1);
+    assert_eq!(
+        second.queue.productive_handle_count(),
+        0,
+        "the push was first's"
+    );
+}
+
+/// The last push through a handle in a service decides what the service showed, so a frame that
+/// finds no downstream leaves the handle unproductive for it (the original sets the observation
+/// false on an unroutable push and true on a routed one, in the order they come).
+#[test]
+fn the_last_push_through_a_handle_wins() {
+    // (kind of push, in a pull, view after from an unproductive start, from a productive start)
+    let cases = [
+        // A request that pushes only what finds no downstream shows nothing: the view is kept.
+        (UNROUTABLE, false, false, true),
+        // A routed push and then an unroutable one: the unroutable one is the last, so nothing shown.
+        (ROUTED_THEN_UNROUTABLE, false, false, true),
+        // A pull that finds nothing, with a push that finds no downstream: unproductive.
+        (UNROUTABLE, true, false, false),
+        (ROUTED_THEN_UNROUTABLE, true, false, false),
+        // The routed push alone shows the handle productive.
+        (ROUTED, false, true, true),
+        (ROUTED, true, true, true),
+    ];
+    for (kind, in_pull, from_unproductive, from_productive) in cases {
+        for (start_productive, expected) in [(false, from_unproductive), (true, from_productive)] {
+            let mut fixture = Fixture::new();
+            let handle = fixture.add(Scripted::new(7));
+            if !start_productive {
+                handle.script(0, false, false, false, false);
+                fixture.pull(1);
+            }
+            handle.unroutable.store(kind, Ordering::Relaxed);
+            handle.script(0, false, false, in_pull, !in_pull);
+            if in_pull {
+                fixture.pull(8);
+            } else {
+                fixture.queue.request(8);
+            }
+            assert_eq!(
+                fixture.queue.productive_handle_count() == 1,
+                expected,
+                "push kind {kind}, in a pull: {in_pull}, from a{} view",
+                if start_productive {
+                    " productive"
+                } else {
+                    "n unproductive"
+                }
+            );
+        }
+    }
 }

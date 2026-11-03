@@ -1,9 +1,11 @@
 use super::*;
 use crate::config::TimingProvider;
+use crate::flow_control::note_routed_push;
 use crate::flow_control::{Claim, UpstreamHandle, UpstreamRegistry};
 use crate::frames::Frame;
 use euhedral_hardware_utils::util::CpuSet;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 fn nanos(nanos: u64) -> Duration {
     Duration::from_nanos(nanos)
@@ -413,4 +415,204 @@ fn calibration_measures_both_thresholds() {
     let threshold = tree.body_cost().expensive_threshold_ns;
     assert!(threshold > 0.0);
     assert!(threshold.is_finite());
+}
+
+/// A source whose every pull finds 0. A lane source never pushes. A push-only one pushes from
+/// `request`, routing a frame through its handle on every `push_every`th request (the frame itself
+/// is not made: the handle only reports the push, as the vertex does for one it routes).
+struct Source {
+    sequence: u64,
+    push_every: u64,
+    requests: AtomicU64,
+    claimed: AtomicBool,
+}
+
+impl Source {
+    fn lane(sequence: u64) -> Arc<Self> {
+        Self::push_only(sequence, 0)
+    }
+
+    fn push_only(sequence: u64, push_every: u64) -> Arc<Self> {
+        Arc::new(Self {
+            sequence,
+            push_every,
+            requests: AtomicU64::new(0),
+            claimed: AtomicBool::new(false),
+        })
+    }
+}
+
+impl UpstreamHandle for Source {
+    fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    fn pull(
+        &self,
+        _claim: &mut Claim,
+        _consumer: &mut dyn FnMut(Box<dyn Frame>),
+        _stop: &mut dyn FnMut(&dyn Frame) -> bool,
+        _demand: u64,
+    ) -> Option<u64> {
+        Some(0)
+    }
+
+    fn request(&self, claim: &mut Claim, _demand: u64) {
+        let requests = self.requests.fetch_add(1, Ordering::Relaxed) + 1;
+        if self.push_every != 0 && requests.is_multiple_of(self.push_every) {
+            note_routed_push(claim.owner(), true);
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        false
+    }
+
+    fn try_acquire(&self) -> Option<Claim> {
+        (!self.claimed.swap(true, Ordering::Acquire)).then(|| Claim::new(self.sequence))
+    }
+
+    fn release(&self, _claim: Claim) {
+        self.claimed.store(false, Ordering::Release);
+    }
+}
+
+/// The demand of a cycle's request: a batch scaled by the pull multiplier, enough to reach every handle.
+const REQUEST: u64 = 1 << 16;
+
+/// What the workers of a lattice with no work did, cycle by cycle.
+#[derive(Debug, PartialEq, Eq)]
+struct Idling {
+    /// Cycles that ended in a park, in the unproductive park or the idle path.
+    parks: u64,
+    /// Workers that did not park in their last cycle.
+    awake: u64,
+    /// The productive handle count each worker saw in its last cycle, by rank.
+    productive: Vec<u64>,
+}
+
+/// Runs `cycles` cycles of each of `workers` workers in turn, over `lanes` sources that have
+/// nothing and `push_only` more that only push (every `push_every`th request), with the choices of the worker loop (the
+/// productive count, `should_idle`, the path, the parks of a cycle that processed nothing) made by
+/// the real queue and tree. Bodies cost `body_ns`, which sets the path.
+fn idle_workers(
+    workers: usize,
+    lanes: u64,
+    push_only: u64,
+    push_every: u64,
+    body_ns: u64,
+    cycles: u64,
+) -> Idling {
+    let registry = UpstreamRegistry::with_topology(workers + 1, CpuSet::new());
+    for sequence in 0..lanes {
+        registry.add_handle(Source::lane(sequence));
+    }
+    for sequence in lanes..lanes + push_only {
+        registry.add_handle(Source::push_only(sequence, push_every));
+    }
+    let mut idling = Idling {
+        parks: 0,
+        awake: 0,
+        productive: Vec::new(),
+    };
+    for rank in 1..=workers {
+        let registry = registry.clone();
+        let (parks, awake, productive) = std::thread::spawn(move || {
+            registry.register_with(|| Some(rank));
+            let mut tree = tree();
+            record_all(tree.body_cost_mut(), [body_ns; 64]);
+            let now = Instant::now();
+            let (mut parks, mut awake, mut productive) = (0, false, 0);
+            for _ in 0..cycles {
+                (awake, productive) = registry
+                    .with_thread_queue(|queue| {
+                        let contention = queue.adaptive_contention(now, nanos(1_000_000));
+                        let productive = queue.productive_handle_count();
+                        let upstreams = queue.cached_upstream_count();
+                        let path = if tree.should_idle(contention, productive, workers, Some(rank))
+                        {
+                            ExecutionPath::Idle
+                        } else {
+                            tree.select_path(productive, upstreams, workers, contention)
+                        };
+                        match path {
+                            ExecutionPath::Direct => {
+                                queue.pull(&mut |_| {}, &mut |_| false, 2);
+                                queue.request(REQUEST);
+                            }
+                            ExecutionPath::Staged => queue.request(REQUEST),
+                            ExecutionPath::Idle => {}
+                        }
+                        let parked =
+                            path == ExecutionPath::Idle || queue.productive_handle_count() == 0;
+                        (!parked, productive)
+                    })
+                    .unwrap();
+                parks += u64::from(!awake);
+            }
+            registry.remove_thread();
+            (parks, awake, productive)
+        })
+        .join()
+        .unwrap();
+        idling.parks += parks;
+        idling.awake += u64::from(awake);
+        idling.productive.push(productive);
+    }
+    idling
+}
+
+/// A source that only pushes (its pull always finds 0, and it pushes from `request`) is one more
+/// handle in the productive count, and it is productive exactly when its requests push.
+///
+/// - Where workers pull (cheap bodies, the Direct path), a pull that finds a handle empty ends its
+///   productivity, so every handle is found empty in turn, the count falls to 0 and all workers park.
+///   A push-only source that does not push in these cycles is found empty like a lane source, so the
+///   lattice is the same as one with one more lane source. One that pushes on every request is
+///   made productive again by each request that follows the pull, so the count stays at 1 and no
+///   worker reaches the unproductive park.
+/// - Where they only request (costly bodies, the Staged path), nothing is found empty, so every handle
+///   counts as productive whether it pushes or not: the count is the number of handles, up to the one
+///   below the number of workers, where a worker that has a handle per worker pulls (the Direct
+///   path) and finds one empty. A request that routes nothing is no evidence of an empty source.
+#[test]
+fn a_source_that_only_pushes_is_productive_when_it_pushes() {
+    // Never reached in the cycles run.
+    const QUIET: u64 = 1 << 40;
+    for total in 3..=9 {
+        // Cheap bodies, a source that does not push: found empty like the others, every worker parks.
+        let lanes = idle_workers(8, total, 0, 0, 250, 100);
+        let quiet = idle_workers(8, total - 1, 1, QUIET, 250, 100);
+        assert_eq!(
+            (lanes.awake, &lanes.productive),
+            (0, &vec![0; 8]),
+            "{lanes:?}"
+        );
+        assert_eq!(
+            (quiet.awake, &quiet.productive),
+            (0, &vec![0; 8]),
+            "{quiet:?}"
+        );
+
+        // Cheap bodies, a source that pushes on every request: it is the one productive handle, and
+        // the unproductive park, which needs none, never comes.
+        let pushing = idle_workers(8, total - 1, 1, 1, 250, 100);
+        assert_eq!(pushing.productive, [1; 8], "{pushing:?}");
+        assert!(
+            pushing.parks < lanes.parks,
+            "{pushing:?} parks as often as {lanes:?}"
+        );
+
+        // Costly bodies: a push-only source counts as a lane source does, pushing or not.
+        let lanes = idle_workers(8, total, 0, 0, 1_200, 100);
+        let quiet = idle_workers(8, total - 1, 1, QUIET, 1_200, 100);
+        let pushing = idle_workers(8, total - 1, 1, 1, 1_200, 100);
+        assert_eq!(lanes.productive, [total.min(7); 8], "{lanes:?}");
+        assert_eq!(quiet.productive, lanes.productive, "{quiet:?} {lanes:?}");
+        assert_eq!(quiet.awake, lanes.awake, "{quiet:?} {lanes:?}");
+        assert_eq!(
+            pushing.productive, lanes.productive,
+            "{pushing:?} {lanes:?}"
+        );
+    }
 }

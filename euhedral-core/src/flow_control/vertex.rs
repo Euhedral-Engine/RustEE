@@ -1065,8 +1065,11 @@ impl UpstreamHandle for UpstreamInterceptor {
                             && !here.is_some_and(|here| locality_allows(&*frame, here, None))
                         {
                             match vertex.route_frame(frame, false) {
-                                Ok(()) => note_routed_push(),
-                                Err(frame) => frame.do_finally_with_error(unroutable()),
+                                Ok(()) => note_routed_push(self.claim_id, true),
+                                Err(frame) => {
+                                    note_routed_push(self.claim_id, false);
+                                    frame.do_finally_with_error(unroutable());
+                                }
                             }
                         } else {
                             consumer(frame);
@@ -1148,8 +1151,11 @@ impl LatticeReceiver for UpstreamInterceptor {
             }
         };
         match routed {
-            Ok(()) => note_routed_push(),
-            Err(frame) => frame.do_finally_with_error(unroutable()),
+            Ok(()) => note_routed_push(self.claim_id, true),
+            Err(frame) => {
+                note_routed_push(self.claim_id, false);
+                frame.do_finally_with_error(unroutable());
+            }
         }
     }
 
