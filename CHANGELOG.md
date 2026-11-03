@@ -3,6 +3,27 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## A worker that sits out still enters a handle every probe interval (2026-11-03)
+
+**What.** A worker on the Idle path now takes a Direct cycle once per `IdlePolicy::probe_interval` (1 ms by default): it pulls one handle,
+and requests the next if the pull ran nothing, as any Direct cycle does. `IdlePolicy::with_probe_interval` changes it; zero never sits out and
+`Duration::MAX` sits out for good, as before.
+
+**Why.** Handles are served only when a worker enters them. The first-ranked worker never sits out; every other worker sits out when none of
+its handles looks productive to it (or as the participation model says), and a worker on the Idle path enters no handle, so its view of the
+handles, which is what keeps it out, changes only if it enters one. After a quiet spell every worker but the first-ranked one was out for good.
+While that one ran a frame that waited (or ran long), no worker entered any handle: a lane source with items in its intake went unserved for
+as long as the frame lasted, with every other worker idle. Euhedral-Execution's worker loop has the same rule and the same hole.
+
+**Semantics.** The clock is the worker's own: `Cycle` keeps the time of the last cycle that chose a path other than Idle. Nothing is shared,
+so the probe adds no atomic. A probe is an ordinary Direct cycle, so what it finds (frames pulled, frames pushed by the request) updates the worker's view
+and can end the sitting out. Between probes the worker sits out exactly as before.
+
+**Tests.** `fragment::tests::a_worker_that_sits_out_still_enters_a_handle` (a rank-2 worker whose policy says Idle, with the rank-1 worker held:
+never entered the handle before), `a_worker_sits_out_between_probes`, `a_worker_that_sits_out_probes_once_per_interval`;
+`euhedral-graph/tests/lane_source_liveness.rs` (lane sources on a real lattice with the first-ranked worker held in a frame: 10 items in the intake
+unserved for 10 s before, served at once after).
+
 ## `DeferredCalls::run_through` waits for a place claimed and not yet published (2026-11-02)
 
 **What.** `run_through(ticket)` returned `true` before the ticket's call had been made when another producer had claimed an earlier
