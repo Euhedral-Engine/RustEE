@@ -243,6 +243,8 @@ pub struct FakeGpu {
     pub(crate) state: Mutex<State>,
     pub(crate) poison: Poison,
     kernels: Mutex<HashMap<String, FakeKernelFn>>,
+    /// A test hook: the next recording fails as a failed capture does (its work still ran).
+    fail_recording: std::sync::atomic::AtomicBool,
 }
 
 impl fmt::Debug for FakeGpu {
@@ -262,7 +264,15 @@ impl FakeGpu {
             }),
             poison: Poison::new(),
             kernels: Mutex::new(HashMap::new()),
+            fail_recording: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// A test hook: the next recording ends with `Err(Capture)`, as a capture the driver refused does; the work it ran
+    /// for real is unaffected.
+    pub fn fail_next_recording(&self) {
+        self.fail_recording
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     pub(crate) fn lock(&self) -> MutexGuard<'_, State> {

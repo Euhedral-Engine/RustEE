@@ -24,8 +24,8 @@ use euhedral_gpu::{
     SharedGraphCache, SharedLanes, StreamOptions, open_shared_lanes,
 };
 use euhedral_graph::{
-    Completions, DEFAULT_RETRY_BACKSTOP, EdgeKind, GraphRuntime, LaneControl, LaneId,
-    QuantumOutcome, Stage, StageCx, StageError, StageGraph, StageGraphSpec, StageSpec, Submitted,
+    Completions, DEFAULT_RETRY_BACKSTOP, EdgeKind, GraphRuntime, LaneId, QuantumOutcome, Stage,
+    StageCx, StageError, StageGraph, StageGraphSpec, StageSpec, Submitted,
 };
 use euhedral_memory::cuda::DeviceMemory;
 use euhedral_memory::{Backend, Block, LocationId};
@@ -160,10 +160,6 @@ struct Replays {
 impl Stage<Work, CudaQueue> for Replays {
     fn run(&self, work: &Work, cx: &StageCx<'_, CudaQueue>) -> Result<Submitted, StageError> {
         let lane = cx.lane_handle().expect("a stage with a lane");
-        for marker in cx.waits {
-            lane.await_marker(*marker)
-                .map_err(|e| StageError::Corrupt(e.to_string()))?;
-        }
         let mut body = Steps {
             axpb: self.axpb.clone(),
             spin: self.spin.clone(),
@@ -176,7 +172,7 @@ impl Stage<Work, CudaQueue> for Replays {
         let mut hold = lock(&work.hold);
         let made = lane.submit_marked(|_| {
             self.cache
-                .run(&self.gpu, lane, self.key, &mut body, &mut hold)
+                .run_after(&self.gpu, lane, cx.waits, self.key, &mut body, &mut hold)
         });
         match made {
             Ok((_, marker)) => Ok(Submitted::marker(marker)),
@@ -192,11 +188,14 @@ impl Stage<Work, CudaQueue> for Replays {
     }
 }
 
-/// Four workers run quanta of a two-stage graph, each stage replaying a cached graph on its own lane, at once: the
-/// second stage awaits the first's marker on the device (the word ends at 6, not 3), a quantum retires only when both
-/// lanes reached their markers, and the stages' hooks release what the work read.
-#[test]
-fn stages_replay_cached_graphs_on_their_lanes_and_the_boundary_covers_both() {
+/// Four workers run quanta of a two-stage graph, each stage replaying a cached graph on its own lane, with at most
+/// `window` quanta in flight: the second stage awaits the first's marker on the device (the word ends at 6, not 3), a
+/// quantum retires only when both lanes reached their markers, and the stages' hooks release what the work read.
+///
+/// With several workers submitting to one stream, a `cuGraphLaunch` could overtake the `cuStreamWaitEvent` its own thread
+/// issued just before it (driver 615.71.09, CUDA 13.4): a replay that launched on the lane lost this ordering in a large
+/// share of the runs of a window of 16 or 32 quanta. A replay now forks a private stream from the lane and joins it back.
+fn overlapping_quanta(window: usize) {
     let Some(gpu) = gpu() else { return };
     let Some(module) = module(&gpu) else { return };
     let (_mem, block) = words(&gpu, 8 * QUANTA);
@@ -273,6 +272,9 @@ fn stages_replay_cached_graphs_on_their_lanes_and_the_boundary_covers_both() {
     let kill = Arc::new(AtomicBool::new(false));
     // Each quantum has its own device word, so the quanta overlap on the device and take their own arguments.
     for i in 0..QUANTA {
+        while i >= window && lock(&outcomes).len() + window <= i {
+            std::thread::yield_now();
+        }
         let work = Work {
             word: block.addr + 8 * i as u64,
             out: block.addr + 8 * i as u64 + 4,
@@ -325,8 +327,26 @@ fn stages_replay_cached_graphs_on_their_lanes_and_the_boundary_covers_both() {
         );
     }
     let stats = cache.stats();
-    assert!(stats.records >= 2);
+    assert_eq!(
+        stats.replays + stats.records + stats.directs,
+        2 * QUANTA as u64,
+        "every stage run was one of the three: {stats:?}"
+    );
+    assert!(
+        stats.replays * 4 >= 2 * QUANTA as u64 * 3,
+        "most stage runs were real replays: {stats:?}"
+    );
     assert_eq!(graph.live(), 0);
+}
+
+#[test]
+fn sixteen_overlapping_quanta_of_replaying_stages_keep_their_order_across_lanes() {
+    overlapping_quanta(16);
+}
+
+#[test]
+fn thirty_two_overlapping_quanta_of_replaying_stages_keep_their_order_across_lanes() {
+    overlapping_quanta(32);
 }
 
 /// Workers that run one key at once each get an instance of their own on a real device: they are held together inside the
@@ -374,7 +394,7 @@ fn workers_running_one_key_at_once_each_get_an_instance_and_every_replay_runs() 
         }
     }
 
-    let round = |expect: Ran| {
+    let round = |expect: Ran, warm: bool| {
         let ran = std::thread::scope(|scope| {
             let threads: Vec<_> = (0..N)
                 .map(|t| {
@@ -387,7 +407,11 @@ fn workers_running_one_key_at_once_each_get_an_instance_and_every_replay_runs() 
                             by: 1,
                             barrier,
                         };
-                        let ran = cache.run(gpu, lane, 7, &mut body, &mut hold).unwrap();
+                        let ran = if warm {
+                            cache.warm(gpu, lane, 7, &mut body, &mut hold).unwrap()
+                        } else {
+                            cache.run(gpu, lane, 7, &mut body, &mut hold).unwrap()
+                        };
                         (ran, hold)
                     })
                 })
@@ -398,10 +422,12 @@ fn workers_running_one_key_at_once_each_get_an_instance_and_every_replay_runs() 
                 .collect::<Vec<_>>()
         });
         assert!(ran.iter().all(|(r, _)| *r == expect));
+        // The holds are kept: the device work they cover has not been waited for yet.
+        ran.into_iter().map(|(_, hold)| hold).collect::<Vec<_>>()
     };
-    round(Ran::Recorded);
+    let recorded = round(Ran::Recorded, true);
     assert_eq!(cache.len(), N);
-    round(Ran::Replayed);
+    let replayed = round(Ran::Replayed, false);
     assert_eq!(
         cache.len(),
         N,
@@ -427,4 +453,6 @@ fn workers_running_one_key_at_once_each_get_an_instance_and_every_replay_runs() 
             "worker {t}: its recording ran once and its replay ran once"
         );
     }
+    // The work ended: now the holds may go.
+    drop((recorded, replayed));
 }

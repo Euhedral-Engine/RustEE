@@ -55,8 +55,16 @@ impl Graph for FakeGraph {
         Ok(())
     }
 
-    fn replay_on(&mut self, lane: &FakeQueue, hold: &mut GraphHold) -> Result<(), GpuError> {
+    fn replay_on(
+        &mut self,
+        lane: &FakeQueue,
+        waits: &[Marker],
+        hold: &mut GraphHold,
+    ) -> Result<(), GpuError> {
         lane.gpu.alive()?;
+        for marker in waits {
+            lane.await_now(*marker)?;
+        }
         self.push_ops(|op| lane.push_op(op));
         // The lane keeps nothing: the caller holds the recording's buffers until the work ended.
         hold.add_frozen(&self.kept);
@@ -241,6 +249,12 @@ impl FakeGpu {
     {
         let count = real.len();
         let (rec, fingerprint) = self.record_pass(real, hold, f)?;
+        if self
+            .fail_recording
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            return Err(GpuError::Capture("failed by the test hook".into()));
+        }
         Ok(FakeGraph {
             ops: rec.ops,
             args: rec.args,

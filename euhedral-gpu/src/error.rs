@@ -67,3 +67,13 @@ impl fmt::Display for GpuError {
 }
 
 impl std::error::Error for GpuError {}
+
+impl From<euhedral_graph::ControlError> for GpuError {
+    fn from(error: euhedral_graph::ControlError) -> Self {
+        match error {
+            euhedral_graph::ControlError::Busy => GpuError::Busy,
+            euhedral_graph::ControlError::Invalid(what)
+            | euhedral_graph::ControlError::Failed(what) => GpuError::Invalid(what),
+        }
+    }
+}

@@ -23,10 +23,11 @@
 //! line up one to one with the recording.
 
 use std::hash::Hash;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use crate::instances::{GiveBack, InstancePool, tag_of};
+use euhedral_graph::Marker;
+
+use crate::instances::{InstancePool, tag_of};
 use crate::{Enqueue, Gpu, GpuError, Graph, GraphHold, Lane, Sequence, Stream};
 
 /// The enqueue body of a recurring sequence: the same code serves a direct run, a recording and an update.
@@ -222,42 +223,130 @@ impl<G: Gpu, K: Copy + Eq> GraphCache<G, K> {
 /// The shared lane type of a backend's streams.
 type LaneOf<G> = <<G as Gpu>::Stream as Stream>::Lane;
 
+/// What a run remembers of a key besides its instances: whether it was seen, and whether recording it failed.
+const SEEN: u64 = 1;
+const UNRECORDABLE: u64 = 2;
+
+/// Java's per-key sightings (`Capture.sightings`, `Capture.unrecordable`) in a fixed table of atomic words,
+/// `(tag << 2) | flags`: a key is recorded on its second sighting, and a key whose capture failed is never recorded again.
+/// A slot is found by probing a few from the key's tag; a table that is full forgets: the key it overwrites is seen for the
+/// first time again.
+struct Sightings {
+    slots: Box<[AtomicU64]>,
+}
+
+impl Sightings {
+    const PROBES: usize = 8;
+
+    fn new(slots: usize) -> Self {
+        Self {
+            slots: (0..slots.max(Self::PROBES))
+                .map(|_| AtomicU64::new(0))
+                .collect(),
+        }
+    }
+
+    /// The flags the key had before this sighting, which counts.
+    fn see(&self, tag: u64) -> u64 {
+        let n = self.slots.len();
+        let start = (tag % n as u64) as usize;
+        for step in 0..Self::PROBES {
+            let slot = &self.slots[(start + step) % n];
+            let seen = slot.load(Ordering::Relaxed);
+            if seen != 0 && seen >> 2 == tag {
+                return seen & 3;
+            }
+            if seen == 0
+                && slot
+                    .compare_exchange(0, (tag << 2) | SEEN, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+            {
+                return 0;
+            }
+            if seen == 0 {
+                // Lost the slot to another key: look at it again.
+                let now = slot.load(Ordering::Relaxed);
+                if now != 0 && now >> 2 == tag {
+                    return now & 3;
+                }
+            }
+        }
+        self.slots[start].store((tag << 2) | SEEN, Ordering::Relaxed);
+        0
+    }
+
+    fn mark_unrecordable(&self, tag: u64) {
+        let n = self.slots.len();
+        let start = (tag % n as u64) as usize;
+        for step in 0..Self::PROBES {
+            let slot = &self.slots[(start + step) % n];
+            let seen = slot.load(Ordering::Relaxed);
+            if seen != 0 && seen >> 2 == tag {
+                slot.fetch_or(UNRECORDABLE, Ordering::Relaxed);
+                return;
+            }
+            if seen == 0
+                && slot
+                    .compare_exchange(
+                        0,
+                        (tag << 2) | SEEN | UNRECORDABLE,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    )
+                    .is_ok()
+            {
+                return;
+            }
+        }
+        self.slots[start].store((tag << 2) | SEEN | UNRECORDABLE, Ordering::Relaxed);
+    }
+}
+
 /// Graphs by key for any number of workers running on shared lanes, through `&self`, without a lock.
 ///
 /// The owned [`GraphCache`] is one lane's: its graphs are replayed with `&mut`, by the lane's owner. A stage on a shared
 /// [`Lane`] runs on whichever worker the lattice gives it, and a key can be running on several at once, so the graphs
 /// are *instances*, pooled by key ([`InstancePool`](crate::instances)):
 ///
+/// - **First sighting of a key**: the body runs directly (as Java's `StageGraph` runs a quantum stage by stage the first
+///   time it sees its capture key). **Second sighting**: it is recorded (the recording runs the work for real). A
+///   warm-up ([`warm`](Self::warm)) records at once.
 /// - **A hit**: a free instance of the key is taken by one compare-and-set (the entry is claimed, not locked), updated with
-///   the unit's arguments and replayed on the lane. The instance stays busy until the caller's [`GraphHold`] is released
-///   (see below).
+///   the unit's arguments and replayed on the lane. The instance goes back to the table once the replay is enqueued.
 /// - **A second concurrent user of a key** finds the instance taken and does not wait or spin: it takes another free
-///   instance of the key, or records one of its own (a miss) and pools it for the next. The instances of a key therefore
-///   settle at the peak number of workers that ran it at once, and a run after warm-up allocates nothing.
-/// - **A miss**, **a changed shape**, **a warm-up** and **caching off** are as the owned cache's.
-/// - **A full pool** (the bound) evicts a free instance; if every instance is in use, the new recording runs and is not
-///   pooled. Dropping an instance is safe whatever its launches are doing: the driver frees an executable once they end.
+///   instance of the key, or records one of its own and pools it for the next. The instances of a key settle at the peak
+///   number of workers that ran it at once, and a run after warm-up allocates nothing.
+/// - **A changed shape** (the body under a known key no longer matches the recording's fingerprint) runs for real and
+///   records again, in place when the driver can update the executable.
+/// - **Capacity counts instances**, not keys. A full table evicts the least recently used free instance (Java's
+///   `MAX_CAPTURES` is least recently used too). If every instance is in use, the unit runs directly: nothing is recorded
+///   to be thrown away. Dropping an instance is safe whatever its launches are doing: the driver frees an executable once
+///   they end.
+/// - **A capture that fails** (the work still ran, for real) marks the key unrecordable: it runs directly from then on.
 ///
-/// **When the instance goes back.** The caller's [`GraphHold`] parks the instance the replay ran on and gives it back to the
-/// cache when it is released, which is the same moment it lets go of the recording's host buffers: after the device work
-/// ended (a stage holds it in its quantum and drops it in `Stage::retired`). An instance is therefore never updated or
-/// launched again while a launch of its own is in flight. (Returning it as soon as the replay is enqueued would rest on
-/// the driver snapshotting a graph's parameters at the launch and ordering the launches of one executable; a stress test
-/// with overlapping quanta that reused instances at once lost an ordering in about one run in seventy, and none did once
-/// an instance was reused only after its launch ended.) The instances a key needs are the replays of it in flight at once,
-/// and the cache grows to that number during warm-up; a recording (a miss) leaves its instance free at once, since the
-/// recording ran the work as direct launches and no launch of the instance is in flight.
+/// **A replay never launches on the lane.** With several threads submitting to one stream, a `cuGraphLaunch` can overtake
+/// the `cuStreamWaitEvent` its own thread issued just before it (seen with driver 615.71.09 on CUDA 13.4: a graph's work
+/// ran before what it waited for, in tens of overlapping runs out of a hundred; a plain launch, one submitter per stream, or
+/// a wait and a launch locked together do not do it, and neither does reusing an instance whose launch is pending). So
+/// each worker forks a stream of its own from the lane for its replay (an event recorded on the lane and awaited by the
+/// private stream), makes its cross-lane waits and the launch there, and joins the lane back (an event recorded on the
+/// private stream and awaited by the lane); the lane's marker is recorded after that join. The private streams are
+/// stocked per lane and reused, so nothing is created after warm-up. The waits are therefore an argument of the run
+/// ([`run_after`](Self::run_after)), not something the stage enqueues on the lane first.
 ///
-/// What the replay reads that the instance does not own are the recording's host buffers: the same hold keeps a handle to
-/// them, so the instance, the cache and the lane may all be gone by the time the work ends without the work losing them.
+/// **Why the instance may go back once the replay is enqueued.** A launch's parameters are fixed when it is issued (an
+/// update applies to the next launch), and the driver orders every launch of one executable behind the previous one,
+/// whichever stream it is on; a stress test of overlapping quanta that returns an instance at once passes. What the replay
+/// reads that the instance does not own are the recording's host buffers: the run adds a handle to them to the caller's
+/// [`GraphHold`], which the caller holds in its quantum and drops in `Stage::retired`, after the device work ended, so the
+/// instance, the cache and the lane may all be gone by then without the work losing them.
 ///
 /// **Markers.** Run it inside [`Lane::submit_marked`]: the marker is claimed before the run, any `Busy` comes before any
-/// replay, and the marker is recorded behind it (the closure's enqueue argument is not needed: the run reaches the lane
-/// through `lane`).
+/// recording or replay, and the marker is recorded behind it (the closure's enqueue argument is not needed: the run reaches
+/// the lane through `lane`).
 pub struct SharedGraphCache<G: Gpu, K> {
-    pool: Arc<InstancePool<K, G::Graph>>,
-    /// The pool as a hold gives an instance back to it.
-    giver: Arc<dyn GiveBack>,
+    pool: InstancePool<K, G::Graph>,
+    sightings: Sightings,
     enabled: AtomicBool,
     replays: AtomicU64,
     records: AtomicU64,
@@ -273,23 +362,22 @@ impl<G: Gpu, K> std::fmt::Debug for SharedGraphCache<G, K> {
     }
 }
 
-impl<G: Gpu, K: Copy + Eq + Hash + Send + 'static> Default for SharedGraphCache<G, K> {
+impl<G: Gpu, K: Copy + Eq + Hash + Send> Default for SharedGraphCache<G, K> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<G: Gpu, K: Copy + Eq + Hash + Send + 'static> SharedGraphCache<G, K> {
+impl<G: Gpu, K: Copy + Eq + Hash + Send> SharedGraphCache<G, K> {
     pub fn new() -> Self {
         Self::with_capacity(DEFAULT_GRAPHS)
     }
 
     /// A cache of at most `instances` graph instances (all keys together).
     pub fn with_capacity(instances: usize) -> Self {
-        let pool = Arc::new(InstancePool::new(instances));
         Self {
-            giver: pool.clone(),
-            pool,
+            pool: InstancePool::new(instances),
+            sightings: Sightings::new(instances.saturating_mul(4)),
             enabled: AtomicBool::new(true),
             replays: AtomicU64::new(0),
             records: AtomicU64::new(0),
@@ -312,7 +400,7 @@ impl<G: Gpu, K: Copy + Eq + Hash + Send + 'static> SharedGraphCache<G, K> {
         }
     }
 
-    /// The instances held, in use or not.
+    /// The instances held, in use or not, and those being recorded.
     pub fn len(&self) -> usize {
         self.pool.len()
     }
@@ -326,7 +414,7 @@ impl<G: Gpu, K: Copy + Eq + Hash + Send + 'static> SharedGraphCache<G, K> {
         self.pool.capacity()
     }
 
-    /// Whether `key` has an instance (in use or not).
+    /// Whether `key` has an instance (in use or not; one still being recorded does not count).
     pub fn contains(&self, key: &K) -> bool {
         self.pool.contains(tag_of(key))
     }
@@ -340,25 +428,52 @@ impl<G: Gpu, K: Copy + Eq + Hash + Send + 'static> SharedGraphCache<G, K> {
         body: &mut B,
         hold: &mut GraphHold,
     ) -> Result<Ran, GpuError> {
+        self.run_after(gpu, lane, &[], key, body, hold)
+    }
+
+    /// As [`run`](Self::run), ordered behind `waits` (the markers of the stage's predecessors on other lanes: a stage's
+    /// `cx.waits`). A replay makes them on its private stream; any other way to run makes them on the lane first.
+    pub fn run_after<B: GraphBody<G>>(
+        &self,
+        gpu: &G,
+        lane: &LaneOf<G>,
+        waits: &[Marker],
+        key: K,
+        body: &mut B,
+        hold: &mut GraphHold,
+    ) -> Result<Ran, GpuError> {
+        self.run_inner(gpu, lane, waits, key, body, hold, false)
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one body behind run, run_after and warm"
+    )]
+    fn run_inner<B: GraphBody<G>>(
+        &self,
+        gpu: &G,
+        lane: &LaneOf<G>,
+        waits: &[Marker],
+        key: K,
+        body: &mut B,
+        hold: &mut GraphHold,
+        record_now: bool,
+    ) -> Result<Ran, GpuError> {
         if !self.enabled.load(Ordering::Relaxed) {
-            lane.submit_held(hold, |enq| body.enqueue(enq))?;
-            self.directs.fetch_add(1, Ordering::Relaxed);
-            return Ok(Ran::Direct);
+            return self.direct(lane, waits, body, hold);
         }
         let tag = tag_of(&key);
         if let Some(mut lease) = self.pool.take(&key, tag) {
             let graph = lease.get();
             return match gpu.update(graph, |seq| seq.submit(0, |enq| body.enqueue(enq))) {
                 Ok(()) => {
-                    graph.replay_on(lane, hold)?;
+                    graph.replay_on(lane, waits, hold)?;
                     self.replays.fetch_add(1, Ordering::Relaxed);
-                    // The launch is in flight: the instance stays busy until the hold is released.
-                    let (index, tag) = lease.park();
-                    hold.add_instance(&self.giver, index, tag);
                     Ok(Ran::Replayed)
                 }
                 Err(GpuError::ShapeChanged { .. }) => {
                     // The body is not the recorded sequence any more: record it again (in place when the driver can).
+                    wait_all(lane, waits)?;
                     gpu.rerecord_on(graph, &[lane], hold, |seq| {
                         seq.submit(0, |enq| body.enqueue(enq))
                     })?;
@@ -368,14 +483,44 @@ impl<G: Gpu, K: Copy + Eq + Hash + Send + 'static> SharedGraphCache<G, K> {
                 Err(other) => Err(other),
             };
         }
-        // No free instance of the key: record one. A slot is reserved first; with none, the recording runs unpooled.
-        let slot = self.pool.reserve(tag);
-        let graph = gpu.record_on(&[lane], hold, |seq| seq.submit(0, |enq| body.enqueue(enq)))?;
-        self.records.fetch_add(1, Ordering::Relaxed);
-        if let Some(slot) = slot {
-            slot.fill(key, graph);
+        // No free instance of the key: the first sighting runs directly, the second records.
+        let flags = self.sightings.see(tag);
+        if flags & UNRECORDABLE != 0 || (flags & SEEN == 0 && !record_now) {
+            return self.direct(lane, waits, body, hold);
         }
-        Ok(Ran::Recorded)
+        // A slot is reserved first; with none free, the unit runs directly (nothing is recorded to be thrown away).
+        let Some(slot) = self.pool.reserve(tag) else {
+            return self.direct(lane, waits, body, hold);
+        };
+        wait_all(lane, waits)?;
+        match gpu.record_on(&[lane], hold, |seq| seq.submit(0, |enq| body.enqueue(enq))) {
+            Ok(graph) => {
+                self.records.fetch_add(1, Ordering::Relaxed);
+                slot.fill(key, graph);
+                Ok(Ran::Recorded)
+            }
+            Err(GpuError::Capture(_)) => {
+                // The work ran for real and is unaffected: only the recording failed. The key runs directly from now on.
+                self.sightings.mark_unrecordable(tag);
+                self.directs.fetch_add(1, Ordering::Relaxed);
+                Ok(Ran::Direct)
+            }
+            Err(other) => Err(other),
+        }
+    }
+
+    /// The body as direct launches on the lane, after `waits`.
+    fn direct<B: GraphBody<G>>(
+        &self,
+        lane: &LaneOf<G>,
+        waits: &[Marker],
+        body: &mut B,
+        hold: &mut GraphHold,
+    ) -> Result<Ran, GpuError> {
+        wait_all(lane, waits)?;
+        lane.submit_held(hold, |enq| body.enqueue(enq))?;
+        self.directs.fetch_add(1, Ordering::Relaxed);
+        Ok(Ran::Direct)
     }
 
     /// A warm-up: records an instance of `key` (running the body for real, on units nobody reads) unless it has one, and
@@ -391,7 +536,7 @@ impl<G: Gpu, K: Copy + Eq + Hash + Send + 'static> SharedGraphCache<G, K> {
         if self.enabled.load(Ordering::Relaxed) && self.contains(&key) {
             return Ok(Ran::Present);
         }
-        self.run(gpu, lane, key, body, hold)
+        self.run_inner(gpu, lane, &[], key, body, hold, true)
     }
 
     /// Drops the free instances whose key `keep` refuses (an old shape, a released prepare); instances in use stay for
@@ -399,6 +544,14 @@ impl<G: Gpu, K: Copy + Eq + Hash + Send + 'static> SharedGraphCache<G, K> {
     pub fn retain(&self, keep: impl Fn(&K) -> bool) -> usize {
         self.pool.retain(keep)
     }
+}
+
+/// Orders the lane behind `waits` (the markers of other lanes), on the lane itself.
+fn wait_all<L: Lane>(lane: &L, waits: &[Marker]) -> Result<(), GpuError> {
+    for marker in waits {
+        lane.await_marker(*marker)?;
+    }
+    Ok(())
 }
 
 #[cfg(all(test, feature = "fake"))]
@@ -724,31 +877,28 @@ mod shared_tests {
     }
 
     #[test]
-    fn a_new_key_records_and_runs_and_the_next_unit_updates_and_replays_on_the_lane() {
+    fn the_first_sighting_runs_directly_the_second_records_and_the_next_replays_on_the_lane() {
         let (gpu, lane, kernel, at) = rig();
         let cache = SharedGraphCache::<FakeGpu, _>::new();
         let mut hold = GraphHold::new();
         let mut b = body(&kernel, at, 2, 10);
-        assert_eq!(
-            cache.run(&gpu, &lane, KEY, &mut b, &mut hold).unwrap(),
-            Ran::Recorded
-        );
-        gpu.run_until_idle();
-        assert_eq!(word(&gpu, at), 20, "the recording ran for real");
+        let mut ran = |cache: &SharedGraphCache<FakeGpu, _>, b: &mut Adds<'_>| {
+            cache.run(&gpu, &lane, KEY, b, &mut hold).unwrap()
+        };
+        assert_eq!(ran(&cache, &mut b), Ran::Direct, "first sighting");
+        assert!(cache.is_empty());
+        assert_eq!(ran(&cache, &mut b), Ran::Recorded, "second sighting");
         b.by = 1;
-        assert_eq!(
-            cache.run(&gpu, &lane, KEY, &mut b, &mut hold).unwrap(),
-            Ran::Replayed
-        );
+        assert_eq!(ran(&cache, &mut b), Ran::Replayed);
         gpu.run_until_idle();
-        assert_eq!(word(&gpu, at), 22, "the replay took the new arguments");
+        assert_eq!(word(&gpu, at), 20 + 20 + 2, "every run did its work, once");
         assert_eq!(
             cache.stats(),
             GraphStats {
                 replays: 1,
                 records: 1,
                 rerecords: 0,
-                directs: 0
+                directs: 1
             }
         );
         assert_eq!(cache.len(), 1);
@@ -762,8 +912,9 @@ mod shared_tests {
         let mut b = body(&kernel, at, 3, 0);
         for key in [KEY, (1, 1, 7), (1, 0, 8)] {
             assert_eq!(
-                cache.run(&gpu, &lane, key, &mut b, &mut hold).unwrap(),
-                Ran::Recorded
+                cache.warm(&gpu, &lane, key, &mut b, &mut hold).unwrap(),
+                Ran::Recorded,
+                "a warm-up records at once"
             );
         }
         assert_eq!(cache.len(), 3);
@@ -791,20 +942,70 @@ mod shared_tests {
         assert!(!cache.contains(&(9, 9, 9)) && cache.contains(&KEY));
     }
 
-    /// Capacity counts instances, and a full cache evicts a free one.
+    /// Capacity counts instances, and a full cache evicts the least recently used free one.
     #[test]
-    fn the_capacity_counts_instances_not_keys() {
+    fn the_capacity_counts_instances_and_a_full_cache_evicts_the_least_recently_used() {
         let (gpu, lane, kernel, at) = rig();
-        let cache = SharedGraphCache::<FakeGpu, _>::with_capacity(4);
+        let cache = SharedGraphCache::<FakeGpu, _>::with_capacity(3);
         let mut hold = GraphHold::new();
         let mut b = body(&kernel, at, 1, 0);
-        for shape in 0..9u64 {
+        for shape in 0..3u64 {
             cache
-                .run(&gpu, &lane, (1, 0, shape), &mut b, &mut hold)
+                .warm(&gpu, &lane, (1, 0, shape), &mut b, &mut hold)
                 .unwrap();
         }
-        assert_eq!(cache.len(), 4);
-        assert_eq!(cache.capacity(), 4);
+        // Key 0 is used again: key 1 is the oldest.
+        assert_eq!(
+            cache
+                .run(&gpu, &lane, (1, 0, 0), &mut b, &mut hold)
+                .unwrap(),
+            Ran::Replayed
+        );
+        cache
+            .warm(&gpu, &lane, (1, 0, 3), &mut b, &mut hold)
+            .unwrap();
+        assert_eq!(cache.len(), 3);
+        assert_eq!(cache.capacity(), 3);
+        assert!(
+            cache.contains(&(1, 0, 0)) && cache.contains(&(1, 0, 2)) && cache.contains(&(1, 0, 3))
+        );
+        assert!(!cache.contains(&(1, 0, 1)), "the least recently used went");
+    }
+
+    #[test]
+    fn a_capture_that_fails_runs_the_work_and_marks_the_key_unrecordable() {
+        let (gpu, lane, kernel, at) = rig();
+        let cache = SharedGraphCache::<FakeGpu, _>::new();
+        let mut hold = GraphHold::new();
+        let mut b = body(&kernel, at, 1, 1);
+        assert_eq!(
+            cache.run(&gpu, &lane, KEY, &mut b, &mut hold).unwrap(),
+            Ran::Direct
+        );
+        gpu.fail_next_recording();
+        assert_eq!(
+            cache.run(&gpu, &lane, KEY, &mut b, &mut hold).unwrap(),
+            Ran::Direct,
+            "the capture failed: the unit ran directly"
+        );
+        for _ in 0..3 {
+            assert_eq!(
+                cache.run(&gpu, &lane, KEY, &mut b, &mut hold).unwrap(),
+                Ran::Direct,
+                "never recorded again"
+            );
+        }
+        assert_eq!(cache.stats().records, 0);
+        assert!(cache.is_empty(), "a failed recording leaves no slot behind");
+        gpu.run_until_idle();
+        assert_eq!(word(&gpu, at), 5, "every unit's work ran once");
+        // A key that never failed still records.
+        assert_eq!(
+            cache
+                .warm(&gpu, &lane, (2, 2, 2), &mut b, &mut hold)
+                .unwrap(),
+            Ran::Recorded
+        );
     }
 
     #[test]
@@ -828,8 +1029,8 @@ mod shared_tests {
         assert!(cache.is_empty());
     }
 
-    /// What the recording keeps lives until the caller's hold is dropped: not until the cache, the graph or the lane
-    /// are gone, and not before the hold of the last run that used it.
+    /// What the recording keeps lives until the caller's hold is dropped: not until the cache, the graph or the lane are
+    /// gone, and not before the hold of the last run that used it.
     #[test]
     fn what_a_recording_keeps_is_held_by_the_callers_until_they_drop_their_holds() {
         let (gpu, lane, kernel, at) = rig();
@@ -838,9 +1039,12 @@ mod shared_tests {
         let mut recorded = GraphHold::new();
         let mut b = body(&kernel, at, 1, 1);
         b.keeps = Some(drops.clone());
-        cache.run(&gpu, &lane, KEY, &mut b, &mut recorded).unwrap();
+        cache.warm(&gpu, &lane, KEY, &mut b, &mut recorded).unwrap();
         let mut replayed = GraphHold::new();
-        cache.run(&gpu, &lane, KEY, &mut b, &mut replayed).unwrap();
+        assert_eq!(
+            cache.run(&gpu, &lane, KEY, &mut b, &mut replayed).unwrap(),
+            Ran::Replayed
+        );
         // The update pass's keeps are not the graph's: they were dropped at once, and the recording's are the one value.
         assert_eq!(drops.load(Ordering::SeqCst), 1, "the update pass's value");
         // The cache goes (the instance with it): the work in flight still has its buffers.
@@ -861,40 +1065,26 @@ mod shared_tests {
         );
     }
 
-    /// An instance a replay ran on stays busy until the hold is released: its launch is in flight until the work ended, and
-    /// an instance is not updated or launched again meanwhile. (Reusing it at once lost an ordering between two lanes in
-    /// about one stress run in seven.)
+    /// A replayed instance goes back once its replay is enqueued: the next unit of the key takes it at once, and no instance
+    /// is added.
     #[test]
-    fn a_replayed_instance_is_busy_until_its_hold_is_released() {
+    fn a_replayed_instance_goes_back_once_the_replay_is_enqueued() {
         let (gpu, lane, kernel, at) = rig();
         let cache = SharedGraphCache::<FakeGpu, _>::new();
         let mut b = body(&kernel, at, 1, 1);
-        let mut first = GraphHold::new();
+        let mut holds: Vec<GraphHold> = (0..4).map(|_| GraphHold::new()).collect();
+        cache.warm(&gpu, &lane, KEY, &mut b, &mut holds[0]).unwrap();
+        for hold in &mut holds[1..] {
+            assert_eq!(
+                cache.run(&gpu, &lane, KEY, &mut b, hold).unwrap(),
+                Ran::Replayed
+            );
+        }
         assert_eq!(
-            cache.run(&gpu, &lane, KEY, &mut b, &mut first).unwrap(),
-            Ran::Recorded
+            cache.len(),
+            1,
+            "the holds are alive, and no instance was added"
         );
-        let mut second = GraphHold::new();
-        assert_eq!(
-            cache.run(&gpu, &lane, KEY, &mut b, &mut second).unwrap(),
-            Ran::Replayed,
-            "a recording leaves its instance free at once"
-        );
-        let mut third = GraphHold::new();
-        assert_eq!(
-            cache.run(&gpu, &lane, KEY, &mut b, &mut third).unwrap(),
-            Ran::Recorded,
-            "the only instance has a replay in flight: a second one is recorded"
-        );
-        assert_eq!(cache.len(), 2);
-        second.release();
-        let mut fourth = GraphHold::new();
-        assert_eq!(
-            cache.run(&gpu, &lane, KEY, &mut b, &mut fourth).unwrap(),
-            Ran::Replayed,
-            "the hold was released: the instance is taken again"
-        );
-        assert_eq!(cache.len(), 2, "no instance was added");
     }
 
     /// Workers that run one key at once each get an instance of their own: none waits for another (they are held together
@@ -905,7 +1095,7 @@ mod shared_tests {
         let (gpu, lane, kernel, at) = rig();
         let cache = SharedGraphCache::<FakeGpu, _>::with_capacity(16);
         let barrier = Barrier::new(N);
-        let round = |expect: Ran| {
+        let round = |expect: Ran, warm: bool| {
             let ran = std::thread::scope(|scope| {
                 let threads: Vec<_> = (0..N)
                     .map(|_| {
@@ -913,7 +1103,11 @@ mod shared_tests {
                             let mut hold = GraphHold::new();
                             let mut b = body(&kernel, at, 1, 1);
                             b.inside = Some(&barrier);
-                            cache.run(&gpu, &lane, KEY, &mut b, &mut hold).unwrap()
+                            if warm {
+                                cache.warm(&gpu, &lane, KEY, &mut b, &mut hold).unwrap()
+                            } else {
+                                cache.run(&gpu, &lane, KEY, &mut b, &mut hold).unwrap()
+                            }
                         })
                     })
                     .collect();
@@ -924,11 +1118,11 @@ mod shared_tests {
             });
             assert!(ran.iter().all(|r| *r == expect), "{ran:?}");
         };
-        // None has an instance: all record at once.
-        round(Ran::Recorded);
+        // None has an instance: all record at once (a warm-up records without waiting for a second sighting).
+        round(Ran::Recorded, true);
         assert_eq!(cache.len(), N);
         // Each takes one of the N instances at the same moment (inside the update pass, all together).
-        round(Ran::Replayed);
+        round(Ran::Replayed, false);
         assert_eq!(cache.len(), N, "no instance was added: each had its own");
         gpu.run_until_idle();
         assert_eq!(word(&gpu, at) as usize, 2 * N, "every launch ran once");
@@ -966,6 +1160,7 @@ mod shared_tests {
         let cache = SharedGraphCache::<FakeGpu, _>::new();
         let mut hold = GraphHold::new();
         let mut b = body(&kernel, at, 1, 1);
+        cache.warm(&gpu, &lane, KEY, &mut b, &mut hold).unwrap();
         let ((ran, ()), _marker) = lane
             .submit_marked(|_| {
                 cache
@@ -973,14 +1168,14 @@ mod shared_tests {
                     .map(|r| (r, ()))
             })
             .unwrap();
-        assert_eq!(ran, Ran::Recorded);
+        assert_eq!(ran, Ran::Replayed);
         let refused = lane.submit_marked(|_| {
             cache
                 .run(&gpu, &lane, KEY, &mut b, &mut hold)
                 .map(|r| (r, ()))
         });
         assert!(matches!(refused, Err(GpuError::Busy)));
-        assert_eq!(cache.stats().replays, 0, "nothing was replayed");
+        assert_eq!(cache.stats().replays, 1, "nothing more was replayed");
         gpu.run_until_idle();
         let (r, _) = lane
             .submit_marked(|_| {
@@ -990,5 +1185,48 @@ mod shared_tests {
             })
             .unwrap();
         assert_eq!(r.0, Ran::Replayed);
+    }
+
+    /// A replay orders itself behind the markers it is given, on the device, before its work.
+    #[test]
+    fn a_replay_orders_itself_behind_its_waits_before_its_work() {
+        let gpu = FakeGpu::new();
+        gpu.define("addv", |_, _, _| Ok(()));
+        let lanes = crate::open_shared_lanes(
+            &gpu,
+            &[
+                ("a", StreamOptions::default()),
+                ("b", StreamOptions::default()),
+            ],
+        )
+        .unwrap();
+        let (a, b_lane) = (
+            lanes.pool.lane(euhedral_graph::LaneId(0)).clone(),
+            lanes.pool.lane(euhedral_graph::LaneId(1)).clone(),
+        );
+        let module = FakeModule::from_source(&gpu, "addv", &Default::default()).unwrap();
+        let kernel = module.kernel("addv").unwrap();
+        let at = gpu.alloc(4);
+        let cache = SharedGraphCache::<FakeGpu, _>::new();
+        let mut hold = GraphHold::new();
+        let mut body = body(&kernel, at, 1, 1);
+        cache
+            .warm(&gpu, &b_lane, KEY, &mut body, &mut hold)
+            .unwrap();
+        let (_, marker) = a.submit_marked(|_| Ok(())).unwrap();
+        cache
+            .run_after(&gpu, &b_lane, &[marker], KEY, &mut body, &mut hold)
+            .unwrap();
+        gpu.run_until_idle();
+        let log = gpu.log();
+        let wait = log
+            .iter()
+            .rposition(|op| matches!(op, crate::fake::FakeOp::Await { lane: 1, .. }))
+            .expect("lane b waited");
+        let launch = log
+            .iter()
+            .rposition(|op| matches!(op, crate::fake::FakeOp::Launch { lane: 1, .. }))
+            .expect("the replay's launch");
+        assert!(wait < launch, "{log:?}");
     }
 }

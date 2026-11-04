@@ -473,17 +473,23 @@ pub trait Graph: Send + fmt::Debug + 'static {
     /// Replays the recording as one submission on a shared lane, through `&self` of the lane, with the arguments set by
     /// the last update.
     ///
+    /// The replay orders itself behind `waits` (markers of other lanes) on the device, then launches; the lane's later
+    /// work and its next marker follow it. On CUDA it launches on a private stream forked from the lane and joined back,
+    /// never on the lane itself: with several threads submitting to one stream, a `cuGraphLaunch` can overtake the
+    /// `cuStreamWaitEvent` its own thread issued just before it (see `SharedGraphCache`).
+    ///
     /// The graph is still used by one thread at a time (`&mut self`): a key that several workers run at once has an
-    /// instance of its graph for each (see [`SharedGraphCache`](crate::SharedGraphCache)). Do not update or launch the
-    /// instance again until this launch ended (a stress test that did lost an ordering between two lanes): the cache keeps
-    /// an instance busy until the caller's hold is released. An instance dropped while its launches are in flight is
-    /// freed by the driver once they end.
+    /// instance of its graph for each (see [`SharedGraphCache`](crate::SharedGraphCache)). The instance may be updated
+    /// and replayed again as soon as this returns: a launch's parameters are fixed when it is issued, and the launches of
+    /// one executable are ordered behind each other. An instance dropped while its launches are in flight is freed by the
+    /// driver once they end.
     ///
     /// The values the recording keeps are not given to the lane, which keeps none: a handle to them is added to `hold`,
     /// and the caller holds it until the work ended (in its quantum, released in `Stage::retired`).
     fn replay_on(
         &mut self,
         lane: &<<Self::Gpu as Gpu>::Stream as Stream>::Lane,
+        waits: &[Marker],
         hold: &mut GraphHold,
     ) -> Result<(), GpuError>;
 }

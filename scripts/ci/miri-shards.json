@@ -139,7 +139,7 @@
   "name": "gpu: graph instances and holds",
   "crate": "euhedral-gpu",
   "commands": [
-   "cargo +nightly miri test -p euhedral-gpu --features fake --lib -- instances::tests hold::tests graph_cache::shared_tests"
+   "cargo +nightly miri test -p euhedral-gpu --features fake --lib -- instances::tests handles::tests hold::tests graph_cache::shared_tests"
   ]
  },
  {

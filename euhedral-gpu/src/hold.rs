@@ -15,8 +15,6 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use crate::instances::GiveBack;
-
 /// A kept value, shared only to be dropped. It is never read, so sharing it between threads cannot race: whichever
 /// thread holds the last handle drops it, which a `Send` value permits.
 pub(crate) struct Held(#[allow(dead_code, reason = "held to be dropped")] Box<dyn Any + Send>);
@@ -57,29 +55,6 @@ pub struct GraphHold {
     first: Frozen,
     more: Vec<Arc<[Held]>>,
     direct: Vec<Held>,
-    /// The graph instance a replay ran on, kept busy in its cache until the hold is released: its launch is in flight
-    /// until then, and an instance is not updated or launched again with a launch of its own in flight.
-    parked: Option<Parked>,
-    more_parked: Vec<Parked>,
-}
-
-/// A graph instance kept busy in its pool.
-struct Parked {
-    giver: Arc<dyn GiveBack>,
-    index: usize,
-    tag: u64,
-}
-
-impl std::fmt::Debug for Parked {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Parked").field("slot", &self.index).finish()
-    }
-}
-
-impl Parked {
-    fn give_back(self) {
-        self.giver.give_back(self.index, self.tag);
-    }
 }
 
 impl GraphHold {
@@ -90,11 +65,7 @@ impl GraphHold {
 
     /// Whether the hold keeps nothing alive.
     pub fn is_empty(&self) -> bool {
-        self.first.is_none()
-            && self.more.is_empty()
-            && self.direct.is_empty()
-            && self.parked.is_none()
-            && self.more_parked.is_empty()
+        self.first.is_none() && self.more.is_empty() && self.direct.is_empty()
     }
 
     /// Adds a handle to a recording's frozen values.
@@ -112,38 +83,11 @@ impl GraphHold {
         self.direct.push(Held(value));
     }
 
-    /// Keeps the instance in slot `index` of the pool `giver` belongs to busy until the hold is released.
-    pub(crate) fn add_instance(&mut self, giver: &Arc<dyn GiveBack>, index: usize, tag: u64) {
-        let parked = Parked {
-            giver: giver.clone(),
-            index,
-            tag,
-        };
-        if self.parked.is_none() {
-            self.parked = Some(parked);
-        } else {
-            self.more_parked.push(parked);
-        }
-    }
-
-    /// Drops what the hold keeps alive and gives the graph instances it parked back to their caches. The device work it
-    /// covers must have ended.
+    /// Drops what the hold keeps alive. The device work it covers must have ended.
     pub fn release(&mut self) {
         self.first = None;
         self.more.clear();
         self.direct.clear();
-        if let Some(parked) = self.parked.take() {
-            parked.give_back();
-        }
-        for parked in self.more_parked.drain(..) {
-            parked.give_back();
-        }
-    }
-}
-
-impl Drop for GraphHold {
-    fn drop(&mut self) {
-        self.release();
     }
 }
 

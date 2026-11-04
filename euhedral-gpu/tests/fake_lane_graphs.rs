@@ -136,7 +136,13 @@ fn one_kernel_body_serves_every_way_to_submit_and_every_pass() {
     };
     assert_eq!(
         cache.run(&gpu, &lane, 1u32, &mut body, &mut hold).unwrap(),
-        Ran::Recorded
+        Ran::Direct,
+        "first sighting"
+    );
+    assert_eq!(
+        cache.run(&gpu, &lane, 1u32, &mut body, &mut hold).unwrap(),
+        Ran::Recorded,
+        "second sighting"
     );
     body.by = 1000;
     assert_eq!(
@@ -144,7 +150,7 @@ fn one_kernel_body_serves_every_way_to_submit_and_every_pass() {
         Ran::Replayed
     );
     gpu.run_until_idle();
-    assert_eq!(word(&gpu, at), 1 + 10 + 100 + 1000);
+    assert_eq!(word(&gpu, at), 1 + 10 + 100 + 100 + 1000);
 }
 
 struct Sink(Producer<Box<dyn Frame>, Multi>);
@@ -187,10 +193,6 @@ struct Replays {
 impl Stage<Batch, FakeQueue> for Replays {
     fn run(&self, q: &Batch, cx: &StageCx<'_, FakeQueue>) -> Result<Submitted, StageError> {
         let lane = cx.lane_handle().expect("a stage with a lane");
-        for marker in cx.waits {
-            lane.await_marker(*marker)
-                .map_err(|e| StageError::Corrupt(e.to_string()))?;
-        }
         let mut body = Body {
             kernel: self.kernel.clone(),
             word: self.word,
@@ -201,7 +203,7 @@ impl Stage<Batch, FakeQueue> for Replays {
         // The marker is claimed before the run: a refusal (`Busy`) comes before any recording or replay.
         let made = lane.submit_marked(|_| {
             self.cache
-                .run(&self.gpu, lane, self.key, &mut body, &mut hold)
+                .run_after(&self.gpu, lane, cx.waits, self.key, &mut body, &mut hold)
         });
         match made {
             Ok((_, marker)) => Ok(Submitted::marker(marker)),
@@ -336,18 +338,21 @@ fn a_stage_replays_a_cached_graph_on_its_lane_and_the_successor_awaits_its_marke
     f.settle();
     assert_eq!(*lock(&f.retired), [(1, QuantumOutcome::Completed)]);
     assert_eq!(
-        f.cache.stats().records,
+        f.cache.stats().directs,
         2,
-        "the first quantum recorded both"
+        "the first sighting ran directly"
     );
-    for q in 2..=5 {
+    f.start(2);
+    f.settle();
+    assert_eq!(f.cache.stats().records, 2, "the second recorded both");
+    for q in 3..=6 {
         f.start(q);
         f.settle();
     }
-    assert_eq!(lock(&f.retired).len(), 5);
+    assert_eq!(lock(&f.retired).len(), 6);
     assert_eq!(f.cache.stats().replays, 8, "four quanta replayed both");
     assert_eq!(f.cache.len(), 2);
-    assert_eq!(word(&f.gpu, f.word), 5 * (1 + 10));
+    assert_eq!(word(&f.gpu, f.word), 6 * (1 + 10));
     // The second stage's launches waited for the first's marker on lane 1.
     let log = f.gpu.log();
     let wait = log

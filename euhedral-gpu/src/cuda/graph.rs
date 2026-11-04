@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use euhedral_graph::Marker;
 use euhedral_memory::cuda::{CuEvent, CuStream, STREAM_NON_BLOCKING};
 
 use crate::hold::{Frozen, freeze};
@@ -17,6 +18,7 @@ use super::enqueue::{Dest, Mode, Node, Recording, Target};
 use super::fns::{
     CAPTURE_MODE_RELAXED, CuGraph, CuGraphExec, ExecUpdateResultInfo, KernelNodeParams,
 };
+use super::stream::Fork;
 use super::{CudaEnqueue, CudaGpu, CudaKernel, CudaQueue, CudaStream, from_cuda};
 
 /// `CU_EVENT_DISABLE_TIMING`.
@@ -188,14 +190,48 @@ impl Graph for CudaGraph {
         Ok(())
     }
 
-    fn replay_on(&mut self, lane: &CudaQueue, hold: &mut GraphHold) -> Result<(), GpuError> {
+    fn replay_on(
+        &mut self,
+        lane: &CudaQueue,
+        waits: &[Marker],
+        hold: &mut GraphHold,
+    ) -> Result<(), GpuError> {
         self.gpu.poison.check()?;
         let _c = self.gpu.device().enter().map_err(from_cuda)?;
-        // SAFETY: the executable and a lane of the same device; `&mut self` makes this call the executable's only user
-        // (the driver orders its launches, whichever stream they are on); the context is current.
-        self.gpu.check("cuGraphLaunch", unsafe {
-            (self.gpu.fns.graph_launch)(self.exec, lane.raw)
-        })?;
+        // The worker launches on a private stream forked from the lane (see `Fork`): never on the lane itself.
+        let fork = lane.take_fork()?;
+        let f = &self.gpu.device().driver.fns;
+        let replayed = (|| {
+            // SAFETY: events and streams of this device; the lane's and the private stream are in use by this thread (the
+            // private one alone); the context is current.
+            unsafe {
+                self.gpu
+                    .check("cuEventRecord", (f.event_record)(fork.fork, lane.raw))?;
+                self.gpu.check(
+                    "cuStreamWaitEvent",
+                    (self.gpu.fns.stream_wait_event)(fork.stream, fork.fork, 0),
+                )?;
+            }
+            for marker in waits {
+                lane.await_now(fork.stream, *marker)?;
+            }
+            // SAFETY: the executable and a stream of the same device; `&mut self` makes this call the executable's only
+            // user; the private stream is this thread's alone; the context is current.
+            unsafe {
+                self.gpu.check(
+                    "cuGraphLaunch",
+                    (self.gpu.fns.graph_launch)(self.exec, fork.stream),
+                )?;
+                self.gpu
+                    .check("cuEventRecord", (f.event_record)(fork.join, fork.stream))?;
+                self.gpu.check(
+                    "cuStreamWaitEvent",
+                    (self.gpu.fns.stream_wait_event)(lane.raw, fork.join, 0),
+                )
+            }
+        })();
+        lane.give_fork(fork);
+        replayed?;
         // The lane keeps nothing: the caller holds the recording's buffers until the work ended.
         hold.add_frozen(&self.kept);
         Ok(())
@@ -207,8 +243,9 @@ impl Graph for CudaGraph {
 pub(crate) struct Real<'a> {
     dest: Dest<'a>,
     shadow: CuStream,
-    /// Whether the shadow was made for this pass (a lane's) and is destroyed with it; a stream keeps its own.
-    owned_shadow: bool,
+    /// The lane's private stream the capture runs on (the lane's stock, given back when the pass ends); a stream keeps
+    /// its own shadow.
+    fork: Option<Box<Fork>>,
 }
 
 /// A pass over a recurring sequence.
@@ -367,10 +404,10 @@ impl Drop for CudaSequence<'_> {
             // SAFETY: events made by `event`, unused after the capture ended.
             unsafe { (f.event_destroy)(event) };
         }
-        for r in &self.real {
-            if r.owned_shadow {
-                // SAFETY: a stream made for this pass, whose capture has ended and which holds no real work.
-                unsafe { (f.stream_destroy)(r.shadow) };
+        for r in &mut self.real {
+            if let (Some(fork), Dest::Lane(lane)) = (r.fork.take(), &r.dest) {
+                // The capture ended, so the stream is out of capture mode and holds no real work.
+                lane.give_fork(fork);
             }
         }
     }
@@ -462,7 +499,7 @@ impl CudaGpu {
         Ok(std::mem::replace(&mut seq.rec, Recording::new(Mode::Probe)))
     }
 
-    /// A stream to capture on.
+    /// A stream to capture on (an owned stream\'s own shadow).
     fn shadow_stream(&self) -> Result<CuStream, GpuError> {
         let mut raw = std::ptr::null_mut();
         // SAFETY: an out pointer; the context is current.
@@ -495,24 +532,22 @@ impl CudaGpu {
         for mut dest in dests {
             let made = match &mut dest {
                 Dest::Stream(stream) => match stream.shadow {
-                    Some(shadow) => Ok((shadow, false)),
+                    Some(shadow) => Ok((shadow, None)),
                     None => self.shadow_stream().map(|raw| {
                         stream.shadow = Some(raw);
-                        (raw, false)
+                        (raw, None)
                     }),
                 },
-                Dest::Lane(_) => self.shadow_stream().map(|raw| (raw, true)),
+                // One shadow stream per lane, from the lane's stock (made once, reused).
+                Dest::Lane(lane) => lane.take_fork().map(|fork| (fork.stream, Some(fork))),
             };
             match made {
-                Ok((shadow, owned_shadow)) => real.push(Real {
-                    dest,
-                    shadow,
-                    owned_shadow,
-                }),
+                Ok((shadow, fork)) => real.push(Real { dest, shadow, fork }),
                 Err(e) => {
-                    for r in real.iter().filter(|r| r.owned_shadow) {
-                        // SAFETY: a stream made for this pass, never used.
-                        unsafe { (self.device().driver.fns.stream_destroy)(r.shadow) };
+                    for r in &mut real {
+                        if let (Some(fork), Dest::Lane(lane)) = (r.fork.take(), &r.dest) {
+                            lane.give_fork(fork);
+                        }
                     }
                     return Err(e);
                 }

@@ -24,8 +24,8 @@ use euhedral_gpu::{
     StreamOptions, open_shared_lanes,
 };
 use euhedral_graph::{
-    Completions, DEFAULT_RETRY_BACKSTOP, EdgeKind, GraphRuntime, LaneControl, LaneId, Stage,
-    StageCx, StageError, StageGraph, StageGraphSpec, StageSpec, Submitted,
+    Completions, DEFAULT_RETRY_BACKSTOP, EdgeKind, GraphRuntime, LaneId, Stage, StageCx,
+    StageError, StageGraph, StageGraphSpec, StageSpec, Submitted,
 };
 
 static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
@@ -143,10 +143,6 @@ struct Replays {
 impl Stage<Work, CudaQueue> for Replays {
     fn run(&self, work: &Work, cx: &StageCx<'_, CudaQueue>) -> Result<Submitted, StageError> {
         let lane = cx.lane_handle().expect("a stage with a lane");
-        for marker in cx.waits {
-            lane.await_marker(*marker)
-                .map_err(|e| StageError::Corrupt(e.to_string()))?;
-        }
         let mut body = Add {
             kernel: self.kernel.clone(),
             word: work.word,
@@ -157,7 +153,7 @@ impl Stage<Work, CudaQueue> for Replays {
             .unwrap_or_else(PoisonError::into_inner);
         let made = lane.submit_marked(|_| {
             self.cache
-                .run(&self.gpu, lane, self.key, &mut body, &mut hold)
+                .run_after(&self.gpu, lane, cx.waits, self.key, &mut body, &mut hold)
         });
         match made {
             Ok((_, marker)) => Ok(Submitted::marker(marker)),
@@ -245,13 +241,16 @@ fn warm_stages_replay_cached_graphs_and_quanta_run_without_allocating() {
     .unwrap();
     let kill = Arc::new(AtomicBool::new(false));
     let mut started = 0usize;
-    let mut quantum = || {
-        let work = Work {
-            word: buf.addr,
-            holds: [Mutex::default(), Mutex::default()],
-        };
-        let _ = graph.start(work, kill.clone(), None::<euhedral_graph::ExternalEdge>);
-        started += 1;
+    // Starts `count` quanta at once (they overlap on the lanes and in the pools) and pumps until all of them retired.
+    let mut batch = |count: usize| {
+        for _ in 0..count {
+            let work = Work {
+                word: buf.addr,
+                holds: [Mutex::default(), Mutex::default()],
+            };
+            let _ = graph.start(work, kill.clone(), None::<euhedral_graph::ExternalEdge>);
+            started += 1;
+        }
         while retired.load(Ordering::Acquire) < started {
             while let Some(frame) = frames.poll() {
                 run_frame(frame);
@@ -263,40 +262,63 @@ fn warm_stages_replay_cached_graphs_and_quanta_run_without_allocating() {
             }
         }
     };
+    // Warm-up: the first sighting of a key runs directly, the second records, and the pools fill for both shapes.
     for _ in 0..200 {
-        quantum();
+        batch(1);
     }
-    let before = ALLOCATIONS.load(Ordering::Relaxed);
-    for _ in 0..2_000 {
-        quantum();
+    for _ in 0..25 {
+        batch(8);
     }
-    let allocated = ALLOCATIONS.load(Ordering::Relaxed) - before;
-    assert_eq!(
-        allocated, 0,
-        "{allocated} allocations over 2000 quanta of two stages that replay a cached graph, mark, hold what the work \
-         reads and release it in their hook"
-    );
+    let measure = |what: &str, run: &mut dyn FnMut()| {
+        let before = ALLOCATIONS.load(Ordering::Relaxed);
+        run();
+        let allocated = ALLOCATIONS.load(Ordering::Relaxed) - before;
+        assert_eq!(
+            allocated, 0,
+            "{allocated} allocations over {what} of two stages that replay a cached graph, mark, hold what the work \
+             reads and release it in their hook"
+        );
+    };
+    measure("2000 quanta, one at a time", &mut || {
+        for _ in 0..2_000 {
+            batch(1);
+        }
+    });
+    measure("2000 quanta, eight in flight at once", &mut || {
+        for _ in 0..250 {
+            batch(8);
+        }
+    });
     assert_eq!(
         hooks.load(Ordering::Acquire),
-        2 * 2_200,
+        2 * (200 + 25 * 8 + 2_000 + 2_000),
         "every stage's hook ran once"
     );
     let stats = cache.stats();
     assert_eq!(
-        stats.records, 2,
-        "one instance per key: the quanta never overlapped"
+        stats.directs, 2,
+        "the first sighting of each key ran directly"
     );
-    assert_eq!(stats.replays, 2 * 2_200 - 2);
+    assert_eq!(
+        stats.records, 2,
+        "one instance per key: a single thread runs one stage at a time, and an instance goes back once its replay is \
+         enqueued"
+    );
+    assert_eq!(
+        stats.replays,
+        2 * (200 + 25 * 8 + 2_000 + 2_000) - 4,
+        "every other stage run was a real replay"
+    );
     assert_eq!(
         freed.load(Ordering::Relaxed),
-        0,
-        "the instances still own the recordings' values"
+        2,
+        "the two direct runs' values went with their holds; the instances still own the recordings' values"
     );
     drop(graph);
     drop(cache);
     assert_eq!(
         freed.load(Ordering::Relaxed),
-        2,
-        "the values were dropped with the instances, once, and no hold kept one"
+        4,
+        "the recordings' values were dropped with the instances, once, and no hold kept one"
     );
 }

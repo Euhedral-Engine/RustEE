@@ -36,6 +36,7 @@ mod error;
 #[cfg(feature = "fake")]
 pub mod fake;
 mod graph_cache;
+mod handles;
 mod hold;
 mod instances;
 #[cfg(any(feature = "fake", feature = "cuda"))]

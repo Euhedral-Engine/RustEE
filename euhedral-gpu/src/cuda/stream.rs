@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use euhedral_graph::{DeviceQueue, LaneControl, LaneId, Marker, QueueId};
 use euhedral_memory::cuda::{CuEvent, CuStream, Device, STREAM_NON_BLOCKING};
 
+use crate::handles::HandlePool;
 use crate::kept::Kept;
 use crate::retire::{RetireSink, Retirements};
 use crate::spans::{Span, SpanBook};
@@ -170,7 +171,32 @@ pub struct CudaQueue {
     /// complete (the context is lost, or the wait fails) and retirements are still outstanding, the drop leaks one
     /// reference to this shared side, so the sink is never freed under a callback that is still to run.
     sink: RetireSink,
+    /// The private streams of this lane, stocked: a worker takes one to replay a graph or to capture on, uses it alone,
+    /// and gives it back (see [`Fork`]).
+    forks: HandlePool,
 }
+
+/// The most private streams a lane keeps stocked; a stream given back to a full stock is destroyed.
+const FORKS_STOCKED: usize = 64;
+
+/// A private stream of a lane, with the two events that fork it from the lane and join it back.
+///
+/// Several threads submitting to one stream let a `cuGraphLaunch` overtake the `cuStreamWaitEvent` its own thread issued
+/// just before it (seen with driver 615.71.09 on CUDA 13.4: a graph's work then runs before what it waited for; plain
+/// launches, a single submitter per stream, and a wait and launch locked together do not do it). So a replay never launches
+/// on the lane: its worker forks a stream of its own from the lane (an event recorded on the lane, awaited by the private
+/// stream), does its cross-lane waits and the launch there, and joins the lane back (an event recorded on the private
+/// stream, awaited by the lane); the marker is recorded on the lane after the join. One stream is used by one worker at a
+/// time, so each launches alone on its stream. The same streams are the shadow streams a recording captures on.
+#[derive(Debug)]
+pub(crate) struct Fork {
+    pub(crate) stream: CuStream,
+    pub(crate) fork: CuEvent,
+    pub(crate) join: CuEvent,
+}
+
+// SAFETY: driver handles of the primary context, used by one thread at a time (taken from the stock, given back).
+unsafe impl Send for Fork {}
 
 // SAFETY: the stream handle belongs to the primary context and is usable from any thread with it current; everything
 // else is atomics, immutable, or reached through a claim.
@@ -181,6 +207,53 @@ unsafe impl Sync for CudaQueue {}
 impl CudaQueue {
     pub(crate) fn sink(&self) -> &RetireSink {
         &self.sink
+    }
+
+    /// A private stream of this lane: one of the stock, else a new one. The context is current. Give it back with
+    /// [`give_fork`](Self::give_fork).
+    pub(crate) fn take_fork(&self) -> Result<Box<Fork>, GpuError> {
+        if let Some(handle) = self.forks.take() {
+            // SAFETY: the handle was made by `Box::into_raw` below and is held by no one else once taken.
+            return Ok(unsafe { Box::from_raw(handle as *mut Fork) });
+        }
+        let f = &self.gpu.device().driver.fns;
+        let mut stream: CuStream = std::ptr::null_mut();
+        // SAFETY: an out pointer; the context is current.
+        self.gpu.check("cuStreamCreate", unsafe {
+            (f.stream_create)(&mut stream, STREAM_NON_BLOCKING)
+        })?;
+        let mut events: [CuEvent; 2] = [std::ptr::null_mut(); 2];
+        for at in 0..2 {
+            // SAFETY: an out pointer; the context is current. `2` is `CU_EVENT_DISABLE_TIMING`.
+            let made = self.gpu.check("cuEventCreate", unsafe {
+                (f.event_create)(&mut events[at], 2)
+            });
+            if let Err(e) = made {
+                // SAFETY: handles made above, unused.
+                unsafe {
+                    for event in &events[..at] {
+                        (f.event_destroy)(*event);
+                    }
+                    (f.stream_destroy)(stream);
+                }
+                return Err(e);
+            }
+        }
+        Ok(Box::new(Fork {
+            stream,
+            fork: events[0],
+            join: events[1],
+        }))
+    }
+
+    /// Gives a private stream back to the stock (destroyed if the stock is full). The context is current. Whatever was
+    /// enqueued on the stream stays ordered on it; a stream that was capturing must have ended its capture.
+    pub(crate) fn give_fork(&self, fork: Box<Fork>) {
+        let handle = Box::into_raw(fork);
+        if let Err(handle) = self.forks.give(handle as usize) {
+            // SAFETY: the pointer made above, given to no one.
+            destroy_fork(&self.gpu, &unsafe { *Box::from_raw(handle as *mut Fork) });
+        }
     }
 
     /// Claims the next marker, ahead of the work it will follow. `Err(Busy)` before anything is submitted.
@@ -263,6 +336,18 @@ impl CudaQueue {
     }
 }
 
+/// Destroys a private stream and its events (after the work on it ended: its lane waited for the join).
+fn destroy_fork(gpu: &CudaGpu, fork: &Fork) {
+    let f = &gpu.device().driver.fns;
+    // SAFETY: handles made by `take_fork`, no longer in use; the context is current.
+    unsafe {
+        (f.stream_synchronize)(fork.stream);
+        (f.event_destroy)(fork.fork);
+        (f.event_destroy)(fork.join);
+        (f.stream_destroy)(fork.stream);
+    }
+}
+
 impl Drop for CudaQueue {
     /// The last handle is gone: the stream's work ends before the stream is destroyed. A retirement a lane armed holds
     /// its own clone of the cell the callback fills, so no callback can outlive what it writes.
@@ -270,10 +355,13 @@ impl Drop for CudaQueue {
         if let Ok(_c) = self.gpu.device().enter() {
             let f = &self.gpu.device().driver.fns;
             // SAFETY: the stream this value stands for, no longer in use; the context is current.
-            unsafe {
-                (f.stream_synchronize)(self.raw);
-                (f.stream_destroy)(self.raw);
+            unsafe { (f.stream_synchronize)(self.raw) };
+            for handle in self.forks.drain() {
+                // SAFETY: the stock holds pointers made by `give_fork`, which no one else holds.
+                destroy_fork(&self.gpu, &unsafe { *Box::from_raw(handle as *mut Fork) });
             }
+            // SAFETY: as above.
+            unsafe { (f.stream_destroy)(self.raw) };
         }
     }
 }
@@ -405,6 +493,7 @@ impl CudaStream {
                     raw,
                     lanes: lanes.clone(),
                     sink,
+                    forks: HandlePool::new(FORKS_STOCKED),
                 }),
                 shadow: None,
                 retire,
