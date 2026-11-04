@@ -3,6 +3,16 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## A retried stage allocates nothing when it runs again (2026-11-04)
+
+**What.** A stage that answers `StageError::Retry` no longer allocates when it runs again. Its wake-up (the lanes' completed counts at the retry and the backstop's deadline) used to be made anew by every retry: a `Vec` and a `Box`. It is now one record per stage of a run, made with the run, prepared again by each retry, and registered with `Completions` as a clone of its `Arc` (the crate-internal `Completions::after_wake`, as `after_retired` registers a clone of a `RetireCell`). The pooled run grows to its peak in warm-up, as before, and nothing after it.
+
+**Semantics unchanged.** A retried stage runs again when any lane of the pool completed more work than at the retry, or after `GraphRuntime::retry_backstop`. `RetryCounts` count the same: `retries` once per `Retry` answered, and each wake-up once, in `progress` or in `backstops` (progress first, when both hold). A kill or a stop while the stage waits ends it as before.
+
+**Why.** Retry is what a stage answers when the marker ring is full; a dependent saw about a thousand retries a minute on one ordered lane, each allocating twice.
+
+**Tests.** `tests/stage_graph_retry_alloc.rs` counts every allocation of the process over 500 quanta of 3 retries each, once with every wake-up by a lane's progress and once with every wake-up by the backstop, and asserts 0 allocations and exact `RetryCounts` (it failed first with 2 allocations per retry). `completions::tests::a_kept_wake_is_emitted_when_it_holds_and_can_be_registered_again`.
+
 ## Stage gates, abandoned behind the join, and the lane's raw stream (2026-11-04)
 
 **What.** Three more of Java's `StageFrame`/`GpuStream` behaviours, each drift from Java fixed.

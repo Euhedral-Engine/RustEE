@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 use euhedral_core::frames::{Frame, FrameError, FrameHeader};
 use euhedral_core::generics::FrameSink;
 
-use crate::completions::{Completions, Ready};
+use crate::completions::{Completions, Ready, Wake};
 use crate::lanes::{DeviceQueue, LaneId, LanePool, Marker, RetireCell};
 use crate::sync::{AtomicU64, AtomicUsize, Ordering, Owned};
 use crate::take_all::{Link, Linked, Sealed, TakeAllStack};
@@ -501,8 +501,8 @@ impl std::error::Error for GraphError {}
 ///   boundary and retirement frames are pooled the same way. After warm-up, a quantum allocates
 ///   nothing and takes no lock of its own on its way (a take from a pool retries the queue's try-claim; it
 ///   never waits). A stage that returns a host completion allocates it, and
-///   a completion that waits for both a marker and a host completion, or a retried stage, allocates
-///   its wake-up.
+///   a completion that waits for both a marker and a host completion allocates its wake-up. A retried stage's
+///   wake-up is pooled with its run: a retry allocates nothing.
 ///
 /// More precisely:
 /// - **Lanes:** each stage's lane is continued by exactly one successor, its critical successor
@@ -1186,6 +1186,8 @@ struct Run<Q, L: DeviceQueue + ?Sized> {
     /// The first reason the quantum did not complete; read by the retirement, after every frame is done.
     cause: FirstCause<QuantumOutcome>,
     stages: Box<[StageRun]>,
+    /// Each stage's wake-up for when it answers `Retry`.
+    retry_wakes: Box<[Arc<RetryWake<L>>]>,
     /// The lanes the quantum submitted to, and the latest marker value on each.
     lanes: LaneTable,
     /// Boundary completions still to come, and one for the arming.
@@ -1206,6 +1208,16 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Run<Q, L> {
         let stages = (0..core.spec.stages.len())
             .map(|_| StageRun::new())
             .collect();
+        let runtime = &core.runtime;
+        let retry_wakes = (0..core.spec.stages.len())
+            .map(|_| {
+                Arc::new(RetryWake::new(
+                    runtime.lanes.clone(),
+                    runtime.retries.clone(),
+                    runtime.retry_backstop,
+                ))
+            })
+            .collect();
         let lanes = LaneTable::new(core.runtime.lanes.len());
         Arc::new(Self {
             core,
@@ -1218,6 +1230,7 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Run<Q, L> {
             stopped: AtomicBool::new(false),
             cause: FirstCause::new(),
             stages,
+            retry_wakes,
             lanes,
             boundary_left: AtomicUsize::new(0),
             retire_cell: Arc::new(RetireCell::new()),
@@ -1649,15 +1662,14 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Run<Q, L> {
         // It has not submitted: a kill while it waits abandons it.
         let runtime = &self.core.runtime;
         runtime.retries.retries.fetch_add(1, Ordering::Relaxed);
-        let ready = Progress::new(
-            runtime.lanes.clone(),
-            runtime.retries.clone(),
-            runtime.retry_backstop,
-        );
+        let wake = &self.retry_wakes[usize::from(stage.0)];
+        // SAFETY: the stage runs once at a time, and its previous wake-up fired before the frame that runs it again was
+        // published.
+        unsafe { wake.prepare() };
         let frame = self
             .core
             .frame(self, Kind::Retry(stage), self.header(None, true));
-        runtime.completions.after(Box::new(ready), frame);
+        runtime.completions.after_wake(wake.clone(), frame);
     }
 
     /// A retried stage's wake-up arrived. Returns whether its live count is to be dropped.
@@ -2326,42 +2338,70 @@ impl Ready for RetiredAndHost {
     }
 }
 
-/// A retried stage's wake-up: any lane of the pool past where it was at the retry, or the
-/// backstop's deadline.
-struct Progress<L: DeviceQueue + ?Sized> {
+/// A retried stage's wake-up: any lane of the pool past where it was at the retry, or the backstop's deadline.
+///
+/// One per stage of a run, made with the run and prepared again by each retry: the completions hold a clone of its
+/// `Arc`, so a retry allocates nothing.
+struct RetryWake<L: DeviceQueue + ?Sized> {
     lanes: Arc<LanePool<L>>,
-    seen: Vec<u64>,
-    deadline: Instant,
     counts: Arc<RetryCounts>,
+    backstop: Duration,
+    /// Each lane's completed count at the retry, and the deadline. Written by the thread that retries the stage before
+    /// it registers the wake; read by the completions' polls until the wake fires. The registration queue hands them
+    /// over, and the next retry comes only after the frame the wake was registered with has been emitted.
+    seen: Owned<Vec<u64>>,
+    deadline: Owned<Instant>,
 }
 
-impl<L: DeviceQueue + ?Sized> Progress<L> {
+impl<L: DeviceQueue + ?Sized> RetryWake<L> {
     fn new(lanes: Arc<LanePool<L>>, counts: Arc<RetryCounts>, backstop: Duration) -> Self {
-        let seen = (0..lanes.len())
-            .map(|i| lanes.lane(LaneId(i as u16)).completed())
-            .collect();
-        Progress {
+        let seen = Vec::with_capacity(lanes.len());
+        Self {
             lanes,
-            seen,
-            deadline: Instant::now() + backstop,
             counts,
+            backstop,
+            seen: Owned::new(seen),
+            deadline: Owned::new(Instant::now()),
+        }
+    }
+
+    /// Notes where the lanes are and when the backstop falls due.
+    ///
+    /// # Safety
+    ///
+    /// The previous registration of this wake fired and its frame was emitted (or the wake was never registered), and
+    /// this wake is registered after this call.
+    unsafe fn prepare(&self) {
+        // SAFETY: the caller's contract: no poll reads the wake, and this thread owns it until it registers it.
+        unsafe {
+            self.seen.write(|seen| {
+                seen.clear();
+                seen.extend(
+                    (0..self.lanes.len()).map(|i| self.lanes.lane(LaneId(i as u16)).completed()),
+                );
+            });
+            self.deadline.set(Instant::now() + self.backstop);
         }
     }
 }
 
-impl<L: DeviceQueue + ?Sized + 'static> Ready for Progress<L> {
-    fn is_ready(&mut self) -> bool {
-        let lanes = &self.lanes;
-        if self
-            .seen
-            .iter()
-            .enumerate()
-            .any(|(i, &v)| lanes.lane(LaneId(i as u16)).completed() > v)
-        {
+impl<L: DeviceQueue + ?Sized + 'static> Wake for RetryWake<L> {
+    fn is_ready(&self) -> bool {
+        // SAFETY: `prepare` wrote these before the registration, which handed them to the polling thread; only that
+        // thread reads them until the wake fires, and nothing prepares it again before then.
+        let progressed = unsafe {
+            self.seen.read(|seen| {
+                seen.iter()
+                    .enumerate()
+                    .any(|(i, &v)| self.lanes.lane(LaneId(i as u16)).completed() > v)
+            })
+        };
+        if progressed {
             self.counts.progress.fetch_add(1, Ordering::Relaxed);
             return true;
         }
-        if Instant::now() >= self.deadline {
+        // SAFETY: as above.
+        if Instant::now() >= unsafe { self.deadline.get() } {
             self.counts.backstops.fetch_add(1, Ordering::Relaxed);
             return true;
         }

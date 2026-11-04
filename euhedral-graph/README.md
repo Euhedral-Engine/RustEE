@@ -259,8 +259,8 @@ retired yet.
 
 Quanta are **pooled**. `start` takes a retired quantum's state from a bounded pool and `retire` gives it back,
 as the graph's frames go back to theirs, so after warm-up a quantum allocates nothing and takes no lock of its own. (A stage
-that returns a host completion allocates it; a retried stage and a completion that waits for both a marker and a
-host completion allocate their wake-ups.) `start` takes its external edges as any iterator of `ExternalEdge`s, so
+that returns a host completion allocates it, and a completion that waits for both a marker and a host completion
+allocates its wake-up; a retried stage's wake-up is pooled with its run, so a retry allocates nothing.) `start` takes its external edges as any iterator of `ExternalEdge`s, so
 an array or an `Option` needs no `Vec`.
 
 ### Lakes
