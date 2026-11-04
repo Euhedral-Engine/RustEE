@@ -17,7 +17,7 @@ use euhedral_data_structures::sync::HotScope;
 
 use euhedral_core::metrics::Histogram;
 
-use crate::lanes::{LanePool, Marker};
+use crate::lanes::{LanePool, Marker, RetireCell};
 
 /// Whether an operation has completed. One cheap query; never blocks.
 pub trait Ready: Send {
@@ -118,6 +118,8 @@ struct Waiting {
 enum Waits {
     Ready(Box<dyn Ready>, Box<dyn Frame>),
     Marker(Marker, Box<dyn Frame>),
+    /// A lane's retirement callback, named by the cell it fills.
+    Retired(Arc<RetireCell>, Box<dyn Frame>),
     At(Instant, Box<dyn Frame>),
     Pending(Box<dyn Pending>),
     /// Completed, its frame held back by a pull's `stop` (with when it was last seen in flight, or
@@ -246,9 +248,12 @@ impl Completions {
     /// is the choice an I/O ring makes for its in-flight buffers. Wherever a frame's resources
     /// could be released while the device may still use them, they are not.
     fn cancel(&self, what: Waits) {
-        if let Waits::Marker(marker, _) = &what
-            && !self.lanes.reached(*marker)
-        {
+        let unreached = match &what {
+            Waits::Marker(marker, _) => !self.lanes.reached(*marker),
+            Waits::Retired(cell, _) => !cell.arrived(),
+            _ => false,
+        };
+        if unreached {
             self.leaked.fetch_add(1, Ordering::Release);
             std::mem::forget(what);
             return;
@@ -256,6 +261,7 @@ impl Completions {
         match what {
             Waits::Ready(_, frame)
             | Waits::Marker(_, frame)
+            | Waits::Retired(_, frame)
             | Waits::At(_, frame)
             | Waits::Done(frame, _) => frame.do_finally(),
             Waits::Pending(pending) => drop(pending),
@@ -390,6 +396,14 @@ impl Completions {
         self.add(Waits::Marker(marker, frame));
     }
 
+    /// Emits `frame` once a lane's retirement callback filled `cell` (see
+    /// [`LaneControl::notify_retired`](crate::LaneControl::notify_retired)): the work submitted before the retirement was
+    /// armed has ended, and `cell` holds its status. Nothing is allocated: the registration holds a clone of the `Arc`.
+    /// A source dropped before the callback arrived leaks the registration, as it does for a marker not reached.
+    pub fn after_retired(&self, cell: Arc<RetireCell>, frame: Box<dyn Frame>) {
+        self.add(Waits::Retired(cell, frame));
+    }
+
     /// Emits `frame` at or after `deadline` (timers: a periodic tick, a watchdog, a backoff).
     pub fn at(&self, deadline: Instant, frame: Box<dyn Frame>) {
         self.add(Waits::At(deadline, frame));
@@ -459,6 +473,7 @@ impl Completions {
             let done = match &mut entry.what {
                 Waits::Ready(ready, _) => ready.is_ready(),
                 Waits::Marker(marker, _) => self.lanes.reached(*marker),
+                Waits::Retired(cell, _) => cell.arrived(),
                 Waits::At(deadline, _) => now >= *deadline,
                 Waits::Pending(pending) => match pending.poll() {
                     Some(frame) => {
@@ -476,7 +491,7 @@ impl Completions {
                 continue;
             }
             entry.what = match std::mem::replace(&mut entry.what, Waits::Moving) {
-                Waits::Ready(_, frame) | Waits::Marker(_, frame) => {
+                Waits::Ready(_, frame) | Waits::Marker(_, frame) | Waits::Retired(_, frame) => {
                     Waits::Done(frame, entry.last_seen)
                 }
                 Waits::At(deadline, frame) => Waits::Done(frame, deadline),

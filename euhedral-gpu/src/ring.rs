@@ -8,15 +8,21 @@
 //! - **`claimed`** is the highest number handed out. A marker's number is claimed by compare-and-set, after checking
 //!   that the slot's previous record (marker `v - n`) completed, so no two threads ever share a slot.
 //! - **`recorded[slot]`** is set, with release ordering, once the claimant's record call returned: `(v << 1) | skipped`.
-//!   A claimant that cannot record (an awaiter holds the slot for too long, or the driver refused) stores the number as
-//!   **skipped**, a hole nobody was given.
+//!   A claimant that gives its number up (the driver refused the record, or the claim was dropped before the work it
+//!   was for) stores it as **skipped**, a hole nobody was given.
 //! - **`done`** is the highest number known complete, advanced by whoever scans. A scan walks the numbers after `done`
 //!   in order and stops at the first it cannot vouch for: a number whose entry is not stored yet (its claimant is still
 //!   inside the record call, and the slot holds an older number's record, which must not be mistaken for it), or one
 //!   whose event is not complete. So a number is never counted complete ahead of one before it, and no thread waits for
 //!   another: a scan that finds a claimant mid-record stops, and the next scan goes on.
 //!
-//! `mark` records *after all the work submitted so far on the stream*, which may include another thread's work: that
+//! **A refusal comes before the work.** A number is claimed ([`MarkerRing::reserve`]) *ahead* of the work it follows, as
+//! Java opens a stage's marker before the stage submits, and the only refusal (`Busy`: the ring is full, or an awaiter
+//! holds the slot) is answered then. Recording the marker afterwards ([`Claim::record`]) is never refused, so a stage
+//! that is told to retry has submitted nothing. A number claimed and not yet recorded holds up the completion count of the
+//! numbers after it, and no more.
+//!
+//! A marker records *after all the work submitted so far on the stream*, which may include another thread's work: that
 //! only over-waits. The driver serializes the calls it gets on one stream; the ring keeps their numbers consistent.
 //!
 //! Awaiters meet the claimants in a Dekker handshake (see [`SlotPins`]): an awaiter that found marker `v` incomplete
@@ -29,10 +35,6 @@
 
 use crate::GpuError;
 use crate::sync::{AtomicU32, AtomicU64, Ordering};
-
-/// How many times a claimant looks at a pinned slot before it gives its number up as skipped. A pin is held for the
-/// length of one driver call.
-const PIN_LOOKS: u32 = 1 << 14;
 
 /// What a query of one marker's event found.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -118,17 +120,13 @@ impl MarkerRing {
         self.done.load(Ordering::Acquire)
     }
 
-    /// Makes the next marker: claims a number, has `record(slot)` record the marker's event after the stream's work so
-    /// far, and stores its entry. `scan` is called once if the ring looks full, to learn of completions before refusing.
+    /// Claims the number of the next marker, ahead of the work it will follow: `Err(Busy)` (retry; this never waits for
+    /// the device) when every slot holds a marker that has not completed, or an awaiter holds the next slot. `scan` is
+    /// called once if the ring looks full, to learn of completions before refusing.
     ///
-    /// `Err(Busy)` (retry; this never waits for the device) when every slot holds a marker that has not completed, or
-    /// when an awaiter kept the slot pinned through [`PIN_LOOKS`] looks (the number is then skipped). An `Err` from
-    /// `record` skips the number too and is returned.
-    pub(crate) fn mark(
-        &self,
-        scan: impl FnOnce(),
-        record: impl FnOnce(usize) -> Result<(), GpuError>,
-    ) -> Result<u64, GpuError> {
+    /// A refusal is the only failure, and it comes before the caller submits anything: a [`Claim`] is recorded
+    /// afterwards ([`Claim::record`]) and cannot be refused. Dropping a claim unrecorded gives its number up as a hole.
+    pub(crate) fn reserve(&self, scan: impl FnOnce()) -> Result<Claim<'_>, GpuError> {
         let n = self.slots();
         let mut scan = Some(scan);
         let value = loop {
@@ -142,36 +140,35 @@ impl MarkerRing {
                     return Err(GpuError::Busy);
                 }
             }
+            // An awaiter that holds the slot: the claim is refused now, before the caller's work, not after it.
+            if self.pins.pins[self.slot(value)].load(Ordering::SeqCst) != 0 {
+                return Err(GpuError::Busy);
+            }
             if self
                 .claimed
-                .compare_exchange(claimed, value, Ordering::SeqCst, Ordering::Acquire)
+                .compare_exchange(claimed, value, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
                 break value;
             }
         };
-        let slot = self.slot(value);
-        // The slot's previous marker completed (checked above). An awaiter may be about to wait on that record: it holds
-        // a pin, and the record waits until the pin drops.
+        // The slot's previous marker completed (checked above): an awaiter that comes now sees this and waits for nothing.
         self.pins.reserved.fetch_max(value, Ordering::SeqCst);
-        let mut looks = 0;
-        while self.pins.pins[slot].load(Ordering::SeqCst) != 0 {
-            looks += 1;
-            if looks >= PIN_LOOKS {
-                self.store_entry(value, true);
-                return Err(GpuError::Busy);
-            }
-        }
-        match record(slot) {
-            Ok(()) => {
-                self.store_entry(value, false);
-                Ok(value)
-            }
-            Err(error) => {
-                self.store_entry(value, true);
-                Err(error)
-            }
-        }
+        Ok(Claim {
+            ring: self,
+            value,
+            recorded: false,
+        })
+    }
+
+    /// Makes the next marker: [`reserve`](Self::reserve) and [`record`](Claim::record) in one step.
+    #[cfg(test)]
+    pub(crate) fn mark(
+        &self,
+        scan: impl FnOnce(),
+        record: impl FnOnce(usize) -> Result<(), GpuError>,
+    ) -> Result<u64, GpuError> {
+        self.reserve(scan)?.record(record)
     }
 
     /// Stores number `value`'s entry: from here a scan can vouch for it.
@@ -223,6 +220,59 @@ impl MarkerRing {
             return None;
         }
         Some(Pin(slot))
+    }
+}
+
+/// A marker number claimed ahead of the work it will follow (Java's marker opened before the stage submits). Record it
+/// once the work is in; dropped without recording, it is given up as a hole nobody was handed.
+#[derive(Debug)]
+pub(crate) struct Claim<'a> {
+    ring: &'a MarkerRing,
+    value: u64,
+    recorded: bool,
+}
+
+impl Claim<'_> {
+    #[cfg(test)]
+    pub(crate) fn value(&self) -> u64 {
+        self.value
+    }
+
+    /// Has `record(slot)` record the marker's event after the work submitted so far, and stores its entry. Never
+    /// refused: a pin an awaiter placed before the claim is waited out (it is held for one driver call). An `Err` from
+    /// `record` gives the number up and is returned.
+    pub(crate) fn record(
+        mut self,
+        record: impl FnOnce(usize) -> Result<(), GpuError>,
+    ) -> Result<u64, GpuError> {
+        let ring = self.ring;
+        let slot = ring.slot(self.value);
+        while ring.pins.pins[slot].load(Ordering::SeqCst) != 0 {
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "JAVA-BACKOFF: the wait is for an awaiter inside one driver call, as Java's `SpinWait` waits for a peer's short step"
+            )]
+            std::hint::spin_loop();
+        }
+        self.recorded = true;
+        match record(slot) {
+            Ok(()) => {
+                ring.store_entry(self.value, false);
+                Ok(self.value)
+            }
+            Err(error) => {
+                ring.store_entry(self.value, true);
+                Err(error)
+            }
+        }
+    }
+}
+
+impl Drop for Claim<'_> {
+    fn drop(&mut self) {
+        if !self.recorded {
+            self.ring.store_entry(self.value, true);
+        }
     }
 }
 
@@ -309,21 +359,67 @@ mod tests {
     }
 
     #[test]
-    fn a_pinned_slot_is_not_recorded_over_until_the_pin_drops() {
+    fn a_pinned_slot_is_refused_before_a_number_is_claimed() {
         let ring = MarkerRing::new(1);
         ring.mark(|| {}, ok).unwrap();
         let pin = ring.pin(1).expect("nothing past marker 1 yet");
         ring.scan(|_| Query::Done);
-        // Marker 2 reuses the only slot: it waits for the pin, and gives its number up if the pin stays.
-        assert_eq!(ring.mark(|| {}, ok), Err(GpuError::Busy));
+        // Marker 2 reuses the only slot, which an awaiter holds: refused at the claim, nothing claimed.
+        assert!(matches!(ring.reserve(|| {}), Err(GpuError::Busy)));
+        assert_eq!(ring.claimed(), 1);
         drop(pin);
-        ring.scan(|_| Query::Done);
         assert_eq!(
-            ring.done(),
+            ring.mark(|| {}, ok).unwrap(),
             2,
-            "the skipped number is complete without an event"
+            "the same number, once the pin dropped"
         );
-        assert_eq!(ring.mark(|| {}, ok).unwrap(), 3, "number 2 was skipped");
+    }
+
+    #[test]
+    fn a_claim_is_recorded_after_the_claims_that_followed_it_and_nothing_is_vouched_for_early() {
+        let ring = MarkerRing::new(4);
+        let first = ring.reserve(|| {}).unwrap();
+        let second = ring.reserve(|| {}).unwrap();
+        assert_eq!((first.value(), second.value()), (1, 2));
+        second.record(ok).unwrap();
+        let mut asked = Vec::new();
+        ring.scan(|slot| {
+            asked.push(slot);
+            Query::Done
+        });
+        assert!(
+            asked.is_empty(),
+            "number 1 is not recorded: the scan stops before it"
+        );
+        assert_eq!(ring.done(), 0);
+        first.record(ok).unwrap();
+        ring.scan(|_| Query::Done);
+        assert_eq!(ring.done(), 2);
+    }
+
+    #[test]
+    fn a_claim_dropped_before_its_work_is_a_hole_that_completes_without_an_event() {
+        let ring = MarkerRing::new(4);
+        drop(ring.reserve(|| {}).unwrap());
+        assert_eq!(ring.mark(|| {}, ok).unwrap(), 2);
+        let mut asked = Vec::new();
+        ring.scan(|slot| {
+            asked.push(slot);
+            Query::Done
+        });
+        assert_eq!(asked, [2], "no event for the hole");
+        assert_eq!(ring.done(), 2);
+    }
+
+    #[test]
+    fn busy_is_the_claims_alone() {
+        let ring = MarkerRing::new(1);
+        let claim = ring.reserve(|| {}).unwrap();
+        assert_eq!(claim.record(ok), Ok(1), "a claim records");
+        assert!(
+            matches!(ring.reserve(|| {}), Err(GpuError::Busy)),
+            "the next is refused, before any work"
+        );
     }
 
     #[test]

@@ -30,7 +30,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use euhedral_graph::{LaneId, QueueId};
+use euhedral_graph::{LaneId, QueueId, RetireCell};
 
 use crate::retire::RetireSink;
 
@@ -184,6 +184,10 @@ pub(crate) enum QOp {
         seq: u64,
         sink: Arc<RetireSink>,
     },
+    /// A retirement armed on a shared lane: the device stores its status in the cell the arm named.
+    Notify {
+        cell: Arc<RetireCell>,
+    },
     /// A time stamp of a timed span's edge: the device's tick when the lane reaches it.
     Stamp {
         id: u64,
@@ -197,6 +201,12 @@ pub(crate) struct Queued {
     op: QOp,
 }
 
+/// Whom a retirement the device reached tells.
+pub(crate) enum Told {
+    Sink(Arc<RetireSink>),
+    Cell(Arc<RetireCell>),
+}
+
 pub(crate) struct Lane {
     /// The identity of the stream that owns the lane, stamped on its markers.
     pub(crate) id: QueueId,
@@ -204,6 +214,8 @@ pub(crate) struct Lane {
     /// Marks submitted, and marks run.
     pub(crate) marks_enqueued: u64,
     pub(crate) marks_run: u64,
+    /// Marks reserved ahead of the work they follow, and not yet enqueued.
+    pub(crate) marks_reserved: u64,
     pub(crate) markers: u32,
     priority: StreamPriority,
 }
@@ -380,8 +392,10 @@ impl FakeGpu {
             self.run(&mut st, index, lane, op, fault.as_ref())
         };
         // The device only queues the outcome, as a driver's callback would; the stream's owner dispatches it.
-        if let Some((sink, status)) = retire {
-            sink.push(status);
+        match retire {
+            Some((Told::Sink(sink), status)) => sink.push(status),
+            Some((Told::Cell(cell), status)) => cell.arrive(status),
+            None => {}
         }
         true
     }
@@ -395,7 +409,7 @@ impl FakeGpu {
         lane: u16,
         op: QOp,
         fault: Option<&GpuError>,
-    ) -> Option<(Arc<RetireSink>, i32)> {
+    ) -> Option<(Told, i32)> {
         let status = match fault {
             Some(GpuError::Fault { code, .. }) => *code,
             Some(_) => POISONED_STATUS,
@@ -407,8 +421,9 @@ impl FakeGpu {
             return match op {
                 QOp::Retire { seq, sink } => {
                     st.log.push(FakeOp::Retire { lane, seq });
-                    Some((sink, status))
+                    Some((Told::Sink(sink), status))
                 }
+                QOp::Notify { cell } => Some((Told::Cell(cell), status)),
                 _ => None,
             };
         }
@@ -472,8 +487,9 @@ impl FakeGpu {
             }
             QOp::Retire { seq, sink } => {
                 st.log.push(FakeOp::Retire { lane, seq });
-                return Some((sink, 0));
+                return Some((Told::Sink(sink), 0));
             }
+            QOp::Notify { cell } => return Some((Told::Cell(cell), 0)),
         };
         if let Err(fault) = outcome {
             st.faulted.get_or_insert(fault.error());
@@ -491,28 +507,45 @@ impl FakeGpu {
     }
 
     /// Appends an operation to the lane with global index `index`.
-    /// Makes the next marker of lane `index` in one step: the ring is checked and the marker enqueued under one hold of
-    /// the device's state, so threads that mark one lane get distinct numbers. `Err(Busy)` when every slot holds a
-    /// marker that has not run.
-    pub(crate) fn push_mark(&self, index: usize, lane: u16) -> Result<u64, GpuError> {
+    /// Reserves a marker of lane `index` ahead of the work it will follow, so that a full ring is learned before the work
+    /// is submitted. `Err(Busy)` when every slot holds a marker that has not run, or is reserved.
+    pub(crate) fn reserve_mark(&self, index: usize) -> Result<(), GpuError> {
         let mut st = self.lock();
-        let (enqueued, run, slots) = {
-            let lane = &st.lanes[index];
-            (lane.marks_enqueued, lane.marks_run, u64::from(lane.markers))
-        };
-        if enqueued - run >= slots {
+        let lane = &mut st.lanes[index];
+        if lane.marks_enqueued + lane.marks_reserved - lane.marks_run >= u64::from(lane.markers) {
             return Err(GpuError::Busy);
         }
-        let value = enqueued + 1;
+        lane.marks_reserved += 1;
+        Ok(())
+    }
+
+    /// Enqueues the marker reserved with [`reserve_mark`](Self::reserve_mark), behind the work enqueued so far.
+    pub(crate) fn push_reserved_mark(&self, index: usize, lane: u16) -> u64 {
+        let mut st = self.lock();
         st.seq += 1;
         let seq = st.seq;
-        st.lanes[index].marks_enqueued = value;
-        st.lanes[index].queue.push_back(Queued {
+        let entry = &mut st.lanes[index];
+        entry.marks_reserved -= 1;
+        let value = entry.marks_enqueued + 1;
+        entry.marks_enqueued = value;
+        entry.queue.push_back(Queued {
             seq,
             lane,
             op: QOp::Mark { value },
         });
-        Ok(value)
+        value
+    }
+
+    /// Gives a reservation up without a marker.
+    pub(crate) fn cancel_reserved_mark(&self, index: usize) {
+        self.lock().lanes[index].marks_reserved -= 1;
+    }
+
+    /// Makes the next marker of lane `index` in one step: reserved and enqueued under one hold of the device's state, so
+    /// threads that mark one lane get distinct numbers. `Err(Busy)` when every slot holds a marker that has not run.
+    pub(crate) fn push_mark(&self, index: usize, lane: u16) -> Result<u64, GpuError> {
+        self.reserve_mark(index)?;
+        Ok(self.push_reserved_mark(index, lane))
     }
 
     pub(crate) fn push(&self, index: usize, lane: u16, op: QOp) {
@@ -560,6 +593,7 @@ impl Gpu for FakeGpu {
                     id: *id,
                     queue: VecDeque::new(),
                     marks_enqueued: 0,
+                    marks_reserved: 0,
                     marks_run: 0,
                     markers: o.markers,
                     priority: o.priority,

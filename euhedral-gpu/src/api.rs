@@ -20,7 +20,9 @@
 //!
 //! A lane can also be **shared**: [`Stream::shared`] is the handle (a [`Lane`]) that any worker submits to through `&self`,
 //! as a stage of a stage graph does. The owner's `&mut` calls and the lane's `&self` calls make markers by the same
-//! lock-free protocol, so the two may coexist; they keep separate retirement channels.
+//! lock-free protocol, so the two may coexist. A shared lane keeps no values and has no retirement channel: each
+//! retirement armed on it names the cell its callback fills ([`LaneControl::notify_retired`]), and what a stage's work
+//! reads is held by the stage, released in its `retired` hook.
 //!
 //! In RustEE's model the owner is a lane's `LatticeSource`: the lattice serializes its `request` and `pull`, so
 //! whichever worker runs them is the submitter's only user, and nothing is locked. [`open_lane_sources`](crate::open_lane_sources)
@@ -34,7 +36,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use euhedral_graph::{DeviceQueue, LaneId, LanePool, Marker, QueueId};
+use euhedral_graph::{DeviceQueue, LaneControl, LaneId, LanePool, Marker, QueueId};
 
 use crate::{Args, Fingerprint, GpuError, Launch, Span};
 
@@ -242,27 +244,29 @@ pub trait Stream: Send + Sized + 'static {
 ///
 /// A lane is a [`DeviceQueue`] too, so a [`LanePool`] of lanes (typed over the lane, as Java's `LanePool` holds
 /// streams) is both what [`Completions`](euhedral_graph::Completions) polls and what a stage reaches through
-/// [`StageCx::lane_handle`](euhedral_graph::StageCx::lane_handle).
+/// [`StageCx::lane_handle`](euhedral_graph::StageCx::lane_handle). It is a [`LaneControl`] as well: it orders its later
+/// work behind another lane's marker and arms retirements that name their sink, which is what a stage graph uses to
+/// join its lanes and retire a quantum.
 ///
-/// - **Submit, mark and await are lock-free.** Submissions are the driver's: it serializes the launches it gets on one
-///   stream. [`mark`](Self::mark) records after all the work submitted so far, which may include another thread's work
-///   (that only over-waits). The marker numbers are handed out by compare-and-set, and are published to
-///   [`DeviceQueue::completed`] in order, whichever thread finishes recording first.
-/// - **Nothing waits.** A marker ring that is full, a retirement channel another thread is using, answer
-///   `Err(Busy)` (retry); nothing blocks on the device or on another worker.
-/// - **Retirement** is armed from any thread. The backend's callback only queues its status (it makes no driver call,
-///   allocates and frees nothing); the status is read by [`poll_retired`](Self::poll_retired) and settled by
-///   [`confirm_retired`](Self::confirm_retired), which releases the values kept for it: both in a frame, on an ordinary
-///   thread (a [`Pending`](euhedral_graph::Pending) polling the lane, as [`retire_into`](crate::retire_into) does), never
-///   in the callback and never in a source's `request` or `pull`.
-///
-/// A lane is shared, so a stream opened for it can also be driven by an owner (a [`Stream`] and its [`LaneSource`]) only
-/// if the two do not both arm retirements: each channel numbers its own.
-///
-/// [`LaneSource`]: euhedral_graph::LaneSource
-pub trait Lane: DeviceQueue + Sized + 'static {
+/// - **Submit and mark are lock-free.** Submissions are the driver's: it serializes the launches it gets on one stream.
+///   A marker is claimed *before* the work it follows ([`submit_marked`](Self::submit_marked), Java opens a stage's
+///   marker before the stage submits) and recorded after it; the marker records after all the work submitted so far,
+///   which may include another thread's work (that only over-waits). The numbers are handed out by compare-and-set and
+///   found complete in order by [`DeviceQueue::completed`].
+/// - **Nothing waits, and a refusal comes before the work.** A marker ring that is full, or a slot an awaiter holds,
+///   answers `Err(Busy)` when the marker is claimed, before anything was submitted: a stage that is told to retry has
+///   submitted nothing. Once the work is in, the marker is recorded and cannot be refused.
+/// - **Retirement** names its sink: [`LaneControl::notify_retired`] takes the [`RetireCell`](euhedral_graph::RetireCell)
+///   the driver callback stores the status in (Java `notifyRetired(listener)`). The callback only fills the cell; the
+///   continuation that finds it filled settles the status with [`LaneControl::confirm_retired`] in a frame, on an
+///   ordinary thread, never in the callback and never in a source's `request` or `pull`. Nothing is claimed or queued
+///   in between, so two parties retiring on one lane never see each other's status.
+/// - **A shared lane keeps no values.** What a submission's work reads (a host buffer a copy reads) lives in the
+///   work's own quantum and is released by the stage's retirement hook ([`Stage::retired`](euhedral_graph::Stage::retired),
+///   Java `StageFrame.retired`), once the quantum's boundary was reached.
+pub trait Lane: DeviceQueue + LaneControl + Sized + 'static {
     type Gpu: Gpu;
-    type Enqueue<'a>: Enqueue<Kernel = <Self::Gpu as Gpu>::Kernel>
+    type Enqueue<'a>: LaneEnqueue<Kernel = <Self::Gpu as Gpu>::Kernel>
     where
         Self: 'a;
 
@@ -276,25 +280,66 @@ pub trait Lane: DeviceQueue + Sized + 'static {
         f: impl FnOnce(&mut Self::Enqueue<'_>) -> Result<R, GpuError>,
     ) -> Result<R, GpuError>;
 
-    /// A marker after the work submitted so far. `Err(Busy)` (retry) when the marker ring is full of markers that have
-    /// not completed, or when an awaiter keeps the slot pinned.
+    /// Claims a marker, runs `f` as [`submit`](Self::submit) does, and records the marker after `f`'s work: Java's
+    /// stage, which has its marker before it submits. `Err(Busy)` (retry) only when the marker could not be claimed
+    /// (the ring is full of markers that have not completed, or an awaiter holds the slot), and then `f` has not run. An
+    /// `Err` from `f` gives the marker up.
+    fn submit_marked<R>(
+        &self,
+        f: impl FnOnce(&mut Self::Enqueue<'_>) -> Result<R, GpuError>,
+    ) -> Result<(R, Marker), GpuError>;
+
+    /// A marker after the work submitted so far. `Err(Busy)` (retry) as for [`submit_marked`](Self::submit_marked). Use
+    /// that for a marker after work you cannot repeat.
     fn mark(&self) -> Result<Marker, GpuError>;
+}
 
-    /// Later work on this lane waits, on the device, for `marker`. The host does not wait. A marker of a queue that is
-    /// not one of this lane's pool is `Err(Invalid)`; it is never treated as already done.
-    fn await_marker(&self, marker: Marker) -> Result<(), GpuError>;
+/// What a submission to a shared lane enqueues: the operations of [`Enqueue`], without `keep`. A shared lane keeps no
+/// values; see [`Lane`].
+pub trait LaneEnqueue {
+    type Kernel: Kernel;
 
-    /// Arms a retirement after the work submitted so far; its ticket comes back from [`poll_retired`](Self::poll_retired).
-    /// `Err(Busy)` (retry) when another thread is arming or polling.
-    fn arm_retirement(&self) -> Result<(), GpuError>;
+    /// Launches `kernel`.
+    ///
+    /// # Safety
+    /// `args` match the kernel's parameters, and every address the kernel touches is valid for that access until the
+    /// work retires.
+    unsafe fn launch(
+        &mut self,
+        kernel: &Self::Kernel,
+        launch: Launch,
+        args: &Args,
+    ) -> Result<(), GpuError>;
 
-    /// The ticket of the next retirement that arrived, in the order they were armed. `None` when none arrived, or when
-    /// another thread is polling: poll again.
-    fn poll_retired(&self) -> Option<RetireTicket>;
+    /// Copies `bytes` from host memory at `src` to the device address `dst`.
+    ///
+    /// # Safety
+    /// The ranges are valid, not used by other work in the meantime, and stay valid until the work retires.
+    unsafe fn copy_to_device(
+        &mut self,
+        dst: u64,
+        src: *const u8,
+        bytes: usize,
+    ) -> Result<(), GpuError>;
 
-    /// Settles a retirement: the device failure behind it, or `None`. Never panics. The values kept for it
-    /// ([`Enqueue::keep`]) are released here, once. A ticket armed on another lane is refused with `Some(Invalid)`.
-    fn confirm_retired(&self, ticket: RetireTicket) -> Option<GpuError>;
+    /// Copies `bytes` from the device address `src` to host memory at `dst`.
+    ///
+    /// # Safety
+    /// As [`copy_to_device`](Self::copy_to_device).
+    unsafe fn copy_to_host(&mut self, dst: *mut u8, src: u64, bytes: usize)
+    -> Result<(), GpuError>;
+
+    /// Copies `bytes` between device addresses.
+    ///
+    /// # Safety
+    /// As [`copy_to_device`](Self::copy_to_device).
+    unsafe fn copy_on_device(&mut self, dst: u64, src: u64, bytes: usize) -> Result<(), GpuError>;
+
+    /// Sets `bytes` at the device address `dst` to `value`.
+    ///
+    /// # Safety
+    /// As [`copy_to_device`](Self::copy_to_device).
+    unsafe fn memset(&mut self, dst: u64, value: u8, bytes: usize) -> Result<(), GpuError>;
 }
 
 /// What a submission enqueues.

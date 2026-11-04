@@ -1,11 +1,11 @@
 //! A fake stream as a shared lane: any thread submits to it through `&self`. The fake device keeps its queues in one
 //! state behind a lock, which stands for the hardware (see `FakeGpu`); the lane adds no lock of its own.
 
-use std::any::Any;
+use std::sync::Arc;
 
-use euhedral_graph::{DeviceQueue, LaneId, Marker};
+use euhedral_graph::{ControlError, DeviceQueue, LaneControl, LaneId, Marker, RetireCell};
 
-use crate::{Args, Enqueue, Gpu, GpuError, Lane, Launch, POISONED_STATUS, RetireTicket};
+use crate::{Args, Gpu, GpuError, Lane, LaneEnqueue, Launch, POISONED_STATUS};
 
 use super::stream::FakeQueue;
 use super::{FakeGpu, FakeKernel, QOp};
@@ -24,7 +24,7 @@ impl FakeLaneEnqueue<'_> {
     }
 }
 
-impl Enqueue for FakeLaneEnqueue<'_> {
+impl LaneEnqueue for FakeLaneEnqueue<'_> {
     type Kernel = FakeKernel;
 
     unsafe fn launch(
@@ -78,9 +78,13 @@ impl Enqueue for FakeLaneEnqueue<'_> {
         self.push(QOp::Memset { dst, value, bytes });
         Ok(())
     }
+}
 
-    fn keep(&mut self, value: Box<dyn Any + Send>) {
-        self.queue.shared.keep(value);
+fn control_error(error: GpuError) -> ControlError {
+    match error {
+        GpuError::Busy => ControlError::Busy,
+        GpuError::Invalid(what) => ControlError::Invalid(what),
+        other => ControlError::Failed(other.to_string()),
     }
 }
 
@@ -100,18 +104,39 @@ impl Lane for FakeQueue {
         f(&mut FakeLaneEnqueue { queue: self })
     }
 
+    fn submit_marked<R>(
+        &self,
+        f: impl FnOnce(&mut FakeLaneEnqueue<'_>) -> Result<R, GpuError>,
+    ) -> Result<(R, Marker), GpuError> {
+        self.gpu.alive()?;
+        // The refusal comes here, before the work.
+        self.gpu.reserve_mark(self.global())?;
+        match f(&mut FakeLaneEnqueue { queue: self }) {
+            Ok(result) => {
+                let value = self.gpu.push_reserved_mark(self.global(), self.lane.0);
+                Ok((result, Marker::new(DeviceQueue::id(self), self.lane, value)))
+            }
+            Err(error) => {
+                self.gpu.cancel_reserved_mark(self.global());
+                Err(error)
+            }
+        }
+    }
+
     fn mark(&self) -> Result<Marker, GpuError> {
         self.gpu.alive()?;
         let value = self.gpu.push_mark(self.global(), self.lane.0)?;
         Ok(Marker::new(DeviceQueue::id(self), self.lane, value))
     }
+}
 
-    fn await_marker(&self, marker: Marker) -> Result<(), GpuError> {
-        self.gpu.alive()?;
+impl LaneControl for FakeQueue {
+    fn await_marker(&self, marker: Marker) -> Result<(), ControlError> {
+        self.gpu.alive().map_err(control_error)?;
         let offset = match marker.lane.0.checked_sub(self.first) {
             Some(offset) if usize::from(offset) < self.count => usize::from(offset),
             _ => {
-                return Err(GpuError::Invalid(format!(
+                return Err(ControlError::Invalid(format!(
                     "{} lane {} is not a lane of this stream's pool",
                     marker.queue, marker.lane.0
                 )));
@@ -123,7 +148,7 @@ impl Lane for FakeQueue {
             let lane = &st.lanes[target];
             // A marker of another queue is refused, whatever its lane and value say.
             if lane.id != marker.queue {
-                return Err(GpuError::Invalid(format!(
+                return Err(ControlError::Invalid(format!(
                     "{} lane {} is not a lane of this stream's pool",
                     marker.queue, marker.lane.0
                 )));
@@ -132,7 +157,7 @@ impl Lane for FakeQueue {
                 return Ok(());
             }
             if marker.value > lane.marks_enqueued {
-                return Err(GpuError::Invalid("a marker that was never made".into()));
+                return Err(ControlError::Invalid("a marker that was never made".into()));
             }
             if marker.value <= lane.marks_run {
                 return Ok(());
@@ -149,55 +174,29 @@ impl Lane for FakeQueue {
         Ok(())
     }
 
-    fn arm_retirement(&self) -> Result<(), GpuError> {
-        self.gpu.alive()?;
-        self.shared.arm(|seq| {
-            self.gpu.push(
-                self.global(),
-                self.lane.0,
-                QOp::Retire {
-                    seq,
-                    sink: self.shared.sink().clone(),
-                },
-            );
-            Ok(())
-        })
-    }
-
-    fn poll_retired(&self) -> Option<RetireTicket> {
-        let (ticket, desync) = self.shared.poll(
-            || self.gpu.poison.get().is_some(),
-            || {
-                let _ = DeviceQueue::completed(self);
-            },
+    fn notify_retired(&self, cell: &Arc<RetireCell>) -> Result<(), ControlError> {
+        self.gpu.alive().map_err(control_error)?;
+        self.gpu.push(
+            self.global(),
+            self.lane.0,
+            QOp::Notify { cell: cell.clone() },
         );
-        if desync {
-            self.gpu.poison.set(GpuError::Invalid(
-                "a retirement outcome arrived that no one had armed".into(),
-            ));
-        }
-        ticket
+        Ok(())
     }
 
-    fn confirm_retired(&self, ticket: RetireTicket) -> Option<GpuError> {
-        if ticket.stream() != DeviceQueue::id(self) {
-            return Some(GpuError::Invalid(
-                "a retirement ticket of another stream".into(),
-            ));
-        }
-        if ticket.status() == POISONED_STATUS {
-            return self
-                .gpu
+    fn confirm_retired(&self, status: i32) -> Option<ControlError> {
+        let poisoned = || {
+            self.gpu
                 .poisoned()
-                .map(|cause| GpuError::Poisoned(Box::new(cause)));
+                .map(|cause| ControlError::Failed(GpuError::Poisoned(Box::new(cause)).to_string()))
+        };
+        if status == POISONED_STATUS {
+            return poisoned();
         }
-        self.shared.release_through(ticket.seq());
-        if ticket.status() != 0 {
+        if status != 0 {
             // The status is the device's own report of the fault.
             self.gpu.observe_fault();
         }
-        self.gpu
-            .poisoned()
-            .map(|cause| GpuError::Poisoned(Box::new(cause)))
+        poisoned()
     }
 }

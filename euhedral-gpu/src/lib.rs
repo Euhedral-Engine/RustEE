@@ -48,8 +48,8 @@ mod spans;
 mod sync;
 
 pub use api::{
-    CompileOptions, Enqueue, Gpu, Graph, Kernel, Lane, Lanes, Module, POISONED_STATUS, Rerecorded,
-    RetireListener, RetireTicket, Sequence, Stream, StreamOptions, StreamPriority,
+    CompileOptions, Enqueue, Gpu, Graph, Kernel, Lane, LaneEnqueue, Lanes, Module, POISONED_STATUS,
+    Rerecorded, RetireListener, RetireTicket, Sequence, Stream, StreamOptions, StreamPriority,
 };
 pub use args::{ArgMismatch, Args, Dim3, KernelArg, Launch, MAX_ARGS};
 pub use error::GpuError;

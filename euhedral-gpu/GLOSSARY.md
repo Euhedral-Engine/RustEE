@@ -14,8 +14,10 @@ wait. An await that races a claimant re-recording a slot is made safe without a 
 it enqueues its wait, and a claimant that finds the slot pinned waits out the pin (one driver call) or gives its number up.
 
 **shared lane** ([`Lane`](src/api.rs), [`cuda::CudaQueue`](src/cuda/stream.rs)): the shared side of a stream that any worker
-submits to through `&self`: `submit`, `mark`, `await_marker`, and a retirement channel of its own whose arming and polling go
-through a try-claim. `Stream::shared()` is the handle; `open_shared_lanes` opens a device's lanes as a `LanePool` typed over it.
+submits to through `&self`: `submit`, `submit_marked` (the marker is claimed before the work, so a refusal comes before it) and
+`mark`, and the graph-facing `LaneControl` (`await_marker`, `notify_retired`, `confirm_retired`). It has no retirement channel
+and keeps no values: each retirement names the `RetireCell` its callback fills, and a stage's held values are released by its
+`retired` hook. `Stream::shared()` is the handle; `open_shared_lanes` opens a device's lanes as a `LanePool` typed over it.
 The driver stream is destroyed, after its work, with the last handle.
 
 **retirement queue** ([`retire`](src/retire.rs), [`cuda::retire`](src/cuda/retire.rs)): each stream owns

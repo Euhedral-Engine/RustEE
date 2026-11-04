@@ -1,14 +1,13 @@
 //! CUDA streams as device lanes: an event ring behind `DeviceQueue::completed`, device-side awaits, and enqueueing.
 
-use std::mem::ManuallyDrop;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use euhedral_graph::{DeviceQueue, LaneId, Marker, QueueId};
+use euhedral_graph::{DeviceQueue, LaneControl, LaneId, Marker, QueueId};
 use euhedral_memory::cuda::{CuEvent, CuStream, Device, STREAM_NON_BLOCKING};
 
 use crate::kept::Kept;
-use crate::retire::{RetireSink, Retirements, SharedRetire};
+use crate::retire::{RetireSink, Retirements};
 use crate::spans::{Span, SpanBook};
 use crate::{
     GpuError, POISONED_STATUS, RetireListener, RetireTicket, Stream, StreamOptions, StreamPriority,
@@ -171,9 +170,6 @@ pub struct CudaQueue {
     /// complete (the context is lost, or the wait fails) and retirements are still outstanding, the drop leaks one
     /// reference to this shared side, so the sink is never freed under a callback that is still to run.
     sink: RetireSink,
-    /// The retirement channel and kept values of the shared lane, apart from the owner stream's. Not dropped when the
-    /// wait for its callbacks failed.
-    pub(crate) shared: ManuallyDrop<SharedRetire>,
 }
 
 // SAFETY: the stream handle belongs to the primary context and is usable from any thread with it current; everything
@@ -187,23 +183,17 @@ impl CudaQueue {
         &self.sink
     }
 
+    /// Claims the next marker, ahead of the work it will follow. `Err(Busy)` before anything is submitted.
+    pub(crate) fn reserve(&self) -> Result<crate::ring::Claim<'_>, GpuError> {
+        self.gpu.poison.check()?;
+        self.ring.ring.reserve(|| self.ring.scan(&self.gpu))
+    }
+
     /// A marker after the work submitted so far (which may include other threads' work: that only over-waits). The
     /// context is current. Any thread may call it.
     pub(crate) fn mark_now(&self) -> Result<Marker, GpuError> {
-        self.gpu.poison.check()?;
-        let ring = &self.ring;
-        let f = &self.gpu.device().driver.fns;
-        let value = ring.ring.mark(
-            || ring.scan(&self.gpu),
-            |slot| {
-                // SAFETY: the slot's event and this stream; the slot's previous marker completed and no awaiter holds
-                // the slot (`MarkerRing::mark`); the context is current.
-                self.gpu.check("cuEventRecord", unsafe {
-                    (f.event_record)(ring.events[slot], self.raw)
-                })
-            },
-        )?;
-        Ok(Marker::new(self.ring.id, self.lane, value))
+        let claim = self.reserve()?;
+        self.record_claim(claim)
     }
 
     /// Later work on `target` (this stream, or its shadow) waits for `marker`. The context is current.
@@ -257,28 +247,33 @@ impl CudaQueue {
     pub(crate) fn look(&self) {
         let _ = DeviceQueue::completed(self);
     }
+
+    /// A marker for the claim `claim`, recorded after the work submitted so far. The context is current.
+    pub(crate) fn record_claim(&self, claim: crate::ring::Claim<'_>) -> Result<Marker, GpuError> {
+        let ring = &self.ring;
+        let f = &self.gpu.device().driver.fns;
+        let value = claim.record(|slot| {
+            // SAFETY: the slot's event and this stream; the slot's previous marker completed and no awaiter holds the
+            // slot (`MarkerRing::reserve`); the context is current.
+            self.gpu.check("cuEventRecord", unsafe {
+                (f.event_record)(ring.events[slot], self.raw)
+            })
+        })?;
+        Ok(Marker::new(self.ring.id, self.lane, value))
+    }
 }
 
 impl Drop for CudaQueue {
-    /// The last handle is gone: the stream's work, and every callback it armed, ends before the stream is destroyed.
+    /// The last handle is gone: the stream's work ends before the stream is destroyed. A retirement a lane armed holds
+    /// its own clone of the cell the callback fills, so no callback can outlive what it writes.
     fn drop(&mut self) {
-        let mut waited = false;
         if let Ok(_c) = self.gpu.device().enter() {
             let f = &self.gpu.device().driver.fns;
             // SAFETY: the stream this value stands for, no longer in use; the context is current.
-            waited = unsafe { (f.stream_synchronize)(self.raw) } == 0;
-            // SAFETY: as above.
-            unsafe { (f.stream_destroy)(self.raw) };
-        }
-        let pending = self.shared.callbacks_pending();
-        if waited || !pending {
-            // SAFETY: as above.
-            unsafe { ManuallyDrop::drop(&mut self.shared) };
-        } else {
-            // The wait did not complete while a callback armed here is still to arrive, and each pushes into the
-            // sink: keep it for good, the price of never freeing the sink under a callback.
-            #[cfg(feature = "test-hooks")]
-            LEAKED_SHARED_SIDES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            unsafe {
+                (f.stream_synchronize)(self.raw);
+                (f.stream_destroy)(self.raw);
+            }
         }
     }
 }
@@ -307,6 +302,10 @@ impl DeviceQueue for CudaQueue {
 
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn control(&self) -> Option<&dyn LaneControl> {
+        Some(self)
     }
 }
 
@@ -406,7 +405,6 @@ impl CudaStream {
                     raw,
                     lanes: lanes.clone(),
                     sink,
-                    shared: ManuallyDrop::new(SharedRetire::new(ring_id, lane)),
                 }),
                 shadow: None,
                 retire,

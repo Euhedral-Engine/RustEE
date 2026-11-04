@@ -60,12 +60,15 @@ pub use lane_source::{
     Deliver, GroupId, LaneClosed, LaneCx, LaneInputs, LaneIntakes, LaneMetrics, LaneSource,
     LaneState, LaneSubmit, LaneWork, Outcome, Retired,
 };
-pub use lanes::{DeviceQueue, LaneId, LanePool, LanePoolBuilder, Marker, Placement, QueueId};
+pub use lanes::{
+    ControlError, DeviceQueue, LaneControl, LaneId, LanePool, LanePoolBuilder, Marker, Placement,
+    QueueId, RetireCell,
+};
 pub use sequencer::{Entry, Progress, Sequencer, Slot, Ticket};
 pub use stage_graph::{
-    DEFAULT_RETRY_BACKSTOP, EdgeKind, ExternalEdge, GraphError, GraphRuntime, QuantumOutcome,
-    QuantumRef, RetryCounts, Stage, StageCx, StageError, StageGraph, StageGraphSpec, StageId,
-    StageSpec, Submitted,
+    DEFAULT_RETRY_BACKSTOP, DEVICE, EdgeKind, ExternalEdge, GraphError, GraphRuntime,
+    QuantumOutcome, QuantumRef, RetryCounts, Stage, StageCx, StageError, StageGraph,
+    StageGraphSpec, StageId, StageSpec, Submitted,
 };
 
 /// Compiles and runs the examples in the crate README as doctests.

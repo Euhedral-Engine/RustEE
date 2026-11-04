@@ -20,11 +20,13 @@ use euhedral_core::generics::{FrameSink, LatticeSource};
 use euhedral_data_structures::queues::{Consumer, MpmcQueue, Multi, Producer};
 use euhedral_gpu::cuda::{CudaKernel, CudaQueue};
 use euhedral_gpu::{
-    Args, Enqueue, GpuError, Lane, Launch, Module, SharedLanes, StreamOptions, open_shared_lanes,
+    Args, GpuError, Lane, LaneEnqueue, Launch, Module, SharedLanes, StreamOptions,
+    open_shared_lanes,
 };
 use euhedral_graph::{
-    Completions, DEFAULT_RETRY_BACKSTOP, EdgeKind, GraphRuntime, LaneId, Pending, QuantumOutcome,
-    Stage, StageCx, StageError, StageGraph, StageGraphSpec, StageSpec, Submitted,
+    Completions, DEFAULT_RETRY_BACKSTOP, EdgeKind, GraphRuntime, LaneControl, LaneId,
+    QuantumOutcome, RetireCell, Stage, StageCx, StageError, StageGraph, StageGraphSpec, StageSpec,
+    Submitted,
 };
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -59,24 +61,24 @@ fn many_workers_submit_to_one_lane_and_every_marker_completes_in_order() {
             scope.spawn(|| {
                 let mut mine = Vec::with_capacity(EACH);
                 for _ in 0..EACH {
-                    lane.submit(|q| {
-                        // SAFETY: the device word is live and 256 bytes; the kernel adds 1 to its first element.
-                        unsafe {
-                            q.launch(
-                                &add,
-                                Launch::linear(1, 1),
-                                &Args::new()
-                                    .device(block.addr)
-                                    .device(block.addr)
-                                    .arg(1u32)
-                                    .arg(1u32),
-                            )
-                        }
-                    })
-                    .unwrap();
+                    // A refusal comes before any work: the launch is entered once per marker made.
                     let marker = loop {
-                        match lane.mark() {
-                            Ok(marker) => break marker,
+                        let made = lane.submit_marked(|q| {
+                            // SAFETY: the device word is live and 256 bytes; the kernel adds 1 to its first element.
+                            unsafe {
+                                q.launch(
+                                    &add,
+                                    Launch::linear(1, 1),
+                                    &Args::new()
+                                        .device(block.addr)
+                                        .device(block.addr)
+                                        .arg(1u32)
+                                        .arg(1u32),
+                                )
+                            }
+                        });
+                        match made {
+                            Ok(((), marker)) => break marker,
                             Err(GpuError::Busy) => std::thread::yield_now(),
                             Err(other) => panic!("{other}"),
                         }
@@ -180,7 +182,7 @@ impl Stage<Work, CudaQueue> for Steps {
         } else {
             (0.0, 3.0)
         };
-        lane.submit(|q| {
+        let made = lane.submit_marked(|q| {
             // SAFETY: the device word is live; the kernel reads and writes its first float. The host word is pinned and
             // outlives the quantum.
             unsafe {
@@ -206,10 +208,9 @@ impl Stage<Work, CudaQueue> for Steps {
                 }
                 Ok(())
             }
-        })
-        .map_err(|e| StageError::Corrupt(e.to_string()))?;
-        match lane.mark() {
-            Ok(marker) => Ok(Submitted::marker(marker)),
+        });
+        match made {
+            Ok(((), marker)) => Ok(Submitted::marker(marker)),
             Err(GpuError::Busy) => Err(StageError::Retry),
             Err(e) => Err(StageError::Corrupt(e.to_string())),
         }
@@ -326,6 +327,45 @@ fn stages_submit_on_their_lanes_and_the_boundary_covers_both() {
     assert_eq!(graph.live(), 0);
 }
 
+/// Sixteen threads arm a retirement each on one lane while others keep submitting: every party reads the status of its
+/// own retirement (a cell it named), none waits for another's, and all arrive.
+#[test]
+fn parties_arming_retirements_on_one_lane_each_get_their_own() {
+    let Some(gpu) = gpu() else { return };
+    let Some(module) = module(&gpu) else { return };
+    let spin = module.kernel("spin").unwrap();
+    let lanes = lanes(&gpu, 1);
+    let lane = lanes.pool.lane(LaneId(0)).clone();
+    const PARTIES: usize = 16;
+    const EACH: usize = 50;
+    let cells: Vec<Arc<RetireCell>> = (0..PARTIES * EACH)
+        .map(|_| Arc::new(RetireCell::new()))
+        .collect();
+    std::thread::scope(|scope| {
+        for party in 0..PARTIES {
+            let (lane, cells, spin) = (&lane, &cells, &spin);
+            scope.spawn(move || {
+                for round in 0..EACH {
+                    lane.submit(|q| {
+                        // SAFETY: the kernel only spins.
+                        unsafe { q.launch(spin, Launch::linear(1, 1), &Args::new().arg(1_000u64)) }
+                    })
+                    .unwrap();
+                    lane.notify_retired(&cells[party * EACH + round]).unwrap();
+                }
+            });
+        }
+    });
+    assert!(
+        wait_until(Duration::from_secs(30), || cells
+            .iter()
+            .all(|c| c.status().is_some())),
+        "every retirement arrived"
+    );
+    assert!(cells.iter().all(|c| c.status() == Some(0)));
+    assert_eq!(lane.confirm_retired(0).map(|e| e.to_string()), None);
+}
+
 struct Counted(Arc<AtomicUsize>);
 
 impl Drop for Counted {
@@ -334,78 +374,165 @@ impl Drop for Counted {
     }
 }
 
-/// The retirements a frame settled: the ticket's number and the failure behind it.
-type Settled = Arc<Mutex<Vec<(u64, Option<GpuError>)>>>;
-
-/// Polls a lane for a retirement and settles it, in a frame.
-struct Settle {
-    lane: Arc<CudaQueue>,
-    settled: Settled,
-}
-
-impl Pending for Settle {
-    fn poll(&mut self) -> Option<Box<dyn Frame>> {
-        let ticket = self.lane.poll_retired()?;
-        let failure = self.lane.confirm_retired(ticket);
-        lock(&self.settled).push((ticket.seq(), failure));
-        Some(Box::new(DummyFrame::INSTANCE))
-    }
-}
-
-/// The driver's callback only queues; the ticket is read and settled in a frame (a `Completions` poll), and the values
-/// kept by submissions from several threads are released there, each once.
+/// A frame settles a retirement: the continuation of a cell is a frame, emitted when the driver's callback filled it.
 #[test]
-fn retirement_is_settled_in_a_frame_and_releases_kept_values_once() {
+fn a_retirement_cell_is_settled_in_a_frame_after_the_work_before_it() {
     let Some(gpu) = gpu() else { return };
     let Some(module) = module(&gpu) else { return };
-    let (_mem, block) = device_word(&gpu);
     let spin = module.kernel("spin").unwrap();
     let lanes = lanes(&gpu, 1);
     let lane = lanes.pool.lane(LaneId(0)).clone();
-    let dropped = Arc::new(AtomicUsize::new(0));
-    std::thread::scope(|scope| {
-        for _ in 0..4 {
-            scope.spawn(|| {
-                for _ in 0..10 {
-                    lane.submit(|q| {
-                        // SAFETY: the kernel only spins.
-                        unsafe {
-                            q.launch(&spin, Launch::linear(1, 1), &Args::new().arg(1_000u64))?;
-                        }
-                        q.keep(Box::new(Counted(dropped.clone())));
-                        Ok(())
-                    })
-                    .unwrap();
-                }
-            });
-        }
-    });
-    let _ = block;
-    loop {
-        match lane.arm_retirement() {
-            Ok(()) => break,
-            Err(GpuError::Busy) => {}
-            Err(other) => panic!("{other}"),
-        }
-    }
+    lane.submit(|q| {
+        // SAFETY: the kernel only spins.
+        unsafe { q.launch(&spin, Launch::linear(1, 1), &Args::new().arg(1_000_000u64)) }
+    })
+    .unwrap();
+    let cell = Arc::new(RetireCell::new());
+    lane.notify_retired(&cell).unwrap();
     let completions = Completions::new(lanes.queues.clone());
-    let settled = Arc::new(Mutex::new(Vec::new()));
-    completions.register(Box::new(Settle {
-        lane: lane.clone(),
-        settled: settled.clone(),
-    }));
+    completions.after_retired(cell.clone(), Box::new(DummyFrame::INSTANCE));
     let mut frames = Vec::new();
     assert!(wait_until(Duration::from_secs(20), || {
         completions.pull(&mut |f| frames.push(f), &mut |_| false, 8);
         !frames.is_empty()
     }));
     assert_eq!(frames.len(), 1, "the continuation is a frame");
-    assert_eq!(*lock(&settled), [(0, None)]);
+    assert_eq!(cell.status(), Some(0));
+    assert_eq!(lane.confirm_retired(0).map(|e| e.to_string()), None);
+    completions.pull(&mut |f| frames.push(f), &mut |_| false, 8);
+    assert_eq!(frames.len(), 1, "once");
+}
+
+/// A stage holds a value for its work and releases it in its `retired` hook, which runs once the quantum's device work
+/// ended: every quantum's hold is released, each once, with four workers running the frames.
+#[test]
+fn what_stages_hold_is_released_by_their_hooks_once_per_quantum() {
+    let Some(gpu) = gpu() else { return };
+    let Some(module) = module(&gpu) else { return };
+    let spin = module.kernel("spin").unwrap();
+    let lanes = lanes(&gpu, 2);
+    let completions = Completions::new(lanes.queues.clone());
+    let queue = MpmcQueue::<Box<dyn Frame>>::bounded(1024);
+    let frames: Consumer<Box<dyn Frame>, Multi> = queue.consumer();
+    let mut spec = StageGraphSpec::new();
+    let first = spec.stage(StageSpec {
+        name: "one",
+        ordered: None,
+        lanes: vec![LaneId(0)],
+    });
+    let second = spec.stage(StageSpec {
+        name: "two",
+        ordered: None,
+        lanes: vec![LaneId(1)],
+    });
+    spec.edge(first, second, EdgeKind::Submission);
+    struct Holder {
+        spin: CudaKernel,
+        dropped: Arc<AtomicUsize>,
+    }
+    struct Held(Mutex<Vec<Counted>>);
+    impl Stage<Held, CudaQueue> for Holder {
+        fn run(&self, held: &Held, cx: &StageCx<'_, CudaQueue>) -> Result<Submitted, StageError> {
+            let lane = cx.lane_handle().expect("a stage with a lane");
+            for marker in cx.waits {
+                lane.await_marker(*marker)
+                    .map_err(|e| StageError::Corrupt(e.to_string()))?;
+            }
+            let made = lane.submit_marked(|q| {
+                // SAFETY: the kernel only spins.
+                unsafe {
+                    q.launch(
+                        &self.spin,
+                        Launch::linear(1, 1),
+                        &Args::new().arg(10_000u64),
+                    )
+                }
+            });
+            match made {
+                Ok(((), marker)) => {
+                    lock(&held.0).push(Counted(self.dropped.clone()));
+                    Ok(Submitted::marker(marker))
+                }
+                Err(GpuError::Busy) => Err(StageError::Retry),
+                Err(e) => Err(StageError::Corrupt(e.to_string())),
+            }
+        }
+
+        fn retired(&self, held: &Held, committed: bool) {
+            assert!(committed);
+            lock(&held.0).clear();
+        }
+    }
+    const QUANTA: usize = 64;
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let outcomes = Arc::new(Mutex::new(Vec::new()));
+    let log = outcomes.clone();
+    let stages: Vec<Arc<dyn Stage<Held, CudaQueue>>> = (0..2)
+        .map(|_| {
+            Arc::new(Holder {
+                spin: spin.clone(),
+                dropped: dropped.clone(),
+            }) as Arc<dyn Stage<Held, CudaQueue>>
+        })
+        .collect();
+    let graph = StageGraph::new(
+        spec,
+        stages,
+        GraphRuntime {
+            stages: Arc::new(Sink(queue.producer())),
+            completions: completions.clone(),
+            lanes: lanes.pool.clone(),
+            retries: Arc::default(),
+            retry_backstop: DEFAULT_RETRY_BACKSTOP,
+        },
+        move |_held, outcome| lock(&log).push(outcome),
+    )
+    .unwrap();
+    let done = Arc::new(AtomicBool::new(false));
+    let workers: Vec<_> = (0..4)
+        .map(|_| {
+            let (frames, completions, done) = (frames.clone(), completions.clone(), done.clone());
+            std::thread::spawn(move || {
+                while !done.load(Ordering::Acquire) {
+                    if let Some(frame) = frames.poll() {
+                        run_frame(frame);
+                        continue;
+                    }
+                    let mut frame = None;
+                    completions.pull(&mut |f| frame = Some(f), &mut |_| false, 1);
+                    match frame {
+                        Some(frame) => run_frame(frame),
+                        None => std::thread::yield_now(),
+                    }
+                }
+            })
+        })
+        .collect();
+    let kill = Arc::new(AtomicBool::new(false));
+    for _ in 0..QUANTA {
+        let _ = graph.start(
+            Held(Mutex::default()),
+            kill.clone(),
+            None::<euhedral_graph::ExternalEdge>,
+        );
+    }
+    assert!(
+        wait_until(Duration::from_secs(60), || lock(&outcomes).len() == QUANTA),
+        "every quantum retired"
+    );
+    done.store(true, Ordering::Release);
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    assert!(
+        lock(&outcomes)
+            .iter()
+            .all(|o| *o == QuantumOutcome::Completed)
+    );
     assert_eq!(
         dropped.load(Ordering::SeqCst),
-        40,
-        "each value released, once"
+        2 * QUANTA,
+        "each hold released, once"
     );
-    completions.pull(&mut |f| frames.push(f), &mut |_| false, 8);
-    assert_eq!(dropped.load(Ordering::SeqCst), 40);
+    assert_eq!(graph.live(), 0);
 }

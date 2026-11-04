@@ -88,8 +88,22 @@ worker runs it. `LanePool::as_queues` is the query view that `Completions` polls
 
 **placement, home lane** ([`Placement`](src/lanes.rs), [`LanePool::next_home`](src/lanes.rs)): how a stage that continues
 no lane picks one of its allowed lanes: at random from a per-thread generator (Java's `ThreadLocalRandom`; no shared
-counter), or in turns (deterministic, for tests). A root continues its run's home lane, taken in turn over the pool's
-lanes when the run is made (Java `nextHome`), so a graph's critical chain keeps one lane in every quantum.
+counter), or by a function of the stage (`Fixed`, Java's `fixed`: deterministic under any number of workers). A root
+continues its run's home lane, taken in turn over the pool's compute lanes (not the reserved ones) when the run is made
+(Java `nextHome`), so a graph's critical chain keeps one lane in every quantum.
+
+**lane control, retire cell, quiesce** ([`LaneControl`, `RetireCell`](src/lanes.rs), [`StageGraph`](src/stage_graph.rs)):
+what a graph asks of a lane it joins and retires: `await_marker` (later work on this lane waits on the device for a
+marker of another lane), `notify_retired(cell)` (the backend's callback stores the work's status in that cell and does
+nothing else) and `confirm_retired(status)`. `RetireCell` is one atomic: the status, or pending. The graph's boundary
+(Java `quiesce`) has the other lanes a quantum used join its home lane, arms one retirement there with the quantum's own
+cell, and registers `Completions::after_retired(cell, frame)`; the frame settles the status, runs the `retired` hooks and
+retires the quantum. Each arm names its own cell, so parties arming on one lane never read each other's retirement, and
+nothing is claimed.
+
+**retired hook** ([`Stage::retired`](src/stage_graph.rs)): Java `StageFrame.retired`. Once per stage that was attempted,
+in stage order, after the quantum's device work ended and before the quantum is handed on: the place to release what
+the stage held for its work. `committed` is true only when the whole quantum succeeded and the stage submitted.
 
 **pooled quantum, run** ([`StageGraph`](src/stage_graph.rs)): the state of one quantum (its counts, its
 markers, its first cause, its external-edge records) kept in a bounded pool and rebound to each quantum in

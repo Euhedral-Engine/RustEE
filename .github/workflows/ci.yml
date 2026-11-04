@@ -148,6 +148,7 @@ jobs:
           cargo test -p euhedral-graph --release --lib sequencer::loom
           cargo test -p euhedral-graph --release --lib stage_graph::loom
           cargo test -p euhedral-graph --release --lib take_all::loom
+          cargo test -p euhedral-graph --release --lib lanes::loom
 
       - name: Loom models (euhedral-gpu)
         if: runner.os == 'Linux' && needs.changes.outputs.euhedral_gpu == 'true'

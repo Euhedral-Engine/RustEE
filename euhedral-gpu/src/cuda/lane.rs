@@ -1,15 +1,14 @@
 //! A CUDA stream as a shared lane: any worker submits to it through `&self`, as a stage of a graph does.
 //!
-//! The state workers share is atomic (the marker ring, see `ring`) or reached through a claim (the retirement channel,
-//! see `retire`); the driver serializes the launches it gets on the stream.
+//! The state workers share is atomic (the marker ring, see `ring`); the driver serializes the launches it gets on the
+//! stream. A retirement names the cell its callback fills (see `retire`), so nothing is claimed or queued.
 
-use std::any::Any;
 use std::ffi::c_void;
+use std::sync::Arc;
 
-use euhedral_graph::{DeviceQueue, LaneId, Marker};
+use euhedral_graph::{ControlError, LaneControl, LaneId, Marker, RetireCell};
 
-use crate::POISONED_STATUS;
-use crate::{Args, Enqueue, GpuError, Kernel, Lane, Launch, MAX_ARGS, RetireTicket};
+use crate::{Args, GpuError, Kernel, Lane, LaneEnqueue, Launch, MAX_ARGS, POISONED_STATUS};
 
 use super::stream::CudaQueue;
 use super::{CudaGpu, CudaKernel, from_cuda};
@@ -26,7 +25,7 @@ impl CudaLaneEnqueue<'_> {
     }
 }
 
-impl Enqueue for CudaLaneEnqueue<'_> {
+impl LaneEnqueue for CudaLaneEnqueue<'_> {
     type Kernel = CudaKernel;
 
     unsafe fn launch(
@@ -119,9 +118,13 @@ impl Enqueue for CudaLaneEnqueue<'_> {
             f(dst, value, bytes, self.queue.raw)
         })
     }
+}
 
-    fn keep(&mut self, value: Box<dyn Any + Send>) {
-        self.queue.shared.keep(value);
+fn control_error(error: GpuError) -> ControlError {
+    match error {
+        GpuError::Busy => ControlError::Busy,
+        GpuError::Invalid(what) => ControlError::Invalid(what),
+        other => ControlError::Failed(other.to_string()),
     }
 }
 
@@ -142,67 +145,69 @@ impl Lane for CudaQueue {
         f(&mut CudaLaneEnqueue { queue: self })
     }
 
+    fn submit_marked<R>(
+        &self,
+        f: impl FnOnce(&mut CudaLaneEnqueue<'_>) -> Result<R, GpuError>,
+    ) -> Result<(R, Marker), GpuError> {
+        // The refusal comes here, before the work: the claim is made first.
+        let claim = self.reserve()?;
+        let _c = self.gpu.device().enter().map_err(from_cuda)?;
+        let result = f(&mut CudaLaneEnqueue { queue: self })?;
+        let marker = self.record_claim(claim)?;
+        Ok((result, marker))
+    }
+
     fn mark(&self) -> Result<Marker, GpuError> {
         let _c = self.gpu.device().enter().map_err(from_cuda)?;
         self.mark_now()
     }
+}
 
-    fn await_marker(&self, marker: Marker) -> Result<(), GpuError> {
-        let _c = self.gpu.device().enter().map_err(from_cuda)?;
-        self.await_now(self.raw, marker)
+impl LaneControl for CudaQueue {
+    fn await_marker(&self, marker: Marker) -> Result<(), ControlError> {
+        let _c = self
+            .gpu
+            .device()
+            .enter()
+            .map_err(|e| control_error(from_cuda(e)))?;
+        self.await_now(self.raw, marker).map_err(control_error)
     }
 
-    fn arm_retirement(&self) -> Result<(), GpuError> {
-        self.gpu.poison.check()?;
-        let _c = self.gpu.device().enter().map_err(from_cuda)?;
-        self.shared
-            .arm(|_seq| self.arm_callback_to(self.shared.sink()))
+    fn notify_retired(&self, cell: &Arc<RetireCell>) -> Result<(), ControlError> {
+        self.gpu.poison.check().map_err(control_error)?;
+        let _c = self
+            .gpu
+            .device()
+            .enter()
+            .map_err(|e| control_error(from_cuda(e)))?;
+        self.arm_cell(cell).map_err(control_error)
     }
 
-    fn poll_retired(&self) -> Option<RetireTicket> {
-        let (ticket, desync) = self
-            .shared
-            .poll(|| self.gpu.poison.get().is_some(), || self.look());
-        if desync {
-            self.gpu
-                .fail_invalid("a retirement outcome arrived that no one had armed");
-        }
-        ticket
-    }
-
-    fn confirm_retired(&self, ticket: RetireTicket) -> Option<GpuError> {
-        if ticket.stream() != DeviceQueue::id(self) {
-            return Some(GpuError::Invalid(
-                "a retirement ticket of another stream".into(),
-            ));
-        }
+    fn confirm_retired(&self, status: i32) -> Option<ControlError> {
         let poisoned = || {
             self.gpu
                 .poison
                 .get()
-                .map(|cause| GpuError::Poisoned(Box::new(cause)))
+                .map(|cause| ControlError::Failed(GpuError::Poisoned(Box::new(cause)).to_string()))
         };
-        if ticket.status() == POISONED_STATUS {
+        if status == POISONED_STATUS || status == 0 {
             return poisoned();
         }
-        // Release only what this retirement covered; a poisoned ticket does not say which that was.
-        self.shared.release_through(ticket.seq());
-        if ticket.status() == 0 {
-            return poisoned();
-        }
+        // Asking the driver for the error's name is a plain call. A device fault poisons the device there, so the
+        // retirement that carries the fault reports what a retirement behind it reports.
         let err = self
             .gpu
-            .check("device work", ticket.status())
+            .check("device work", status)
             .err()
             .unwrap_or(GpuError::Call {
                 call: "device work",
-                code: ticket.status(),
+                code: status,
                 name: "unknown".into(),
             });
         if matches!(err, GpuError::Fault { .. }) {
             poisoned()
         } else {
-            Some(err)
+            Some(control_error(err))
         }
     }
 }

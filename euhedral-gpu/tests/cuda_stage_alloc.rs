@@ -5,23 +5,25 @@
 #![cfg(feature = "cuda")]
 #![allow(
     clippy::disallowed_methods,
-    reason = "the test thread is not a lattice worker: it pumps frames and yields while the device runs"
+    clippy::disallowed_types,
+    reason = "the test thread is not a lattice worker: it pumps frames and yields while the device runs, and a quantum's \
+              held values sit behind a lock the test owns"
 )]
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use euhedral_core::frames::{Frame, FrameError};
 use euhedral_core::generics::{FrameSink, LatticeSource};
 use euhedral_data_structures::queues::{Consumer, MpscQueue, Multi, Producer, Single};
 use euhedral_gpu::cuda::{CudaGpu, CudaKernel, CudaModule, CudaQueue};
 use euhedral_gpu::{
-    Args, Enqueue, GpuError, Lane, Launch, Module, StreamOptions, open_shared_lanes,
+    Args, GpuError, Lane, LaneEnqueue, Launch, Module, StreamOptions, open_shared_lanes,
 };
 use euhedral_graph::{
-    Completions, DEFAULT_RETRY_BACKSTOP, EdgeKind, GraphRuntime, LaneId, Stage, StageCx,
-    StageError, StageGraph, StageGraphSpec, StageSpec, Submitted,
+    Completions, DEFAULT_RETRY_BACKSTOP, EdgeKind, GraphRuntime, LaneControl, LaneId, Stage,
+    StageCx, StageError, StageGraph, StageGraphSpec, StageSpec, Submitted,
 };
 
 static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
@@ -85,35 +87,61 @@ thread_local! {
     static ARGS: std::cell::RefCell<Args> = std::cell::RefCell::new(Args::new());
 }
 
-/// A stage that waits for the markers it was given, launches on its lane and returns the lane's marker.
-struct Adds {
-    kernel: CudaKernel,
+/// What a quantum is: the device word its stages add to, and what each stage holds for its work until its hook.
+struct Work {
+    word: u64,
+    held: [Mutex<Option<Arc<AtomicUsize>>>; 2],
 }
 
-impl Stage<u64, CudaQueue> for Adds {
-    fn run(&self, word: &u64, cx: &StageCx<'_, CudaQueue>) -> Result<Submitted, StageError> {
+/// A stage that waits for the markers it was given, launches on its lane with its marker (a refusal comes before the
+/// work), holds a value for the launch, and releases it in its retirement hook.
+struct Adds {
+    kernel: CudaKernel,
+    /// The value a stage holds (a clone of this) and the count of hooks that released one.
+    value: Arc<AtomicUsize>,
+    released: Arc<AtomicUsize>,
+    slot: usize,
+}
+
+impl Stage<Work, CudaQueue> for Adds {
+    fn run(&self, work: &Work, cx: &StageCx<'_, CudaQueue>) -> Result<Submitted, StageError> {
         let lane = cx.lane_handle().expect("a stage with a lane");
         for marker in cx.waits {
             lane.await_marker(*marker)
                 .map_err(|e| StageError::Corrupt(e.to_string()))?;
         }
         // The arguments are rewritten in place in a container this worker keeps: a launch allocates nothing.
-        ARGS.with_borrow_mut(|args| {
+        let made = ARGS.with_borrow_mut(|args| {
             args.clear();
-            args.push_device(*word)
-                .push_device(*word)
+            args.push_device(work.word)
+                .push_device(work.word)
                 .push(1u32)
                 .push(1u32);
-            lane.submit(|q| {
+            lane.submit_marked(|q| {
                 // SAFETY: matching arguments over a live device word.
                 unsafe { q.launch(&self.kernel, Launch::linear(1, 1), args) }
             })
-        })
-        .map_err(|e| StageError::Corrupt(e.to_string()))?;
-        match lane.mark() {
-            Ok(marker) => Ok(Submitted::marker(marker)),
+        });
+        match made {
+            Ok(((), marker)) => {
+                *work.held[self.slot]
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = Some(self.value.clone());
+                Ok(Submitted::marker(marker))
+            }
             Err(GpuError::Busy) => Err(StageError::Retry),
             Err(e) => Err(StageError::Corrupt(e.to_string())),
+        }
+    }
+
+    fn retired(&self, work: &Work, committed: bool) {
+        assert!(committed);
+        let held = work.held[self.slot]
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if held.is_some() {
+            self.released.fetch_add(1, Ordering::Release);
         }
     }
 }
@@ -156,13 +184,23 @@ fn warm_stages_submit_and_quanta_run_without_allocating() {
     spec.edge(first, second, EdgeKind::Submission);
     let retired = Arc::new(AtomicUsize::new(0));
     let counted = retired.clone();
+    let value = Arc::new(AtomicUsize::new(0));
+    let released = Arc::new(AtomicUsize::new(0));
     let graph = StageGraph::new(
         spec,
         vec![
             Arc::new(Adds {
                 kernel: add.clone(),
-            }) as Arc<dyn Stage<u64, CudaQueue>>,
-            Arc::new(Adds { kernel: add }),
+                value: value.clone(),
+                released: released.clone(),
+                slot: 0,
+            }) as Arc<dyn Stage<Work, CudaQueue>>,
+            Arc::new(Adds {
+                kernel: add,
+                value: value.clone(),
+                released: released.clone(),
+                slot: 1,
+            }),
         ],
         GraphRuntime {
             stages: Arc::new(Sink(queue.producer())),
@@ -179,7 +217,11 @@ fn warm_stages_submit_and_quanta_run_without_allocating() {
     let kill = Arc::new(AtomicBool::new(false));
     let mut started = 0usize;
     let mut quantum = || {
-        let _ = graph.start(buf.addr, kill.clone(), None::<euhedral_graph::ExternalEdge>);
+        let work = Work {
+            word: buf.addr,
+            held: [Mutex::new(None), Mutex::new(None)],
+        };
+        let _ = graph.start(work, kill.clone(), None::<euhedral_graph::ExternalEdge>);
         started += 1;
         while retired.load(Ordering::Acquire) < started {
             while let Some(frame) = frames.poll() {
@@ -202,6 +244,17 @@ fn warm_stages_submit_and_quanta_run_without_allocating() {
     let allocated = ALLOCATIONS.load(Ordering::Relaxed) - before;
     assert_eq!(
         allocated, 0,
-        "{allocated} allocations over 2000 quanta of two stages that launch, wait on a marker and mark"
+        "{allocated} allocations over 2000 quanta of two stages that launch, wait on a marker, mark, hold a value and \
+         release it in their hook"
+    );
+    assert_eq!(
+        released.load(Ordering::Acquire),
+        2 * 2_200,
+        "every value a stage held was released by its hook, once"
+    );
+    assert_eq!(
+        Arc::strong_count(&value),
+        3,
+        "this handle and the two stages': no hold outlives its quantum"
     );
 }

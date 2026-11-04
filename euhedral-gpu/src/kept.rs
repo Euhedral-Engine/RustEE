@@ -68,17 +68,6 @@ impl Kept {
             .drain_while(drop, |(kept_for, _)| *kept_for > seq, u64::MAX);
     }
 
-    /// Takes out the oldest value kept for a retirement numbered `seq` or lower, if the front of the queue is one.
-    pub(crate) fn pop_through(&mut self, seq: u64) -> Option<Box<dyn Any + Send>> {
-        let mut taken = None;
-        self.values.drain_while(
-            |(_, value)| taken = Some(value),
-            |(kept_for, _)| *kept_for > seq,
-            1,
-        );
-        taken
-    }
-
     /// Drops everything kept.
     #[cfg_attr(
         not(feature = "cuda"),

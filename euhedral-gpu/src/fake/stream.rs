@@ -3,10 +3,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use euhedral_graph::{DeviceQueue, LaneId, Marker, QueueId};
+use euhedral_graph::{DeviceQueue, LaneControl, LaneId, Marker, QueueId};
 
 use crate::kept::Kept;
-use crate::retire::{RetireSink, Retirements, SharedRetire};
+use crate::retire::{RetireSink, Retirements};
 use crate::spans::{Span, SpanBook};
 use crate::{Gpu, GpuError, POISONED_STATUS, RetireListener, RetireTicket, Stream, StreamPriority};
 
@@ -31,8 +31,6 @@ pub struct FakeQueue {
     pub(crate) base: usize,
     pub(crate) first: u16,
     pub(crate) count: usize,
-    /// The retirement channel and kept values of the shared lane, apart from the owner stream's.
-    pub(crate) shared: SharedRetire,
 }
 
 impl FakeQueue {
@@ -66,6 +64,10 @@ impl DeviceQueue for FakeQueue {
 
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn control(&self) -> Option<&dyn LaneControl> {
+        Some(self)
     }
 }
 
@@ -130,7 +132,6 @@ impl FakeStream {
             base,
             first,
             count,
-            shared: SharedRetire::new(id, lane),
         });
         Self {
             gpu,
