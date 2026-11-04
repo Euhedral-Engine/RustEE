@@ -136,6 +136,20 @@
   ]
  },
  {
+  "name": "gpu: graph instances and holds",
+  "crate": "euhedral-gpu",
+  "commands": [
+   "cargo +nightly miri test -p euhedral-gpu --features fake --lib -- instances::tests hold::tests graph_cache::shared_tests"
+  ]
+ },
+ {
+  "name": "gpu: shared lane graphs",
+  "crate": "euhedral-gpu",
+  "commands": [
+   "cargo +nightly miri test -p euhedral-gpu --features fake --test fake_lane_graphs"
+  ]
+ },
+ {
   "name": "gpu: shared fake lanes",
   "crate": "euhedral-gpu",
   "commands": [

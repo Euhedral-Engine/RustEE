@@ -8,10 +8,12 @@ use std::sync::Arc;
 
 use euhedral_graph::{ControlError, LaneControl, LaneId, Marker, RetireCell};
 
-use crate::{Args, GpuError, Kernel, Lane, LaneEnqueue, Launch, MAX_ARGS, POISONED_STATUS};
+use crate::{
+    Args, GpuError, GraphHold, Kernel, Lane, LaneEnqueue, Launch, MAX_ARGS, POISONED_STATUS,
+};
 
 use super::stream::CudaQueue;
-use super::{CudaGpu, CudaKernel, from_cuda};
+use super::{CudaEnqueue, CudaGpu, CudaKernel, from_cuda};
 
 /// What a submission to a shared CUDA lane enqueues.
 #[derive(Debug)]
@@ -131,6 +133,7 @@ fn control_error(error: GpuError) -> ControlError {
 impl Lane for CudaQueue {
     type Gpu = CudaGpu;
     type Enqueue<'a> = CudaLaneEnqueue<'a>;
+    type Held<'a> = CudaEnqueue<'a>;
 
     fn lane(&self) -> LaneId {
         self.lane
@@ -143,6 +146,16 @@ impl Lane for CudaQueue {
         self.gpu.poison.check()?;
         let _c = self.gpu.device().enter().map_err(from_cuda)?;
         f(&mut CudaLaneEnqueue { queue: self })
+    }
+
+    fn submit_held<R>(
+        &self,
+        hold: &mut GraphHold,
+        f: impl FnOnce(&mut CudaEnqueue<'_>) -> Result<R, GpuError>,
+    ) -> Result<R, GpuError> {
+        self.gpu.poison.check()?;
+        let _c = self.gpu.device().enter().map_err(from_cuda)?;
+        f(&mut CudaEnqueue::on_lane(&self.gpu, self, hold))
     }
 
     fn submit_marked<R>(

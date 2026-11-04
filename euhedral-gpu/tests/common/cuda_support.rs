@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use super::{HostWord, Item, Plan, Probe, collect_all, lock, pump_from};
 use euhedral_gpu::cuda::{CudaGpu, CudaModule, CudaStream};
 use euhedral_gpu::{
-    Args, CompileOptions, Enqueue, Gpu, GpuError, LaneSpec, Module, Stream, StreamOptions,
+    Args, CompileOptions, Gpu, GpuError, LaneEnqueue, LaneSpec, Module, Stream, StreamOptions,
     open_lane_sources,
 };
 use euhedral_graph::{Deliver, LaneId};

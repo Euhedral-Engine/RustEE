@@ -1,5 +1,6 @@
 //! A lane's cache of recorded graphs: the same sequence of operations run for each unit of work, recorded once and updated and
-//! replayed after.
+//! replayed after. [`GraphCache`] is an owned lane\'s (one owner, `&mut`); [`SharedGraphCache`] is the cache of shared lanes,
+//! for any number of workers through `&self`.
 //!
 //! A lane that runs the same short sequence of launches for each unit of work (a stage of several kernels) records it as a graph the
 //! first time and replays it after, giving each replay the unit's own arguments. The cache is one lane's: a graph is replayed with
@@ -21,7 +22,11 @@
 //! The body is one piece of code for all three passes (direct, record, update): it enqueues through [`Enqueue`], so its launches
 //! line up one to one with the recording.
 
-use crate::{Enqueue, Gpu, GpuError, Graph, Sequence, Stream};
+use std::hash::Hash;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+use crate::instances::{InstancePool, tag_of};
+use crate::{Enqueue, Gpu, GpuError, Graph, GraphHold, Lane, Sequence, Stream};
 
 /// The enqueue body of a recurring sequence: the same code serves a direct run, a recording and an update.
 pub trait GraphBody<G: Gpu> {
@@ -210,6 +215,174 @@ impl<G: Gpu, K: Copy + Eq> GraphCache<G, K> {
     /// Graphs waiting to be freed.
     pub fn stale(&self) -> usize {
         self.stale.len()
+    }
+}
+
+/// The shared lane type of a backend's streams.
+type LaneOf<G> = <<G as Gpu>::Stream as Stream>::Lane;
+
+/// Graphs by key for any number of workers running on shared lanes, through `&self`, without a lock.
+///
+/// The owned [`GraphCache`] is one lane's: its graphs are replayed with `&mut`, by the lane's owner. A stage on a shared
+/// [`Lane`] runs on whichever worker the lattice gives it, and a key can be running on several at once, so the graphs
+/// are *instances*, pooled by key ([`InstancePool`](crate::instances)):
+///
+/// - **A hit**: a free instance of the key is taken by one compare-and-set (the entry is claimed, not locked), updated with
+///   the unit's arguments and replayed on the lane. It goes back to the pool when the replay has been *enqueued*.
+/// - **A second concurrent user of a key** finds the instance taken and does not wait or spin: it takes another free
+///   instance of the key, or records one of its own (a miss) and pools it for the next. The instances of a key therefore
+///   settle at the peak number of workers that ran it at once, and a run after warm-up allocates nothing.
+/// - **A miss**, **a changed shape**, **a warm-up** and **caching off** are as the owned cache's.
+/// - **A full pool** (the bound) evicts a free instance; if every instance is in use, the new recording runs and is not
+///   pooled. Dropping an instance is safe whatever its launches are doing: the driver frees an executable once they end.
+///
+/// **Why the instance may go back once the replay is enqueued.** The driver snapshots a graph's parameters at the launch
+/// (an update applies to the next launch, never to one in flight) and orders every launch of one executable behind the
+/// previous one, whichever stream it is on; so the next user may update and launch the instance at once. What the replay
+/// reads that the instance does not own are the recording's host buffers: the run adds a handle to them to the caller's
+/// [`GraphHold`], which the caller holds in its quantum and drops in `Stage::retired`, after the device work ended, so
+/// the instance, the cache and the lane may all be gone by then without the work losing them.
+///
+/// **Markers.** Run it inside [`Lane::submit_marked`]: the marker is claimed before the run, any `Busy` comes before any
+/// replay, and the marker is recorded behind it (the closure's enqueue argument is not needed: the run reaches the lane
+/// through `lane`).
+pub struct SharedGraphCache<G: Gpu, K> {
+    pool: InstancePool<K, G::Graph>,
+    enabled: AtomicBool,
+    replays: AtomicU64,
+    records: AtomicU64,
+    rerecords: AtomicU64,
+    directs: AtomicU64,
+}
+
+impl<G: Gpu, K> std::fmt::Debug for SharedGraphCache<G, K> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedGraphCache")
+            .field("pool", &self.pool)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<G: Gpu, K: Copy + Eq + Hash> Default for SharedGraphCache<G, K> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<G: Gpu, K: Copy + Eq + Hash> SharedGraphCache<G, K> {
+    pub fn new() -> Self {
+        Self::with_capacity(DEFAULT_GRAPHS)
+    }
+
+    /// A cache of at most `instances` graph instances (all keys together).
+    pub fn with_capacity(instances: usize) -> Self {
+        Self {
+            pool: InstancePool::new(instances),
+            enabled: AtomicBool::new(true),
+            replays: AtomicU64::new(0),
+            records: AtomicU64::new(0),
+            rerecords: AtomicU64::new(0),
+            directs: AtomicU64::new(0),
+        }
+    }
+
+    /// Turns caching off or on.
+    pub fn set_enabled(&self, on: bool) {
+        self.enabled.store(on, Ordering::Relaxed);
+    }
+
+    pub fn stats(&self) -> GraphStats {
+        GraphStats {
+            replays: self.replays.load(Ordering::Relaxed),
+            records: self.records.load(Ordering::Relaxed),
+            rerecords: self.rerecords.load(Ordering::Relaxed),
+            directs: self.directs.load(Ordering::Relaxed),
+        }
+    }
+
+    /// The instances held, in use or not.
+    pub fn len(&self) -> usize {
+        self.pool.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pool.len() == 0
+    }
+
+    /// The most instances the cache keeps.
+    pub fn capacity(&self) -> usize {
+        self.pool.capacity()
+    }
+
+    /// Whether `key` has an instance (in use or not).
+    pub fn contains(&self, key: &K) -> bool {
+        self.pool.contains(tag_of(key))
+    }
+
+    /// Runs the sequence `body` on `lane` under `key`, adding what the work reads to `hold` (see the type's docs).
+    pub fn run<B: GraphBody<G>>(
+        &self,
+        gpu: &G,
+        lane: &LaneOf<G>,
+        key: K,
+        body: &mut B,
+        hold: &mut GraphHold,
+    ) -> Result<Ran, GpuError> {
+        if !self.enabled.load(Ordering::Relaxed) {
+            lane.submit_held(hold, |enq| body.enqueue(enq))?;
+            self.directs.fetch_add(1, Ordering::Relaxed);
+            return Ok(Ran::Direct);
+        }
+        let tag = tag_of(&key);
+        if let Some(mut lease) = self.pool.take(&key, tag) {
+            let graph = lease.get();
+            return match gpu.update(graph, |seq| seq.submit(0, |enq| body.enqueue(enq))) {
+                Ok(()) => {
+                    graph.replay_on(lane, hold)?;
+                    self.replays.fetch_add(1, Ordering::Relaxed);
+                    Ok(Ran::Replayed)
+                }
+                Err(GpuError::ShapeChanged { .. }) => {
+                    // The body is not the recorded sequence any more: record it again (in place when the driver can).
+                    gpu.rerecord_on(graph, &[lane], hold, |seq| {
+                        seq.submit(0, |enq| body.enqueue(enq))
+                    })?;
+                    self.rerecords.fetch_add(1, Ordering::Relaxed);
+                    Ok(Ran::Rerecorded)
+                }
+                Err(other) => Err(other),
+            };
+        }
+        // No free instance of the key: record one. A slot is reserved first; with none, the recording runs unpooled.
+        let slot = self.pool.reserve(tag);
+        let graph = gpu.record_on(&[lane], hold, |seq| seq.submit(0, |enq| body.enqueue(enq)))?;
+        self.records.fetch_add(1, Ordering::Relaxed);
+        if let Some(slot) = slot {
+            slot.fill(key, graph);
+        }
+        Ok(Ran::Recorded)
+    }
+
+    /// A warm-up: records an instance of `key` (running the body for real, on units nobody reads) unless it has one, and
+    /// replays nothing.
+    pub fn warm<B: GraphBody<G>>(
+        &self,
+        gpu: &G,
+        lane: &LaneOf<G>,
+        key: K,
+        body: &mut B,
+        hold: &mut GraphHold,
+    ) -> Result<Ran, GpuError> {
+        if self.enabled.load(Ordering::Relaxed) && self.contains(&key) {
+            return Ok(Ran::Present);
+        }
+        self.run(gpu, lane, key, body, hold)
+    }
+
+    /// Drops the free instances whose key `keep` refuses (an old shape, a released prepare); instances in use stay for
+    /// the next call. Returns how many went.
+    pub fn retain(&self, keep: impl Fn(&K) -> bool) -> usize {
+        self.pool.retain(keep)
     }
 }
 
@@ -426,5 +599,345 @@ mod tests {
         }
         assert_eq!(cache.len(), 4);
         assert_eq!(cache.stale(), 5);
+    }
+}
+
+/// The shared cache over the fake device: instances by key, taken by claim, the hold of what the work reads.
+#[cfg(all(test, feature = "fake"))]
+mod shared_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
+
+    use crate::fake::{FakeGpu, FakeKernel, FakeModule, FakeQueue};
+    use crate::{Args, Dim3, Lane, Launch, Module, StreamOptions};
+
+    use super::*;
+
+    const KEY: (u16, u32, u64) = (1, 0, 7);
+
+    /// A kernel that adds its second argument to the word its first names.
+    fn rig() -> (Arc<FakeGpu>, Arc<FakeQueue>, FakeKernel, u64) {
+        let gpu = FakeGpu::new();
+        gpu.define("addv", |mem, _launch, args| {
+            let at = args.read::<u64>(0).unwrap();
+            let by = args.read::<u32>(1).unwrap();
+            let word = mem.bytes_mut(at, 4)?;
+            let v = u32::from_le_bytes(word.try_into().unwrap()) + by;
+            word.copy_from_slice(&v.to_le_bytes());
+            Ok(())
+        });
+        let lanes = crate::open_shared_lanes(
+            &gpu,
+            &[(
+                "lane",
+                StreamOptions {
+                    markers: 1024,
+                    ..StreamOptions::default()
+                },
+            )],
+        )
+        .expect("a lane");
+        let lane = lanes.pool.lane(euhedral_graph::LaneId(0)).clone();
+        let module = FakeModule::from_source(&gpu, "addv", &Default::default()).unwrap();
+        let kernel = module.kernel("addv").unwrap();
+        let word = gpu.alloc(4);
+        (gpu, lane, kernel, word)
+    }
+
+    fn word(gpu: &FakeGpu, at: u64) -> u32 {
+        u32::from_le_bytes(gpu.read(at, 4).try_into().unwrap())
+    }
+
+    /// `launches` launches that add `by` to the word, and a value kept for them.
+    struct Adds<'a> {
+        kernel: &'a FakeKernel,
+        word: u64,
+        launches: u32,
+        by: u32,
+        keeps: Option<Arc<AtomicUsize>>,
+        /// Called inside every pass, to hold threads together.
+        inside: Option<&'a Barrier>,
+    }
+
+    struct Counted(Arc<AtomicUsize>);
+
+    impl Drop for Counted {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl GraphBody<FakeGpu> for Adds<'_> {
+        fn enqueue<E: Enqueue<Kernel = FakeKernel>>(
+            &mut self,
+            enq: &mut E,
+        ) -> Result<(), GpuError> {
+            if let Some(barrier) = self.inside {
+                barrier.wait();
+            }
+            for _ in 0..self.launches {
+                let launch = Launch {
+                    grid: Dim3::x(1),
+                    block: Dim3::x(32),
+                    shared_bytes: 0,
+                };
+                // SAFETY: a live fake allocation.
+                unsafe {
+                    enq.launch(
+                        self.kernel,
+                        launch,
+                        &Args::new().device(self.word).arg(self.by),
+                    )?
+                };
+            }
+            if let Some(count) = &self.keeps {
+                enq.keep(Box::new(Counted(count.clone())));
+            }
+            Ok(())
+        }
+    }
+
+    fn body<'a>(kernel: &'a FakeKernel, word: u64, launches: u32, by: u32) -> Adds<'a> {
+        Adds {
+            kernel,
+            word,
+            launches,
+            by,
+            keeps: None,
+            inside: None,
+        }
+    }
+
+    #[test]
+    fn a_new_key_records_and_runs_and_the_next_unit_updates_and_replays_on_the_lane() {
+        let (gpu, lane, kernel, at) = rig();
+        let cache = SharedGraphCache::<FakeGpu, _>::new();
+        let mut hold = GraphHold::new();
+        let mut b = body(&kernel, at, 2, 10);
+        assert_eq!(
+            cache.run(&gpu, &lane, KEY, &mut b, &mut hold).unwrap(),
+            Ran::Recorded
+        );
+        gpu.run_until_idle();
+        assert_eq!(word(&gpu, at), 20, "the recording ran for real");
+        b.by = 1;
+        assert_eq!(
+            cache.run(&gpu, &lane, KEY, &mut b, &mut hold).unwrap(),
+            Ran::Replayed
+        );
+        gpu.run_until_idle();
+        assert_eq!(word(&gpu, at), 22, "the replay took the new arguments");
+        assert_eq!(
+            cache.stats(),
+            GraphStats {
+                replays: 1,
+                records: 1,
+                rerecords: 0,
+                directs: 0
+            }
+        );
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn variants_shapes_warm_ups_and_retain_work_as_the_owned_caches() {
+        let (gpu, lane, kernel, at) = rig();
+        let cache = SharedGraphCache::<FakeGpu, _>::new();
+        let mut hold = GraphHold::new();
+        let mut b = body(&kernel, at, 3, 0);
+        for key in [KEY, (1, 1, 7), (1, 0, 8)] {
+            assert_eq!(
+                cache.run(&gpu, &lane, key, &mut b, &mut hold).unwrap(),
+                Ran::Recorded
+            );
+        }
+        assert_eq!(cache.len(), 3);
+        b.launches = 5;
+        assert_eq!(
+            cache.run(&gpu, &lane, KEY, &mut b, &mut hold).unwrap(),
+            Ran::Rerecorded
+        );
+        assert_eq!(
+            cache.run(&gpu, &lane, KEY, &mut b, &mut hold).unwrap(),
+            Ran::Replayed
+        );
+        assert_eq!(cache.len(), 3, "one instance per key");
+        assert_eq!(
+            cache.warm(&gpu, &lane, KEY, &mut b, &mut hold).unwrap(),
+            Ran::Present
+        );
+        assert_eq!(
+            cache
+                .warm(&gpu, &lane, (9, 9, 9), &mut b, &mut hold)
+                .unwrap(),
+            Ran::Recorded
+        );
+        assert_eq!(cache.retain(|k| k.0 == 1), 1);
+        assert!(!cache.contains(&(9, 9, 9)) && cache.contains(&KEY));
+    }
+
+    /// Capacity counts instances, and a full cache evicts a free one.
+    #[test]
+    fn the_capacity_counts_instances_not_keys() {
+        let (gpu, lane, kernel, at) = rig();
+        let cache = SharedGraphCache::<FakeGpu, _>::with_capacity(4);
+        let mut hold = GraphHold::new();
+        let mut b = body(&kernel, at, 1, 0);
+        for shape in 0..9u64 {
+            cache
+                .run(&gpu, &lane, (1, 0, shape), &mut b, &mut hold)
+                .unwrap();
+        }
+        assert_eq!(cache.len(), 4);
+        assert_eq!(cache.capacity(), 4);
+    }
+
+    #[test]
+    fn caching_off_runs_the_body_directly_and_holds_what_it_keeps() {
+        let (gpu, lane, kernel, at) = rig();
+        let cache = SharedGraphCache::<FakeGpu, _>::new();
+        cache.set_enabled(false);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut b = body(&kernel, at, 1, 3);
+        b.keeps = Some(drops.clone());
+        let mut hold = GraphHold::new();
+        assert_eq!(
+            cache.run(&gpu, &lane, KEY, &mut b, &mut hold).unwrap(),
+            Ran::Direct
+        );
+        gpu.run_until_idle();
+        assert_eq!(word(&gpu, at), 3);
+        assert_eq!(drops.load(Ordering::SeqCst), 0, "the hold keeps it");
+        drop(hold);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert!(cache.is_empty());
+    }
+
+    /// What the recording keeps lives until the caller\'s hold is dropped: not until the cache, the graph or the lane
+    /// are gone, and not before the hold of the last run that used it.
+    #[test]
+    fn what_a_recording_keeps_is_held_by_the_callers_until_they_drop_their_holds() {
+        let (gpu, lane, kernel, at) = rig();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let cache = SharedGraphCache::<FakeGpu, _>::new();
+        let mut recorded = GraphHold::new();
+        let mut b = body(&kernel, at, 1, 1);
+        b.keeps = Some(drops.clone());
+        cache.run(&gpu, &lane, KEY, &mut b, &mut recorded).unwrap();
+        let mut replayed = GraphHold::new();
+        cache.run(&gpu, &lane, KEY, &mut b, &mut replayed).unwrap();
+        // The update pass\'s keeps are not the graph\'s: they were dropped at once, and the recording\'s are the one value.
+        assert_eq!(drops.load(Ordering::SeqCst), 1, "the update pass\'s value");
+        // The cache goes (the instance with it): the work in flight still has its buffers.
+        drop(cache);
+        gpu.run_until_idle();
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        drop(recorded);
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            1,
+            "the replay\'s hold has it too"
+        );
+        drop(replayed);
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            2,
+            "released with the last hold"
+        );
+    }
+
+    /// Workers that run one key at once each get an instance of their own: none waits for another (they are held together
+    /// inside the passes, so a wait would never end), and every replay runs.
+    #[test]
+    fn workers_running_one_key_at_once_each_get_their_own_instance_and_no_one_waits() {
+        const N: usize = 4;
+        let (gpu, lane, kernel, at) = rig();
+        let cache = SharedGraphCache::<FakeGpu, _>::with_capacity(16);
+        let barrier = Barrier::new(N);
+        let round = |expect: Ran| {
+            let ran = std::thread::scope(|scope| {
+                let threads: Vec<_> = (0..N)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            let mut hold = GraphHold::new();
+                            let mut b = body(&kernel, at, 1, 1);
+                            b.inside = Some(&barrier);
+                            cache.run(&gpu, &lane, KEY, &mut b, &mut hold).unwrap()
+                        })
+                    })
+                    .collect();
+                threads
+                    .into_iter()
+                    .map(|t| t.join().unwrap())
+                    .collect::<Vec<_>>()
+            });
+            assert!(ran.iter().all(|r| *r == expect), "{ran:?}");
+        };
+        // None has an instance: all record at once.
+        round(Ran::Recorded);
+        assert_eq!(cache.len(), N);
+        // Each takes one of the N instances at the same moment (inside the update pass, all together).
+        round(Ran::Replayed);
+        assert_eq!(cache.len(), N, "no instance was added: each had its own");
+        gpu.run_until_idle();
+        assert_eq!(word(&gpu, at) as usize, 2 * N, "every launch ran once");
+        assert_eq!(
+            cache.stats(),
+            GraphStats {
+                replays: N as u64,
+                records: N as u64,
+                rerecords: 0,
+                directs: 0
+            }
+        );
+    }
+
+    /// A run inside `submit_marked`: a refused marker comes before any recording or replay.
+    #[test]
+    fn a_busy_marker_ring_refuses_the_run_before_it_records_or_replays() {
+        let gpu = FakeGpu::new();
+        gpu.define("addv", |_, _, _| Ok(()));
+        let lanes = crate::open_shared_lanes(
+            &gpu,
+            &[(
+                "lane",
+                StreamOptions {
+                    markers: 1,
+                    ..StreamOptions::default()
+                },
+            )],
+        )
+        .unwrap();
+        let lane = lanes.pool.lane(euhedral_graph::LaneId(0)).clone();
+        let module = FakeModule::from_source(&gpu, "addv", &Default::default()).unwrap();
+        let kernel = module.kernel("addv").unwrap();
+        let at = gpu.alloc(4);
+        let cache = SharedGraphCache::<FakeGpu, _>::new();
+        let mut hold = GraphHold::new();
+        let mut b = body(&kernel, at, 1, 1);
+        let ((ran, ()), _marker) = lane
+            .submit_marked(|_| {
+                cache
+                    .run(&gpu, &lane, KEY, &mut b, &mut hold)
+                    .map(|r| (r, ()))
+            })
+            .unwrap();
+        assert_eq!(ran, Ran::Recorded);
+        let refused = lane.submit_marked(|_| {
+            cache
+                .run(&gpu, &lane, KEY, &mut b, &mut hold)
+                .map(|r| (r, ()))
+        });
+        assert!(matches!(refused, Err(GpuError::Busy)));
+        assert_eq!(cache.stats().replays, 0, "nothing was replayed");
+        gpu.run_until_idle();
+        let (r, _) = lane
+            .submit_marked(|_| {
+                cache
+                    .run(&gpu, &lane, KEY, &mut b, &mut hold)
+                    .map(|r| (r, ()))
+            })
+            .unwrap();
+        assert_eq!(r.0, Ran::Replayed);
     }
 }

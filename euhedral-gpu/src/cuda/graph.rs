@@ -8,14 +8,16 @@ use std::sync::Arc;
 
 use euhedral_memory::cuda::{CuEvent, CuStream, STREAM_NON_BLOCKING};
 
-use crate::kept::{Frozen, freeze};
-use crate::{Args, Fingerprint, GpuError, Graph, Kernel, Launch, MAX_ARGS, Rerecorded, Sequence};
+use crate::hold::{Frozen, freeze};
+use crate::{
+    Args, Fingerprint, GpuError, Graph, GraphHold, Kernel, Launch, MAX_ARGS, Rerecorded, Sequence,
+};
 
-use super::enqueue::{Mode, Node, Recording, Target};
+use super::enqueue::{Dest, Mode, Node, Recording, Target};
 use super::fns::{
     CAPTURE_MODE_RELAXED, CuGraph, CuGraphExec, ExecUpdateResultInfo, KernelNodeParams,
 };
-use super::{CudaEnqueue, CudaGpu, CudaKernel, CudaStream, from_cuda};
+use super::{CudaEnqueue, CudaGpu, CudaKernel, CudaQueue, CudaStream, from_cuda};
 
 /// `CU_EVENT_DISABLE_TIMING`.
 const EVENT_DISABLE_TIMING: u32 = 2;
@@ -185,13 +187,28 @@ impl Graph for CudaGraph {
         }
         Ok(())
     }
+
+    fn replay_on(&mut self, lane: &CudaQueue, hold: &mut GraphHold) -> Result<(), GpuError> {
+        self.gpu.poison.check()?;
+        let _c = self.gpu.device().enter().map_err(from_cuda)?;
+        // SAFETY: the executable and a lane of the same device; `&mut self` makes this call the executable's only user
+        // (the driver orders its launches, whichever stream they are on); the context is current.
+        self.gpu.check("cuGraphLaunch", unsafe {
+            (self.gpu.fns.graph_launch)(self.exec, lane.raw)
+        })?;
+        // The lane keeps nothing: the caller holds the recording's buffers until the work ended.
+        hold.add_frozen(&self.kept);
+        Ok(())
+    }
 }
 
-/// One stream of a record pass: borrowed mutably for the whole closure.
+/// One stream or lane of a record pass: borrowed for the whole closure.
 #[derive(Debug)]
 pub(crate) struct Real<'a> {
-    stream: &'a mut CudaStream,
+    dest: Dest<'a>,
     shadow: CuStream,
+    /// Whether the shadow was made for this pass (a lane's) and is destroyed with it; a stream keeps its own.
+    owned_shadow: bool,
 }
 
 /// A pass over a recurring sequence.
@@ -206,6 +223,8 @@ pub struct CudaSequence<'a> {
     capturing: bool,
     /// Whether the recording's kept values were handed to the real streams.
     handed_over: bool,
+    /// Where a recording over shared lanes hands the kept values (a lane keeps none).
+    hold: Option<&'a mut GraphHold>,
 }
 
 impl CudaSequence<'_> {
@@ -223,8 +242,13 @@ impl CudaSequence<'_> {
             return;
         };
         for r in &mut self.real {
-            let seq = r.stream.retire.next_seq();
-            r.stream.kept.push(seq, Box::new(frozen.clone()));
+            if let Dest::Stream(stream) = &mut r.dest {
+                let seq = stream.retire.next_seq();
+                stream.kept.push(seq, Box::new(frozen.clone()));
+            }
+        }
+        if let Some(hold) = self.hold.as_deref_mut() {
+            hold.add_frozen(&self.rec.frozen);
         }
     }
 
@@ -265,7 +289,7 @@ impl CudaSequence<'_> {
     }
 
     fn raw(&self, index: usize) -> CuStream {
-        self.real[index].stream.raw
+        self.real[index].dest.raw()
     }
 
     fn shadow(&self, index: usize) -> CuStream {
@@ -343,6 +367,12 @@ impl Drop for CudaSequence<'_> {
             // SAFETY: events made by `event`, unused after the capture ended.
             unsafe { (f.event_destroy)(event) };
         }
+        for r in &self.real {
+            if r.owned_shadow {
+                // SAFETY: a stream made for this pass, whose capture has ended and which holds no real work.
+                unsafe { (f.stream_destroy)(r.shadow) };
+            }
+        }
     }
 }
 
@@ -363,13 +393,14 @@ impl Sequence for CudaSequence<'_> {
         }
         let record = self.rec.mode == Mode::Record;
         let target = self.real.get_mut(stream).map(|r| Target {
-            stream: &mut *r.stream,
+            dest: r.dest.reborrow(),
             shadow: record.then_some(r.shadow),
         });
         let mut q = CudaEnqueue {
             gpu: self.gpu,
             target,
             rec: Some((&mut self.rec, stream)),
+            hold: None,
         };
         f(&mut q)
     }
@@ -425,44 +456,67 @@ impl CudaGpu {
             events: Vec::new(),
             capturing: false,
             handed_over: false,
+            hold: None,
         };
         f(&mut seq)?;
         Ok(std::mem::replace(&mut seq.rec, Recording::new(Mode::Probe)))
     }
 
-    /// Runs `f` for real over `streams` and captures it: the recording, and the graph the driver made of it.
+    /// A stream to capture on.
+    fn shadow_stream(&self) -> Result<CuStream, GpuError> {
+        let mut raw = std::ptr::null_mut();
+        // SAFETY: an out pointer; the context is current.
+        let code =
+            unsafe { (self.device().driver.fns.stream_create)(&mut raw, STREAM_NON_BLOCKING) };
+        self.check("cuStreamCreate", code)?;
+        Ok(raw)
+    }
+
+    /// Runs `f` for real over `dests` and captures it: the recording, and the graph the driver made of it. A shared lane
+    /// keeps no values, so the kept values go to `hold`.
     pub(crate) fn capture<F>(
         self: &Arc<Self>,
-        streams: &mut [&mut CudaStream],
+        dests: Vec<Dest<'_>>,
+        hold: Option<&mut GraphHold>,
         f: F,
     ) -> Result<(Recording, CuGraph), GpuError>
     where
         F: FnOnce(&mut CudaSequence<'_>) -> Result<(), GpuError>,
     {
         self.poison.check()?;
-        if streams.is_empty() {
+        if dests.is_empty() {
             return Err(GpuError::Invalid("a recording needs a stream".into()));
         }
         let _c = self.device().enter().map_err(from_cuda)?;
-        let mut real = Vec::with_capacity(streams.len());
-        // The streams are borrowed mutably for the whole run: nothing else can enqueue on them meanwhile, and two
-        // entries can never name one stream.
-        for stream in streams.iter_mut() {
-            let stream: &mut CudaStream = stream;
-            let shadow = match stream.shadow {
-                Some(shadow) => shadow,
-                None => {
-                    let mut raw = std::ptr::null_mut();
-                    // SAFETY: an out pointer; the context is current.
-                    let code = unsafe {
-                        (self.device().driver.fns.stream_create)(&mut raw, STREAM_NON_BLOCKING)
-                    };
-                    self.check("cuStreamCreate", code)?;
-                    stream.shadow = Some(raw);
-                    raw
-                }
+        let mut real: Vec<Real<'_>> = Vec::with_capacity(dests.len());
+        // A stream is borrowed mutably for the whole run: nothing else can enqueue on it meanwhile, and two entries can
+        // never name one stream. A lane is shared: its other users' work may come between the pass's, which only
+        // over-waits, and the capture is on a shadow stream of the pass's own.
+        for mut dest in dests {
+            let made = match &mut dest {
+                Dest::Stream(stream) => match stream.shadow {
+                    Some(shadow) => Ok((shadow, false)),
+                    None => self.shadow_stream().map(|raw| {
+                        stream.shadow = Some(raw);
+                        (raw, false)
+                    }),
+                },
+                Dest::Lane(_) => self.shadow_stream().map(|raw| (raw, true)),
             };
-            real.push(Real { stream, shadow });
+            match made {
+                Ok((shadow, owned_shadow)) => real.push(Real {
+                    dest,
+                    shadow,
+                    owned_shadow,
+                }),
+                Err(e) => {
+                    for r in real.iter().filter(|r| r.owned_shadow) {
+                        // SAFETY: a stream made for this pass, never used.
+                        unsafe { (self.device().driver.fns.stream_destroy)(r.shadow) };
+                    }
+                    return Err(e);
+                }
+            }
         }
         let mut seq = CudaSequence {
             gpu: self,
@@ -472,6 +526,7 @@ impl CudaGpu {
             events: Vec::new(),
             capturing: false,
             handed_over: false,
+            hold,
         };
         let begun = seq.begin();
         let ran = begun.and_then(|()| f(&mut seq));

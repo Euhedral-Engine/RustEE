@@ -13,8 +13,8 @@ use std::sync::{Arc, Mutex};
 
 use euhedral_gpu::fake::{FakeFault, FakeGpu, FakeOp, FakeStream};
 use euhedral_gpu::{
-    Args, CompileOptions, Enqueue, Gpu, GpuError, Launch, Module, RetireListener, RetireTicket,
-    Stream, StreamOptions,
+    Args, CompileOptions, Enqueue, Gpu, GpuError, LaneEnqueue, Launch, Module, RetireListener,
+    RetireTicket, Stream, StreamOptions,
 };
 use euhedral_graph::{LaneId, Marker, QueueId};
 

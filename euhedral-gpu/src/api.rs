@@ -38,7 +38,7 @@ use std::time::Duration;
 
 use euhedral_graph::{DeviceQueue, LaneControl, LaneId, LanePool, Marker, QueueId};
 
-use crate::{Args, Fingerprint, GpuError, Launch, Span};
+use crate::{Args, Fingerprint, GpuError, GraphHold, Launch, Span};
 
 /// The pool and the streams that [`Gpu::open_lanes`] makes: stream `i` is lane `i` of the pool.
 pub type Lanes<G> = (Arc<LanePool>, Vec<<G as Gpu>::Stream>);
@@ -99,6 +99,33 @@ pub trait Gpu: Send + Sync + fmt::Debug + Sized + 'static {
         &self,
         graph: &mut Self::Graph,
         streams: &mut [&mut Self::Stream],
+        f: F,
+    ) -> Result<Rerecorded, GpuError>
+    where
+        F: FnOnce(&mut Self::Sequence<'_>) -> Result<(), GpuError>;
+
+    /// As [`record`](Self::record), over shared lanes, through `&self`: `f` runs once for real, as a replay on `lanes[0]`
+    /// would, and is recorded. The other lanes fork from `lanes[0]` at the start and join it at the end.
+    ///
+    /// A shared lane keeps no values, so what the real run and the recording read (the buffers the closure keeps) go to
+    /// the caller: a handle to them is added to `hold`, whatever becomes of the recording, and the caller holds it until
+    /// the device work ended (see [`GraphHold`]). A shadow stream that captures the work is made for the call and
+    /// destroyed after it.
+    fn record_on<F>(
+        &self,
+        lanes: &[&<Self::Stream as Stream>::Lane],
+        hold: &mut GraphHold,
+        f: F,
+    ) -> Result<Self::Graph, GpuError>
+    where
+        F: FnOnce(&mut Self::Sequence<'_>) -> Result<(), GpuError>;
+
+    /// As [`rerecord`](Self::rerecord), over shared lanes (see [`record_on`](Self::record_on)).
+    fn rerecord_on<F>(
+        &self,
+        graph: &mut Self::Graph,
+        lanes: &[&<Self::Stream as Stream>::Lane],
+        hold: &mut GraphHold,
         f: F,
     ) -> Result<Rerecorded, GpuError>
     where
@@ -269,6 +296,10 @@ pub trait Lane: DeviceQueue + LaneControl + Sized + 'static {
     type Enqueue<'a>: LaneEnqueue<Kernel = <Self::Gpu as Gpu>::Kernel>
     where
         Self: 'a;
+    /// What [`submit_held`](Self::submit_held) enqueues: an [`Enqueue`] whose kept values go to a [`GraphHold`].
+    type Held<'a>: Enqueue<Kernel = <Self::Gpu as Gpu>::Kernel>
+    where
+        Self: 'a;
 
     /// This lane's id in its pool.
     fn lane(&self) -> LaneId;
@@ -288,6 +319,15 @@ pub trait Lane: DeviceQueue + LaneControl + Sized + 'static {
         &self,
         f: impl FnOnce(&mut Self::Enqueue<'_>) -> Result<R, GpuError>,
     ) -> Result<(R, Marker), GpuError>;
+
+    /// As [`submit`](Self::submit), for a body written against [`Enqueue`] (a recurring sequence's body): the values the
+    /// body keeps (`Enqueue::keep`) are added to `hold`, since a shared lane keeps none. The caller holds them until the
+    /// work ended.
+    fn submit_held<R>(
+        &self,
+        hold: &mut GraphHold,
+        f: impl FnOnce(&mut Self::Held<'_>) -> Result<R, GpuError>,
+    ) -> Result<R, GpuError>;
 
     /// A marker after the work submitted so far. `Err(Busy)` (retry) as for [`submit_marked`](Self::submit_marked). Use
     /// that for a marker after work you cannot repeat.
@@ -342,60 +382,29 @@ pub trait LaneEnqueue {
     unsafe fn memset(&mut self, dst: u64, value: u8, bytes: usize) -> Result<(), GpuError>;
 }
 
-/// What a submission enqueues.
-pub trait Enqueue {
-    type Kernel: Kernel;
-
-    /// Launches `kernel`.
-    ///
-    /// # Safety
-    /// `args` match the kernel's parameters, and every address the kernel touches is valid for that access until the
-    /// work retires.
-    unsafe fn launch(
-        &mut self,
-        kernel: &Self::Kernel,
-        launch: Launch,
-        args: &Args,
-    ) -> Result<(), GpuError>;
-
-    /// Copies `bytes` from host memory at `src` to the device address `dst`.
-    ///
-    /// # Safety
-    /// The ranges are valid, not used by other work in the meantime, and stay valid until the work retires.
-    unsafe fn copy_to_device(
-        &mut self,
-        dst: u64,
-        src: *const u8,
-        bytes: usize,
-    ) -> Result<(), GpuError>;
-
-    /// Copies `bytes` from the device address `src` to host memory at `dst`.
-    ///
-    /// # Safety
-    /// As [`copy_to_device`](Self::copy_to_device).
-    unsafe fn copy_to_host(&mut self, dst: *mut u8, src: u64, bytes: usize)
-    -> Result<(), GpuError>;
-
-    /// Copies `bytes` between device addresses.
-    ///
-    /// # Safety
-    /// As [`copy_to_device`](Self::copy_to_device).
-    unsafe fn copy_on_device(&mut self, dst: u64, src: u64, bytes: usize) -> Result<(), GpuError>;
-
-    /// Sets `bytes` at the device address `dst` to `value`.
-    ///
-    /// # Safety
-    /// As [`copy_to_device`](Self::copy_to_device).
-    unsafe fn memset(&mut self, dst: u64, value: u8, bytes: usize) -> Result<(), GpuError>;
-
+/// What a submission on an owned stream, or into a recurring sequence's passes, enqueues: the operations of
+/// [`LaneEnqueue`] (a kernel body written once against that trait serves a shared lane's submission, an owned stream's
+/// and every pass of a recurring sequence), and the values it keeps alive for its work.
+pub trait Enqueue: LaneEnqueue {
     /// Keeps `value` alive until the next retirement armed on this stream is confirmed. Host buffers that a copy
-    /// reads belong here.
+    /// reads belong here. On a shared lane, which keeps none, the value goes to the caller\'s [`GraphHold`]
+    /// ([`Lane::submit_held`]).
     ///
     /// In a recording the value belongs to the graph. A recorded copy reads its host buffer again at every replay, so
     /// every pointer a recording names must stay valid for every replay until the graph drops, and a host buffer must
     /// be kept. Each replay hands the graph's values to its stream, which holds them until the next retirement armed
     /// after the replay is confirmed, so a replay in flight survives the graph dropping.
     fn keep(&mut self, value: Box<dyn Any + Send>);
+
+    /// As [`keep`](Self::keep), making the value only when it is kept. A recurring sequence\'s body runs in every pass,
+    /// but only a recording (and a direct run) keeps its values: an update pass drops them. A body that makes its value
+    /// here allocates it once, when it is recorded, and not at every replay.
+    fn keep_with<T: Any + Send>(&mut self, make: impl FnOnce() -> T)
+    where
+        Self: Sized,
+    {
+        self.keep(Box::new(make()));
+    }
 }
 
 /// A function of a loaded module.
@@ -460,6 +469,22 @@ pub trait Graph: Send + fmt::Debug {
     /// retirement armed on it after this call is confirmed: arm one per replay (or per batch of replays), or they
     /// are held until the stream drops. The graph may drop while its replays are in flight.
     fn replay(&mut self, stream: &mut <Self::Gpu as Gpu>::Stream) -> Result<(), GpuError>;
+
+    /// Replays the recording as one submission on a shared lane, through `&self` of the lane, with the arguments set by
+    /// the last update.
+    ///
+    /// The graph is still used by one thread at a time (`&mut self`): a key that several workers run at once has an
+    /// instance of its graph for each (see [`SharedGraphCache`](crate::SharedGraphCache)). The instance may be used again
+    /// (updated, replayed on any lane) as soon as this call returns: the driver snapshots the parameters at the launch and
+    /// orders a graph's launches, and an instance dropped while its launches are in flight is freed once they end.
+    ///
+    /// The values the recording keeps are not given to the lane, which keeps none: a handle to them is added to `hold`,
+    /// and the caller holds it until the work ended (in its quantum, released in `Stage::retired`).
+    fn replay_on(
+        &mut self,
+        lane: &<<Self::Gpu as Gpu>::Stream as Stream>::Lane,
+        hold: &mut GraphHold,
+    ) -> Result<(), GpuError>;
 }
 
 /// Told once that a retirement happened.

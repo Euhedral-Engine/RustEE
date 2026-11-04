@@ -2,11 +2,13 @@
 
 use std::any::Any;
 
-use crate::kept::{Frozen, freeze};
+use crate::hold::{Frozen, freeze};
 use crate::shape::{CopyKind, ShapeHasher};
-use crate::{Args, Enqueue, GpuError, Kernel, Launch};
+use euhedral_graph::Marker;
 
-use super::{FakeKernel, FakeStream, QOp};
+use crate::{Args, Enqueue, GpuError, GraphHold, Kernel, Lane, LaneEnqueue, Launch};
+
+use super::{FakeKernel, FakeQueue, FakeStream, QOp};
 
 /// An operation of a recording, replayed in recording order.
 #[derive(Clone, Debug)]
@@ -81,24 +83,65 @@ impl Recording {
     }
 }
 
-/// What a fake submission enqueues: onto a stream, into a recording, or both.
+/// Where an operation goes: an owned stream, or a shared lane.
 #[derive(Debug)]
-pub struct FakeEnqueue<'a> {
-    /// The stream the operations go to; none on a probe or an update.
-    pub(crate) target: Option<&'a mut FakeStream>,
-    /// The pass collecting them, and the sequence's index of the stream.
-    pub(crate) rec: Option<(&'a mut Recording, usize)>,
+pub(crate) enum Real<'a> {
+    Stream(&'a mut FakeStream),
+    Lane(&'a FakeQueue),
 }
 
-impl FakeEnqueue<'_> {
-    fn push(&self, op: QOp) {
-        if let Some(stream) = &self.target {
-            stream.push(op);
+impl Real<'_> {
+    pub(crate) fn reborrow(&mut self) -> Real<'_> {
+        match self {
+            Real::Stream(s) => Real::Stream(s),
+            Real::Lane(l) => Real::Lane(l),
+        }
+    }
+
+    pub(crate) fn push(&self, op: QOp) {
+        match self {
+            Real::Stream(s) => s.push(op),
+            Real::Lane(l) => l.push_op(op),
+        }
+    }
+
+    /// A marker after the work enqueued so far.
+    pub(crate) fn mark(&self) -> Result<Marker, GpuError> {
+        match self {
+            Real::Stream(s) => s.mark_now(),
+            Real::Lane(l) => Lane::mark(*l),
+        }
+    }
+
+    /// Later work waits for `marker`.
+    pub(crate) fn await_marker(&self, marker: Marker) -> Result<(), GpuError> {
+        match self {
+            Real::Stream(s) => s.await_now(marker),
+            Real::Lane(l) => l.await_now(marker),
         }
     }
 }
 
-impl Enqueue for FakeEnqueue<'_> {
+/// What a fake submission enqueues: onto a stream or a shared lane, into a recording, or both.
+#[derive(Debug)]
+pub struct FakeEnqueue<'a> {
+    /// Where the operations go; none on a probe or an update.
+    pub(crate) target: Option<Real<'a>>,
+    /// The pass collecting them, and the sequence's index of the stream.
+    pub(crate) rec: Option<(&'a mut Recording, usize)>,
+    /// Where the values a body keeps go when it runs directly on a shared lane, which keeps none.
+    pub(crate) hold: Option<&'a mut GraphHold>,
+}
+
+impl FakeEnqueue<'_> {
+    fn push(&self, op: QOp) {
+        if let Some(target) = &self.target {
+            target.push(op);
+        }
+    }
+}
+
+impl LaneEnqueue for FakeEnqueue<'_> {
     type Kernel = FakeKernel;
 
     unsafe fn launch(
@@ -204,16 +247,29 @@ impl Enqueue for FakeEnqueue<'_> {
         self.push(QOp::Memset { dst, value, bytes });
         Ok(())
     }
+}
+
+impl Enqueue for FakeEnqueue<'_> {
+    fn keep_with<T: Any + Send>(&mut self, make: impl FnOnce() -> T) {
+        if matches!(&self.rec, Some((rec, _)) if rec.mode != Mode::Record) {
+            return;
+        }
+        self.keep(Box::new(make()));
+    }
 
     fn keep(&mut self, value: Box<dyn Any + Send>) {
         match (&mut self.rec, &mut self.target) {
             // In a recording the value belongs to the graph.
             (Some((rec, _)), _) if rec.mode == Mode::Record => rec.kept.push(value),
             (Some(_), _) => drop(value),
-            (None, Some(stream)) => {
+            (None, Some(Real::Stream(stream))) => {
                 let seq = stream.retire.next_seq();
                 stream.kept.push(seq, value);
             }
+            (None, Some(Real::Lane(_))) => match &mut self.hold {
+                Some(hold) => hold.add_value(value),
+                None => drop(value),
+            },
             (None, None) => drop(value),
         }
     }

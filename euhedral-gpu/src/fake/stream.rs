@@ -285,8 +285,9 @@ impl Stream for FakeStream {
     ) -> Result<R, GpuError> {
         self.gpu.alive()?;
         f(&mut FakeEnqueue {
-            target: Some(self),
+            target: Some(super::enqueue::Real::Stream(self)),
             rec: None,
+            hold: None,
         })
     }
 

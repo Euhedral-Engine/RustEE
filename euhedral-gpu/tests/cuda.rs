@@ -37,7 +37,7 @@ mod streams {
     use super::*;
     use std::time::{Duration, Instant};
 
-    use euhedral_gpu::{Enqueue, Gpu, GpuError, Stream, StreamOptions};
+    use euhedral_gpu::{Enqueue, Gpu, GpuError, LaneEnqueue, Stream, StreamOptions};
     use euhedral_graph::{LaneId, LanePool, Marker};
     use euhedral_memory::cuda::{DeviceMemory, PinnedHost};
     use euhedral_memory::{Backend, LocationId};
@@ -536,7 +536,7 @@ mod launches {
 
     use euhedral_gpu::cuda::{CudaModule, Nvrtc};
     use euhedral_gpu::{
-        Args, CompileOptions, Enqueue, Gpu, GpuError, Launch, Module, Stream, StreamOptions,
+        Args, CompileOptions, Gpu, GpuError, LaneEnqueue, Launch, Module, Stream, StreamOptions,
     };
     use euhedral_memory::cuda::PinnedHost;
     use euhedral_memory::{Backend, LocationId};
@@ -652,8 +652,8 @@ mod markers {
 
     use euhedral_gpu::cuda::CudaModule;
     use euhedral_gpu::{
-        Args, CompileOptions, Enqueue, Gpu, Launch, Module, RetireListener, RetireTicket, Stream,
-        StreamOptions,
+        Args, CompileOptions, Gpu, LaneEnqueue, Launch, Module, RetireListener, RetireTicket,
+        Stream, StreamOptions,
     };
     use euhedral_memory::cuda::PinnedHost;
     use euhedral_memory::{Backend, LocationId};

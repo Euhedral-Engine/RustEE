@@ -23,7 +23,8 @@ Asynchronous, backend-neutral GPU access for the RustEE control plane. A lattice
 | [`lanes`](src/lanes.rs) | `LaneSubmit` for the backends' streams, and `open_lane_sources`: a device's lanes as a pool, its intakes and a `LaneSource` per lane (`LaneSpec`, `OpenedLanes`); `open_shared_lanes`: a device's lanes as a typed pool that any worker submits to (`SharedLanes`). |
 | [`ring`](src/ring.rs) | The lock-free marker ring behind a lane's markers: numbers claimed by compare-and-set, completion found by an in-order scan, the awaiters' pins. No driver; loom-checked. |
 | [`cuda::texture`](src/cuda/texture.rs) | `TexObject`, `View`: texture objects over pitched device memory (filter, address and coordinate modes). |
-| [`graph_cache`](src/graph_cache.rs) | `GraphCache`: a lane's graphs by key (a hit updates and replays, a miss records, a warm-up only records), `GraphBody`, `Ran`. |
+| [`graph_cache`](src/graph_cache.rs) | `GraphCache`: an owned lane's graphs by key (a hit updates and replays, a miss records, a warm-up only records), `SharedGraphCache`: the same through a shared lane for any number of workers (instances by key), `GraphBody`, `Ran`. |
+| [`hold`](src/hold.rs) | `GraphHold`: what the work of a run on a shared lane reads, held by the caller until the work ended. |
 | [`args`](src/args.rs) | `KernelArg`, `Args` (the typed argument builder, rewritable in place), `Launch`, `Dim3`. |
 | [`error`](src/error.rs) | `GpuError`, the one error type. |
 | [`poison`](src/poison.rs) | `Poison`: a device's first fault, set once. |
@@ -179,7 +180,7 @@ use std::sync::{Arc, Mutex};
 use euhedral_core::generics::LatticeSource;
 use euhedral_gpu::fake::{FakeGpu, FakeModule};
 use euhedral_gpu::{
-    Args, CompileOptions, Enqueue, Gpu, Launch, Module, OnceFrame, Stream, StreamOptions, retire_into,
+    Args, CompileOptions, Enqueue, LaneEnqueue, Gpu, Launch, Module, OnceFrame, Stream, StreamOptions, retire_into,
 };
 use euhedral_graph::Completions;
 
@@ -262,7 +263,7 @@ next mark.
 use std::convert::Infallible;
 
 use euhedral_gpu::fake::{FakeGpu, FakeStream};
-use euhedral_gpu::{Enqueue, GpuError, LaneSpec, Stream, StreamOptions, open_lane_sources};
+use euhedral_gpu::{Enqueue, LaneEnqueue, GpuError, LaneSpec, Stream, StreamOptions, open_lane_sources};
 use euhedral_graph::{Deliver, LaneCx, LaneId, LaneWork, Marker, Outcome};
 
 /// An item that sets a device word on its lane.

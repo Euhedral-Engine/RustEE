@@ -5,12 +5,12 @@ use std::ffi::c_void;
 
 use euhedral_memory::cuda::CuStream;
 
-use crate::kept::{Frozen, freeze};
+use crate::hold::{Frozen, freeze};
 use crate::shape::{CopyKind, ShapeHasher};
-use crate::{Args, Enqueue, GpuError, Kernel, Launch, MAX_ARGS};
+use crate::{Args, Enqueue, GpuError, GraphHold, Kernel, LaneEnqueue, Launch, MAX_ARGS};
 
 use super::fns::{CAPTURE_STATUS_ACTIVE, CaptureInfo, CuGraph, CuGraphNode};
-use super::{CudaGpu, CudaKernel, CudaStream};
+use super::{CudaGpu, CudaKernel, CudaQueue, CudaStream};
 
 /// Which pass a sequence is running.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,10 +83,33 @@ impl Recording {
     }
 }
 
-/// The stream an operation goes to, and the shadow that captures it while recording.
+/// Where an operation goes: an owned stream, or a shared lane.
+#[derive(Debug)]
+pub(crate) enum Dest<'a> {
+    Stream(&'a mut CudaStream),
+    Lane(&'a CudaQueue),
+}
+
+impl Dest<'_> {
+    pub(crate) fn raw(&self) -> CuStream {
+        match self {
+            Dest::Stream(s) => s.raw,
+            Dest::Lane(l) => l.raw,
+        }
+    }
+
+    pub(crate) fn reborrow(&mut self) -> Dest<'_> {
+        match self {
+            Dest::Stream(s) => Dest::Stream(s),
+            Dest::Lane(l) => Dest::Lane(l),
+        }
+    }
+}
+
+/// The stream or lane an operation goes to, and the shadow that captures it while recording.
 #[derive(Debug)]
 pub(crate) struct Target<'a> {
-    pub(crate) stream: &'a mut CudaStream,
+    pub(crate) dest: Dest<'a>,
     pub(crate) shadow: Option<CuStream>,
 }
 
@@ -97,6 +120,8 @@ pub struct CudaEnqueue<'a> {
     pub(crate) target: Option<Target<'a>>,
     /// The pass collecting the operations, and the sequence's index of the stream.
     pub(crate) rec: Option<(&'a mut Recording, usize)>,
+    /// Where the values a body keeps go when it runs directly on a shared lane, which keeps none.
+    pub(crate) hold: Option<&'a mut GraphHold>,
 }
 
 impl<'a> CudaEnqueue<'a> {
@@ -104,10 +129,24 @@ impl<'a> CudaEnqueue<'a> {
         Self {
             gpu,
             target: Some(Target {
-                stream,
+                dest: Dest::Stream(stream),
                 shadow: None,
             }),
             rec: None,
+            hold: None,
+        }
+    }
+
+    /// A direct run on a shared lane: what the body keeps goes to `hold`.
+    pub(crate) fn on_lane(gpu: &'a CudaGpu, lane: &'a CudaQueue, hold: &'a mut GraphHold) -> Self {
+        Self {
+            gpu,
+            target: Some(Target {
+                dest: Dest::Lane(lane),
+                shadow: None,
+            }),
+            rec: None,
+            hold: Some(hold),
         }
     }
 
@@ -117,7 +156,7 @@ impl<'a> CudaEnqueue<'a> {
         let Some(target) = &self.target else {
             return Ok(());
         };
-        self.gpu.check(call, op(target.stream.raw))?;
+        self.gpu.check(call, op(target.dest.raw()))?;
         if let (Some(shadow), Some((rec, _))) = (target.shadow, &mut self.rec)
             && rec.failed.is_none()
             && let Err(e) = self.gpu.check(call, op(shadow))
@@ -170,7 +209,7 @@ impl<'a> CudaEnqueue<'a> {
     }
 }
 
-impl Enqueue for CudaEnqueue<'_> {
+impl LaneEnqueue for CudaEnqueue<'_> {
     type Kernel = CudaKernel;
 
     unsafe fn launch(
@@ -308,16 +347,41 @@ impl Enqueue for CudaEnqueue<'_> {
         // SAFETY: as above.
         self.run("cuMemsetD8Async", |s| unsafe { f(dst, value, bytes, s) })
     }
+}
+
+impl Enqueue for CudaEnqueue<'_> {
+    fn keep_with<T: Any + Send>(&mut self, make: impl FnOnce() -> T) {
+        if matches!(&self.rec, Some((rec, _)) if rec.mode != Mode::Record) {
+            return;
+        }
+        self.keep(Box::new(make()));
+    }
 
     fn keep(&mut self, value: Box<dyn Any + Send>) {
         match (&mut self.rec, &mut self.target) {
             // In a recording the value belongs to the graph.
             (Some((rec, _)), _) if rec.mode == Mode::Record => rec.kept.push(value),
             (Some(_), _) => drop(value),
-            (None, Some(target)) => {
-                let seq = target.stream.retire.next_seq();
-                target.stream.kept.push(seq, value);
+            (
+                None,
+                Some(Target {
+                    dest: Dest::Stream(stream),
+                    ..
+                }),
+            ) => {
+                let seq = stream.retire.next_seq();
+                stream.kept.push(seq, value);
             }
+            (
+                None,
+                Some(Target {
+                    dest: Dest::Lane(_),
+                    ..
+                }),
+            ) => match &mut self.hold {
+                Some(hold) => hold.add_value(value),
+                None => drop(value),
+            },
             (None, None) => drop(value),
         }
     }

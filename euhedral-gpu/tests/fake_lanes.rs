@@ -11,7 +11,7 @@ use common::{HostWord, Item, Plan, Probe, collect_all, lock, pump, pump_from};
 use euhedral_core::generics::LatticeSource as _;
 use euhedral_gpu::fake::{FAKE_GREATEST_PRIORITY, FakeGpu, FakeModule, FakeOp, FakeStream};
 use euhedral_gpu::{
-    Args, CompileOptions, Enqueue, Gpu, GpuError, LaneSpec, Module, Stream, StreamOptions,
+    Args, CompileOptions, Gpu, GpuError, LaneEnqueue, LaneSpec, Module, Stream, StreamOptions,
     StreamPriority, open_lane_sources,
 };
 use euhedral_graph::testing::FakeLanes;

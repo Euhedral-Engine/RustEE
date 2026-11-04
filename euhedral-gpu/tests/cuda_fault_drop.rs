@@ -10,7 +10,7 @@
 use std::time::Duration;
 
 use euhedral_gpu::cuda::{CudaGpu, CudaModule, leaked_shared_sides};
-use euhedral_gpu::{Args, CompileOptions, Enqueue, Gpu, Launch, Module, Stream, StreamOptions};
+use euhedral_gpu::{Args, CompileOptions, Gpu, LaneEnqueue, Launch, Module, Stream, StreamOptions};
 
 const OPS: &str = include_str!("kernels/ops.cu");
 const OPS_PTX: &[u8] = include_bytes!("kernels/ops.ptx");
