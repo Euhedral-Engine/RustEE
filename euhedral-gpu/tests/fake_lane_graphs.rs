@@ -450,9 +450,10 @@ fn a_body_is_lent_the_raw_stream_only_when_it_runs_directly() {
     let cache = SharedGraphCache::<FakeGpu, u32>::new();
     let mut hold = GraphHold::new();
     let mut body = Asks(seen.clone());
+    cache.run(&gpu, &lane, 1, &mut body, &mut hold).unwrap(); // first sighting: direct
     cache.run(&gpu, &lane, 1, &mut body, &mut hold).unwrap(); // records
     cache.run(&gpu, &lane, 1, &mut body, &mut hold).unwrap(); // updates
     cache.set_enabled(false);
     cache.run(&gpu, &lane, 1, &mut body, &mut hold).unwrap(); // direct
-    assert_eq!(*lock(&seen), [false, false, true]);
+    assert_eq!(*lock(&seen), [true, false, false, true]);
 }
