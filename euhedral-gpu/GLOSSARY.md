@@ -41,6 +41,10 @@ parameters; the fingerprint is 128 bits of it. A changed shape is `GpuError::Sha
 **shadow stream** ([`CudaSequence`](src/cuda/graph.rs)): the stream a recording captures a stream's work
 on, so the real stream is never in capture mode and a failed capture never disturbs the work.
 
+**shared graph cache, instance, graph hold** ([`SharedGraphCache`](src/graph_cache.rs), [`instances`](src/instances.rs), [`GraphHold`](src/hold.rs)): the graph cache of shared lanes. A recorded graph is used by one thread at a time, so a key that several workers run at once has several instances, in a fixed table of slots whose one atomic word says empty, free or busy: a worker takes a free instance of its key by one compare-and-set, and one that finds none records an instance of its own (it never waits). The instance goes back once the replay is enqueued; the recording's host buffers go to the caller's `GraphHold`, which the stage drops in `Stage::retired`, after the device work ended. Capacity counts instances, and a full table evicts the least recently used free one; a key is recorded on its second sighting.
+
+**private stream, fork** ([`cuda::stream`](src/cuda/stream.rs), [`handles`](src/handles.rs)): a replay on a shared CUDA lane never launches on the lane: with several threads submitting to one stream a `cuGraphLaunch` can overtake the `cuStreamWaitEvent` its own thread issued just before it (driver 615.71.09, CUDA 13.4). The worker takes a stream of its own from the lane's lock-free stock, forks it from the lane (an event recorded on the lane, awaited by the private stream), makes the cross-lane waits and the launch there, and joins the lane back (an event recorded on the private stream, awaited by the lane); the marker follows the join. The same streams are the shadow streams a recording captures on.
+
 **graph cache** ([`GraphCache`](src/graph_cache.rs)): a lane's recorded graphs by key. A hit runs the body
 as an update pass and replays the graph; a miss runs the body for real once and records it; a body whose
 shape no longer matches is run for real and recorded again, in place when the driver can. `warm` records a

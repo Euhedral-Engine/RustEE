@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use euhedral_gpu::cuda::texture::{Address, Filter, Format, TexObject, View, alignments};
 use euhedral_gpu::cuda::{CudaGpu, CudaModule};
-use euhedral_gpu::{Args, CompileOptions, Enqueue, Gpu, Launch, Module, Stream, StreamOptions};
+use euhedral_gpu::{Args, CompileOptions, Gpu, LaneEnqueue, Launch, Module, Stream, StreamOptions};
 use euhedral_memory::cuda::DeviceMemory;
 use euhedral_memory::{Backend, LocationId};
 

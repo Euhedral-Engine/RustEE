@@ -21,7 +21,7 @@ mod common;
 use std::time::Duration;
 
 use common::cuda_support::{gpu, module, wait_until};
-use euhedral_gpu::{Args, Enqueue, Gpu, GpuError, Launch, Module, Stream, StreamOptions};
+use euhedral_gpu::{Args, Gpu, GpuError, LaneEnqueue, Launch, Module, Stream, StreamOptions};
 
 /// Cycles of the `spin` kernel for about `ms` milliseconds.
 fn cycles(ms: u64) -> u64 {

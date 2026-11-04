@@ -10,7 +10,7 @@
 //! | [`Lane`], [`open_shared_lanes`], [`SharedLanes`] | `api`, `lanes` | a lane that any worker submits to through `&self`, and a device's lanes as a typed pool of them |
 //! | [`Module`], [`Kernel`], [`Args`] | `api`, `args` | code loaded at run time and its typed arguments |
 //! | [`Sequence`], [`Graph`] | `api` | a recurring sequence of submissions, recorded once and replayed |
-//! | [`GraphCache`] | `graph_cache` | a lane's graphs by key: a hit updates and replays, a miss records |
+//! | [`GraphCache`], [`SharedGraphCache`], [`GraphHold`] | `graph_cache`, `hold` | graphs by key: a hit updates and replays, a miss records; on shared lanes, instances per key for any number of workers, and the values the work reads held by the caller |
 //! | [`open_lane_sources`], [`LaneSpec`] | `lanes` | a device's streams as lane sources: a pool, its intakes and a `LaneSource` per lane |
 //! | [`retire_into`], [`RetireListener`] | `retire`, `api` | retirement: the callback queues, the owner drains and dispatches, and it continues as a frame |
 //! | [`ModuleCache`] | `module_cache` | compiled modules keyed by a content hash |
@@ -36,6 +36,9 @@ mod error;
 #[cfg(feature = "fake")]
 pub mod fake;
 mod graph_cache;
+mod handles;
+mod hold;
+mod instances;
 #[cfg(any(feature = "fake", feature = "cuda"))]
 mod kept;
 mod lanes;
@@ -48,12 +51,14 @@ mod spans;
 mod sync;
 
 pub use api::{
-    CompileOptions, Enqueue, Gpu, Graph, Kernel, Lane, LaneEnqueue, Lanes, Module, POISONED_STATUS,
-    Rerecorded, RetireListener, RetireTicket, Sequence, Stream, StreamOptions, StreamPriority,
+    CompileOptions, Enqueue, Gpu, Graph, Kernel, Lane, LaneEnqueue, LaneStream, Lanes, Module,
+    POISONED_STATUS, RawStream, Rerecorded, RetireListener, RetireTicket, Sequence, Stream,
+    StreamOptions, StreamPriority,
 };
 pub use args::{ArgMismatch, Args, Dim3, KernelArg, Launch, MAX_ARGS};
 pub use error::GpuError;
-pub use graph_cache::{DEFAULT_GRAPHS, GraphBody, GraphCache, GraphStats, Ran};
+pub use graph_cache::{DEFAULT_GRAPHS, GraphBody, GraphCache, GraphStats, Ran, SharedGraphCache};
+pub use hold::GraphHold;
 pub use lanes::{LaneSpec, OpenedLanes, SharedLanes, open_lane_sources, open_shared_lanes};
 pub use module_cache::{CacheKey, KeyMaterial, ModuleCache, cache_key};
 pub use poison::Poison;

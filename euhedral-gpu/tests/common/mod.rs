@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use euhedral_core::frames::{Failure, Frame, FrameHeader};
 use euhedral_core::generics::{LatticeReceiver, LatticeSource, LatticeTerminal};
-use euhedral_gpu::{Args, Enqueue, Gpu, GpuError, Launch, Stream};
+use euhedral_gpu::{Args, Gpu, GpuError, LaneEnqueue, Launch, Stream};
 use euhedral_graph::{Deliver, LaneCx, LaneSource, LaneSubmit, LaneWork, Marker, Outcome};
 
 pub fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {

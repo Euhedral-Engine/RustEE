@@ -35,12 +35,14 @@ use euhedral_graph::{LaneId, QueueId, RetireCell};
 use crate::retire::RetireSink;
 
 use crate::{
-    Args, Fingerprint, Gpu, GpuError, Kernel, Launch, POISONED_STATUS, Poison, Rerecorded,
-    StreamOptions, StreamPriority,
+    Args, Fingerprint, Gpu, GpuError, GraphHold, Kernel, Launch, POISONED_STATUS, Poison,
+    Rerecorded, StreamOptions, StreamPriority,
 };
 
 pub use enqueue::FakeEnqueue;
+use enqueue::Real;
 pub use graph::{FakeGraph, FakeSequence};
+pub use lane::{FakeLaneEnqueue, FakeRawStream};
 pub use module::{FakeKernel, FakeModule};
 use stream::Placement;
 pub use stream::{FakeQueue, FakeStream};
@@ -242,6 +244,8 @@ pub struct FakeGpu {
     pub(crate) state: Mutex<State>,
     pub(crate) poison: Poison,
     kernels: Mutex<HashMap<String, FakeKernelFn>>,
+    /// A test hook: how the next recording fails (0: it does not; 1: after its work ran; 2: before the body ran).
+    fail_recording: std::sync::atomic::AtomicU8,
 }
 
 impl fmt::Debug for FakeGpu {
@@ -261,7 +265,22 @@ impl FakeGpu {
             }),
             poison: Poison::new(),
             kernels: Mutex::new(HashMap::new()),
+            fail_recording: std::sync::atomic::AtomicU8::new(0),
         })
+    }
+
+    /// A test hook: the next recording ends with `Err(Capture)`, as a capture the driver refused does; the work it ran
+    /// for real is unaffected.
+    pub fn fail_next_recording(&self) {
+        self.fail_recording
+            .store(1, std::sync::atomic::Ordering::Release);
+    }
+
+    /// A test hook: the next recording fails before its body ran, as a capture that cannot start does (the unit has not
+    /// run).
+    pub fn fail_next_recording_before_the_body(&self) {
+        self.fail_recording
+            .store(2, std::sync::atomic::Ordering::Release);
     }
 
     pub(crate) fn lock(&self) -> MutexGuard<'_, State> {
@@ -632,7 +651,35 @@ impl Gpu for FakeGpu {
     where
         F: FnOnce(&mut FakeSequence<'_>) -> Result<(), GpuError>,
     {
-        self.record_graph(streams, f)
+        let real = streams.iter_mut().map(|s| Real::Stream(s)).collect();
+        self.record_graph(real, None, f)
+    }
+
+    fn record_on<F>(
+        &self,
+        lanes: &[&FakeQueue],
+        hold: &mut GraphHold,
+        f: F,
+    ) -> Result<FakeGraph, GpuError>
+    where
+        F: FnOnce(&mut FakeSequence<'_>) -> Result<(), GpuError>,
+    {
+        let real = lanes.iter().map(|l| Real::Lane(l)).collect();
+        self.record_graph(real, Some(hold), f)
+    }
+
+    fn rerecord_on<F>(
+        &self,
+        graph: &mut FakeGraph,
+        lanes: &[&FakeQueue],
+        hold: &mut GraphHold,
+        f: F,
+    ) -> Result<Rerecorded, GpuError>
+    where
+        F: FnOnce(&mut FakeSequence<'_>) -> Result<(), GpuError>,
+    {
+        let real = lanes.iter().map(|l| Real::Lane(l)).collect();
+        self.rerecord_graph(graph, real, Some(hold), f)
     }
 
     fn rerecord<F>(
@@ -644,7 +691,8 @@ impl Gpu for FakeGpu {
     where
         F: FnOnce(&mut FakeSequence<'_>) -> Result<(), GpuError>,
     {
-        self.rerecord_graph(graph, streams, f)
+        let real = streams.iter_mut().map(|s| Real::Stream(s)).collect();
+        self.rerecord_graph(graph, real, None, f)
     }
 
     fn fingerprint<F>(&self, streams: usize, f: F) -> Result<Fingerprint, GpuError>

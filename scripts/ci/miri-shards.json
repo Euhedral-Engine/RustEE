@@ -136,6 +136,20 @@
   ]
  },
  {
+  "name": "gpu: graph instances and holds",
+  "crate": "euhedral-gpu",
+  "commands": [
+   "cargo +nightly miri test -p euhedral-gpu --features fake --lib -- instances::tests handles::tests hold::tests graph_cache::shared_tests"
+  ]
+ },
+ {
+  "name": "gpu: shared lane graphs",
+  "crate": "euhedral-gpu",
+  "commands": [
+   "cargo +nightly miri test -p euhedral-gpu --features fake --test fake_lane_graphs"
+  ]
+ },
+ {
   "name": "gpu: shared fake lanes",
   "crate": "euhedral-gpu",
   "commands": [
@@ -143,10 +157,31 @@
   ]
  },
  {
+  "name": "graph: stage gates",
+  "crate": "euhedral-graph",
+  "commands": [
+   "cargo +nightly miri test -p euhedral-graph --lib -- stage_graph::tests::a_stage_held_at_its_gate stage_graph::tests::gates_released stage_graph::tests::a_gate_ stage_graph::tests::a_stage_held_with_no_gate stage_graph::tests::a_pass_gate_that_panics_after stage_graph::tests::a_stage_released_into stage_graph::tests::an_ordered_stage_released"
+  ]
+ },
+ {
+  "name": "graph: abandoned hooks",
+  "crate": "euhedral-graph",
+  "commands": [
+   "cargo +nightly miri test -p euhedral-graph --lib -- stage_graph::tests::a_stage_is_abandoned_after stage_graph::tests::every_stage_that_never_submitted stage_graph::tests::a_killed_quantum_that_used_no_lane stage_graph::tests::a_quantum_that_used_no_lane stage_graph::tests::a_later_quantum_on_an_abandoned stage_graph::tests::a_refused_retirement_for_the_hooks"
+  ]
+ },
+ {
   "name": "graph: stage graph, device control",
   "crate": "euhedral-graph",
   "commands": [
-   "cargo +nightly miri test -p euhedral-graph --lib -- stage_graph::tests::a_quantum_joins stage_graph::tests::a_device_failure stage_graph::tests::a_hook_runs stage_graph::tests::a_quantum_that_ran_nothing stage_graph::tests::a_refused_retirement stage_graph::tests::a_completion_edge_waits lanes::tests::a_fixed lanes::tests::a_reserved"
+   "cargo +nightly miri test -p euhedral-graph --lib -- stage_graph::tests::a_quantum_joins stage_graph::tests::a_device_failure stage_graph::tests::a_hook_runs stage_graph::tests::a_quantum_that_ran_nothing stage_graph::tests::a_refused_retirement"
+  ]
+ },
+ {
+  "name": "graph: completion edges, placement",
+  "crate": "euhedral-graph",
+  "commands": [
+   "cargo +nightly miri test -p euhedral-graph --lib -- stage_graph::tests::a_completion_edge_waits lanes::tests::a_fixed lanes::tests::a_reserved"
   ]
  },
  {

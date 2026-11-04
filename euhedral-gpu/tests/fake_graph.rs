@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use euhedral_gpu::fake::{FakeGpu, FakeKernel, FakeModule, FakeStream};
 use euhedral_gpu::{
-    Args, CompileOptions, Enqueue, Gpu, GpuError, Graph, Launch, Module, Rerecorded, Sequence,
-    Stream, StreamOptions,
+    Args, CompileOptions, Enqueue, Gpu, GpuError, Graph, LaneEnqueue, Launch, Module, Rerecorded,
+    Sequence, Stream, StreamOptions,
 };
 
 const WORDS: usize = 8;

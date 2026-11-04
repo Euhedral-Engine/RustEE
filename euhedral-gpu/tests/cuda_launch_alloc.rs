@@ -13,7 +13,8 @@ use std::time::{Duration, Instant};
 
 use euhedral_gpu::cuda::{CudaGpu, CudaModule};
 use euhedral_gpu::{
-    Args, Enqueue, Gpu, GpuError, Graph, Launch, Module, Sequence, Stream, StreamOptions,
+    Args, Enqueue, Gpu, GpuError, Graph, LaneEnqueue, Launch, Module, Sequence, Stream,
+    StreamOptions,
 };
 
 static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);

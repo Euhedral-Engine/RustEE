@@ -1,38 +1,10 @@
-//! Values held until a retirement is confirmed, and the values a recording keeps.
+//! Values an owned submitter holds until a retirement is confirmed.
 //!
-//! Nothing here is shared mutably. A submitter owns its [`Kept`] list and changes it through `&mut self`. A recording
-//! collects its values in a `Vec` while it runs, then freezes them into an immutable [`Frozen`] that the graph and the
-//! streams the recording ran on share by `Arc`.
-
-use std::any::Any;
-use std::sync::Arc;
+//! Nothing here is shared mutably. A submitter owns its [`Kept`] list and changes it through `&mut self`. (The values a
+//! recording keeps are in [`hold`](crate::hold).)
 
 use euhedral_data_structures::queues::PlainQueue;
-
-/// A kept value, shared only to be dropped. It is never read, so sharing it between threads cannot race: whichever
-/// thread holds the last handle drops it, which a `Send` value permits.
-pub(crate) struct Held(#[allow(dead_code, reason = "held to be dropped")] Box<dyn Any + Send>);
-
-// SAFETY: a `Held` is never accessed, only dropped, and the value inside is `Send`.
-unsafe impl Sync for Held {}
-
-impl std::fmt::Debug for Held {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Held")
-    }
-}
-
-/// The values a recording keeps, frozen: shared by the recording's own run, its graph and every replay. Each holds a
-/// handle through the streams it ran on, so the buffers live until the last of them retired.
-pub(crate) type Frozen = Option<Arc<[Held]>>;
-
-/// Freezes the values a recording collected: `None` for none, which allocates nothing.
-pub(crate) fn freeze(values: Vec<Box<dyn Any + Send>>) -> Frozen {
-    if values.is_empty() {
-        return None;
-    }
-    Some(values.into_iter().map(Held).collect())
-}
+use std::any::Any;
 
 /// Values held until a retirement is confirmed: `(retirement seq, value)`, released in order. Owned by one submitter:
 /// a `PlainQueue`, the single-owner FIFO of `euhedral-data-structures`, which needs no synchronisation.
@@ -80,6 +52,8 @@ impl Kept {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
 
     #[test]
@@ -100,20 +74,5 @@ mod tests {
         );
         kept.clear();
         assert_eq!(Arc::strong_count(&c), 1);
-    }
-
-    #[test]
-    fn frozen_values_live_until_the_last_handle_drops() {
-        let token = Arc::new(());
-        let frozen = freeze(vec![Box::new(token.clone())]);
-        assert!(
-            freeze(Vec::new()).is_none(),
-            "nothing kept, nothing allocated"
-        );
-        let second = frozen.clone();
-        drop(frozen);
-        assert_eq!(Arc::strong_count(&token), 2);
-        drop(second);
-        assert_eq!(Arc::strong_count(&token), 1);
     }
 }

@@ -17,7 +17,7 @@ use euhedral_core::frames::RunnableFrame;
 use euhedral_core::generics::LatticeSource;
 use euhedral_gpu::cuda::{CudaGpu, CudaModule};
 use euhedral_gpu::{
-    Args, CompileOptions, Enqueue, Gpu, GpuError, Launch, Module, RetireListener, RetireTicket,
+    Args, CompileOptions, Gpu, GpuError, LaneEnqueue, Launch, Module, RetireListener, RetireTicket,
     Stream, StreamOptions, retire_into,
 };
 use euhedral_graph::Completions;

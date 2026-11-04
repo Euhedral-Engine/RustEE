@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 
 use euhedral_gpu::cuda::{CudaGpu, CudaKernel, CudaModule, CudaStream};
 use euhedral_gpu::{
-    Args, CompileOptions, Enqueue, Gpu, GpuError, Graph, Launch, Module, Rerecorded, Sequence,
-    Stream, StreamOptions,
+    Args, CompileOptions, Enqueue, Gpu, GpuError, Graph, LaneEnqueue, Launch, Module, Rerecorded,
+    Sequence, Stream, StreamOptions,
 };
 use euhedral_graph::{LanePool, Marker};
 use euhedral_memory::cuda::{DeviceMemory, PinnedHost};

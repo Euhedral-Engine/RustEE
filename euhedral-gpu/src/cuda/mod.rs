@@ -31,7 +31,7 @@ use euhedral_graph::LaneId;
 
 use enqueue::Mode;
 
-use crate::{Fingerprint, Gpu, GpuError, Poison, Rerecorded, StreamOptions};
+use crate::{Fingerprint, Gpu, GpuError, GraphHold, Poison, Rerecorded, StreamOptions};
 
 use fns::{ATTR_CC_MAJOR, ATTR_CC_MINOR, GpuFns};
 
@@ -221,8 +221,47 @@ impl Gpu for CudaGpu {
             .gpu
             .clone();
         let count = streams.len();
-        let (rec, graph) = gpu.capture(streams, f)?;
+        let dests = streams
+            .iter_mut()
+            .map(|s| enqueue::Dest::Stream(s))
+            .collect();
+        let (rec, graph) = gpu.capture(dests, None, f)?;
         gpu.instantiate(rec, graph, count)
+    }
+
+    fn record_on<F>(
+        &self,
+        lanes: &[&CudaQueue],
+        hold: &mut GraphHold,
+        f: F,
+    ) -> Result<CudaGraph, GpuError>
+    where
+        F: FnOnce(&mut CudaSequence<'_>) -> Result<(), GpuError>,
+    {
+        let gpu = lanes
+            .first()
+            .ok_or_else(|| GpuError::Invalid("a recording needs a lane".into()))?
+            .gpu
+            .clone();
+        let dests = lanes.iter().map(|l| enqueue::Dest::Lane(l)).collect();
+        let (rec, graph) = gpu.capture(dests, Some(hold), f)?;
+        gpu.instantiate(rec, graph, lanes.len())
+    }
+
+    fn rerecord_on<F>(
+        &self,
+        graph: &mut CudaGraph,
+        lanes: &[&CudaQueue],
+        hold: &mut GraphHold,
+        f: F,
+    ) -> Result<Rerecorded, GpuError>
+    where
+        F: FnOnce(&mut CudaSequence<'_>) -> Result<(), GpuError>,
+    {
+        let gpu = graph.gpu().clone();
+        let dests = lanes.iter().map(|l| enqueue::Dest::Lane(l)).collect();
+        let (rec, new) = gpu.capture(dests, Some(hold), f)?;
+        graph.replace(rec, new, lanes.len())
     }
 
     fn rerecord<F>(
@@ -236,7 +275,11 @@ impl Gpu for CudaGpu {
     {
         let gpu = graph.gpu().clone();
         let count = streams.len();
-        let (rec, new) = gpu.capture(streams, f)?;
+        let dests = streams
+            .iter_mut()
+            .map(|s| enqueue::Dest::Stream(s))
+            .collect();
+        let (rec, new) = gpu.capture(dests, None, f)?;
         graph.replace(rec, new, count)
     }
 

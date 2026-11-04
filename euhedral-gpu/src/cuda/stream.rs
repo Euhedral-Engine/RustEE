@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use euhedral_graph::{DeviceQueue, LaneControl, LaneId, Marker, QueueId};
 use euhedral_memory::cuda::{CuEvent, CuStream, Device, STREAM_NON_BLOCKING};
 
+use crate::handles::HandlePool;
 use crate::kept::Kept;
 use crate::retire::{RetireSink, Retirements};
 use crate::spans::{Span, SpanBook};
@@ -170,7 +171,35 @@ pub struct CudaQueue {
     /// complete (the context is lost, or the wait fails) and retirements are still outstanding, the drop leaks one
     /// reference to this shared side, so the sink is never freed under a callback that is still to run.
     sink: RetireSink,
+    /// The private streams of this lane, stocked: a worker takes one to replay a graph or to capture on, uses it alone,
+    /// and gives it back (see [`Fork`]).
+    forks: HandlePool,
+    /// How many private streams were ever made (a test asks: after warm-up none is made, whatever the contention).
+    forks_made: std::sync::atomic::AtomicUsize,
 }
+
+/// The private streams a lane keeps stocked. A stream beyond them (more exist than slots: more workers replaying at once
+/// than this) goes to an overflow list and is destroyed with the lane, never on the thread that gave it back.
+const FORKS_STOCKED: usize = 256;
+
+/// A private stream of a lane, with the two events that fork it from the lane and join it back.
+///
+/// Several threads submitting to one stream let a `cuGraphLaunch` overtake the `cuStreamWaitEvent` its own thread issued
+/// just before it (seen with driver 615.71.09 on CUDA 13.4: a graph's work then runs before what it waited for; plain
+/// launches, a single submitter per stream, and a wait and launch locked together do not do it). So a replay never launches
+/// on the lane: its worker forks a stream of its own from the lane (an event recorded on the lane, awaited by the private
+/// stream), does its cross-lane waits and the launch there, and joins the lane back (an event recorded on the private
+/// stream, awaited by the lane); the marker is recorded on the lane after the join. One stream is used by one worker at a
+/// time, so each launches alone on its stream. The same streams are the shadow streams a recording captures on.
+#[derive(Debug)]
+pub(crate) struct Fork {
+    pub(crate) stream: CuStream,
+    pub(crate) fork: CuEvent,
+    pub(crate) join: CuEvent,
+}
+
+// SAFETY: driver handles of the primary context, used by one thread at a time (taken from the stock, given back).
+unsafe impl Send for Fork {}
 
 // SAFETY: the stream handle belongs to the primary context and is usable from any thread with it current; everything
 // else is atomics, immutable, or reached through a claim.
@@ -181,6 +210,68 @@ unsafe impl Sync for CudaQueue {}
 impl CudaQueue {
     pub(crate) fn sink(&self) -> &RetireSink {
         &self.sink
+    }
+
+    /// A private stream of this lane: one of the stock, else a new one. The context is current. Give it back with
+    /// [`give_fork`](Self::give_fork).
+    pub(crate) fn take_fork(&self) -> Result<Box<Fork>, GpuError> {
+        if let Some(handle) = self.forks.take() {
+            // SAFETY: the handle was made by `Box::into_raw` below and is held by no one else once taken.
+            return Ok(unsafe { Box::from_raw(handle as *mut Fork) });
+        }
+        let f = &self.gpu.device().driver.fns;
+        let mut stream: CuStream = std::ptr::null_mut();
+        // SAFETY: an out pointer; the context is current.
+        self.gpu.check("cuStreamCreate", unsafe {
+            (f.stream_create)(&mut stream, STREAM_NON_BLOCKING)
+        })?;
+        let mut events: [CuEvent; 2] = [std::ptr::null_mut(); 2];
+        for at in 0..2 {
+            // SAFETY: an out pointer; the context is current. `2` is `CU_EVENT_DISABLE_TIMING`.
+            let made = self.gpu.check("cuEventCreate", unsafe {
+                (f.event_create)(&mut events[at], 2)
+            });
+            if let Err(e) = made {
+                // SAFETY: handles made above, unused.
+                unsafe {
+                    for event in &events[..at] {
+                        (f.event_destroy)(*event);
+                    }
+                    (f.stream_destroy)(stream);
+                }
+                return Err(e);
+            }
+        }
+        self.forks.created();
+        self.forks_made
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(Box::new(Fork {
+            stream,
+            fork: events[0],
+            join: events[1],
+        }))
+    }
+
+    /// Gives a private stream back to the stock (to the overflow list when more streams exist than slots: it is destroyed
+    /// with the lane, never here). Whatever was enqueued on the stream stays ordered on it; a stream that was capturing must
+    /// have ended its capture.
+    pub(crate) fn give_fork(&self, fork: Box<Fork>) {
+        let handle = Box::into_raw(fork);
+        if let Err(handle) = self.forks.give(handle as usize) {
+            self.forks.overflow(handle);
+        }
+    }
+
+    /// The lane's own driver stream. (A test hook: a library is never lent it.)
+    #[cfg(feature = "test-hooks")]
+    pub fn raw_stream_for_tests(&self) -> CuStream {
+        self.raw
+    }
+
+    /// How many private streams this lane ever made. (A test hook: a warmed lane makes no more, whatever the contention.)
+    #[cfg(feature = "test-hooks")]
+    pub fn forks_made(&self) -> usize {
+        self.forks_made.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Claims the next marker, ahead of the work it will follow. `Err(Busy)` before anything is submitted.
@@ -263,6 +354,139 @@ impl CudaQueue {
     }
 }
 
+/// The private stream a submission on a shared lane lends for library calls, forked from the lane on the first request and
+/// joined back when the submission ends.
+///
+/// A library may call `cuGraphLaunch` internally, and a `cuGraphLaunch` on a stream that several threads submit to can
+/// overtake the `cuStreamWaitEvent` its own thread issued just before it (see [`Fork`]). So the lane's stream is never
+/// lent: the stream a library call gets is private to the closure, forked from the lane (an event recorded on the lane and
+/// awaited by it) so it is ordered after everything enqueued so far, and every operation the closure enqueues from then on
+/// goes to it too, so what follows the library call follows its work. When the submission ends the lane waits for it (an
+/// event recorded on it and awaited by the lane), and the marker is recorded after that.
+pub(crate) struct LaneFork<'a> {
+    queue: &'a CudaQueue,
+    fork: std::cell::RefCell<Option<Box<Fork>>>,
+    /// A fork that could not be made or joined: `finish` returns it, so the submission does not end without it.
+    failed: std::cell::RefCell<Option<GpuError>>,
+}
+
+impl std::fmt::Debug for LaneFork<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LaneFork")
+            .field("lent", &self.fork.borrow().is_some())
+            .finish()
+    }
+}
+
+impl<'a> LaneFork<'a> {
+    pub(crate) fn new(queue: &'a CudaQueue) -> Self {
+        Self {
+            queue,
+            fork: std::cell::RefCell::new(None),
+            failed: std::cell::RefCell::new(None),
+        }
+    }
+
+    /// The stream the closure's operations go to: the lane's until a library asks for a stream, the private one after.
+    pub(crate) fn current(&self) -> CuStream {
+        match &*self.fork.borrow() {
+            Some(fork) => fork.stream,
+            None => self.queue.raw,
+        }
+    }
+
+    /// The private stream, forked from the lane on the first call. `None` if it could not be made (the submission then
+    /// ends with that error).
+    pub(crate) fn private(&self) -> Option<CuStream> {
+        if let Some(fork) = &*self.fork.borrow() {
+            return Some(fork.stream);
+        }
+        if self.failed.borrow().is_some() {
+            return None;
+        }
+        let made = (|| {
+            let fork = self.queue.take_fork()?;
+            let f = &self.queue.gpu.device().driver.fns;
+            // SAFETY: events and streams of this device; the private stream is this thread\'s alone; the context is current
+            // (the submission entered it).
+            let forked = unsafe {
+                self.queue
+                    .gpu
+                    .check("cuEventRecord", (f.event_record)(fork.fork, self.queue.raw))
+                    .and_then(|()| {
+                        self.queue.gpu.check(
+                            "cuStreamWaitEvent",
+                            (self.queue.gpu.fns.stream_wait_event)(fork.stream, fork.fork, 0),
+                        )
+                    })
+            };
+            match forked {
+                Ok(()) => Ok(fork),
+                Err(e) => {
+                    self.queue.give_fork(fork);
+                    Err(e)
+                }
+            }
+        })();
+        match made {
+            Ok(fork) => {
+                let stream = fork.stream;
+                *self.fork.borrow_mut() = Some(fork);
+                Some(stream)
+            }
+            Err(e) => {
+                *self.failed.borrow_mut() = Some(e);
+                None
+            }
+        }
+    }
+
+    /// Joins the private stream back into the lane (if one was lent) and gives it back. Once; returns what failed.
+    pub(crate) fn finish(&self) -> Result<(), GpuError> {
+        if let Some(fork) = self.fork.borrow_mut().take() {
+            let f = &self.queue.gpu.device().driver.fns;
+            // SAFETY: as in `private`; the private stream is still this thread\'s.
+            let joined = unsafe {
+                self.queue
+                    .gpu
+                    .check("cuEventRecord", (f.event_record)(fork.join, fork.stream))
+                    .and_then(|()| {
+                        self.queue.gpu.check(
+                            "cuStreamWaitEvent",
+                            (self.queue.gpu.fns.stream_wait_event)(self.queue.raw, fork.join, 0),
+                        )
+                    })
+            };
+            self.queue.give_fork(fork);
+            if let Err(e) = joined {
+                self.failed.borrow_mut().get_or_insert(e);
+            }
+        }
+        match self.failed.borrow_mut().take() {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for LaneFork<'_> {
+    fn drop(&mut self) {
+        let _ = self.finish();
+    }
+}
+
+/// Destroys a private stream and its events (after the work on it ended: its lane waited for the join).
+fn destroy_fork(gpu: &CudaGpu, fork: &Fork) {
+    let f = &gpu.device().driver.fns;
+    // SAFETY: handles made by `take_fork`, no longer in use; the context is current.
+    unsafe {
+        (f.stream_synchronize)(fork.stream);
+        (f.event_destroy)(fork.fork);
+        (f.event_destroy)(fork.join);
+        (f.stream_destroy)(fork.stream);
+    }
+}
+
 impl Drop for CudaQueue {
     /// The last handle is gone: the stream's work ends before the stream is destroyed. A retirement a lane armed holds
     /// its own clone of the cell the callback fills, so no callback can outlive what it writes.
@@ -270,10 +494,13 @@ impl Drop for CudaQueue {
         if let Ok(_c) = self.gpu.device().enter() {
             let f = &self.gpu.device().driver.fns;
             // SAFETY: the stream this value stands for, no longer in use; the context is current.
-            unsafe {
-                (f.stream_synchronize)(self.raw);
-                (f.stream_destroy)(self.raw);
+            unsafe { (f.stream_synchronize)(self.raw) };
+            for handle in self.forks.drain() {
+                // SAFETY: the stock holds pointers made by `give_fork`, which no one else holds.
+                destroy_fork(&self.gpu, &unsafe { *Box::from_raw(handle as *mut Fork) });
             }
+            // SAFETY: as above.
+            unsafe { (f.stream_destroy)(self.raw) };
         }
     }
 }
@@ -405,6 +632,8 @@ impl CudaStream {
                     raw,
                     lanes: lanes.clone(),
                     sink,
+                    forks: HandlePool::new(FORKS_STOCKED),
+                    forks_made: std::sync::atomic::AtomicUsize::new(0),
                 }),
                 shadow: None,
                 retire,

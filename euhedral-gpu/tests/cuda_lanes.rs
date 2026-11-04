@@ -16,8 +16,8 @@ use common::cuda_support::{Pinned, device_word, gpu, module, wait_until};
 use common::{HostWord, Item, Plan, Probe, Value, collect_all, lock, pump_from};
 use euhedral_gpu::cuda::{CudaGpu, CudaKernel, CudaModule, CudaStream};
 use euhedral_gpu::{
-    Args, Enqueue, Gpu, GpuError, LaneSpec, Launch, Module, Stream, StreamOptions, StreamPriority,
-    open_lane_sources,
+    Args, Gpu, GpuError, LaneEnqueue, LaneSpec, Launch, Module, Stream, StreamOptions,
+    StreamPriority, open_lane_sources,
 };
 use euhedral_graph::testing::FakeLanes;
 use euhedral_graph::{

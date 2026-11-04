@@ -5,10 +5,14 @@ use std::sync::Arc;
 
 use euhedral_graph::{ControlError, DeviceQueue, LaneControl, LaneId, Marker, RetireCell};
 
-use crate::{Args, Gpu, GpuError, Lane, LaneEnqueue, Launch, POISONED_STATUS};
+use crate::{
+    Args, Gpu, GpuError, GraphHold, Lane, LaneEnqueue, LaneStream, Launch, POISONED_STATUS,
+    RawStream,
+};
 
+use super::enqueue::Real;
 use super::stream::FakeQueue;
-use super::{FakeGpu, FakeKernel, QOp};
+use super::{FakeEnqueue, FakeGpu, FakeKernel, QOp};
 
 /// What a submission to a shared fake lane enqueues.
 #[derive(Debug)]
@@ -88,9 +92,49 @@ fn control_error(error: GpuError) -> ControlError {
     }
 }
 
+/// The fake device's stream behind a lane: what a library call "enqueues on" in a test.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FakeRawStream {
+    /// The lane's id in its pool.
+    pub lane: LaneId,
+    /// The lane's global index on the fake device.
+    pub global: usize,
+}
+
+impl LaneStream for FakeLaneEnqueue<'_> {
+    type Raw = FakeRawStream;
+
+    fn raw_stream(&self) -> Option<RawStream<'_, FakeRawStream>> {
+        Some(RawStream::new(FakeRawStream {
+            lane: self.queue.lane,
+            global: self.queue.global(),
+        }))
+    }
+}
+
+fn gpu_error(error: ControlError) -> GpuError {
+    match error {
+        ControlError::Busy => GpuError::Busy,
+        ControlError::Invalid(what) | ControlError::Failed(what) => GpuError::Invalid(what),
+    }
+}
+
+impl FakeQueue {
+    /// Appends an operation to this lane.
+    pub(crate) fn push_op(&self, op: QOp) {
+        self.gpu.push(self.global(), self.lane.0, op);
+    }
+
+    /// Later work on this lane waits for `marker`.
+    pub(crate) fn await_now(&self, marker: Marker) -> Result<(), GpuError> {
+        self.await_marker(marker).map_err(gpu_error)
+    }
+}
+
 impl Lane for FakeQueue {
     type Gpu = FakeGpu;
     type Enqueue<'a> = FakeLaneEnqueue<'a>;
+    type Held<'a> = FakeEnqueue<'a>;
 
     fn lane(&self) -> LaneId {
         self.lane
@@ -102,6 +146,19 @@ impl Lane for FakeQueue {
     ) -> Result<R, GpuError> {
         self.gpu.alive()?;
         f(&mut FakeLaneEnqueue { queue: self })
+    }
+
+    fn submit_held<R>(
+        &self,
+        hold: &mut GraphHold,
+        f: impl FnOnce(&mut FakeEnqueue<'_>) -> Result<R, GpuError>,
+    ) -> Result<R, GpuError> {
+        self.gpu.alive()?;
+        f(&mut FakeEnqueue {
+            target: Some(Real::Lane(self)),
+            rec: None,
+            hold: Some(hold),
+        })
     }
 
     fn submit_marked<R>(

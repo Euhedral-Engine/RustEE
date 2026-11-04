@@ -23,7 +23,8 @@ Asynchronous, backend-neutral GPU access for the RustEE control plane. A lattice
 | [`lanes`](src/lanes.rs) | `LaneSubmit` for the backends' streams, and `open_lane_sources`: a device's lanes as a pool, its intakes and a `LaneSource` per lane (`LaneSpec`, `OpenedLanes`); `open_shared_lanes`: a device's lanes as a typed pool that any worker submits to (`SharedLanes`). |
 | [`ring`](src/ring.rs) | The lock-free marker ring behind a lane's markers: numbers claimed by compare-and-set, completion found by an in-order scan, the awaiters' pins. No driver; loom-checked. |
 | [`cuda::texture`](src/cuda/texture.rs) | `TexObject`, `View`: texture objects over pitched device memory (filter, address and coordinate modes). |
-| [`graph_cache`](src/graph_cache.rs) | `GraphCache`: a lane's graphs by key (a hit updates and replays, a miss records, a warm-up only records), `GraphBody`, `Ran`. |
+| [`graph_cache`](src/graph_cache.rs) | `GraphCache`: an owned lane's graphs by key (a hit updates and replays, a miss records, a warm-up only records), `SharedGraphCache`: the same through a shared lane for any number of workers (instances by key), `GraphBody`, `Ran`. |
+| [`hold`](src/hold.rs) | `GraphHold`: what the work of a run on a shared lane reads, held by the caller until the work ended. |
 | [`args`](src/args.rs) | `KernelArg`, `Args` (the typed argument builder, rewritable in place), `Launch`, `Dim3`. |
 | [`error`](src/error.rs) | `GpuError`, the one error type. |
 | [`poison`](src/poison.rs) | `Poison`: a device's first fault, set once. |
@@ -72,6 +73,10 @@ Asynchronous, backend-neutral GPU access for the RustEE control plane. A lattice
     one lane never read each other's retirement and nothing is claimed or waited for. The cell is refcounted (the callback
     holds a clone), so it outlives a lane that is dropped first. The continuation that settles the status is a frame
     (`Completions::after_retired`).
+  - **Library calls.** `LaneStream::raw_stream()` on the closure's enqueue handle lends the lane's driver stream (a `RawStream<'_, R>`: it
+    borrows the handle and is `!Send`, so it stays inside the closure and on the calling thread), for library calls that
+    enqueue on a stream of their own accord (any library that enqueues on a stream): Java's `GpuStream.submit(Runnable)`. What the
+    library does with the stream is the caller's contract (see `LaneStream`); the marker claim still precedes the closure.
   - **Held values.** A shared lane keeps none. What a submission's work reads (a host buffer a copy reads) is held by the
     stage, in its quantum, and released in the stage's `retired` hook, which runs once the quantum's device work ended: a
     retirement armed by another party cannot release it early.
@@ -179,7 +184,7 @@ use std::sync::{Arc, Mutex};
 use euhedral_core::generics::LatticeSource;
 use euhedral_gpu::fake::{FakeGpu, FakeModule};
 use euhedral_gpu::{
-    Args, CompileOptions, Enqueue, Gpu, Launch, Module, OnceFrame, Stream, StreamOptions, retire_into,
+    Args, CompileOptions, Enqueue, LaneEnqueue, Gpu, Launch, Module, OnceFrame, Stream, StreamOptions, retire_into,
 };
 use euhedral_graph::Completions;
 
@@ -262,7 +267,7 @@ next mark.
 use std::convert::Infallible;
 
 use euhedral_gpu::fake::{FakeGpu, FakeStream};
-use euhedral_gpu::{Enqueue, GpuError, LaneSpec, Stream, StreamOptions, open_lane_sources};
+use euhedral_gpu::{Enqueue, LaneEnqueue, GpuError, LaneSpec, Stream, StreamOptions, open_lane_sources};
 use euhedral_graph::{Deliver, LaneCx, LaneId, LaneWork, Marker, Outcome};
 
 /// An item that sets a device word on its lane.

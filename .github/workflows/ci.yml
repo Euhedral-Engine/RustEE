@@ -154,7 +154,10 @@ jobs:
         if: runner.os == 'Linux' && needs.changes.outputs.euhedral_gpu == 'true'
         env:
           RUSTFLAGS: --cfg loom
-        run: cargo test -p euhedral-gpu --release --lib ring::loom
+        run: |
+          cargo test -p euhedral-gpu --release --lib ring::loom
+          cargo test -p euhedral-gpu --release --lib instances::loom
+          cargo test -p euhedral-gpu --release --lib handles::loom
 
       # Built and linted; the tests skip with no device.
       - name: CUDA backend (euhedral-memory)

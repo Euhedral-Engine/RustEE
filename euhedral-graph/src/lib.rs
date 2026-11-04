@@ -66,9 +66,9 @@ pub use lanes::{
 };
 pub use sequencer::{Entry, Progress, Sequencer, Slot, Ticket};
 pub use stage_graph::{
-    DEFAULT_RETRY_BACKSTOP, EdgeKind, ExternalEdge, GraphError, GraphRuntime, QuantumOutcome,
-    QuantumRef, RetryCounts, Stage, StageCx, StageError, StageGraph, StageGraphSpec, StageId,
-    StageSpec, Submitted,
+    DEFAULT_RETRY_BACKSTOP, EdgeKind, ExternalEdge, Gate, GateRef, GraphError, GraphRuntime,
+    QuantumOutcome, QuantumRef, RetryCounts, Stage, StageCx, StageError, StageGraph,
+    StageGraphSpec, StageId, StageSpec, Submitted,
 };
 
 /// Compiles and runs the examples in the crate README as doctests.

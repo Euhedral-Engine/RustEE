@@ -18,7 +18,7 @@ mod common;
 use std::time::{Duration, Instant};
 
 use common::cuda_support::{device_word, gpu, module, wait_until};
-use euhedral_gpu::{Args, Enqueue, Gpu, Launch, Module, Stream, StreamOptions};
+use euhedral_gpu::{Args, Gpu, LaneEnqueue, Launch, Module, Stream, StreamOptions};
 use euhedral_memory::cuda::{DeviceMemory, PinnedHost};
 use euhedral_memory::{Backend, Bounds, DeferredCalls, LocationId, Place};
 

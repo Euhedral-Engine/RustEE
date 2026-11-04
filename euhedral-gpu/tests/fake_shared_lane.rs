@@ -16,8 +16,8 @@ use euhedral_core::generics::{FrameSink, LatticeSource};
 use euhedral_data_structures::queues::{Consumer, MpmcQueue, Multi, Producer};
 use euhedral_gpu::fake::{FakeFault, FakeGpu, FakeKernel, FakeModule, FakeOp, FakeQueue};
 use euhedral_gpu::{
-    Args, CompileOptions, GpuError, Lane, LaneEnqueue, Launch, Module, SharedLanes, StreamOptions,
-    open_shared_lanes,
+    Args, CompileOptions, GpuError, Lane, LaneEnqueue, LaneStream, Launch, Module, SharedLanes,
+    StreamOptions, open_shared_lanes,
 };
 use euhedral_graph::{
     Completions, DEFAULT_RETRY_BACKSTOP, EdgeKind, GraphRuntime, LaneControl, LaneId,
@@ -628,4 +628,39 @@ fn a_device_fault_fails_the_quantum_at_its_retirement_and_the_hooks_still_run() 
     );
     assert_eq!(f.hooks.load(Ordering::SeqCst), 1);
     assert_eq!(f.held.load(Ordering::SeqCst), 1);
+}
+
+/// The closure of a marked submission is given the lane's raw stream for library calls (in a direct or a held submission
+/// too); a refused marker comes before the closure, so no library call is made.
+#[test]
+fn the_raw_stream_of_a_lane_is_lent_inside_a_submission_and_only_after_its_marker_is_claimed() {
+    let gpu = gpu();
+    let lanes = open_with(&gpu, 2, 1);
+    let lane = lanes.pool.lane(LaneId(1)).clone();
+    let seen = Mutex::new(Vec::new());
+    lane.submit_marked(|q| {
+        lock(&seen).push(q.raw_stream().expect("a lane lends its stream").as_raw());
+        Ok(())
+    })
+    .unwrap();
+    let raw = lock(&seen)[0];
+    assert_eq!(raw.lane, LaneId(1), "the lane's own stream");
+    // The ring of one marker is full: the next submission is refused before its closure runs.
+    let refused = lane.submit_marked(|q| {
+        lock(&seen).push(q.raw_stream().unwrap().as_raw());
+        Ok(())
+    });
+    assert!(matches!(refused, Err(GpuError::Busy)));
+    assert_eq!(
+        lock(&seen).len(),
+        1,
+        "no library call is made behind a refused marker"
+    );
+    // A held submission (what a recurring sequence's body runs in directly) lends it too.
+    let mut hold = euhedral_gpu::GraphHold::new();
+    lane.submit_held(&mut hold, |q| {
+        assert_eq!(q.raw_stream().expect("lent").as_raw(), raw);
+        Ok(())
+    })
+    .unwrap();
 }
