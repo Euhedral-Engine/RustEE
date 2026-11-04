@@ -143,10 +143,17 @@
   ]
  },
  {
+  "name": "graph: stage graph, device control",
+  "crate": "euhedral-graph",
+  "commands": [
+   "cargo +nightly miri test -p euhedral-graph --lib -- stage_graph::tests::a_quantum_joins stage_graph::tests::a_device_failure stage_graph::tests::a_hook_runs stage_graph::tests::a_quantum_that_ran_nothing stage_graph::tests::a_refused_retirement stage_graph::tests::a_completion_edge_waits lanes::tests::a_fixed lanes::tests::a_reserved"
+  ]
+ },
+ {
   "name": "graph: stage graph, completions and reuse",
   "crate": "euhedral-graph",
   "commands": [
-   "cargo +nightly miri test -p euhedral-graph --lib -- stage_graph::tests::a_halted_quantum_keeps stage_graph::tests::a_stage_that_fails_on_a_foreign stage_graph::tests::a_stage_that_ran_and_failed stage_graph::tests::a_failed_quantum_still_waits stage_graph::tests::a_host_completion_gates stage_graph::tests::repeated_quanta_reuse stage_graph::tests::a_quantum_may_start stage_graph::tests::a_refused_stage_frame stage_graph::tests::a_panicking_stage stage_graph::tests::a_stage_reaches_its_lane stage_graph::tests::a_root_continues stage_graph::tests::a_quantum_joins stage_graph::tests::a_device_failure stage_graph::tests::a_hook_runs stage_graph::tests::a_quantum_that_ran_nothing stage_graph::tests::a_refused_retirement stage_graph::tests::a_completion_edge_waits lanes::tests::a_fixed lanes::tests::a_reserved"
+   "cargo +nightly miri test -p euhedral-graph --lib -- stage_graph::tests::a_halted_quantum_keeps stage_graph::tests::a_stage_that_fails_on_a_foreign stage_graph::tests::a_stage_that_ran_and_failed stage_graph::tests::a_failed_quantum_still_waits stage_graph::tests::a_host_completion_gates stage_graph::tests::repeated_quanta_reuse stage_graph::tests::a_quantum_may_start stage_graph::tests::a_refused_stage_frame stage_graph::tests::a_panicking_stage stage_graph::tests::a_stage_reaches_its_lane stage_graph::tests::a_root_continues"
   ]
  }
 ]
