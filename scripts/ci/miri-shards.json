@@ -99,5 +99,12 @@
    "cargo +nightly miri test -p euhedral-graph --lib -- completions::tests::registrations_racing completions::tests::a_request_while completions::tests::a_sweep_that completions::tests::a_consumer_that completions::tests::a_panicking completions::tests::a_late_registration completions::tests::a_marker_registration completions::tests::dropping_",
    "cargo +nightly miri test -p euhedral-graph --lib -- sequencer::tests"
   ]
+ },
+ {
+  "name": "graph: stage graph, take-all stack",
+  "crate": "euhedral-graph",
+  "commands": [
+   "cargo +nightly miri test -p euhedral-graph --lib -- take_all:: stage_graph:: --skip the_retry_backstop"
+  ]
  }
 ]
