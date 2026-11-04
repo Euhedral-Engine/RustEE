@@ -612,7 +612,9 @@ order they are published) and may name the lanes able to run its work.
 **quantum** ([`StageGraph`](euhedral-graph/src/stage_graph.rs)): the unit of work a stage graph is started
 for, carrying whatever the caller's stages need. It has a kill switch of its own and ends with a
 [`QuantumOutcome`](euhedral-graph/src/stage_graph.rs): `Completed`, `Failed` or `Killed`. Retirement and
-the retry backstop: [`euhedral-graph` glossary](euhedral-graph/GLOSSARY.md#stage-graphs).
+the retry backstop: [`euhedral-graph` glossary](euhedral-graph/GLOSSARY.md#stage-graphs). A quantum's state is
+pooled and rebound to each quantum in turn, so a quantum allocates nothing after warm-up and takes no lock of its
+own (the pools' takes retry a queue's try-claim).
 
 **QuantumRef pin** ([`QuantumRef`](euhedral-graph/src/stage_graph.rs)): a handle from `start` that keeps a
 quantum from retiring while any clone lives, so a later quantum's external edge can still use its results.

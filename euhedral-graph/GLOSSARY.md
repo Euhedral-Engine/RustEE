@@ -71,14 +71,29 @@ itself, so the lattice has nothing left to poll. The next `admit` attaches a fre
 ## Stage graphs
 
 **live count** ([`StageGraph::live`](src/stage_graph.rs)): the quanta started and not yet retired. Each
-quantum also counts its own published frames, armed completion edges, external edges not yet arrived and
-admission's hold; at zero no stage can run again.
+quantum also counts its own published frames, armed completion edges, host completions no edge consumed,
+external edges not yet arrived and admission's hold; at zero no stage can run again.
 
 **retirement boundary, retirement** ([`StageGraph`](src/stage_graph.rs)): the latest marker per lane of
-everything a quantum submitted (and of later quanta's stages that used it through external edges), and every
-host completion no completion edge consumed. A quantum retires, handing itself and its outcome to the
-graph's `retire` callback, once none of its frames can run again and the boundary is reached. The boundary
-is armed as a `Completions` edge.
+everything a quantum submitted (and of later quanta's stages that used it through external edges, and of
+external edges into stages that never ran). A quantum retires, handing itself and its outcome to the graph's
+`retire` callback, once none of its frames can run again and the boundary is reached. The boundary is armed
+as one `Completions` edge per lane used; a host completion no completion edge consumed holds the quantum live
+until it is ready, so the quantum retires after it.
+
+**pooled quantum, run** ([`StageGraph`](src/stage_graph.rs)): the state of one quantum (its counts, its
+markers, its first cause, its external-edge records) kept in a bounded pool and rebound to each quantum in
+turn. `start` takes one and `retire` gives it back, as the graph's frames (stage, arrival, boundary and
+retirement frames, one pooled type) go back to a pool of their own. A pool that is full drops what comes
+back. A take retries the queue's try-claim for as long as the pool holds anything, up to 65536 polls, and
+makes a new object only when the pool is empty (or stays unpollable that long): the pool grows to the
+objects in flight at once, and no further.
+
+**TakeAllStack** ([`take_all`](src/take_all.rs)): a stack any thread pushes to and one thread takes whole and
+seals. The nodes are the caller's own, pooled objects (each holds its link), so a push allocates nothing.
+The seal names why the stack closed (`Submitted`: the stage submitted; `Swept`: its quantum quiesced
+without it), and a push after it is refused with that reason. Every node ends in exactly one place: in the
+list a seal returned, or refused. A stage graph keeps the external edges waiting for a stage on one.
 
 **retry backstop** ([`GraphRuntime::retry_backstop`](src/stage_graph.rs),
 [`DEFAULT_RETRY_BACKSTOP`](src/stage_graph.rs)): a stage that answers `StageError::Retry` runs again when

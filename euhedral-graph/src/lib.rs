@@ -8,10 +8,11 @@
 //! - **the completion**, found when a lattice worker polls [`Completions`] or `euhedral-io`'s
 //!   `AsyncIo`.
 //!
-//! One exception remains, and it is not part of the design: the per-quantum state of a [`StageGraph`]
-//! (`stage_graph.rs`) sits behind `Mutex` and `RwLock` fields tagged with the `HOT-FIX` ids G10 to G15,
-//! which stage frames take. They stay until the lock plan replaces them. (A [`Lake`] holds its generation lists in `LifecycleMutex`es, which start, stop and rebalance
-//! take, not frames.)
+//! No stage frame takes a lock of its own. A [`StageGraph`]'s per-quantum state is a pooled run, handed from stage to
+//! stage by counts, plain fields and closable stacks, and after warm-up a quantum allocates nothing. The pools of runs
+//! and frames are bounded multi-consumer queues, whose consumer side is a try-claim that a take retries (a bounded
+//! number of polls) instead of waiting on. (A [`Lake`] holds its generation lists in `LifecycleMutex`es, which start,
+//! stop and rebalance take, not frames.)
 //!
 //! No piece owns a thread. The sources ([`Completions`], and `euhedral-io`'s `AsyncIo`) are
 //! `LatticeSource`s that the lattice's own polls drive, and the rest are structures run from frame
@@ -49,6 +50,7 @@ pub mod lanes;
 pub mod sequencer;
 pub mod stage_graph;
 pub(crate) mod sync;
+pub(crate) mod take_all;
 #[cfg(feature = "testing")]
 pub mod testing;
 
