@@ -172,7 +172,7 @@ struct Batch {
     hold: Mutex<GraphHold>,
 }
 
-/// A stage that runs a cached graph on its lane, inside the lane\'s marker, and holds what the work reads.
+/// A stage that runs a cached graph on its lane, inside the lane's marker, and holds what the work reads.
 struct Replays {
     cache: Arc<SharedGraphCache<FakeGpu, u32>>,
     gpu: Arc<FakeGpu>,
@@ -348,16 +348,16 @@ fn a_stage_replays_a_cached_graph_on_its_lane_and_the_successor_awaits_its_marke
     assert_eq!(f.cache.stats().replays, 8, "four quanta replayed both");
     assert_eq!(f.cache.len(), 2);
     assert_eq!(word(&f.gpu, f.word), 5 * (1 + 10));
-    // The second stage\'s launches waited for the first\'s marker on lane 1.
+    // The second stage's launches waited for the first's marker on lane 1.
     let log = f.gpu.log();
     let wait = log
         .iter()
         .position(|op| matches!(op, FakeOp::Await { lane: 1, .. }))
-        .expect("the second lane waited for the first\'s marker");
+        .expect("the second lane waited for the first's marker");
     let launch = log
         .iter()
         .position(|op| matches!(op, FakeOp::Launch { lane: 1, .. }))
-        .expect("the second stage\'s launch");
+        .expect("the second stage's launch");
     assert!(wait < launch, "{log:?}");
 }
 
@@ -379,14 +379,14 @@ impl Fixture {
     }
 }
 
-/// What the work reads is held by the quantum and released only by the stages\' `retired` hooks, after the work: not when
+/// What the work reads is held by the quantum and released only by the stages' `retired` hooks, after the work: not when
 /// the run is enqueued, and not by a retirement another party arms on the lane while the work is queued. (With caching
-/// off the values are the quantum\'s alone.)
+/// off the values are the quantum's alone.)
 #[test]
 fn what_a_run_reads_is_released_by_the_hook_after_the_work_and_by_nothing_before() {
     let f = fixture();
     f.cache.set_enabled(false);
-    // Another party arms a retirement on lane 0 ahead of the quantum\'s work: it fires while that work is queued.
+    // Another party arms a retirement on lane 0 ahead of the quantum's work: it fires while that work is queued.
     let other = Arc::new(euhedral_graph::RetireCell::new());
     f.lanes.pool.lane(LaneId(0)).notify_retired(&other).unwrap();
     f.start(1);
@@ -398,7 +398,7 @@ fn what_a_run_reads_is_released_by_the_hook_after_the_work_and_by_nothing_before
     assert_eq!(
         word(&f.gpu, f.word),
         0,
-        "the quantum\'s work is still queued"
+        "the quantum's work is still queued"
     );
     assert_eq!(f.kept.load(Ordering::SeqCst), 0, "nothing is released yet");
     assert_eq!(f.hooks.load(Ordering::SeqCst), 0);

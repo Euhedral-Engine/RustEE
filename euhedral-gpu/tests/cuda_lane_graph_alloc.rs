@@ -104,7 +104,7 @@ struct Work {
     holds: [Mutex<GraphHold>; 2],
 }
 
-/// The sequence: one launch with this unit\'s arguments, and a value kept for it (made only when it is kept).
+/// The sequence: one launch with this unit's arguments, and a value kept for it (made only when it is kept).
 struct Add {
     kernel: CudaKernel,
     word: u64,
@@ -279,7 +279,7 @@ fn warm_stages_replay_cached_graphs_and_quanta_run_without_allocating() {
     assert_eq!(
         hooks.load(Ordering::Acquire),
         2 * 2_200,
-        "every stage\'s hook ran once"
+        "every stage's hook ran once"
     );
     let stats = cache.stats();
     assert_eq!(
@@ -290,7 +290,7 @@ fn warm_stages_replay_cached_graphs_and_quanta_run_without_allocating() {
     assert_eq!(
         freed.load(Ordering::Relaxed),
         0,
-        "the instances still own the recordings\' values"
+        "the instances still own the recordings' values"
     );
     drop(graph);
     drop(cache);

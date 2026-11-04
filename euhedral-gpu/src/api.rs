@@ -387,7 +387,7 @@ pub trait LaneEnqueue {
 /// and every pass of a recurring sequence), and the values it keeps alive for its work.
 pub trait Enqueue: LaneEnqueue {
     /// Keeps `value` alive until the next retirement armed on this stream is confirmed. Host buffers that a copy
-    /// reads belong here. On a shared lane, which keeps none, the value goes to the caller\'s [`GraphHold`]
+    /// reads belong here. On a shared lane, which keeps none, the value goes to the caller's [`GraphHold`]
     /// ([`Lane::submit_held`]).
     ///
     /// In a recording the value belongs to the graph. A recorded copy reads its host buffer again at every replay, so
@@ -396,7 +396,7 @@ pub trait Enqueue: LaneEnqueue {
     /// after the replay is confirmed, so a replay in flight survives the graph dropping.
     fn keep(&mut self, value: Box<dyn Any + Send>);
 
-    /// As [`keep`](Self::keep), making the value only when it is kept. A recurring sequence\'s body runs in every pass,
+    /// As [`keep`](Self::keep), making the value only when it is kept. A recurring sequence's body runs in every pass,
     /// but only a recording (and a direct run) keeps its values: an update pass drops them. A body that makes its value
     /// here allocates it once, when it is recorded, and not at every replay.
     fn keep_with<T: Any + Send>(&mut self, make: impl FnOnce() -> T)
@@ -451,7 +451,7 @@ pub trait Sequence {
 }
 
 /// A recorded sequence.
-pub trait Graph: Send + fmt::Debug {
+pub trait Graph: Send + fmt::Debug + 'static {
     type Gpu: Gpu<Graph = Self>;
 
     fn fingerprint(&self) -> Fingerprint;
@@ -474,9 +474,10 @@ pub trait Graph: Send + fmt::Debug {
     /// the last update.
     ///
     /// The graph is still used by one thread at a time (`&mut self`): a key that several workers run at once has an
-    /// instance of its graph for each (see [`SharedGraphCache`](crate::SharedGraphCache)). The instance may be used again
-    /// (updated, replayed on any lane) as soon as this call returns: the driver snapshots the parameters at the launch and
-    /// orders a graph's launches, and an instance dropped while its launches are in flight is freed once they end.
+    /// instance of its graph for each (see [`SharedGraphCache`](crate::SharedGraphCache)). Do not update or launch the
+    /// instance again until this launch ended (a stress test that did lost an ordering between two lanes): the cache keeps
+    /// an instance busy until the caller's hold is released. An instance dropped while its launches are in flight is
+    /// freed by the driver once they end.
     ///
     /// The values the recording keeps are not given to the lane, which keeps none: a handle to them is added to `hold`,
     /// and the caller holds it until the work ended (in its quantum, released in `Stage::retired`).

@@ -18,6 +18,10 @@ impl<T> UnsafeCell<T> {
         Self(std::cell::UnsafeCell::new(value))
     }
 
+    pub(crate) fn with<R>(&self, f: impl FnOnce(*const T) -> R) -> R {
+        f(self.0.get())
+    }
+
     pub(crate) fn with_mut<R>(&self, f: impl FnOnce(*mut T) -> R) -> R {
         f(self.0.get())
     }

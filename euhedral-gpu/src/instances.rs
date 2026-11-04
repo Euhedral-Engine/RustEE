@@ -54,8 +54,8 @@ pub(crate) struct InstancePool<K, T> {
 }
 
 // SAFETY: a slot's cell is accessed only by the thread that owns the slot (its word says BUSY, and the thread that made
-// it so by compare-and-set), and ownership passes by release/acquire on the word; the contents move between threads, so
-// they must be `Send`.
+// it so by compare-and-set, or was handed it), and ownership passes by release/acquire on the word; the contents move
+// between threads, so they must be `Send`.
 unsafe impl<K: Send, T: Send> Sync for InstancePool<K, T> {}
 
 impl<K, T> std::fmt::Debug for InstancePool<K, T> {
@@ -66,81 +66,108 @@ impl<K, T> std::fmt::Debug for InstancePool<K, T> {
     }
 }
 
-/// A slot a thread owns: it gives the slot up when it is dropped, empty.
-struct Owned<'a, K, T> {
+/// Gives a parked instance back to its pool: what a [`GraphHold`](crate::GraphHold) calls when it is released, whatever
+/// the pool's types.
+pub(crate) trait GiveBack: Send + Sync {
+    /// Frees slot `index`, which holds an instance of the key `tag` names, for the next user.
+    fn give_back(&self, index: usize, tag: u64);
+}
+
+impl<K: Send, T: Send> GiveBack for InstancePool<K, T> {
+    fn give_back(&self, index: usize, tag: u64) {
+        // The release store hands the slot's contents to whoever takes it next.
+        self.slots[index]
+            .word
+            .store(word(tag, FREE), Ordering::Release);
+    }
+}
+
+/// A taken instance. It is the slot's owner: dropped, it frees the slot; [`parked`](Self::park), it keeps the slot busy
+/// until someone gives it back.
+pub(crate) struct Lease<'a, K, T> {
     pool: &'a InstancePool<K, T>,
     index: usize,
     tag: u64,
-}
-
-impl<K, T> Owned<'_, K, T> {
-    fn slot(&self) -> &Slot<K, T> {
-        &self.pool.slots[self.index]
-    }
-
-    /// Puts `contents` in the slot and frees it for the key `tag` names.
-    fn give(self, key: K, value: T) {
-        // SAFETY: this thread owns the slot.
-        let put = |cell: *mut Option<(K, T)>| unsafe { *cell = Some((key, value)) };
-        self.slot().cell.with_mut(put);
-        let free = word(self.tag, FREE);
-        self.slot().word.store(free, Ordering::Release);
-        std::mem::forget(self);
-    }
-}
-
-impl<K, T> Drop for Owned<'_, K, T> {
-    fn drop(&mut self) {
-        // SAFETY: this thread owns the slot.
-        let old = self.slot().cell.with_mut(|cell| unsafe { (*cell).take() });
-        self.slot().word.store(EMPTY, Ordering::Release);
-        // Dropped after the slot is free: a driver call in the contents' drop does not hold the slot.
-        drop(old);
-    }
-}
-
-/// A taken instance. It goes back to the pool when it is dropped (so an early return keeps it), or is dropped for good by
-/// [`discard`](Self::discard).
-pub(crate) struct Lease<'a, K, T> {
-    owned: Option<Owned<'a, K, T>>,
-    key: Option<K>,
-    value: Option<T>,
+    live: bool,
 }
 
 impl<K, T> Lease<'_, K, T> {
+    /// The instance. Valid while the lease (or the slot it parked) is not freed.
     pub(crate) fn get(&mut self) -> &mut T {
-        self.value.as_mut().expect("a lease holds its instance")
+        // SAFETY: this lease owns the slot, and holds the instance in it.
+        self.pool.slots[self.index].cell.with_mut(|cell| unsafe {
+            &mut (*cell)
+                .as_mut()
+                .expect("a leased slot holds its instance")
+                .1
+        })
+    }
+
+    /// Keeps the slot busy after the lease ends: the caller gives it back with [`GiveBack::give_back`] (the slot's index
+    /// and tag) once nothing uses the instance any more. Returns them.
+    pub(crate) fn park(mut self) -> (usize, u64) {
+        self.live = false;
+        (self.index, self.tag)
     }
 
     /// Drops the instance instead of putting it back (it is not fit for another run).
     #[cfg(test)]
     pub(crate) fn discard(mut self) {
-        self.value = None;
-        self.key = None;
-        // The owned slot drops empty.
-        self.owned = None;
+        self.live = false;
+        // SAFETY: this lease owns the slot.
+        let old = self.pool.slots[self.index]
+            .cell
+            .with_mut(|cell| unsafe { (*cell).take() });
+        self.pool.slots[self.index]
+            .word
+            .store(EMPTY, Ordering::Release);
+        drop(old);
     }
 }
 
 impl<K, T> Drop for Lease<'_, K, T> {
     fn drop(&mut self) {
-        if let (Some(owned), Some(key), Some(value)) =
-            (self.owned.take(), self.key.take(), self.value.take())
-        {
-            owned.give(key, value);
+        if self.live {
+            self.pool.slots[self.index]
+                .word
+                .store(word(self.tag, FREE), Ordering::Release);
         }
     }
 }
 
 /// A slot reserved to record an instance in: given back empty when dropped.
 pub(crate) struct Reservation<'a, K, T> {
-    owned: Owned<'a, K, T>,
+    pool: &'a InstancePool<K, T>,
+    index: usize,
+    tag: u64,
+    filled: bool,
 }
 
 impl<K, T> Reservation<'_, K, T> {
-    /// Puts the recorded instance in the pool.
-    pub(crate) fn fill(self, key: K, value: T) {
-        self.owned.give(key, value);
+    /// Puts the recorded instance in the pool, free.
+    pub(crate) fn fill(mut self, key: K, value: T) {
+        // SAFETY: this reservation owns the slot.
+        let put = |cell: *mut Option<(K, T)>| unsafe { *cell = Some((key, value)) };
+        self.pool.slots[self.index].cell.with_mut(put);
+        self.filled = true;
+        self.pool.slots[self.index]
+            .word
+            .store(word(self.tag, FREE), Ordering::Release);
+    }
+}
+
+impl<K, T> Drop for Reservation<'_, K, T> {
+    fn drop(&mut self) {
+        if !self.filled {
+            // SAFETY: this reservation owns the slot.
+            let old = self.pool.slots[self.index]
+                .cell
+                .with_mut(|cell| unsafe { (*cell).take() });
+            self.pool.slots[self.index]
+                .word
+                .store(EMPTY, Ordering::Release);
+            drop(old);
+        }
     }
 }
 
@@ -183,24 +210,19 @@ impl<K: Copy + Eq, T> InstancePool<K, T> {
             {
                 continue;
             }
-            let owned = Owned {
+            let lease = Lease {
                 pool: self,
                 index,
                 tag,
+                live: true,
             };
             // SAFETY: this thread owns the slot.
-            let contents = slot.cell.with_mut(|cell| unsafe { (*cell).take() });
-            match contents {
-                Some((k, value)) if k == *key => {
-                    return Some(Lease {
-                        owned: Some(owned),
-                        key: Some(k),
-                        value: Some(value),
-                    });
-                }
-                // The tag matched another key: the slot goes back as it was.
-                Some((k, value)) => owned.give(k, value),
-                None => {}
+            let same = slot
+                .cell
+                .with(|cell| unsafe { matches!(&*cell, Some((k, _)) if k == key) });
+            // The tag matched another key: the slot goes back as it was (the lease frees it).
+            if same {
+                return Some(lease);
             }
         }
         None
@@ -221,11 +243,10 @@ impl<K: Copy + Eq, T> InstancePool<K, T> {
                     .is_ok()
             {
                 return Some(Reservation {
-                    owned: Owned {
-                        pool: self,
-                        index,
-                        tag,
-                    },
+                    pool: self,
+                    index,
+                    tag,
+                    filled: false,
                 });
             }
         }
@@ -246,11 +267,10 @@ impl<K: Copy + Eq, T> InstancePool<K, T> {
                 let old = slot.cell.with_mut(|cell| unsafe { (*cell).take() });
                 drop(old);
                 return Some(Reservation {
-                    owned: Owned {
-                        pool: self,
-                        index,
-                        tag,
-                    },
+                    pool: self,
+                    index,
+                    tag,
+                    filled: false,
                 });
             }
         }
@@ -261,14 +281,15 @@ impl<K: Copy + Eq, T> InstancePool<K, T> {
     /// two keys is a false yes).
     pub(crate) fn contains(&self, tag: u64) -> bool {
         self.slots.iter().any(|s| {
-            s.word.load(Ordering::Acquire) >> 2 == tag && s.word.load(Ordering::Relaxed) != EMPTY
+            let seen = s.word.load(Ordering::Acquire);
+            seen != EMPTY && seen >> 2 == tag
         })
     }
 
     /// Drops the free instances whose key `keep` refuses; those in use stay for the next call. Returns how many went.
     pub(crate) fn retain(&self, keep: impl Fn(&K) -> bool) -> usize {
         let mut dropped = 0;
-        for (index, slot) in self.slots.iter().enumerate() {
+        for slot in self.slots.iter() {
             let seen = slot.word.load(Ordering::Acquire);
             if seen & STATE != FREE {
                 continue;
@@ -281,19 +302,18 @@ impl<K: Copy + Eq, T> InstancePool<K, T> {
             {
                 continue;
             }
-            let owned = Owned {
-                pool: self,
-                index,
-                tag,
-            };
             // SAFETY: this thread owns the slot.
-            match slot.cell.with_mut(|cell| unsafe { (*cell).take() }) {
-                Some((k, v)) if keep(&k) => owned.give(k, v),
-                Some(_) => {
-                    dropped += 1;
-                    // The owned slot drops empty, and the instance with it.
-                }
-                None => {}
+            let kept = slot
+                .cell
+                .with(|cell| unsafe { matches!(&*cell, Some((k, _)) if keep(k)) });
+            if kept {
+                slot.word.store(seen, Ordering::Release);
+            } else {
+                // SAFETY: as above.
+                let old = slot.cell.with_mut(|cell| unsafe { (*cell).take() });
+                slot.word.store(EMPTY, Ordering::Release);
+                dropped += 1;
+                drop(old);
             }
         }
         dropped
@@ -334,6 +354,25 @@ mod tests {
         drop(lease);
         assert_eq!(*pool.take(&7, tag(7)).unwrap().get(), 71);
         assert_eq!(pool.len(), 1);
+    }
+
+    #[test]
+    fn a_parked_instance_stays_busy_until_it_is_given_back() {
+        let pool = Arc::new(InstancePool::<u32, u32>::new(2));
+        pool.reserve(tag(3)).unwrap().fill(3, 30);
+        let mut lease = pool.take(&3, tag(3)).unwrap();
+        *lease.get() = 31;
+        let (index, parked_tag) = lease.park();
+        assert!(
+            pool.take(&3, tag(3)).is_none(),
+            "a parked instance is not taken: its launch may be in flight"
+        );
+        assert!(pool.contains(tag(3)), "it is still the key's");
+        assert_eq!(pool.retain(|_| false), 0, "and a retain leaves it");
+        let giver: Arc<dyn GiveBack> = pool.clone();
+        giver.give_back(index, parked_tag);
+        assert_eq!(*pool.take(&3, tag(3)).unwrap().get(), 31);
+        assert_eq!(pool.retain(|_| false), 1);
     }
 
     #[test]
@@ -475,39 +514,67 @@ mod loom_tests {
     use loom::sync::atomic::AtomicUsize;
     use loom::thread;
 
-    // Two threads take the one instance of a key: at most one gets it, the instance's contents written by its last owner
-    // are seen by the next, and what is not taken is still there after.
+    // Two threads take the one instance of a key: at most one gets it.
     #[test]
-    fn loom_one_instance_is_taken_by_one_thread_and_its_contents_are_ordered() {
+    fn loom_one_instance_is_taken_by_one_thread() {
         loom::model(|| {
-            let pool = Arc::new(InstancePool::<u32, Arc<AtomicUsize>>::new(2));
-            let inner = Arc::new(AtomicUsize::new(0));
-            pool.reserve(5).unwrap().fill(5, inner.clone());
+            let pool = Arc::new(InstancePool::<u32, u32>::new(2));
+            pool.reserve(5).unwrap().fill(5, 0);
             let taken = Arc::new(AtomicUsize::new(0));
             let worker = {
                 let (pool, taken) = (pool.clone(), taken.clone());
                 thread::spawn(move || {
                     if let Some(mut lease) = pool.take(&5, 5) {
                         taken.fetch_add(1, loom::sync::atomic::Ordering::SeqCst);
-                        let before = lease
-                            .get()
-                            .fetch_add(1, loom::sync::atomic::Ordering::SeqCst);
-                        assert!(before <= 1);
+                        *lease.get() += 1;
                     }
                 })
             };
             if let Some(mut lease) = pool.take(&5, 5) {
                 taken.fetch_add(1, loom::sync::atomic::Ordering::SeqCst);
-                let before = lease
-                    .get()
-                    .fetch_add(1, loom::sync::atomic::Ordering::SeqCst);
-                assert!(before <= 1);
+                *lease.get() += 1;
             }
             worker.join().unwrap();
-            // The instance was given back by whoever took it: it is takeable again, and the count shows the users.
+            // Whoever took it gave it back: it is takeable again, and the count shows its users in turn.
             let mut again = pool.take(&5, 5).expect("the instance is back");
-            let seen = again.get().load(loom::sync::atomic::Ordering::SeqCst);
-            assert_eq!(seen, taken.load(loom::sync::atomic::Ordering::SeqCst));
+            assert_eq!(
+                *again.get() as usize,
+                taken.load(loom::sync::atomic::Ordering::SeqCst)
+            );
+        });
+    }
+
+    // The instance is used and parked by one thread, and given back by it later (the thread that releases the hold): the
+    // next taker, whichever thread it is, sees what the first user wrote, and never sees the instance before.
+    #[test]
+    fn loom_a_parked_instance_given_back_hands_over_its_contents() {
+        loom::model(|| {
+            let pool = Arc::new(InstancePool::<u32, u32>::new(2));
+            pool.reserve(7).unwrap().fill(7, 0);
+            let user = {
+                let pool = pool.clone();
+                thread::spawn(move || {
+                    let Some(mut lease) = pool.take(&7, 7) else {
+                        return;
+                    };
+                    *lease.get() = 42;
+                    let (index, tag) = lease.park();
+                    pool.give_back(index, tag);
+                })
+            };
+            // Either the instance is in use (or parked), or it is back with the first user's write.
+            if let Some(mut again) = pool.take(&7, 7) {
+                let seen = *again.get();
+                assert!(seen == 0 || seen == 42);
+                if seen == 42 {
+                    // Taken after the give-back: the write is ordered before this read (checked by the cell).
+                }
+            }
+            user.join().unwrap();
+            assert!(matches!(
+                *pool.take(&7, 7).expect("given back").get(),
+                0 | 42
+            ));
         });
     }
 
@@ -521,10 +588,10 @@ mod loom_tests {
             let worker = {
                 let pool = pool.clone();
                 thread::spawn(move || {
-                    if pool.take(&9, 9).is_none() {
-                        if let Some(slot) = pool.reserve(9) {
-                            slot.fill(9, 2);
-                        }
+                    if pool.take(&9, 9).is_none()
+                        && let Some(slot) = pool.reserve(9)
+                    {
+                        slot.fill(9, 2);
                     }
                 })
             };

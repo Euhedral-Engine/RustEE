@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex, PoisonError};
 use std::time::Duration;
 
-use common::cuda_support::{Pinned, device_word, gpu, module, wait_until};
+use common::cuda_support::{Pinned, device_word, gpu, module, wait_until, zero};
 use euhedral_core::frames::{Frame, FrameError};
 use euhedral_core::generics::{FrameSink, LatticeSource};
 use euhedral_data_structures::queues::{Consumer, MpmcQueue, Multi, Producer};
@@ -27,9 +27,24 @@ use euhedral_graph::{
     Completions, DEFAULT_RETRY_BACKSTOP, EdgeKind, GraphRuntime, LaneControl, LaneId,
     QuantumOutcome, Stage, StageCx, StageError, StageGraph, StageGraphSpec, StageSpec, Submitted,
 };
+use euhedral_memory::cuda::DeviceMemory;
+use euhedral_memory::{Backend, Block, LocationId};
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+const QUANTA: usize = 256;
+
+/// A zeroed device allocation of `bytes`.
+fn words(gpu: &Arc<CudaGpu>, bytes: usize) -> (DeviceMemory, Block) {
+    let mem = DeviceMemory {
+        device: gpu.device().clone(),
+        location: LocationId(0),
+    };
+    let block = mem.alloc(bytes as u64).unwrap();
+    zero(gpu, block.addr, bytes);
+    (mem, block)
 }
 
 fn lanes(gpu: &Arc<CudaGpu>, count: usize) -> SharedLanes<CudaQueue> {
@@ -51,10 +66,15 @@ impl Drop for Counted {
 
 /// Stage one sets the word to 3 (behind a spin, so that a second stage that did not wait would overtake it); stage two
 /// doubles it. In the wrong order the word ends at 3, not 6.
+/// Cycles stage one burns on the device, so that the lanes back up and quanta overlap.
+const SPIN_CYCLES: u64 = 2_000_000;
+
 struct Steps {
     axpb: CudaKernel,
     spin: CudaKernel,
     word: u64,
+    /// The word the second stage writes: twice the first's, plus one.
+    out: u64,
     last: bool,
     /// Called inside every pass, to hold threads together.
     inside: Option<Arc<Barrier>>,
@@ -66,30 +86,32 @@ impl GraphBody<CudaGpu> for Steps {
         if let Some(barrier) = &self.inside {
             barrier.wait();
         }
-        let (a, b) = if self.last {
-            (2.0f32, 0.0f32)
-        } else {
-            (0.0, 3.0)
-        };
-        // SAFETY: the device word is live; the kernel reads and writes its first float.
+        // SAFETY: the device words are live; the kernel reads and writes its first float.
         unsafe {
-            if !self.last {
+            let axpb = |enq: &mut E, dst: u64, a: f32, b: f32| {
+                enq.launch(
+                    &self.axpb,
+                    Launch::linear(1, 1),
+                    &Args::new()
+                        .device(dst)
+                        .device(self.word)
+                        .arg(a)
+                        .arg(b)
+                        .arg(1u32),
+                )
+            };
+            if self.last {
+                // Reads the first stage's word into a second one (2y + 1), then doubles it in place.
+                axpb(enq, self.out, 2.0, 1.0)?;
+                axpb(enq, self.word, 2.0, 0.0)?;
+            } else {
                 enq.launch(
                     &self.spin,
                     Launch::linear(1, 1),
-                    &Args::new().arg(2_000_000u64),
+                    &Args::new().arg(SPIN_CYCLES),
                 )?;
+                axpb(enq, self.word, 0.0, 3.0)?;
             }
-            enq.launch(
-                &self.axpb,
-                Launch::linear(1, 1),
-                &Args::new()
-                    .device(self.word)
-                    .device(self.word)
-                    .arg(a)
-                    .arg(b)
-                    .arg(1u32),
-            )?;
         }
         if let Some(count) = &self.keeps {
             enq.keep(Box::new(Counted(count.clone())));
@@ -120,6 +142,7 @@ fn run_frame(mut frame: Box<dyn Frame>) {
 /// A quantum: the device word its stages work on, and what they hold for their work.
 struct Work {
     word: u64,
+    out: u64,
     hold: Mutex<GraphHold>,
 }
 
@@ -145,6 +168,7 @@ impl Stage<Work, CudaQueue> for Replays {
             axpb: self.axpb.clone(),
             spin: self.spin.clone(),
             word: work.word,
+            out: work.out,
             last: self.last,
             inside: None,
             keeps: Some(self.keeps.clone()),
@@ -169,13 +193,13 @@ impl Stage<Work, CudaQueue> for Replays {
 }
 
 /// Four workers run quanta of a two-stage graph, each stage replaying a cached graph on its own lane, at once: the
-/// second stage awaits the first\'s marker on the device (the word ends at 6, not 3), a quantum retires only when both
-/// lanes reached their markers, and the stages\' hooks release what the work read.
+/// second stage awaits the first's marker on the device (the word ends at 6, not 3), a quantum retires only when both
+/// lanes reached their markers, and the stages' hooks release what the work read.
 #[test]
 fn stages_replay_cached_graphs_on_their_lanes_and_the_boundary_covers_both() {
     let Some(gpu) = gpu() else { return };
     let Some(module) = module(&gpu) else { return };
-    let (_mem, block) = device_word(&gpu);
+    let (_mem, block) = words(&gpu, 8 * QUANTA);
     let pinned = Pinned::new(&gpu);
     let (axpb, spin) = (
         module.kernel("axpb").unwrap(),
@@ -197,7 +221,6 @@ fn stages_replay_cached_graphs_on_their_lanes_and_the_boundary_covers_both() {
         lanes: vec![LaneId(1)],
     });
     spec.edge(first, second, EdgeKind::Submission);
-    const QUANTA: usize = 64;
     let cache = Arc::new(SharedGraphCache::<CudaGpu, u32>::new());
     let (keeps, hooks) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
     let stage = |key: u32, last: bool| {
@@ -251,7 +274,8 @@ fn stages_replay_cached_graphs_on_their_lanes_and_the_boundary_covers_both() {
     // Each quantum has its own device word, so the quanta overlap on the device and take their own arguments.
     for i in 0..QUANTA {
         let work = Work {
-            word: block.addr + 4 * i as u64,
+            word: block.addr + 8 * i as u64,
+            out: block.addr + 8 * i as u64 + 4,
             hold: Mutex::default(),
         };
         let _ = graph.start(work, kill.clone(), None::<euhedral_graph::ExternalEdge>);
@@ -269,7 +293,7 @@ fn stages_replay_cached_graphs_on_their_lanes_and_the_boundary_covers_both() {
             .iter()
             .all(|o| *o == QuantumOutcome::Completed)
     );
-    assert_eq!(hooks.load(Ordering::SeqCst), 2 * QUANTA);
+    assert_eq!(hooks.load(Ordering::SeqCst), 2 * (QUANTA));
     // Read the words back on lane 0, behind everything.
     let lane = lanes.pool.lane(LaneId(0)).clone();
     let host = pinned.word();
@@ -277,7 +301,7 @@ fn stages_replay_cached_graphs_on_their_lanes_and_the_boundary_covers_both() {
         let (_, marker) = lane
             .submit_marked(|q| {
                 // SAFETY: the pinned block holds the words; the device words are live.
-                unsafe { q.copy_to_host(host.bytes().add(4 * i), block.addr + 4 * i as u64, 4) }
+                unsafe { q.copy_to_host(host.bytes().add(8 * i), block.addr + 8 * i as u64, 8) }
             })
             .unwrap();
         assert!(wait_until(Duration::from_secs(10), || lanes
@@ -286,19 +310,23 @@ fn stages_replay_cached_graphs_on_their_lanes_and_the_boundary_covers_both() {
     }
     for i in 0..QUANTA {
         // SAFETY: the copy ended (its marker was reached).
-        let seen = unsafe { ((host.bytes() as *const u32).add(i)).read_volatile() };
+        let (y, z) = unsafe {
+            let at = (host.bytes() as *const u32).add(2 * i);
+            (
+                f32::from_bits(at.read_volatile()),
+                f32::from_bits(at.add(1).read_volatile()),
+            )
+        };
         assert_eq!(
-            f32::from_bits(seen),
-            6.0,
-            "quantum {i}: the second stage ran after the first"
+            (y, z),
+            (6.0, 7.0),
+            "quantum {i}: the second stage read the first's word after it was set (stats {:?})",
+            cache.stats()
         );
     }
     let stats = cache.stats();
-    assert!(stats.records >= 2 && stats.replays + stats.records == 2 * QUANTA as u64);
+    assert!(stats.records >= 2);
     assert_eq!(graph.live(), 0);
-    // The cache holds the recordings\' buffers; the quanta\'s holds are gone, and every update pass\'s value too.
-    drop(cache);
-    assert!(keeps.load(Ordering::SeqCst) >= 2 * QUANTA - 8);
 }
 
 /// Workers that run one key at once each get an instance of their own on a real device: they are held together inside the

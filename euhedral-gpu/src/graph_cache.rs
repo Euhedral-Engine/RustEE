@@ -1,5 +1,5 @@
 //! A lane's cache of recorded graphs: the same sequence of operations run for each unit of work, recorded once and updated and
-//! replayed after. [`GraphCache`] is an owned lane\'s (one owner, `&mut`); [`SharedGraphCache`] is the cache of shared lanes,
+//! replayed after. [`GraphCache`] is an owned lane's (one owner, `&mut`); [`SharedGraphCache`] is the cache of shared lanes,
 //! for any number of workers through `&self`.
 //!
 //! A lane that runs the same short sequence of launches for each unit of work (a stage of several kernels) records it as a graph the
@@ -23,9 +23,10 @@
 //! line up one to one with the recording.
 
 use std::hash::Hash;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use crate::instances::{InstancePool, tag_of};
+use crate::instances::{GiveBack, InstancePool, tag_of};
 use crate::{Enqueue, Gpu, GpuError, Graph, GraphHold, Lane, Sequence, Stream};
 
 /// The enqueue body of a recurring sequence: the same code serves a direct run, a recording and an update.
@@ -228,7 +229,8 @@ type LaneOf<G> = <<G as Gpu>::Stream as Stream>::Lane;
 /// are *instances*, pooled by key ([`InstancePool`](crate::instances)):
 ///
 /// - **A hit**: a free instance of the key is taken by one compare-and-set (the entry is claimed, not locked), updated with
-///   the unit's arguments and replayed on the lane. It goes back to the pool when the replay has been *enqueued*.
+///   the unit's arguments and replayed on the lane. The instance stays busy until the caller's [`GraphHold`] is released
+///   (see below).
 /// - **A second concurrent user of a key** finds the instance taken and does not wait or spin: it takes another free
 ///   instance of the key, or records one of its own (a miss) and pools it for the next. The instances of a key therefore
 ///   settle at the peak number of workers that ran it at once, and a run after warm-up allocates nothing.
@@ -236,18 +238,26 @@ type LaneOf<G> = <<G as Gpu>::Stream as Stream>::Lane;
 /// - **A full pool** (the bound) evicts a free instance; if every instance is in use, the new recording runs and is not
 ///   pooled. Dropping an instance is safe whatever its launches are doing: the driver frees an executable once they end.
 ///
-/// **Why the instance may go back once the replay is enqueued.** The driver snapshots a graph's parameters at the launch
-/// (an update applies to the next launch, never to one in flight) and orders every launch of one executable behind the
-/// previous one, whichever stream it is on; so the next user may update and launch the instance at once. What the replay
-/// reads that the instance does not own are the recording's host buffers: the run adds a handle to them to the caller's
-/// [`GraphHold`], which the caller holds in its quantum and drops in `Stage::retired`, after the device work ended, so
-/// the instance, the cache and the lane may all be gone by then without the work losing them.
+/// **When the instance goes back.** The caller's [`GraphHold`] parks the instance the replay ran on and gives it back to the
+/// cache when it is released, which is the same moment it lets go of the recording's host buffers: after the device work
+/// ended (a stage holds it in its quantum and drops it in `Stage::retired`). An instance is therefore never updated or
+/// launched again while a launch of its own is in flight. (Returning it as soon as the replay is enqueued would rest on
+/// the driver snapshotting a graph's parameters at the launch and ordering the launches of one executable; a stress test
+/// with overlapping quanta that reused instances at once lost an ordering in about one run in seventy, and none did once
+/// an instance was reused only after its launch ended.) The instances a key needs are the replays of it in flight at once,
+/// and the cache grows to that number during warm-up; a recording (a miss) leaves its instance free at once, since the
+/// recording ran the work as direct launches and no launch of the instance is in flight.
+///
+/// What the replay reads that the instance does not own are the recording's host buffers: the same hold keeps a handle to
+/// them, so the instance, the cache and the lane may all be gone by the time the work ends without the work losing them.
 ///
 /// **Markers.** Run it inside [`Lane::submit_marked`]: the marker is claimed before the run, any `Busy` comes before any
 /// replay, and the marker is recorded behind it (the closure's enqueue argument is not needed: the run reaches the lane
 /// through `lane`).
 pub struct SharedGraphCache<G: Gpu, K> {
-    pool: InstancePool<K, G::Graph>,
+    pool: Arc<InstancePool<K, G::Graph>>,
+    /// The pool as a hold gives an instance back to it.
+    giver: Arc<dyn GiveBack>,
     enabled: AtomicBool,
     replays: AtomicU64,
     records: AtomicU64,
@@ -263,21 +273,23 @@ impl<G: Gpu, K> std::fmt::Debug for SharedGraphCache<G, K> {
     }
 }
 
-impl<G: Gpu, K: Copy + Eq + Hash> Default for SharedGraphCache<G, K> {
+impl<G: Gpu, K: Copy + Eq + Hash + Send + 'static> Default for SharedGraphCache<G, K> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<G: Gpu, K: Copy + Eq + Hash> SharedGraphCache<G, K> {
+impl<G: Gpu, K: Copy + Eq + Hash + Send + 'static> SharedGraphCache<G, K> {
     pub fn new() -> Self {
         Self::with_capacity(DEFAULT_GRAPHS)
     }
 
     /// A cache of at most `instances` graph instances (all keys together).
     pub fn with_capacity(instances: usize) -> Self {
+        let pool = Arc::new(InstancePool::new(instances));
         Self {
-            pool: InstancePool::new(instances),
+            giver: pool.clone(),
+            pool,
             enabled: AtomicBool::new(true),
             replays: AtomicU64::new(0),
             records: AtomicU64::new(0),
@@ -340,6 +352,9 @@ impl<G: Gpu, K: Copy + Eq + Hash> SharedGraphCache<G, K> {
                 Ok(()) => {
                     graph.replay_on(lane, hold)?;
                     self.replays.fetch_add(1, Ordering::Relaxed);
+                    // The launch is in flight: the instance stays busy until the hold is released.
+                    let (index, tag) = lease.park();
+                    hold.add_instance(&self.giver, index, tag);
                     Ok(Ran::Replayed)
                 }
                 Err(GpuError::ShapeChanged { .. }) => {
@@ -813,7 +828,7 @@ mod shared_tests {
         assert!(cache.is_empty());
     }
 
-    /// What the recording keeps lives until the caller\'s hold is dropped: not until the cache, the graph or the lane
+    /// What the recording keeps lives until the caller's hold is dropped: not until the cache, the graph or the lane
     /// are gone, and not before the hold of the last run that used it.
     #[test]
     fn what_a_recording_keeps_is_held_by_the_callers_until_they_drop_their_holds() {
@@ -826,8 +841,8 @@ mod shared_tests {
         cache.run(&gpu, &lane, KEY, &mut b, &mut recorded).unwrap();
         let mut replayed = GraphHold::new();
         cache.run(&gpu, &lane, KEY, &mut b, &mut replayed).unwrap();
-        // The update pass\'s keeps are not the graph\'s: they were dropped at once, and the recording\'s are the one value.
-        assert_eq!(drops.load(Ordering::SeqCst), 1, "the update pass\'s value");
+        // The update pass's keeps are not the graph's: they were dropped at once, and the recording's are the one value.
+        assert_eq!(drops.load(Ordering::SeqCst), 1, "the update pass's value");
         // The cache goes (the instance with it): the work in flight still has its buffers.
         drop(cache);
         gpu.run_until_idle();
@@ -836,7 +851,7 @@ mod shared_tests {
         assert_eq!(
             drops.load(Ordering::SeqCst),
             1,
-            "the replay\'s hold has it too"
+            "the replay's hold has it too"
         );
         drop(replayed);
         assert_eq!(
@@ -844,6 +859,42 @@ mod shared_tests {
             2,
             "released with the last hold"
         );
+    }
+
+    /// An instance a replay ran on stays busy until the hold is released: its launch is in flight until the work ended, and
+    /// an instance is not updated or launched again meanwhile. (Reusing it at once lost an ordering between two lanes in
+    /// about one stress run in seven.)
+    #[test]
+    fn a_replayed_instance_is_busy_until_its_hold_is_released() {
+        let (gpu, lane, kernel, at) = rig();
+        let cache = SharedGraphCache::<FakeGpu, _>::new();
+        let mut b = body(&kernel, at, 1, 1);
+        let mut first = GraphHold::new();
+        assert_eq!(
+            cache.run(&gpu, &lane, KEY, &mut b, &mut first).unwrap(),
+            Ran::Recorded
+        );
+        let mut second = GraphHold::new();
+        assert_eq!(
+            cache.run(&gpu, &lane, KEY, &mut b, &mut second).unwrap(),
+            Ran::Replayed,
+            "a recording leaves its instance free at once"
+        );
+        let mut third = GraphHold::new();
+        assert_eq!(
+            cache.run(&gpu, &lane, KEY, &mut b, &mut third).unwrap(),
+            Ran::Recorded,
+            "the only instance has a replay in flight: a second one is recorded"
+        );
+        assert_eq!(cache.len(), 2);
+        second.release();
+        let mut fourth = GraphHold::new();
+        assert_eq!(
+            cache.run(&gpu, &lane, KEY, &mut b, &mut fourth).unwrap(),
+            Ran::Replayed,
+            "the hold was released: the instance is taken again"
+        );
+        assert_eq!(cache.len(), 2, "no instance was added");
     }
 
     /// Workers that run one key at once each get an instance of their own: none waits for another (they are held together
