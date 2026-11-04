@@ -174,7 +174,14 @@
   "name": "graph: stage graph, device control",
   "crate": "euhedral-graph",
   "commands": [
-   "cargo +nightly miri test -p euhedral-graph --lib -- stage_graph::tests::a_quantum_joins stage_graph::tests::a_device_failure stage_graph::tests::a_hook_runs stage_graph::tests::a_quantum_that_ran_nothing stage_graph::tests::a_refused_retirement stage_graph::tests::a_completion_edge_waits lanes::tests::a_fixed lanes::tests::a_reserved"
+   "cargo +nightly miri test -p euhedral-graph --lib -- stage_graph::tests::a_quantum_joins stage_graph::tests::a_device_failure stage_graph::tests::a_hook_runs stage_graph::tests::a_quantum_that_ran_nothing stage_graph::tests::a_refused_retirement"
+  ]
+ },
+ {
+  "name": "graph: completion edges, placement",
+  "crate": "euhedral-graph",
+  "commands": [
+   "cargo +nightly miri test -p euhedral-graph --lib -- stage_graph::tests::a_completion_edge_waits lanes::tests::a_fixed lanes::tests::a_reserved"
   ]
  },
  {
