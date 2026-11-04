@@ -81,6 +81,16 @@ external edges into stages that never ran). A quantum retires, handing itself an
 as one `Completions` edge per lane used; a host completion no completion edge consumed holds the quantum live
 until it is ready, so the quantum retires after it.
 
+**typed lane pool, lane handle** ([`LanePool`](src/lanes.rs), [`StageCx::lane_handle`](src/stage_graph.rs)): a pool is typed
+over its lane, as Java's `LanePool` holds `GpuStream`s. The default, `dyn DeviceQueue`, is the query side only; with a
+backend's shared lane type, a stage gets the lane it was given from its context and submits to it from whichever
+worker runs it. `LanePool::as_queues` is the query view that `Completions` polls.
+
+**placement, home lane** ([`Placement`](src/lanes.rs), [`LanePool::next_home`](src/lanes.rs)): how a stage that continues
+no lane picks one of its allowed lanes: at random from a per-thread generator (Java's `ThreadLocalRandom`; no shared
+counter), or in turns (deterministic, for tests). A root continues its run's home lane, taken in turn over the pool's
+lanes when the run is made (Java `nextHome`), so a graph's critical chain keeps one lane in every quantum.
+
 **pooled quantum, run** ([`StageGraph`](src/stage_graph.rs)): the state of one quantum (its counts, its
 markers, its first cause, its external-edge records) kept in a bounded pool and rebound to each quantum in
 turn. `start` takes one and `retire` gives it back, as the graph's frames (stage, arrival, boundary and

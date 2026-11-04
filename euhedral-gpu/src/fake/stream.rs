@@ -6,7 +6,7 @@ use std::time::Duration;
 use euhedral_graph::{DeviceQueue, LaneId, Marker, QueueId};
 
 use crate::kept::Kept;
-use crate::retire::{RetireSink, Retirements};
+use crate::retire::{RetireSink, Retirements, SharedRetire};
 use crate::spans::{Span, SpanBook};
 use crate::{Gpu, GpuError, POISONED_STATUS, RetireListener, RetireTicket, Stream, StreamPriority};
 
@@ -17,7 +17,7 @@ use super::{FAKE_GREATEST_PRIORITY, FAKE_NORMAL_PRIORITY, FakeEnqueue, FakeGpu, 
 /// The query side of a fake stream: what the pool and `Completions` hold. Shared and `Sync`.
 #[derive(Debug)]
 pub struct FakeQueue {
-    gpu: Arc<FakeGpu>,
+    pub(crate) gpu: Arc<FakeGpu>,
     id: QueueId,
     name: String,
     /// Global index of this stream's lane.
@@ -25,6 +25,21 @@ pub struct FakeQueue {
     /// The end of the retirement queue the device pushes to. It lives as long as the shared side does, as a driver's
     /// callback context would.
     sink: Arc<RetireSink>,
+    /// This lane's id in its pool, the first lane of the opening call and how many lanes it made: what a marker of
+    /// the pool is checked against.
+    pub(crate) lane: LaneId,
+    pub(crate) base: usize,
+    pub(crate) first: u16,
+    pub(crate) count: usize,
+    /// The retirement channel and kept values of the shared lane, apart from the owner stream's.
+    pub(crate) shared: SharedRetire,
+}
+
+impl FakeQueue {
+    /// Global index of this stream's lane.
+    pub(crate) fn global(&self) -> usize {
+        self.global
+    }
 }
 
 impl DeviceQueue for FakeQueue {
@@ -111,6 +126,11 @@ impl FakeStream {
             name: name.to_owned(),
             global: base + index,
             sink: Arc::new(sink),
+            lane,
+            base,
+            first,
+            count,
+            shared: SharedRetire::new(id, lane),
         });
         Self {
             gpu,
@@ -236,6 +256,7 @@ impl FakeStream {
 impl Stream for FakeStream {
     type Gpu = FakeGpu;
     type Enqueue<'a> = FakeEnqueue<'a>;
+    type Lane = FakeQueue;
 
     fn gpu(&self) -> &Arc<FakeGpu> {
         &self.gpu
@@ -250,6 +271,10 @@ impl Stream for FakeStream {
     }
 
     fn queue(&self) -> Arc<dyn DeviceQueue> {
+        self.queue.clone()
+    }
+
+    fn shared(&self) -> Arc<FakeQueue> {
         self.queue.clone()
     }
 

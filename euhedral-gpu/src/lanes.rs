@@ -12,7 +12,7 @@ use euhedral_graph::{
     Retired,
 };
 
-use crate::{Gpu, GpuError, Stream, StreamOptions};
+use crate::{Gpu, GpuError, Lane, Stream, StreamOptions};
 
 /// Why a stream looks at the device.
 #[cfg_attr(
@@ -111,6 +111,46 @@ where
         intakes,
         sources,
     })
+}
+
+/// A device's lanes as a typed pool that any worker submits to: [`StageCx::lane_handle`] of a stage graph on this pool is
+/// the lane, and the stage submits to it from whichever worker runs it.
+///
+/// [`StageCx::lane_handle`]: euhedral_graph::StageCx::lane_handle
+pub struct SharedLanes<L: Lane> {
+    /// The typed pool: lane `i` is the `i`-th spec.
+    pub pool: Arc<LanePool<L>>,
+    /// The same lanes as query queues, for [`Completions`](euhedral_graph::Completions) and the intakes.
+    pub queues: Arc<LanePool>,
+}
+
+impl<L: Lane> std::fmt::Debug for SharedLanes<L> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedLanes")
+            .field("lanes", &self.pool.len())
+            .finish()
+    }
+}
+
+/// Opens a device's lanes as one typed pool of shared lanes, `lanes[i]` as lane `i` (1 to 64). The streams'
+/// owners are dropped at once: each lane keeps its driver stream until the last handle goes.
+///
+/// `Err(Invalid)` for no lanes or more than 64.
+pub fn open_shared_lanes<G: Gpu>(
+    gpu: &Arc<G>,
+    lanes: &[(&str, StreamOptions)],
+) -> Result<SharedLanes<<G::Stream as Stream>::Lane>, GpuError> {
+    if lanes.is_empty() || lanes.len() > 64 {
+        return Err(GpuError::Invalid("a pool has 1 to 64 lanes".into()));
+    }
+    let names: Vec<&str> = lanes.iter().map(|(name, _)| *name).collect();
+    let options: Vec<StreamOptions> = lanes.iter().map(|(_, options)| *options).collect();
+    let streams = gpu.open_lanes_at(LaneId(0), &names, &options)?;
+    let handles = streams.iter().map(Stream::shared).collect();
+    drop(streams);
+    let pool = Arc::new(LanePool::typed(handles));
+    let queues = pool.as_queues();
+    Ok(SharedLanes { pool, queues })
 }
 
 /// `LaneSubmit` for a backend's stream: the methods delegate to the stream's own, with fully qualified calls.

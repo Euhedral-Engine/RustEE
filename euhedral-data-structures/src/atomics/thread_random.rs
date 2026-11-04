@@ -1,3 +1,5 @@
+//! A per-thread random stream.
+
 use std::cell::Cell;
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
@@ -11,8 +13,9 @@ fn seed() -> u64 {
     RandomState::new().build_hasher().finish()
 }
 
-/// The next value of a per-thread SplitMix64 stream, standing in for `ThreadLocalRandom.nextLong()`.
-pub(crate) fn next_u64() -> u64 {
+/// The next value of a per-thread SplitMix64 stream, standing in for `ThreadLocalRandom.nextLong()`. Not for
+/// anything secret.
+pub fn next_u64() -> u64 {
     STATE.with(|state| {
         let next = state.get().wrapping_add(0x9e37_79b9_7f4a_7c15);
         state.set(next);

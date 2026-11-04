@@ -83,20 +83,39 @@ pub trait DeviceQueue: Send + Sync + fmt::Debug {
     fn name(&self) -> &str;
 }
 
+/// How a stage that continues no lane picks one of its allowed lanes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Placement {
+    /// A random allowed lane from a per-thread generator (Java's `ThreadLocalRandom`): independent frames spread over
+    /// many device orderings and the workers that submit them rarely share one, with no shared counter to contend on.
+    #[default]
+    Random,
+    /// The allowed lanes in turn, from one shared counter. Deterministic, which tests need (Java's `fixed`
+    /// placement); a counter shared by every worker.
+    Turns,
+}
+
 /// The device lanes shared by every stage graph of a process.
 ///
 /// A stage chooses its lane each time it runs: it continues the lane of the predecessor whose
-/// critical successor it is (each stage's lane is continued by one successor only), or takes a lane
-/// in turn (a root, or any other branch of a fan-out). A dependency between stages on different
-/// lanes is a device-side wait on the predecessor's marker; stages on one lane rely on the lane's
+/// critical successor it is (each stage's lane is continued by one successor only), a root continues its graph's home
+/// lane ([`next_home`](Self::next_home)), and any other branch of a fan-out takes a random lane. A dependency between
+/// stages on different lanes is a device-side wait on the predecessor's marker; stages on one lane rely on the lane's
 /// order.
-pub struct LanePool {
-    lanes: Vec<Arc<dyn DeviceQueue>>,
-    /// The turn for stages that continue no lane.
+///
+/// The pool is typed over its lane, as Java's `LanePool` holds `GpuStream`s: with the default `dyn DeviceQueue` a lane
+/// is only the query side; a pool of a backend's shared lane type gives a stage the lane it was given to submit to
+/// (see [`StageCx::lane_handle`](crate::StageCx::lane_handle)).
+pub struct LanePool<L: DeviceQueue + ?Sized = dyn DeviceQueue> {
+    lanes: Vec<Arc<L>>,
+    placement: Placement,
+    /// The turn for stages that continue no lane ([`Placement::Turns`]).
     next: AtomicUsize,
+    /// The home lane of the next graph run ([`next_home`](Self::next_home)).
+    next_home: AtomicUsize,
 }
 
-impl fmt::Debug for LanePool {
+impl<L: DeviceQueue + ?Sized> fmt::Debug for LanePool<L> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LanePool")
             .field("lanes", &self.lanes.len())
@@ -107,14 +126,43 @@ impl fmt::Debug for LanePool {
 impl LanePool {
     /// A pool over `lanes`; [`LaneId`] `i` is `lanes[i]`. Panics with no lanes or more than 64.
     pub fn new(lanes: Vec<Arc<dyn DeviceQueue>>) -> Self {
+        Self::typed(lanes)
+    }
+}
+
+impl<L: DeviceQueue + Sized + 'static> LanePool<L> {
+    /// The query side of this pool: the same lanes as `dyn DeviceQueue`, for what polls them without submitting
+    /// ([`Completions`](crate::Completions), the lane intakes). Made once, at set-up.
+    pub fn as_queues(&self) -> Arc<LanePool> {
+        let queues = self
+            .lanes
+            .iter()
+            .map(|lane| lane.clone() as Arc<dyn DeviceQueue>)
+            .collect();
+        Arc::new(LanePool::new(queues).with_placement(self.placement))
+    }
+}
+
+impl<L: DeviceQueue + ?Sized> LanePool<L> {
+    /// A pool over lanes of one type; [`LaneId`] `i` is `lanes[i]`. Panics with no lanes or more than 64.
+    pub fn typed(lanes: Vec<Arc<L>>) -> Self {
         assert!(
             !lanes.is_empty() && lanes.len() <= 64,
             "a lane pool needs 1 to 64 lanes"
         );
         Self {
             lanes,
+            placement: Placement::default(),
             next: AtomicUsize::new(0),
+            next_home: AtomicUsize::new(0),
         }
+    }
+
+    /// The same pool with `placement` for stages that continue no lane.
+    #[must_use]
+    pub fn with_placement(mut self, placement: Placement) -> Self {
+        self.placement = placement;
+        self
     }
 
     pub fn len(&self) -> usize {
@@ -125,7 +173,7 @@ impl LanePool {
         self.lanes.is_empty()
     }
 
-    pub fn lane(&self, id: LaneId) -> &Arc<dyn DeviceQueue> {
+    pub fn lane(&self, id: LaneId) -> &Arc<L> {
         &self.lanes[id.0 as usize]
     }
 
@@ -145,10 +193,17 @@ impl LanePool {
         self.lanes.iter().all(|q| q.completed() >= q.issued())
     }
 
+    /// The home lane of a new graph run, taken in turn over the pool's lanes (Java `LanePool.nextHome`): the lane its
+    /// roots, and so its critical chain, continue in every quantum.
+    pub fn next_home(&self) -> LaneId {
+        let turn = self.next_home.fetch_add(1, Ordering::Relaxed) % self.lanes.len();
+        LaneId(u16::try_from(turn).expect("at most 64 lanes"))
+    }
+
     /// The lane for a stage: `continued` (the lane of the predecessor it is the critical successor
-    /// of) when given and among `allowed`, otherwise one of `allowed` in turn. `allowed` lists the lanes able to run
-    /// the stage's kind of work (compute, copy, a hardware engine). Panics if `allowed` is empty (a
-    /// CPU-only stage chooses no lane).
+    /// of, or the home lane of a root) when given and among `allowed`, otherwise one of `allowed` by the pool's
+    /// [`Placement`]. `allowed` lists the lanes able to run the stage's kind of work (compute, copy, a hardware
+    /// engine). Panics if `allowed` is empty (a CPU-only stage chooses no lane).
     pub fn choose(&self, allowed: &[LaneId], continued: Option<LaneId>) -> LaneId {
         assert!(
             !allowed.is_empty(),
@@ -162,7 +217,13 @@ impl LanePool {
         if let [only] = allowed {
             return *only;
         }
-        allowed[self.next.fetch_add(1, Ordering::Relaxed) % allowed.len()]
+        let pick = match self.placement {
+            Placement::Random => {
+                euhedral_data_structures::atomics::thread_random::next_u64() as usize
+            }
+            Placement::Turns => self.next.fetch_add(1, Ordering::Relaxed),
+        };
+        allowed[pick % allowed.len()]
     }
 }
 
@@ -307,8 +368,52 @@ mod tests {
     }
 
     #[test]
-    fn otherwise_it_takes_its_allowed_lanes_in_turn() {
+    fn a_random_placement_picks_only_allowed_lanes_and_reaches_every_one() {
         let pool = pool(4);
+        let allowed = [LaneId(1), LaneId(2), LaneId(3)];
+        let mut seen = [false; 4];
+        for _ in 0..2_000 {
+            let lane = pool.choose(&allowed, Some(LaneId(0)));
+            assert!(
+                allowed.contains(&lane),
+                "a lane it may not run on: {lane:?}"
+            );
+            seen[usize::from(lane.0)] = true;
+        }
+        assert_eq!(
+            seen,
+            [false, true, true, true],
+            "every allowed lane, and no other"
+        );
+    }
+
+    #[test]
+    fn a_random_placement_shares_no_counter_between_threads() {
+        // The turn counter of `Turns` is untouched by `Random`: the pool places in turns only when asked to.
+        let pool = pool(2);
+        for _ in 0..10 {
+            pool.choose(&[LaneId(0), LaneId(1)], None);
+        }
+        assert_eq!(pool.next.load(Ordering::Relaxed), 0);
+        let turns = pool.with_placement(Placement::Turns);
+        turns.choose(&[LaneId(0), LaneId(1)], None);
+        assert_eq!(turns.next.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn homes_are_taken_in_turn_over_the_lanes() {
+        let pool = pool(3);
+        let homes: Vec<LaneId> = (0..7).map(|_| pool.next_home()).collect();
+        assert_eq!(
+            homes,
+            [0, 1, 2, 0, 1, 2, 0].map(LaneId),
+            "Java `nextHome`: a graph's home lane, round robin"
+        );
+    }
+
+    #[test]
+    fn otherwise_it_takes_its_allowed_lanes_in_turn() {
+        let pool = pool(4).with_placement(Placement::Turns);
         let compute = [LaneId(1), LaneId(2), LaneId(3)];
         let chosen: Vec<LaneId> = (0..6)
             .map(|_| pool.choose(&compute, Some(LaneId(0))))

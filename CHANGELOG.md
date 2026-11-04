@@ -3,6 +3,37 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## A stage submits to its lane directly, as in Java (2026-11-04)
+
+**What.** A stage of a `StageGraph` can submit device work to the lane it runs on, from whichever worker runs it, and return the marker of that work synchronously.
+- `euhedral-graph`: `LanePool`, `GraphRuntime`, `StageCx`, `Stage` and `StageGraph` take a lane type `L` (default `dyn DeviceQueue`, the query side, so existing code is unchanged). `StageCx::lane_handle()` is the lane the stage was given. `LanePool::typed`, `LanePool::as_queues` (the query view for `Completions`), `LanePool::next_home`, `Placement`.
+- `euhedral-gpu`: the `Lane` trait, the shared submit side of a lane (`CudaQueue`, `FakeQueue`): `submit`, `mark`, `await_marker`, `arm_retirement`, `poll_retired` and `confirm_retired` through `&self`. `Stream::shared()` is the handle; `open_shared_lanes` opens a device's lanes as a typed pool (`SharedLanes`).
+- `euhedral-data-structures`: `atomics::thread_random` is public (`next_u64`, the per-thread generator).
+
+**Why.** Java's `GpuStream.submit` runs on the calling thread, from any worker, and the driver serializes the launches on one stream; RustEE's streams took `&mut self`, owned by a lane source, so a stage could not launch on its lane and return `Submitted::marker`. The user chose Java's model: a shared stream that any worker submits to, not routing by lane hash.
+
+**Java correspondence.**
+- `GpuStream.submit(Runnable, overlap)` on the calling thread: `Lane::submit(&self, f)`.
+- `GpuStream.mark(marker)`, which records after all the work submitted so far (it may include another thread's work, which only over-waits): `Lane::mark`. Java opens a reusable event per marker (`openMarker`, `closeMarker`); RustEE keeps its ring of events and numbers, so that `DeviceQueue::completed` stays a monotonic count that `Completions` polls. The numbers are handed out by compare-and-set and found complete by an in-order scan (`ring.rs`).
+- `GpuStream.await(marker)`: `Lane::await_marker`, with the pin handshake that keeps a slot from being re-recorded under an awaiter.
+- `GpuStream.notifyRetired` / `confirmRetired`: `Lane::arm_retirement` / `poll_retired` / `confirm_retired`. The callback only queues; the ticket is polled and settled by a frame, never in a source's `request` or `pull`.
+- `LanePool.choose` and `nextHome`: see Drift.
+
+**Semantics.**
+- The marker ring is lock-free for any number of submitters (`MarkerRing`): `claimed` by compare-and-set after checking the slot's previous marker completed; `recorded[slot]` stored after the record call; `done` advanced by scans that stop at a number whose record is not stored. A claimant that cannot record (an awaiter keeps the slot pinned through 16384 looks, or the driver refuses) stores the number as skipped, a hole nobody was given, and answers `Err(Busy)`. `issued()` is the highest number claimed. The owned `CudaStream` uses the same ring; an owner and a shared handle can both mark.
+- A shared lane's retirement channel is separate from its owner stream's. Arming and polling go through a try-claim over the channel (`ClaimCell`): `arm_retirement` answers `Err(Busy)` and `poll_retired` finds nothing when another thread holds it. Kept values (`Enqueue::keep` from any worker) are pushed to a lock-free queue tagged with the number of retirements armed; retirement `s` releases the values tagged `s` or less, in `confirm_retired`, one at a time outside the claim. A value may wait for a later retirement than the first that covers it, never for an earlier one.
+- The driver stream now belongs to `CudaQueue` and is destroyed, after its work, with the last handle. `CudaStream`'s drop still waits for its work and callbacks.
+- The stage graph's boundary is unchanged: one `Completions` marker edge per lane the quantum used. Java joins every used lane to the home lane on the device (`home.await(tail)`) and arms one retirement; `DeviceQueue` has no mark/await, and the markers are polled either way.
+
+**Drift from Java fixed.**
+- `LanePool::choose` took the allowed lanes in turn from one counter shared by every worker. Java picks a random compute lane from `ThreadLocalRandom`, so that independent frames spread over many device orderings and the workers that submit them rarely share one, and nothing contends. The default is now random (`Placement::Random`, a per-thread generator); `Placement::Turns` keeps the deterministic turns, which tests use (Java's `fixed` placement).
+- A root took a lane in turn. In Java a root continues its graph's home lane (`continuedLane`: no submitted predecessors), taken in turn per graph (`nextHome`), so each graph's critical chain keeps one lane in every quantum. A run now has a home lane taken in turn over the pool when the run is made, and a root continues it when it is allowed there.
+- Kept as RustEE extensions: a stage's allowed lanes (Java: compute lanes plus an optional reserved transfer lane, and no continuing of a transfer chain; RustEE: any set of lanes per stage, and a continued lane must be among them).
+
+**Migration.** Nothing breaks for existing users: the new type parameters default to `dyn DeviceQueue`, `LanePool::new` is unchanged, `Stream` gains the associated type `Lane` and the method `shared` (an implementor outside this repository must add them), and `LaneSource` consumes the owned stream as before. `Placement::Random` is the new default for stages that continue no lane: code that relied on the old turns passes `.with_placement(Placement::Turns)`. A stage that wants the one-allocation-free path keeps an `Args` it rewrites in place (a thread-local or its quantum's).
+
+**Tests.** `euhedral-gpu/src/ring.rs` (unit tests, a stress test with 8 threads, loom models `loom_two_markers_get_distinct_numbers_and_both_complete` and `loom_a_scan_never_vouches_for_a_marker_still_being_recorded`); `retire::tests::shared` (arms from 8 threads come back in order once each, kept values released once); `tests/fake_shared_lane.rs` (a stage submits on its lane and a successor on another awaits its marker, the boundary covers both lanes; 8 workers on one lane; retirement settled in a frame); `tests/cuda_shared_lane.rs` (16 workers on one lane: 3200 launches and markers, distinct, contiguous, rising per worker, all complete; a two-lane graph run by 4 workers: the second stage's wait is what orders it, 64 quanta; retirement from 4 threads settled in a `Completions` frame, 40 kept values released once); `tests/cuda_stage_alloc.rs` (2000 quanta of two stages that launch, wait and mark: 0 allocations after warm-up); `stage_graph::tests::a_stage_reaches_its_lane_through_a_typed_pool`, `a_root_continues_its_runs_home_lane`, and the `lanes` tests of the random placement and `next_home`.
+
 ## A stage graph's quantum takes no lock of its own and allocates nothing after warm-up (2026-11-03)
 
 **What.** `StageGraph`'s per-quantum path no longer takes a lock of its own (the `HOT-FIX` ids G10 to G15 are gone) and no longer allocates once

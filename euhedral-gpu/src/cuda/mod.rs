@@ -6,6 +6,7 @@
 mod enqueue;
 pub mod fns;
 mod graph;
+mod lane;
 mod module;
 pub mod nvrtc;
 mod retire;
@@ -14,6 +15,7 @@ pub mod texture;
 
 pub use enqueue::CudaEnqueue;
 pub use graph::{CudaGraph, CudaSequence};
+pub use lane::CudaLaneEnqueue;
 pub use module::{CudaKernel, CudaModule};
 pub use nvrtc::{Nvrtc, Target};
 #[cfg(feature = "test-hooks")]

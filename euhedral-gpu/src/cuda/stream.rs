@@ -1,14 +1,14 @@
 //! CUDA streams as device lanes: an event ring behind `DeviceQueue::completed`, device-side awaits, and enqueueing.
 
+use std::mem::ManuallyDrop;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use euhedral_graph::{DeviceQueue, LaneId, Marker, QueueId};
 use euhedral_memory::cuda::{CuEvent, CuStream, Device, STREAM_NON_BLOCKING};
 
 use crate::kept::Kept;
-use crate::retire::{RetireSink, Retirements};
+use crate::retire::{RetireSink, Retirements, SharedRetire};
 use crate::spans::{Span, SpanBook};
 use crate::{
     GpuError, POISONED_STATUS, RetireListener, RetireTicket, Stream, StreamOptions, StreamPriority,
@@ -16,6 +16,7 @@ use crate::{
 
 use super::{CudaEnqueue, CudaGpu, from_cuda};
 use crate::lanes::Probe;
+use crate::ring::{MarkerRing, Query};
 
 /// How often a stream with retirements outstanding looks at the device while no callback arrives: one event query.
 const PROBE_EVERY: Duration = Duration::from_millis(1);
@@ -27,86 +28,19 @@ const EVENT_DEFAULT: u32 = 0;
 /// `CUDA_ERROR_NOT_READY`, from `cuEventQuery` while the work before the event runs.
 const NOT_READY: i32 = 600;
 
-/// Keeps a marker slot from being re-recorded under an awaiter, without a lock.
-///
-/// Value `v` is recorded in slot `v % n`; the owner may record `v + n` there once `v` is complete. An awaiter of `v`
-/// that has found `v` incomplete must enqueue its wait on the slot's event *while the slot still holds `v`'s record*,
-/// or it would wait for the later value `v + n`, which can deadlock. The two sides meet in a Dekker handshake of
-/// sequentially consistent operations:
-/// - the **owner** announces the value it is about to record (`reserved = w`) and then reads the slot's pin count:
-///   a pinned slot is not recorded, and the owner returns `Busy` (it never waits);
-/// - an **awaiter** raises the slot's pin count and then reads `reserved`: if the owner is already past `v`
-///   (`reserved >= v + n`) the slot is being (or has been) re-recorded, which the owner does only when `v` is
-///   complete, so there is nothing to wait for and the pin is dropped.
-///
-/// Whichever of the two reads comes second sees the other's write, so an awaiter that keeps its pin always has the
-/// slot as `v` left it, until it lowers the pin after `cuStreamWaitEvent`. A pin is held for one driver call.
-#[derive(Debug)]
-struct SlotPins {
-    pins: Vec<AtomicU32>,
-    reserved: AtomicU64,
-}
-
-/// A raised pin on a marker slot; lowers it on drop.
-struct Pin<'a>(&'a AtomicU32);
-
-impl Drop for Pin<'_> {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
-impl SlotPins {
-    fn new(slots: usize) -> Self {
-        Self {
-            pins: (0..slots).map(|_| AtomicU32::new(0)).collect(),
-            reserved: AtomicU64::new(0),
-        }
-    }
-
-    fn slots(&self) -> u64 {
-        self.pins.len() as u64
-    }
-
-    /// The owner is about to record value `w`. `Err(Busy)` if an awaiter holds the slot (nothing is reserved then).
-    fn begin_record(&self, w: u64) -> Result<(), GpuError> {
-        self.reserved.store(w, Ordering::SeqCst);
-        if self.pins[(w % self.slots()) as usize].load(Ordering::SeqCst) != 0 {
-            self.reserved.store(w - 1, Ordering::SeqCst);
-            return Err(GpuError::Busy);
-        }
-        Ok(())
-    }
-
-    /// An awaiter of value `v`. `Some(pin)`: the slot holds `v`'s record until the pin drops. `None`: the owner has
-    /// started re-recording the slot, so `v` is complete and needs no wait.
-    fn pin(&self, v: u64) -> Option<Pin<'_>> {
-        let slot = &self.pins[(v % self.slots()) as usize];
-        slot.fetch_add(1, Ordering::SeqCst);
-        if self.reserved.load(Ordering::SeqCst) >= v + self.slots() {
-            slot.fetch_sub(1, Ordering::SeqCst);
-            return None;
-        }
-        Some(Pin(slot))
-    }
-}
-
-/// A lane's marker events: value `v` is recorded in slot `v % events.len()`.
+/// A lane's marker events: value `v` is recorded in slot `v % events.len()`, by the protocol of [`MarkerRing`].
 #[derive(Debug)]
 pub(crate) struct LaneRing {
     /// The identity of the stream this ring belongs to, stamped on its markers.
     id: QueueId,
     device: Arc<Device>,
     events: Vec<CuEvent>,
-    /// Markers made so far (the highest value), and the highest value known complete.
-    marked: AtomicU64,
-    done: AtomicU64,
-    /// Keeps a slot from being re-recorded under an awaiter.
-    pins: SlotPins,
+    /// The numbers: claimed, published and complete, and the handshake with awaiters.
+    ring: MarkerRing,
 }
 
-// SAFETY: events of the primary context; `marked` has one writer (the stream's owner) and `done` only grows; the pins
-// are atomics.
+// SAFETY: events of the primary context, which any thread may record and query with the context current; the ring is
+// atomics.
 unsafe impl Send for LaneRing {}
 // SAFETY: as above.
 unsafe impl Sync for LaneRing {}
@@ -120,9 +54,7 @@ impl LaneRing {
             id,
             device: device.clone(),
             events: Vec::with_capacity(markers as usize),
-            marked: AtomicU64::new(0),
-            done: AtomicU64::new(0),
-            pins: SlotPins::new(markers as usize),
+            ring: MarkerRing::new(markers as usize),
         };
         for _ in 0..markers {
             let mut event = std::ptr::null_mut();
@@ -135,37 +67,25 @@ impl LaneRing {
     }
 
     fn slot(&self, value: u64) -> CuEvent {
-        self.events[(value % self.events.len() as u64) as usize]
+        self.events[self.ring.slot(value)]
     }
 
     /// Advances `done` over the markers that completed. The context is current. A query that fails for any reason
     /// but "not ready" poisons the device, so `completed` reports every marker and nothing is stranded behind it.
     fn scan(&self, gpu: &CudaGpu) {
         let f = &gpu.device().driver.fns;
-        let marked = self.marked.load(Ordering::Acquire);
-        let from = self.done.load(Ordering::Acquire);
-        let (done, failed) = advance(from, marked, |value| {
+        let failed = self.ring.scan(|slot| {
             // SAFETY: an event of this ring; the context is current.
-            unsafe { (f.event_query)(self.slot(value)) }
+            match unsafe { (f.event_query)(self.events[slot]) } {
+                0 => Query::Done,
+                NOT_READY => Query::Pending,
+                other => Query::Failed(other),
+            }
         });
-        self.done.fetch_max(done, Ordering::AcqRel);
         if let Some(code) = failed {
             gpu.fail("cuEventQuery", code);
         }
     }
-}
-
-/// Walks the markers after `done` up to `marked`, asking `query` (a driver result code) about each. Returns the new
-/// `done` and the error code that stopped the walk, if it was neither success nor "not ready".
-fn advance(mut done: u64, marked: u64, mut query: impl FnMut(u64) -> i32) -> (u64, Option<i32>) {
-    while done < marked {
-        match query(done + 1) {
-            0 => done += 1,
-            NOT_READY => return (done, None),
-            other => return (done, Some(other)),
-        }
-    }
-    (done, None)
 }
 
 impl Drop for LaneRing {
@@ -231,23 +151,135 @@ impl Drop for SpanEvents {
     }
 }
 
-/// The query side of a CUDA stream: what the pool and `Completions` hold. It reads the marker ring's atomics and asks
-/// the driver whether an event completed; it never waits and takes no lock.
+/// The shared side of a CUDA stream: what the pool and `Completions` hold, and what any worker submits to (it is the
+/// stream's [`Lane`](crate::Lane)). Query methods read the marker ring's atomics and ask the driver whether an event
+/// completed; they never wait and take no lock. It owns the driver stream, which is destroyed (after its work) when the
+/// last handle goes.
 #[derive(Debug)]
 pub struct CudaQueue {
-    gpu: Arc<CudaGpu>,
-    ring: Arc<LaneRing>,
+    pub(crate) gpu: Arc<CudaGpu>,
+    pub(crate) ring: Arc<LaneRing>,
     name: String,
+    pub(crate) lane: LaneId,
+    /// The driver stream this queue stands for: usable from any thread with the context current.
+    pub(crate) raw: CuStream,
+    /// The rings of the lanes the opening call made, at their lane ids; the ids below the call's first lane are
+    /// `None`. An await accepts only these lanes' markers.
+    lanes: Arc<[Option<Arc<LaneRing>>]>,
     /// The callback's end of the stream's retirement queue. Its address is the callbacks' user data, so it must outlive
     /// every callback the stream armed. The stream's drop waits for them (`cuStreamSynchronize`); if that wait cannot
     /// complete (the context is lost, or the wait fails) and retirements are still outstanding, the drop leaks one
     /// reference to this shared side, so the sink is never freed under a callback that is still to run.
     sink: RetireSink,
+    /// The retirement channel and kept values of the shared lane, apart from the owner stream's. Not dropped when the
+    /// wait for its callbacks failed.
+    pub(crate) shared: ManuallyDrop<SharedRetire>,
 }
+
+// SAFETY: the stream handle belongs to the primary context and is usable from any thread with it current; everything
+// else is atomics, immutable, or reached through a claim.
+unsafe impl Send for CudaQueue {}
+// SAFETY: as above.
+unsafe impl Sync for CudaQueue {}
 
 impl CudaQueue {
     pub(crate) fn sink(&self) -> &RetireSink {
         &self.sink
+    }
+
+    /// A marker after the work submitted so far (which may include other threads' work: that only over-waits). The
+    /// context is current. Any thread may call it.
+    pub(crate) fn mark_now(&self) -> Result<Marker, GpuError> {
+        self.gpu.poison.check()?;
+        let ring = &self.ring;
+        let f = &self.gpu.device().driver.fns;
+        let value = ring.ring.mark(
+            || ring.scan(&self.gpu),
+            |slot| {
+                // SAFETY: the slot's event and this stream; the slot's previous marker completed and no awaiter holds
+                // the slot (`MarkerRing::mark`); the context is current.
+                self.gpu.check("cuEventRecord", unsafe {
+                    (f.event_record)(ring.events[slot], self.raw)
+                })
+            },
+        )?;
+        Ok(Marker::new(self.ring.id, self.lane, value))
+    }
+
+    /// Later work on `target` (this stream, or its shadow) waits for `marker`. The context is current.
+    pub(crate) fn await_now(&self, target: CuStream, marker: Marker) -> Result<(), GpuError> {
+        self.gpu.poison.check()?;
+        let other = self
+            .lanes
+            .get(usize::from(marker.lane.0))
+            .and_then(Option::as_ref)
+            .filter(|ring| ring.id == marker.queue)
+            .ok_or_else(|| {
+                GpuError::Invalid(format!(
+                    "{} lane {} is not a lane of this stream's pool",
+                    marker.queue, marker.lane.0
+                ))
+            })?;
+        if marker.value == 0 {
+            return Ok(());
+        }
+        if marker.value > other.ring.claimed() {
+            return Err(GpuError::Invalid("a marker that was never made".into()));
+        }
+        if marker.value <= other.ring.done() {
+            return Ok(());
+        }
+        other.scan(&self.gpu);
+        if marker.value <= other.ring.done() {
+            return Ok(());
+        }
+        // The slot must still hold this value's record when the wait is enqueued (see `MarkerRing`).
+        let Some(_pin) = other.ring.pin(marker.value) else {
+            return Ok(());
+        };
+        // SAFETY: an event of the pool's ring and a stream of this device; the pin keeps a claimant from re-recording
+        // the slot; the context is current.
+        self.gpu.check("cuStreamWaitEvent", unsafe {
+            (self.gpu.fns.stream_wait_event)(target, other.slot(marker.value), 0)
+        })
+    }
+
+    /// Whether `marker` names a lane this stream's opening call made, under that lane's queue.
+    pub(crate) fn owns_marker_lane(&self, marker: Marker) -> bool {
+        self.lanes
+            .get(usize::from(marker.lane.0))
+            .and_then(Option::as_ref)
+            .is_some_and(|ring| ring.id == marker.queue)
+    }
+
+    /// One look at the device: a query of the stream's marker events, which poisons the device when the query fails for
+    /// any reason but "not ready".
+    pub(crate) fn look(&self) {
+        let _ = DeviceQueue::completed(self);
+    }
+}
+
+impl Drop for CudaQueue {
+    /// The last handle is gone: the stream's work, and every callback it armed, ends before the stream is destroyed.
+    fn drop(&mut self) {
+        let mut waited = false;
+        if let Ok(_c) = self.gpu.device().enter() {
+            let f = &self.gpu.device().driver.fns;
+            // SAFETY: the stream this value stands for, no longer in use; the context is current.
+            waited = unsafe { (f.stream_synchronize)(self.raw) } == 0;
+            // SAFETY: as above.
+            unsafe { (f.stream_destroy)(self.raw) };
+        }
+        let pending = self.shared.callbacks_pending();
+        if waited || !pending {
+            // SAFETY: as above.
+            unsafe { ManuallyDrop::drop(&mut self.shared) };
+        } else {
+            // The wait did not complete while a callback armed here is still to arrive, and each pushes into the
+            // sink: keep it for good, the price of never freeing the sink under a callback.
+            #[cfg(feature = "test-hooks")]
+            LEAKED_SHARED_SIDES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 
@@ -258,19 +290,19 @@ impl DeviceQueue for CudaQueue {
 
     fn completed(&self) -> u64 {
         if self.gpu.poison.get().is_some() {
-            return self.ring.marked.load(Ordering::Acquire);
+            return self.ring.ring.claimed();
         }
         if let Ok(_c) = self.gpu.device().enter().map_err(from_cuda) {
             self.ring.scan(&self.gpu);
         }
         if self.gpu.poison.get().is_some() {
-            return self.ring.marked.load(Ordering::Acquire);
+            return self.ring.ring.claimed();
         }
-        self.ring.done.load(Ordering::Acquire)
+        self.ring.ring.done()
     }
 
     fn issued(&self) -> u64 {
-        self.ring.marked.load(Ordering::Acquire)
+        self.ring.ring.claimed()
     }
 
     fn name(&self) -> &str {
@@ -287,10 +319,6 @@ pub struct CudaStream {
     lane: LaneId,
     pub(crate) raw: CuStream,
     pub(crate) queue: Arc<CudaQueue>,
-    ring: Arc<LaneRing>,
-    /// The rings of the lanes the opening call made, at their lane ids; the ids below the call's first lane are
-    /// `None`. An await accepts only these lanes' markers.
-    lanes: Arc<[Option<Arc<LaneRing>>]>,
     /// The stream a recording captures this stream's work on, made on first use.
     pub(crate) shadow: Option<CuStream>,
     /// The owner's end of the retirement queue, and the retirements armed.
@@ -372,12 +400,14 @@ impl CudaStream {
                 raw,
                 queue: Arc::new(CudaQueue {
                     gpu: gpu.clone(),
-                    ring: ring.clone(),
+                    ring,
                     name: (*name).to_owned(),
+                    lane,
+                    raw,
+                    lanes: lanes.clone(),
                     sink,
+                    shared: ManuallyDrop::new(SharedRetire::new(ring_id, lane)),
                 }),
-                ring,
-                lanes: lanes.clone(),
                 shadow: None,
                 retire,
                 kept: Kept::default(),
@@ -402,64 +432,12 @@ impl CudaStream {
 
     /// A marker after the work submitted so far. The context is current.
     pub(crate) fn mark_now(&self) -> Result<Marker, GpuError> {
-        self.gpu.poison.check()?;
-        let ring = &self.ring;
-        let n = ring.events.len() as u64;
-        let value = ring.marked.load(Ordering::Acquire) + 1;
-        if value > n && value - n > ring.done.load(Ordering::Acquire) {
-            ring.scan(&self.gpu);
-            if value - n > ring.done.load(Ordering::Acquire) {
-                return Err(GpuError::Busy);
-            }
-        }
-        // An awaiter may be about to wait on the slot's previous record: then this is `Busy`, not a wait.
-        ring.pins.begin_record(value)?;
-        let f = &self.gpu.device().driver.fns;
-        // SAFETY: the slot's event and this stream; the slot's previous marker completed (checked above), and no
-        // awaiter holds the slot (`begin_record`).
-        self.gpu.check("cuEventRecord", unsafe {
-            (f.event_record)(ring.slot(value), self.raw)
-        })?;
-        ring.marked.store(value, Ordering::Release);
-        Ok(Marker::new(self.id, self.lane, value))
+        self.queue.mark_now()
     }
 
     /// Later work on `target` (this stream, or its shadow) waits for `marker`. The context is current.
     pub(crate) fn await_now(&self, target: CuStream, marker: Marker) -> Result<(), GpuError> {
-        self.gpu.poison.check()?;
-        let other = self
-            .lanes
-            .get(usize::from(marker.lane.0))
-            .and_then(Option::as_ref)
-            .filter(|ring| ring.id == marker.queue)
-            .ok_or_else(|| {
-                GpuError::Invalid(format!(
-                    "{} lane {} is not a lane of this stream's pool",
-                    marker.queue, marker.lane.0
-                ))
-            })?;
-        if marker.value == 0 {
-            return Ok(());
-        }
-        if marker.value > other.marked.load(Ordering::Acquire) {
-            return Err(GpuError::Invalid("a marker that was never made".into()));
-        }
-        if marker.value <= other.done.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        other.scan(&self.gpu);
-        if marker.value <= other.done.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        // The slot must still hold this value's record when the wait is enqueued (see `SlotPins`).
-        let Some(_pin) = other.pins.pin(marker.value) else {
-            return Ok(());
-        };
-        // SAFETY: an event of the pool's ring and a stream of this device; the pin keeps the owner from re-recording
-        // the slot; the context is current.
-        self.gpu.check("cuStreamWaitEvent", unsafe {
-            (self.gpu.fns.stream_wait_event)(target, other.slot(marker.value), 0)
-        })
+        self.queue.await_now(target, marker)
     }
 
     /// One look at the device: a query of the stream's marker events, which poisons the device when the query fails for
@@ -474,7 +452,7 @@ impl CudaStream {
         if mode == Probe::Idle && self.retire.outstanding() == 0 {
             return;
         }
-        if self.ring.done.load(Ordering::Acquire) >= self.ring.marked.load(Ordering::Acquire) {
+        if self.queue.ring.ring.done() >= self.queue.ring.ring.claimed() {
             return;
         }
         if mode == Probe::Idle {
@@ -487,15 +465,12 @@ impl CudaStream {
             }
             self.last_probe = Some(now);
         }
-        let _ = DeviceQueue::completed(&*self.queue);
+        self.queue.look();
     }
 
     /// Whether `marker` names a lane this stream's opening call made, under that lane's queue.
     pub(crate) fn owns_marker_lane(&self, marker: Marker) -> bool {
-        self.lanes
-            .get(usize::from(marker.lane.0))
-            .and_then(Option::as_ref)
-            .is_some_and(|ring| ring.id == marker.queue)
+        self.queue.owns_marker_lane(marker)
     }
 
     /// Arms a retirement: the callback is enqueued first, and registered once the driver accepted it.
@@ -516,12 +491,12 @@ impl CudaStream {
 
 /// How many shared sides were leaked by streams that could not wait for their callbacks (test builds only).
 #[cfg(feature = "test-hooks")]
-static LEAKED_SHARED_SIDES: AtomicU64 = AtomicU64::new(0);
+static LEAKED_SHARED_SIDES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// A test hook (feature `test-hooks`): how many stream drops leaked their shared side.
 #[cfg(feature = "test-hooks")]
 pub fn leaked_shared_sides() -> u64 {
-    LEAKED_SHARED_SIDES.load(Ordering::Relaxed)
+    LEAKED_SHARED_SIDES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 impl Drop for CudaStream {
@@ -540,9 +515,9 @@ impl Drop for CudaStream {
             };
             waited = a == 0 && b == 0;
             self.kept.clear();
+            // The driver stream itself belongs to the shared queue, which destroys it with its last handle.
             // SAFETY: as above.
             unsafe {
-                (f.stream_destroy)(self.raw);
                 if let Some(shadow) = self.shadow {
                     (f.stream_destroy)(shadow);
                 }
@@ -555,7 +530,7 @@ impl Drop for CudaStream {
             // for good: a leaked reference is the price of never freeing the sink under a callback.
             std::mem::forget(self.queue.clone());
             #[cfg(feature = "test-hooks")]
-            LEAKED_SHARED_SIDES.fetch_add(1, Ordering::Relaxed);
+            LEAKED_SHARED_SIDES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
 }
@@ -563,6 +538,7 @@ impl Drop for CudaStream {
 impl Stream for CudaStream {
     type Gpu = CudaGpu;
     type Enqueue<'a> = CudaEnqueue<'a>;
+    type Lane = CudaQueue;
 
     /// Synchronizes the stream (and its shadow stream): the work submitted so far and its callbacks have ended on return,
     /// unless the context is lost.
@@ -592,6 +568,10 @@ impl Stream for CudaStream {
     }
 
     fn queue(&self) -> Arc<dyn DeviceQueue> {
+        self.queue.clone()
+    }
+
+    fn shared(&self) -> Arc<CudaQueue> {
         self.queue.clone()
     }
 
@@ -737,105 +717,5 @@ impl Stream for CudaStream {
         } else {
             Some(err)
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_walk_stops_at_the_first_marker_not_ready() {
-        let results = [0, 0, NOT_READY, 0];
-        let (done, failed) = advance(0, 4, |v| results[(v - 1) as usize]);
-        assert_eq!((done, failed), (2, None));
-        assert_eq!(advance(2, 2, |_| unreachable!()), (2, None));
-    }
-
-    #[test]
-    fn a_walk_reports_an_error_other_than_not_ready() {
-        let results = [0, 101, 0];
-        let (done, failed) = advance(0, 3, |v| results[(v - 1) as usize]);
-        assert_eq!((done, failed), (1, Some(101)));
-    }
-
-    #[test]
-    fn a_pinned_slot_is_not_recorded_over() {
-        let pins = SlotPins::new(4);
-        // Value 1 is made; an awaiter of 1 pins its slot.
-        pins.begin_record(1).unwrap();
-        let pin = pins.pin(1).expect("nothing past value 1 yet");
-        // Value 5 would reuse slot 1: refused while the pin is held, and nothing stays reserved.
-        assert_eq!(pins.begin_record(5), Err(GpuError::Busy));
-        assert!(pins.pin(1).is_some(), "the refused record reserved nothing");
-        drop(pin);
-        assert!(pins.begin_record(5).is_ok(), "released with the pin");
-    }
-
-    #[test]
-    fn an_awaiter_that_arrives_after_the_owner_moved_on_skips_the_wait() {
-        let pins = SlotPins::new(4);
-        pins.begin_record(1).unwrap();
-        // Value 1 completed, and the owner started recording value 5 over its slot.
-        pins.begin_record(5).unwrap();
-        assert!(
-            pins.pin(1).is_none(),
-            "the slot no longer holds value 1, which is complete: no wait"
-        );
-        // The refused pin left nothing raised, so the owner is not held up by it.
-        assert!(pins.begin_record(5).is_ok());
-    }
-
-    /// An owner re-records two slots as fast as it can while an awaiter pins the latest value: a pin that is granted
-    /// always finds the slot as its value left it, for as long as the pin is up.
-    #[test]
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "two threads stand in for the owner of a lane and an awaiter on another lane"
-    )]
-    fn a_granted_pin_always_sees_its_own_value_in_the_slot() {
-        use std::sync::atomic::AtomicBool;
-        const SLOTS: u64 = 2;
-        let pins = SlotPins::new(SLOTS as usize);
-        let recorded: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
-        let marked = AtomicU64::new(0);
-        let stop = AtomicBool::new(false);
-        let granted = AtomicU64::new(0);
-        std::thread::scope(|scope| {
-            scope.spawn(|| {
-                let mut w = 1;
-                while w <= 200_000 {
-                    // Busy is retried: the owner never waits on an awaiter, it tries again.
-                    if pins.begin_record(w).is_ok() {
-                        recorded[(w % SLOTS) as usize].store(w, Ordering::SeqCst);
-                        marked.store(w, Ordering::SeqCst);
-                        w += 1;
-                    }
-                }
-                stop.store(true, Ordering::SeqCst);
-            });
-            scope.spawn(|| {
-                while !stop.load(Ordering::SeqCst) {
-                    let v = marked.load(Ordering::SeqCst);
-                    if v == 0 {
-                        continue;
-                    }
-                    if let Some(_pin) = pins.pin(v) {
-                        for _ in 0..4 {
-                            assert_eq!(
-                                recorded[(v % SLOTS) as usize].load(Ordering::SeqCst),
-                                v,
-                                "the slot was re-recorded under a pin"
-                            );
-                        }
-                        granted.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-            });
-        });
-        assert!(
-            granted.load(Ordering::Relaxed) > 0,
-            "some pins were granted"
-        );
     }
 }

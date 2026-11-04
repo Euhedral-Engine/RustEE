@@ -18,6 +18,10 @@
 //!   Exclusivity is the borrow checker's, so there is no lock to take or to wait on, and a call on a stream from
 //!   inside its own `submit` closure does not compile.
 //!
+//! A lane can also be **shared**: [`Stream::shared`] is the handle (a [`Lane`]) that any worker submits to through `&self`,
+//! as a stage of a stage graph does. The owner's `&mut` calls and the lane's `&self` calls make markers by the same
+//! lock-free protocol, so the two may coexist; they keep separate retirement channels.
+//!
 //! In RustEE's model the owner is a lane's `LatticeSource`: the lattice serializes its `request` and `pull`, so
 //! whichever worker runs them is the submitter's only user, and nothing is locked. [`open_lane_sources`](crate::open_lane_sources)
 //! opens a device's streams that way; work for a lane from other frames reaches the source through the lock-free
@@ -123,6 +127,8 @@ pub trait Gpu: Send + Sync + fmt::Debug + Sized + 'static {
 pub trait Stream: Send + Sized + 'static {
     type Gpu: Gpu<Stream = Self>;
     type Enqueue<'a>: Enqueue<Kernel = <Self::Gpu as Gpu>::Kernel>;
+    /// The shared handle over this stream's queue: any thread may submit to it through `&self` (see [`Lane`]).
+    type Lane: Lane<Gpu = Self::Gpu>;
 
     fn gpu(&self) -> &Arc<Self::Gpu>;
 
@@ -133,6 +139,11 @@ pub trait Stream: Send + Sized + 'static {
 
     /// The shared query side of this stream, as the pool holds it.
     fn queue(&self) -> Arc<dyn DeviceQueue>;
+
+    /// The shared handle over this stream's queue: the query side of [`queue`](Self::queue) and the submit side of a
+    /// [`Lane`], for a [`LanePool`] of lanes that stages submit to from any worker. It keeps the device queue alive: the
+    /// stream may be dropped, and the queue is closed (after its work) when the last handle goes.
+    fn shared(&self) -> Arc<Self::Lane>;
 
     /// Runs `f` with the stream selected for every operation; the operations are contiguous on the stream. Keep `f`
     /// to enqueueing. The stream is borrowed for the call, so `f` cannot use it again: a call on the stream from
@@ -224,6 +235,66 @@ pub trait Stream: Send + Sized + 'static {
     /// owns the stream too (see [`retire_into`](crate::retire_into)): nothing is shared, and nothing is locked or
     /// queued to release the values.
     fn confirm_retired(&mut self, ticket: RetireTicket) -> Option<GpuError>;
+}
+
+/// The shared submit side of one ordered queue of device work: a lane that any worker submits to through `&self`, as in
+/// Java's `GpuStream`, where a stage submits to its lane directly from whichever worker runs it.
+///
+/// A lane is a [`DeviceQueue`] too, so a [`LanePool`] of lanes (typed over the lane, as Java's `LanePool` holds
+/// streams) is both what [`Completions`](euhedral_graph::Completions) polls and what a stage reaches through
+/// [`StageCx::lane_handle`](euhedral_graph::StageCx::lane_handle).
+///
+/// - **Submit, mark and await are lock-free.** Submissions are the driver's: it serializes the launches it gets on one
+///   stream. [`mark`](Self::mark) records after all the work submitted so far, which may include another thread's work
+///   (that only over-waits). The marker numbers are handed out by compare-and-set, and are published to
+///   [`DeviceQueue::completed`] in order, whichever thread finishes recording first.
+/// - **Nothing waits.** A marker ring that is full, a retirement channel another thread is using, answer
+///   `Err(Busy)` (retry); nothing blocks on the device or on another worker.
+/// - **Retirement** is armed from any thread. The backend's callback only queues its status (it makes no driver call,
+///   allocates and frees nothing); the status is read by [`poll_retired`](Self::poll_retired) and settled by
+///   [`confirm_retired`](Self::confirm_retired), which releases the values kept for it: both in a frame, on an ordinary
+///   thread (a [`Pending`](euhedral_graph::Pending) polling the lane, as [`retire_into`](crate::retire_into) does), never
+///   in the callback and never in a source's `request` or `pull`.
+///
+/// A lane is shared, so a stream opened for it can also be driven by an owner (a [`Stream`] and its [`LaneSource`]) only
+/// if the two do not both arm retirements: each channel numbers its own.
+///
+/// [`LaneSource`]: euhedral_graph::LaneSource
+pub trait Lane: DeviceQueue + Sized + 'static {
+    type Gpu: Gpu;
+    type Enqueue<'a>: Enqueue<Kernel = <Self::Gpu as Gpu>::Kernel>
+    where
+        Self: 'a;
+
+    /// This lane's id in its pool.
+    fn lane(&self) -> LaneId;
+
+    /// Runs `f` with the lane selected for every operation, on the calling thread: the operations are contiguous in this
+    /// call's submissions to the driver, though another thread's may interleave between two calls.
+    fn submit<R>(
+        &self,
+        f: impl FnOnce(&mut Self::Enqueue<'_>) -> Result<R, GpuError>,
+    ) -> Result<R, GpuError>;
+
+    /// A marker after the work submitted so far. `Err(Busy)` (retry) when the marker ring is full of markers that have
+    /// not completed, or when an awaiter keeps the slot pinned.
+    fn mark(&self) -> Result<Marker, GpuError>;
+
+    /// Later work on this lane waits, on the device, for `marker`. The host does not wait. A marker of a queue that is
+    /// not one of this lane's pool is `Err(Invalid)`; it is never treated as already done.
+    fn await_marker(&self, marker: Marker) -> Result<(), GpuError>;
+
+    /// Arms a retirement after the work submitted so far; its ticket comes back from [`poll_retired`](Self::poll_retired).
+    /// `Err(Busy)` (retry) when another thread is arming or polling.
+    fn arm_retirement(&self) -> Result<(), GpuError>;
+
+    /// The ticket of the next retirement that arrived, in the order they were armed. `None` when none arrived, or when
+    /// another thread is polling: poll again.
+    fn poll_retired(&self) -> Option<RetireTicket>;
+
+    /// Settles a retirement: the device failure behind it, or `None`. Never panics. The values kept for it
+    /// ([`Enqueue::keep`]) are released here, once. A ticket armed on another lane is refused with `Some(Invalid)`.
+    fn confirm_retired(&self, ticket: RetireTicket) -> Option<GpuError>;
 }
 
 /// What a submission enqueues.

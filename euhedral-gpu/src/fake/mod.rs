@@ -22,6 +22,7 @@
 
 mod enqueue;
 mod graph;
+mod lane;
 mod module;
 mod stream;
 
@@ -490,6 +491,30 @@ impl FakeGpu {
     }
 
     /// Appends an operation to the lane with global index `index`.
+    /// Makes the next marker of lane `index` in one step: the ring is checked and the marker enqueued under one hold of
+    /// the device's state, so threads that mark one lane get distinct numbers. `Err(Busy)` when every slot holds a
+    /// marker that has not run.
+    pub(crate) fn push_mark(&self, index: usize, lane: u16) -> Result<u64, GpuError> {
+        let mut st = self.lock();
+        let (enqueued, run, slots) = {
+            let lane = &st.lanes[index];
+            (lane.marks_enqueued, lane.marks_run, u64::from(lane.markers))
+        };
+        if enqueued - run >= slots {
+            return Err(GpuError::Busy);
+        }
+        let value = enqueued + 1;
+        st.seq += 1;
+        let seq = st.seq;
+        st.lanes[index].marks_enqueued = value;
+        st.lanes[index].queue.push_back(Queued {
+            seq,
+            lane,
+            op: QOp::Mark { value },
+        });
+        Ok(value)
+    }
+
     pub(crate) fn push(&self, index: usize, lane: u16, op: QOp) {
         let mut st = self.lock();
         st.seq += 1;

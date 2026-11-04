@@ -34,7 +34,7 @@ use euhedral_core::frames::{Frame, FrameError, FrameHeader};
 use euhedral_core::generics::FrameSink;
 
 use crate::completions::{Completions, Ready};
-use crate::lanes::{LaneId, LanePool, Marker};
+use crate::lanes::{DeviceQueue, LaneId, LanePool, Marker};
 use crate::sync::{AtomicU64, AtomicUsize, Ordering, Owned};
 use crate::take_all::{Link, Linked, Sealed, TakeAllStack};
 
@@ -199,20 +199,40 @@ pub enum QuantumOutcome {
 }
 
 /// What a stage sees while it runs.
-#[derive(Debug)]
-pub struct StageCx<'a> {
+pub struct StageCx<'a, L: DeviceQueue + ?Sized = dyn DeviceQueue> {
     pub stage: StageId,
     /// The lane the stage submits to (`None` for a CPU-only stage).
     pub lane: Option<LaneId>,
     /// Markers its submission must wait for on the device: submission-edge predecessors on other
     /// lanes, and external edges. Empty when every predecessor ran on `lane`.
     pub waits: &'a [Marker],
-    pub lanes: &'a LanePool,
+    pub lanes: &'a LanePool<L>,
+}
+
+impl<L: DeviceQueue + ?Sized> fmt::Debug for StageCx<'_, L> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StageCx")
+            .field("stage", &self.stage)
+            .field("lane", &self.lane)
+            .field("waits", &self.waits)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<L: DeviceQueue + ?Sized> StageCx<'_, L> {
+    /// The lane the stage was given, as the pool holds it: for a pool of a backend's shared lane type, the handle the
+    /// stage submits its device work to, from whichever worker runs it. `None` for a CPU-only stage.
+    ///
+    /// The stage orders itself behind [`waits`](Self::waits) on the lane, submits, and returns the marker of its work
+    /// in [`Submitted::marker`]; the graph awaits nothing for it.
+    pub fn lane_handle(&self) -> Option<&Arc<L>> {
+        self.lane.map(|lane| self.lanes.lane(lane))
+    }
 }
 
 /// One stage's work for a quantum `Q`. It computes or submits, and returns; it never waits.
-pub trait Stage<Q>: Send + Sync {
-    fn run(&self, quantum: &Q, cx: &StageCx<'_>) -> Result<Submitted, StageError>;
+pub trait Stage<Q, L: DeviceQueue + ?Sized = dyn DeviceQueue>: Send + Sync {
+    fn run(&self, quantum: &Q, cx: &StageCx<'_, L>) -> Result<Submitted, StageError>;
 
     /// The quantum ended without this stage submitting: it never ran (the quantum was killed, or a predecessor failed),
     /// or it ran and failed. Called once, at the quantum's boundary, in stage order.
@@ -222,14 +242,13 @@ pub trait Stage<Q>: Send + Sync {
 }
 
 /// The RustEE side a graph publishes through.
-#[derive(Clone)]
-pub struct GraphRuntime {
+pub struct GraphRuntime<L: DeviceQueue + ?Sized = dyn DeviceQueue> {
     /// Where stage frames are offered: any sink of the lattice's frames, usually a
     /// [`Lake`](crate::Lake) (whose units are the graph's quanta, so the caller admits one before
     /// it starts a quantum and drops its guard when the quantum retires).
     pub stages: Arc<dyn FrameSink>,
     pub completions: Arc<Completions>,
-    pub lanes: Arc<LanePool>,
+    pub lanes: Arc<LanePool<L>>,
     /// Shared by the runtime's graphs.
     pub retries: Arc<RetryCounts>,
     /// How long a retried stage waits at most for a lane's progress before it runs again; see
@@ -237,7 +256,19 @@ pub struct GraphRuntime {
     pub retry_backstop: Duration,
 }
 
-impl fmt::Debug for GraphRuntime {
+impl<L: DeviceQueue + ?Sized> Clone for GraphRuntime<L> {
+    fn clone(&self) -> Self {
+        Self {
+            stages: self.stages.clone(),
+            completions: self.completions.clone(),
+            lanes: self.lanes.clone(),
+            retries: self.retries.clone(),
+            retry_backstop: self.retry_backstop,
+        }
+    }
+}
+
+impl<L: DeviceQueue + ?Sized> fmt::Debug for GraphRuntime<L> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("GraphRuntime")
             .field("lanes", &self.lanes.len())
@@ -357,13 +388,13 @@ impl std::error::Error for GraphError {}
 ///   completion edges, by an arrival frame on the predecessor's ordered lane (completions are
 ///   emitted in registration order), so an ordered predecessor's order carries over to an ordered
 ///   successor (a fetch → parse chain).
-pub struct StageGraph<Q> {
-    core: Arc<Core<Q>>,
+pub struct StageGraph<Q, L: DeviceQueue + ?Sized = dyn DeviceQueue> {
+    core: Arc<Core<Q, L>>,
     /// Retired runs, for the next quanta.
-    runs: Pool<Arc<Run<Q>>>,
+    runs: Pool<Arc<Run<Q, L>>>,
 }
 
-impl<Q> fmt::Debug for StageGraph<Q> {
+impl<Q, L: DeviceQueue + ?Sized> fmt::Debug for StageGraph<Q, L> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("StageGraph")
             .field("stages", &self.core.spec.stages.len())
@@ -374,16 +405,16 @@ impl<Q> fmt::Debug for StageGraph<Q> {
 
 /// What every run of a graph shares: the shape, the stages, the runtime, and the frame pool. Immutable but for its
 /// counters and the pool.
-struct Core<Q> {
+struct Core<Q, L: DeviceQueue + ?Sized> {
     spec: StageGraphSpec,
-    stages: Vec<Arc<dyn Stage<Q>>>,
+    stages: Vec<Arc<dyn Stage<Q, L>>>,
     topology: Topology,
-    runtime: GraphRuntime,
+    runtime: GraphRuntime<L>,
     retire: Box<dyn Fn(Q, QuantumOutcome) + Send + Sync>,
     live: AtomicUsize,
     seeds: AtomicU64,
     /// Finished frames, for the next stages, arrivals and boundaries (of any run of the graph).
-    frames: Pool<Box<GraphFrame<Q>>>,
+    frames: Pool<Box<GraphFrame<Q, L>>>,
 }
 
 /// The id hash of a graph's unordered frames (their routing hash is randomized per frame).
@@ -617,13 +648,13 @@ const POOLED_RUNS: usize = 256;
 /// Frames kept for reuse.
 const POOLED_FRAMES: usize = 4096;
 
-impl<Q: Send + Sync + 'static> StageGraph<Q> {
+impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> StageGraph<Q, L> {
     /// `stages[i]` implements `spec.stages()[i]`. `retire` runs once per quantum, in a frame, after
     /// its boundary.
     pub fn new(
         spec: StageGraphSpec,
-        stages: Vec<Arc<dyn Stage<Q>>>,
-        runtime: GraphRuntime,
+        stages: Vec<Arc<dyn Stage<Q, L>>>,
+        runtime: GraphRuntime<L>,
         retire: impl Fn(Q, QuantumOutcome) + Send + Sync + 'static,
     ) -> Result<Arc<Self>, GraphError> {
         if stages.len() != spec.stages.len() {
@@ -722,13 +753,18 @@ impl<Q: Send + Sync + 'static> StageGraph<Q> {
     }
 }
 
-impl<Q: Send + Sync + 'static> Core<Q> {
+impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Core<Q, L> {
     fn next_seed(&self) -> u64 {
         self.seeds.fetch_add(1, Ordering::Relaxed)
     }
 
     /// A frame for `run`: a finished one made over, or a new one.
-    fn frame(&self, run: &Arc<Run<Q>>, kind: Kind, header: FrameHeader) -> Box<GraphFrame<Q>> {
+    fn frame(
+        &self,
+        run: &Arc<Run<Q, L>>,
+        kind: Kind,
+        header: FrameHeader,
+    ) -> Box<GraphFrame<Q, L>> {
         let mut frame = self
             .frames
             .take()
@@ -970,10 +1006,12 @@ impl LaneTable {
 }
 
 /// A quantum bound to its graph: pooled, and rebound to each quantum in turn.
-struct Run<Q> {
-    core: Arc<Core<Q>>,
+struct Run<Q, L: DeviceQueue + ?Sized> {
+    core: Arc<Core<Q, L>>,
     /// Where the run goes when its quantum retires.
-    home: Weak<Producer<Arc<Run<Q>>, Multi>>,
+    home: Weak<Producer<Arc<Run<Q, L>>, Multi>>,
+    /// The lane its roots continue in every quantum (Java `StageGraph.home`).
+    home_lane: LaneId,
     /// Read while stages run (concurrently); taken by the retirement, after every stage is done.
     quantum: Owned<Option<Q>>,
     kill: Owned<Option<Arc<AtomicBool>>>,
@@ -995,8 +1033,9 @@ struct Run<Q> {
     ext: Owned<ExtSlots>,
 }
 
-impl<Q: Send + Sync + 'static> Run<Q> {
-    fn new(core: Arc<Core<Q>>, home: Weak<Producer<Arc<Run<Q>>, Multi>>) -> Arc<Self> {
+impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Run<Q, L> {
+    fn new(core: Arc<Core<Q, L>>, home: Weak<Producer<Arc<Run<Q, L>>, Multi>>) -> Arc<Self> {
+        let home_lane = core.runtime.lanes.next_home();
         let stages = (0..core.spec.stages.len())
             .map(|_| StageRun::new())
             .collect();
@@ -1004,6 +1043,7 @@ impl<Q: Send + Sync + 'static> Run<Q> {
         Arc::new(Self {
             core,
             home,
+            home_lane,
             quantum: Owned::new(None),
             kill: Owned::new(None),
             live: AtomicUsize::new(0),
@@ -1218,10 +1258,16 @@ impl<Q: Send + Sync + 'static> Run<Q> {
         let lane = unsafe {
             let spec = &self.core.spec.stages[index];
             let lane = (!spec.lanes.is_empty()).then(|| {
-                let continued = topology.path_predecessor[index]
-                    .map(|p| self.stages[usize::from(p.0)].lane.get())
-                    .filter(|&l| l != NO_LANE)
-                    .map(|l| LaneId(l as u16));
+                // Java `continuedLane`: a root continues its graph's home lane; any other stage its path predecessor's
+                // (none when that predecessor ran on no lane).
+                let continued = if topology.submission_predecessors[index].is_empty() {
+                    Some(self.home_lane)
+                } else {
+                    topology.path_predecessor[index]
+                        .map(|p| self.stages[usize::from(p.0)].lane.get())
+                        .filter(|&l| l != NO_LANE)
+                        .map(|l| LaneId(l as u16))
+                };
                 self.core.runtime.lanes.choose(&spec.lanes, continued)
             });
             if let Some(lane) = lane {
@@ -1670,7 +1716,7 @@ impl<Q: Send + Sync + 'static> Run<Q> {
     }
 }
 
-impl<Q: Send + Sync + 'static> Upstream for Run<Q> {
+impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Upstream for Run<Q, L> {
     fn subscribe(&self, stage: StageId, node: NonNull<ExtSlot>) {
         // SAFETY: the node is a later quantum's slot, valid until its edge arrives, and in no stack.
         if let Err(why) = unsafe { self.stages[usize::from(stage.0)].waiters.push(node) } {
@@ -1696,7 +1742,7 @@ impl<Q: Send + Sync + 'static> Upstream for Run<Q> {
     }
 }
 
-impl<Q: Send + Sync + 'static> Downstream for Run<Q> {
+impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Downstream for Run<Q, L> {
     fn external_arrived(self: Arc<Self>, index: usize) {
         // SAFETY: the slots do not change while the quantum runs; the thread that satisfied the edge wrote the markers
         // before this call.
@@ -1732,15 +1778,15 @@ impl<Q: Send + Sync + 'static> Downstream for Run<Q> {
 }
 
 /// A stage's completion that waits for a marker and for a host completion.
-struct MarkerAndHost {
-    lanes: Arc<LanePool>,
+struct MarkerAndHost<L: DeviceQueue + ?Sized> {
+    lanes: Arc<LanePool<L>>,
     marker: Marker,
     marker_reached: bool,
     host: Box<dyn Ready>,
     host_ready: bool,
 }
 
-impl Ready for MarkerAndHost {
+impl<L: DeviceQueue + ?Sized + 'static> Ready for MarkerAndHost<L> {
     fn is_ready(&mut self) -> bool {
         if !self.marker_reached {
             self.marker_reached = self.lanes.reached(self.marker);
@@ -1754,15 +1800,15 @@ impl Ready for MarkerAndHost {
 
 /// A retried stage's wake-up: any lane of the pool past where it was at the retry, or the
 /// backstop's deadline.
-struct Progress {
-    lanes: Arc<LanePool>,
+struct Progress<L: DeviceQueue + ?Sized> {
+    lanes: Arc<LanePool<L>>,
     seen: Vec<u64>,
     deadline: Instant,
     counts: Arc<RetryCounts>,
 }
 
-impl Progress {
-    fn new(lanes: Arc<LanePool>, counts: Arc<RetryCounts>, backstop: Duration) -> Self {
+impl<L: DeviceQueue + ?Sized> Progress<L> {
+    fn new(lanes: Arc<LanePool<L>>, counts: Arc<RetryCounts>, backstop: Duration) -> Self {
         let seen = (0..lanes.len())
             .map(|i| lanes.lane(LaneId(i as u16)).completed())
             .collect();
@@ -1775,7 +1821,7 @@ impl Progress {
     }
 }
 
-impl Ready for Progress {
+impl<L: DeviceQueue + ?Sized + 'static> Ready for Progress<L> {
     fn is_ready(&mut self) -> bool {
         let lanes = &self.lanes;
         if self
@@ -1816,21 +1862,21 @@ enum Kind {
 }
 
 /// The one frame type of a graph, pooled: a stage, an arrival, a boundary or a retirement, by its [`Kind`].
-struct GraphFrame<Q> {
+struct GraphFrame<Q, L: DeviceQueue + ?Sized> {
     header: FrameHeader,
     /// The run it serves, while it is in flight.
-    run: Option<Arc<Run<Q>>>,
+    run: Option<Arc<Run<Q, L>>>,
     kind: Kind,
     result: Option<Result<Submitted, StageError>>,
     /// A stage's scratch: the markers it ran after, and those of them on other lanes. Their capacity stays with the
     /// frame.
     inputs: Vec<Marker>,
     waits: Vec<Marker>,
-    pool: Weak<Producer<Box<GraphFrame<Q>>, Multi>>,
+    pool: Weak<Producer<Box<GraphFrame<Q, L>>, Multi>>,
 }
 
-impl<Q: Send + Sync + 'static> GraphFrame<Q> {
-    fn new(pool: Weak<Producer<Box<GraphFrame<Q>>, Multi>>) -> Self {
+impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> GraphFrame<Q, L> {
+    fn new(pool: Weak<Producer<Box<GraphFrame<Q, L>>, Multi>>) -> Self {
         Self {
             header: FrameHeader::new(0),
             run: None,
@@ -1843,7 +1889,7 @@ impl<Q: Send + Sync + 'static> GraphFrame<Q> {
     }
 }
 
-impl<Q: Send + Sync + 'static> Frame for GraphFrame<Q> {
+impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Frame for GraphFrame<Q, L> {
     fn header(&self) -> &FrameHeader {
         &self.header
     }
@@ -2215,12 +2261,16 @@ mod tests {
         fn with_backstop(lanes: usize, retry_backstop: Duration) -> Self {
             let hands: Vec<Arc<HandLane>> =
                 (0..lanes).map(|_| Arc::new(HandLane::default())).collect();
-            let pool = Arc::new(LanePool::new(
-                hands
-                    .iter()
-                    .map(|h| h.clone() as Arc<dyn DeviceQueue>)
-                    .collect(),
-            ));
+            // Placement in turns: the tests below name the lanes stages take (Java's `fixed` placement).
+            let pool = Arc::new(
+                LanePool::new(
+                    hands
+                        .iter()
+                        .map(|h| h.clone() as Arc<dyn DeviceQueue>)
+                        .collect(),
+                )
+                .with_placement(crate::Placement::Turns),
+            );
             let stages = Arc::new(QueueIngestSink::new());
             // A queue ingest sink hands out frames only once something is attached; this one asks
             // for nothing.
@@ -2295,6 +2345,13 @@ mod tests {
                 ran += 1;
             }
             ran
+        }
+
+        /// Takes the first turn of the pool's placement, as the root of a fan-out did before roots continued their
+        /// graph's home lane: the branches that continue no lane then take the turns after it.
+        fn take_a_turn(&self) {
+            let all: Vec<LaneId> = (0..self.hands.len()).map(|i| LaneId(i as u16)).collect();
+            self.runtime.lanes.choose(&all, None);
         }
 
         fn finish_lanes(&self) {
@@ -2454,6 +2511,7 @@ mod tests {
                 (2, 4, Submission),
             ],
         );
+        h.take_a_turn();
         let _ = graph.start(1, alive(), Vec::new());
         h.pump();
         let mut ran = h.ran(1);
@@ -2505,6 +2563,7 @@ mod tests {
                 (2, 3, Submission),
             ],
         );
+        h.take_a_turn();
         let _ = graph.start(1, alive(), Vec::new());
         h.pump();
         let lane = lanes_of(&h, 4);
@@ -2549,6 +2608,7 @@ mod tests {
             4,
             &[(0, 1, Submission), (0, 2, Submission), (0, 3, Submission)],
         );
+        h.take_a_turn();
         let _ = graph.start(1, alive(), Vec::new());
         h.pump();
         let lane = lanes_of(&h, 4);
@@ -2575,6 +2635,7 @@ mod tests {
             4,
             &[(0, 1, Submission), (0, 2, Submission), (2, 3, Submission)],
         );
+        h.take_a_turn();
         let _ = graph.start(1, alive(), Vec::new());
         h.pump();
         let lane = lanes_of(&h, 4);
@@ -3424,6 +3485,119 @@ mod tests {
         for thread in threads {
             thread.join().unwrap();
         }
+    }
+
+    /// A graph over a typed pool: a stage reaches the lane it was given through its context, and a CPU stage has none.
+    #[test]
+    fn a_stage_reaches_its_lane_through_a_typed_pool() {
+        type Seen = Arc<Mutex<Vec<(u16, Option<usize>)>>>;
+        struct Submits(Seen);
+        impl Stage<u64, HandLane> for Submits {
+            fn run(&self, _: &u64, cx: &StageCx<'_, HandLane>) -> Result<Submitted, StageError> {
+                let handle = cx.lane_handle();
+                lock(&self.0).push((cx.stage.0, handle.map(|h| Arc::as_ptr(h) as usize)));
+                Ok(match (cx.lane, handle) {
+                    (Some(lane), Some(hand)) => {
+                        Submitted::marker(Marker::new(hand.id, lane, hand.submit()))
+                    }
+                    _ => Submitted::done(),
+                })
+            }
+        }
+        let hands: Vec<Arc<HandLane>> = (0..2).map(|_| Arc::new(HandLane::default())).collect();
+        let pool = Arc::new(LanePool::typed(hands.clone()));
+        let completions = Completions::new(pool.as_queues());
+        let sink = Arc::new(QueueIngestSink::new());
+        sink.delegate().add_downstream(Arc::new(Unattended));
+        let mut spec = StageGraphSpec::new();
+        let on_lane_one = spec.stage(StageSpec {
+            name: "device",
+            ordered: None,
+            lanes: vec![LaneId(1)],
+        });
+        let cpu = spec.stage(StageSpec {
+            name: "cpu",
+            ordered: None,
+            lanes: vec![],
+        });
+        spec.edge(on_lane_one, cpu, Submission);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let retired = Arc::new(Mutex::new(Vec::new()));
+        let log = retired.clone();
+        let graph = StageGraph::new(
+            spec,
+            vec![
+                Arc::new(Submits(seen.clone())) as Arc<dyn Stage<u64, HandLane>>,
+                Arc::new(Submits(seen.clone())),
+            ],
+            GraphRuntime {
+                stages: Arc::new(QueueStages(sink.clone())),
+                completions: completions.clone(),
+                lanes: pool,
+                retries: Arc::default(),
+                retry_backstop: DEFAULT_RETRY_BACKSTOP,
+            },
+            move |q, outcome| lock(&log).push((q, outcome)),
+        )
+        .unwrap();
+        let _ = graph.start(1, alive(), Vec::new());
+        let pump = || loop {
+            let mut frame = None;
+            sink.delegate()
+                .pull(&mut |f| frame = Some(f), &mut |_| false, 1);
+            if frame.is_none() {
+                completions.pull(&mut |f| frame = Some(f), &mut |_| false, 1);
+            }
+            match frame {
+                Some(frame) => run_frame(frame),
+                None => return,
+            }
+        };
+        pump();
+        assert_eq!(
+            *lock(&seen),
+            [(0, Some(Arc::as_ptr(&hands[1]) as usize)), (1, None)],
+            "the stage got lane 1's own handle; the CPU stage none"
+        );
+        assert!(
+            lock(&retired).is_empty(),
+            "lane 1 has not completed its work"
+        );
+        hands[1].finish();
+        pump();
+        assert_eq!(*lock(&retired), [(1, QuantumOutcome::Completed)]);
+    }
+
+    /// Java `continuedLane`: a root continues its graph's home lane, taken in turn over the pool's lanes when the run is
+    /// made. Quanta that overlap use different runs, so different homes; a run keeps its home for the quanta it serves
+    /// after, as a Java graph does.
+    #[test]
+    fn a_root_continues_its_runs_home_lane() {
+        let h = Harness::new(2);
+        let graph = h.graph(
+            &[(None, &[0, 1], Act::Submit), (None, &[0, 1], Act::Submit)],
+            &[(0, 1, Submission)],
+        );
+        // Two quanta at once: two runs, homes 0 and 1.
+        let _ = graph.start(1, alive(), Vec::new());
+        let _ = graph.start(2, alive(), Vec::new());
+        h.pump();
+        h.finish_lanes();
+        h.pump();
+        let lane = |q, s| h.ran_with(q, s).unwrap().0.unwrap();
+        assert_eq!(lane(1, 0), 0, "the first run's home");
+        assert_eq!(lane(1, 1), 0, "its chain continues the root's lane");
+        assert_eq!(lane(2, 0), 1, "the second run's home");
+        assert_eq!(lane(2, 1), 1);
+        // The runs are pooled: quanta after them reuse a run, and so its home.
+        let _ = graph.start(3, alive(), Vec::new());
+        h.pump();
+        h.finish_lanes();
+        h.pump();
+        assert!(
+            [0, 1].contains(&lane(3, 0)) && lane(3, 1) == lane(3, 0),
+            "a pooled run keeps its home"
+        );
     }
 
     /// Java `AbstractQuantum.failure.compareAndSet(null, cause)`: the first cause stands.

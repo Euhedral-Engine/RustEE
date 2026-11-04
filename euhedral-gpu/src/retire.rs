@@ -18,10 +18,18 @@
     allow(dead_code, reason = "the retirement channel is used by the backends")
 )]
 
+use std::any::Any;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
 use euhedral_core::frames::{Frame, FrameError, FrameHeader};
 use euhedral_data_structures::queues::{Consumer, Multi, PlainQueue, Producer, Queue, Single};
+use euhedral_data_structures::sync::ClaimCell;
 use euhedral_graph::{Completions, LaneId, Pending, QueueId};
 
+#[cfg(any(feature = "fake", feature = "cuda"))]
+use crate::kept::Kept;
 use crate::{GpuError, POISONED_STATUS, RetireListener, RetireTicket, Stream};
 
 /// A frame that runs a closure once and owns whatever the closure moved in: the frame of a chain that carries a
@@ -350,6 +358,160 @@ impl Retirements {
     }
 }
 
+#[cfg(any(feature = "fake", feature = "cuda"))]
+mod shared {
+    use super::*;
+
+    /// A lane's retirement and kept values, shared by every thread that submits to it.
+    ///
+    /// The callback side is the lock-free sink every retirement channel has; what changes is the owner side, which several
+    /// threads reach:
+    /// - **Arming and polling** go through a try-claim ([`ClaimCell`]) over the lane's [`Retirements`]: one thread at a time
+    ///   arms or drains, and a thread that finds it held does not wait ([`arm`](Self::arm) answers `Busy`,
+    ///   [`poll`](Self::poll) finds nothing yet and its caller polls again). The claim makes the order of the callbacks the
+    ///   order of the arms, which the channel relies on (the n-th status that arrives belongs to the n-th retirement armed).
+    /// - **Kept values** are pushed by any thread to a lock-free queue, tagged with the number of retirements armed so far
+    ///   when the value was kept. Retirement `s` releases the values tagged `s` or less: the retirement count moves *before*
+    ///   the callback is enqueued, so a value kept while its work was enqueued before the callback is tagged at most `s`, and
+    ///   a value tagged `s` or less never outlives work that the callback does not cover. (A value is released by a
+    ///   retirement at or after its tag, sometimes later than the first that covers it: never earlier.)
+    /// - **Release** happens in [`release_through`](Self::release_through), called from the continuation that confirms a
+    ///   retirement, on an ordinary thread in a frame. Values are dropped outside the claim, one at a time.
+    pub(crate) struct SharedRetire {
+        sink: Arc<RetireSink>,
+        state: ClaimCell<LaneRetire>,
+        /// Retirements armed so far, as the keepers see them.
+        armed: AtomicU64,
+        kept_in: Producer<(u64, Box<dyn Any + Send>), Multi>,
+    }
+
+    /// What the claim holder reaches.
+    struct LaneRetire {
+        retire: Retirements,
+        kept_out: Consumer<(u64, Box<dyn Any + Send>), Single>,
+        kept: Kept,
+        /// When the lane last looked at the device for a fault with retirements outstanding.
+        last_probe: Option<Instant>,
+    }
+
+    impl std::fmt::Debug for SharedRetire {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("SharedRetire")
+                .field("armed", &self.armed.load(Ordering::Relaxed))
+                .finish_non_exhaustive()
+        }
+    }
+
+    /// How often a lane with retirements outstanding looks at the device while no callback arrives.
+    const PROBE_EVERY: Duration = Duration::from_millis(1);
+
+    impl SharedRetire {
+        /// The retirement channel of the lane `lane` of the stream `id`.
+        pub(crate) fn new(id: QueueId, lane: LaneId) -> Self {
+            let (retire, sink) = Retirements::new(id, lane);
+            let kept =
+                Queue::<(u64, Box<dyn Any + Send>), Multi, Single>::with_pool(CHUNK, POOLED_CHUNKS);
+            Self {
+                sink: Arc::new(sink),
+                state: ClaimCell::new(LaneRetire {
+                    retire,
+                    kept_out: kept.consumer(),
+                    kept: Kept::default(),
+                    last_probe: None,
+                }),
+                armed: AtomicU64::new(0),
+                kept_in: kept.producer(),
+            }
+        }
+
+        /// The callback's end: the backend passes a pointer to it as the callback's user data.
+        pub(crate) fn sink(&self) -> &Arc<RetireSink> {
+            &self.sink
+        }
+
+        /// Arms a retirement after the work enqueued so far. `enqueue(seq)` enqueues the backend's callback for retirement
+        /// number `seq`. `Err(Busy)` (retry; this never waits) when another thread is arming or polling.
+        pub(crate) fn arm(
+            &self,
+            enqueue: impl FnOnce(u64) -> Result<(), GpuError>,
+        ) -> Result<(), GpuError> {
+            let Some(mut state) = self.state.try_claim() else {
+                return Err(GpuError::Busy);
+            };
+            // The count moves before the callback is enqueued (see the type's documentation).
+            self.armed.fetch_add(1, Ordering::SeqCst);
+            if let Err(error) = enqueue(state.retire.next_seq()) {
+                // Nothing was armed. A value kept meanwhile is tagged one too high, which only delays its release.
+                self.armed.fetch_sub(1, Ordering::SeqCst);
+                return Err(error);
+            }
+            state.retire.register(None);
+            Ok(())
+        }
+
+        /// Keeps `value` until a retirement armed after this call is confirmed.
+        pub(crate) fn keep(&self, value: Box<dyn Any + Send>) {
+            let tag = self.armed.load(Ordering::SeqCst);
+            // An unbounded queue never refuses.
+            let _ = self.kept_in.offer((tag, value));
+        }
+
+        /// The ticket of the next retirement that arrived, if the claim is free and one did. `look` is one look at the
+        /// device, which a lane makes (at most every millisecond) when retirements are outstanding and none arrived: a
+        /// retirement behind a lane that faulted never gets its callback. Returns whether a status arrived that nobody had
+        /// armed (the order the channel relies on broke).
+        pub(crate) fn poll(
+            &self,
+            poisoned: impl Fn() -> bool,
+            look: impl FnOnce(),
+        ) -> (Option<RetireTicket>, bool) {
+            let Some(mut state) = self.state.try_claim() else {
+                return (None, false);
+            };
+            let mut ticket = state.retire.poll(poisoned());
+            if ticket.is_none() && state.retire.outstanding() > 0 {
+                let now = Instant::now();
+                if state
+                    .last_probe
+                    .is_none_or(|last| now.duration_since(last) >= PROBE_EVERY)
+                {
+                    state.last_probe = Some(now);
+                    look();
+                    ticket = state.retire.poll(poisoned());
+                }
+            }
+            let desync = state.retire.take_desync();
+            (ticket, desync)
+        }
+
+        /// Releases the values kept for retirement `seq` and the ones before it, in the calling thread. Each value is
+        /// dropped outside the claim.
+        pub(crate) fn release_through(&self, seq: u64) {
+            loop {
+                let value = loop {
+                    if let Some(mut state) = self.state.try_claim() {
+                        let LaneRetire { kept_out, kept, .. } = &mut *state;
+                        kept_out.drain_all(|(tag, value)| kept.push(tag, value));
+                        break kept.pop_through(seq);
+                    }
+                };
+                match value {
+                    Some(value) => drop(value),
+                    None => return,
+                }
+            }
+        }
+
+        /// Whether a callback armed here may still be to come (see [`Retirements::callbacks_pending`]).
+        #[cfg(feature = "cuda")]
+        pub(crate) fn callbacks_pending(&mut self) -> bool {
+            self.state.get_mut().retire.callbacks_pending()
+        }
+    }
+}
+#[cfg(any(feature = "fake", feature = "cuda"))]
+pub(crate) use shared::SharedRetire;
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
@@ -501,5 +663,127 @@ mod tests {
         sink.push(0);
         assert!(r.poll(false).is_some());
         assert_eq!((r.outstanding(), r.outstanding_tickets()), (1, 1));
+    }
+
+    /// The lane's shared channel: arms from many threads, the order of the callbacks the order of the arms, kept values
+    /// released once, by the retirement that covers them.
+    #[cfg(any(feature = "fake", feature = "cuda"))]
+    mod shared {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use super::*;
+
+        /// A value that counts its own drop.
+        struct Counted(Arc<AtomicUsize>);
+
+        impl Drop for Counted {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        fn lane() -> SharedRetire {
+            SharedRetire::new(QueueId::next(), LaneId(1))
+        }
+
+        #[test]
+        fn a_value_kept_is_released_once_by_the_retirement_that_covers_it() {
+            let shared = lane();
+            let dropped = Arc::new(AtomicUsize::new(0));
+            // Kept before the first retirement is armed: tagged 0, covered by retirement 0.
+            shared.keep(Box::new(Counted(dropped.clone())));
+            shared
+                .arm(|seq| {
+                    assert_eq!(seq, 0);
+                    shared.sink().push(0);
+                    Ok(())
+                })
+                .unwrap();
+            // Kept after it: tagged 1, covered by retirement 1.
+            shared.keep(Box::new(Counted(dropped.clone())));
+            shared
+                .arm(|_| {
+                    shared.sink().push(0);
+                    Ok(())
+                })
+                .unwrap();
+            let (first, _) = shared.poll(|| false, || {});
+            let first = first.expect("the first retirement arrived");
+            assert_eq!(first.seq(), 0);
+            assert_eq!(
+                dropped.load(Ordering::SeqCst),
+                0,
+                "nothing is released by a poll"
+            );
+            shared.release_through(first.seq());
+            assert_eq!(dropped.load(Ordering::SeqCst), 1);
+            shared.release_through(first.seq());
+            assert_eq!(dropped.load(Ordering::SeqCst), 1, "released once");
+            let (second, _) = shared.poll(|| false, || {});
+            shared.release_through(second.expect("the second arrived").seq());
+            assert_eq!(dropped.load(Ordering::SeqCst), 2);
+        }
+
+        /// Eight threads arm retirements while another polls: the callbacks (pushed inside the claim, as the driver's are
+        /// enqueued in call order) come back as tickets numbered in the order of the arms, each exactly once.
+        #[test]
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "threads stand in for the workers that arm a lane's retirements"
+        )]
+        fn arms_from_many_threads_come_back_in_order_each_once() {
+            let rounds = if cfg!(miri) { 4 } else { 500 };
+            let shared = lane();
+            let armed = AtomicUsize::new(0);
+            let mut tickets = Vec::new();
+            std::thread::scope(|scope| {
+                let workers: Vec<_> = (0..8)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            for _ in 0..rounds {
+                                while shared
+                                    .arm(|_| {
+                                        shared.sink().push(0);
+                                        Ok(())
+                                    })
+                                    .is_err()
+                                {}
+                                armed.fetch_add(1, Ordering::SeqCst);
+                            }
+                        })
+                    })
+                    .collect();
+                while tickets.len() < 8 * rounds {
+                    if let (Some(ticket), _) = shared.poll(|| false, || {}) {
+                        tickets.push(ticket.seq());
+                    }
+                }
+                for worker in workers {
+                    worker.join().unwrap();
+                }
+            });
+            assert_eq!(armed.load(Ordering::SeqCst), 8 * rounds);
+            assert_eq!(
+                tickets,
+                (0..(8 * rounds) as u64).collect::<Vec<_>>(),
+                "in the order armed, none twice"
+            );
+        }
+
+        #[test]
+        fn a_failed_enqueue_arms_nothing() {
+            let shared = lane();
+            let refused = shared.arm(|_| Err(GpuError::Invalid("refused".into())));
+            assert!(matches!(refused, Err(GpuError::Invalid(_))));
+            assert!(shared.poll(|| false, || {}).0.is_none());
+            shared
+                .arm(|seq| {
+                    assert_eq!(seq, 0, "the failed arm took no number");
+                    shared.sink().push(0);
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(shared.poll(|| false, || {}).0.unwrap().seq(), 0);
+        }
     }
 }

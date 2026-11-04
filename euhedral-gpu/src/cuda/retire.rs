@@ -16,7 +16,7 @@ use euhedral_memory::cuda::{CuResult, CuStream};
 use crate::GpuError;
 use crate::retire::RetireSink;
 
-use super::stream::CudaStream;
+use super::stream::{CudaQueue, CudaStream};
 
 fn tell(user: *mut c_void, status: CuResult) {
     let _hot = HotScope::enter();
@@ -32,17 +32,23 @@ unsafe extern "C" fn trampoline(_stream: CuStream, status: CuResult, user: *mut 
     tell(user, status);
 }
 
-impl CudaStream {
-    /// Enqueues a callback after the work enqueued so far. The context is current. Nothing is allocated: the user data
-    /// is the stream's own sink.
-    pub(crate) fn arm_callback(&self) -> Result<(), GpuError> {
-        let user = std::ptr::from_ref(self.queue.sink())
-            .cast_mut()
-            .cast::<c_void>();
+impl CudaQueue {
+    /// Enqueues a callback after the work enqueued so far, whose user data is `sink`. The context is current. Nothing
+    /// is allocated: the user data is a sink this queue owns.
+    pub(crate) fn arm_callback_to(&self, sink: &RetireSink) -> Result<(), GpuError> {
+        let user = std::ptr::from_ref(sink).cast_mut().cast::<c_void>();
         let fns = &self.gpu.fns;
-        // SAFETY: a stream of this device and the sink the callback reads; the context is current.
+        // SAFETY: a stream of this device and the sink the callback reads; the sink outlives every callback (this
+        // queue's drop waits for them); the context is current.
         self.gpu.check("cuStreamAddCallback", unsafe {
             (fns.stream_add_callback)(self.raw, trampoline, user, 0)
         })
+    }
+}
+
+impl CudaStream {
+    /// Enqueues a callback after the work enqueued so far, for the owner's channel. The context is current.
+    pub(crate) fn arm_callback(&self) -> Result<(), GpuError> {
+        self.queue.arm_callback_to(self.queue.sink())
     }
 }

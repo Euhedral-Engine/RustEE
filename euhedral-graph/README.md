@@ -225,7 +225,13 @@ graph is started for. Edges say when a stage's successor may run:
   earlier one, held through a `QuantumRef`.
 
 A stage's `run` computes or submits and returns a `Submitted` (its marker, perhaps a host
-completion); it never waits. A stage that finds its resources busy answers `StageError::Retry` and
+completion); it never waits. A stage can submit to its lane itself, as in Java: `LanePool`, `GraphRuntime`, `StageCx`,
+`Stage` and `StageGraph` are typed over the lane (`dyn DeviceQueue`, the query side only, by default), so with a pool
+of a backend's shared lane type a stage reaches the lane it was given with `cx.lane_handle()`, submits to it from
+whichever worker runs it, and returns the marker. The stage orders itself behind `cx.waits` on its lane. A stage that
+continues no lane takes a random allowed lane (`Placement::Random`, a per-thread generator, as Java's
+`ThreadLocalRandom`; `Placement::Turns` is the deterministic placement tests use), and a root continues its run's home
+lane, taken in turn over the pool's lanes when the run is made (Java `nextHome`). A stage that finds its resources busy answers `StageError::Retry` and
 runs again when a lane of the pool made progress, or after `GraphRuntime::retry_backstop` (default
 `DEFAULT_RETRY_BACKSTOP`, 20 ms: set it longer than any one pass on your devices). A stage can be
 **ordered** (`StageSpec::ordered`): its frames then run in the order they were published, on one
