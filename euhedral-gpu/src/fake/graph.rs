@@ -248,11 +248,16 @@ impl FakeGpu {
         F: FnOnce(&mut FakeSequence<'_>) -> Result<(), GpuError>,
     {
         let count = real.len();
-        let (rec, fingerprint) = self.record_pass(real, hold, f)?;
-        if self
+        let hook = self
             .fail_recording
-            .swap(false, std::sync::atomic::Ordering::AcqRel)
-        {
+            .swap(0, std::sync::atomic::Ordering::AcqRel);
+        if hook == 2 {
+            return Err(GpuError::Capture(
+                "failed by the test hook before the body ran".into(),
+            ));
+        }
+        let (rec, fingerprint) = self.record_pass(real, hold, f)?;
+        if hook == 1 {
             return Err(GpuError::Capture("failed by the test hook".into()));
         }
         Ok(FakeGraph {

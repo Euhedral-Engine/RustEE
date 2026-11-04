@@ -456,3 +456,82 @@ fn workers_running_one_key_at_once_each_get_an_instance_and_every_replay_runs() 
     // The work ended: now the holds may go.
     drop((recorded, replayed));
 }
+
+/// Under contention a replay never makes a private stream once the lane is warm: a take that scanned past a handle another
+/// worker moved retries instead of missing (a miss makes a stream, events and a box on the frame path), and a give always
+/// lands. Six workers replay one key for thousands of rounds: the lane made at most one stream per worker, however the
+/// takes and gives interleaved, and the count does not grow after warm-up.
+#[test]
+fn six_workers_replaying_under_contention_make_no_private_stream_after_warm_up() {
+    const N: usize = 6;
+    let Some(gpu) = gpu() else { return };
+    let Some(module) = module(&gpu) else { return };
+    let (_mem, block) = words(&gpu, 4 * N);
+    let add = module.kernel("add_u32").unwrap();
+    let lanes = lanes(&gpu, 1);
+    let lane = lanes.pool.lane(LaneId(0)).clone();
+    let cache = SharedGraphCache::<CudaGpu, u32>::with_capacity(32);
+
+    struct Add {
+        kernel: CudaKernel,
+        word: u64,
+    }
+    impl GraphBody<CudaGpu> for Add {
+        fn enqueue<E: Enqueue<Kernel = CudaKernel>>(
+            &mut self,
+            enq: &mut E,
+        ) -> Result<(), GpuError> {
+            // SAFETY: the device word is live.
+            unsafe {
+                enq.launch(
+                    &self.kernel,
+                    Launch::linear(1, 1),
+                    &Args::new()
+                        .device(self.word)
+                        .device(self.word)
+                        .arg(1u32)
+                        .arg(1u32),
+                )
+            }
+        }
+    }
+    let rounds = |count: usize| {
+        std::thread::scope(|scope| {
+            for t in 0..N {
+                let (gpu, lane, cache, add) = (&gpu, &lane, &cache, &add);
+                scope.spawn(move || {
+                    let mut body = Add {
+                        kernel: add.clone(),
+                        word: block.addr + 4 * t as u64,
+                    };
+                    for _ in 0..count {
+                        let mut hold = GraphHold::new();
+                        let (ran, _marker) = loop {
+                            match lane
+                                .submit_marked(|_| cache.run(gpu, lane, 3, &mut body, &mut hold))
+                            {
+                                Ok(done) => break done,
+                                Err(GpuError::Busy) => std::thread::yield_now(),
+                                Err(other) => panic!("{other}"),
+                            }
+                        };
+                        assert!(matches!(ran, Ran::Direct | Ran::Recorded | Ran::Replayed));
+                    }
+                });
+            }
+        });
+    };
+    rounds(60);
+    let warmed = lane.forks_made();
+    assert!(
+        (1..=N + 1).contains(&warmed),
+        "at most a stream per worker (and the recording's): {warmed}"
+    );
+    rounds(1_500);
+    assert_eq!(
+        lane.forks_made(),
+        warmed,
+        "no stream was made after warm-up: no take missed, however the workers raced"
+    );
+    assert!(cache.stats().replays > 1_000);
+}

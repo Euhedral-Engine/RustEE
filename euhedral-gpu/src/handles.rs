@@ -6,14 +6,56 @@
 //! A lock-free stock of driver handles (private streams) that any thread takes one of, uses alone, and gives back.
 //!
 //! A slot holds a handle or 0. A thread takes a handle by swapping a slot to 0 (a compare-and-set that acquires what the
-//! last user wrote) and gives it back by storing it into an empty slot (a release store). Nothing waits and nothing
-//! allocates after the table is made; a handle that finds no empty slot on its way back is the caller's to destroy.
+//! last user wrote) and gives it back by storing it into an empty slot (a release store).
+//!
+//! **No spurious misses or refusals.** The pool counts the handles that exist (`population`, told by the owner when it
+//! makes one) and the handles stocked or on their way into a slot (`stocked`, raised *before* the store that lands a
+//! handle and lowered after the swap that takes one):
+//! - a `take` that scanned past a handle another thread moved retries while `stocked > 0`, so it misses only when no handle
+//!   is stocked, and the owner then makes a new one. It waits for nothing but a giver between its count and its store, a
+//!   few instructions.
+//! - while the population is at most the slots, an empty slot exists for every handle in flight, so a `give` loops until
+//!   its handle lands and is never refused.
+//!
+//! A handle beyond the slots (more handles than slots exist) goes to an overflow list, never destroyed on the thread that
+//! gave it: the owner destroys what the list and the slots hold when it goes away. Nothing allocates after the table is
+//! made, except the list's node of a handle that overflows.
+
+#![allow(
+    unsafe_code,
+    reason = "the overflow list's nodes are boxes handed between threads as addresses, owned by whoever swapped them out"
+)]
 
 use crate::sync::{AtomicUsize, Ordering};
+
+/// One step of the short wait for a peer between its count and its store (or its swap and its count).
+fn backoff() {
+    #[cfg(loom)]
+    loom::thread::yield_now();
+    #[cfg(not(loom))]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "JAVA-BACKOFF: the retry waits only for a peer in a step of a few instructions, as Java's `SpinWait` waits for a peer's short step"
+    )]
+    std::hint::spin_loop();
+}
 
 /// A fixed table of handles, each a non-zero `usize` (a pointer).
 pub(crate) struct HandlePool {
     slots: Box<[AtomicUsize]>,
+    /// Handles stocked, or counted in on their way into a slot.
+    stocked: AtomicUsize,
+    /// Handles that exist, stocked or in use.
+    population: AtomicUsize,
+    /// Handles that found no slot: a push-only list (a Treiber stack that is never popped before the drain, so it has no
+    /// ABA), drained when the owner goes away.
+    overflow: crate::sync::AtomicUsize,
+}
+
+/// An overflow node: the handle and the node pushed before it.
+struct Overflow {
+    handle: usize,
+    next: usize,
 }
 
 impl std::fmt::Debug for HandlePool {
@@ -28,30 +70,46 @@ impl HandlePool {
     pub(crate) fn new(slots: usize) -> Self {
         Self {
             slots: (0..slots.max(1)).map(|_| AtomicUsize::new(0)).collect(),
+            stocked: AtomicUsize::new(0),
+            population: AtomicUsize::new(0),
+            overflow: AtomicUsize::new(0),
         }
     }
 
-    /// Takes a handle, if one is stocked. Never waits.
+    /// The owner made a handle (it is in use until given).
+    pub(crate) fn created(&self) {
+        self.population.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Takes a handle. `None` only when no handle is stocked.
     pub(crate) fn take(&self) -> Option<usize> {
-        for slot in self.slots.iter() {
-            let seen = slot.load(Ordering::Relaxed);
-            if seen != 0
-                && slot
-                    .compare_exchange(seen, 0, Ordering::Acquire, Ordering::Relaxed)
-                    .is_ok()
-            {
-                return Some(seen);
+        loop {
+            for slot in self.slots.iter() {
+                let seen = slot.load(Ordering::Relaxed);
+                if seen != 0
+                    && slot
+                        .compare_exchange(seen, 0, Ordering::Acquire, Ordering::Relaxed)
+                        .is_ok()
+                {
+                    self.stocked.fetch_sub(1, Ordering::Release);
+                    return Some(seen);
+                }
             }
+            if self.stocked.load(Ordering::Acquire) == 0 {
+                return None;
+            }
+            // A handle is stocked or landing, and a scan missed it: look again.
+            backoff();
         }
-        None
     }
 
-    /// Stocks `handle`; `Err(handle)` when every slot holds one (a stock that other threads are emptying and filling as it
-    /// is scanned may refuse a handle it had room for: the caller destroys it, and makes another when it needs one).
+    /// Stocks `handle`. `Err(handle)` only when more handles exist than slots and none is free: the caller pushes it with
+    /// [`overflow`](Self::overflow).
     pub(crate) fn give(&self, handle: usize) -> Result<(), usize> {
         debug_assert_ne!(handle, 0);
-        // A slot another thread emptied behind the scan is found by the second pass; a stock that stays full is full.
-        for _ in 0..2 {
+        self.stocked.fetch_add(1, Ordering::Release);
+        let must_land = self.population.load(Ordering::Relaxed) <= self.slots.len();
+        loop {
             for slot in self.slots.iter() {
                 if slot.load(Ordering::Relaxed) == 0
                     && slot
@@ -61,34 +119,69 @@ impl HandlePool {
                     return Ok(());
                 }
             }
+            if !must_land {
+                self.stocked.fetch_sub(1, Ordering::Release);
+                return Err(handle);
+            }
+            // The population fits the slots, so a slot is empty for this handle: one was emptied behind the scan.
+            backoff();
         }
-        Err(handle)
     }
 
-    /// Every handle still stocked (the pool is going away: no thread uses it).
-    #[cfg_attr(
-        not(feature = "cuda"),
-        allow(dead_code, reason = "the CUDA queue's drop uses it")
-    )]
+    /// Keeps `handle`, which found no slot, until the owner goes away.
+    pub(crate) fn overflow(&self, handle: usize) {
+        let node = Box::into_raw(Box::new(Overflow { handle, next: 0 })) as usize;
+        let mut head = self.overflow.load(Ordering::Relaxed);
+        loop {
+            // SAFETY: the node was made above and is this thread's until the exchange publishes it.
+            unsafe { (*(node as *mut Overflow)).next = head };
+            match self
+                .overflow
+                .compare_exchange(head, node, Ordering::Release, Ordering::Relaxed)
+            {
+                Ok(_) => return,
+                Err(seen) => head = seen,
+            }
+        }
+    }
+
+    /// Every handle the pool still holds, in the slots and the overflow list (the owner is going away: no thread uses it).
     pub(crate) fn drain(&self) -> impl Iterator<Item = usize> + '_ {
-        self.slots.iter().filter_map(|slot| {
+        let mut node = self.overflow.swap(0, Ordering::Acquire);
+        let overflowed = std::iter::from_fn(move || {
+            if node == 0 {
+                return None;
+            }
+            // SAFETY: the list was swapped out whole: this iterator owns every node, made by `overflow`.
+            let boxed = unsafe { Box::from_raw(node as *mut Overflow) };
+            node = boxed.next;
+            Some(boxed.handle)
+        });
+        let stocked = self.slots.iter().filter_map(|slot| {
             let v = slot.swap(0, Ordering::Acquire);
             (v != 0).then_some(v)
-        })
+        });
+        stocked.chain(overflowed)
     }
 }
 
 #[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize as Count;
+
+    fn stocked(slots: usize, handles: &[usize]) -> HandlePool {
+        let pool = HandlePool::new(slots);
+        for &h in handles {
+            pool.created();
+            pool.give(h).unwrap();
+        }
+        pool
+    }
 
     #[test]
     fn a_handle_is_taken_once_and_given_back_to_a_free_slot() {
-        let pool = HandlePool::new(2);
-        assert_eq!(pool.take(), None);
-        pool.give(7).unwrap();
-        pool.give(9).unwrap();
-        assert_eq!(pool.give(11), Err(11), "full: the caller destroys it");
+        let pool = stocked(2, &[7, 9]);
         let a = pool.take().unwrap();
         let b = pool.take().unwrap();
         assert_eq!(
@@ -99,18 +192,30 @@ mod tests {
             },
             [7, 9]
         );
-        assert_eq!(pool.take(), None);
+        assert_eq!(pool.take(), None, "nothing stocked");
+        pool.give(a).unwrap();
+        assert_eq!(pool.take(), Some(a));
+    }
+
+    #[test]
+    fn a_handle_beyond_the_slots_goes_to_the_overflow_list_and_is_drained_with_the_rest() {
+        let pool = stocked(2, &[7, 9]);
+        pool.created(); // a third handle exists: more than the slots
+        assert_eq!(pool.give(11), Err(11), "no slot for it");
+        pool.overflow(11);
+        pool.created();
+        assert_eq!(pool.give(13), Err(13));
+        pool.overflow(13);
+        let mut all: Vec<usize> = pool.drain().collect();
+        all.sort_unstable();
+        assert_eq!(all, [7, 9, 11, 13]);
+        assert_eq!(pool.drain().count(), 0);
     }
 
     #[test]
     fn threads_never_hold_one_handle_at_once() {
-        let pool = HandlePool::new(4);
-        for h in 1..=4 {
-            pool.give(h).unwrap();
-        }
-        let in_use: Vec<std::sync::atomic::AtomicUsize> = (0..5)
-            .map(|_| std::sync::atomic::AtomicUsize::new(0))
-            .collect();
+        let pool = stocked(4, &[1, 2, 3, 4]);
+        let in_use: Vec<Count> = (0..5).map(|_| Count::new(0)).collect();
         let (threads, rounds) = if cfg!(miri) { (3, 6) } else { (8, 3_000) };
         std::thread::scope(|scope| {
             for _ in 0..threads {
@@ -121,13 +226,40 @@ mod tests {
                             let users = in_use[h].fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                             assert_eq!(users, 0, "two threads hold handle {h}");
                             in_use[h].fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                            // A handle that finds no slot is dropped (the stock is a cache): exclusivity is the property.
-                            let _ = pool.give(h);
+                            pool.give(h).unwrap();
                         }
                     }
                 });
             }
         });
+    }
+
+    /// With as many slots as handles and fewer threads than handles, a handle is always stocked and a slot is always empty
+    /// for a give: a take never misses and a give is never refused, however the scans interleave.
+    #[test]
+    fn a_take_never_misses_and_a_give_is_never_refused_while_a_handle_is_stocked_and_the_population_fits()
+     {
+        let pool = stocked(8, &[1, 2, 3, 4, 5, 6, 7, 8]);
+        let (misses, refusals) = (Count::new(0), Count::new(0));
+        let rounds = if cfg!(miri) { 20 } else { 3_000_000 };
+        std::thread::scope(|scope| {
+            for _ in 0..7 {
+                let (pool, misses, refusals) = (&pool, &misses, &refusals);
+                scope.spawn(move || {
+                    for _ in 0..rounds {
+                        let Some(mut h) = pool.take() else {
+                            misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            continue;
+                        };
+                        while let Err(back) = pool.give(h) {
+                            refusals.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            h = back;
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!((misses.into_inner(), refusals.into_inner()), (0, 0));
     }
 }
 
@@ -146,6 +278,7 @@ mod loom_tests {
         loom::model(|| {
             let pool = Arc::new(HandlePool::new(1));
             let cell = Arc::new(UnsafeCell::new(0u32));
+            pool.created();
             pool.give(1).unwrap();
             let user = |pool: Arc<HandlePool>, cell: Arc<UnsafeCell<u32>>| {
                 move || {

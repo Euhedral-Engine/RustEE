@@ -20,8 +20,10 @@
 //! at once when it does not match. A scan therefore never blocks another thread on a slot it does not want, except for
 //! the instant between its two stores.
 //!
-//! **Eviction is least recently used**, as Java's `MAX_CAPTURES` map is: each slot keeps the tick of its last take (a
-//! pool-wide counter), and a full pool evicts the free instance with the oldest one. An instance in use is never evicted.
+//! **Eviction is approximately least recently used**, as Java's `MAX_CAPTURES` map is least recently used: each slot keeps
+//! the tick of its last take, and a full pool evicts the free instance with the oldest one. The tick is a coarse clock that
+//! advances only when an instance is filled, so a take costs a read and a store, nothing shared is read-modify-written
+//! per run. An instance in use is never evicted.
 
 #![allow(
     unsafe_code,
@@ -132,7 +134,7 @@ impl<K, T> Reservation<'_, K, T> {
         let put = |cell: *mut Option<(K, T)>| unsafe { *cell = Some((key, value)) };
         self.pool.slots[self.index].cell.with_mut(put);
         self.filled = true;
-        self.pool.stamp(self.index);
+        self.pool.advance(self.index);
         self.pool.slots[self.index]
             .word
             .store(word(self.tag, FREE), Ordering::Release);
@@ -155,7 +157,17 @@ impl<K, T> Drop for Reservation<'_, K, T> {
 }
 
 impl<K, T> InstancePool<K, T> {
-    fn stamp(&self, index: usize) {
+    /// A take marks its slot with the current tick: a read of the clock and a store to the slot, no read-modify-write on
+    /// anything shared. The clock advances when an instance is filled (a recording, which is rare), so instances used since
+    /// the last fill share a tick and ties go to the scan order: the choice of a victim is approximately least recently
+    /// used, and a wrong choice only records an instance again.
+    fn touch(&self, index: usize) {
+        let tick = self.clock.load(Ordering::Relaxed);
+        self.slots[index].stamp.store(tick, Ordering::Relaxed);
+    }
+
+    /// A fill advances the clock and marks its slot with the new tick.
+    fn advance(&self, index: usize) {
         let tick = self.clock.fetch_add(1, Ordering::Relaxed) + 1;
         self.slots[index].stamp.store(tick, Ordering::Relaxed);
     }
@@ -213,7 +225,7 @@ impl<K: Copy + Eq, T> InstancePool<K, T> {
                 .with(|cell| unsafe { matches!(&*cell, Some((k, _)) if k == key) });
             // The tag matched another key: the slot goes back as it was (the lease frees it).
             if same {
-                self.stamp(index);
+                self.touch(index);
                 return Some(lease);
             }
         }
@@ -371,22 +383,20 @@ mod tests {
     }
 
     #[test]
-    fn a_full_pool_evicts_the_least_recently_used_free_instance() {
+    fn a_full_pool_evicts_the_free_instance_that_was_used_least_recently() {
         let pool = InstancePool::<u32, u32>::new(3);
         for k in 1..=3u32 {
             pool.reserve(tag(k)).unwrap().fill(k, k * 10);
         }
-        // Use 1 and 3 again: 2 is the least recently used.
+        // Use 1 and 3 again: 2 was not used since it was filled.
         drop(pool.take(&1, tag(1)).unwrap());
         drop(pool.take(&3, tag(3)).unwrap());
         pool.reserve(tag(4)).unwrap().fill(4, 40);
-        assert!(pool.take(&2, tag(2)).is_none(), "the oldest went");
+        assert!(
+            pool.take(&2, tag(2)).is_none(),
+            "the one not used since went"
+        );
         assert!(pool.take(&1, tag(1)).is_some() && pool.take(&3, tag(3)).is_some());
-        // 4 was filled last, then 1 and 3 were taken: 4 is the oldest now.
-        drop(pool.take(&1, tag(1)).unwrap());
-        drop(pool.take(&3, tag(3)).unwrap());
-        pool.reserve(tag(5)).unwrap().fill(5, 50);
-        assert!(pool.take(&4, tag(4)).is_none());
     }
 
     #[test]

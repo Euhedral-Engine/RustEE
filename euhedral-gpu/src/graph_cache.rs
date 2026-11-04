@@ -227,78 +227,72 @@ type LaneOf<G> = <<G as Gpu>::Stream as Stream>::Lane;
 const SEEN: u64 = 1;
 const UNRECORDABLE: u64 = 2;
 
-/// Java's per-key sightings (`Capture.sightings`, `Capture.unrecordable`) in a fixed table of atomic words,
-/// `(tag << 2) | flags`: a key is recorded on its second sighting, and a key whose capture failed is never recorded again.
-/// A slot is found by probing a few from the key's tag; a table that is full forgets: the key it overwrites is seen for the
-/// first time again.
+/// Java's per-key sightings (`Capture.sightings`, `Capture.unrecordable`) in fixed tables of atomic words holding a key's
+/// tag: a key is recorded on its second sighting, and a key whose capture failed is never recorded again. The two live in
+/// separate tables, so a crowd of ordinary sightings never forgets an unrecordable mark (which would make the key record,
+/// fail and run its work again). A slot is found by probing a few from the key's tag; a sightings table that is full
+/// forgets: the key it overwrites is seen for the first time again, which only delays its recording by a unit.
 struct Sightings {
-    slots: Box<[AtomicU64]>,
+    seen: Box<[AtomicU64]>,
+    unrecordable: Box<[AtomicU64]>,
 }
 
 impl Sightings {
     const PROBES: usize = 8;
 
     fn new(slots: usize) -> Self {
-        Self {
-            slots: (0..slots.max(Self::PROBES))
+        let table = |n: usize| {
+            (0..n.max(Self::PROBES))
                 .map(|_| AtomicU64::new(0))
-                .collect(),
+                .collect()
+        };
+        Self {
+            seen: table(slots),
+            unrecordable: table(slots),
         }
+    }
+
+    /// Whether `tag` is in `table`; with `insert`, it is put in an empty slot of its probe if it was not, and at its first
+    /// probe (forgetting what was there) when the probe is full.
+    fn find(table: &[AtomicU64], tag: u64, insert: bool) -> bool {
+        let n = table.len();
+        let start = (tag % n as u64) as usize;
+        for step in 0..Self::PROBES {
+            let slot = &table[(start + step) % n];
+            let mut seen = slot.load(Ordering::Relaxed);
+            if seen == 0 && insert {
+                match slot.compare_exchange(0, tag + 1, Ordering::Relaxed, Ordering::Relaxed) {
+                    Ok(_) => return false,
+                    Err(now) => seen = now,
+                }
+            }
+            if seen == tag + 1 {
+                return true;
+            }
+        }
+        if insert {
+            table[start].store(tag + 1, Ordering::Relaxed);
+        }
+        false
     }
 
     /// The flags the key had before this sighting, which counts.
     fn see(&self, tag: u64) -> u64 {
-        let n = self.slots.len();
-        let start = (tag % n as u64) as usize;
-        for step in 0..Self::PROBES {
-            let slot = &self.slots[(start + step) % n];
-            let seen = slot.load(Ordering::Relaxed);
-            if seen != 0 && seen >> 2 == tag {
-                return seen & 3;
-            }
-            if seen == 0
-                && slot
-                    .compare_exchange(0, (tag << 2) | SEEN, Ordering::Relaxed, Ordering::Relaxed)
-                    .is_ok()
-            {
-                return 0;
-            }
-            if seen == 0 {
-                // Lost the slot to another key: look at it again.
-                let now = slot.load(Ordering::Relaxed);
-                if now != 0 && now >> 2 == tag {
-                    return now & 3;
-                }
-            }
-        }
-        self.slots[start].store((tag << 2) | SEEN, Ordering::Relaxed);
-        0
+        let bad = if Self::find(&self.unrecordable, tag, false) {
+            UNRECORDABLE
+        } else {
+            0
+        };
+        let seen = if Self::find(&self.seen, tag, true) {
+            SEEN
+        } else {
+            0
+        };
+        bad | seen
     }
 
     fn mark_unrecordable(&self, tag: u64) {
-        let n = self.slots.len();
-        let start = (tag % n as u64) as usize;
-        for step in 0..Self::PROBES {
-            let slot = &self.slots[(start + step) % n];
-            let seen = slot.load(Ordering::Relaxed);
-            if seen != 0 && seen >> 2 == tag {
-                slot.fetch_or(UNRECORDABLE, Ordering::Relaxed);
-                return;
-            }
-            if seen == 0
-                && slot
-                    .compare_exchange(
-                        0,
-                        (tag << 2) | SEEN | UNRECORDABLE,
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                    )
-                    .is_ok()
-            {
-                return;
-            }
-        }
-        self.slots[start].store((tag << 2) | SEEN | UNRECORDABLE, Ordering::Relaxed);
+        Self::find(&self.unrecordable, tag, true);
     }
 }
 
@@ -493,17 +487,29 @@ impl<G: Gpu, K: Copy + Eq + Hash + Send> SharedGraphCache<G, K> {
             return self.direct(lane, waits, body, hold);
         };
         wait_all(lane, waits)?;
-        match gpu.record_on(&[lane], hold, |seq| seq.submit(0, |enq| body.enqueue(enq))) {
+        let ran = std::cell::Cell::new(false);
+        let recorded = gpu.record_on(&[lane], hold, |seq| {
+            ran.set(true);
+            seq.submit(0, |enq| body.enqueue(enq))
+        });
+        match recorded {
             Ok(graph) => {
                 self.records.fetch_add(1, Ordering::Relaxed);
                 slot.fill(key, graph);
                 Ok(Ran::Recorded)
             }
             Err(GpuError::Capture(_)) => {
-                // The work ran for real and is unaffected: only the recording failed. The key runs directly from now on.
+                // Only the recording failed: the key runs directly from now on.
                 self.sightings.mark_unrecordable(tag);
-                self.directs.fetch_add(1, Ordering::Relaxed);
-                Ok(Ran::Direct)
+                drop(slot);
+                if ran.get() {
+                    // The body ran for real, unaffected by the failed capture: the unit is done.
+                    self.directs.fetch_add(1, Ordering::Relaxed);
+                    Ok(Ran::Direct)
+                } else {
+                    // The capture failed before the body ran (the shadow could not be started): the unit has not run.
+                    self.direct(lane, &[], body, hold)
+                }
             }
             Err(other) => Err(other),
         }
@@ -1006,6 +1012,42 @@ mod shared_tests {
                 .unwrap(),
             Ran::Recorded
         );
+    }
+
+    /// A capture that cannot start fails before the body ran: the unit has not run, so it runs directly, once.
+    #[test]
+    fn a_capture_that_fails_before_the_body_ran_still_runs_the_unit_once() {
+        let (gpu, lane, kernel, at) = rig();
+        let cache = SharedGraphCache::<FakeGpu, _>::new();
+        let mut hold = GraphHold::new();
+        let mut b = body(&kernel, at, 1, 1);
+        cache.run(&gpu, &lane, KEY, &mut b, &mut hold).unwrap(); // first sighting
+        gpu.fail_next_recording_before_the_body();
+        assert_eq!(
+            cache.run(&gpu, &lane, KEY, &mut b, &mut hold).unwrap(),
+            Ran::Direct
+        );
+        gpu.run_until_idle();
+        assert_eq!(word(&gpu, at), 2, "two units, each run exactly once");
+        assert_eq!(cache.stats().directs, 2);
+        assert!(cache.is_empty());
+        assert_eq!(
+            cache.run(&gpu, &lane, KEY, &mut b, &mut hold).unwrap(),
+            Ran::Direct,
+            "the key is unrecordable"
+        );
+    }
+
+    /// An unrecordable mark is not forgotten by a crowd of other keys\' sightings.
+    #[test]
+    fn a_crowd_of_sightings_does_not_forget_an_unrecordable_key() {
+        let sightings = Sightings::new(16);
+        let bad = tag_of(&(9u16, 9u32, 9u64));
+        sightings.mark_unrecordable(bad);
+        for key in 0..(if cfg!(miri) { 200 } else { 50_000u64 }) {
+            sightings.see(tag_of(&(1u16, 1u32, key)));
+        }
+        assert_eq!(sightings.see(bad) & UNRECORDABLE, UNRECORDABLE);
     }
 
     #[test]

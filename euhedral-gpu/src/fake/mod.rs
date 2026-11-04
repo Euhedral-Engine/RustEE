@@ -243,8 +243,8 @@ pub struct FakeGpu {
     pub(crate) state: Mutex<State>,
     pub(crate) poison: Poison,
     kernels: Mutex<HashMap<String, FakeKernelFn>>,
-    /// A test hook: the next recording fails as a failed capture does (its work still ran).
-    fail_recording: std::sync::atomic::AtomicBool,
+    /// A test hook: how the next recording fails (0: it does not; 1: after its work ran; 2: before the body ran).
+    fail_recording: std::sync::atomic::AtomicU8,
 }
 
 impl fmt::Debug for FakeGpu {
@@ -264,7 +264,7 @@ impl FakeGpu {
             }),
             poison: Poison::new(),
             kernels: Mutex::new(HashMap::new()),
-            fail_recording: std::sync::atomic::AtomicBool::new(false),
+            fail_recording: std::sync::atomic::AtomicU8::new(0),
         })
     }
 
@@ -272,7 +272,14 @@ impl FakeGpu {
     /// for real is unaffected.
     pub fn fail_next_recording(&self) {
         self.fail_recording
-            .store(true, std::sync::atomic::Ordering::Release);
+            .store(1, std::sync::atomic::Ordering::Release);
+    }
+
+    /// A test hook: the next recording fails before its body ran, as a capture that cannot start does (the unit has not
+    /// run).
+    pub fn fail_next_recording_before_the_body(&self) {
+        self.fail_recording
+            .store(2, std::sync::atomic::Ordering::Release);
     }
 
     pub(crate) fn lock(&self) -> MutexGuard<'_, State> {

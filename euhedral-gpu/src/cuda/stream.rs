@@ -174,10 +174,13 @@ pub struct CudaQueue {
     /// The private streams of this lane, stocked: a worker takes one to replay a graph or to capture on, uses it alone,
     /// and gives it back (see [`Fork`]).
     forks: HandlePool,
+    /// How many private streams were ever made (a test asks: after warm-up none is made, whatever the contention).
+    forks_made: std::sync::atomic::AtomicUsize,
 }
 
-/// The most private streams a lane keeps stocked; a stream given back to a full stock is destroyed.
-const FORKS_STOCKED: usize = 64;
+/// The private streams a lane keeps stocked. A stream beyond them (more exist than slots: more workers replaying at once
+/// than this) goes to an overflow list and is destroyed with the lane, never on the thread that gave it back.
+const FORKS_STOCKED: usize = 256;
 
 /// A private stream of a lane, with the two events that fork it from the lane and join it back.
 ///
@@ -239,6 +242,9 @@ impl CudaQueue {
                 return Err(e);
             }
         }
+        self.forks.created();
+        self.forks_made
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(Box::new(Fork {
             stream,
             fork: events[0],
@@ -246,14 +252,20 @@ impl CudaQueue {
         }))
     }
 
-    /// Gives a private stream back to the stock (destroyed if the stock is full). The context is current. Whatever was
-    /// enqueued on the stream stays ordered on it; a stream that was capturing must have ended its capture.
+    /// Gives a private stream back to the stock (to the overflow list when more streams exist than slots: it is destroyed
+    /// with the lane, never here). Whatever was enqueued on the stream stays ordered on it; a stream that was capturing must
+    /// have ended its capture.
     pub(crate) fn give_fork(&self, fork: Box<Fork>) {
         let handle = Box::into_raw(fork);
         if let Err(handle) = self.forks.give(handle as usize) {
-            // SAFETY: the pointer made above, given to no one.
-            destroy_fork(&self.gpu, &unsafe { *Box::from_raw(handle as *mut Fork) });
+            self.forks.overflow(handle);
         }
+    }
+
+    /// How many private streams this lane ever made. (A test hook: a warmed lane makes no more, whatever the contention.)
+    #[cfg(feature = "test-hooks")]
+    pub fn forks_made(&self) -> usize {
+        self.forks_made.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Claims the next marker, ahead of the work it will follow. `Err(Busy)` before anything is submitted.
@@ -494,6 +506,7 @@ impl CudaStream {
                     lanes: lanes.clone(),
                     sink,
                     forks: HandlePool::new(FORKS_STOCKED),
+                    forks_made: std::sync::atomic::AtomicUsize::new(0),
                 }),
                 shadow: None,
                 retire,
