@@ -235,7 +235,10 @@ workers, as Java's `fixed` placement), and a root continues its run's home lane,
 lanes when the run is made (Java `nextHome`; `LanePool::with_reserved_lanes` sets a lane apart for work of its own). A stage
 must return the marker of the work it submitted on its lane (`Lane::submit_marked` makes the marker with the submission,
 and any `Busy` comes before any work, so a retried stage has submitted nothing). A stage holds what its work reads and
-releases it in `Stage::retired`, which runs once the quantum's device work ended. A stage that finds its resources busy answers `StageError::Retry` and
+releases it in `Stage::retired`, which runs once the quantum's device work ended. A stage that waits for host-side readiness holds itself at its gate (`Stage::pass_gate` returns `false` after taking a `Gate`) and
+whatever makes it ready releases the gate, once, from any thread that may publish frames: no polling, and no stream waits for
+the host. A stage that never submitted is abandoned (`Stage::abandoned(quantum, home)`) after the quantum's lanes joined the
+home lane and before the retirement is armed on it, so what the hook submits to home is covered by the retirement. A stage that finds its resources busy answers `StageError::Retry` and
 runs again when a lane of the pool made progress, or after `GraphRuntime::retry_backstop` (default
 `DEFAULT_RETRY_BACKSTOP`, 20 ms: set it longer than any one pass on your devices). A stage can be
 **ordered** (`StageSpec::ordered`): its frames then run in the order they were published, on one

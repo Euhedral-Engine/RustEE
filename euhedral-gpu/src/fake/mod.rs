@@ -42,6 +42,7 @@ use crate::{
 pub use enqueue::FakeEnqueue;
 use enqueue::Real;
 pub use graph::{FakeGraph, FakeSequence};
+pub use lane::{FakeLaneEnqueue, FakeRawStream};
 pub use module::{FakeKernel, FakeModule};
 use stream::Placement;
 pub use stream::{FakeQueue, FakeStream};

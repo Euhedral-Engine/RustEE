@@ -5,7 +5,9 @@ use std::sync::Arc;
 
 use euhedral_graph::{ControlError, DeviceQueue, LaneControl, LaneId, Marker, RetireCell};
 
-use crate::{Args, Gpu, GpuError, GraphHold, Lane, LaneEnqueue, Launch, POISONED_STATUS};
+use crate::{
+    Args, Gpu, GpuError, GraphHold, Lane, LaneEnqueue, LaneStream, Launch, POISONED_STATUS,
+};
 
 use super::enqueue::Real;
 use super::stream::FakeQueue;
@@ -86,6 +88,26 @@ fn control_error(error: GpuError) -> ControlError {
         GpuError::Busy => ControlError::Busy,
         GpuError::Invalid(what) => ControlError::Invalid(what),
         other => ControlError::Failed(other.to_string()),
+    }
+}
+
+/// The fake device's stream behind a lane: what a library call "enqueues on" in a test.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FakeRawStream {
+    /// The lane's id in its pool.
+    pub lane: LaneId,
+    /// The lane's global index on the fake device.
+    pub global: usize,
+}
+
+impl LaneStream for FakeLaneEnqueue<'_> {
+    type Raw = FakeRawStream;
+
+    unsafe fn raw_stream(&self) -> FakeRawStream {
+        FakeRawStream {
+            lane: self.queue.lane,
+            global: self.queue.global(),
+        }
     }
 }
 

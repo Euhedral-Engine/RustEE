@@ -9,8 +9,11 @@ use std::sync::Arc;
 use euhedral_graph::{ControlError, LaneControl, LaneId, Marker, RetireCell};
 
 use crate::{
-    Args, GpuError, GraphHold, Kernel, Lane, LaneEnqueue, Launch, MAX_ARGS, POISONED_STATUS,
+    Args, GpuError, GraphHold, Kernel, Lane, LaneEnqueue, LaneStream, Launch, MAX_ARGS,
+    POISONED_STATUS,
 };
+
+use euhedral_memory::cuda::CuStream;
 
 use super::stream::CudaQueue;
 use super::{CudaEnqueue, CudaGpu, CudaKernel, from_cuda};
@@ -119,6 +122,14 @@ impl LaneEnqueue for CudaLaneEnqueue<'_> {
         self.gpu().check("cuMemsetD8Async", unsafe {
             f(dst, value, bytes, self.queue.raw)
         })
+    }
+}
+
+impl LaneStream for CudaLaneEnqueue<'_> {
+    type Raw = CuStream;
+
+    unsafe fn raw_stream(&self) -> CuStream {
+        self.queue.raw
     }
 }
 

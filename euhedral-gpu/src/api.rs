@@ -293,7 +293,7 @@ pub trait Stream: Send + Sized + 'static {
 ///   Java `StageFrame.retired`), once the quantum's boundary was reached.
 pub trait Lane: DeviceQueue + LaneControl + Sized + 'static {
     type Gpu: Gpu;
-    type Enqueue<'a>: LaneEnqueue<Kernel = <Self::Gpu as Gpu>::Kernel>
+    type Enqueue<'a>: LaneEnqueue<Kernel = <Self::Gpu as Gpu>::Kernel> + LaneStream
     where
         Self: 'a;
     /// What [`submit_held`](Self::submit_held) enqueues: an [`Enqueue`] whose kept values go to a [`GraphHold`].
@@ -380,6 +380,33 @@ pub trait LaneEnqueue {
     /// # Safety
     /// As [`copy_to_device`](Self::copy_to_device).
     unsafe fn memset(&mut self, dst: u64, value: u8, bytes: usize) -> Result<(), GpuError>;
+}
+
+/// The driver stream behind a shared lane's submission, for library calls that enqueue on a stream of their own accord (a
+/// codec, an optical-flow engine, an inference runtime): Java's `GpuStream.submit(Runnable)`, which runs the library calls
+/// with the stream selected.
+///
+/// The handle is raw, so what it names is the caller's to keep right. Library calls enqueued on it are ordered with the
+/// closure's other operations (they are on the same stream), and the marker that [`Lane::submit_marked`] claimed before the
+/// closure is recorded after them.
+pub trait LaneStream: LaneEnqueue {
+    /// The backend's stream handle (CUDA: `CuStream`).
+    type Raw: Copy + fmt::Debug;
+
+    /// The lane's driver stream.
+    ///
+    /// # Safety
+    /// - Use it only inside the closure of the `submit`, `submit_marked` or `submit_held` call that gave this value to
+    ///   you, on the calling thread, and do not keep it: after the closure the lane belongs to every worker again, and
+    ///   the marker is recorded behind the closure's work.
+    /// - The device context must be the one current for the call (the backend selected it for the closure; a library call
+    ///   that switches it must restore it).
+    /// - Enqueue only work that completes on its own on the stream: do not synchronize the stream, destroy it, or
+    ///   capture it. Every pointer the enqueued work reads or writes stays valid until the work retires (hold it in the
+    ///   quantum, as for a copy).
+    /// - Work enqueued this way is not part of a recording: a body that must also be recorded as a graph enqueues through
+    ///   [`LaneEnqueue`].
+    unsafe fn raw_stream(&self) -> Self::Raw;
 }
 
 /// What a submission on an owned stream, or into a recurring sequence's passes, enqueues: the operations of

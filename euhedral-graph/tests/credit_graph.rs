@@ -50,9 +50,9 @@ use euhedral_core::impls::BaseCloneableObject;
 use euhedral_core::ingest::{IngestSink, QueueIngestSink};
 use euhedral_graph::testing::FakeDevice;
 use euhedral_graph::{
-    Completions, DEFAULT_RETRY_BACKSTOP, EdgeKind, GraphRuntime, Lake, LaneId, LanePool, Marker,
-    QuantumOutcome, Sequencer, Slot, Stage, StageCx, StageError, StageGraph, StageGraphSpec,
-    StageSpec, Submitted, Ticket,
+    Completions, DEFAULT_RETRY_BACKSTOP, DeviceQueue, EdgeKind, GraphRuntime, Lake, LaneId,
+    LanePool, Marker, QuantumOutcome, Sequencer, Slot, Stage, StageCx, StageError, StageGraph,
+    StageGraphSpec, StageSpec, Submitted, Ticket,
 };
 use euhedral_hardware_utils::affinity;
 
@@ -299,7 +299,7 @@ impl Stage<Item> for Fetch {
         Ok(Submitted::marker(self.0.submit(DISK, FETCH, cx.waits)))
     }
 
-    fn abandoned(&self, item: &Item) {
+    fn abandoned(&self, item: &Item, _home: &dyn DeviceQueue) {
         item.drop_slot();
     }
 }
@@ -312,7 +312,7 @@ impl Stage<Item> for Parse {
         Ok(Submitted::marker(self.0.submit(PARSE_Q, PARSE, cx.waits)))
     }
 
-    fn abandoned(&self, item: &Item) {
+    fn abandoned(&self, item: &Item, _home: &dyn DeviceQueue) {
         item.drop_slot();
     }
 }
@@ -341,7 +341,7 @@ impl Stage<Item> for Compute {
         Ok(Submitted::marker(marker))
     }
 
-    fn abandoned(&self, item: &Item) {
+    fn abandoned(&self, item: &Item, _home: &dyn DeviceQueue) {
         item.drop_slot();
     }
 }

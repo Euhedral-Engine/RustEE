@@ -157,6 +157,13 @@
   ]
  },
  {
+  "name": "graph: stage gates and abandoned hooks",
+  "crate": "euhedral-graph",
+  "commands": [
+   "cargo +nightly miri test -p euhedral-graph --lib -- stage_graph::tests::a_stage_held_at_its_gate stage_graph::tests::gates_released stage_graph::tests::a_gate_ stage_graph::tests::a_stage_held_with_no_gate stage_graph::tests::a_stage_is_abandoned_after stage_graph::tests::every_stage_that_never_submitted"
+  ]
+ },
+ {
   "name": "graph: stage graph, device control",
   "crate": "euhedral-graph",
   "commands": [

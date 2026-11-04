@@ -20,7 +20,7 @@ use euhedral_core::generics::{FrameSink, LatticeSource};
 use euhedral_data_structures::queues::{Consumer, MpmcQueue, Multi, Producer};
 use euhedral_gpu::cuda::{CudaKernel, CudaQueue};
 use euhedral_gpu::{
-    Args, GpuError, Lane, LaneEnqueue, Launch, Module, SharedLanes, StreamOptions,
+    Args, GpuError, Lane, LaneEnqueue, LaneStream, Launch, Module, SharedLanes, StreamOptions,
     open_shared_lanes,
 };
 use euhedral_graph::{
@@ -535,4 +535,37 @@ fn what_stages_hold_is_released_by_their_hooks_once_per_quantum() {
         "each hold released, once"
     );
     assert_eq!(graph.live(), 0);
+}
+
+/// Java `GpuStream.submit(Runnable)`: a library call that enqueues on a stream of its own accord (here the driver\'s memset,
+/// standing for a codec or an inference runtime) runs on the lane\'s driver stream inside the closure, ordered with the
+/// closure\'s other operations and covered by the marker the call claimed before the closure.
+#[test]
+fn a_library_call_enqueues_on_the_lanes_raw_stream_inside_the_marked_submission() {
+    let Some(gpu) = gpu() else { return };
+    let (_mem, block) = device_word(&gpu);
+    let pinned = Pinned::new(&gpu);
+    let lanes = lanes(&gpu, 1);
+    let lane = lanes.pool.lane(LaneId(0)).clone();
+    let memset = gpu.device().driver.fns.memset_d8_async;
+    let host = pinned.word();
+    let ((), marker) = lane
+        .submit_marked(|q| {
+            // SAFETY: the raw stream is used inside this closure on this thread; the device word is live and 256 bytes;
+            // the memset completes on its own.
+            let code = unsafe { memset(block.addr, 0x2a, 4, q.raw_stream()) };
+            assert_eq!(code, 0, "the library call was accepted");
+            // The closure\'s own operations follow it on the same stream.
+            // SAFETY: the pinned word and the device word are live.
+            unsafe { q.copy_to_host(host.bytes(), block.addr, 4) }
+        })
+        .unwrap();
+    assert!(wait_until(Duration::from_secs(10), || lanes
+        .queues
+        .reached(marker)));
+    assert_eq!(
+        host.load(),
+        0x2a2a_2a2a,
+        "the copy that follows the library call read what it wrote: one stream, in order"
+    );
 }
