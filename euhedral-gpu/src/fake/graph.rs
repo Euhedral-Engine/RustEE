@@ -144,6 +144,10 @@ impl Sequence for FakeSequence<'_> {
         f(&mut q)
     }
 
+    fn library_stream_requested(&self) -> bool {
+        self.rec.asked.get()
+    }
+
     fn order(&mut self, after: usize, before: usize) -> Result<(), GpuError> {
         if after >= self.streams || before >= self.streams {
             return Err(GpuError::Invalid(format!(
@@ -207,6 +211,7 @@ impl FakeGpu {
         if let Some(hold) = hold.as_mut() {
             hold.add_frozen(&seq.rec.frozen);
         }
+        let asked = seq.rec.asked.get();
         let rec = std::mem::replace(&mut seq.rec, Recording::new(Mode::Probe));
         // Join: real[0] ends behind every other stream. Done even when `f` failed, so the streams stay consistent.
         let mut joined = Ok(());
@@ -215,6 +220,11 @@ impl FakeGpu {
         }
         result?;
         joined?;
+        if asked {
+            return Err(GpuError::Invalid(
+                "a body asked for the driver stream in a recording pass, which has none to lend: the library call did not run (a body that does library work is run directly, which a probe pass finds out first)".into(),
+            ));
+        }
         let fingerprint = rec.hasher.finish();
         Ok((rec, fingerprint))
     }

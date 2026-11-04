@@ -382,8 +382,8 @@ pub trait LaneEnqueue {
     unsafe fn memset(&mut self, dst: u64, value: u8, bytes: usize) -> Result<(), GpuError>;
 }
 
-/// A driver stream lent for the closure of a submission, for library calls that enqueue on a stream of their own accord
-/// (a codec, an optical-flow engine, an inference runtime). It borrows the enqueue handle it came from and is `!Send`, so it
+/// A driver stream lent for the closure of a submission, for library calls that enqueue on a stream of their own accord. It
+/// borrows the enqueue handle it came from and is `!Send`, so it
 /// cannot outlive the closure or leave the calling thread:
 ///
 /// ```compile_fail,E0521
@@ -436,16 +436,25 @@ impl<R: Copy> RawStream<'_, R> {
 /// The driver stream behind a submission, for library calls that enqueue on a stream (Java `GpuStream.submit(Runnable)`,
 /// which runs the library calls with the stream selected).
 ///
+/// **The lent stream is private to the closure.** On a shared lane it is not the lane's own stream but one forked from it
+/// for this submission: ordered after everything enqueued so far, and the closure's later operations go to it too, so what
+/// follows the library call follows its work; when the closure ends the lane waits for it, and the marker is recorded after
+/// that. The lane's stream is never lent because a library may call `cuGraphLaunch` (or another call that behaves like it)
+/// internally, and with several threads submitting to one stream a `cuGraphLaunch` can overtake the `cuStreamWaitEvent` its
+/// own thread issued just before it (driver 615.71.09, CUDA 13.4), so the library's work would run before what it waited for.
+///
 /// The loan is a [`RawStream`]: the borrow checker keeps it inside the closure and on the calling thread. What the
-/// library does with the stream is outside Rust\'s view, so the contract of the call is the caller\'s:
+/// library does with the stream is outside Rust's view, so the contract of the call is the caller's:
 /// - Enqueue only work that completes on its own on the stream: do not synchronize the stream, destroy it, or capture it.
 /// - The device context is the one the backend selected for the closure; a call that switches it restores it.
 /// - Every pointer the enqueued work reads or writes stays valid until the work retires (hold it in the quantum, as for a
 ///   copy).
 ///
-/// Library calls enqueued this way are ordered with the closure\'s other operations (the same stream), and the marker
-/// that [`Lane::submit_marked`] claimed before the closure is recorded after them. They are not part of a recording: in a
-/// pass of a recurring sequence (probe, update, record) there is no stream to lend, and `raw_stream` is `None`.
+/// Library calls are not part of a recording: in a pass of a recurring sequence (probe, update, record) there is no stream
+/// to lend, `raw_stream` is `None`, and the pass notes the request ([`Sequence::library_stream_requested`]). A caller never
+/// lets that skip the call: [`SharedGraphCache`](crate::SharedGraphCache) finds the request out before it records or
+/// replays, makes the key unrecordable, and runs the unit directly, every time, with the call made. An owned stream has a
+/// single submitter, so it lends its own stream.
 pub trait LaneStream: LaneEnqueue {
     /// The backend\'s stream handle.
     type Raw: Copy + fmt::Debug;
@@ -521,6 +530,12 @@ pub trait Sequence {
 
     /// Later work on `before` waits for the work submitted so far on `after`.
     fn order(&mut self, after: usize, before: usize) -> Result<(), GpuError>;
+
+    /// Whether a body asked for the driver stream ([`LaneStream::raw_stream`]) in this pass. A pass has no stream to lend
+    /// (what ran on it would not be recorded, and an update or probe touches no device), so the request was answered
+    /// `None`: a body that does library work cannot be replayed, and a caller that sees this runs it directly (see
+    /// [`SharedGraphCache`](crate::SharedGraphCache)).
+    fn library_stream_requested(&self) -> bool;
 }
 
 /// A recorded sequence.

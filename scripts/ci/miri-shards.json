@@ -167,7 +167,7 @@
   "name": "graph: abandoned hooks",
   "crate": "euhedral-graph",
   "commands": [
-   "cargo +nightly miri test -p euhedral-graph --lib -- stage_graph::tests::a_stage_is_abandoned_after stage_graph::tests::every_stage_that_never_submitted stage_graph::tests::a_killed_quantum_that_used_no_lane stage_graph::tests::a_quantum_that_used_no_lane stage_graph::tests::a_later_quantum_on_an_abandoned"
+   "cargo +nightly miri test -p euhedral-graph --lib -- stage_graph::tests::a_stage_is_abandoned_after stage_graph::tests::every_stage_that_never_submitted stage_graph::tests::a_killed_quantum_that_used_no_lane stage_graph::tests::a_quantum_that_used_no_lane stage_graph::tests::a_later_quantum_on_an_abandoned stage_graph::tests::a_refused_retirement_for_the_hooks"
   ]
  },
  {

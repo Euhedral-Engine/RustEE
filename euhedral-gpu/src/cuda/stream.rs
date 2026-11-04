@@ -262,6 +262,12 @@ impl CudaQueue {
         }
     }
 
+    /// The lane's own driver stream. (A test hook: a library is never lent it.)
+    #[cfg(feature = "test-hooks")]
+    pub fn raw_stream_for_tests(&self) -> CuStream {
+        self.raw
+    }
+
     /// How many private streams this lane ever made. (A test hook: a warmed lane makes no more, whatever the contention.)
     #[cfg(feature = "test-hooks")]
     pub fn forks_made(&self) -> usize {
@@ -345,6 +351,127 @@ impl CudaQueue {
             })
         })?;
         Ok(Marker::new(self.ring.id, self.lane, value))
+    }
+}
+
+/// The private stream a submission on a shared lane lends for library calls, forked from the lane on the first request and
+/// joined back when the submission ends.
+///
+/// A library may call `cuGraphLaunch` internally, and a `cuGraphLaunch` on a stream that several threads submit to can
+/// overtake the `cuStreamWaitEvent` its own thread issued just before it (see [`Fork`]). So the lane's stream is never
+/// lent: the stream a library call gets is private to the closure, forked from the lane (an event recorded on the lane and
+/// awaited by it) so it is ordered after everything enqueued so far, and every operation the closure enqueues from then on
+/// goes to it too, so what follows the library call follows its work. When the submission ends the lane waits for it (an
+/// event recorded on it and awaited by the lane), and the marker is recorded after that.
+pub(crate) struct LaneFork<'a> {
+    queue: &'a CudaQueue,
+    fork: std::cell::RefCell<Option<Box<Fork>>>,
+    /// A fork that could not be made or joined: `finish` returns it, so the submission does not end without it.
+    failed: std::cell::RefCell<Option<GpuError>>,
+}
+
+impl std::fmt::Debug for LaneFork<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LaneFork")
+            .field("lent", &self.fork.borrow().is_some())
+            .finish()
+    }
+}
+
+impl<'a> LaneFork<'a> {
+    pub(crate) fn new(queue: &'a CudaQueue) -> Self {
+        Self {
+            queue,
+            fork: std::cell::RefCell::new(None),
+            failed: std::cell::RefCell::new(None),
+        }
+    }
+
+    /// The stream the closure's operations go to: the lane's until a library asks for a stream, the private one after.
+    pub(crate) fn current(&self) -> CuStream {
+        match &*self.fork.borrow() {
+            Some(fork) => fork.stream,
+            None => self.queue.raw,
+        }
+    }
+
+    /// The private stream, forked from the lane on the first call. `None` if it could not be made (the submission then
+    /// ends with that error).
+    pub(crate) fn private(&self) -> Option<CuStream> {
+        if let Some(fork) = &*self.fork.borrow() {
+            return Some(fork.stream);
+        }
+        if self.failed.borrow().is_some() {
+            return None;
+        }
+        let made = (|| {
+            let fork = self.queue.take_fork()?;
+            let f = &self.queue.gpu.device().driver.fns;
+            // SAFETY: events and streams of this device; the private stream is this thread\'s alone; the context is current
+            // (the submission entered it).
+            let forked = unsafe {
+                self.queue
+                    .gpu
+                    .check("cuEventRecord", (f.event_record)(fork.fork, self.queue.raw))
+                    .and_then(|()| {
+                        self.queue.gpu.check(
+                            "cuStreamWaitEvent",
+                            (self.queue.gpu.fns.stream_wait_event)(fork.stream, fork.fork, 0),
+                        )
+                    })
+            };
+            match forked {
+                Ok(()) => Ok(fork),
+                Err(e) => {
+                    self.queue.give_fork(fork);
+                    Err(e)
+                }
+            }
+        })();
+        match made {
+            Ok(fork) => {
+                let stream = fork.stream;
+                *self.fork.borrow_mut() = Some(fork);
+                Some(stream)
+            }
+            Err(e) => {
+                *self.failed.borrow_mut() = Some(e);
+                None
+            }
+        }
+    }
+
+    /// Joins the private stream back into the lane (if one was lent) and gives it back. Once; returns what failed.
+    pub(crate) fn finish(&self) -> Result<(), GpuError> {
+        if let Some(fork) = self.fork.borrow_mut().take() {
+            let f = &self.queue.gpu.device().driver.fns;
+            // SAFETY: as in `private`; the private stream is still this thread\'s.
+            let joined = unsafe {
+                self.queue
+                    .gpu
+                    .check("cuEventRecord", (f.event_record)(fork.join, fork.stream))
+                    .and_then(|()| {
+                        self.queue.gpu.check(
+                            "cuStreamWaitEvent",
+                            (self.queue.gpu.fns.stream_wait_event)(self.queue.raw, fork.join, 0),
+                        )
+                    })
+            };
+            self.queue.give_fork(fork);
+            if let Err(e) = joined {
+                self.failed.borrow_mut().get_or_insert(e);
+            }
+        }
+        match self.failed.borrow_mut().take() {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for LaneFork<'_> {
+    fn drop(&mut self) {
+        let _ = self.finish();
     }
 }
 

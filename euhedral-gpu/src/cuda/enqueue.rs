@@ -13,6 +13,7 @@ use crate::{
 };
 
 use super::fns::{CAPTURE_STATUS_ACTIVE, CaptureInfo, CuGraph, CuGraphNode};
+use super::stream::LaneFork;
 use super::{CudaGpu, CudaKernel, CudaQueue, CudaStream};
 
 /// Which pass a sequence is running.
@@ -56,6 +57,8 @@ pub(crate) struct Recording {
     pub(crate) staged_len: usize,
     /// The first reason the capture cannot be used. The real work is unaffected.
     pub(crate) failed: Option<GpuError>,
+    /// Whether a body asked for the raw stream in this pass (answered `None`: a pass has none to lend).
+    pub(crate) asked: std::cell::Cell<bool>,
 }
 
 impl Recording {
@@ -70,6 +73,7 @@ impl Recording {
             staged: Vec::new(),
             staged_len: 0,
             failed: None,
+            asked: std::cell::Cell::new(false),
         }
     }
 
@@ -83,6 +87,7 @@ impl Recording {
         self.frozen = None;
         self.staged_len = 0;
         self.failed = None;
+        self.asked.set(false);
     }
 }
 
@@ -125,6 +130,8 @@ pub struct CudaEnqueue<'a> {
     pub(crate) rec: Option<(&'a mut Recording, usize)>,
     /// Where the values a body keeps go when it runs directly on a shared lane, which keeps none.
     pub(crate) hold: Option<&'a mut GraphHold>,
+    /// The private stream a direct run on a shared lane lends to library calls (see `LaneFork`).
+    pub(crate) fork: Option<&'a LaneFork<'a>>,
 }
 
 impl<'a> CudaEnqueue<'a> {
@@ -137,11 +144,17 @@ impl<'a> CudaEnqueue<'a> {
             }),
             rec: None,
             hold: None,
+            fork: None,
         }
     }
 
     /// A direct run on a shared lane: what the body keeps goes to `hold`.
-    pub(crate) fn on_lane(gpu: &'a CudaGpu, lane: &'a CudaQueue, hold: &'a mut GraphHold) -> Self {
+    pub(crate) fn on_lane(
+        gpu: &'a CudaGpu,
+        lane: &'a CudaQueue,
+        fork: &'a LaneFork<'a>,
+        hold: &'a mut GraphHold,
+    ) -> Self {
         Self {
             gpu,
             target: Some(Target {
@@ -150,6 +163,15 @@ impl<'a> CudaEnqueue<'a> {
             }),
             rec: None,
             hold: Some(hold),
+            fork: Some(fork),
+        }
+    }
+
+    /// The stream this run\'s operations go to: the lane\'s, or the private one once a library asked for a stream.
+    fn real_stream(&self, target: &Target<'_>) -> CuStream {
+        match (&target.dest, self.fork) {
+            (Dest::Lane(_), Some(fork)) => fork.current(),
+            (dest, _) => dest.raw(),
         }
     }
 
@@ -159,7 +181,7 @@ impl<'a> CudaEnqueue<'a> {
         let Some(target) = &self.target else {
             return Ok(());
         };
-        self.gpu.check(call, op(target.dest.raw()))?;
+        self.gpu.check(call, op(self.real_stream(target)))?;
         if let (Some(shadow), Some((rec, _))) = (target.shadow, &mut self.rec)
             && rec.failed.is_none()
             && let Err(e) = self.gpu.check(call, op(shadow))
@@ -394,12 +416,19 @@ impl LaneStream for CudaEnqueue<'_> {
     type Raw = CuStream;
 
     fn raw_stream(&self) -> Option<RawStream<'_, CuStream>> {
-        // A pass of a recurring sequence has no stream to lend: what runs on it would not be recorded.
-        if self.rec.is_some() {
+        // A pass of a recurring sequence has no stream to lend: what runs on it would not be recorded. The request is
+        // noted, so the caller runs a body that does library work directly.
+        if let Some((rec, _)) = &self.rec {
+            rec.asked.set(true);
             return None;
         }
-        self.target
-            .as_ref()
-            .map(|target| RawStream::new(target.dest.raw()))
+        let target = self.target.as_ref()?;
+        match (&target.dest, self.fork) {
+            // A shared lane lends a private stream (it may be launched on from several workers at once), never its own.
+            (Dest::Lane(_), Some(fork)) => fork.private().map(RawStream::new),
+            (Dest::Lane(_), None) => None,
+            // An owned stream has one submitter: its own stream.
+            (dest, _) => Some(RawStream::new(dest.raw())),
+        }
     }
 }

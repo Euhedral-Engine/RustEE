@@ -258,7 +258,10 @@ pub trait Stage<Q, L: DeviceQueue + ?Sized = dyn DeviceQueue>: Send + Sync {
     /// The quantum ended without this stage submitting: it never ran (the quantum was killed, or a predecessor failed),
     /// or it ran and failed (Java `StageFrame.abandoned(home)`). Called once, at the quantum's boundary, in stage order,
     /// after the quantum's other lanes joined the `home` lane (when the lanes have control: a query-only lane cannot
-    /// join, and the hook then runs without the join) and before the retirement is armed on it. So what the hook submits
+    /// join, and the hook then runs without the join, and a hook given a query-only lane has nothing to enqueue on it) and
+    /// before the retirement is armed on it. If that retirement cannot be armed on a home lane that has control, the quantum
+    /// is noted as `DeviceFailed` (a quantum whose hook ran already has an earlier cause, which stands: the first cause
+    /// wins), because what the hooks submitted is not covered, and the quantum still retires. So what the hook submits
     /// to `home` is ordered after the quantum's device work and covered by its retirement: a stage that enqueued part of
     /// its work and then failed releases its buffers here, behind work that may still read them.
     fn abandoned(&self, quantum: &Q, home: &L) {
@@ -2007,6 +2010,22 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Run<Q, L> {
             return;
         }
         if used == 0 {
+            // A hook ran and the retirement could not be armed. A home lane with control that refused it leaves the
+            // hooks' work uncovered, which the quantum reports; a lane type with no control (a query-only `DeviceQueue`)
+            // gives a hook nothing to enqueue, so there is nothing to cover.
+            if hooks_ran
+                && self
+                    .core
+                    .runtime
+                    .lanes
+                    .lane(self.home_lane)
+                    .control()
+                    .is_some()
+            {
+                self.note(QuantumOutcome::DeviceFailed {
+                    cause: "the retirement covering the abandoned hooks' work could not be armed on the home lane".into(),
+                });
+            }
             self.offer_retirement();
             return;
         }
@@ -5117,6 +5136,25 @@ mod tests {
         h.finish_lanes();
         h.pump();
         assert_eq!(h.retired(1), [QuantumOutcome::Killed]);
+    }
+
+    /// A quantum that used no lane but ran hooks, whose retirement the home lane refuses: it still retires (it is not left
+    /// waiting on a retirement that was never armed), and nothing was armed.
+    #[test]
+    fn a_refused_retirement_for_the_hooks_of_a_quantum_with_no_lane_still_retires_it() {
+        let h = Harness::controlled(1, usize::from);
+        let graph = h.graph(&[(None, &[0], Act::Submit)], &[]);
+        h.hands[0].refuse.store(true, Ordering::Release);
+        let _ = graph.start(1, Arc::new(AtomicBool::new(true)), Vec::new());
+        h.pump();
+        assert_eq!(h.abandoned(1), [0]);
+        assert_eq!(h.hands[0].armed(), 0, "the arming was refused");
+        assert_eq!(
+            h.retired(1),
+            [QuantumOutcome::Killed],
+            "the first cause stands"
+        );
+        assert_eq!(graph.live(), 0);
     }
 
     /// A quantum with nothing on a lane and no hook has nothing for a retirement to cover.

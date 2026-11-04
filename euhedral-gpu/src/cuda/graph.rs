@@ -438,8 +438,13 @@ impl Sequence for CudaSequence<'_> {
             target,
             rec: Some((&mut self.rec, stream)),
             hold: None,
+            fork: None,
         };
         f(&mut q)
+    }
+
+    fn library_stream_requested(&self) -> bool {
+        self.rec.asked.get()
     }
 
     fn order(&mut self, after: usize, before: usize) -> Result<(), GpuError> {
@@ -564,13 +569,18 @@ impl CudaGpu {
             hold,
         };
         let begun = seq.begin();
-        let ran = begun.and_then(|()| f(&mut seq));
+        let mut ran = begun.and_then(|()| f(&mut seq));
         let ended = if seq.capturing {
             seq.finish().map(Some)
         } else {
             Ok(None)
         };
         seq.hand_over_kept();
+        if seq.rec.asked.get() && ran.is_ok() {
+            ran = Err(GpuError::Invalid(
+                "a body asked for the driver stream in a recording pass, which has none to lend: the library call did not run (a body that does library work is run directly, which a probe pass finds out first)".into(),
+            ));
+        }
         let mut rec = std::mem::replace(&mut seq.rec, Recording::new(Mode::Probe));
         // `hand_over_kept` froze the values into the recording that was just taken out of the sequence.
         drop(seq);

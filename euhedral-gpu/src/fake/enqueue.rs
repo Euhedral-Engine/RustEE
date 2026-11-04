@@ -68,6 +68,8 @@ pub(crate) struct Recording {
     /// The same, frozen once the run ended, to be shared by the streams, the graph and every replay.
     pub(crate) frozen: Frozen,
     pub(crate) staged: Vec<Args>,
+    /// Whether a body asked for the raw stream in this pass (answered `None`: a pass has none to lend).
+    pub(crate) asked: std::cell::Cell<bool>,
 }
 
 impl Recording {
@@ -81,6 +83,7 @@ impl Recording {
             kept: Vec::new(),
             frozen: freeze(Vec::new()),
             staged: Vec::new(),
+            asked: std::cell::Cell::new(false),
         }
     }
 }
@@ -289,7 +292,8 @@ impl LaneStream for FakeEnqueue<'_> {
     type Raw = super::FakeRawStream;
 
     fn raw_stream(&self) -> Option<RawStream<'_, super::FakeRawStream>> {
-        if self.rec.is_some() {
+        if let Some((rec, _)) = &self.rec {
+            rec.asked.set(true);
             return None;
         }
         self.target.as_ref().map(|target| {

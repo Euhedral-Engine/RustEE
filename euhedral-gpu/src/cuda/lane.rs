@@ -15,13 +15,15 @@ use crate::{
 
 use euhedral_memory::cuda::CuStream;
 
-use super::stream::CudaQueue;
+use super::stream::{CudaQueue, LaneFork};
 use super::{CudaEnqueue, CudaGpu, CudaKernel, from_cuda};
 
 /// What a submission to a shared CUDA lane enqueues.
 #[derive(Debug)]
 pub struct CudaLaneEnqueue<'a> {
     queue: &'a CudaQueue,
+    /// The private stream lent to library calls, if one was (see `LaneFork`).
+    fork: &'a LaneFork<'a>,
 }
 
 impl CudaLaneEnqueue<'_> {
@@ -62,7 +64,7 @@ impl LaneEnqueue for CudaLaneEnqueue<'_> {
                 args.len()
             )));
         }
-        let (func, params, stream) = (kernel.raw(), pointers.as_mut_ptr(), self.queue.raw);
+        let (func, params, stream) = (kernel.raw(), pointers.as_mut_ptr(), self.fork.current());
         // SAFETY: the caller's contract (arguments match the kernel; addresses valid until retired); the pointers
         // address `args`, which outlives the call; the context is current (`Lane::submit`).
         self.gpu().check("cuLaunchKernel", unsafe {
@@ -91,7 +93,7 @@ impl LaneEnqueue for CudaLaneEnqueue<'_> {
         let f = self.gpu().device().driver.fns.memcpy_htod_async;
         // SAFETY: the caller's contract (valid ranges untouched until retired); the context is current.
         self.gpu().check("cuMemcpyHtoDAsync", unsafe {
-            f(dst, src.cast::<c_void>(), bytes, self.queue.raw)
+            f(dst, src.cast::<c_void>(), bytes, self.fork.current())
         })
     }
 
@@ -104,7 +106,7 @@ impl LaneEnqueue for CudaLaneEnqueue<'_> {
         let f = self.gpu().device().driver.fns.memcpy_dtoh_async;
         // SAFETY: as above.
         self.gpu().check("cuMemcpyDtoHAsync", unsafe {
-            f(dst.cast::<c_void>(), src, bytes, self.queue.raw)
+            f(dst.cast::<c_void>(), src, bytes, self.fork.current())
         })
     }
 
@@ -112,7 +114,7 @@ impl LaneEnqueue for CudaLaneEnqueue<'_> {
         let f = self.gpu().device().driver.fns.memcpy_dtod_async;
         // SAFETY: as above.
         self.gpu().check("cuMemcpyDtoDAsync", unsafe {
-            f(dst, src, bytes, self.queue.raw)
+            f(dst, src, bytes, self.fork.current())
         })
     }
 
@@ -120,7 +122,7 @@ impl LaneEnqueue for CudaLaneEnqueue<'_> {
         let f = self.gpu().device().driver.fns.memset_d8_async;
         // SAFETY: as above.
         self.gpu().check("cuMemsetD8Async", unsafe {
-            f(dst, value, bytes, self.queue.raw)
+            f(dst, value, bytes, self.fork.current())
         })
     }
 }
@@ -129,7 +131,7 @@ impl LaneStream for CudaLaneEnqueue<'_> {
     type Raw = CuStream;
 
     fn raw_stream(&self) -> Option<RawStream<'_, CuStream>> {
-        Some(RawStream::new(self.queue.raw))
+        self.fork.private().map(RawStream::new)
     }
 }
 
@@ -156,7 +158,13 @@ impl Lane for CudaQueue {
     ) -> Result<R, GpuError> {
         self.gpu.poison.check()?;
         let _c = self.gpu.device().enter().map_err(from_cuda)?;
-        f(&mut CudaLaneEnqueue { queue: self })
+        let fork = LaneFork::new(self);
+        let result = f(&mut CudaLaneEnqueue {
+            queue: self,
+            fork: &fork,
+        });
+        fork.finish()?;
+        result
     }
 
     fn submit_held<R>(
@@ -166,7 +174,10 @@ impl Lane for CudaQueue {
     ) -> Result<R, GpuError> {
         self.gpu.poison.check()?;
         let _c = self.gpu.device().enter().map_err(from_cuda)?;
-        f(&mut CudaEnqueue::on_lane(&self.gpu, self, hold))
+        let fork = LaneFork::new(self);
+        let result = f(&mut CudaEnqueue::on_lane(&self.gpu, self, &fork, hold));
+        fork.finish()?;
+        result
     }
 
     fn submit_marked<R>(
@@ -176,7 +187,14 @@ impl Lane for CudaQueue {
         // The refusal comes here, before the work: the claim is made first.
         let claim = self.reserve()?;
         let _c = self.gpu.device().enter().map_err(from_cuda)?;
-        let result = f(&mut CudaLaneEnqueue { queue: self })?;
+        let fork = LaneFork::new(self);
+        let result = f(&mut CudaLaneEnqueue {
+            queue: self,
+            fork: &fork,
+        });
+        // The lane joins the private stream before the marker is recorded: the marker covers the library work too.
+        fork.finish()?;
+        let result = result?;
         let marker = self.record_claim(claim)?;
         Ok((result, marker))
     }

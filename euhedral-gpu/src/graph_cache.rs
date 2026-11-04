@@ -317,6 +317,12 @@ impl Sightings {
 ///   to be thrown away. Dropping an instance is safe whatever its launches are doing: the driver frees an executable once
 ///   they end.
 /// - **A capture that fails** (the work still ran, for real) marks the key unrecordable: it runs directly from then on.
+/// - **A body that does library work** (it asks for `LaneStream::raw_stream`) cannot be replayed or recorded: a pass has
+///   no stream to lend, so the library call would be skipped. A probe pass before the recording, and the update pass of a
+///   hit, find the request out; the key is then unrecordable and its units run directly, every time, with the call made.
+/// - **A body that does library work** (it asks for [`LaneStream::raw_stream`]) cannot be replayed or recorded: a pass has
+///   no stream to lend, so the library call would be skipped. A probe pass before the recording, and the update pass of a
+///   hit, find the request out; the key is then unrecordable and its units run directly, every time, with the call made.
 ///
 /// **A replay never launches on the lane.** With several threads submitting to one stream, a `cuGraphLaunch` can overtake
 /// the `cuStreamWaitEvent` its own thread issued just before it (seen with driver 615.71.09 on CUDA 13.4: a graph's work
@@ -458,8 +464,22 @@ impl<G: Gpu, K: Copy + Eq + Hash + Send> SharedGraphCache<G, K> {
         }
         let tag = tag_of(&key);
         if let Some(mut lease) = self.pool.take(&key, tag) {
+            let asked = std::cell::Cell::new(false);
+            let updated = gpu.update(lease.get(), |seq| {
+                let done = seq.submit(0, |enq| body.enqueue(enq));
+                asked.set(seq.library_stream_requested());
+                done
+            });
+            if asked.get() {
+                // The body does library work, which a pass cannot make (it has no stream to lend) and a replay would
+                // skip: it is not replayable. Nothing ran (an update touches no device): the unit runs directly, now and
+                // every time.
+                lease.discard();
+                self.sightings.mark_unrecordable(tag);
+                return self.direct(lane, waits, body, hold);
+            }
             let graph = lease.get();
-            return match gpu.update(graph, |seq| seq.submit(0, |enq| body.enqueue(enq))) {
+            return match updated {
                 Ok(()) => {
                     graph.replay_on(lane, waits, hold)?;
                     self.replays.fetch_add(1, Ordering::Relaxed);
@@ -480,6 +500,18 @@ impl<G: Gpu, K: Copy + Eq + Hash + Send> SharedGraphCache<G, K> {
         // No free instance of the key: the first sighting runs directly, the second records.
         let flags = self.sightings.see(tag);
         if flags & UNRECORDABLE != 0 || (flags & SEEN == 0 && !record_now) {
+            return self.direct(lane, waits, body, hold);
+        }
+        // A body that does library work cannot be recorded (the recording pass runs it for real, with no stream to lend, so
+        // the library call would be skipped without a word): a probe pass, which touches no device, finds out first.
+        let asked = std::cell::Cell::new(false);
+        gpu.fingerprint(1, |seq| {
+            let done = seq.submit(0, |enq| body.enqueue(enq));
+            asked.set(seq.library_stream_requested());
+            done
+        })?;
+        if asked.get() {
+            self.sightings.mark_unrecordable(tag);
             return self.direct(lane, waits, body, hold);
         }
         // A slot is reserved first; with none free, the unit runs directly (nothing is recorded to be thrown away).
@@ -1087,22 +1119,26 @@ mod shared_tests {
             cache.run(&gpu, &lane, KEY, &mut b, &mut replayed).unwrap(),
             Ran::Replayed
         );
-        // The update pass's keeps are not the graph's: they were dropped at once, and the recording's are the one value.
-        assert_eq!(drops.load(Ordering::SeqCst), 1, "the update pass's value");
+        // The probe pass before the recording and the update pass before the replay each dropped the value they made.
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            2,
+            "the probe's and the update pass's values"
+        );
         // The cache goes (the instance with it): the work in flight still has its buffers.
         drop(cache);
         gpu.run_until_idle();
-        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
         drop(recorded);
         assert_eq!(
             drops.load(Ordering::SeqCst),
-            1,
+            2,
             "the replay's hold has it too"
         );
         drop(replayed);
         assert_eq!(
             drops.load(Ordering::SeqCst),
-            2,
+            3,
             "released with the last hold"
         );
     }

@@ -429,31 +429,91 @@ fn a_quantum_whose_work_is_queued_has_not_retired_and_no_hook_has_run() {
     assert_eq!(f.hooks.load(Ordering::SeqCst), 2);
 }
 
-/// A body that asks for the raw stream: a direct run (caching off) lends it, a pass of a recording or an update has no
-/// stream to lend (what ran on it would not be recorded).
+/// A body that does library work (it asks for the raw stream) is never replayed or recorded: a pass has no stream to lend,
+/// so the library call would be skipped without a word. Every unit runs directly, with the call made.
 #[test]
-fn a_body_is_lent_the_raw_stream_only_when_it_runs_directly() {
-    struct Asks(Arc<Mutex<Vec<bool>>>);
-    impl GraphBody<FakeGpu> for Asks {
+fn library_work_runs_for_every_unit_through_the_cache() {
+    struct Lib(Arc<Mutex<u32>>);
+    impl GraphBody<FakeGpu> for Lib {
         fn enqueue<E: Enqueue<Kernel = FakeKernel>>(
             &mut self,
             enq: &mut E,
         ) -> Result<(), GpuError> {
-            lock(&self.0).push(enq.raw_stream().is_some());
+            if enq.raw_stream().is_some() {
+                *lock(&self.0) += 1; // stands for the library call enqueued on the lent stream
+            }
             Ok(())
         }
     }
     let gpu = gpu();
     let lanes = lanes(&gpu, 1);
     let lane = lanes.pool.lane(LaneId(0)).clone();
-    let seen = Arc::new(Mutex::new(Vec::new()));
+    let calls = Arc::new(Mutex::new(0));
     let cache = SharedGraphCache::<FakeGpu, u32>::new();
     let mut hold = GraphHold::new();
-    let mut body = Asks(seen.clone());
-    cache.run(&gpu, &lane, 1, &mut body, &mut hold).unwrap(); // first sighting: direct
-    cache.run(&gpu, &lane, 1, &mut body, &mut hold).unwrap(); // records
-    cache.run(&gpu, &lane, 1, &mut body, &mut hold).unwrap(); // updates
-    cache.set_enabled(false);
-    cache.run(&gpu, &lane, 1, &mut body, &mut hold).unwrap(); // direct
-    assert_eq!(*lock(&seen), [true, false, false, true]);
+    let mut body = Lib(calls.clone());
+    let mut ran = Vec::new();
+    for _ in 0..4 {
+        ran.push(cache.run(&gpu, &lane, 1, &mut body, &mut hold).unwrap());
+    }
+    assert_eq!(
+        *lock(&calls),
+        4,
+        "units run {ran:?}: a library call per unit"
+    );
+    assert!(ran.iter().all(|r| *r == Ran::Direct), "{ran:?}");
+    assert!(cache.is_empty(), "nothing was recorded");
+}
+
+/// A key recorded for a body that did no library work, whose body now asks for the stream (an update pass finds out): its
+/// instance goes, the key is unrecordable, and this unit and every later one run directly with the call made.
+#[test]
+fn a_recorded_key_whose_body_starts_to_do_library_work_runs_directly_from_then_on() {
+    struct Maybe {
+        library: bool,
+        calls: Arc<Mutex<u32>>,
+        kernel: FakeKernel,
+        word: u64,
+    }
+    impl GraphBody<FakeGpu> for Maybe {
+        fn enqueue<E: Enqueue<Kernel = FakeKernel>>(
+            &mut self,
+            enq: &mut E,
+        ) -> Result<(), GpuError> {
+            if self.library && enq.raw_stream().is_some() {
+                *lock(&self.calls) += 1;
+            }
+            add_by(enq, &self.kernel, self.word, 1)
+        }
+    }
+    let gpu = gpu();
+    let kernel = kernel(&gpu);
+    let at = gpu.alloc(4);
+    let lanes = lanes(&gpu, 1);
+    let lane = lanes.pool.lane(LaneId(0)).clone();
+    let cache = SharedGraphCache::<FakeGpu, u32>::new();
+    let mut hold = GraphHold::new();
+    let calls = Arc::new(Mutex::new(0));
+    let mut body = Maybe {
+        library: false,
+        calls: calls.clone(),
+        kernel,
+        word: at,
+    };
+    cache.warm(&gpu, &lane, 1, &mut body, &mut hold).unwrap();
+    assert_eq!(
+        cache.run(&gpu, &lane, 1, &mut body, &mut hold).unwrap(),
+        Ran::Replayed
+    );
+    body.library = true;
+    for _ in 0..3 {
+        assert_eq!(
+            cache.run(&gpu, &lane, 1, &mut body, &mut hold).unwrap(),
+            Ran::Direct
+        );
+    }
+    gpu.run_until_idle();
+    assert_eq!(*lock(&calls), 3, "the library call was made every time");
+    assert_eq!(word(&gpu, at), 1 + 1 + 3, "and every unit's work ran once");
+    assert!(cache.is_empty(), "the instance went");
 }
