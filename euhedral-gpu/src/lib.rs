@@ -52,8 +52,8 @@ mod sync;
 
 pub use api::{
     CompileOptions, Enqueue, Gpu, Graph, Kernel, Lane, LaneEnqueue, LaneStream, Lanes, Module,
-    POISONED_STATUS, Rerecorded, RetireListener, RetireTicket, Sequence, Stream, StreamOptions,
-    StreamPriority,
+    POISONED_STATUS, RawStream, Rerecorded, RetireListener, RetireTicket, Sequence, Stream,
+    StreamOptions, StreamPriority,
 };
 pub use args::{ArgMismatch, Args, Dim3, KernelArg, Launch, MAX_ARGS};
 pub use error::GpuError;

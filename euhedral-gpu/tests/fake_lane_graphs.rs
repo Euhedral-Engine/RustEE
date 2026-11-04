@@ -428,3 +428,31 @@ fn a_quantum_whose_work_is_queued_has_not_retired_and_no_hook_has_run() {
     f.settle();
     assert_eq!(f.hooks.load(Ordering::SeqCst), 2);
 }
+
+/// A body that asks for the raw stream: a direct run (caching off) lends it, a pass of a recording or an update has no
+/// stream to lend (what ran on it would not be recorded).
+#[test]
+fn a_body_is_lent_the_raw_stream_only_when_it_runs_directly() {
+    struct Asks(Arc<Mutex<Vec<bool>>>);
+    impl GraphBody<FakeGpu> for Asks {
+        fn enqueue<E: Enqueue<Kernel = FakeKernel>>(
+            &mut self,
+            enq: &mut E,
+        ) -> Result<(), GpuError> {
+            lock(&self.0).push(enq.raw_stream().is_some());
+            Ok(())
+        }
+    }
+    let gpu = gpu();
+    let lanes = lanes(&gpu, 1);
+    let lane = lanes.pool.lane(LaneId(0)).clone();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let cache = SharedGraphCache::<FakeGpu, u32>::new();
+    let mut hold = GraphHold::new();
+    let mut body = Asks(seen.clone());
+    cache.run(&gpu, &lane, 1, &mut body, &mut hold).unwrap(); // records
+    cache.run(&gpu, &lane, 1, &mut body, &mut hold).unwrap(); // updates
+    cache.set_enabled(false);
+    cache.run(&gpu, &lane, 1, &mut body, &mut hold).unwrap(); // direct
+    assert_eq!(*lock(&seen), [false, false, true]);
+}

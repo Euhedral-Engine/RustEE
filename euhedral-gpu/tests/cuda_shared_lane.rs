@@ -553,7 +553,7 @@ fn a_library_call_enqueues_on_the_lanes_raw_stream_inside_the_marked_submission(
         .submit_marked(|q| {
             // SAFETY: the raw stream is used inside this closure on this thread; the device word is live and 256 bytes;
             // the memset completes on its own.
-            let code = unsafe { memset(block.addr, 0x2a, 4, q.raw_stream()) };
+            let code = unsafe { memset(block.addr, 0x2a, 4, q.raw_stream().unwrap().as_raw()) };
             assert_eq!(code, 0, "the library call was accepted");
             // The closure\'s own operations follow it on the same stream.
             // SAFETY: the pinned word and the device word are live.

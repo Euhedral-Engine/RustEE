@@ -4,9 +4,11 @@ use std::any::Any;
 
 use crate::hold::{Frozen, freeze};
 use crate::shape::{CopyKind, ShapeHasher};
-use euhedral_graph::Marker;
+use euhedral_graph::{LaneId, Marker};
 
-use crate::{Args, Enqueue, GpuError, GraphHold, Kernel, Lane, LaneEnqueue, Launch};
+use crate::{
+    Args, Enqueue, GpuError, GraphHold, Kernel, Lane, LaneEnqueue, LaneStream, Launch, RawStream,
+};
 
 use super::{FakeKernel, FakeQueue, FakeStream, QOp};
 
@@ -95,6 +97,14 @@ impl Real<'_> {
         match self {
             Real::Stream(s) => Real::Stream(s),
             Real::Lane(l) => Real::Lane(l),
+        }
+    }
+
+    /// The lane\'s id and global index.
+    pub(crate) fn identity(&self) -> (LaneId, usize) {
+        match self {
+            Real::Stream(s) => (LaneId(s.lane_id()), s.global()),
+            Real::Lane(l) => (l.lane, l.global()),
         }
     }
 
@@ -272,5 +282,19 @@ impl Enqueue for FakeEnqueue<'_> {
             },
             (None, None) => drop(value),
         }
+    }
+}
+
+impl LaneStream for FakeEnqueue<'_> {
+    type Raw = super::FakeRawStream;
+
+    fn raw_stream(&self) -> Option<RawStream<'_, super::FakeRawStream>> {
+        if self.rec.is_some() {
+            return None;
+        }
+        self.target.as_ref().map(|target| {
+            let (lane, global) = target.identity();
+            RawStream::new(super::FakeRawStream { lane, global })
+        })
     }
 }

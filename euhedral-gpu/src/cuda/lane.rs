@@ -10,7 +10,7 @@ use euhedral_graph::{ControlError, LaneControl, LaneId, Marker, RetireCell};
 
 use crate::{
     Args, GpuError, GraphHold, Kernel, Lane, LaneEnqueue, LaneStream, Launch, MAX_ARGS,
-    POISONED_STATUS,
+    POISONED_STATUS, RawStream,
 };
 
 use euhedral_memory::cuda::CuStream;
@@ -128,8 +128,8 @@ impl LaneEnqueue for CudaLaneEnqueue<'_> {
 impl LaneStream for CudaLaneEnqueue<'_> {
     type Raw = CuStream;
 
-    unsafe fn raw_stream(&self) -> CuStream {
-        self.queue.raw
+    fn raw_stream(&self) -> Option<RawStream<'_, CuStream>> {
+        Some(RawStream::new(self.queue.raw))
     }
 }
 

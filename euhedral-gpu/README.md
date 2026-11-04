@@ -73,9 +73,10 @@ Asynchronous, backend-neutral GPU access for the RustEE control plane. A lattice
     one lane never read each other's retirement and nothing is claimed or waited for. The cell is refcounted (the callback
     holds a clone), so it outlives a lane that is dropped first. The continuation that settles the status is a frame
     (`Completions::after_retired`).
-  - **Library calls.** `LaneStream::raw_stream()` on the closure's enqueue handle is the lane's driver stream, for library calls that
-    enqueue on a stream of their own accord (a codec, an inference runtime): Java's `GpuStream.submit(Runnable)`. `unsafe`, valid
-    only inside the closure; the marker claim still precedes the closure.
+  - **Library calls.** `LaneStream::raw_stream()` on the closure's enqueue handle lends the lane's driver stream (a `RawStream<'_, R>`: it
+    borrows the handle and is `!Send`, so it stays inside the closure and on the calling thread), for library calls that
+    enqueue on a stream of their own accord (a codec, an inference runtime): Java's `GpuStream.submit(Runnable)`. What the
+    library does with the stream is the caller's contract (see `LaneStream`); the marker claim still precedes the closure.
   - **Held values.** A shared lane keeps none. What a submission's work reads (a host buffer a copy reads) is held by the
     stage, in its quantum, and released in the stage's `retired` hook, which runs once the quantum's device work ended: a
     retirement armed by another party cannot release it early.

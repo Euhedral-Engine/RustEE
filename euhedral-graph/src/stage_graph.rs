@@ -243,14 +243,14 @@ pub trait Stage<Q, L: DeviceQueue + ?Sized = dyn DeviceQueue>: Send + Sync {
 
     /// Called once per quantum, when the stage's last incoming edge arrived and before it is published (Java
     /// `StageFrame.passGate`): `true` lets it be published now; `false` holds it, and the stage must then have taken a
-    /// [`Gate`] from `gate` ([`GateRef::hold`]) and release it (from any thread that may publish frames, once) when
-    /// whatever it waits for exists. A held stage keeps the quantum live. This is how a stage waits for host-side
-    /// readiness without polling: the work that makes it ready releases the gate, so no stream ever waits for the host
-    /// and nothing retries. A gate that panics fails the quantum and drops the stage's count.
+    /// [`Gate`] from `gate` ([`GateRef::hold`], which consumes it: a stage takes its gate once) and release it (from any
+    /// thread that may publish frames, once) when whatever it waits for exists. A held stage keeps the quantum live. This
+    /// is how a stage waits for host-side readiness without polling: the work that makes it ready releases the gate, so
+    /// no stream ever waits for the host and nothing retries. A `pass_gate` that panics fails the quantum.
     ///
     /// Taking a gate means holding the stage whatever this returns (a `true` after [`GateRef::hold`] is ignored): the
     /// gate's holder publishes it.
-    fn pass_gate(&self, quantum: &Q, gate: &GateRef<'_>) -> bool {
+    fn pass_gate(&self, quantum: &Q, gate: GateRef<'_>) -> bool {
         let _ = (quantum, gate);
         true
     }
@@ -285,13 +285,30 @@ trait GateTarget: Send + Sync {
     fn fail_gate(self: Arc<Self>, stage: StageId, error: StageError);
 }
 
-/// What a stage holds in [`Stage::pass_gate`] to take a [`Gate`].
+/// What a stage is given in [`Stage::pass_gate`] to take a [`Gate`]. It is moved by [`hold`](Self::hold), so a stage
+/// cannot take two gates:
+///
+/// ```compile_fail,E0382
+/// use euhedral_graph::{GateRef, Stage, StageCx, StageError, Submitted};
+///
+/// struct Twice;
+/// impl Stage<u64> for Twice {
+///     fn run(&self, _: &u64, _: &StageCx<'_>) -> Result<Submitted, StageError> {
+///         Ok(Submitted::done())
+///     }
+///     fn pass_gate(&self, _: &u64, gate: GateRef<'_>) -> bool {
+///         let first = gate.hold();
+///         let second = gate.hold(); // use of moved value: the gate is taken once
+///         drop((first, second));
+///         false
+///     }
+/// }
+/// ```
 pub struct GateRef<'a> {
     source: &'a dyn GateSource,
     stage: StageId,
-    /// Whether the stage took a gate: local to the call that made this value (the quantum may be gone once a gate is
-    /// released, so nothing shared is read after `pass_gate` returns).
-    taken: std::cell::Cell<bool>,
+    /// Set when the stage takes a gate: the arrival's own flag, on its stack.
+    taken: &'a std::cell::Cell<bool>,
 }
 
 /// What a [`GateRef`] takes a gate from.
@@ -300,9 +317,9 @@ trait GateSource {
 }
 
 impl GateRef<'_> {
-    /// Holds the stage: it is published when the returned [`Gate`] is released. Call it once, inside
-    /// [`Stage::pass_gate`], and return `false`.
-    pub fn hold(&self) -> Gate {
+    /// Holds the stage: it is published when the returned [`Gate`] is released. Consumes the reference, so it is called
+    /// once, inside [`Stage::pass_gate`], which then returns `false`.
+    pub fn hold(self) -> Gate {
         self.taken.set(true);
         self.source.hold_gate(self.stage)
     }
@@ -1172,6 +1189,11 @@ struct Run<Q, L: DeviceQueue + ?Sized> {
     boundary_left: AtomicUsize,
     /// Where the retirement armed on the home lane for the boundary leaves its status.
     retire_cell: Arc<RetireCell>,
+    /// Whether any `abandoned` hook ran this quantum (written by `quiesce`, read by the boundary).
+    abandoned_any: Owned<bool>,
+    /// The latest marker value of each lane already awaited on the home lane (0: none), so the boundary joins only what
+    /// later quanta added since `quiesce` joined.
+    joined_values: Owned<Vec<u64>>,
     ext: Owned<ExtSlots>,
 }
 
@@ -1196,6 +1218,8 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Run<Q, L> {
             lanes,
             boundary_left: AtomicUsize::new(0),
             retire_cell: Arc::new(RetireCell::new()),
+            abandoned_any: Owned::new(false),
+            joined_values: Owned::new(Vec::new()),
             ext: Owned::new(ExtSlots::default()),
         })
     }
@@ -1210,6 +1234,14 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Run<Q, L> {
         }
         // SAFETY: as above: this thread owns the run until it publishes a frame or a reference.
         unsafe { self.cause.reset() };
+        // SAFETY: as above.
+        unsafe {
+            self.abandoned_any.set(false);
+            self.joined_values.write(|v| {
+                v.clear();
+                v.resize(64, 0);
+            });
+        }
         // The returned ref's pin, and the quantum's own token (dropped once its live count reached 0).
         self.holds.store(2, Ordering::Relaxed);
         self.stopped.store(false, Ordering::Relaxed);
@@ -1361,6 +1393,33 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Run<Q, L> {
         }
     }
 
+    /// Java `publishOrRun`, for a stage a gate held: offers its frame, and a sink that no longer takes frames has the
+    /// stage run right here, on the thread that released the gate, so its held count is always dropped.
+    ///
+    /// Only an unordered stage can: an ordered stage's frames must run in the order they were published and one at a time
+    /// on their lane, which only the sink enforces, so running one beside the sink could overtake or overlap an earlier
+    /// frame. A refused ordered stage ends in place as any refused frame does (it fails the quantum).
+    fn publish_or_run(self: &Arc<Self>, stage: StageId) {
+        let ordered = self.core.spec.stages[usize::from(stage.0)].ordered;
+        if ordered.is_some() {
+            self.offer(stage);
+            return;
+        }
+        let frame = self
+            .core
+            .frame(self, Kind::Stage(stage), self.header(None, true));
+        if let Err(mut frame) = self.core.runtime.stages.offer(frame) {
+            if !frame.is_alive() {
+                frame.do_finally();
+                return;
+            }
+            match frame.execute() {
+                Ok(()) | Err(FrameError::Cancelled) => frame.do_finally(),
+                Err(error) => frame.do_finally_with_error(error),
+            }
+        }
+    }
+
     /// An edge into `stage` arrived; the last one publishes it.
     fn arrive(self: &Arc<Self>, stage: StageId) {
         let _hot = HotScope::enter();
@@ -1378,25 +1437,36 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Run<Q, L> {
 
     /// Java `publishGated`: asks the stage whether it may be published now; a stage that holds itself at its gate is
     /// published by whoever releases the gate, and a gate that fails fails the quantum and drops the count.
+    ///
+    /// The caller's own live count covers the quantum for the whole call (this runs from an arrival, inside the frame or
+    /// admission that still holds its count), so the run may be read and the quantum failed after the stage returns, even
+    /// though a released gate has published the stage and the stage's own count may be gone.
     fn gate_and_offer(self: &Arc<Self>, stage: StageId) {
         let index = usize::from(stage.0);
+        let taken = std::cell::Cell::new(false);
         let gate = GateRef {
             source: self,
             stage,
-            taken: std::cell::Cell::new(false),
+            taken: &taken,
         };
-        // SAFETY: the quantum is bound until it retires, which waits for this stage's live count.
+        // SAFETY: the quantum is bound until it retires, which waits for the caller's live count (see above).
         let passed = unsafe {
             self.quantum.read(|quantum| {
                 let quantum = quantum.as_ref().expect("a bound run has its quantum");
                 catch_unwind(AssertUnwindSafe(|| {
-                    self.core.stages[index].pass_gate(quantum, &gate)
+                    self.core.stages[index].pass_gate(quantum, gate)
                 }))
             })
         };
-        // Nothing of the run is touched once a gate was taken: whoever releases it publishes the stage, and the quantum
-        // may be over before this returns.
-        if gate.taken.get() {
+        if taken.get() {
+            // Whoever holds the gate publishes the stage and its count is theirs. A stage that took a gate and then
+            // panicked fails the quantum all the same (a gate dropped by the unwind already did, and dropped the count).
+            if passed.is_err() {
+                self.fail(
+                    stage,
+                    StageError::Fatal("the stage's pass_gate panicked".into()),
+                );
+            }
             return;
         }
         match passed {
@@ -1869,10 +1939,20 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Run<Q, L> {
         target.external_arrived(index);
     }
 
-    /// No stage of the quantum can run again: later quanta waiting on its stages are released, and its own token
-    /// dropped (the boundary is armed once no pin is left, and the unrun stages are abandoned there, behind the join).
+    /// Java `quiesce`, up to the sweep: the quantum's own lanes join the home lane, the stages that never submitted are
+    /// abandoned (with the home lane, behind that join), and only then are later quanta waiting on its stages released,
+    /// so what a hook releases is there for them. Its own token is dropped (the retirement is armed once no pin is left).
     fn quiesce(self: &Arc<Self>) {
         self.take_over_external_waits();
+        let used = self.lanes.used();
+        if used != 0 {
+            // A join this early covers the quantum's own markers; the boundary joins again for the markers later quanta
+            // add while they pin it (an await of a marker that is already awaited orders nothing more).
+            let _ = self.join_lanes(used);
+        }
+        let any = self.abandon_unsubmitted();
+        // SAFETY: every stage is done and every pin is gone or kept by a later quantum: this thread is the only writer.
+        unsafe { self.abandoned_any.set(any) };
         for index in 0..self.stages.len() {
             self.release_waiters(StageId(index as u16), Sealed::Swept);
         }
@@ -1918,12 +1998,16 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Run<Q, L> {
     fn arm_boundary(self: &Arc<Self>) {
         let used = self.lanes.used();
         let joined = used != 0 && self.join_lanes(used);
-        self.abandon_unsubmitted();
-        if used == 0 {
-            self.offer_retirement();
+        // SAFETY: written by `quiesce`, which happens before this call.
+        let hooks_ran = unsafe { self.abandoned_any.get() };
+        // Java always arms `home.notifyRetired` after `abandonUnsubmitted(home)`: here when a lane was used, or a hook ran
+        // (what it submitted to home is covered before `retired` and `retire` drop anything). A quantum with neither has
+        // nothing on a lane for the retirement to cover.
+        if (used == 0 && hooks_ran || joined) && self.retire_on_home() {
             return;
         }
-        if joined && self.retire_on_home() {
+        if used == 0 {
+            self.offer_retirement();
             return;
         }
         // The lanes are only a query side (or the join could not be made): one completion per lane.
@@ -1959,9 +2043,17 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Run<Q, L> {
         while others != 0 {
             let lane = others.trailing_zeros() as usize;
             others &= others - 1;
-            if home.await_marker(self.lane_marker(lane)).is_err() {
+            let marker = self.lane_marker(lane);
+            // SAFETY: `quiesce` and then the boundary call this, one after the other, never at once.
+            let seen = unsafe { self.joined_values.read(|v| v[lane]) };
+            if seen == marker.value {
+                continue;
+            }
+            if home.await_marker(marker).is_err() {
                 return false;
             }
+            // SAFETY: as above.
+            unsafe { self.joined_values.write(|v| v[lane] = marker.value) };
         }
         true
     }
@@ -1989,10 +2081,12 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Run<Q, L> {
     }
 
     /// Java `abandonUnsubmitted(home)`: every stage that never submitted (it never ran, or ran and failed) gets its hook,
-    /// in stage order, once, with the home lane. A hook that panics fails the quantum and the others still run.
-    fn abandon_unsubmitted(&self) {
+    /// in stage order, once, with the home lane. A hook that panics fails the quantum and the others still run. Whether
+    /// any hook ran.
+    fn abandon_unsubmitted(&self) -> bool {
         let home = self.core.runtime.lanes.lane(self.home_lane);
-        // SAFETY: every stage is done and every pin is gone; the quantum is taken by the retirement, after the boundary.
+        let mut any = false;
+        // SAFETY: every stage is done; the quantum is taken by the retirement, after the boundary.
         unsafe {
             self.quantum.read(|quantum| {
                 let quantum = quantum.as_ref().expect("a quiescing quantum is bound");
@@ -2000,6 +2094,7 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Run<Q, L> {
                     if state.submitted.get() {
                         continue;
                     }
+                    any = true;
                     let hook = catch_unwind(AssertUnwindSafe(|| {
                         self.core.stages[index].abandoned(quantum, &**home);
                     }));
@@ -2012,6 +2107,7 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Run<Q, L> {
                 }
             });
         }
+        any
     }
 
     /// The home lane's retirement arrived: settles its status. A failure of the device work fails the quantum.
@@ -2098,7 +2194,7 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> GateTarget for
             .gate_held
             .swap(false, Ordering::AcqRel)
         {
-            self.offer(stage);
+            self.publish_or_run(stage);
         }
     }
 
@@ -2752,7 +2848,7 @@ mod tests {
             self.1.run(q, cx)
         }
 
-        fn pass_gate(&self, q: &u64, gate: &GateRef<'_>) -> bool {
+        fn pass_gate(&self, q: &u64, gate: GateRef<'_>) -> bool {
             lock(&self.1.log).push(Event::Gated {
                 q: *q,
                 stage: self.0,
@@ -4936,6 +5032,241 @@ mod tests {
         h.finish_lanes();
         h.pump();
         assert_eq!(h.abandoned(1), [1, 2, 3]);
+    }
+
+    /// A stage whose `pass_gate` is a closure; it runs as a CPU stage and logs `Ran`.
+    struct GateFn<F: Fn(GateRef<'_>) -> bool + Send + Sync>(Log, F);
+
+    impl<F: Fn(GateRef<'_>) -> bool + Send + Sync> Stage<u64> for GateFn<F> {
+        fn run(&self, q: &u64, cx: &StageCx<'_>) -> Result<Submitted, StageError> {
+            lock(&self.0).push(Event::Ran {
+                q: *q,
+                stage: cx.stage.0,
+                lane: None,
+                waits: Vec::new(),
+            });
+            Ok(Submitted::done())
+        }
+
+        fn pass_gate(&self, _q: &u64, gate: GateRef<'_>) -> bool {
+            (self.1)(gate)
+        }
+    }
+
+    fn one_stage_graph(
+        h: &Harness,
+        stage: Arc<dyn Stage<u64>>,
+        ordered: Option<u64>,
+    ) -> Arc<StageGraph<u64>> {
+        let mut spec = StageGraphSpec::new();
+        spec.stage(StageSpec {
+            name: "g",
+            ordered,
+            lanes: vec![],
+        });
+        let log = h.log.clone();
+        StageGraph::new(spec, vec![stage], h.runtime.clone(), move |q, outcome| {
+            lock(&log).push(Event::Retired { q, outcome });
+        })
+        .unwrap()
+    }
+
+    /// A `pass_gate` that panics after it took (and kept) a gate fails the quantum all the same.
+    #[test]
+    fn a_pass_gate_that_panics_after_taking_a_gate_fails_the_quantum() {
+        let h = Harness::new(1);
+        let kept: Arc<Mutex<Vec<Gate>>> = Arc::default();
+        let k = kept.clone();
+        let stage = Arc::new(GateFn(h.log.clone(), move |gate: GateRef<'_>| {
+            lock(&k).push(gate.hold());
+            panic!("the gate broke after it was taken")
+        }));
+        let graph = one_stage_graph(&h, stage, None);
+        let _ = graph.start(1, alive(), Vec::new());
+        h.pump();
+        lock(&kept).pop().unwrap().release();
+        h.pump();
+        assert!(
+            matches!(&h.retired(1)[..], [QuantumOutcome::Failed { .. }]),
+            "retired {:?}, ran {:?}",
+            h.retired(1),
+            h.ran(1)
+        );
+        assert_eq!(graph.live(), 0);
+    }
+
+    /// Java `quiesce` arms `home.notifyRetired` after `abandonUnsubmitted(home)`: a quantum that used no lane (killed
+    /// before any stage ran) still has what its hooks submitted to home covered by a retirement.
+    #[test]
+    fn a_killed_quantum_that_used_no_lane_arms_a_retirement_after_its_abandoned_hooks() {
+        let h = Harness::controlled(1, usize::from);
+        let graph = h.graph(
+            &[(None, &[0], Act::Submit), (None, &[0], Act::Submit)],
+            &[(0, 1, Submission)],
+        );
+        let _ = graph.start(1, Arc::new(AtomicBool::new(true)), Vec::new());
+        h.pump();
+        assert_eq!(h.abandoned(1), [0, 1]);
+        assert_eq!(
+            h.hands[0].armed(),
+            1,
+            "a retirement on home covers the abandoned hooks' work (retired: {:?})",
+            h.retired(1)
+        );
+        assert!(h.retired(1).is_empty(), "retired only when it arrives");
+        h.finish_lanes();
+        h.pump();
+        assert_eq!(h.retired(1), [QuantumOutcome::Killed]);
+    }
+
+    /// A quantum with nothing on a lane and no hook has nothing for a retirement to cover.
+    #[test]
+    fn a_quantum_that_used_no_lane_and_abandoned_nothing_arms_no_retirement() {
+        let h = Harness::controlled(1, usize::from);
+        let graph = h.graph(&[(None, &[], Act::Cpu)], &[]);
+        let _ = graph.start(1, alive(), Vec::new());
+        h.pump();
+        assert_eq!(h.hands[0].armed(), 0);
+        assert_eq!(h.retired(1), [QuantumOutcome::Completed]);
+    }
+
+    /// Java runs `abandonUnsubmitted(home)` before it sweeps the externals, so a later quantum waiting on an abandoned stage
+    /// runs after the hook (and what the hook released).
+    #[test]
+    fn a_later_quantum_on_an_abandoned_stage_runs_after_the_abandoned_hook() {
+        let h = Harness::controlled(1, usize::from);
+        let graph = h.graph(&[(None, &[0], Act::Submit)], &[]);
+        let a = graph.start(1, Arc::new(AtomicBool::new(true)), Vec::new());
+        let edge = ExternalEdge {
+            from: a.clone(),
+            from_stage: StageId(0),
+            to_stage: StageId(0),
+            kind: Submission,
+        };
+        drop(a);
+        let _ = graph.start(2, alive(), vec![edge]);
+        h.pump();
+        let events = h.events();
+        let abandoned = events
+            .iter()
+            .position(|e| matches!(e, Event::Abandoned { q: 1, .. }));
+        let ran = events
+            .iter()
+            .position(|e| matches!(e, Event::Ran { q: 2, .. }));
+        assert!(abandoned.is_some() && ran.is_some(), "{events:?}");
+        assert!(
+            abandoned < ran,
+            "q1's abandoned hook ran before q2's stage: {events:?}"
+        );
+    }
+
+    /// A sink that takes frames until told to refuse them.
+    struct Refuses {
+        inner: Arc<QueueIngestSink>,
+        refuse: AtomicBool,
+    }
+
+    impl FrameSink for Refuses {
+        fn offer(&self, frame: Box<dyn Frame>) -> Result<(), Box<dyn Frame>> {
+            if self.refuse.load(Ordering::Acquire) {
+                Err(frame)
+            } else {
+                self.inner.offer(frame)
+            }
+        }
+    }
+
+    /// Java `publishOrRun`: a lake that refuses the stage a gate held has it run right there, so the held count is dropped
+    /// and the stage still does its work.
+    #[test]
+    fn a_stage_released_into_a_sink_that_refuses_it_runs_where_it_was_released() {
+        let h = Harness::new(1);
+        let sink = Arc::new(Refuses {
+            inner: h.sink.clone(),
+            refuse: AtomicBool::new(false),
+        });
+        let mut runtime = h.runtime.clone();
+        runtime.stages = sink.clone();
+        let held = gates();
+        let mut spec = StageGraphSpec::new();
+        for _ in 0..2 {
+            spec.stage(StageSpec {
+                name: "g",
+                ordered: None,
+                lanes: vec![],
+            });
+        }
+        spec.edge(StageId(0), StageId(1), Submission);
+        let log = h.log.clone();
+        let stages: Vec<Arc<dyn Stage<u64>>> = [GateAct::Pass, GateAct::Hold(held.clone())]
+            .into_iter()
+            .enumerate()
+            .map(|(i, gate)| {
+                Arc::new(Named(
+                    i as u16,
+                    Probe {
+                        act: Act::Cpu,
+                        gate,
+                        log: h.log.clone(),
+                        hands: h.hands.clone(),
+                    },
+                )) as Arc<dyn Stage<u64>>
+            })
+            .collect();
+        let graph = StageGraph::new(spec, stages, runtime, move |q, outcome| {
+            lock(&log).push(Event::Retired { q, outcome });
+        })
+        .unwrap();
+        let _ = graph.start(1, alive(), Vec::new());
+        h.pump();
+        assert_eq!(h.ran(1), [0]);
+        sink.refuse.store(true, Ordering::Release);
+        lock(&held).pop().unwrap().release();
+        assert_eq!(h.ran(1), [0, 1], "the refused stage ran in place");
+        assert_eq!(h.retired(1), [QuantumOutcome::Completed]);
+        assert_eq!(graph.live(), 0);
+    }
+
+    /// An ordered stage cannot be run beside its sink (its order is the sink\'s to keep): a refused one fails the quantum
+    /// and drops its count.
+    #[test]
+    fn an_ordered_stage_released_into_a_sink_that_refuses_it_fails_the_quantum() {
+        let h = Harness::new(1);
+        let sink = Arc::new(Refuses {
+            inner: h.sink.clone(),
+            refuse: AtomicBool::new(false),
+        });
+        let mut runtime = h.runtime.clone();
+        runtime.stages = sink.clone();
+        let held: Arc<Mutex<Vec<Gate>>> = Arc::default();
+        let k = held.clone();
+        let mut spec = StageGraphSpec::new();
+        spec.stage(StageSpec {
+            name: "g",
+            ordered: Some(9),
+            lanes: vec![],
+        });
+        let log = h.log.clone();
+        let stage = Arc::new(GateFn(h.log.clone(), move |gate: GateRef<'_>| {
+            lock(&k).push(gate.hold());
+            false
+        }));
+        let graph = StageGraph::new(spec, vec![stage], runtime, move |q, outcome| {
+            lock(&log).push(Event::Retired { q, outcome });
+        })
+        .unwrap();
+        let _ = graph.start(1, alive(), Vec::new());
+        sink.refuse.store(true, Ordering::Release);
+        lock(&held).pop().unwrap().release();
+        assert!(h.ran(1).is_empty());
+        assert!(matches!(
+            &h.retired(1)[..],
+            [QuantumOutcome::Failed {
+                stage: StageId(0),
+                ..
+            }]
+        ));
+        assert_eq!(graph.live(), 0);
     }
 
     /// Java `StageGraphTest.repeatedQuantaReuseTheSameGraphFramesAndResetReadiness`: quanta one after another reuse

@@ -7,6 +7,7 @@ use euhedral_graph::{ControlError, DeviceQueue, LaneControl, LaneId, Marker, Ret
 
 use crate::{
     Args, Gpu, GpuError, GraphHold, Lane, LaneEnqueue, LaneStream, Launch, POISONED_STATUS,
+    RawStream,
 };
 
 use super::enqueue::Real;
@@ -103,11 +104,11 @@ pub struct FakeRawStream {
 impl LaneStream for FakeLaneEnqueue<'_> {
     type Raw = FakeRawStream;
 
-    unsafe fn raw_stream(&self) -> FakeRawStream {
-        FakeRawStream {
+    fn raw_stream(&self) -> Option<RawStream<'_, FakeRawStream>> {
+        Some(RawStream::new(FakeRawStream {
             lane: self.queue.lane,
             global: self.queue.global(),
-        }
+        }))
     }
 }
 

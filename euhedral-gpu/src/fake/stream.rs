@@ -176,11 +176,11 @@ impl FakeStream {
         offset < self.count && self.gpu.lock().lanes[self.base + offset].id == marker.queue
     }
 
-    fn global(&self) -> usize {
+    pub(crate) fn global(&self) -> usize {
         self.base + self.index
     }
 
-    fn lane_id(&self) -> u16 {
+    pub(crate) fn lane_id(&self) -> u16 {
         self.first + u16::try_from(self.index).expect("at most 64 lanes")
     }
 

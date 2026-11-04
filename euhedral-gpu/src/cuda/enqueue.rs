@@ -7,7 +7,10 @@ use euhedral_memory::cuda::CuStream;
 
 use crate::hold::{Frozen, freeze};
 use crate::shape::{CopyKind, ShapeHasher};
-use crate::{Args, Enqueue, GpuError, GraphHold, Kernel, LaneEnqueue, Launch, MAX_ARGS};
+use crate::{
+    Args, Enqueue, GpuError, GraphHold, Kernel, LaneEnqueue, LaneStream, Launch, MAX_ARGS,
+    RawStream,
+};
 
 use super::fns::{CAPTURE_STATUS_ACTIVE, CaptureInfo, CuGraph, CuGraphNode};
 use super::{CudaGpu, CudaKernel, CudaQueue, CudaStream};
@@ -384,5 +387,19 @@ impl Enqueue for CudaEnqueue<'_> {
             },
             (None, None) => drop(value),
         }
+    }
+}
+
+impl LaneStream for CudaEnqueue<'_> {
+    type Raw = CuStream;
+
+    fn raw_stream(&self) -> Option<RawStream<'_, CuStream>> {
+        // A pass of a recurring sequence has no stream to lend: what runs on it would not be recorded.
+        if self.rec.is_some() {
+            return None;
+        }
+        self.target
+            .as_ref()
+            .map(|target| RawStream::new(target.dest.raw()))
     }
 }

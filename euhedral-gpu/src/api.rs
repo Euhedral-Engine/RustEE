@@ -297,7 +297,7 @@ pub trait Lane: DeviceQueue + LaneControl + Sized + 'static {
     where
         Self: 'a;
     /// What [`submit_held`](Self::submit_held) enqueues: an [`Enqueue`] whose kept values go to a [`GraphHold`].
-    type Held<'a>: Enqueue<Kernel = <Self::Gpu as Gpu>::Kernel>
+    type Held<'a>: Enqueue<Kernel = <Self::Gpu as Gpu>::Kernel> + LaneStream
     where
         Self: 'a;
 
@@ -382,37 +382,83 @@ pub trait LaneEnqueue {
     unsafe fn memset(&mut self, dst: u64, value: u8, bytes: usize) -> Result<(), GpuError>;
 }
 
-/// The driver stream behind a shared lane's submission, for library calls that enqueue on a stream of their own accord (a
-/// codec, an optical-flow engine, an inference runtime): Java's `GpuStream.submit(Runnable)`, which runs the library calls
-/// with the stream selected.
+/// A driver stream lent for the closure of a submission, for library calls that enqueue on a stream of their own accord
+/// (a codec, an optical-flow engine, an inference runtime). It borrows the enqueue handle it came from and is `!Send`, so it
+/// cannot outlive the closure or leave the calling thread:
 ///
-/// The handle is raw, so what it names is the caller's to keep right. Library calls enqueued on it are ordered with the
-/// closure's other operations (they are on the same stream), and the marker that [`Lane::submit_marked`] claimed before the
-/// closure is recorded after them.
+/// ```compile_fail,E0521
+/// use euhedral_gpu::fake::FakeGpu;
+/// use euhedral_gpu::{Lane, LaneStream, LaneEnqueue, open_shared_lanes, StreamOptions};
+///
+/// let gpu = FakeGpu::new();
+/// let lanes = open_shared_lanes(&gpu, &[("a", StreamOptions::default())]).unwrap();
+/// let lane = lanes.pool.lane(euhedral_graph::LaneId(0));
+/// let mut kept = None;
+/// // the loan cannot be kept past the closure
+/// lane.submit(|q| { kept = q.raw_stream(); Ok(()) }).unwrap();
+/// ```
+///
+/// ```compile_fail,E0277
+/// use euhedral_gpu::fake::FakeGpu;
+/// use euhedral_gpu::{Lane, LaneStream, open_shared_lanes, StreamOptions};
+///
+/// let gpu = FakeGpu::new();
+/// let lanes = open_shared_lanes(&gpu, &[("a", StreamOptions::default())]).unwrap();
+/// let lane = lanes.pool.lane(euhedral_graph::LaneId(0));
+/// // nor leave the calling thread
+/// lane.submit(|q| {
+///     let raw = q.raw_stream().unwrap();
+///     std::thread::scope(|s| { s.spawn(move || drop(raw)); });
+///     Ok(())
+/// }).unwrap();
+/// ```
+#[derive(Debug)]
+pub struct RawStream<'a, R> {
+    raw: R,
+    /// Borrowed from the handle, and not `Send` or `Sync`.
+    _lent: std::marker::PhantomData<(&'a (), *const ())>,
+}
+
+impl<R: Copy> RawStream<'_, R> {
+    pub(crate) fn new(raw: R) -> Self {
+        Self {
+            raw,
+            _lent: std::marker::PhantomData,
+        }
+    }
+
+    /// The backend\'s stream handle (CUDA: `CuStream`), to pass to the library call.
+    pub fn as_raw(&self) -> R {
+        self.raw
+    }
+}
+
+/// The driver stream behind a submission, for library calls that enqueue on a stream (Java `GpuStream.submit(Runnable)`,
+/// which runs the library calls with the stream selected).
+///
+/// The loan is a [`RawStream`]: the borrow checker keeps it inside the closure and on the calling thread. What the
+/// library does with the stream is outside Rust\'s view, so the contract of the call is the caller\'s:
+/// - Enqueue only work that completes on its own on the stream: do not synchronize the stream, destroy it, or capture it.
+/// - The device context is the one the backend selected for the closure; a call that switches it restores it.
+/// - Every pointer the enqueued work reads or writes stays valid until the work retires (hold it in the quantum, as for a
+///   copy).
+///
+/// Library calls enqueued this way are ordered with the closure\'s other operations (the same stream), and the marker
+/// that [`Lane::submit_marked`] claimed before the closure is recorded after them. They are not part of a recording: in a
+/// pass of a recurring sequence (probe, update, record) there is no stream to lend, and `raw_stream` is `None`.
 pub trait LaneStream: LaneEnqueue {
-    /// The backend's stream handle (CUDA: `CuStream`).
+    /// The backend\'s stream handle.
     type Raw: Copy + fmt::Debug;
 
-    /// The lane's driver stream.
-    ///
-    /// # Safety
-    /// - Use it only inside the closure of the `submit`, `submit_marked` or `submit_held` call that gave this value to
-    ///   you, on the calling thread, and do not keep it: after the closure the lane belongs to every worker again, and
-    ///   the marker is recorded behind the closure's work.
-    /// - The device context must be the one current for the call (the backend selected it for the closure; a library call
-    ///   that switches it must restore it).
-    /// - Enqueue only work that completes on its own on the stream: do not synchronize the stream, destroy it, or
-    ///   capture it. Every pointer the enqueued work reads or writes stays valid until the work retires (hold it in the
-    ///   quantum, as for a copy).
-    /// - Work enqueued this way is not part of a recording: a body that must also be recorded as a graph enqueues through
-    ///   [`LaneEnqueue`].
-    unsafe fn raw_stream(&self) -> Self::Raw;
+    /// The stream this submission enqueues on, lent for as long as `self` is borrowed.
+    fn raw_stream(&self) -> Option<RawStream<'_, Self::Raw>>;
 }
 
 /// What a submission on an owned stream, or into a recurring sequence's passes, enqueues: the operations of
 /// [`LaneEnqueue`] (a kernel body written once against that trait serves a shared lane's submission, an owned stream's
-/// and every pass of a recurring sequence), and the values it keeps alive for its work.
-pub trait Enqueue: LaneEnqueue {
+/// and every pass of a recurring sequence), [`LaneStream`] (the driver stream for library calls, where there is one), and
+/// the values it keeps alive for its work.
+pub trait Enqueue: LaneStream {
     /// Keeps `value` alive until the next retirement armed on this stream is confirmed. Host buffers that a copy
     /// reads belong here. On a shared lane, which keeps none, the value goes to the caller's [`GraphHold`]
     /// ([`Lane::submit_held`]).
