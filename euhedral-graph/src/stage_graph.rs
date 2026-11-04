@@ -271,7 +271,8 @@ impl fmt::Debug for QuantumRef {
 /// edge: `to_stage` waits for its markers on the device) or once those markers are reached (a
 /// [`Completion`](EdgeKind::Completion) edge; a host completion of `from_stage` is not shared). If
 /// `from_stage` will never run (its quantum was killed or failed), the edge arrives anyway, with
-/// every marker that quantum submitted. The earlier quantum stays pinned until `to_stage` has
+/// every marker that quantum submitted, and those its own external edges brought into stages that
+/// never ran (so the order of the quanta before it is kept). The earlier quantum stays pinned until `to_stage` has
 /// submitted (its marker joins the earlier quantum's retirement boundary) or been abandoned.
 #[derive(Clone, Debug)]
 pub struct ExternalEdge {
@@ -3115,7 +3116,7 @@ mod tests {
         }
         let graph = h.graph(&stages, &edges);
         let pull = Arc::new(Mutex::new(()));
-        for round in 0..20 {
+        for round in 0..if cfg!(miri) { 2 } else { 20 } {
             let _ = graph.start(round, alive(), Vec::new());
             let threads: Vec<_> = (0..4)
                 .map(|_| {
@@ -3414,7 +3415,7 @@ mod tests {
         let stages: Vec<(Option<u64>, &[u16], Act)> =
             (0..8).map(|_| (None, &[][..], Act::Fail)).collect();
         let graph = h.graph(&stages, &[]);
-        for q in 0..50 {
+        for q in 0..if cfg!(miri) { 3 } else { 50 } {
             let _ = graph.start(q, alive(), Vec::new());
             let g = graph.clone();
             drive(&h, 4, move || g.live() == 0);
@@ -3481,7 +3482,7 @@ mod tests {
                 (2, 3, Submission),
             ],
         );
-        let total = 300;
+        let total = if cfg!(miri) { 6 } else { 300 };
         for q in 0..total {
             let _ = graph.start(q, alive(), Vec::new());
         }
@@ -3656,7 +3657,7 @@ mod tests {
             ],
         );
         let mut pooled = None;
-        for q in 0..20 {
+        for q in 0..if cfg!(miri) { 4 } else { 20 } {
             let _ = graph.start(q, alive(), Vec::new());
             for _ in 0..4 {
                 h.pump();
@@ -3726,7 +3727,7 @@ mod tests {
             ],
             &[(0, 1, Submission), (1, 2, Completion)],
         );
-        let per_thread = 100u64;
+        let per_thread = if cfg!(miri) { 5 } else { 100u64 };
         let started = Arc::new(AtomicU64::new(0));
         let starters: Vec<_> = (0..4u64)
             .map(|t| {
@@ -3758,7 +3759,7 @@ mod tests {
     #[test]
     fn a_quantum_may_start_the_next_from_its_retire_callback() {
         let h = Harness::new(1);
-        let graph: Arc<OnceLock<Arc<StageGraph<u64>>>> = Arc::default();
+        let graph: Arc<OnceLock<Weak<StageGraph<u64>>>> = Arc::default();
         let log = h.log.clone();
         let again = graph.clone();
         let spec = {
@@ -3784,12 +3785,13 @@ mod tests {
             move |q: u64, outcome| {
                 lock(&log).push(Event::Retired { q, outcome });
                 if q < 3 {
-                    let _ = again.get().unwrap().start(q + 1, alive(), Vec::new());
+                    let next = again.get().unwrap().upgrade().unwrap();
+                    let _ = next.start(q + 1, alive(), Vec::new());
                 }
             },
         )
         .unwrap();
-        graph.set(built.clone()).ok().unwrap();
+        graph.set(Arc::downgrade(&built)).ok().unwrap();
         let _ = built.start(0, alive(), Vec::new());
         h.pump();
         for q in 0..=3 {
