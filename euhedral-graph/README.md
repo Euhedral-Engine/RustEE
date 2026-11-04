@@ -230,7 +230,7 @@ completion); it never waits. A stage can submit to its lane itself, as in Java: 
 of a backend's shared lane type a stage reaches the lane it was given with `cx.lane_handle()`, submits to it from
 whichever worker runs it, and returns the marker. The stage orders itself behind `cx.waits` on its lane. A stage that
 continues no lane takes a random allowed lane (`Placement::Random`, a per-thread generator, as Java's
-`ThreadLocalRandom`; `Placement::Fixed(f)` maps a stage to its lane by a function, deterministic under any number of
+`ThreadLocalRandom`; `Placement::Fixed(f)` maps a stage to its lane by a function, overriding the continued lane too and deterministic under any number of
 workers, as Java's `fixed` placement), and a root continues its run's home lane, taken in turn over the pool's compute
 lanes when the run is made (Java `nextHome`; `LanePool::with_reserved_lanes` sets a lane apart for work of its own). A stage
 must return the marker of the work it submitted on its lane (`Lane::submit_marked` makes the marker with the submission,

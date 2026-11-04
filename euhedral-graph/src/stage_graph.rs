@@ -40,9 +40,6 @@ use crate::lanes::{DeviceQueue, LaneId, LanePool, Marker, RetireCell};
 use crate::sync::{AtomicU64, AtomicUsize, Ordering, Owned};
 use crate::take_all::{Link, Linked, Sealed, TakeAllStack};
 
-/// The stage a quantum's failure names when the failure is the device's (the retirement of its work), and no stage's.
-pub const DEVICE: StageId = StageId(u16::MAX);
-
 /// A stage's index in its [`StageGraphSpec`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct StageId(pub u16);
@@ -198,6 +195,11 @@ pub enum QuantumOutcome {
     Failed {
         stage: StageId,
         error: StageError,
+    },
+    /// The device work of the quantum failed at its retirement: the failure belongs to no one stage (Java's
+    /// `retire(ticket)` fails the quantum without a stage). `cause` is the backend's description of the failure.
+    DeviceFailed {
+        cause: String,
     },
     /// Its kill switch was set (the work it belonged to was cancelled or superseded).
     Killed,
@@ -1842,9 +1844,8 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Run<Q, L> {
         if let Some(control) = lanes.lane(self.home_lane).control()
             && let Some(error) = control.confirm_retired(status)
         {
-            self.note(QuantumOutcome::Failed {
-                stage: DEVICE,
-                error: StageError::Fatal(error.to_string()),
+            self.note(QuantumOutcome::DeviceFailed {
+                cause: error.to_string(),
             });
         }
     }
@@ -2535,28 +2536,35 @@ mod tests {
             Self::with_backstop(lanes, DEFAULT_RETRY_BACKSTOP)
         }
 
-        /// A harness whose stages that continue no lane take `allowed[lane_of(stage) % allowed.len()]`.
+        /// A harness with `Placement::Fixed`: every stage takes `allowed[lane_of(stage) % allowed.len()]`, whatever lane it
+        /// continues.
         fn fixed(lanes: usize, lane_of: fn(u16) -> usize) -> Self {
-            Self::build(lanes, DEFAULT_RETRY_BACKSTOP, lane_of)
+            Self::build_with(
+                lanes,
+                DEFAULT_RETRY_BACKSTOP,
+                crate::Placement::Fixed(lane_of),
+                false,
+            )
         }
 
         fn with_backstop(lanes: usize, retry_backstop: Duration) -> Self {
-            Self::build(lanes, retry_backstop, usize::from)
+            Self::build_with(lanes, retry_backstop, crate::Placement::Random, false)
         }
 
         /// A harness whose lanes take retirements and waits (a lane of a driver's stream), with `lane_of` placement.
         fn controlled(lanes: usize, lane_of: fn(u16) -> usize) -> Self {
-            Self::build_with(lanes, DEFAULT_RETRY_BACKSTOP, lane_of, true)
-        }
-
-        fn build(lanes: usize, retry_backstop: Duration, lane_of: fn(u16) -> usize) -> Self {
-            Self::build_with(lanes, retry_backstop, lane_of, false)
+            Self::build_with(
+                lanes,
+                DEFAULT_RETRY_BACKSTOP,
+                crate::Placement::Fixed(lane_of),
+                true,
+            )
         }
 
         fn build_with(
             lanes: usize,
             retry_backstop: Duration,
-            lane_of: fn(u16) -> usize,
+            placement: crate::Placement,
             controlled: bool,
         ) -> Self {
             let hands: Vec<Arc<HandLane>> = (0..lanes)
@@ -2570,7 +2578,7 @@ mod tests {
                         .map(|h| h.clone() as Arc<dyn DeviceQueue>)
                         .collect(),
                 )
-                .with_placement(crate::Placement::Fixed(lane_of)),
+                .with_placement(placement),
             );
             let stages = Arc::new(QueueIngestSink::new());
             // A queue ingest sink hands out frames only once something is attached; this one asks
@@ -2786,14 +2794,14 @@ mod tests {
     /// placementKeepsTheLongestChainOnTheHomeLaneWhicheverBranchRunsFirst
     #[test]
     fn fan_out_runs_both_branches_and_fan_in_runs_the_join_once_behind_the_other_lane() {
-        let h = Harness::fixed(2, |s| usize::from(s) - 1);
+        let h = Harness::new(2);
         let both: &[u16] = &[0, 1];
-        // 0 -> 1 -> 3 -> 4 is the longest path; 0 -> 2 -> 4 is the side branch.
+        // 0 -> 1 -> 3 -> 4 is the longest path; 0 -> 2 -> 4 is the side branch, which only the other lane allows.
         let graph = h.graph(
             &[
                 (None, both, Act::Submit),
                 (None, both, Act::Submit),
-                (None, both, Act::Submit),
+                (None, &[1], Act::Submit),
                 (None, both, Act::Submit),
                 (None, both, Act::Submit),
             ],
@@ -2820,6 +2828,20 @@ mod tests {
         assert_eq!(waits[0].0, lane(2));
     }
 
+    /// Java `fixed` placement overrides everything: a stage takes its fixed lane although it is the critical successor of
+    /// a predecessor on another one.
+    #[test]
+    fn a_fixed_placement_overrides_the_lane_a_stage_would_continue() {
+        let h = Harness::fixed(2, usize::from);
+        // 0 -> 1: stage 1 would continue stage 0's lane (0), but its fixed lane is 1.
+        let graph = open_graph(&h, 2, 2, &[(0, 1, Submission)]);
+        let _ = graph.start(1, alive(), Vec::new());
+        h.pump();
+        assert_eq!(lanes_of(&h, 2), [0, 1]);
+        let (_, waits) = h.ran_with(1, 1).unwrap();
+        assert_eq!(waits.len(), 1, "it waits on the predecessor's marker");
+    }
+
     /// The lane each stage of a graph ran on, after one quantum ran to its end.
     fn lanes_of(h: &Harness, stages: usize) -> Vec<u16> {
         (0..stages)
@@ -2841,14 +2863,27 @@ mod tests {
         h.graph(&stages, edges)
     }
 
+    /// A graph whose stage `i` may run on the lanes `allowed[i]`.
+    fn graph_allowed(
+        h: &Harness,
+        allowed: &[&[u16]],
+        edges: &[(u16, u16, EdgeKind)],
+    ) -> Arc<StageGraph<u64>> {
+        let stages: Vec<(Option<u64>, &[u16], Act)> = allowed
+            .iter()
+            .map(|lanes| (None, *lanes, Act::Submit))
+            .collect();
+        h.graph(&stages, edges)
+    }
+
     #[test]
     fn a_fan_out_spreads_its_branches_over_the_lanes_and_the_join_waits_for_the_other_branch() {
-        let h = Harness::fixed(2, |s| usize::from(s) - 1);
-        // 0 -> {1, 2} -> 3. The branches tie; the first listed, 1, continues the root's lane.
-        let graph = open_graph(
+        let h = Harness::new(2);
+        // 0 -> {1, 2} -> 3. The branches tie; the first listed, 1, continues the root's lane; 2 is allowed on the
+        // other lane only.
+        let graph = graph_allowed(
             &h,
-            2,
-            4,
+            &[&[0, 1], &[0, 1], &[1], &[0, 1]],
             &[
                 (0, 1, Submission),
                 (0, 2, Submission),
@@ -2893,11 +2928,11 @@ mod tests {
 
     #[test]
     fn a_wider_fan_out_uses_every_lane() {
-        let h = Harness::fixed(3, |s| usize::from(s) - 1);
-        let graph = open_graph(
+        let h = Harness::new(3);
+        // The first listed branch continues the root; the others are allowed on one other lane each.
+        let graph = graph_allowed(
             &h,
-            3,
-            4,
+            &[&[0, 1, 2], &[0, 1, 2], &[1], &[2]],
             &[(0, 1, Submission), (0, 2, Submission), (0, 3, Submission)],
         );
         let _ = graph.start(1, alive(), Vec::new());
@@ -2919,11 +2954,11 @@ mod tests {
     #[test]
     fn a_longer_branch_continues_the_lane_whatever_its_place_in_the_edge_order() {
         let h = Harness::new(2);
-        // 0 -> 1 (a sink) and 0 -> 2 -> 3: 2 has the greater height although 1 is listed first.
-        let graph = open_graph(
+        // 0 -> 1 (a sink, allowed on the other lane only) and 0 -> 2 -> 3: 2 has the greater height although 1 is listed
+        // first.
+        let graph = graph_allowed(
             &h,
-            2,
-            4,
+            &[&[0, 1], &[1], &[0, 1], &[0, 1]],
             &[(0, 1, Submission), (0, 2, Submission), (2, 3, Submission)],
         );
         let _ = graph.start(1, alive(), Vec::new());
@@ -4138,7 +4173,7 @@ mod tests {
     /// on the home lane, which ends the quantum.
     #[test]
     fn a_quantum_joins_its_lanes_to_the_home_lane_and_retires_on_one_retirement() {
-        let h = Harness::controlled(2, |s| usize::from(s) - 1);
+        let h = Harness::controlled(2, |s| usize::from(s).saturating_sub(1));
         // Stage 0 continues the home lane (0); stage 1 is the other branch, on lane 1.
         let graph = h.graph(
             &[
@@ -4202,10 +4237,13 @@ mod tests {
         assert!(h.retired(1).is_empty());
         h.finish_lanes();
         h.pump();
-        assert!(matches!(
-            &h.retired(1)[..],
-            [QuantumOutcome::Failed { stage, .. }] if *stage == DEVICE
-        ));
+        // The failure is the device's: it names no stage (Java `retire(ticket)` fails the quantum without one).
+        assert_eq!(
+            h.retired(1),
+            [QuantumOutcome::DeviceFailed {
+                cause: "device status 7".into()
+            }]
+        );
         assert_eq!(hooks(&h, 1), [(0, false), (1, false)]);
         assert_eq!(graph.live(), 0);
     }

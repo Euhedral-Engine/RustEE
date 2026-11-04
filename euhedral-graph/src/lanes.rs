@@ -185,7 +185,7 @@ pub trait LaneControl: Send + Sync {
     fn confirm_retired(&self, status: i32) -> Option<ControlError>;
 }
 
-/// How a stage that continues no lane picks one of its allowed lanes.
+/// How a stage picks one of its allowed lanes when it continues none (and, for `Fixed`, whatever it continues).
 #[derive(Clone, Copy, Debug, Default)]
 pub enum Placement {
     /// A random allowed lane from a per-thread generator (Java's `ThreadLocalRandom`): independent frames spread over
@@ -193,7 +193,8 @@ pub enum Placement {
     #[default]
     Random,
     /// The lane is a function of the stage: `allowed[f(stage) % allowed.len()]`, whichever thread asks and in whatever
-    /// order (Java's `fixed` placement, a test placement). Deterministic under any number of workers.
+    /// order, and it overrides the continued lane too (Java's `fixed` placement, a test placement). Deterministic under
+    /// any number of workers.
     Fixed(fn(u16) -> usize),
 }
 
@@ -334,15 +335,19 @@ impl<L: DeviceQueue + ?Sized> LanePool<L> {
         unreachable!("a pool has a compute lane")
     }
 
-    /// The lane for `stage`: `continued` (the lane of the predecessor it is the critical successor
-    /// of, or the home lane of a root) when given and among `allowed`, otherwise one of `allowed` by the pool's
-    /// [`Placement`]. `allowed` lists the lanes able to run the stage's kind of work (compute, copy, a hardware
+    /// The lane for `stage`. With [`Placement::Fixed`] it is the placement's, whatever `continued` says (Java's `fixed`
+    /// overrides the continued lane: a test placement). Otherwise it is `continued` (the lane of the predecessor the
+    /// stage is the critical successor of, or the home lane of a root) when given and among `allowed`, else a random
+    /// one of `allowed`. `allowed` lists the lanes able to run the stage's kind of work (compute, copy, a hardware
     /// engine). Panics if `allowed` is empty (a CPU-only stage chooses no lane).
     pub fn choose(&self, stage: u16, allowed: &[LaneId], continued: Option<LaneId>) -> LaneId {
         assert!(
             !allowed.is_empty(),
             "a stage with device work needs at least one allowed lane"
         );
+        if let Placement::Fixed(lane_of) = self.placement {
+            return allowed[lane_of(stage) % allowed.len()];
+        }
         if let Some(lane) = continued
             && allowed.contains(&lane)
         {
@@ -351,12 +356,7 @@ impl<L: DeviceQueue + ?Sized> LanePool<L> {
         if let [only] = allowed {
             return *only;
         }
-        let pick = match self.placement {
-            Placement::Random => {
-                euhedral_data_structures::atomics::thread_random::next_u64() as usize
-            }
-            Placement::Fixed(lane_of) => lane_of(stage),
-        };
+        let pick = euhedral_data_structures::atomics::thread_random::next_u64() as usize;
         allowed[pick % allowed.len()]
     }
 }
@@ -540,10 +540,11 @@ mod tests {
             }
         });
         assert_eq!(
-            pool.choose(5, &compute, Some(LaneId(2))),
-            LaneId(2),
-            "a continued lane still wins"
+            pool.choose(5, &compute, Some(LaneId(1))),
+            expected(5),
+            "a continued lane does not win over the fixed one"
         );
+        assert_ne!(expected(5), LaneId(1), "the test continues another lane");
     }
 
     #[test]

@@ -88,7 +88,7 @@ worker runs it. `LanePool::as_queues` is the query view that `Completions` polls
 
 **placement, home lane** ([`Placement`](src/lanes.rs), [`LanePool::next_home`](src/lanes.rs)): how a stage that continues
 no lane picks one of its allowed lanes: at random from a per-thread generator (Java's `ThreadLocalRandom`; no shared
-counter), or by a function of the stage (`Fixed`, Java's `fixed`: deterministic under any number of workers). A root
+counter), or by a function of the stage (`Fixed`, Java's `fixed`: it overrides the continued lane too and is deterministic under any number of workers). A root
 continues its run's home lane, taken in turn over the pool's compute lanes (not the reserved ones) when the run is made
 (Java `nextHome`), so a graph's critical chain keeps one lane in every quantum.
 

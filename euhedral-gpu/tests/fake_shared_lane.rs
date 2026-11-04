@@ -20,7 +20,7 @@ use euhedral_gpu::{
     open_shared_lanes,
 };
 use euhedral_graph::{
-    Completions, DEFAULT_RETRY_BACKSTOP, DEVICE, EdgeKind, GraphRuntime, LaneControl, LaneId,
+    Completions, DEFAULT_RETRY_BACKSTOP, EdgeKind, GraphRuntime, LaneControl, LaneId,
     QuantumOutcome, RetireCell, Stage, StageCx, StageError, StageGraph, StageGraphSpec, StageSpec,
     Submitted,
 };
@@ -623,10 +623,7 @@ fn a_device_fault_fails_the_quantum_at_its_retirement_and_the_hooks_still_run() 
     f.settle();
     let retired = lock(&f.retired).clone();
     assert!(
-        matches!(
-            &retired[..],
-            [(1, QuantumOutcome::Failed { stage, .. })] if *stage == DEVICE
-        ),
+        matches!(&retired[..], [(1, QuantumOutcome::DeviceFailed { .. })]),
         "{retired:?}"
     );
     assert_eq!(f.hooks.load(Ordering::SeqCst), 1);
