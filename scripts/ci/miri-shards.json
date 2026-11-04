@@ -101,10 +101,38 @@
   ]
  },
  {
-  "name": "graph: stage graph, take-all stack",
+  "name": "graph: take-all stack",
   "crate": "euhedral-graph",
   "commands": [
-   "cargo +nightly miri test -p euhedral-graph --lib -- take_all:: stage_graph:: --skip the_retry_backstop"
+   "cargo +nightly miri test -p euhedral-graph --lib -- take_all::"
+  ]
+ },
+ {
+  "name": "graph: stage graph, worker threads",
+  "crate": "euhedral-graph",
+  "commands": [
+   "cargo +nightly miri test -p euhedral-graph --lib -- stage_graph::tests::quanta_started_on_four_threads stage_graph::tests::concurrent_incoming_edges stage_graph::tests::a_diamond_on_8_workers stage_graph::tests::the_first_failure_wins stage_graph::tests::a_kill_after_a_failure"
+  ]
+ },
+ {
+  "name": "graph: stage graph, external edges (1)",
+  "crate": "euhedral-graph",
+  "commands": [
+   "cargo +nightly miri test -p euhedral-graph --lib -- stage_graph::tests::subscriptions_before stage_graph::tests::external_pins stage_graph::tests::a_rebound_run stage_graph::tests::a_cancelled_quantum stage_graph::tests::a_failed_middle_stage stage_graph::tests::a_cpu_middle_stage"
+  ]
+ },
+ {
+  "name": "graph: stage graph, external edges (2)",
+  "crate": "euhedral-graph",
+  "commands": [
+   "cargo +nightly miri test -p euhedral-graph --lib -- stage_graph::tests::a_later_quantum_on_another stage_graph::tests::an_edge_on_a_stage_that_never_runs stage_graph::tests::the_boundary_covers stage_graph::tests::an_external_completion_edge stage_graph::tests::a_later_quantums_stage_waits stage_graph::tests::an_earlier_quantum_retires"
+  ]
+ },
+ {
+  "name": "graph: stage graph, completions and reuse",
+  "crate": "euhedral-graph",
+  "commands": [
+   "cargo +nightly miri test -p euhedral-graph --lib -- stage_graph::tests::a_halted_quantum_keeps stage_graph::tests::a_stage_that_fails_on_a_foreign stage_graph::tests::a_stage_that_ran_and_failed stage_graph::tests::a_failed_quantum_still_waits stage_graph::tests::a_host_completion_gates stage_graph::tests::repeated_quanta_reuse stage_graph::tests::a_quantum_may_start stage_graph::tests::a_refused_stage_frame stage_graph::tests::a_panicking_stage"
   ]
  }
 ]
