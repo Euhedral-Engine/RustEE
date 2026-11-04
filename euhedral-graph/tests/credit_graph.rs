@@ -479,7 +479,7 @@ impl Ctx {
                     QuantumOutcome::Killed => {
                         _ = ctx.counts.killed_outcomes.fetch_add(1, Ordering::Relaxed)
                     }
-                    QuantumOutcome::Failed { .. } => {
+                    QuantumOutcome::Failed { .. } | QuantumOutcome::DeviceFailed { .. } => {
                         _ = ctx.counts.failed_outcomes.fetch_add(1, Ordering::Relaxed)
                     }
                 }

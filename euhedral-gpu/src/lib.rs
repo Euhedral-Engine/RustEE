@@ -7,6 +7,7 @@
 //! | Piece | Module | What it is |
 //! |---|---|---|
 //! | [`Gpu`], [`Stream`], [`Enqueue`] | `api` | a device, an ordered queue of device work, and what a submission enqueues |
+//! | [`Lane`], [`open_shared_lanes`], [`SharedLanes`] | `api`, `lanes` | a lane that any worker submits to through `&self`, and a device's lanes as a typed pool of them |
 //! | [`Module`], [`Kernel`], [`Args`] | `api`, `args` | code loaded at run time and its typed arguments |
 //! | [`Sequence`], [`Graph`] | `api` | a recurring sequence of submissions, recorded once and replayed |
 //! | [`GraphCache`] | `graph_cache` | a lane's graphs by key: a hit updates and replays, a miss records |
@@ -41,17 +42,19 @@ mod lanes;
 mod module_cache;
 mod poison;
 mod retire;
+mod ring;
 mod shape;
 mod spans;
+mod sync;
 
 pub use api::{
-    CompileOptions, Enqueue, Gpu, Graph, Kernel, Lanes, Module, POISONED_STATUS, Rerecorded,
-    RetireListener, RetireTicket, Sequence, Stream, StreamOptions, StreamPriority,
+    CompileOptions, Enqueue, Gpu, Graph, Kernel, Lane, LaneEnqueue, Lanes, Module, POISONED_STATUS,
+    Rerecorded, RetireListener, RetireTicket, Sequence, Stream, StreamOptions, StreamPriority,
 };
 pub use args::{ArgMismatch, Args, Dim3, KernelArg, Launch, MAX_ARGS};
 pub use error::GpuError;
 pub use graph_cache::{DEFAULT_GRAPHS, GraphBody, GraphCache, GraphStats, Ran};
-pub use lanes::{LaneSpec, OpenedLanes, open_lane_sources};
+pub use lanes::{LaneSpec, OpenedLanes, SharedLanes, open_lane_sources, open_shared_lanes};
 pub use module_cache::{CacheKey, KeyMaterial, ModuleCache, cache_key};
 pub use poison::Poison;
 pub use retire::{OnceFrame, RetireError, UNPOLLED_RETIREMENTS, retire_into, retire_into_with};

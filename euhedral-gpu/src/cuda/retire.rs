@@ -10,13 +10,16 @@
 use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
+use std::sync::Arc;
+
 use euhedral_data_structures::sync::HotScope;
+use euhedral_graph::RetireCell;
 use euhedral_memory::cuda::{CuResult, CuStream};
 
 use crate::GpuError;
 use crate::retire::RetireSink;
 
-use super::stream::CudaStream;
+use super::stream::{CudaQueue, CudaStream};
 
 fn tell(user: *mut c_void, status: CuResult) {
     let _hot = HotScope::enter();
@@ -25,6 +28,24 @@ fn tell(user: *mut c_void, status: CuResult) {
     let sink = unsafe { &*user.cast::<RetireSink>() };
     // A panic must not cross into the driver; a push cannot normally panic.
     let _ = catch_unwind(AssertUnwindSafe(|| sink.push(status)));
+}
+
+/// The callback of a retirement that names its cell: it stores the status there and does nothing else.
+fn tell_cell(user: *mut c_void, status: CuResult) {
+    let _hot = HotScope::enter();
+    // SAFETY: `user` is the pointer `arm_cell` made with `Arc::into_raw`, which this callback takes back: the reference
+    // count it held keeps the cell alive until here, however the lane has gone since.
+    let cell = unsafe { Arc::from_raw(user.cast::<RetireCell>()) };
+    // A panic must not cross into the driver; a store cannot normally panic.
+    let _ = catch_unwind(AssertUnwindSafe(|| cell.arrive(status)));
+    // The lane that armed the retirement keeps its own reference for as long as it uses the cell; the last drop of a
+    // cell nobody holds any more is the only free this callback can make.
+    drop(cell);
+}
+
+/// `CUstreamCallback` of [`CudaQueue::arm_cell`].
+unsafe extern "C" fn trampoline_cell(_stream: CuStream, status: CuResult, user: *mut c_void) {
+    tell_cell(user, status);
 }
 
 /// `CUstreamCallback`: the driver passes the status of the work before it.
@@ -44,5 +65,24 @@ impl CudaStream {
         self.gpu.check("cuStreamAddCallback", unsafe {
             (fns.stream_add_callback)(self.raw, trampoline, user, 0)
         })
+    }
+}
+
+impl CudaQueue {
+    /// Enqueues a callback after the work enqueued so far that stores the work's status in `cell`. The context is
+    /// current. Nothing is allocated: the user data is a clone of the `Arc`.
+    pub(crate) fn arm_cell(&self, cell: &Arc<RetireCell>) -> Result<(), GpuError> {
+        let user = Arc::into_raw(cell.clone()).cast_mut().cast::<c_void>();
+        let fns = &self.gpu.fns;
+        // SAFETY: a stream of this device; the user data is the reference the callback takes back; the context is
+        // current.
+        let armed = self.gpu.check("cuStreamAddCallback", unsafe {
+            (fns.stream_add_callback)(self.raw, trampoline_cell, user, 0)
+        });
+        if armed.is_err() {
+            // SAFETY: the driver refused the callback, so nothing else holds the reference made above.
+            drop(unsafe { Arc::from_raw(user.cast::<RetireCell>()) });
+        }
+        armed
     }
 }

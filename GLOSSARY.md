@@ -687,7 +687,8 @@ another thread goes to its owner, or to another lane. Marker rings, spans and ke
 The owning source learns of it in `poll_retired` (in its `request` or `pull`) and tells the listeners, in
 order; `confirm_retired` settles the ticket (a submitter method) and returns the device failure, or none;
 `retire_into` makes the retirement a frame of a `Completions`, and the submitter travels with its
-continuation. A stage finishing its submission is never completion. The callback and its queue:
+continuation. On a shared lane a retirement names its own `RetireCell` (`LaneControl::notify_retired`), and a stage
+graph's quantum retires on one armed on its home lane. A stage finishing its submission is never completion. The callback and its queue:
 [`euhedral-gpu` glossary](euhedral-gpu/GLOSSARY.md).
 
 **poisoned device** ([`Poison`](euhedral-gpu/src/poison.rs), [`GpuError::Poisoned`](euhedral-gpu/src/error.rs)):

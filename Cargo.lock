@@ -80,6 +80,7 @@ dependencies = [
  "euhedral-hashing",
  "euhedral-memory",
  "libc",
+ "loom",
 ]
 
 [[package]]

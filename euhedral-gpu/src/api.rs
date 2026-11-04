@@ -18,6 +18,12 @@
 //!   Exclusivity is the borrow checker's, so there is no lock to take or to wait on, and a call on a stream from
 //!   inside its own `submit` closure does not compile.
 //!
+//! A lane can also be **shared**: [`Stream::shared`] is the handle (a [`Lane`]) that any worker submits to through `&self`,
+//! as a stage of a stage graph does. The owner's `&mut` calls and the lane's `&self` calls make markers by the same
+//! lock-free protocol, so the two may coexist. A shared lane keeps no values and has no retirement channel: each
+//! retirement armed on it names the cell its callback fills ([`LaneControl::notify_retired`]), and what a stage's work
+//! reads is held by the stage, released in its `retired` hook.
+//!
 //! In RustEE's model the owner is a lane's `LatticeSource`: the lattice serializes its `request` and `pull`, so
 //! whichever worker runs them is the submitter's only user, and nothing is locked. [`open_lane_sources`](crate::open_lane_sources)
 //! opens a device's streams that way; work for a lane from other frames reaches the source through the lock-free
@@ -30,7 +36,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use euhedral_graph::{DeviceQueue, LaneId, LanePool, Marker, QueueId};
+use euhedral_graph::{DeviceQueue, LaneControl, LaneId, LanePool, Marker, QueueId};
 
 use crate::{Args, Fingerprint, GpuError, Launch, Span};
 
@@ -123,6 +129,8 @@ pub trait Gpu: Send + Sync + fmt::Debug + Sized + 'static {
 pub trait Stream: Send + Sized + 'static {
     type Gpu: Gpu<Stream = Self>;
     type Enqueue<'a>: Enqueue<Kernel = <Self::Gpu as Gpu>::Kernel>;
+    /// The shared handle over this stream's queue: any thread may submit to it through `&self` (see [`Lane`]).
+    type Lane: Lane<Gpu = Self::Gpu>;
 
     fn gpu(&self) -> &Arc<Self::Gpu>;
 
@@ -133,6 +141,11 @@ pub trait Stream: Send + Sized + 'static {
 
     /// The shared query side of this stream, as the pool holds it.
     fn queue(&self) -> Arc<dyn DeviceQueue>;
+
+    /// The shared handle over this stream's queue: the query side of [`queue`](Self::queue) and the submit side of a
+    /// [`Lane`], for a [`LanePool`] of lanes that stages submit to from any worker. It keeps the device queue alive: the
+    /// stream may be dropped, and the queue is closed (after its work) when the last handle goes.
+    fn shared(&self) -> Arc<Self::Lane>;
 
     /// Runs `f` with the stream selected for every operation; the operations are contiguous on the stream. Keep `f`
     /// to enqueueing. The stream is borrowed for the call, so `f` cannot use it again: a call on the stream from
@@ -224,6 +237,109 @@ pub trait Stream: Send + Sized + 'static {
     /// owns the stream too (see [`retire_into`](crate::retire_into)): nothing is shared, and nothing is locked or
     /// queued to release the values.
     fn confirm_retired(&mut self, ticket: RetireTicket) -> Option<GpuError>;
+}
+
+/// The shared submit side of one ordered queue of device work: a lane that any worker submits to through `&self`, as in
+/// Java's `GpuStream`, where a stage submits to its lane directly from whichever worker runs it.
+///
+/// A lane is a [`DeviceQueue`] too, so a [`LanePool`] of lanes (typed over the lane, as Java's `LanePool` holds
+/// streams) is both what [`Completions`](euhedral_graph::Completions) polls and what a stage reaches through
+/// [`StageCx::lane_handle`](euhedral_graph::StageCx::lane_handle). It is a [`LaneControl`] as well: it orders its later
+/// work behind another lane's marker and arms retirements that name their sink, which is what a stage graph uses to
+/// join its lanes and retire a quantum.
+///
+/// - **Submit and mark are lock-free.** Submissions are the driver's: it serializes the launches it gets on one stream.
+///   A marker is claimed *before* the work it follows ([`submit_marked`](Self::submit_marked), Java opens a stage's
+///   marker before the stage submits) and recorded after it; the marker records after all the work submitted so far,
+///   which may include another thread's work (that only over-waits). The numbers are handed out by compare-and-set and
+///   found complete in order by [`DeviceQueue::completed`].
+/// - **Nothing waits, and a refusal comes before the work.** A marker ring that is full, or a slot an awaiter holds,
+///   answers `Err(Busy)` when the marker is claimed, before anything was submitted: a stage that is told to retry has
+///   submitted nothing. Once the work is in, the marker is recorded and cannot be refused.
+/// - **Retirement** names its sink: [`LaneControl::notify_retired`] takes the [`RetireCell`](euhedral_graph::RetireCell)
+///   the driver callback stores the status in (Java `notifyRetired(listener)`). The callback only fills the cell; the
+///   continuation that finds it filled settles the status with [`LaneControl::confirm_retired`] in a frame, on an
+///   ordinary thread, never in the callback and never in a source's `request` or `pull`. Nothing is claimed or queued
+///   in between, so two parties retiring on one lane never see each other's status.
+/// - **A shared lane keeps no values.** What a submission's work reads (a host buffer a copy reads) lives in the
+///   work's own quantum and is released by the stage's retirement hook ([`Stage::retired`](euhedral_graph::Stage::retired),
+///   Java `StageFrame.retired`), once the quantum's boundary was reached.
+pub trait Lane: DeviceQueue + LaneControl + Sized + 'static {
+    type Gpu: Gpu;
+    type Enqueue<'a>: LaneEnqueue<Kernel = <Self::Gpu as Gpu>::Kernel>
+    where
+        Self: 'a;
+
+    /// This lane's id in its pool.
+    fn lane(&self) -> LaneId;
+
+    /// Runs `f` with the lane selected for every operation, on the calling thread: the operations are contiguous in this
+    /// call's submissions to the driver, though another thread's may interleave between two calls.
+    fn submit<R>(
+        &self,
+        f: impl FnOnce(&mut Self::Enqueue<'_>) -> Result<R, GpuError>,
+    ) -> Result<R, GpuError>;
+
+    /// Claims a marker, runs `f` as [`submit`](Self::submit) does, and records the marker after `f`'s work: Java's
+    /// stage, which has its marker before it submits. `Err(Busy)` (retry) only when the marker could not be claimed
+    /// (the ring is full of markers that have not completed, or an awaiter holds the slot), and then `f` has not run. An
+    /// `Err` from `f` gives the marker up.
+    fn submit_marked<R>(
+        &self,
+        f: impl FnOnce(&mut Self::Enqueue<'_>) -> Result<R, GpuError>,
+    ) -> Result<(R, Marker), GpuError>;
+
+    /// A marker after the work submitted so far. `Err(Busy)` (retry) as for [`submit_marked`](Self::submit_marked). Use
+    /// that for a marker after work you cannot repeat.
+    fn mark(&self) -> Result<Marker, GpuError>;
+}
+
+/// What a submission to a shared lane enqueues: the operations of [`Enqueue`], without `keep`. A shared lane keeps no
+/// values; see [`Lane`].
+pub trait LaneEnqueue {
+    type Kernel: Kernel;
+
+    /// Launches `kernel`.
+    ///
+    /// # Safety
+    /// `args` match the kernel's parameters, and every address the kernel touches is valid for that access until the
+    /// work retires.
+    unsafe fn launch(
+        &mut self,
+        kernel: &Self::Kernel,
+        launch: Launch,
+        args: &Args,
+    ) -> Result<(), GpuError>;
+
+    /// Copies `bytes` from host memory at `src` to the device address `dst`.
+    ///
+    /// # Safety
+    /// The ranges are valid, not used by other work in the meantime, and stay valid until the work retires.
+    unsafe fn copy_to_device(
+        &mut self,
+        dst: u64,
+        src: *const u8,
+        bytes: usize,
+    ) -> Result<(), GpuError>;
+
+    /// Copies `bytes` from the device address `src` to host memory at `dst`.
+    ///
+    /// # Safety
+    /// As [`copy_to_device`](Self::copy_to_device).
+    unsafe fn copy_to_host(&mut self, dst: *mut u8, src: u64, bytes: usize)
+    -> Result<(), GpuError>;
+
+    /// Copies `bytes` between device addresses.
+    ///
+    /// # Safety
+    /// As [`copy_to_device`](Self::copy_to_device).
+    unsafe fn copy_on_device(&mut self, dst: u64, src: u64, bytes: usize) -> Result<(), GpuError>;
+
+    /// Sets `bytes` at the device address `dst` to `value`.
+    ///
+    /// # Safety
+    /// As [`copy_to_device`](Self::copy_to_device).
+    unsafe fn memset(&mut self, dst: u64, value: u8, bytes: usize) -> Result<(), GpuError>;
 }
 
 /// What a submission enqueues.

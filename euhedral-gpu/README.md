@@ -19,8 +19,9 @@ Asynchronous, backend-neutral GPU access for the RustEE control plane. A lattice
 
 | Module | Main types |
 |---|---|
-| [`api`](src/api.rs) | The traits: `Gpu`, `Stream`, `Enqueue`, `Module`, `Kernel`, `Sequence`, `Graph`, `RetireListener`; `RetireTicket`, `StreamOptions`, `StreamPriority`, `CompileOptions`, `Rerecorded`, `Span` (timed spans, `Stream::span_*`). |
-| [`lanes`](src/lanes.rs) | `LaneSubmit` for the backends' streams, and `open_lane_sources`: a device's lanes as a pool, its intakes and a `LaneSource` per lane (`LaneSpec`, `OpenedLanes`). |
+| [`api`](src/api.rs) | The traits: `Gpu`, `Stream`, `Lane`, `LaneEnqueue`, `Enqueue`, `Module`, `Kernel`, `Sequence`, `Graph`, `RetireListener`; `RetireTicket`, `StreamOptions`, `StreamPriority`, `CompileOptions`, `Rerecorded`, `Span` (timed spans, `Stream::span_*`). |
+| [`lanes`](src/lanes.rs) | `LaneSubmit` for the backends' streams, and `open_lane_sources`: a device's lanes as a pool, its intakes and a `LaneSource` per lane (`LaneSpec`, `OpenedLanes`); `open_shared_lanes`: a device's lanes as a typed pool that any worker submits to (`SharedLanes`). |
+| [`ring`](src/ring.rs) | The lock-free marker ring behind a lane's markers: numbers claimed by compare-and-set, completion found by an in-order scan, the awaiters' pins. No driver; loom-checked. |
 | [`cuda::texture`](src/cuda/texture.rs) | `TexObject`, `View`: texture objects over pitched device memory (filter, address and coordinate modes). |
 | [`graph_cache`](src/graph_cache.rs) | `GraphCache`: a lane's graphs by key (a hit updates and replays, a miss records, a warm-up only records), `GraphBody`, `Ran`. |
 | [`args`](src/args.rs) | `KernelArg`, `Args` (the typed argument builder, rewritable in place), `Launch`, `Dim3`. |
@@ -50,6 +51,32 @@ Asynchronous, backend-neutral GPU access for the RustEE control plane. A lattice
     which is what `retire_into` does, or the work runs on another lane. There is no routing layer.
   - Enqueue operations (`launch`, the copies, `memset`) are `unsafe fn`s, as `euhedral_memory::Copier::start` is: a
     kernel or a copy can touch any device-visible memory.
+- **Shared lanes: any worker submits.** A stage of a stage graph submits to the lane it was given, from whichever worker
+  runs it, as in Java, where a stage calls `stream.submit` directly. `Stream::shared()` is the lane's shared handle
+  (`Lane`: `CudaQueue`, `FakeQueue`): the queue side above, and `submit`, `submit_marked` and `mark` through `&self`, plus
+  `LaneControl` (`await_marker`, `notify_retired`, `confirm_retired`), which is what a stage graph uses to join and retire
+  lanes. `open_shared_lanes` opens a device's lanes as a `LanePool` typed over the lane, which a `StageGraph<Q, L>` takes
+  as its runtime's lanes, so a stage reaches its lane with `cx.lane_handle()` and returns the marker of its work in
+  `Submitted::marker`.
+  - **Submit** is the driver's: it serializes the launches it gets on one stream, and a submission's operations are
+    contiguous in one call's driver calls (another worker's may come between two calls). Nothing is locked.
+  - **Mark** records after all the work submitted so far, which may include another worker's: that only over-waits.
+    `submit_marked` claims the marker's number before the work and records it after (Java opens the marker before the
+    stage submits), so a full ring (`Err(Busy)`) is learned before any work is in and a retried stage submitted nothing.
+    The numbers are handed out by compare-and-set, and the scan that finds markers complete walks them in order and stops
+    at a number whose record is not stored yet, so a slot that still holds an older record is never mistaken for the new
+    marker (`src/ring.rs`; its loom models check the claim and the scan). A claim whose work failed is given up as a hole
+    that completes without an event.
+  - **Retirement** keeps the callback that only queues, and each arm names its own sink: `notify_retired(cell)` makes the
+    driver's callback store the status of the work before it in that `RetireCell` and nothing else, so parties arming on
+    one lane never read each other's retirement and nothing is claimed or waited for. The cell is refcounted (the callback
+    holds a clone), so it outlives a lane that is dropped first. The continuation that settles the status is a frame
+    (`Completions::after_retired`).
+  - **Held values.** A shared lane keeps none. What a submission's work reads (a host buffer a copy reads) is held by the
+    stage, in its quantum, and released in the stage's `retired` hook, which runs once the quantum's device work ended: a
+    retirement armed by another party cannot release it early.
+  - The owned `Stream` is unchanged and still what `LaneSource` consumes. A stream and a shared handle over it share the
+    marker ring and the driver stream; the owner keeps its own retirement channel and kept values.
 - **Markers across streams.** `mark()` records a marker after the work submitted so far; `await_marker(m)` orders later
   work behind it on the device, and the host does not wait. A marker carries the identity of the queue that made it (`QueueId`, from `DeviceQueue::id`): `await_marker`
   refuses a marker of a queue that is not in the stream's pool with `Err(Invalid)`, whatever its lane and value, and a

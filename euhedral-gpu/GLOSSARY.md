@@ -5,11 +5,20 @@ and the rings and caches under a stream. The terms a user submits work with (str
 modules, sequences, graphs) and the lifecycle are in the [top-level glossary](../GLOSSARY.md). Paths are
 relative to this crate. Entries run from the lowest layer up: streams, recording, caches.
 
-**marker ring** ([`StreamOptions::markers`](src/api.rs)): each CUDA stream has a ring of events for its
-markers (256 by default). `mark()` returns `Err(Busy)` rather than reuse a slot whose marker has not
-completed; an await on a marker that already completed adds no device wait. An await that races the owner
-re-recording a slot is made safe without a lock: the awaiter raises a per-slot pin before it enqueues its
-wait, and the owner's `mark` returns `Busy` if the slot it would reuse is pinned.
+**marker ring** ([`StreamOptions::markers`](src/api.rs), [`ring`](src/ring.rs)): each CUDA stream has a ring of events for its
+markers (256 by default), made by any number of threads. A number is claimed by compare-and-set once the slot's previous
+marker completed (`mark()` returns `Err(Busy)` rather than reuse a slot whose marker has not completed), the claimant records
+the event and stores the number's entry, and a scan finds markers complete in order, stopping at a number whose entry is not
+stored yet; a claimant that cannot record stores a skipped number. An await on a marker that already completed adds no device
+wait. An await that races a claimant re-recording a slot is made safe without a lock: the awaiter raises a per-slot pin before
+it enqueues its wait, and a claimant that finds the slot pinned waits out the pin (one driver call) or gives its number up.
+
+**shared lane** ([`Lane`](src/api.rs), [`cuda::CudaQueue`](src/cuda/stream.rs)): the shared side of a stream that any worker
+submits to through `&self`: `submit`, `submit_marked` (the marker is claimed before the work, so a refusal comes before it) and
+`mark`, and the graph-facing `LaneControl` (`await_marker`, `notify_retired`, `confirm_retired`). It has no retirement channel
+and keeps no values: each retirement names the `RetireCell` its callback fills, and a stage's held values are released by its
+`retired` hook. `Stream::shared()` is the handle; `open_shared_lanes` opens a device's lanes as a `LanePool` typed over it.
+The driver stream is destroyed, after its work, with the last handle.
 
 **retirement queue** ([`retire`](src/retire.rs), [`cuda::retire`](src/cuda/retire.rs)): each stream owns
 one unbounded lock-free MPSC queue. The driver's callback (`cuStreamAddCallback`, which reports the status

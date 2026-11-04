@@ -225,7 +225,17 @@ graph is started for. Edges say when a stage's successor may run:
   earlier one, held through a `QuantumRef`.
 
 A stage's `run` computes or submits and returns a `Submitted` (its marker, perhaps a host
-completion); it never waits. A stage that finds its resources busy answers `StageError::Retry` and
+completion); it never waits. A stage can submit to its lane itself, as in Java: `LanePool`, `GraphRuntime`, `StageCx`,
+`Stage` and `StageGraph` are typed over the lane (`dyn DeviceQueue`, the query side only, by default), so with a pool
+of a backend's shared lane type a stage reaches the lane it was given with `cx.lane_handle()`, submits to it from
+whichever worker runs it, and returns the marker. The stage orders itself behind `cx.waits` on its lane. A stage that
+continues no lane takes a random allowed lane (`Placement::Random`, a per-thread generator, as Java's
+`ThreadLocalRandom`; `Placement::Fixed(f)` maps a stage to its lane by a function, overriding the continued lane too and deterministic under any number of
+workers, as Java's `fixed` placement), and a root continues its run's home lane, taken in turn over the pool's compute
+lanes when the run is made (Java `nextHome`; `LanePool::with_reserved_lanes` sets a lane apart for work of its own). A stage
+must return the marker of the work it submitted on its lane (`Lane::submit_marked` makes the marker with the submission,
+and any `Busy` comes before any work, so a retried stage has submitted nothing). A stage holds what its work reads and
+releases it in `Stage::retired`, which runs once the quantum's device work ended. A stage that finds its resources busy answers `StageError::Retry` and
 runs again when a lane of the pool made progress, or after `GraphRuntime::retry_backstop` (default
 `DEFAULT_RETRY_BACKSTOP`, 20 ms: set it longer than any one pass on your devices). A stage can be
 **ordered** (`StageSpec::ordered`): its frames then run in the order they were published, on one
@@ -233,7 +243,13 @@ lane of the lattice. The graph's **kill switch** goes on every stage frame of a 
 quantum's unrun stages are `abandoned`.
 
 A quantum **retires** when none of its frames can run again and every lane it used has reached its
-last marker (its retirement boundary, armed as one `Completions` edge per lane). `retire` then receives the
+last marker (its retirement boundary). When the lanes can be controlled (`DeviceQueue::control`, which a backend's
+shared lane gives, as Java's `GpuStream` does), the boundary is Java's `quiesce`: every other lane used joins the home
+lane on the device (the home lane awaits its latest marker), one retirement is armed on the home lane and fills the
+quantum's own `RetireCell`, and a retirement frame settles it, runs each attempted stage's `retired` hook and the
+quantum's terminal work, and recycles the quantum. A completion edge arms a retirement on the producing stage's lane the
+same way (Java `RetiredEdge`). For lanes that are only a query side (`dyn DeviceQueue` without control) the boundary
+stays one `Completions` marker edge per lane. `retire` then receives the
 quantum and its `QuantumOutcome`: `Completed`, `Failed` or `Killed`. `live()` counts quanta not
 retired yet.
 
