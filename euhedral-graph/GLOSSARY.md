@@ -85,7 +85,9 @@ until it is ready, so the quantum retires after it.
 markers, its first cause, its external-edge records) kept in a bounded pool and rebound to each quantum in
 turn. `start` takes one and `retire` gives it back, as the graph's frames (stage, arrival, boundary and
 retirement frames, one pooled type) go back to a pool of their own. A pool that is full drops what comes
-back, and a take that finds another taker active makes a new one.
+back. A take retries the queue's try-claim for as long as the pool holds anything, up to 65536 polls, and
+makes a new object only when the pool is empty (or stays unpollable that long): the pool grows to the
+objects in flight at once, and no further.
 
 **TakeAllStack** ([`take_all`](src/take_all.rs)): a stack any thread pushes to and one thread takes whole and
 seals. The nodes are the caller's own, pooled objects (each holds its link), so a push allocates nothing.

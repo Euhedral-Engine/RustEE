@@ -48,8 +48,10 @@ entering the kernel.
 The crate's clippy bans (see [`clippy.toml`](clippy.toml)) keep it that way: no threads, sleeps,
 channels, `Condvar`, blocking `std::fs` or `std::net` calls.
 
-No stage frame takes a lock. The per-quantum state of a `StageGraph` (`src/stage_graph.rs`) is a pooled run, handed
-from stage to stage by counts, plain fields and closable stacks, and a quantum allocates nothing after warm-up. A `Lake`
+No stage frame takes a lock of its own. The per-quantum state of a `StageGraph` (`src/stage_graph.rs`) is a pooled run,
+handed from stage to stage by counts, plain fields and closable stacks, and a quantum allocates nothing after warm-up.
+The pools of runs and frames are bounded multi-consumer queues; their consumer claim is a try-claim that a take retries
+(a bounded number of polls) instead of waiting on. A `Lake`
 keeps its generation lists in `LifecycleMutex`es, which start, stop and rebalance take, not frames.
 
 ### Completions
@@ -236,7 +238,7 @@ quantum and its `QuantumOutcome`: `Completed`, `Failed` or `Killed`. `live()` co
 retired yet.
 
 Quanta are **pooled**. `start` takes a retired quantum's state from a bounded pool and `retire` gives it back,
-as the graph's frames go back to theirs, so after warm-up a quantum allocates nothing and takes no lock. (A stage
+as the graph's frames go back to theirs, so after warm-up a quantum allocates nothing and takes no lock of its own. (A stage
 that returns a host completion allocates it; a retried stage and a completion that waits for both a marker and a
 host completion allocate their wake-ups.) `start` takes its external edges as any iterator of `ExternalEdge`s, so
 an array or an `Option` needs no `Vec`.

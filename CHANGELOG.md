@@ -3,10 +3,10 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
-## A stage graph's quantum takes no lock and allocates nothing after warm-up (2026-11-03)
+## A stage graph's quantum takes no lock of its own and allocates nothing after warm-up (2026-11-03)
 
-**What.** `StageGraph`'s per-quantum path no longer takes a lock (the `HOT-FIX` ids G10 to G15 are gone) and no longer allocates once
-warmed up. A quantum is a pooled run, taken by `start` and given back by `retire`; the graph's frames are one pooled type. `start` takes
+**What.** `StageGraph`'s per-quantum path no longer takes a lock of its own (the `HOT-FIX` ids G10 to G15 are gone) and no longer allocates once
+warmed up. The pools of runs and frames are bounded multi-consumer queues, whose consumer side is a try-claim; a take retries it instead of waiting. A quantum is a pooled run, taken by `start` and given back by `retire`; the graph's frames are one pooled type. `start` takes
 its external edges as any `IntoIterator<Item = ExternalEdge>` (a `Vec` still works; an array or an `Option` needs none). `QuantumRef` is
 unchanged to use.
 
@@ -25,27 +25,38 @@ a `FrameManager`-style pool (a bounded multi-consumer queue: `FrameManager::get`
   without it (`StageFrame.externals`, `SUBMITTED`, `SWEPT`). New: `take_all::TakeAllStack`, intrusive over the later quantum's pooled edge
   records, so a push allocates nothing.
 - G14 `boundary: Mutex<BoundarySet>` becomes the used-lane mask and the latest marker value per lane (`StageGraph.usedLanes`); the boundary is
-  armed as one `Completions` edge per lane, and the last one retires the quantum. A host completion no edge consumed holds a live count until
+  armed as one `Completions` edge per lane, and the last one retires the quantum. A host completion holds a live count until
   it is ready (`deferral`), so the boundary needs no host list.
 - G15 `pins: Mutex<Vec<(StageId, QuantumRef)>>` becomes the pin in each external-edge record, taken by the stage that used it or by the quiesce
   (`externalIn`, `firstSlot`: fixed slots, each holding a live count).
 
 **Semantics.**
-- Quanta, frames, markers and edge records are pooled. A full pool drops what comes back; a take that finds another taker active makes a
-  new one. A stage that returns a host completion allocates it; a retried stage, and a completion that waits for both a marker and a
-  host completion, allocate their wake-ups.
+- Quanta, frames, markers and edge records are pooled. A full pool drops what comes back. A take polls the queue again for as long as it holds
+  anything (up to 65536 polls), so a lost race for the consumer claim, or a head that is claimed and not yet published, costs a retry and not a new
+  object; a new one is made when the pool is empty. The pool therefore grows to the number of objects in flight at once and no further (with 8
+  workers a single poll made a new frame for about one take in eight). A stage that returns a host completion allocates it; a retried stage,
+  and a completion that waits for both a marker and a host completion, allocate their wake-ups.
 - The boundary is armed as one edge per used lane, not one edge over all of them: a retirement frame no longer travels through the stage
   sink when the quantum used a lane (the last lane's arrival retires it in place); a quantum that used none still offers its retirement frame to
   the sink.
-- A host completion that no completion edge consumes now holds the quantum live (as in Java), so the quantum quiesces, and abandons its
-  unrun stages, after it. Before, it only delayed the retirement.
-- The boundary edges are `Completions::after_marker` registrations, so a `Completions` dropped while a lane has not reached a quantum's marker
-  leaks the registration (as it does for any marker registration) rather than concluding the quantum: its resources are not released
-  while the device may still use them.
+- A host completion holds the quantum live (as in Java's deferral), whether or not a completion edge consumes it, and also when the quantum
+  halted (killed or failed) or the stage failed on a foreign marker. The quantum quiesces, and abandons its stages that did not submit, after it.
+  Before, a host completion only delayed the retirement, and one that fed a completion edge was dropped when the quantum had halted.
+- **`Stage::abandoned` is for every stage that did not submit** (Java `!submitted`): also one that ran and failed or panicked, and not only
+  those that never ran. Before, a stage that ran and failed was never abandoned.
+- **Completions that wait on a marker are `Completions::after_marker` registrations**: the quantum's boundary (one per used lane), a stage's
+  completion edge whose work has a marker and no host completion, and an external completion edge (one per marker). A `Completions` that is
+  dropped while the lane has not reached such a marker leaks the registration, as it does for any marker registration, and the quantum it
+  belongs to never retires: its `retire` does not run and `live()` does not return to zero. That is reachable at shutdown, or when the
+  completions source is dropped while quanta are in flight, and is safer than concluding the quantum while the device may still use what it
+  holds. (A completion that waits for a host completion, or for both, is a `Completions::after` registration as before, and is finished
+  when the source is dropped.)
 - A stage whose marker names a queue that is no lane of the pool fails the quantum (`StageError::Fatal`); the boundary could never reach it.
-- **Drift from Java fixed.** An external edge into a stage that never ran (its quantum was killed or failed first) now passes the edge's
-  markers on: the quantum's boundary takes them over, so a quantum released onto it still follows the quanta before it (Java `awaitExternals`).
-  Before, a later quantum named through a killed quantum lost the order of the one before.
+  A later quantum of another graph on a pool with other lanes, which pins an earlier quantum, adds its markers to the earlier quantum's
+  boundary only if they are lanes of the earlier pool.
+- **Drift from Java fixed.** The quantum's boundary takes over the markers of all its external edges, whatever became of their stages (Java
+  `awaitExternals` joins every slot to the home lane): a quantum released onto one whose stage was killed, failed or ran on the CPU still
+  follows the quanta before it. Before, a later quantum named through a killed quantum lost the order of the one before.
 
 **Tests.** `stage_graph::tests`: `the_first_failure_wins_among_8_failing_stages`, `a_kill_after_a_failure_keeps_the_failure_and_a_failure_after_a_kill_keeps_the_kill`,
 `a_diamond_on_8_workers_runs_the_join_with_every_input`, `subscriptions_before_during_and_after_publication_each_arrive_once`,
@@ -55,8 +66,12 @@ a `FrameManager`-style pool (a bounded multi-consumer queue: `FrameManager::get`
 `repeated_quanta_reuse_the_pooled_run_and_frames_and_reset_readiness` (`StageGraphTest.repeatedQuantaReuseTheSameGraphFramesAndResetReadiness`),
 `a_rebound_run_starts_with_clean_stacks_and_markers`, `quanta_started_on_four_threads_retire_once_each_while_the_pool_serves_them`
 (`StageGraphReuseTest.concurrentFinishersRecycleGraphsForLaterQuanta`), `a_quantum_may_start_the_next_from_its_retire_callback`;
+`a_failed_middle_stage_passes_the_earlier_order_on`, `a_cpu_middle_stage_passes_the_earlier_order_on`, `a_halted_quantum_keeps_a_host_completion_that_feeds_a_completion_edge`,
+`a_stage_that_fails_on_a_foreign_marker_keeps_its_host_completion`, `a_later_quantum_on_another_lane_pool_is_left_out_of_the_boundary`,
+`a_stage_that_ran_and_failed_is_abandoned_with_the_stages_behind_it`;
 `take_all` (pushes racing a seal, and the loom model `loom_two_pushes_and_a_seal_account_for_every_node_once`);
 `euhedral-graph/tests/stage_graph_alloc.rs` (3000 quanta of 4 stages over two lanes, each with an external edge, allocate 0 times after warm-up);
+`euhedral-graph/tests/stage_graph_alloc_threads.rs` (12800 quanta run by 8 workers: at most the frames in flight at once are made after warm-up; 0 to 15 allocations observed, against about 78000 when a take polled the queue once);
 `euhedral-core/tests/hot_fix_ratchet.rs` (the six ids are removed from `HOT_FIX_TAGS`, and `the_stage_graph_path_names_no_lock_and_carries_no_hot_fix_tag`).
 
 ## A worker that sits out still enters a handle every probe interval (2026-11-03)

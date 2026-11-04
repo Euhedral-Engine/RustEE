@@ -2,7 +2,8 @@
 //! (the upstream Java `StageGraph`).
 //!
 //! A started quantum is a pooled [`Run`]: the state of one quantum, recycled when the quantum retires, as the graph's
-//! frames are recycled through their pool. After warm-up a quantum allocates nothing and takes no lock:
+//! frames are recycled through their pool. After warm-up a quantum allocates nothing and takes no lock of its own (the
+//! pools are queues whose consumer claim is a try-claim, retried and never waited on):
 //!
 //! - **The quantum, the cause, the markers** are plain fields of the run, handed from one stage to the next by the
 //!   counts that order the run's phases (the Java fields written before a volatile count and read after it).
@@ -213,7 +214,8 @@ pub struct StageCx<'a> {
 pub trait Stage<Q>: Send + Sync {
     fn run(&self, quantum: &Q, cx: &StageCx<'_>) -> Result<Submitted, StageError>;
 
-    /// The quantum ended (killed, or a predecessor failed) before this stage ran.
+    /// The quantum ended without this stage submitting: it never ran (the quantum was killed, or a predecessor failed),
+    /// or it ran and failed. Called once, at the quantum's boundary, in stage order.
     fn abandoned(&self, quantum: &Q) {
         let _ = quantum;
     }
@@ -271,9 +273,9 @@ impl fmt::Debug for QuantumRef {
 /// edge: `to_stage` waits for its markers on the device) or once those markers are reached (a
 /// [`Completion`](EdgeKind::Completion) edge; a host completion of `from_stage` is not shared). If
 /// `from_stage` will never run (its quantum was killed or failed), the edge arrives anyway, with
-/// every marker that quantum submitted, and those its own external edges brought into stages that
-/// never ran (so the order of the quanta before it is kept). The earlier quantum stays pinned until `to_stage` has
-/// submitted (its marker joins the earlier quantum's retirement boundary) or been abandoned.
+/// every marker that quantum submitted, and those its own external edges brought (so the order of the quanta before it
+/// is kept). The earlier quantum stays pinned until `to_stage` has submitted (its marker joins the earlier quantum's
+/// retirement boundary) or been abandoned.
 #[derive(Clone, Debug)]
 pub struct ExternalEdge {
     pub from: QuantumRef,
@@ -325,7 +327,8 @@ impl std::error::Error for GraphError {}
 /// - **A quantum is pooled.** `start` takes a retired quantum's state from the graph's pool (a
 ///   bounded queue) and `retire` gives it back, as frames go back to theirs; the stage, arrival,
 ///   boundary and retirement frames are pooled the same way. After warm-up, a quantum allocates
-///   nothing and takes no lock on its way. A stage that returns a host completion allocates it, and
+///   nothing and takes no lock of its own on its way (a take from a pool retries the queue's try-claim; it
+///   never waits). A stage that returns a host completion allocates it, and
 ///   a completion that waits for both a marker and a host completion, or a retried stage, allocates
 ///   its wake-up.
 ///
@@ -341,9 +344,8 @@ impl std::error::Error for GraphError {}
 ///   (CPU-only) passes its inputs on, so device order is kept through it.
 /// - **The boundary** is the latest marker per lane of everything the quantum submitted (plus the
 ///   markers of later quanta's stages that used it through external edges, and those of external
-///   edges into stages that never ran). It is armed as one completion per lane used. A host
-///   completion no completion edge consumed holds the quantum live until it is ready, so the
-///   quantum retires after it.
+///   edges, whatever became of their stages). It is armed as one completion per lane used. A host
+///   completion holds the quantum live until it is ready, so the quantum retires after it.
 /// - **The outcome** is the first of: a stage's failure (an `Err`, or a panic as
 ///   [`StageError::Fatal`]), or the kill switch found set before a stage or edge ran. Otherwise it
 ///   is [`QuantumOutcome::Completed`].
@@ -562,9 +564,13 @@ impl Topology {
 /// A bounded multi-producer, multi-consumer queue, as a [`FrameManager`](euhedral_core::impls::FrameManager) keeps its
 /// returned frames (which cannot serve here: its checkout takes `&mut self`, and a quantum starts and a frame is made
 /// on any thread). An object comes back through a weak handle, so objects in the pool never keep the pool alive; a
-/// full pool drops what comes back, and a take that finds another taker active (the queue's consumer claim is a
-/// `try`, never a wait) makes a new object. Either way the pool is a speed-up: the owner of an object that is gone
-/// makes another.
+/// full pool drops what comes back.
+///
+/// A take polls the queue, whose consumer side is claimed by a try-lock that fails instead of waiting (and that also
+/// finds nothing while the head is claimed by a producer and not yet published). The take polls again for as long as
+/// the queue holds anything, up to [`TAKE_TRIES`] polls, so a lost race costs a retry, not a new object. A take makes
+/// a new object only when the queue is empty, or stays unpollable for `TAKE_TRIES` polls in a row (a producer
+/// descheduled between claiming a place and publishing into it).
 struct Pool<T> {
     consumer: Consumer<T, Multi>,
     producer: Arc<Producer<T, Multi>>,
@@ -580,7 +586,15 @@ impl<T> Pool<T> {
     }
 
     fn take(&self) -> Option<T> {
-        self.consumer.poll()
+        for _ in 0..TAKE_TRIES {
+            if let Some(item) = self.consumer.poll() {
+                return Some(item);
+            }
+            if self.consumer.is_empty() {
+                return None;
+            }
+        }
+        None
     }
 
     /// The handle objects come back through.
@@ -596,6 +610,8 @@ fn give_back<T>(to: &Weak<Producer<T, Multi>>, item: T) {
     }
 }
 
+/// The polls a take makes while the pool holds something it could not take yet.
+const TAKE_TRIES: usize = 1 << 16;
 /// Quanta kept for reuse.
 const POOLED_RUNS: usize = 256;
 /// Frames kept for reuse.
@@ -827,8 +843,9 @@ struct StageRun {
     /// The lane it ran on, or `NO_LANE`: written by the stage, read by the successors that continue its lane after
     /// their final arrival.
     lane: Owned<u32>,
-    /// Whether it ran (and so is not abandoned): written by the thread that owns its frame, read at quiesce.
-    ran: Owned<bool>,
+    /// Whether it submitted (a stage that did not, ran or not, is abandoned): written by the thread that owns its
+    /// frame, read at quiesce.
+    submitted: Owned<bool>,
     /// The markers its successors and the edges on it wait for, once it submitted: the marker it queued, or else the
     /// markers it passed on.
     out: Owned<Vec<Marker>>,
@@ -841,7 +858,7 @@ impl StageRun {
         Self {
             pending: AtomicUsize::new(0),
             lane: Owned::new(NO_LANE),
-            ran: Owned::new(false),
+            submitted: Owned::new(false),
             out: Owned::new(Vec::new()),
             waiters: TakeAllStack::new(),
         }
@@ -1020,7 +1037,7 @@ impl<Q: Send + Sync + 'static> Run<Q> {
             // SAFETY: as above.
             unsafe {
                 state.lane.set(NO_LANE);
-                state.ran.set(false);
+                state.submitted.set(false);
                 state.out.write(Vec::clear);
             }
             state.waiters.reopen();
@@ -1195,11 +1212,10 @@ impl<Q: Send + Sync + 'static> Run<Q> {
         let index = usize::from(stage.0);
         let state = &self.stages[index];
         let topology = &self.core.topology;
-        // SAFETY: this thread owns the stage's frame: `ran` and `lane` are its to write, and every stage it reads
+        // SAFETY: this thread owns the stage's frame: `lane` is its to write, and every stage it reads
         // (its predecessors, and the path predecessor among them) submitted before its final arrival, which ordered
         // their writes before this call.
         let lane = unsafe {
-            state.ran.set(true);
             let spec = &self.core.spec.stages[index];
             let lane = (!spec.lanes.is_empty()).then(|| {
                 let continued = topology.path_predecessor[index]
@@ -1263,6 +1279,11 @@ impl<Q: Send + Sync + 'static> Run<Q> {
                 Some(error) => {
                     self.fail(stage, error);
                     self.release_pins(stage, None);
+                    // Its host completion still holds the quantum live.
+                    if let Some(host) = submitted.completion {
+                        self.live.fetch_add(1, Ordering::AcqRel);
+                        self.completes(stage, None, Some(host));
+                    }
                 }
             },
             Some(Err(StageError::Retry)) if alive => {
@@ -1271,8 +1292,6 @@ impl<Q: Send + Sync + 'static> Run<Q> {
                 return false;
             }
             Some(Err(StageError::Retry)) => {
-                // SAFETY: this thread owns the stage's frame.
-                unsafe { self.stages[usize::from(stage.0)].ran.set(false) };
                 self.note(QuantumOutcome::Killed);
             }
             Some(Err(error)) => {
@@ -1306,8 +1325,6 @@ impl<Q: Send + Sync + 'static> Run<Q> {
     /// A stage frame failed outright (`execute` panicked or returned an error).
     fn stage_errored(self: &Arc<Self>, stage: StageId, error: FrameError) {
         let name = self.core.spec.stages[usize::from(stage.0)].name;
-        // SAFETY: this thread owns the stage's frame.
-        unsafe { self.stages[usize::from(stage.0)].ran.set(true) };
         self.fail(
             stage,
             StageError::Fatal(format!("stage {name} failed: {error}")),
@@ -1318,9 +1335,7 @@ impl<Q: Send + Sync + 'static> Run<Q> {
     /// `stage` answered [`StageError::Retry`]: it runs again on a lane's progress or at the
     /// backstop (its live count is kept).
     fn retry(self: &Arc<Self>, stage: StageId) {
-        // It has not run: a kill while it waits abandons it.
-        // SAFETY: this thread owns the stage's frame.
-        unsafe { self.stages[usize::from(stage.0)].ran.set(false) };
+        // It has not submitted: a kill while it waits abandons it.
         let runtime = &self.core.runtime;
         runtime.retries.retries.fetch_add(1, Ordering::Relaxed);
         let ready = Progress::new(
@@ -1382,6 +1397,7 @@ impl<Q: Send + Sync + 'static> Run<Q> {
         // SAFETY: this thread owns the stage's frame; the readers of `out` come after the seal below, or after the
         // successors' final arrival.
         unsafe {
+            self.stages[index].submitted.set(true);
             self.stages[index].out.write(|out| {
                 out.clear();
                 match marker {
@@ -1400,8 +1416,9 @@ impl<Q: Send + Sync + 'static> Run<Q> {
             if self.kill_set() {
                 self.note(QuantumOutcome::Killed);
             }
-            // A host completion that no edge consumes still holds the retirement back.
-            if !completion_edge && let Some(host) = completion {
+            // A host completion still holds the quantum live, whether or not an edge would consume it (Java's
+            // deferral): its work may still use what the quantum holds.
+            if let Some(host) = completion {
                 self.live.fetch_add(1, Ordering::AcqRel);
                 self.completes(stage, None, Some(host));
             }
@@ -1572,7 +1589,7 @@ impl<Q: Send + Sync + 'static> Run<Q> {
             self.quantum.read(|quantum| {
                 let quantum = quantum.as_ref().expect("a quiescing quantum is bound");
                 for (index, state) in self.stages.iter().enumerate() {
-                    if !state.ran.get() {
+                    if !state.submitted.get() {
                         self.core.stages[index].abandoned(quantum);
                     }
                 }
@@ -1581,26 +1598,24 @@ impl<Q: Send + Sync + 'static> Run<Q> {
         self.clone().release_hold();
     }
 
-    /// A stage that never ran never waited for the markers its external edges brought: the quantum's boundary takes
-    /// them over (Java `awaitExternals`, which joins them to the home lane), so a later quantum released onto this one
-    /// still follows the quanta before it.
+    /// The quantum's boundary takes over the markers its external edges brought (Java `awaitExternals`, which joins
+    /// every slot's marker to the home lane), so a later quantum released onto this one still follows the quanta before
+    /// it. A stage that never submitted (killed, failed, a CPU stage) did not wait for them itself.
     fn take_over_external_waits(&self) {
-        // SAFETY: every stage is done: the slots and their markers are no longer written, and `ran` is final.
+        // SAFETY: every stage is done: the slots and their markers are no longer written.
         let count = unsafe { self.ext.read(|ext| ext.active.len()) };
         for index in 0..count {
             // SAFETY: as above.
             unsafe {
                 self.ext.read(|ext| {
                     let slot = &ext.active[index];
-                    if !self.stages[usize::from(slot.to_stage.0)].ran.get() {
-                        slot.markers.read(|markers| {
-                            for &marker in markers {
-                                if self.is_lane_marker(marker) {
-                                    self.record(marker);
-                                }
+                    slot.markers.read(|markers| {
+                        for &marker in markers {
+                            if self.is_lane_marker(marker) {
+                                self.record(marker);
                             }
-                        });
-                    }
+                        }
+                    });
                 });
             }
         }
@@ -1664,7 +1679,10 @@ impl<Q: Send + Sync + 'static> Upstream for Run<Q> {
     }
 
     fn cover(&self, marker: Marker) {
-        self.record(marker);
+        // A later quantum of another graph may run on another pool of lanes; its markers are no lane of this one.
+        if self.is_lane_marker(marker) {
+            self.record(marker);
+        }
     }
 
     fn add_hold(&self) {
@@ -2804,8 +2822,8 @@ mod tests {
         assert_eq!(h.ran(1), [0, 1]);
         assert_eq!(
             h.abandoned(1),
-            [2, 3],
-            "the stages that never ran are abandoned, in order"
+            [1, 2, 3],
+            "the stages that never submitted are abandoned, in order: the one that failed, and those behind it"
         );
         assert!(
             h.retired(1).is_empty(),
@@ -2844,8 +2862,8 @@ mod tests {
         );
         assert_eq!(
             h.abandoned(1),
-            [1],
-            "a stage that panicked ran; its successor did not"
+            [0, 1],
+            "a stage that panicked never submitted: it is abandoned with its successor"
         );
     }
 
@@ -2870,9 +2888,9 @@ mod tests {
         let _ = graph.start(1, alive(), Vec::new());
         h.pump();
         assert!(!h.ran(1).contains(&3), "the join never runs");
-        // The failure stops the quantum: the other branch, published but not yet run, is abandoned
-        // too.
-        assert_eq!(h.abandoned(1), [2, 3]);
+        // The failure stops the quantum: the failed stage, and the other branch, published but not yet run, are
+        // abandoned (Java abandons every stage that never submitted).
+        assert_eq!(h.abandoned(1), [1, 2, 3]);
         assert_eq!(h.retired(1).len(), 1);
     }
 
@@ -3626,7 +3644,7 @@ mod tests {
         assert_eq!(h.abandoned(1), [], "the quantum has not quiesced");
         token.0.store(true, Ordering::Release);
         h.pump();
-        assert_eq!(h.abandoned(1), [2]);
+        assert_eq!(h.abandoned(1), [1, 2]);
         assert!(matches!(
             &h.retired(1)[..],
             [QuantumOutcome::Failed {
@@ -3798,5 +3816,219 @@ mod tests {
             assert_eq!(h.retired(q), [QuantumOutcome::Completed], "quantum {q}");
         }
         assert_eq!(built.live(), 0);
+    }
+
+    /// Java `awaitExternals` joins every external slot's marker at quiesce: a middle quantum whose stage ran and
+    /// failed (so it never waited on the device for its external markers) still passes the earlier order on.
+    #[test]
+    fn a_failed_middle_stage_passes_the_earlier_order_on() {
+        let h = Harness::new(2);
+        let first = h.graph(&[(None, &[0], Act::Submit)], &[]);
+        let middle = h.graph(&[(None, &[1], Act::Fail)], &[]);
+        let last = h.graph(&[(None, &[1], Act::Submit)], &[]);
+        let a = first.start(1, alive(), Vec::new());
+        let edge = |from: QuantumRef| ExternalEdge {
+            from,
+            from_stage: StageId(0),
+            to_stage: StageId(0),
+            kind: Submission,
+        };
+        let b = middle.start(2, alive(), vec![edge(a)]);
+        let _ = last.start(3, alive(), vec![edge(b)]);
+        h.pump();
+        assert_eq!(h.ran(2), [0], "the middle stage ran (and failed)");
+        assert_eq!(
+            h.ran_with(3, 0).unwrap().1,
+            [(0, 1)],
+            "the last follows the first through the failed middle"
+        );
+        h.finish_lanes();
+        h.pump();
+        assert_eq!(h.retired(1), [QuantumOutcome::Completed]);
+        assert_eq!(h.retired(3), [QuantumOutcome::Completed]);
+    }
+
+    /// The same for a CPU-only middle stage: it submits no marker and waits for none.
+    #[test]
+    fn a_cpu_middle_stage_passes_the_earlier_order_on() {
+        let h = Harness::new(2);
+        let first = h.graph(&[(None, &[0], Act::Submit)], &[]);
+        let middle = h.graph(&[(None, &[], Act::Cpu)], &[]);
+        let last = h.graph(&[(None, &[1], Act::Submit)], &[]);
+        let a = first.start(1, alive(), Vec::new());
+        let edge = |from: QuantumRef| ExternalEdge {
+            from,
+            from_stage: StageId(0),
+            to_stage: StageId(0),
+            kind: Submission,
+        };
+        let b = middle.start(2, alive(), vec![edge(a)]);
+        let _ = last.start(3, alive(), vec![edge(b)]);
+        h.pump();
+        assert_eq!(h.ran_with(3, 0).unwrap().1, [(0, 1)]);
+    }
+
+    /// A stage that sets its own quantum's kill switch while it runs, then returns a host completion and has a
+    /// completion-edge successor: Java's deferral keeps the quantum live until the host work ends.
+    struct KillsThenDefers {
+        kill: Arc<AtomicBool>,
+        token: Token,
+        log: Log,
+    }
+
+    impl Stage<u64> for KillsThenDefers {
+        fn run(&self, q: &u64, cx: &StageCx<'_>) -> Result<Submitted, StageError> {
+            lock(&self.log).push(Event::Ran {
+                q: *q,
+                stage: cx.stage.0,
+                lane: None,
+                waits: Vec::new(),
+            });
+            self.kill.store(true, Ordering::Release);
+            Ok(Submitted {
+                marker: None,
+                completion: Some(Box::new(self.token.clone())),
+            })
+        }
+    }
+
+    #[test]
+    fn a_halted_quantum_keeps_a_host_completion_that_feeds_a_completion_edge() {
+        let h = Harness::new(1);
+        let kill = alive();
+        let token = Token::default();
+        let mut spec = StageGraphSpec::new();
+        for _ in 0..2 {
+            spec.stage(StageSpec {
+                name: "probe",
+                ordered: None,
+                lanes: Vec::new(),
+            });
+        }
+        spec.edge(StageId(0), StageId(1), EdgeKind::Completion);
+        let log = h.log.clone();
+        let stages: Vec<Arc<dyn Stage<u64>>> = vec![
+            Arc::new(KillsThenDefers {
+                kill: kill.clone(),
+                token: token.clone(),
+                log: h.log.clone(),
+            }),
+            Arc::new(Named(
+                1,
+                Probe {
+                    act: Act::Cpu,
+                    log: h.log.clone(),
+                    hands: h.hands.clone(),
+                },
+            )),
+        ];
+        let graph = StageGraph::new(spec, stages, h.runtime.clone(), move |q, outcome| {
+            lock(&log).push(Event::Retired { q, outcome });
+        })
+        .unwrap();
+        let _ = graph.start(1, kill, Vec::new());
+        h.pump();
+        assert_eq!(h.ran(1), [0]);
+        assert!(
+            h.retired(1).is_empty(),
+            "the host completion is not ready: the quantum must not retire yet"
+        );
+        assert_eq!(h.abandoned(1), [], "nor quiesce");
+        token.0.store(true, Ordering::Release);
+        h.pump();
+        assert_eq!(h.ran(1), [0], "nothing runs past a killed quantum");
+        assert_eq!(h.retired(1), [QuantumOutcome::Killed]);
+        assert_eq!(h.abandoned(1), [1]);
+    }
+
+    /// A stage that returns a marker of a queue that is no lane of the pool, with a host completion.
+    struct ForeignWithHost(Token);
+
+    impl Stage<u64> for ForeignWithHost {
+        fn run(&self, _: &u64, _: &StageCx<'_>) -> Result<Submitted, StageError> {
+            Ok(Submitted {
+                marker: Some(Marker::new(QueueId::next(), LaneId(0), 1)),
+                completion: Some(Box::new(self.0.clone())),
+            })
+        }
+    }
+
+    #[test]
+    fn a_stage_that_fails_on_a_foreign_marker_keeps_its_host_completion() {
+        let h = Harness::new(1);
+        let token = Token::default();
+        let mut spec = StageGraphSpec::new();
+        spec.stage(StageSpec {
+            name: "foreign",
+            ordered: None,
+            lanes: Vec::new(),
+        });
+        let log = h.log.clone();
+        let graph = StageGraph::new(
+            spec,
+            vec![Arc::new(ForeignWithHost(token.clone())) as Arc<dyn Stage<u64>>],
+            h.runtime.clone(),
+            move |q, outcome| lock(&log).push(Event::Retired { q, outcome }),
+        )
+        .unwrap();
+        let _ = graph.start(1, alive(), Vec::new());
+        h.pump();
+        assert!(
+            h.retired(1).is_empty(),
+            "the host completion still holds the quantum"
+        );
+        token.0.store(true, Ordering::Release);
+        h.pump();
+        assert!(matches!(
+            &h.retired(1)[..],
+            [QuantumOutcome::Failed {
+                error: StageError::Fatal(_),
+                ..
+            }]
+        ));
+    }
+
+    /// A later quantum of a graph on a wider lane pool pins an earlier one: its marker is no lane of the earlier pool,
+    /// and the earlier quantum's boundary leaves it out instead of indexing past its lanes.
+    #[test]
+    fn a_later_quantum_on_another_lane_pool_is_left_out_of_the_boundary() {
+        let small = Harness::new(1);
+        let big = Harness::new(2);
+        let earlier = small.graph(&[(None, &[0], Act::Submit)], &[]);
+        let later = big.graph(&[(None, &[1], Act::Submit)], &[]);
+        let a = earlier.start(1, alive(), Vec::new());
+        let edge = ExternalEdge {
+            from: a,
+            from_stage: StageId(0),
+            to_stage: StageId(0),
+            kind: Submission,
+        };
+        let _ = later.start(2, alive(), vec![edge]);
+        small.pump();
+        big.pump();
+        small.finish_lanes();
+        big.finish_lanes();
+        small.pump();
+        big.pump();
+        assert_eq!(small.retired(1), [QuantumOutcome::Completed]);
+        assert_eq!(big.retired(2), [QuantumOutcome::Completed]);
+    }
+
+    /// Java `abandoned` is for every stage that never submitted: also one that ran and failed, or panicked.
+    #[test]
+    fn a_stage_that_ran_and_failed_is_abandoned_with_the_stages_behind_it() {
+        let h = Harness::new(1);
+        let graph = h.graph(
+            &[
+                (None, &[], Act::Cpu),
+                (None, &[], Act::Fail),
+                (None, &[], Act::Cpu),
+            ],
+            &[(0, 1, Submission), (1, 2, Submission)],
+        );
+        let _ = graph.start(1, alive(), Vec::new());
+        h.pump();
+        assert_eq!(h.ran(1), [0, 1]);
+        assert_eq!(h.abandoned(1), [1, 2], "the failed stage never submitted");
     }
 }

@@ -54,8 +54,8 @@ pub(crate) use loom::cell::UnsafeCell;
 pub(crate) struct Owned<T>(UnsafeCell<T>);
 
 // SAFETY: the cell hands its value to one thread at a time through accesses whose safety contracts name the ordering
-// that does so; the value moves between threads, so it must be `Send`.
-unsafe impl<T: Send> Sync for Owned<T> {}
+// that does so; the value moves between threads, so it must be `Send`, and `read` lets threads share it, so `Sync`.
+unsafe impl<T: Send + Sync> Sync for Owned<T> {}
 // SAFETY: the value is sent with the cell.
 unsafe impl<T: Send> Send for Owned<T> {}
 
