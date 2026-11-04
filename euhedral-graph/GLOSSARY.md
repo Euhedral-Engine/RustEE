@@ -103,6 +103,8 @@ nothing is claimed.
 
 **stage gate** ([`Stage::pass_gate`, `Gate`](src/stage_graph.rs)): Java `StageFrame.passGate`/`releaseGate`. When a stage's last incoming edge arrives it is asked whether it may be published now; a stage that holds itself takes a `Gate` and the thing it waits for releases it, once, from any thread that may publish frames. The held stage keeps the quantum live; a gate that fails, panics or is dropped unreleased fails the quantum and drops the count.
 
+**hold from run** ([`StageCx::hold`, `StageError::Held`](src/stage_graph.rs)): a stage holds itself at its gate from inside `run`, when it finds there that what it needs is not ready. It takes the gate with `cx.hold()` and answers `Held`; the release runs it again exactly once. A release that comes before `run` returns publishes the stage when `run` returns, never beside it. It registers nothing with the completions, so it is no retry and allocates nothing.
+
 **abandoned hook** ([`Stage::abandoned`](src/stage_graph.rs)): Java `abandoned(home)`. Once per stage that never submitted, in stage order, at the quantum's quiesce: after the other lanes joined the home lane, before later quanta waiting on its stages are released and before the retirement is armed on home, with the home lane.
 
 **retired hook** ([`Stage::retired`](src/stage_graph.rs)): Java `StageFrame.retired`. Once per stage that was attempted,
