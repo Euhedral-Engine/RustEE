@@ -29,6 +29,13 @@
 //! leaving the lattice with nothing to poll. The next unit attaches a fresh set.
 //! [`Duration::ZERO`] as the idle time keeps the sinks attached.
 //!
+//! **The watch only looks; a frame detaches.** The watch's `request` and `pull` read two atomics (the
+//! unit count, and when it last reached zero) and push nothing while the lake is busy. When the lake has
+//! been idle for the idle time, the call pushes the watch's one key frame, and the worker that runs it
+//! detaches the set (taking the attach lock, completing the sinks), where its cost is measured like any
+//! other frame's. (Both calls look: an idle lattice calls `pull` on a handle far more often than `request`.) A frame that finds the lake busy again leaves the set alone and goes home, and the
+//! watch pushes it again at the next idle time.
+//!
 //! **The hot side is lock-free** (Java's volatile `generation`): the attached set is a cell of the lattice's registry,
 //! so [`Lake::offer`] and [`Lake::admit`] read it from the calling thread's view with no lock. A producer thread gets a
 //! light view on its first call and upgrades a weak reference for the length of each call (one reference-count update);
@@ -47,8 +54,8 @@ use std::time::{Duration, Instant};
 use euhedral_core::control_plane::{ControlPlaneLattice, LatticeError};
 use euhedral_core::flow_control::Cell;
 use euhedral_core::flow_control::UpstreamRegistry;
-use euhedral_core::frames::Frame;
-use euhedral_core::generics::{DownstreamSlot, FrameSink, LatticeReceiver, LatticeSource};
+use euhedral_core::frames::{Frame, FrameError, FrameHeader};
+use euhedral_core::generics::{DownstreamSlot, FrameSink, KeySlot, LatticeReceiver, LatticeSource};
 use euhedral_core::ingest::{IngestSink, QueueIngestSink};
 use euhedral_core::utils::math::unsigned_multiply_high;
 use euhedral_data_structures::sync::{HotScope, LifecycleMutex};
@@ -405,13 +412,12 @@ impl Lake {
                 .map(|_| QueueIngestSink::new())
                 .collect(),
             watch: (!self.idle_release.is_zero()).then(|| {
-                Arc::new(IdleWatch {
-                    lake: self.this.clone(),
-                    admission: self.admission.clone(),
-                    idle: self.idle_release,
-                    generation: id,
-                    downstream: DownstreamSlot::new(),
-                })
+                IdleWatch::new(
+                    self.this.clone(),
+                    self.admission.clone(),
+                    self.idle_release,
+                    id,
+                )
             }),
         }
     }
@@ -500,6 +506,21 @@ impl Drop for Lake {
     }
 }
 
+#[cfg(feature = "testing")]
+impl Lake {
+    /// An idle watch of the set attached now, with its own downstream and the idle time `idle`, for a test to
+    /// drive by hand (the watch the lake attaches to its lattice is not reachable). `None` while no set is attached.
+    pub fn idle_watch_by_hand(&self, idle: Duration) -> Option<Arc<dyn LatticeSource>> {
+        let generation = self.current.lock().as_ref()?.id;
+        Some(IdleWatch::new(
+            self.this.clone(),
+            self.admission.clone(),
+            idle,
+            generation,
+        ))
+    }
+}
+
 impl FrameSink for Lake {
     fn offer(&self, frame: Box<dyn Frame>) -> Result<(), Box<dyn Frame>> {
         Lake::offer(self, frame)
@@ -547,7 +568,8 @@ enum Attempt {
     Refused(Box<dyn Frame>, u64),
 }
 
-/// A source the workers poll beside the sinks: it notices that the lake has been idle long enough.
+/// A source the workers poll beside the sinks: it notices that the lake has been idle long enough, and
+/// then pushes the frame that detaches the set.
 struct IdleWatch {
     lake: Weak<Lake>,
     admission: Arc<Admission>,
@@ -555,17 +577,96 @@ struct IdleWatch {
     generation: u64,
     /// Java's idle watch is an ingest delegate: the downstream is installed once and completed once.
     downstream: DownstreamSlot,
+    /// The frame that detaches the set, while it is home.
+    detach: KeySlot<DetachFrame>,
 }
 
 impl IdleWatch {
-    /// One look at the lake: two atomic loads while it is busy.
-    fn poll(&self) {
+    fn new(
+        lake: Weak<Lake>,
+        admission: Arc<Admission>,
+        idle: Duration,
+        generation: u64,
+    ) -> Arc<Self> {
+        Arc::new_cyclic(|me| Self {
+            lake,
+            admission,
+            idle,
+            generation,
+            downstream: DownstreamSlot::new(),
+            detach: KeySlot::with_key(DetachFrame::new(me.clone())),
+        })
+    }
+
+    /// Pushes the detach frame when the lake has been idle for the idle time and the frame is home. The
+    /// look is two atomic loads while the lake is busy; it detaches nothing itself.
+    fn push_detach(&self) {
         if self.downstream.is_complete() || !self.admission.idle_for(self.idle) {
             return;
         }
-        match self.lake.upgrade() {
-            Some(lake) => lake.detach(self.generation),
-            None => self.complete(),
+        let Some(receiver) = self.downstream.receiver() else {
+            return;
+        };
+        let Some(frame) = self.detach.take() else {
+            return;
+        };
+        receiver.push(frame);
+    }
+}
+
+/// The key frame of an [`IdleWatch`]: its `execute` detaches the set, if the lake is still idle.
+struct DetachFrame {
+    header: FrameHeader,
+    watch: Weak<IdleWatch>,
+}
+
+impl DetachFrame {
+    fn new(watch: Weak<IdleWatch>) -> Box<Self> {
+        Box::new(Self {
+            header: FrameHeader::new(0x9e37_79b9_7f4a_7c15),
+            watch,
+        })
+    }
+}
+
+impl Frame for DetachFrame {
+    fn header(&self) -> &FrameHeader {
+        &self.header
+    }
+
+    fn header_mut(&mut self) -> &mut FrameHeader {
+        &mut self.header
+    }
+
+    fn execute(&mut self) -> Result<(), FrameError> {
+        let Some(watch) = self.watch.upgrade() else {
+            return Ok(());
+        };
+        match watch.lake.upgrade() {
+            // A unit admitted since the watch looked keeps the set: `detach` looks again under the lock.
+            Some(lake) => lake.detach(watch.generation),
+            None => watch.complete(),
+        }
+        Ok(())
+    }
+
+    /// The frame goes home, so that a lake that was busy again is detached at its next idle time. (A set
+    /// that was detached has completed its watch, which asks for nothing more.)
+    fn recycle(self: Box<Self>) {
+        if let Some(watch) = self.watch.upgrade() {
+            watch.detach.home(self);
+        }
+    }
+}
+
+impl Drop for DetachFrame {
+    /// A frame that is dropped without having run (a lattice that discarded it) must not leave the lake
+    /// attached for good: a new one goes home. A frame that is homed does not get here.
+    fn drop(&mut self) {
+        if let Some(watch) = self.watch.upgrade()
+            && !watch.detach.is_home()
+        {
+            watch.detach.home(DetachFrame::new(self.watch.clone()));
         }
     }
 }
@@ -576,19 +677,21 @@ impl LatticeSource for IdleWatch {
         self.downstream.attach(source, downstream);
     }
 
-    /// It holds no frames; a pull is the worker's poll.
+    /// It holds no frames to hand over: it looks at the lake (two atomic loads while it is busy) and, once it has
+    /// been idle for the idle time, pushes the frame that detaches the set.
     fn pull(
         &self,
         _consumer: &mut dyn FnMut(Box<dyn Frame>),
         _stop: &mut dyn FnMut(&dyn Frame) -> bool,
         _demand: u64,
     ) -> u64 {
-        self.poll();
+        self.push_detach();
         0
     }
 
+    /// As [`pull`](Self::pull): looks, and pushes the frame that detaches the set once the lake is idle.
     fn request(&self, _demand: u64) {
-        self.poll();
+        self.push_detach();
     }
 
     fn complete(&self) {
