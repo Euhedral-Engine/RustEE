@@ -15,6 +15,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use euhedral_core::frames::{Frame, FrameError};
 use euhedral_core::generics::FrameSink;
@@ -170,11 +171,18 @@ impl Releaser {
 
     /// Has the thread release the parked gate, and returns once it has.
     fn release(&self) {
-        let thread = self.thread.as_ref().expect("running").thread();
+        let handle = self.thread.as_ref().expect("running");
         self.done.store(false, Ordering::Relaxed);
         self.go.store(true, Ordering::Release);
-        thread.unpark();
+        handle.thread().unpark();
+        // A releaser that panicked ends its thread: the test fails instead of waiting for ever.
+        let deadline = Instant::now() + Duration::from_secs(30);
         while !self.done.load(Ordering::Acquire) {
+            assert!(!handle.is_finished(), "the releaser thread ended");
+            assert!(
+                Instant::now() < deadline,
+                "the releaser did not release in time"
+            );
             std::hint::spin_loop();
         }
     }

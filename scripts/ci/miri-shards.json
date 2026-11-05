@@ -167,7 +167,7 @@
   "name": "graph: gates taken in run (1)",
   "crate": "euhedral-graph",
   "commands": [
-   "cargo +nightly miri test -p euhedral-graph --lib -- stage_graph::tests::a_gate_taken_in_run_holds stage_graph::tests::a_gate_taken_in_run_and_released_before stage_graph::tests::a_gate_taken_in_run_may stage_graph::tests::a_gate_taken_in_run_that_ stage_graph::tests::a_gate_taken_in_run_and_released_after stage_graph::tests::a_gate_taken_in_run_by_a_stage_that_killed stage_graph::tests::a_gate_taken_in_run_and_dropped stage_graph::tests::a_gate_released_by stage_graph::tests::a_gate_never"
+   "cargo +nightly miri test -p euhedral-graph --lib -- stage_graph::tests::a_gate_taken_in_run_holds stage_graph::tests::a_gate_taken_in_run_and_released_before stage_graph::tests::a_gate_taken_in_run_may stage_graph::tests::a_gate_taken_in_run_that_ stage_graph::tests::a_gate_taken_in_run_and_released_after stage_graph::tests::a_gate_taken_in_run_by_a_stage_that_killed stage_graph::tests::a_gate_released_by stage_graph::tests::a_gate_never"
   ]
  },
  {
@@ -182,6 +182,13 @@
   "crate": "euhedral-graph",
   "commands": [
    "cargo +nightly miri test -p euhedral-graph --lib -- stage_graph::tests::a_gate_taken_in_run_by_four_stages stage_graph::tests::a_gate_taken_in_run_released_by_a_racing"
+  ]
+ },
+ {
+  "name": "graph: gates after a kill, retries",
+  "crate": "euhedral-graph",
+  "commands": [
+   "cargo +nightly miri test -p euhedral-graph --lib -- stage_graph::tests::a_gate_taken_in_run_and_spent stage_graph::tests::a_gate_taken_in_run_with_ok stage_graph::tests::a_gate_failed_with stage_graph::tests::a_gate_taken_in_pass_gate stage_graph::tests::a_retry_wake stage_graph::tests::a_kill_while_a_retry_waits completions::tests::a_kept_wake"
   ]
  },
  {

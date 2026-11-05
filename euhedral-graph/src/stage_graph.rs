@@ -138,8 +138,9 @@ impl Submitted {
     }
 }
 
-/// Why a stage failed. The quantum then ends with [`QuantumOutcome::Failed`]: its later stages get
-/// [`Stage::abandoned`], and it still retires.
+/// What a stage's run answers when it does not submit. `Corrupt` and `Fatal` are failures: the quantum then ends with
+/// [`QuantumOutcome::Failed`], its later stages get [`Stage::abandoned`], and it still retires. `Retry` and `Held` are
+/// no failures: the stage waits and runs again.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StageError {
     /// This quantum's input was bad (a corrupt packet); the next quantum may be fine.
@@ -153,9 +154,9 @@ pub enum StageError {
     /// something a thread of its own makes ready holds itself at a gate instead ([`Held`](Self::Held)): nothing polls.
     Retry,
     /// The stage found, while running, that what it needs does not exist yet, and holds itself at a [`Gate`] it took with
-    /// [`StageCx::hold`]: it runs again, once, when the gate is released. Not a failure, and never the error of a failed
-    /// quantum: answered without a gate taken, or a gate taken and another answer given, it fails the quantum with
-    /// [`StageError::Fatal`]. See [`Stage::run`].
+    /// [`StageCx::hold`]: it runs again, once, when the gate is released. Not a failure: answered without a gate taken,
+    /// or a gate taken and another answer given, it fails the quantum with [`StageError::Fatal`], and so does a
+    /// [`Gate::fail`] given `Held` (or `Retry`). It is never the error of a failed quantum. See [`Stage::run`].
     Held,
 }
 
@@ -292,18 +293,22 @@ pub trait Stage<Q, L: DeviceQueue + ?Sized = dyn DeviceQueue>: Send + Sync {
     ///   only once the gate is spent. Released after a kill or a failure, the stage is published and ends without
     ///   running (the quantum is killed or failed already), and its count is dropped; it is abandoned exactly once, at the
     ///   quantum's boundary, like any stage that never submitted. A holder that learns of a kill releases the gate, fails
-    ///   it or drops it; any of the three is harmless.
+    ///   it or drops it; any of the three is harmless, and with the kill switch set each ends the quantum as
+    ///   [`QuantumOutcome::Killed`] (the kill is noted before the failure of a `fail` or a drop, so it is the first
+    ///   cause).
     /// - **Fail and drop.** [`Gate::fail`] fails the quantum with the given error, as for a gate taken in
     ///   [`pass_gate`](Self::pass_gate): the stage does not run again and the count is dropped. A gate dropped unspent
-    ///   fails the quantum with [`StageError::Fatal`] the same way. Both before `run` returns drop the count when `run`
-    ///   returns.
+    ///   fails the quantum with [`StageError::Fatal`] the same way, and `Held` or `Retry` given to `fail` become
+    ///   `Fatal` (they are no failures). Both before `run` returns drop the count when `run` returns.
     /// - **Retry untouched.** `Held` is no [`StageError::Retry`]: nothing is registered with the completions, and
     ///   [`RetryCounts`] do not move.
     /// - **A stage that breaks the contract fails the quantum.** `Held` answered with no gate taken, a gate taken and
     ///   another answer given (`Ok`, `Retry`; an error stands as the cause), or a second [`StageCx::hold`] in one run
     ///   (a panic): the quantum fails with [`StageError::Fatal`] (a panic in `run` after a gate was taken included), the
     ///   stage does not run again, and the gate it took is still held until its holder spends it: the count stays with
-    ///   it, and spending it is harmless.
+    ///   it, and spending it is harmless. An `Ok` answer's work counts all the same: its marker joins the quantum's
+    ///   boundary and its host completion keeps the quantum live until it is ready, as for a stage that submitted in a
+    ///   quantum that stopped meanwhile.
     fn run(&self, quantum: &Q, cx: &StageCx<'_, L>) -> Result<Submitted, StageError>;
 
     /// Called once per quantum, when the stage's last incoming edge arrived and before it is published (Java
@@ -348,7 +353,7 @@ pub trait Stage<Q, L: DeviceQueue + ?Sized = dyn DeviceQueue>: Send + Sync {
 
 /// What a [`Gate`] releases into: a quantum's run, whatever its types.
 trait GateTarget: Send + Sync {
-    /// Publishes `stage`, held by its gate, once: a gate already spent (released, failed or passed) does nothing. A lake
+    /// Publishes `stage`, held by its gate, once: a gate already spent (released or failed) does nothing. A lake
     /// that no longer takes frames ends the stage in place, so the held count is always dropped.
     fn release_gate(self: Arc<Self>, stage: StageId);
 
@@ -430,9 +435,17 @@ impl Gate {
     }
 
     /// The gate cannot be released because what the stage waits for failed: the quantum fails with `error`, and the held
-    /// stage's count is dropped.
+    /// stage's count is dropped. `Retry` and `Held` are no failures, so a gate failed with either fails the quantum with
+    /// [`StageError::Fatal`]. If the quantum's kill switch is set, the quantum ends as [`QuantumOutcome::Killed`] instead,
+    /// whichever way the gate is spent (release, `fail` or drop).
     pub fn fail(mut self, error: StageError) {
         if let Some((target, stage)) = self.held.take() {
+            let error = match error {
+                StageError::Retry | StageError::Held => StageError::Fatal(format!(
+                    "a gate was failed with {error:?}, which is no failure"
+                )),
+                failure => failure,
+            };
             target.fail_gate(stage, error);
         }
     }
@@ -1174,27 +1187,19 @@ impl StageRun {
     /// The stage's gate is spent, to `to` (`GATE_RELEASED` or `GATE_FAILED`): a stage whose run is still going is left to
     /// that run's end, which then sees `to`.
     ///
-    /// The one exchange is the hand-over with [`run_ended_with_gate`](Self::run_ended_with_gate): of the two parties, the
-    /// second to arrive acts, and sees what the first wrote before it (release on the way in, acquire on the way out).
+    /// One exchange, which is the hand-over with [`run_ended_with_gate`](Self::run_ended_with_gate): of the end of the run
+    /// and the spender, the second to arrive acts, and sees what the first wrote before it (release on the way in,
+    /// acquire on the way out). A gate is spent once (it is moved), so no third party meets the state.
     fn spend_gate(&self, to: u8) -> Spend {
-        match self
-            .gate
-            .compare_exchange(GATE_RUNNING, to, Ordering::Release, Ordering::Acquire)
-        {
-            Ok(_) => Spend::AtRunEnd,
-            // Parked (or never running): a gate is spent once, so a second spender finds it spent.
-            Err(GATE_HELD) => {
-                if self
-                    .gate
-                    .compare_exchange(GATE_HELD, GATE_IDLE, Ordering::Relaxed, Ordering::Relaxed)
-                    .is_ok()
-                {
-                    Spend::Now
-                } else {
-                    Spend::Nothing
-                }
+        match self.gate.swap(to, Ordering::AcqRel) {
+            GATE_RUNNING => Spend::AtRunEnd,
+            // Parked, or taken in `pass_gate`: nothing else acts on a spent gate, and the next to look is the run the stage
+            // is published for.
+            GATE_HELD => {
+                self.gate.store(GATE_IDLE, Ordering::Relaxed);
+                Spend::Now
             }
-            Err(_) => Spend::Nothing,
+            _ => Spend::Nothing,
         }
     }
 
@@ -1767,19 +1772,14 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Run<Q, L> {
         held: bool,
     ) -> bool {
         if held {
-            return self.held_ended(stage, result);
+            return self.held_ended(stage, result, inputs);
         }
         match result {
             Some(Ok(submitted)) => match self.foreign(&submitted) {
                 None => self.submitted(stage, submitted, inputs),
                 Some(error) => {
                     self.fail(stage, error);
-                    self.release_pins(stage, None);
-                    // Its host completion still holds the quantum live.
-                    if let Some(host) = submitted.completion {
-                        self.live.fetch_add(1, Ordering::AcqRel);
-                        self.completes(stage, None, Some(host));
-                    }
+                    self.release_foreign(stage, submitted);
                 }
             },
             Some(Err(StageError::Retry)) if alive => {
@@ -1807,6 +1807,16 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Run<Q, L> {
         true
     }
 
+    /// The failed quantum's stage `stage` answered with a marker that is no lane of the pool: its pins go, and its host
+    /// completion still holds the quantum live.
+    fn release_foreign(self: &Arc<Self>, stage: StageId, submitted: Submitted) {
+        self.release_pins(stage, None);
+        if let Some(host) = submitted.completion {
+            self.live.fetch_add(1, Ordering::AcqRel);
+            self.completes(stage, None, Some(host));
+        }
+    }
+
     /// `stage`'s run took a gate ([`StageCx::hold`]) and ended with `result`. Returns whether its live count is to be
     /// dropped: not when the count is the gate's (the stage is parked, or the gate was released while the run went on and
     /// the stage is published again here).
@@ -1814,18 +1824,31 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Run<Q, L> {
         self: &Arc<Self>,
         stage: StageId,
         result: Option<Result<Submitted, StageError>>,
+        inputs: &[Marker],
     ) -> bool {
-        let broken = match result {
-            Some(Err(StageError::Held)) | None => None,
-            // The stage's own error stands as the cause; the contract it broke is the same.
-            Some(Err(StageError::Retry)) | Some(Ok(_)) => Some(StageError::Fatal(
-                "a stage that took a gate in run did not answer Held".into(),
-            )),
-            Some(Err(error)) => Some(error),
-        };
-        if let Some(error) = broken {
-            self.fail(stage, error);
-            self.release_pins(stage, None);
+        let broke =
+            || StageError::Fatal("a stage that took a gate in run did not answer Held".into());
+        match result {
+            Some(Err(StageError::Held)) | None => {}
+            Some(Err(StageError::Retry)) => {
+                self.fail(stage, broke());
+                self.release_pins(stage, None);
+            }
+            // The stage's own error stands as the cause.
+            Some(Err(error)) => {
+                self.fail(stage, error);
+                self.release_pins(stage, None);
+            }
+            // The quantum fails first, so that the submission below is handled as a stopped quantum's: the stage did
+            // submit, so its marker joins the boundary and its host completion keeps the quantum live until it is ready
+            // (device work and the work a completion polls may still read what the quantum holds).
+            Some(Ok(submitted)) => {
+                self.fail(stage, broke());
+                match self.foreign(&submitted) {
+                    None => self.submitted(stage, submitted, inputs),
+                    Some(_) => self.release_foreign(stage, submitted),
+                }
+            }
         }
         self.gate_after_run(stage)
     }
@@ -1839,7 +1862,12 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Run<Q, L> {
                 self.publish_or_run(stage);
                 false
             }
-            RunEnd::Failed | RunEnd::NoGate => true,
+            RunEnd::Failed => true,
+            RunEnd::NoGate => {
+                // `held` says the run took a gate, and only this end moves the gate out of `GATE_RUNNING` but a spender.
+                debug_assert!(false, "a run that took a gate ended with no gate out");
+                true
+            }
         }
     }
 
@@ -2457,7 +2485,10 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> GateTarget for
 
     fn fail_gate(self: Arc<Self>, stage: StageId, error: StageError) {
         // Noted before the gate is spent: once it is, the end of the run may drop the stage's count, and with the last
-        // count the quantum retires.
+        // count the quantum retires. A killed quantum ends as killed, whichever way its gate is spent.
+        if self.kill_set() {
+            self.note(QuantumOutcome::Killed);
+        }
         self.fail(stage, error);
         if self.stages[usize::from(stage.0)].spend_gate(GATE_FAILED) == Spend::Now {
             self.finish_one();
@@ -2882,22 +2913,30 @@ mod loom_tests {
         });
     }
 
-    // The same for a gate that fails: the party that acts drops the stage's count, once.
+    // The same for a gate that fails: the failer notes the cause before it spends the gate, and the party that acts drops
+    // the stage's count, once. The end of the run that finds the gate failed reads the cause: it sees it whenever it sees
+    // `GATE_FAILED` (so the cause is written before the spend, as `fail_gate` does it).
     #[test]
-    fn loom_the_second_of_a_runs_end_and_its_gates_failure_drops_the_count_once() {
+    fn loom_the_second_of_a_runs_end_and_its_gates_failure_drops_the_count_once_and_sees_the_cause()
+    {
         loom::model(|| {
             let stage = Arc::new(StageRun::new());
+            let cause = Arc::new(Owned::new(0u32));
             let drops = Arc::new(crate::sync::AtomicUsize::new(0));
             stage.gate.store(GATE_RUNNING, Ordering::Relaxed);
             let failer = {
-                let (stage, drops) = (stage.clone(), drops.clone());
+                let (stage, cause, drops) = (stage.clone(), cause.clone(), drops.clone());
                 thread::spawn(move || {
+                    // SAFETY: only this thread writes the cell; the run's end reads it after seeing the failure.
+                    unsafe { cause.write(|c| *c = 5) };
                     if stage.spend_gate(GATE_FAILED) == Spend::Now {
                         drops.fetch_add(1, Ordering::AcqRel);
                     }
                 })
             };
             if stage.run_ended_with_gate() == RunEnd::Failed {
+                // SAFETY: the exchange that found the gate failed follows the failer's write.
+                assert_eq!(unsafe { cause.read(|c| *c) }, 5, "the cause is there");
                 drops.fetch_add(1, Ordering::AcqRel);
             }
             failer.join().unwrap();
@@ -2906,6 +2945,35 @@ mod loom_tests {
                 1,
                 "the count is dropped once"
             );
+        });
+    }
+
+    // The in-run gate is stored with Relaxed, and the gate then reaches the spender by a hand-over of the stage's own
+    // (here a flag stored with Release and loaded with Acquire, as a lock or a channel would): the spender sees the gate
+    // out, so exactly one of the run's end and the spender acts.
+    #[test]
+    fn loom_a_gate_stored_in_run_and_handed_to_another_thread_is_spent_by_exactly_one_party() {
+        loom::model(|| {
+            let stage = Arc::new(StageRun::new());
+            let handed = Arc::new(crate::sync::AtomicBool::new(false));
+            let spender = {
+                let (stage, handed) = (stage.clone(), handed.clone());
+                thread::spawn(move || {
+                    while !handed.load(Ordering::Acquire) {
+                        thread::yield_now();
+                    }
+                    stage.spend_gate(GATE_RELEASED)
+                })
+            };
+            // What `hold_gate_in_run` stores, then the hand-over.
+            stage.gate.store(GATE_RUNNING, Ordering::Relaxed);
+            handed.store(true, Ordering::Release);
+            let ended = stage.run_ended_with_gate();
+            let spent = spender.join().unwrap();
+            match (ended, spent) {
+                (RunEnd::Parked, Spend::Now) | (RunEnd::Released, Spend::AtRunEnd) => {}
+                other => panic!("a gate out in run was spent twice or not at all: {other:?}"),
+            }
         });
     }
 
@@ -4180,6 +4248,56 @@ mod tests {
             (vec![0, 1], 0),
             "20 ms is not the backstop any more"
         );
+    }
+
+    /// Each retry prepares its stage's wake-up again and registers it; it fires once, by a lane's progress or by the
+    /// backstop, and `RetryCounts` say which, exactly. Nothing here depends on the clock (an hour away, or already past),
+    /// so it also runs under Miri.
+    #[test]
+    fn a_retry_wake_is_prepared_again_by_each_retry_and_fires_once_by_progress_or_by_the_backstop()
+    {
+        // Progress only: the backstop is an hour away.
+        let h = Harness::with_backstop(1, Duration::from_secs(3600));
+        let graph = h.graph(
+            &[
+                (None, &[], Act::Cpu),
+                (None, &[], Act::Retry(Arc::new(AtomicU32::new(3)))),
+            ],
+            &[],
+        );
+        let _ = graph.start(1, alive(), Vec::new());
+        h.pump();
+        assert_eq!(h.ran(1), [0, 1], "the retried stage waits");
+        for round in 1..=3u64 {
+            let counts = &h.runtime.retries;
+            assert_eq!((counts.retries(), counts.progress()), (round, round - 1));
+            h.hands[0].submit();
+            h.finish_lanes();
+            h.pump();
+            assert_eq!(counts.progress(), round, "woken by the lane's progress");
+        }
+        let counts = &h.runtime.retries;
+        assert_eq!(
+            (counts.retries(), counts.progress(), counts.backstops()),
+            (3, 3, 0)
+        );
+        assert_eq!(h.ran(1), [0, 1, 1, 1, 1]);
+        assert_eq!(h.retired(1), [QuantumOutcome::Completed]);
+        assert_eq!(h.runtime.completions.pending(), 0);
+
+        // Backstop only: it is already due, and no lane moves.
+        let h = Harness::with_backstop(1, Duration::ZERO);
+        let graph = h.graph(&[(None, &[], Act::Retry(Arc::new(AtomicU32::new(3))))], &[]);
+        let _ = graph.start(1, alive(), Vec::new());
+        h.pump();
+        let counts = &h.runtime.retries;
+        assert_eq!(
+            (counts.retries(), counts.progress(), counts.backstops()),
+            (3, 0, 3)
+        );
+        assert_eq!(h.ran(1), [0, 0, 0, 0]);
+        assert_eq!(h.retired(1), [QuantumOutcome::Completed]);
+        assert_eq!(h.runtime.completions.pending(), 0);
     }
 
     #[test]
@@ -6087,6 +6205,10 @@ mod tests {
         KillThenPark(Arc<AtomicBool>, Arc<Mutex<Vec<Gate>>>),
         /// The first run answers `Held` with no gate taken.
         HeldWithoutGate,
+        /// The first run sets the kill switch, takes the gate and fails it before it answers `Held`.
+        KillThenFail(Arc<AtomicBool>),
+        /// The first run sets the kill switch, takes the gate and drops it before it answers `Held`.
+        KillThenDrop(Arc<AtomicBool>),
     }
 
     #[derive(Clone, Copy)]
@@ -6158,6 +6280,16 @@ mod tests {
                     })
                     .join()
                     .unwrap();
+                    return Err(StageError::Held);
+                }
+                HoldAct::KillThenFail(kill) if n == 0 => {
+                    kill.store(true, Ordering::Release);
+                    cx.hold().fail(StageError::Corrupt("a bad packet".into()));
+                    return Err(StageError::Held);
+                }
+                HoldAct::KillThenDrop(kill) if n == 0 => {
+                    kill.store(true, Ordering::Release);
+                    drop(cx.hold());
                     return Err(StageError::Held);
                 }
                 HoldAct::FailAtOnce(error) if n == 0 => {
@@ -6491,23 +6623,195 @@ mod tests {
         assert_eq!(graph.live(), 0);
     }
 
-    /// A gate dropped after the kill is harmless too: the quantum retires once, the stage is abandoned once. (A dropped gate
-    /// is the first cause, as it is for a gate taken in `pass_gate`.)
+    /// Once the quantum's kill switch is set, spending its gate any way (release, `fail`, drop) ends the quantum as killed,
+    /// and the stage is abandoned once: the kill is noted whichever spend comes first.
     #[test]
-    fn a_gate_taken_in_run_and_dropped_after_a_kill_retires_the_quantum_once() {
+    fn a_gate_taken_in_run_and_spent_after_a_kill_ends_the_quantum_as_killed() {
+        for spend in ["release", "fail", "drop"] {
+            let h = Harness::new(1);
+            let held = gates();
+            let mid = Holds::new(&h, 1, HoldAct::Park(1, held.clone()));
+            let graph = holding_chain(&h, mid.clone());
+            let kill = alive();
+            let _ = graph.start(1, kill.clone(), Vec::new());
+            h.pump();
+            kill.store(true, Ordering::Release);
+            let gate = lock(&held).pop().unwrap();
+            match spend {
+                "release" => gate.release(),
+                "fail" => gate.fail(StageError::Corrupt("the artifact would not read".into())),
+                _ => drop(gate),
+            }
+            h.pump();
+            assert_eq!(mid.runs(), 1, "{spend}: not run again");
+            assert_eq!(h.retired(1), [QuantumOutcome::Killed], "{spend}");
+            assert_eq!(h.abandoned(1), [1, 2], "{spend}: abandoned once each");
+            assert_eq!(graph.live(), 0, "{spend}");
+            assert_no_retry(&h);
+        }
+    }
+
+    /// The same when the kill switch is set by the stage's own run, which then spends the gate before it returns.
+    #[test]
+    fn a_gate_taken_in_run_and_spent_in_a_run_that_killed_its_quantum_ends_it_as_killed() {
+        for fail in [true, false] {
+            let h = Harness::new(1);
+            let kill = alive();
+            let act = if fail {
+                HoldAct::KillThenFail(kill.clone())
+            } else {
+                HoldAct::KillThenDrop(kill.clone())
+            };
+            let mid = Holds::new(&h, 1, act);
+            let graph = holding_chain(&h, mid.clone());
+            let _ = graph.start(1, kill, Vec::new());
+            h.pump();
+            assert_eq!(mid.runs(), 1);
+            assert_eq!(h.retired(1), [QuantumOutcome::Killed], "fail: {fail}");
+            assert_eq!(h.abandoned(1), [1, 2]);
+            assert_eq!(graph.live(), 0);
+        }
+    }
+
+    /// A gate taken in `pass_gate` ends the same way: `fail` and drop after a kill end the quantum as killed.
+    #[test]
+    fn a_gate_taken_in_pass_gate_and_failed_or_dropped_after_a_kill_ends_the_quantum_as_killed() {
+        for fail in [true, false] {
+            let h = Harness::new(1);
+            let held = gates();
+            let graph = h.gated_graph(
+                &[(None, &[], Act::Cpu), (None, &[], Act::Cpu)],
+                &[(0, 1, Submission)],
+                &[GateAct::Pass, GateAct::Hold(held.clone())],
+            );
+            let kill = alive();
+            let _ = graph.start(1, kill.clone(), Vec::new());
+            h.pump();
+            kill.store(true, Ordering::Release);
+            let gate = lock(&held).pop().unwrap();
+            if fail {
+                gate.fail(StageError::Corrupt("the artifact would not read".into()));
+            } else {
+                drop(gate);
+            }
+            h.pump();
+            assert_eq!(h.retired(1), [QuantumOutcome::Killed], "fail: {fail}");
+            assert_eq!(h.abandoned(1), [1], "fail: {fail}");
+            assert_eq!(graph.live(), 0);
+        }
+    }
+
+    /// `Retry` and `Held` are no failures: a gate failed with either fails the quantum with `Fatal` (the cause names which),
+    /// whether the gate was taken in `run` or in `pass_gate`.
+    #[test]
+    fn a_gate_failed_with_retry_or_held_fails_the_quantum_with_fatal() {
+        for error in [StageError::Retry, StageError::Held] {
+            for in_run in [true, false] {
+                let h = Harness::new(1);
+                let held = gates();
+                let graph = if in_run {
+                    holding_chain(&h, Holds::new(&h, 1, HoldAct::Park(1, held.clone())))
+                } else {
+                    h.gated_graph(
+                        &[
+                            (None, &[], Act::Cpu),
+                            (None, &[], Act::Cpu),
+                            (None, &[], Act::Cpu),
+                        ],
+                        &[(0, 1, Submission), (1, 2, Submission)],
+                        &[GateAct::Pass, GateAct::Hold(held.clone())],
+                    )
+                };
+                let _ = graph.start(1, alive(), Vec::new());
+                h.pump();
+                lock(&held).pop().unwrap().fail(error.clone());
+                h.pump();
+                assert!(
+                    matches!(
+                        &h.retired(1)[..],
+                        [QuantumOutcome::Failed {
+                            stage: StageId(1),
+                            error: StageError::Fatal(_)
+                        }]
+                    ),
+                    "{error:?} in_run {in_run}: {:?}",
+                    h.retired(1)
+                );
+                assert_eq!(graph.live(), 0);
+                assert_no_retry(&h);
+            }
+        }
+    }
+
+    /// A stage that took a gate and answered `Ok` has submitted device work and a host completion all the same: the
+    /// boundary joins its lane and the quantum waits for the completion before it ends as failed.
+    #[test]
+    fn a_gate_taken_in_run_with_ok_answered_still_joins_its_marker_and_waits_for_its_completion() {
+        struct TakesAndSubmits {
+            hand: Arc<HandLane>,
+            token: Token,
+            gates: Arc<Mutex<Vec<Gate>>>,
+        }
+        impl Stage<u64> for TakesAndSubmits {
+            fn run(&self, _: &u64, cx: &StageCx<'_>) -> Result<Submitted, StageError> {
+                lock(&self.gates).push(cx.hold());
+                let lane = cx.lane.expect("a lane stage");
+                Ok(Submitted {
+                    marker: Some(Marker::new(self.hand.id, lane, self.hand.submit())),
+                    completion: Some(Box::new(self.token.clone())),
+                })
+            }
+        }
         let h = Harness::new(1);
         let held = gates();
-        let mid = Holds::new(&h, 1, HoldAct::Park(1, held.clone()));
-        let graph = holding_chain(&h, mid.clone());
-        let kill = alive();
-        let _ = graph.start(1, kill.clone(), Vec::new());
+        let token = Token::default();
+        let mut spec = StageGraphSpec::new();
+        spec.stage(StageSpec {
+            name: "g",
+            ordered: None,
+            lanes: vec![LaneId(0)],
+        });
+        let log = h.log.clone();
+        let stage = TakesAndSubmits {
+            hand: h.hands[0].clone(),
+            token: token.clone(),
+            gates: held.clone(),
+        };
+        let graph = StageGraph::new(
+            spec,
+            vec![Arc::new(stage) as Arc<dyn Stage<u64>>],
+            h.runtime.clone(),
+            move |q, outcome| lock(&log).push(Event::Retired { q, outcome }),
+        )
+        .unwrap();
+        let _ = graph.start(1, alive(), Vec::new());
         h.pump();
-        kill.store(true, Ordering::Release);
-        drop(lock(&held).pop().unwrap());
+        lock(&held).pop().unwrap().release();
         h.pump();
-        assert_eq!(mid.runs(), 1);
-        assert_eq!(h.retired(1).len(), 1, "retired once: {:?}", h.retired(1));
-        assert_eq!(h.abandoned(1), [1, 2]);
+        assert!(
+            h.retired(1).is_empty(),
+            "its host completion is not ready: {:?}",
+            h.retired(1)
+        );
+        token.0.store(true, Ordering::Release);
+        h.pump();
+        assert!(
+            h.retired(1).is_empty(),
+            "its marker is not reached: the boundary joined its lane"
+        );
+        h.finish_lanes();
+        h.pump();
+        assert!(
+            matches!(
+                &h.retired(1)[..],
+                [QuantumOutcome::Failed {
+                    stage: StageId(0),
+                    error: StageError::Fatal(_)
+                }]
+            ),
+            "{:?}",
+            h.retired(1)
+        );
         assert_eq!(graph.live(), 0);
     }
 
@@ -6544,7 +6848,13 @@ mod tests {
                     error: expect
                 }]
             );
-            assert_eq!(h.abandoned(1), [1, 2]);
+            // An `Ok` answer is a submission all the same, so only the stage behind it is abandoned.
+            let abandoned: &[u16] = if matches!(how, Broken::Ok) {
+                &[2]
+            } else {
+                &[1, 2]
+            };
+            assert_eq!(h.abandoned(1), abandoned);
             assert_eq!(graph.live(), 0);
             assert_no_retry(&h);
         }
