@@ -40,8 +40,9 @@ completion holds a worker for long. The `AsyncIo` type is the same everywhere; a
 starts operations and finds their ends, and `src/lib.rs` does the rest.
 
 The source side takes no lock: the continuations a pull's `stop` held back are plain state of the hand-out,
-and the downstream is a `DownstreamSlot`. **Reaping is a frame's work**: `request` and `pull` only hand out
-what was reaped, and `request` pushes one reap frame while operations are in flight, whose `execute` is
+and the downstream is a `DownstreamSlot`. **Reaping is a frame's work** (it asks the kernel, takes a lock and calls the
+continuations, at every visit): `request` and `pull` only hand out
+what was reaped, and `request` or `pull` pushes one reap frame while operations are in flight, whose `execute` is
 `AsyncIo::reap` (a caller outside a lattice calls it before it pulls). A `request` that finds a hand-out running
 banks its demand and leaves a wakeup, which the running hand-out serves as it lets go.
 

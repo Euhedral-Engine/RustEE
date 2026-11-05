@@ -1,9 +1,10 @@
 //! The home of a source's key frame.
 //!
-//! A source never runs work in `request` or `pull`: workers execute frames, so that they can measure
-//! what a frame costs and learn the shape of the workload. A source that has work to do (polling a
-//! device or the operating system, finishing copies, detaching a set of sinks) therefore hands out a
-//! *key frame* whose `execute` does it. The source owns one reusable frame, the key. It leaves the
+//! `request` and `pull` run at every visit of a worker, so they do no heavy or high-frequency work: a small
+//! continuation (O(1) bookkeeping, handing out a result that is ready) may run there, but anything that costs more or
+//! recurs at the rate of the visits would hide from the workers, which measure what a frame costs and learn the shape
+//! of the workload only from the frames they execute. A source that has such work (polling a device or the operating
+//! system, finishing copies, detaching a set of sinks) therefore hands out a *key frame* whose `execute` does it. The source owns one reusable frame, the key. It leaves the
 //! source by a push from `request` or `pull`, and the work happens in `execute` on whichever worker
 //! the frame was routed to. Once the frame has finished, its [`recycle`](crate::frames::Frame::recycle)
 //! sends it home. While the key is out the source has no second one to push, so at most one worker is

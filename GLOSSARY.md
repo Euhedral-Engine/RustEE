@@ -393,12 +393,13 @@ guards never exist: `try_enter` hands a refusal back (a nested entry, or a direc
 `enter` panics. Under the lattice the claim is always free. A source's lifecycle calls from other threads
 set atomics, and the source applies them in `pull` or `request`.
 
-**no work in `request` or `pull`**: a source assembles frames, hands them out and pushes them; it does not do the
-work itself. Workers measure how long work takes only when a frame comes back through their executor, and that is what
-lets them size their batches and idle or take part correctly, so work done inside a source is work they cannot see.
-Looking at devices or the operating system, finishing copies, building continuations and detaching sinks therefore
-run in a frame (see **key frame**). What may stay in `request` and `pull` is O(1) bookkeeping with no effect of its
-own: popping a ready frame, reading a counter that says whether work is due.
+**no heavy or high-frequency work in `request` or `pull`**: they run at every visit of a worker. A source assembles
+frames, hands them out and pushes them, and a small continuation may run there (O(1) bookkeeping: popping a ready
+frame, reading a counter that says whether work is due). Workers measure how long work takes only when a frame comes
+back through their executor, and that is what lets them size their batches and idle or take part correctly, so heavy
+work done inside a source, or work that recurs at the rate of the visits, is work they cannot see. Looking at devices or
+the operating system, finishing copies, a lock with a system call, querying every operation that waits, and detaching
+sinks therefore run in a frame (see **key frame**).
 
 **key frame, KeySlot** ([`KeySlot`](euhedral-core/src/generics/key_slot.rs)): the one reusable frame a source owns
 for work that is due now and then (a poll of the operations it holds, a device pump, a detach). The source pushes it

@@ -3,9 +3,9 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
-## Sources run no work in `request` or `pull` (2026-11-05)
+## `request` and `pull` do no heavy or high-frequency work (2026-11-05)
 
-**What.** Five places did work inside a source's `request` or `pull`. Four of them no longer do:
+**What.** Five places did heavy or high-frequency work inside a source's `request` or `pull`. Four of them no longer do:
 - `Completions` queried every registered operation on each call (a `Ready`'s `is_ready`, a `Pending`'s `poll`, markers, retirement cells, timers) and called the continuations that build frames.
 - `AsyncIo` asked the engine for finished operations (reading the rings' completion queues, flushing the kernel's backlog with a system call, resubmitting short pieces) and called each operation's continuation.
 - `Moves` (`euhedral-memory`) called `Mover::pump` on every `pull`: it asked every in-flight copy whether it retired, started second hops, freed slots and scanned every resident for one to bring home.
@@ -13,11 +13,18 @@ semantics and the tests that pin it.
 
 The fifth, `GiveBacks`, stays as it is: it pops one order and builds its frame, and the handler already runs as a frame.
 
-Now the work is a frame's. Each of these sources owns one reusable **key frame** and pushes it from `request` or `pull` when work is due: `Completions` while operations wait, `AsyncIo` while operations are in flight, `Moves` when `Mover::pump_due`, `IdleWatch` once the lake has been idle for the idle time. A worker executes the frame (so its cost is measured as any frame's is), and the frame's `recycle` sends it home. `request` and `pull` only hand out: they pass on the continuations the key frame found, within the demand, and ask nothing of the operations.
+Now the work is a frame's. Each of these sources owns one reusable **key frame** and pushes it from `request` or `pull` when work is due: `Completions` while operations wait, `AsyncIo` while operations are in flight, `Moves` when `Mover::pump_due`, `IdleWatch` once the lake has been idle for the idle time. A worker executes the frame (so its cost is measured as any frame's is), and the frame's `recycle` sends it home. `request` and `pull` hand out what is ready: they pass on the continuations the key frame found, within the demand, and ask nothing of the operations. (`pull` no longer finds anything on its own for the same reason: a poll at every pull is the high-frequency work the rule keeps out of it.)
 
-**Why.** The workers can only measure how long work takes if the frame comes back through their executor; that is how they learn the shape of the workload, size their batches, and decide to idle or to take part. Work done in a source's `request` or `pull` is invisible to them.
+**The rule.** `request` and `pull` run at every visit of a worker, so they do no heavy or high-frequency work. A small continuation may run there: O(1) bookkeeping, handing out a result that is ready. What moved, and why, in those terms:
+- `Completions`: a query of every registered operation, with the application's code, at every visit: high-frequency.
+- `AsyncIo`: a system call (`io_uring_enter`), a lock and the application's continuations at every visit: heavy and high-frequency.
+- `Moves`: a device query per copy in flight, a scan of every resident and copy submissions at every pull: heavy.
+- `IdleWatch`: the look (two atomic loads) stays; the detach is a lock plus completing every sink: heavy.
+- `GiveBacks` stays: a pop and a frame, O(1).
 
-**Java correspondence.** Java's `GpuCompletions`, `AsyncReads` and `InferenceLake`'s idle watch do their work in the delegate's `hookOnPull` and `hookOnRequest`. This is a deliberate departure from them: the rule that sources run no work in `request` or `pull` supersedes. `Moves` and `GiveBacks` have no Java original.
+**Why.** The workers can only measure how long work takes if the frame comes back through their executor; that is how they learn the shape of the workload, size their batches, and decide to idle or to take part. Heavy work, or work that recurs at the rate of the visits, done in a source's `request` or `pull` is invisible to them.
+
+**Java correspondence.** Java's `GpuCompletions`, `AsyncReads` and `InferenceLake`'s idle watch do their work in the delegate's `hookOnPull` and `hookOnRequest`. This is a deliberate departure from them: the rule above supersedes. `Moves` and `GiveBacks` have no Java original.
 
 **How to use it.**
 - New in `euhedral-core`: `generics::KeySlot<K>`, the key's home. One atomic reference: `take` (a swap with `Acquire`, behind a `Relaxed` read that spares a key that is away) and `home` (a store with `Release`). A source that needs a key frame holds one `KeySlot<K>`.

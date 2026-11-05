@@ -62,7 +62,7 @@ link-time dependency).
     priority first, as slots free up. Pairs no copier joins go through a staging tier in two hops.
   - Free slots, and the slots of residents that can spill, are elastic: a higher-priority claim orders them back, and
     the mover's give-back handler retires free slots, then spills residents and retires their slots.
-  - Completions reach owners as frames of the `Moves` source; releasing a resident mid-move cancels it. The source runs no work in `request` or `pull`: while `Mover::pump_due` it pushes a pump frame whose `execute` is `Mover::pump` (copies retired, second hops, spilled residents brought home).
+  - Completions reach owners as frames of the `Moves` source; releasing a resident mid-move cancels it. `request` and `pull` do no heavy work (querying every copy, scanning every resident, submitting copies): while `Mover::pump_due` it pushes a pump frame whose `execute` is `Mover::pump` (copies retired, second hops, spilled residents brought home).
 - **Blocking frees wait for a moment with nothing in flight.** On the CUDA driver, `cuMemFree`, `cuMemFreeHost`,
   `cuMemHostUnregister` and `cuModuleLoadDataEx` wait for the kernels running when they are called, and make every other
   stream's `cuEventRecord` wait with them, on whichever thread the call is made (measured: 370 ms for a 400 ms spin;

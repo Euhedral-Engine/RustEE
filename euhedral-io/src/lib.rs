@@ -546,8 +546,10 @@ type Platform = win::Engine;
 /// - **Dropping** an `AsyncIo` with operations in flight leaks their buffers (the kernel may still
 ///   write them).
 ///
-/// **Who does what.** The source's `request` and `pull` only hand out: they pass on the continuations
-/// that were already reaped, within the demand, and never ask the engine for anything. The reaping
+/// **Who does what.** `request` and `pull` run at every visit of a worker, and reaping asks the kernel (a system call
+/// and a lock) and calls the application's continuations, which is heavy and high-frequency work. So they only hand
+/// out: they pass on the continuations that were already reaped, within the demand, and never ask the engine for
+/// anything. The reaping
 /// (looking at the kernel's completions, resubmitting a short read, calling each operation's
 /// continuation to build its frame) is the work of a *key frame*: the source owns one, and a
 /// `request` or `pull` pushes it into the lattice while operations are in flight and no reap frame is out (`pull` as

@@ -1,8 +1,8 @@
 //! `AsyncIo` hands out in `request` and `pull`; reaping is a frame's work.
 //!
-//! A source never runs work in `request` or `pull`: a worker that executes a frame can be measured, and
-//! the workers learn the shape of the workload from the frames they execute. So `request` and `pull`
-//! only pass on what was already reaped, and `request` pushes one key frame whose `execute` reaps
+//! `request` and `pull` do no heavy or high-frequency work: a worker that executes a frame can be measured, and
+//! the workers learn the shape of the workload from the frames they execute. Reaping asks the kernel (a system call
+//! and a lock) at every visit, so `request` and `pull` only pass on what was already reaped, and push one key frame whose `execute` reaps
 //! (looks at the kernel's completions and calls each operation's continuation). The tests play the
 //! worker: they keep what the source pushes and run it.
 #![allow(

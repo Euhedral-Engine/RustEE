@@ -40,8 +40,9 @@ Work is **submitted** and the call returns at once. What follows it starts on on
   source emits, and the lattice runs it like any other.
 
 `Completions` and `euhedral-io`'s `AsyncIo` are `LatticeSource`s, so they attach to a lattice with `add_upstream`.
-Looking at the pending operations is a frame's work, not the source's: a source's `request` and `pull` only hand out,
-and a `request` pushes the source's one *poll frame* while operations wait, which a worker runs like any other frame
+Looking at the pending operations is a frame's work: `request` and `pull` run at every visit, so they do no heavy or
+high-frequency work (querying every pending operation, with the application's code, would be both). They hand out what
+is ready, and a `request` or `pull` pushes the source's one *poll frame* while operations wait, which a worker runs like any other frame
 (so what a poll costs is measured as a frame's cost). There is no timer thread, no completion thread and no channel.
 A poll never blocks: a lane's completed value is one atomic read (`DeviceQueue::completed`), and an io_uring
 completion queue is read without entering the kernel.

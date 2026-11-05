@@ -16,7 +16,7 @@
 //!
 //! Completions reach the residents' owners as lattice frames of the mover's [`Moves`] source (routed by the owner's
 //! hash, as give-back orders are); the same source pushes a pump frame, which a worker runs to drive the moves
-//! (the source's `request` and `pull` run no work of their own). Nothing takes a lock: residents are cells of
+//! (the source's `request` and `pull` do no heavy work of their own). Nothing takes a lock: residents are cells of
 //! atomics, moves and free slots go through lock-free queues.
 
 use std::fmt;
@@ -1195,7 +1195,8 @@ impl Drop for Mover {
 /// hash.
 ///
 /// Driving the moves ([`Mover::pump`]: asking each copy whether it retired, starting second hops, bringing spilled
-/// residents home) is a frame's work, never the source's: `request` and `pull` only hand out the completions that
+/// residents home) is heavy work (a device query per copy in flight, a scan of every resident, copy submissions), and a
+/// pull used to do it at every visit, so it is a frame's work: `request` and `pull` only hand out the completions that
 /// are done. When a pump is due ([`Mover::pump_due`]), `request` or `pull` pushes the source's one *pump frame*
 /// (`pull` as well as `request`: a Direct worker that is busy never calls `request` on a source, and an idle one can
 /// phase-lock so that `request` never reaches half of its handles; see the changelog), whose `execute` pumps on whichever

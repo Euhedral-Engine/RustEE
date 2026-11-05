@@ -35,11 +35,12 @@ pub trait LatticeReceiver: LatticeTerminal {
 
 /// Where frames come from.
 ///
-/// **A source runs no work in `request` or `pull`.** They assemble frames, hand them out and push them: pop a
-/// ready frame, read a counter that says whether work is due. Anything that costs more (looking at a device or the
-/// operating system, finishing copies, calling continuations, detaching sinks) is a frame's work, because a worker
-/// can only measure how long work takes when the frame comes back through its executor, and that is how it sizes its
-/// batches and decides to idle or take part. A source with such work owns a *key frame* ([`KeySlot`](super::KeySlot)):
+/// **`request` and `pull` do no heavy or high-frequency work.** They run at every visit of a worker. They assemble
+/// frames, hand them out and push them, and a small continuation may run there: pop a ready frame, read a counter that
+/// says whether work is due. Anything heavy (looking at a device or the operating system, finishing copies, a lock and
+/// a system call, detaching sinks), or that would recur at the rate of the visits (querying every operation that waits),
+/// is a frame's work, because a worker can only measure how long work takes when the frame comes back through its
+/// executor, and that is how it sizes its batches and decides to idle or take part. A source with such work owns a *key frame* ([`KeySlot`](super::KeySlot)):
 /// `request` or `pull` pushes it to the downstream when the work is due and it is home, a worker runs its `execute`, and
 /// its `recycle` sends it home. (`pull` as well as `request`: a Direct worker that is busy never calls `request` on a
 /// source, and an idle one can phase-lock so that `request` never reaches half of its handles; see the changelog.) The key

@@ -46,8 +46,9 @@ pub trait Pending: Send {
 ///
 /// [`after`](Self::after), [`after_marker`](Self::after_marker), [`at`](Self::at) and
 /// [`register`](Self::register) may be called from any thread. **Looking at the operations is a frame's
-/// work, not the source's.** The source's `request` and `pull` hand out the continuations that are already
-/// ready, within the demand, and never query an operation. While operations wait and no poll frame is out,
+/// work.** `request` and `pull` run at every visit of a worker, and querying every operation that waits (with the
+/// application's code) is high-frequency work, so they hand out the continuations that are already ready, within the
+/// demand, and query no operation. While operations wait and no poll frame is out,
 /// `request` or `pull` pushes the source's one key frame, the *poll frame* (`pull` as well as `request` pushes it: a
 /// Direct worker that is busy never calls `request` on a source, and an idle one can phase-lock so that `request`
 /// never reaches half of its handles; see the changelog), and a worker runs it like any other frame:
