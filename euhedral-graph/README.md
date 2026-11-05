@@ -268,7 +268,12 @@ lane on the device (the home lane awaits its latest marker), one retirement is a
 quantum's own `RetireCell`, and a retirement frame settles it, runs each attempted stage's `retired` hook and the
 quantum's terminal work, and recycles the quantum. A completion edge arms a retirement on the producing stage's lane the
 same way (Java `RetiredEdge`). For lanes that are only a query side (`dyn DeviceQueue` without control) the boundary
-stays one `Completions` marker edge per lane. `retire` then receives the
+stays one `Completions` marker edge per lane. A quantum that **touched no lane** (none of its stages submitted a
+marker, none was recorded for it, and no `abandoned` hook of a stage that names a lane ran on a home lane that can arm
+a retirement) has no device work to retire and arms no retirement: it concludes in its own last frame (the frame that
+ends its last stage, its last host completion or the frame that abandons its stages), or, when its last hold goes
+anywhere else (a dropped `QuantumRef`, a later quantum's stage releasing its pin, a gate failed from outside), in one
+pooled frame; `retire` never runs inside the call that drops a hold (a sink that refuses the frame has it end in place on that thread, where a panic of `retire` is contained). `retire` then receives the
 quantum and its `QuantumOutcome`: `Completed`, `Failed` or `Killed`. `live()` counts quanta not
 retired yet.
 
