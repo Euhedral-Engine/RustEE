@@ -137,7 +137,8 @@ pub struct LaneSource<S: LaneSubmit, X: LaneState, W> {
     /// The depth of `ready`, published at the end of each call.
     ready_len: AtomicUsize,
     /// A `request` happened that no pass has served yet: a wakeup, as the ingest sinks'
-    /// `requestPending`. A caller that cannot enter the cell leaves it set for whoever is inside.
+    /// `requestPending`. A caller that cannot enter the cell leaves it set for whoever is inside, if that is a `request`
+    /// (it looks again after it lets go); a `pull` that was inside serves nothing, so the wakeup waits for the next `request`.
     pending: AtomicBool,
     intakes: Arc<LaneIntakes<W>>,
     metrics: LaneMetrics,
@@ -460,7 +461,8 @@ impl<S: LaneSubmit, X: LaneState, W: LaneWork<S, X>> LaneSource<S, X, W> {
     }
 
     /// Serves the requests that arrived, one pass per claim. A caller that cannot take the claim
-    /// leaves `pending` set for the holder, which looks again after it lets go.
+    /// leaves `pending` set for the holder, which looks again after it lets go when it is a `request` (a `pull` never
+    /// calls this: serving runs items and pushes). Only `request` calls it.
     fn drain_requests(&self) {
         while self.pending.load(Ordering::SeqCst) {
             let Some(mut guard) = self.cell.try_enter() else {
@@ -613,9 +615,10 @@ impl<S: LaneSubmit, X: LaneState, W: LaneWork<S, X>> LatticeSource for LaneSourc
         self.publish(&inner);
         drop(inner);
         self.metrics.service_ns.record(ns(started.elapsed()));
-        // A request made while this pull held the claim (from the consumer) left a wakeup: serve it
-        // now, as the ingest sinks' pull does in its `finally`.
-        self.drain_requests();
+        // A request made while this pull held the claim (from the consumer, or from another thread) left a wakeup, and
+        // banked its demand. It is not served here: serving runs the lane's items and pushes, and a pull does neither.
+        // The wakeup stays set for the next `request`, which serves it (the lattice requests whenever a pull found
+        // nothing), and the frames already ready are handed out by the next `pull`.
         pulled
     }
 

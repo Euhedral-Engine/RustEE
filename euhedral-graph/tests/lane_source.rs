@@ -713,7 +713,8 @@ fn a_retirement_taken_by_an_item_strands_only_that_continuation() {
 }
 
 #[test]
-fn a_request_made_by_the_consumer_of_a_pull_is_served_when_the_pull_lets_go() {
+fn a_request_made_by_the_consumer_of_a_pull_is_served_by_the_next_request_and_the_pull_pushes_nothing()
+ {
     let rig = Rig::new(1, &[]);
     rig.deliver(rig.job(1).frame(), rig.lane(0));
     rig.deliver(rig.job(2).frame(), rig.lane(0));
@@ -725,7 +726,8 @@ fn a_request_made_by_the_consumer_of_a_pull_is_served_when_the_pull_lets_go() {
     let n = rig.sources[0].pull(
         &mut |frame| {
             pulled.push(frame.header().id_hash());
-            // The claim is held: this banks its demand and leaves a wakeup.
+            // The claim is held, as when a frame the pulling worker runs inline requests the lane: this banks its
+            // demand and leaves a wakeup. It serves nothing.
             source.request(1);
         },
         &mut |_| false,
@@ -733,10 +735,23 @@ fn a_request_made_by_the_consumer_of_a_pull_is_served_when_the_pull_lets_go() {
     );
     assert_eq!((n, pulled), (1, vec![2]));
     assert_eq!(
-        rig.probe.ran(),
-        vec![1, 2, 3],
-        "the pull served the wakeup before it returned"
+        rig.received(0),
+        vec![1],
+        "the pull pushed nothing as it let go (it used to serve the wakeup and push item 3's frame)"
     );
+    assert_eq!(
+        rig.probe.ran(),
+        vec![1, 2],
+        "and ran no item: item 3 waits in its intake"
+    );
+    assert_eq!(
+        rig.sources[0].banked(),
+        1,
+        "the demand the consumer banked is kept"
+    );
+    // The next request serves the wakeup: it runs item 3 and pushes its frame within the banked demand.
+    rig.sources[0].request(1);
+    assert_eq!(rig.probe.ran(), vec![1, 2, 3]);
     assert_eq!(rig.received(0), vec![1, 3]);
 }
 
