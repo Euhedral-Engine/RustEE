@@ -1,11 +1,21 @@
 # Builds and tests the crates a change affects, on Linux and Windows: formatting, Clippy with warnings as
-# errors, and the affected crates' tests and doctests. The toolchain is the one pinned in mise.toml.
+# errors, and the affected crates' tests and doctests. The toolchain is the one pinned in mise.toml; Miri's is the
+# dated nightly in scripts/ci/miri-toolchain (bump the date there, and the caches rebuild once).
+#
+# It runs for pull requests and on demand, and not again on a push to main: the pull request ran it already.
+# Instead a push to main runs cache-warm.yml, which builds the dependencies every job here restores (only caches made
+# on the default branch are shared with pull requests). A new push to a branch cancels the run it supersedes.
 #
 # The first job, `changes`, runs scripts/ci/affected.py: it maps the changed files to crates, adds every crate
 # that depends on one (transitively, read from `cargo metadata`), and publishes the set. Layers below a change
-# are not run. A root build file (Cargo.toml, Cargo.lock, mise.toml, clippy.toml, anything under .github/ or
-# scripts/ci/) or a manual run affects everything; a change to documentation alone affects nothing, and every
-# later job then skips. `ci-ok` always runs and fails only if a job failed, so it is the one check to require.
+# are not run. A root build file (Cargo.toml, Cargo.lock, mise.toml, the Clippy and rustfmt configuration,
+# rust-toolchain, .cargo/, a file under .github/ or scripts/ci/ that nothing below names) or a manual run affects
+# everything; a change to documentation alone affects nothing, and every later job then skips. The CI files select
+# less (the rules are in scripts/ci/affected.py): this workflow runs the workspace jobs in full and, of Miri, the
+# shards the crates select plus a canary; the shards file runs the shards that changed; the pinned Miri nightly runs
+# every Miri shard; the scripts and cache-warm.yml run no crate (`changes` runs the script tests). Each Miri shard
+# that runs has its reason in the `miri_reasons` output and in the log of `changes`.
+# `ci-ok` always runs and fails only if a job failed, so it is the one check to require.
 #
 # windows-2025 is Windows Server 2025 (build 26100), which has IoRing, so euhedral-io's
 # Windows engine runs on its kernel ring there (each of its tests also runs forced onto the
@@ -13,10 +23,14 @@
 name: ci
 
 on:
-  push:
-    branches: [main]
   pull_request:
   workflow_dispatch:
+
+# One run per branch or pull request: a push aborts the run it supersedes (its `ci-ok` is then red for the old commit
+# only; the check of the new head commit is the new run's).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -48,27 +62,21 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install the toolchain pinned in mise.toml
+      # `cargo metadata` of the runner's own toolchain is all the script needs.
+      - name: Test the scripts
         run: |
-          version=$(sed -n 's/^rust = .*version = "\([^"]*\)".*/\1/p' mise.toml)
-          rustup toolchain install "$version" --profile minimal
-          rustup default "$version"
-
-      - name: Test the affected-crates script
-        run: python3 scripts/ci/test_affected.py
+          python3 scripts/ci/test_affected.py
+          python3 scripts/ci/test_miri_build.py
 
       - name: Compute the affected crates
         id: affected
         env:
           EVENT: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}
-          BEFORE: ${{ github.event.before }}
         run: |
           case "$EVENT" in
             # Against the merge base with the PR's base branch, which is not always main (stacked PRs).
             pull_request) python3 scripts/ci/affected.py --base "origin/$BASE_REF" --head HEAD --merge-base --github-output "$GITHUB_OUTPUT" ;;
-            # The commits this push added to main.
-            push) python3 scripts/ci/affected.py --base "$BEFORE" --head HEAD --github-output "$GITHUB_OUTPUT" ;;
             *) python3 scripts/ci/affected.py --all --github-output "$GITHUB_OUTPUT" ;;
           esac
 
@@ -98,6 +106,17 @@ jobs:
           rustc --version
           cargo --version
 
+      # Restored from the caches the push to main saved (cache-warm.yml); this run saves nothing.
+      # The preinstalled stable is not used, and its hash changes with the runner image: drop it before the cache key
+      # is computed.
+      - name: Drop the preinstalled stable toolchain
+        run: rustup toolchain uninstall stable || true
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-${{ matrix.os }}
+          save-if: false
+
       # Cheap, so it checks the whole workspace.
       - name: Format
         run: cargo fmt --all --check
@@ -113,51 +132,37 @@ jobs:
         run: cargo test -p euhedral-io --lib the_machines_ring_is_reported -- --nocapture
 
       # The memory orderings are tested optimised.
+      # One run per binary: the filters are alternatives, and the build is shared.
       - name: Source-invariant stress tests in release (euhedral-core)
         if: needs.changes.outputs.euhedral_core == 'true'
-        run: |
-          cargo test --release -p euhedral-core --lib flow_control::vertex
-          cargo test --release -p euhedral-core --lib generics::
-          cargo test --release -p euhedral-core --lib ingest::
-          cargo test --release -p euhedral-core --lib flow_control::hot_source
-          cargo test --release -p euhedral-core --lib utils::stop_watch
-          cargo test --release -p euhedral-core --lib flow_control::edge
-          cargo test --release -p euhedral-core --lib control_plane::cache
-          cargo test --release -p euhedral-core --lib flow_control::views
+        run: >
+          cargo test --release -p euhedral-core --lib --
+          flow_control::vertex generics:: ingest:: flow_control::hot_source utils::stop_watch flow_control::edge
+          control_plane::cache flow_control::views
 
       - name: Source-invariant stress tests in release (euhedral-graph)
         if: needs.changes.outputs.euhedral_graph == 'true'
         run: |
-          cargo test --release -p euhedral-graph --lib sequencer
+          cargo test --release -p euhedral-graph --lib -- sequencer completions::
           cargo test --release -p euhedral-graph --test lake
-          cargo test --release -p euhedral-graph --lib completions::
 
       - name: Loom models (euhedral-data-structures)
         if: runner.os == 'Linux' && needs.changes.outputs.euhedral_data_structures == 'true'
         env:
           RUSTFLAGS: --cfg loom
-        run: |
-          cargo test -p euhedral-data-structures --release --lib sync::claim_cell::loom
-          cargo test -p euhedral-data-structures --release --lib queues::chunk::loom
+        run: cargo test -p euhedral-data-structures --release --lib -- sync::claim_cell::loom queues::chunk::loom
 
       - name: Loom models (euhedral-graph)
         if: runner.os == 'Linux' && needs.changes.outputs.euhedral_graph == 'true'
         env:
           RUSTFLAGS: --cfg loom
-        run: |
-          cargo test -p euhedral-graph --release --lib sequencer::loom
-          cargo test -p euhedral-graph --release --lib stage_graph::loom
-          cargo test -p euhedral-graph --release --lib take_all::loom
-          cargo test -p euhedral-graph --release --lib lanes::loom
+        run: cargo test -p euhedral-graph --release --lib -- sequencer::loom stage_graph::loom take_all::loom lanes::loom
 
       - name: Loom models (euhedral-gpu)
         if: runner.os == 'Linux' && needs.changes.outputs.euhedral_gpu == 'true'
         env:
           RUSTFLAGS: --cfg loom
-        run: |
-          cargo test -p euhedral-gpu --release --lib ring::loom
-          cargo test -p euhedral-gpu --release --lib instances::loom
-          cargo test -p euhedral-gpu --release --lib handles::loom
+        run: cargo test -p euhedral-gpu --release --lib -- ring::loom instances::loom handles::loom
 
       # Built and linted; the tests skip with no device.
       - name: CUDA backend (euhedral-memory)
@@ -171,12 +176,68 @@ jobs:
           cargo test -p euhedral-gpu --features cuda
 
   # The lock-free sources' handshakes (a claim, a wakeup flag, a re-check after release) under Miri's weak-memory
-  # emulation with several seeds. The tests scale their rounds down under `cfg(miri)`. The tests are split into
-  # shards (scripts/ci/miri-shards.json), one job each, so they run in parallel; `changes` keeps only the shards of
-  # affected crates (a change in a lower layer affects the crates above it), and the job is skipped if none is left.
+  # emulation. The tests scale their rounds down under `cfg(miri)`. The tests are split into shards
+  # (scripts/ci/miri-shards.json), one job each, so they run in parallel; `changes` keeps only the shards of affected
+  # crates (a change in a lower layer affects the crates above it), and the jobs are skipped if none is left.
+  #
+  # Each shard says how many seeds Miri runs. A seed fixes the scheduler's choices, the addresses and which weak
+  # compare-exchanges fail spuriously, so seeds matter where threads race and little in a test with one thread: 1 for
+  # such a test. A test with threads gets 4 only if a loom model runs the same code and asserts the same property (Miri
+  # then looks for undefined behaviour and aliasing; loom does not check SeqCst store-to-load orderings); otherwise 16.
+  #
+  # Nothing is built twice: `miri-build` builds Miri's sysroot and, once, every selection of tests the shards run, and
+  # hands its target directory and sysroot to the shards as an artifact (a tarball, which keeps file times), so a
+  # shard only installs the toolchain and runs tests.
+  miri-build:
+    needs: changes
+    if: needs.changes.outputs.miri == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      MATRIX: ${{ needs.changes.outputs.miri_matrix }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned nightly toolchain with Miri
+        run: |
+          toolchain=$(cat scripts/ci/miri-toolchain)
+          rustup toolchain install "$toolchain" --profile minimal --component miri --component rust-src
+          echo "RUSTUP_TOOLCHAIN=$toolchain" >> "$GITHUB_ENV"
+
+      - name: Drop the preinstalled stable toolchain
+        run: rustup toolchain uninstall stable || true
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: miri
+          cache-directories: ~/.cache/miri
+          save-if: false
+
+      # Built from the fresh checkout, whose files are newer than anything restored: nothing stale is reused.
+      - name: Build Miri's sysroot and the tests
+        run: |
+          cargo miri setup
+          python3 scripts/ci/miri_build.py --matrix "$MATRIX" > miri-build.sh
+          bash -ex miri-build.sh
+
+      # The commit the build is of: a shard refuses a build that is not of its own checkout.
+      - name: Pack the target directory and the sysroot
+        run: |
+          git rev-parse HEAD > target/miri/built-from-commit
+          tar --use-compress-program="zstd -T0 -3" -C / -cf "$RUNNER_TEMP/miri-build.tar.zst" "${GITHUB_WORKSPACE#/}/target/miri" "${HOME#/}/.cache/miri"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: miri-build
+          path: ${{ runner.temp }}/miri-build.tar.zst
+          # A re-run of one shard days later still finds it; a re-run of the build replaces it.
+          retention-days: 7
+          overwrite: true
+          compression-level: 0
+
   miri:
     name: miri (${{ matrix.name }})
-    needs: changes
+    needs: [changes, miri-build]
     if: needs.changes.outputs.miri == 'true'
     strategy:
       fail-fast: false
@@ -184,15 +245,32 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      MIRIFLAGS: -Zmiri-many-seeds=0..16 -Zmiri-ignore-leaks
+      MIRIFLAGS: -Zmiri-many-seeds=0..${{ matrix.seeds }} -Zmiri-ignore-leaks
       COMMANDS: ${{ matrix.commands }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install a nightly toolchain with Miri
+      - name: Install the pinned nightly toolchain with Miri
         run: |
-          rustup toolchain install nightly --profile minimal --component miri --component rust-src
-          cargo +nightly miri setup
+          toolchain=$(cat scripts/ci/miri-toolchain)
+          rustup toolchain install "$toolchain" --profile minimal --component miri --component rust-src
+          echo "RUSTUP_TOOLCHAIN=$toolchain" >> "$GITHUB_ENV"
+
+      # Cargo rebuilds what a source newer than its output may have changed. The build job built from this commit, so
+      # the sources are dated before its outputs, which are then used as they are.
+      - name: Date the sources
+        run: git ls-files -z | xargs -0 touch -d 2000-01-01
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: miri-build
+          path: ${{ runner.temp }}
+
+      - name: Unpack the target directory and the sysroot
+        run: |
+          tar --use-compress-program="zstd -T0" -C / -xf "$RUNNER_TEMP/miri-build.tar.zst"
+          built=$(cat target/miri/built-from-commit)
+          test "$built" = "$(git rev-parse HEAD)" || { echo "the build is of $built, this checkout is $(git rev-parse HEAD): re-run the build job"; exit 1; }
 
       # -e stops at the first failing command; -x logs each command as it starts.
       - name: Miri
@@ -201,7 +279,7 @@ jobs:
   # Always runs, and fails only if a job failed or was cancelled: a job skipped because no crate it covers
   # was affected counts as success. This is the one check to require on a branch.
   ci-ok:
-    needs: [changes, workspace, miri]
+    needs: [changes, workspace, miri-build, miri]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5

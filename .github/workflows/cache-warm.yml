@@ -1,0 +1,115 @@
+# Warms the caches the pull-request workflow (ci.yml) restores. A pull request can restore only caches made on the
+# default branch, and ci.yml does not run again for a push to main (the pull request ran it already), so this workflow
+# runs there instead: it fetches and builds the dependencies for every toolchain and profile the jobs of ci.yml use,
+# and tests nothing. The cache keys are shared with ci.yml (`shared-key`): keep the two in step.
+#
+#   workspace-<os>  Clippy (`check` builds), the test build, the release build and, on Linux, the loom build
+#                   (`--cfg loom`) and the CUDA-feature builds, with the toolchain pinned in mise.toml;
+#   miri            Miri's sysroot and the dependencies of every Miri test selection, with the dated nightly in
+#                   scripts/ci/miri-toolchain.
+#
+# The cache key changes only with the toolchain, Cargo.lock and the manifests, and a cache that is found under its exact
+# key is not saved again; so when it is found, the builds are skipped (a merge that changes no dependency does no work).
+# The builds are best effort: a pull request that builds fewer crates, or other features, finds what overlaps.
+name: cache-warm
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - "LICENSE*"
+      - ".gitignore"
+  workflow_dispatch:
+
+# A warm-up runs to its end (an aborted one saves nothing); the next on the same ref waits for it.
+concurrency:
+  group: cache-warm-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  workspace:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the toolchain pinned in mise.toml
+        run: |
+          version=$(sed -n 's/^rust = .*version = "\([^"]*\)".*/\1/p' mise.toml)
+          rustup toolchain install "$version" --profile minimal --component rustfmt --component clippy
+          rustup default "$version"
+          rustup toolchain uninstall stable || true
+
+      # Saved after the job, also if a build failed (the dependencies built so far are worth keeping).
+      - uses: Swatinem/rust-cache@v2
+        id: cache
+        with:
+          shared-key: workspace-${{ matrix.os }}
+          cache-on-failure: true
+
+      # Lints are the pull request's business: here a warning must not stop the dependencies from being cached.
+      - name: Dependencies for Clippy (check builds)
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: cargo clippy --workspace --all-targets
+
+      - name: Dependencies for the tests
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: cargo test --workspace --no-run
+
+      - name: Dependencies for the release tests
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: cargo test --release -p euhedral-core -p euhedral-graph --no-run
+
+      - name: Dependencies for the loom models
+        if: runner.os == 'Linux' && steps.cache.outputs.cache-hit != 'true'
+        env:
+          RUSTFLAGS: --cfg loom
+        run: cargo test --release -p euhedral-data-structures -p euhedral-graph -p euhedral-gpu --lib --no-run
+
+      - name: Dependencies for the CUDA backend
+        if: runner.os == 'Linux' && steps.cache.outputs.cache-hit != 'true'
+        run: |
+          cargo clippy -p euhedral-memory -p euhedral-gpu --all-targets --features cuda
+          cargo test -p euhedral-gpu --features cuda --no-run
+
+  miri:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned nightly toolchain with Miri
+        run: |
+          toolchain=$(cat scripts/ci/miri-toolchain)
+          rustup toolchain install "$toolchain" --profile minimal --component miri --component rust-src
+          echo "RUSTUP_TOOLCHAIN=$toolchain" >> "$GITHUB_ENV"
+          rustup toolchain uninstall stable || true
+
+      - uses: Swatinem/rust-cache@v2
+        id: cache
+        with:
+          shared-key: miri
+          cache-directories: ~/.cache/miri
+          cache-on-failure: true
+
+      - name: Build Miri's sysroot and the dependencies of every test selection
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          cargo miri setup
+          python3 scripts/ci/miri_build.py --all > miri-build.sh
+          bash -ex miri-build.sh
