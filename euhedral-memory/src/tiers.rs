@@ -15,15 +15,16 @@
 //! - **without allocating**: every slot comes from a pool planned up front; a move only leases and returns slots.
 //!
 //! Completions reach the residents' owners as lattice frames of the mover's [`Moves`] source (routed by the owner's
-//! hash, as give-back orders are); the same source drives the moves when the lattice asks it for frames. Nothing
-//! takes a lock: residents are cells of atomics, moves and free slots go through lock-free queues.
+//! hash, as give-back orders are); the same source pushes a pump frame, which a worker runs to drive the moves
+//! (the source's `request` and `pull` run no work of their own). Nothing takes a lock: residents are cells of
+//! atomics, moves and free slots go through lock-free queues.
 
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
-use euhedral_core::frames::{Frame, RunnableFrame};
-use euhedral_core::generics::{LatticeReceiver, LatticeSource};
+use euhedral_core::frames::{Frame, FrameError, FrameHeader, RunnableFrame};
+use euhedral_core::generics::{KeySlot, LatticeReceiver, LatticeSource};
 use euhedral_data_structures::queues::{Consumer, MpmcQueue, Multi, Producer};
 use euhedral_data_structures::sync::HotScope;
 use euhedral_graph::{DeviceQueue, Marker};
@@ -203,6 +204,9 @@ pub struct TierPool {
     count: u32,
     free: Queue<(u32, Claim)>,
     free_count: AtomicU32,
+    /// Slots that became free, ever (a slot returned, or its budget restored): what a mover reads to see that a
+    /// spilled resident's home may have room again.
+    frees: AtomicU64,
     /// Slots whose budget was given back on order: (index) without a claim, until restored.
     retired: Queue<u32>,
     retired_count: AtomicU32,
@@ -243,6 +247,7 @@ impl TierPool {
             count,
             free: (q.producer(), q.consumer()),
             free_count: AtomicU32::new(0),
+            frees: AtomicU64::new(0),
             retired: (r.producer(), r.consumer()),
             retired_count: AtomicU32::new(0),
         };
@@ -261,6 +266,7 @@ impl TierPool {
     fn push_free(&self, index: u32, claim: Claim) {
         self.free_count.fetch_add(1, Ordering::AcqRel);
         let _ = self.free.0.offer((index, claim));
+        self.frees.fetch_add(1, Ordering::Release);
     }
 
     pub fn location(&self) -> LocationId {
@@ -521,6 +527,9 @@ pub struct Mover {
     done: Queue<(MoveHandler, MoveDone)>,
     source: Arc<Moves>,
     moves_started: AtomicU64,
+    /// The pools' `frees` as of the last pump: a change says a slot freed since, so a spilled resident may be able
+    /// to come home.
+    pumped_frees: AtomicU64,
 }
 
 impl fmt::Debug for Mover {
@@ -551,6 +560,11 @@ impl Mover {
         let mq = MpmcQueue::<Box<MoveTask>>::new(n);
         let dq = MpmcQueue::<(MoveHandler, MoveDone)>::new(n);
         let staging = staging.and_then(|l| pools.iter().position(|p| p.location == l));
+        // The slots the pools were made with are not a change: nothing is due until one frees.
+        let frees = pools
+            .iter()
+            .map(|p| p.frees.load(Ordering::Acquire))
+            .fold(0, u64::wrapping_add);
         Arc::new_cyclic(|weak: &Weak<Mover>| Mover {
             planner: planner.clone(),
             pools,
@@ -563,10 +577,12 @@ impl Mover {
             done: (dq.producer(), dq.consumer()),
             source: Arc::new(Moves::new(weak.clone())),
             moves_started: AtomicU64::new(0),
+            pumped_frees: AtomicU64::new(frees),
         })
     }
 
-    /// The source of completion frames: add it upstream of a lattice; the lattice's demand also drives the moves.
+    /// The source of completion frames: add it upstream of a lattice; the lattice's demand also drives the moves,
+    /// by a frame the source pushes when a pump is due (see [`pump_due`](Self::pump_due)).
     pub fn moves(&self) -> Arc<Moves> {
         self.source.clone()
     }
@@ -861,9 +877,30 @@ impl Mover {
         unsafe { copier.start(from, fp.address(fslot), to, tp.address(tslot), bytes) }
     }
 
+    /// The slots the pools freed, ever: it changes when a slot is returned or its budget restored.
+    fn frees(&self) -> u64 {
+        self.pools
+            .iter()
+            .map(|p| p.frees.load(Ordering::Acquire))
+            .fold(0, u64::wrapping_add)
+    }
+
+    /// Whether a pump has something to do: a move is in flight (its copy may have retired), or a slot freed since
+    /// the last pump (a spilled resident's home may have room). Two atomic loads per pool; it queries no copy and
+    /// scans no resident. [`Moves`] asks it before it pushes its pump frame, so an idle mover costs no frame.
+    pub fn pump_due(&self) -> bool {
+        self.in_flight() > 0 || self.frees() != self.pumped_frees.load(Ordering::Acquire)
+    }
+
     /// Drives the moves: finishes those whose copy retired (or starts their second hop), then brings spilled
     /// residents home where slots are free. Returns the moves finished. Never waits; any thread may call it.
+    ///
+    /// This is the work of the pump frame that [`Moves`] pushes into a lattice (a worker runs it, as it runs any
+    /// frame); the source's `request` and `pull` never run it. Slots that free during the pump (and one that frees
+    /// while it runs) make the next one due.
     pub fn pump(&self) -> u32 {
+        // Read before the scan: a slot that frees during it is not covered by this pump.
+        self.pumped_frees.store(self.frees(), Ordering::Release);
         let mut finished = 0;
         let mut keep = Vec::new();
         let limit = self.moves.1.size_long();
@@ -1119,12 +1156,82 @@ impl Drop for Mover {
 // Completions as frames
 
 /// A `LatticeSource` of move completions: each runs its resident owner's handler as a frame routed by the owner's
-/// hash. Pulling also drives the moves ([`Mover::pump`]), so a lattice that asks for frames keeps the copies going.
+/// hash.
+///
+/// Driving the moves ([`Mover::pump`]: asking each copy whether it retired, starting second hops, bringing spilled
+/// residents home) is a frame's work, never the source's: `request` and `pull` only hand out the completions that
+/// are done. When a pump is due ([`Mover::pump_due`]), `request` or `pull` pushes the source's one *pump frame*
+/// (an idle lattice calls `pull` on a handle far more often than `request`), whose `execute` pumps on whichever worker
+/// it is routed to; once it has run, the frame goes home and the next call may push it again. A worker that has no
+/// pump to run sees no frame.
 pub struct Moves {
     mover: Weak<Mover>,
     downstream: OnceLock<Arc<dyn LatticeReceiver>>,
     demand: AtomicU64,
     complete: AtomicBool,
+    /// The pump frame, while it is home.
+    key: KeySlot<PumpFrame>,
+}
+
+/// The key frame of a [`Moves`] source: its `execute` pumps the mover.
+struct PumpFrame {
+    header: FrameHeader,
+    mover: Weak<Mover>,
+    /// Counts the pushes, so that each is routed by a hash of its own.
+    seed: u64,
+}
+
+impl PumpFrame {
+    fn new(mover: Weak<Mover>) -> Box<Self> {
+        let id = euhedral_hashing::hasher_api::mix_with_zero_check(mover.as_ptr() as usize as u64);
+        Box::new(Self {
+            header: FrameHeader::new(id),
+            mover,
+            seed: 0,
+        })
+    }
+
+    /// Unordered, and a new routing hash for each push: the pump may run on any worker.
+    fn arm(&mut self) {
+        self.seed = self.seed.wrapping_add(1);
+        self.header.randomize_hash(self.seed);
+    }
+}
+
+impl Frame for PumpFrame {
+    fn header(&self) -> &FrameHeader {
+        &self.header
+    }
+
+    fn header_mut(&mut self) -> &mut FrameHeader {
+        &mut self.header
+    }
+
+    fn execute(&mut self) -> Result<(), FrameError> {
+        if let Some(mover) = self.mover.upgrade() {
+            mover.pump();
+        }
+        Ok(())
+    }
+
+    /// The key goes home. (A mover that is gone has no home: the frame is dropped.)
+    fn recycle(self: Box<Self>) {
+        if let Some(mover) = self.mover.upgrade() {
+            mover.source.key.home(self);
+        }
+    }
+}
+
+impl Drop for PumpFrame {
+    /// A key that is dropped without having run (a lattice that discarded it) must not strand the pump: a new
+    /// one goes home. A key that is homed does not get here.
+    fn drop(&mut self) {
+        if let Some(mover) = self.mover.upgrade()
+            && !mover.source.key.is_home()
+        {
+            mover.source.key.home(PumpFrame::new(self.mover.clone()));
+        }
+    }
 }
 
 impl fmt::Debug for Moves {
@@ -1138,6 +1245,7 @@ impl fmt::Debug for Moves {
 impl Moves {
     fn new(mover: Weak<Mover>) -> Self {
         Moves {
+            key: KeySlot::with_key(PumpFrame::new(mover.clone())),
             mover,
             downstream: OnceLock::new(),
             demand: AtomicU64::new(0),
@@ -1161,7 +1269,6 @@ impl Moves {
         let Some(m) = self.mover.upgrade() else {
             return 0;
         };
-        m.pump();
         let mut n = 0;
         while n < demand {
             let Some((handler, done)) = m.take_done() else {
@@ -1207,6 +1314,28 @@ impl Moves {
                 });
         }
     }
+
+    /// Pushes the pump frame when a pump is due and no pump frame is out. The key is a control frame, not part of the
+    /// demand (like a hot source's pushes), and there is at most one. Does nothing without a downstream.
+    fn push_pump(&self) {
+        if self.complete.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(downstream) = self.downstream.get() else {
+            return;
+        };
+        let Some(m) = self.mover.upgrade() else {
+            return;
+        };
+        if !m.pump_due() {
+            return;
+        }
+        let Some(mut key) = self.key.take() else {
+            return;
+        };
+        key.arm();
+        downstream.push(key);
+    }
 }
 
 impl LatticeSource for Moves {
@@ -1226,7 +1355,9 @@ impl LatticeSource for Moves {
         stop: &mut dyn FnMut(&dyn Frame) -> bool,
         demand: u64,
     ) -> u64 {
-        self.emit(consumer, stop, demand)
+        let handed = self.emit(consumer, stop, demand);
+        self.push_pump();
+        handed
     }
 
     fn request(&self, demand: u64) {
@@ -1235,6 +1366,7 @@ impl LatticeSource for Moves {
         }
         self.demand.fetch_add(demand, Ordering::AcqRel);
         self.wake();
+        self.push_pump();
     }
 
     fn complete(&self) {
