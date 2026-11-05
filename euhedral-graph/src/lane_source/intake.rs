@@ -2,7 +2,9 @@
 //!
 //! A lane's own intake is an MPSC queue: any thread delivers, the lane's source takes, and delivery
 //! order is kept per lane. A lane group's shared intake is an MPMC queue every source of the group
-//! takes from, one item at a time. Delivery is an `offer` and nothing more.
+//! takes from, one item at a time. Delivery is an `offer` and nothing more, and it is the only thing an outside thread
+//! (a submitter, a completion poller, another runtime) does to get work to a lane: it never calls the source's
+//! `request` or `pull` to have the work admitted. A worker admits it at its next `request` of the source.
 
 use std::fmt;
 use std::sync::Arc;

@@ -49,6 +49,13 @@ pub trait LatticeReceiver: LatticeTerminal {
 /// The key is a control frame, not part of the demand. A key that polls blind is
 /// paced ([`KeyPacing`](super::KeyPacing)): it is not pushed at every visit while nothing ends, or the worker never
 /// parks.
+///
+/// **Only the lattice's workers call `request` and `pull`.** Work that comes from outside (a submitter, a completion
+/// poller, another runtime) is offered into a queue the source owns, an MPSC the source's `pull` and `request` take
+/// from on the workers' own visits, and the outside thread returns at once: it never calls `request` or `pull` to get
+/// its work admitted. A call from outside is not served by anything that is waiting for it: it can find the source
+/// held by a worker's `pull`, which pushes nothing and serves nothing, and then waits for the lattice's next `request`
+/// of that source. (A test or a caller with no lattice may stand in for the worker, and drive a source by hand.)
 pub trait LatticeSource: Send + Sync {
     /// Attaches the receiver this source pushes to. A source that tells the receiver about itself
     /// does so through [`LatticeTerminal::add_upstream`], passing this `Arc`.
@@ -70,6 +77,12 @@ pub trait LatticeSource: Send + Sync {
     /// The source may push during this call or later from another thread. Each push is a separate
     /// admission that uses whatever routing is live when that push begins: returning from `request`
     /// reserves nothing for frames pushed later.
+    ///
+    /// Only a worker calls it (see the trait's documentation). A `request` made while a `pull` of the same source holds
+    /// it (from the pull's consumer, or from a caller that is not a worker) banks its demand and is not served by that pull: a pull pushes nothing, not even as it lets go. The source
+    /// serves it at the lattice's next `request` of that source, which comes when a worker's whole cycle processed
+    /// nothing (its cache included), and `request` returns nothing, so a caller cannot tell it was refused. Frames
+    /// the source already holds are handed out by the pulls meanwhile.
     fn request(&self, demand: u64);
 
     /// Finishes the source.

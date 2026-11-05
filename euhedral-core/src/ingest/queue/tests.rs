@@ -121,7 +121,7 @@ fn nothing_is_delivered_without_a_receiver() {
 }
 
 #[test]
-fn a_request_inside_a_pull_consumer_is_delivered_after_the_pull_lets_go() {
+fn a_request_inside_a_pull_consumer_is_delivered_by_the_next_request_and_the_pull_pushes_nothing() {
     let (sink, source, receiver) = attached();
     offer(&sink, 1..=3);
     let inner = source.clone();
@@ -129,6 +129,8 @@ fn a_request_inside_a_pull_consumer_is_delivered_after_the_pull_lets_go() {
     let count = source.pull(
         &mut |frame| {
             pulled.push(frame.header().id_hash());
+            // The queue is held, as when a frame the pulling worker runs inline requests the source: the request banks
+            // its demand and leaves a wakeup, and delivers nothing.
             inner.request(1);
             assert!(receiver.received().is_empty());
         },
@@ -137,8 +139,16 @@ fn a_request_inside_a_pull_consumer_is_delivered_after_the_pull_lets_go() {
     );
     assert_eq!(count, 1);
     assert_eq!(pulled, [1]);
-    assert_eq!(receiver.received(), [2]);
-    assert_eq!(sink.size(), 1);
+    assert!(
+        receiver.received().is_empty(),
+        "the pull pushed nothing as it let go (it used to deliver frame 2 to the receiver)"
+    );
+    assert_eq!(sink.size(), 2, "frames 2 and 3 are still queued");
+    assert_eq!(sink.demand(), 1, "the demand the consumer banked is kept");
+    // The next request delivers it, within the banked demand (1, and this request's 1).
+    source.request(1);
+    assert_eq!(receiver.received(), [2, 3]);
+    assert_eq!(sink.size(), 0);
     assert_eq!(sink.demand(), 0);
 }
 
@@ -482,7 +492,7 @@ fn complete_before_attach_tells_the_late_receiver_once() {
 }
 
 #[test]
-fn a_request_while_a_pull_holds_the_queue_is_served_when_the_pull_releases() {
+fn a_request_while_a_pull_holds_the_queue_is_delivered_by_the_next_request_not_by_the_pull() {
     use std::sync::Barrier;
     let (sink, source, receiver) = attached();
     offer(&sink, 0..5);
@@ -513,12 +523,16 @@ fn a_request_while_a_pull_holds_the_queue_is_served_when_the_pull_releases() {
         release.wait();
         assert_eq!(puller.join().unwrap(), 1);
     });
-    assert_eq!(
-        receiver.received().len(),
-        4,
-        "the pull served the request as it let go"
+    assert!(
+        receiver.received().is_empty(),
+        "the pull pushed nothing as it let go: a pull never pushes"
     );
-    assert_eq!(sink.demand(), 0);
+    assert_eq!(sink.demand(), 4, "the refused request's demand is kept");
+    assert_eq!(sink.size(), 4);
+    // The next request serves the wakeup: it delivers within the demand banked (4, and its own 1).
+    source.request(1);
+    assert_eq!(receiver.received().len(), 4);
+    assert_eq!(sink.demand(), 1);
     assert_eq!(sink.size(), 0);
 }
 
@@ -575,6 +589,64 @@ impl Owner for Discarding {
             source.discard_queued(|frame| frame.do_finally_with_error(FrameError::Cancelled));
         }
     }
+}
+
+/// An owner whose kill is under way: once `killing` is set, the tail of every drain discards what is queued, as a
+/// runner's does between its kill switch and the close that completes the downstream.
+struct Killing(std::sync::atomic::AtomicBool);
+
+impl Owner for Killing {
+    fn complete(&self, source: &QueueSource) {
+        source.close();
+    }
+
+    fn drain_finished(&self, source: &QueueSource) {
+        if self.0.load(Ordering::SeqCst) {
+            source.discard_queued(|frame| frame.do_finally_with_error(FrameError::Cancelled));
+        }
+    }
+}
+
+#[test]
+fn a_discard_from_the_tail_of_a_pull_during_a_kill_serves_no_request() {
+    let source = QueueSource::new(NonZeroUsize::MIN, 64, Ending::Gracefully);
+    let owner = Arc::new(Killing(std::sync::atomic::AtomicBool::new(false)));
+    let as_owner: Arc<dyn Owner> = owner.clone();
+    source.set_owner(Arc::downgrade(&as_owner));
+    let receiver = TestReceiver::new();
+    source.clone().add_downstream(receiver.clone());
+    for id in 1..=3 {
+        assert!(source.offer(frame(id)).is_ok());
+    }
+    let inner = source.clone();
+    let pulled = source.pull(
+        &mut |_frame| {
+            // The queue is held: the request banks its demand and leaves its wakeup. The kill switch is set while the
+            // pull is inside, so the tail of this pull runs the owner's discard.
+            inner.request(1);
+            owner.0.store(true, Ordering::SeqCst);
+        },
+        &mut |frame| frame.header().id_hash() == 2,
+        3,
+    );
+    assert_eq!(pulled, 1);
+    assert_eq!(
+        source.size(),
+        0,
+        "the kill's discard from the tail of the pull cancelled the frames left in the queue"
+    );
+    assert!(
+        receiver.received().is_empty(),
+        "nothing was pushed from the pull"
+    );
+    // Only a request takes the wakeup (the swap in `drain_requests`): the discard used to take it, and to push what
+    // was queued behind its last emptiness check, from inside the pull. The kill completes the downstream right
+    // after, so a request left pending is not lost.
+    assert!(
+        source.request_pending.load(Ordering::SeqCst),
+        "the discard left the wakeup for the next request"
+    );
+    assert_eq!(source.demand(), 1, "and its banked demand");
 }
 
 #[test]

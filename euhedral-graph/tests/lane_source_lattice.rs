@@ -232,3 +232,117 @@ fn lane_sources_on_a_real_lattice_deliver_every_frame_once() {
     lattice.close();
     let _: Vec<Arc<LaneSource<FakeLane, (), Item>>> = sources;
 }
+
+/// A frame that keeps its worker busy for `spin`.
+struct Busy {
+    header: FrameHeader,
+    spin: Duration,
+    ran: Arc<AtomicUsize>,
+}
+
+impl Frame for Busy {
+    fn header(&self) -> &FrameHeader {
+        &self.header
+    }
+
+    fn header_mut(&mut self) -> &mut FrameHeader {
+        &mut self.header
+    }
+
+    fn execute(&mut self) -> Result<(), FrameError> {
+        let until = Instant::now() + self.spin;
+        while Instant::now() < until {
+            std::hint::spin_loop();
+        }
+        self.ran.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[test]
+fn work_offered_from_outside_runs_while_two_or_more_workers_are_busy_with_nothing_requesting_it() {
+    // The workers have other frames to run (a hot source's), so their cycles process something and the lane's
+    // handle is visited by pulls. The outside thread offers an item to the lane's intake and returns: it calls neither
+    // `request` nor `pull`. The workers take it on their own visits, once their cycles have a moment with nothing to
+    // run: eventually, and no outside call helps.
+    let allowed = affinity::base_mask();
+    let mut cpus: Vec<usize> = cpus()
+        .into_iter()
+        .filter(|&c| allowed.contains(c))
+        .collect();
+    if cpus.is_empty() {
+        cpus = allowed.iter().take(4).collect();
+    }
+    assert!(
+        cpus.len() >= 2,
+        "the test needs two workers or more (set EUHEDRAL_TEST_CPUS)"
+    );
+    let lattice = lattice(&cpus);
+
+    let mut builder = LanePoolBuilder::new();
+    let first = builder.reserve(1);
+    let (fake, submitters, queues) = FakeLanes::open(first, 1);
+    let fake = fake.quiet();
+    for (i, queue) in queues.into_iter().enumerate() {
+        builder.set(LaneId(i as u16), queue);
+    }
+    let (intakes, inputs) = LaneIntakes::<Item>::new(builder.build(), &[]);
+    let source = LaneSource::new(
+        submitters.into_iter().next().unwrap(),
+        (),
+        inputs.into_iter().next().unwrap(),
+        intakes.clone(),
+    );
+    lattice
+        .add_upstream(source.clone() as Arc<dyn LatticeSource>)
+        .unwrap();
+    let hot = Arc::new(euhedral_core::flow_control::LatticeHotSource::new());
+    lattice
+        .add_upstream(hot.clone() as Arc<dyn LatticeSource>)
+        .unwrap();
+
+    // Busy work for every worker: 2 ms frames, enough of them to keep all of them running for a while.
+    let ran = Arc::new(AtomicUsize::new(0));
+    let busy_frames = cpus.len() * 100;
+    for i in 0..busy_frames {
+        hot.accept(Box::new(Busy {
+            header: FrameHeader::new(i as u64),
+            spin: Duration::from_millis(2),
+            ran: ran.clone(),
+        }));
+    }
+    // The outside offer, while the workers are busy.
+    let counters: Counters = Arc::new(vec![AtomicUsize::new(0)]);
+    intakes
+        .deliver(
+            Item {
+                index: 0,
+                retire: false,
+                counters: counters.clone(),
+                failures: Arc::new(AtomicUsize::new(0)),
+            },
+            Deliver::Lane(LaneId(0)),
+        )
+        .unwrap();
+    assert!(
+        ran.load(Ordering::SeqCst) < busy_frames,
+        "the workers are still busy when the item is offered"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while counters[0].load(Ordering::SeqCst) == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the offered item runs within 30 s, though nobody outside requested it"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    while ran.load(Ordering::SeqCst) < busy_frames {
+        assert!(Instant::now() < deadline, "the busy frames all ran");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    std::thread::sleep(Duration::from_millis(20));
+    assert_eq!(counters[0].load(Ordering::SeqCst), 1, "the item ran once");
+    drop(fake);
+    lattice.close();
+}

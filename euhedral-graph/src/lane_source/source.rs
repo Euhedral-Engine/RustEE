@@ -122,9 +122,11 @@ impl<S: LaneSubmit, X: LaneState, W> Drop for Inner<S, X, W> {
 ///
 /// Everything the lane keeps is plain state in a `SourceCell`, entered inside `request` and `pull`,
 /// which the lattice serializes. The cell's claim is checked in every build: a `request` that finds
-/// it taken (a direct call racing the lattice, or a call from inside an item) has banked its demand
-/// and left a wakeup, and the holder serves it when it lets go; a `pull` that finds it taken hands
-/// over nothing. The lifecycle (`complete`) touches atomics only.
+/// it taken (a call from inside an item, or a caller that is not a worker) has banked its demand
+/// and left a wakeup, and a holder that is a `request` serves it when it lets go; a holder that is a `pull` serves
+/// nothing (a worker that entered from a pull must not push, and serving runs items), so the wakeup waits for the
+/// lattice's next `request` of this source. A `pull` that finds the cell taken hands over nothing. The lifecycle
+/// (`complete`) touches atomics only.
 ///
 /// Work an item answers `Wait` for stays in this source, even when it came from the group's shared
 /// intake: it runs when this lane's state meets the wait.
@@ -137,7 +139,8 @@ pub struct LaneSource<S: LaneSubmit, X: LaneState, W> {
     /// The depth of `ready`, published at the end of each call.
     ready_len: AtomicUsize,
     /// A `request` happened that no pass has served yet: a wakeup, as the ingest sinks'
-    /// `requestPending`. A caller that cannot enter the cell leaves it set for whoever is inside.
+    /// `requestPending`. A caller that cannot enter the cell leaves it set for whoever is inside, if that is a `request`
+    /// (it looks again after it lets go); a `pull` that was inside serves nothing, so the wakeup waits for the next `request`.
     pending: AtomicBool,
     intakes: Arc<LaneIntakes<W>>,
     metrics: LaneMetrics,
@@ -460,7 +463,8 @@ impl<S: LaneSubmit, X: LaneState, W: LaneWork<S, X>> LaneSource<S, X, W> {
     }
 
     /// Serves the requests that arrived, one pass per claim. A caller that cannot take the claim
-    /// leaves `pending` set for the holder, which looks again after it lets go.
+    /// leaves `pending` set for the holder, which looks again after it lets go when it is a `request` (a `pull` never
+    /// calls this: serving runs items and pushes). Only `request` calls it.
     fn drain_requests(&self) {
         while self.pending.load(Ordering::SeqCst) {
             let Some(mut guard) = self.cell.try_enter() else {
@@ -593,7 +597,7 @@ impl<S: LaneSubmit, X: LaneState, W: LaneWork<S, X>> LatticeSource for LaneSourc
         }
         let started = Instant::now();
         // The lattice serializes `pull` and `request`, so the claim is free. A caller that finds it
-        // taken (a direct call racing the lattice, or a call from inside an item) hands over
+        // taken (a call from inside an item, or a caller that is not a worker) hands over
         // nothing, as the ingest sinks' `pull` does when their drain is taken.
         let Some(mut inner) = self.cell.try_enter() else {
             return 0;
@@ -613,9 +617,10 @@ impl<S: LaneSubmit, X: LaneState, W: LaneWork<S, X>> LatticeSource for LaneSourc
         self.publish(&inner);
         drop(inner);
         self.metrics.service_ns.record(ns(started.elapsed()));
-        // A request made while this pull held the claim (from the consumer) left a wakeup: serve it
-        // now, as the ingest sinks' pull does in its `finally`.
-        self.drain_requests();
+        // A request made while this pull held the claim (from the consumer, or from another thread) left a wakeup, and
+        // banked its demand. It is not served here: serving runs the lane's items and pushes, and a pull does neither.
+        // The wakeup stays set for the next `request`, which serves it (the lattice requests whenever a pull found
+        // nothing), and the frames already ready are handed out by the next `pull`.
         pulled
     }
 
