@@ -3,6 +3,26 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## A quantum that touched no lane concludes in its last frame (2026-11-05)
+
+**What.** A quantum whose stages name no device lane runs to its end in the frames of its stages. The conclude rule, per quantum:
+- A quantum **touches a lane** when one of its stages submitted a marker, a marker was recorded for it (an external edge brought one, or a later quantum's stage that used it submitted one), or the `Stage::abandoned` hook of a stage that names a lane (`StageSpec::lanes` not empty) ran.
+- A quantum that touches a lane keeps its boundary exactly as before: the lanes it used join its home lane and one retirement is armed there (or one completion per lane on a query-only pool), and it concludes in the frame that retirement or completion emits.
+- A quantum that touches none arms no retirement. It concludes (runs the `retired` hooks, calls `retire`, returns its run to the pool) in the call that drops its last live count: the frame that ends its last stage, the frame of its last host completion, or the frame that abandons its stages (a kill, a failed stage). When a `QuantumRef` or a later quantum's stage still holds it, it concludes in the call that drops the last hold, on that thread. The frames of such a quantum are its stages' and its completions' frames.
+
+**Java correspondence.** Java arms `home.notifyRetired` for every quantum (its `usedLanes` starts with the home lane) and concludes through the retirement frame. Java's `StageFrame.host()` names a stage that submits nothing to a lane and records no marker; `StageSpec::lanes` empty is that declaration here, and a quantum of such stages alone has no device work to retire. A quantum that touches a lane follows Java as before.
+
+**Why.** `abandon_unsubmitted` counted every stage that did not submit as a hook that ran, even the default no-op `abandoned`, so `arm_boundary` armed a retirement on the home lane (a host callback on the lane, a registration and two frames) for each killed or failed quantum of host-only stages, and every quantum of such a graph ended in a separate retirement frame. A graph of host stages needed a query-only home pool to avoid it.
+
+**Contract** (stated on `Stage::abandoned`, `StageSpec::lanes`, `StageGraph` and in the module documentation; pinned by tests with no tolerance):
+- The hook of a stage that names no lane runs at the same place with the same arguments as before (once, in stage order, with the home lane). A retirement covers the hooks of stages that name a lane.
+- Retirements armed by a quantum that touched no lane: 0, for a run, a kill and an abandon, on a lane that arms retirements and on a query-only lane. Frames: one per stage frame run, plus one per host completion.
+- `retire` and the `retired` hooks of such a quantum run on the thread that drops its last count or hold.
+
+**Migration.** A stage that names no lane and enqueues work on the home lane from `abandoned` names that lane in `StageSpec::lanes`.
+
+**Tests.** `stage_graph::tests` (names start `a_quantum_that_used_no_lane`, `a_killed_quantum_that_used_no_lane`, which the Miri shard selects): a chain of host stages concludes in its last stage's frame (3 stages, 3 frames); a host completion's frame concludes it; a kill and a failed stage conclude in the abandoning frame (1 frame, hooks in stage order, no arming attempted even with the lane set to refuse one); 30 quanta of run, kill and abandon each cost the frames of their stages and arm 0 retirements; the last dropped reference concludes it at the drop; a quantum covered by a later quantum's marker keeps its retirement; a quantum with a stage that names a lane keeps its retirement. Each on a lane that arms retirements and on a query-only lane. `tests/stage_graph_lane_less_alloc.rs`: 3000 quanta of run, kill and abandon allocate 0 after warm-up and cost exactly their stages' frames.
+
 ## A stage holds itself at its gate from inside `run` (2026-11-04)
 
 **What.** A stage that finds, while it runs, that the state it needs is not ready takes its gate with `StageCx::hold()` and answers `Err(StageError::Held)`. Whoever makes the state ready releases the `Gate`; the stage then runs again, once, with nothing retried and nothing allocated. Until now only `Stage::pass_gate` (Java `StageFrame.passGate`), consulted before the first run, could hold a stage, so a wait found only by running could be answered by `StageError::Retry` alone, which re-places the stage and registers a wake-up for every attempt.
