@@ -3,6 +3,56 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## Sources run no work in `request` or `pull` (2026-11-05)
+
+**What.** Five places did work inside a source's `request` or `pull`. Four of them no longer do:
+- `Completions` queried every registered operation on each call (a `Ready`'s `is_ready`, a `Pending`'s `poll`, markers, retirement cells, timers) and called the continuations that build frames.
+- `AsyncIo` asked the engine for finished operations (reading the rings' completion queues, flushing the kernel's backlog with a system call, resubmitting short pieces) and called each operation's continuation.
+- `Moves` (`euhedral-memory`) called `Mover::pump` on every `pull`: it asked every in-flight copy whether it retired, started second hops, freed slots and scanned every resident for one to bring home.
+- `IdleWatch` (the lake's idle watch) detached the set of sinks (the attach lock, completing each sink) from the poll that found the lake idle.
+
+The fifth, `GiveBacks`, stays as it is: it pops one order and builds its frame, and the handler already runs as a frame.
+
+Now the work is a frame's. Each of these sources owns one reusable **key frame** and pushes it from `request` or `pull` when work is due: `Completions` while operations wait, `AsyncIo` while operations are in flight, `Moves` when `Mover::pump_due`, `IdleWatch` once the lake has been idle for the idle time. A worker executes the frame (so its cost is measured as any frame's is), and the frame's `recycle` sends it home. `request` and `pull` only hand out: they pass on the continuations the key frame found, within the demand, and ask nothing of the operations.
+
+**Why.** The workers can only measure how long work takes if the frame comes back through their executor; that is how they learn the shape of the workload, size their batches, and decide to idle or to take part. Work done in a source's `request` or `pull` is invisible to them.
+
+**Java correspondence.** Java's `GpuCompletions`, `AsyncReads` and `InferenceLake`'s idle watch do their work in the delegate's `hookOnPull` and `hookOnRequest`. This is a deliberate departure from them: the rule that sources run no work in `request` or `pull` supersedes. `Moves` and `GiveBacks` have no Java original.
+
+**How to use it.**
+- New in `euhedral-core`: `generics::KeySlot<K>`, the key's home. One atomic reference: `take` (a swap with `Acquire`, behind a `Relaxed` read that spares a key that is away) and `home` (a store with `Release`). A source that needs a key frame holds one `KeySlot<K>`.
+- A caller that drives a source by hand (tests, or any code outside a lattice) calls `Completions::reap` or `AsyncIo::reap` before it pulls. They do what the key frame does. **Breaking:** `Completions::pull` and `AsyncIo::pull` find nothing on their own; they hand out what a reap queued. `Mover::pump` is unchanged (public, any thread).
+- `Mover::pump_due()`: whether a move is in flight, or a slot freed in any pool since the last pump.
+
+**Semantics.**
+- **At most one key frame per source is out.** The source pushes it only while it is home. A `request` or `pull` that finds it away does nothing more than read one flag. The frame is unordered (the lake's detach frame excepted) and routed by a new hash for each push, so it may run on any worker.
+- **A pull pushes it too, and it is not part of the demand.** An idle lattice was seen calling `pull` on a source tens of thousands of times in 20 s and `request` on it not once (the idle watch of the lake test `offers_racing_an_idle_detach_land_in_exactly_one_set`: it was asked 0 times and pulled 57 000 times, and the set never detached), so a source whose work is due only now and then cannot rely on `request`. `pull` still hands over no key frame: the key is pushed to the downstream, as a hot source pushes, which a source without a downstream (a caller driving by hand) does not do.
+- **Pushed only when there is work.** The check is an O(1) counter (`Completions`: registrations not yet found completed; `AsyncIo`: operations submitted and not yet reaped; `Mover::pump_due`; the lake's idle test, two atomic loads). A source with nothing to look at pushes nothing, so an idle source costs a worker no frame.
+- **Order and demand are unchanged.** The frames a reap finds go into one single-producer, single-consumer queue in the order found and out through `request`/`pull` with `stop` and the banked demand as before (a `Completions` holds back the first frame a pull's `stop` matches, as before). The worker that ran the key frame hands out within the demand already banked when it has found something.
+- **A completed `Completions` pushes no key frame, and its `request` and `pull` cancel nothing.** What was registered behind `complete`'s marker is cancelled by a registration's own sweep, by `reap`, or by the last drop, as before; none of them is `request` or `pull`.
+- **A key frame dropped without having run** (a frame the lattice discarded) is replaced by a new one, at home, so the work cannot be stranded. A frame that finds its source gone does nothing.
+- **A detach frame that finds the lake busy again** leaves the set alone and goes home; the watch pushes it again at the next idle time.
+- **Allocation:** none added per frame. The key and the queues' chunks are made once (the chunks are pooled).
+
+**Tests.** A test per moved site detects work in `request`/`pull` without timing, with a receiver that keeps what the source pushes (the test runs it as a worker would) and a counter of the queries made, or a mark that the work itself reads to see whether it runs inside a frame: `euhedral-memory/tests/tiers.rs` (`a_request_or_pull_of_the_moves_source_drives_no_move_and_a_frame_does`, `a_source_with_nothing_in_flight_pushes_no_pump_frame`, `a_freed_slot_asks_for_one_pump_to_bring_a_spilled_resident_home`), `euhedral-io/tests/key_frame.rs`, `euhedral-graph/tests/lake.rs` (`an_idle_watch_detaches_in_a_frame_and_not_in_a_request`, `a_detach_frame_that_finds_the_lake_busy_again_keeps_the_set_and_goes_home`), `completions::tests` (names start `request_and_pull_query_nothing`, `the_poll_frame`), and `euhedral-memory/tests/planner.rs` (`a_give_back_order_runs_its_handler_only_when_its_frame_executes`) for the site that stayed. `KeySlot` has its own tests (`generics::key_slot::tests`), including eight threads racing for the key.
+
+## A pull that finds nothing holds the handle for the request that follows (2026-11-05)
+
+**What.** `UpstreamQueue::pull` holds back a handle whose pull found no frames (and did not stop at one), so the next `request` services that same handle first. Until now only a handle whose pull stopped at a frame was held back.
+
+**Why.** A demand under `pull_bucket_target` (2048) is one bucket, so a pull and a request each service one handle. A Direct worker that finds nothing runs one pull and then one request, so the rotation moved two handles per cycle. With an even number of handles the pulls always landed on one half of them and the requests on the other: the half that was only ever requested never read as empty, so its productivity stayed at its initial value for ever and `productive_handle_count()` never reached 0; and the half that was only ever pulled was never requested, so a source that does its work in `request` was never reached. An idle lattice with an even number of idle sources kept its first-ranked worker out of the unproductive park: one CPU with 6 handles and nothing to do, against 0.32 with 5.
+
+**How to use it.** Nothing to change. It is how the queue now reads its own rotation: every handle gets both a pull and a request, one handle per cycle, whatever the number of handles.
+
+**Semantics.**
+- A pull that ends having found 0 frames and without a stop holds its handle in `pending_request`; the request that follows takes it first, and returns it to the queue behind the others. The rotation therefore advances by one handle per pull-and-request cycle. The same holds when the pull could not be made at all (a closed or draining handle): its request does nothing either.
+- A handle that found nothing never displaces one that stopped at a frame: the frame still gets its request first.
+- A handle held for finding nothing goes back to the queue when the next pull comes before any request, so pulls reach it again; a complete one is dropped then. A handle held for a stop stays held until a request, as before.
+- A pull that found frames holds nothing; a lattice with work behaves as before. Productivity is unchanged: a pull that found nothing marks the handle unproductive, and the request after it is no evidence to the contrary.
+- Java's `UpstreamQueue` has the same rotation and gets the same change. Java leaves the held handle in the queue as a hint and clears the hint at the start of a pull that is not holding a stop; here the entry itself is released at that point, so the request services the same handles in both.
+
+**Tests.** `flow_control::upstream_queue::tests`: five fail on the code before: `every_idle_handle_is_pulled_and_requested_whatever_their_number`, `idle_handles_are_serviced_evenly_by_pulls_and_requests`, `a_lattice_of_idle_handles_reads_as_unproductive_whatever_their_number` (1000 cycles, or 600 for the even split, of `pull(64)` then `request(64)` over 1, 2, 3, 4, 5, 6 and 8 idle handles: each is pulled and requested, and the productive count reaches 0), `a_pull_that_found_nothing_holds_the_handle_for_the_request_that_follows` and `control_plane::fragment::tests::a_worker_over_idle_handles_reaches_the_unproductive_park_whatever_their_number` (a worker's real cycles over 1 to 8 idle handles reach a productive count of 0 within twice as many cycles as handles). The others are guards that pass before and after: `a_pull_that_found_frames_does_not_hold_the_handle`, `a_handle_that_found_nothing_is_pulled_again_when_no_request_comes`, `a_handle_that_found_nothing_does_not_displace_one_that_stopped`, `a_hint_to_an_empty_handle_is_gone_when_a_later_pull_finds_frames` (a pull of A finds nothing, a pull of B finds frames, the request goes to the queue's front as in Java).
+
 ## The benchmark times one push in 64, not one frame in 64 (2026-11-05)
 
 **What.** The benchmark's latency sampling is decided by the source, per push: each source counts its pushes and stamps the 1st, 65th, 129th and so on. It was decided by the frame: one frame in 64 was made as a sampled frame and stamped every time it was pushed.

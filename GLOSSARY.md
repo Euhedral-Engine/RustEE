@@ -38,7 +38,7 @@ Each row is something RustEE does for every frame, source or operation. Do not r
 | Asks each source for frames in batches sized to the core's cache and CPU pressure (`request`). | Push frames nobody asked for, or buffer them without bound. |
 | Returns a finished frame to its pool when the finalizer is the default one. | Keep your own free list of frames. |
 | Follows the machine: effective CPUs (cgroup limits included), pressure and topology changes. It rebalances the workers when the effective topology changes. | Poll `/proc`, re-pin threads or resize the worker set. |
-| Finds completions (device lanes, timers, file and socket operations) in the workers' own polls and runs the continuation as a frame. | Start a completion thread or a timer thread, use a channel, or block on a device or an I/O call. |
+| Finds completions (device lanes, timers, file and socket operations) in a poll frame that a worker runs, and runs the continuation as a frame. | Start a completion thread or a timer thread, use a channel, or block on a device or an I/O call. |
 | Concludes `Sequencer` entries in the order they were offered. | Keep a reorder buffer. |
 | Keeps a memory budget by location and owner, orders lower-priority holders to give memory back, and reports leaks. | Count bytes by hand. |
 | Settles a device retirement and hands it to you as a frame. | Synchronize a stream or wait on an event. |
@@ -392,6 +392,22 @@ state under the source invariant. Entry takes a claim with one compare-and-set i
 guards never exist: `try_enter` hands a refusal back (a nested entry, or a direct call racing the lattice),
 `enter` panics. Under the lattice the claim is always free. A source's lifecycle calls from other threads
 set atomics, and the source applies them in `pull` or `request`.
+
+**no work in `request` or `pull`**: a source assembles frames, hands them out and pushes them; it does not do the
+work itself. Workers measure how long work takes only when a frame comes back through their executor, and that is what
+lets them size their batches and idle or take part correctly, so work done inside a source is work they cannot see.
+Looking at devices or the operating system, finishing copies, building continuations and detaching sinks therefore
+run in a frame (see **key frame**). What may stay in `request` and `pull` is O(1) bookkeeping with no effect of its
+own: popping a ready frame, reading a counter that says whether work is due.
+
+**key frame, KeySlot** ([`KeySlot`](euhedral-core/src/generics/key_slot.rs)): the one reusable frame a source owns
+for work that is due now and then (a poll of the operations it holds, a device pump, a detach). The source pushes it
+from `request` or `pull` only when an O(1) check says there is work and the key is home (it is a control frame, not part of
+the demand); a worker runs its `execute`; its `recycle` sends it home. So at most one worker is in that work, and a source with
+nothing to do pushes nothing. The home is one atomic reference: `take` is a swap with `Acquire` behind a `Relaxed`
+read, `home` a store with `Release`. A key that is dropped without having run is replaced by a new one.
+`Completions`, `AsyncIo`, the memory `Moves` and the lake's idle watch use one; a caller outside a lattice runs the
+work by hand (`Completions::reap`, `AsyncIo::reap`, `Mover::pump`).
 
 **DownstreamSlot** ([`DownstreamSlot`](euhedral-core/src/generics/downstream_slot.rs)): the one receiver a
 source pushes to, read without a lock. A second attach is told `on_error`; the receiver hears
