@@ -24,6 +24,15 @@ pub trait Ready: Send {
     fn is_ready(&mut self) -> bool;
 }
 
+/// A condition that its owner keeps and registers again and again ([`Completions::after_wake`]): polled through a
+/// shared reference, so the registration holds a clone of an `Arc` and allocates nothing. The owner prepares the
+/// condition before each registration and does not touch it again until the frame it was registered with has been
+/// emitted.
+pub(crate) trait Wake: Send + Sync {
+    /// Whether the condition holds now. Called by the polling thread, once per poll, until it does.
+    fn is_ready(&self) -> bool;
+}
+
 /// An operation in flight and what continues it: polled until it yields the continuation frame. Use
 /// it when the completion carries a result (a result fetched from a driver without
 /// waiting, a model's output); use [`Completions::after`] when it doesn't.
@@ -117,6 +126,8 @@ struct Waiting {
 
 enum Waits {
     Ready(Box<dyn Ready>, Box<dyn Frame>),
+    /// A condition its owner keeps (see [`Wake`]).
+    Wake(Arc<dyn Wake>, Box<dyn Frame>),
     Marker(Marker, Box<dyn Frame>),
     /// A lane's retirement callback, named by the cell it fills.
     Retired(Arc<RetireCell>, Box<dyn Frame>),
@@ -260,6 +271,7 @@ impl Completions {
         }
         match what {
             Waits::Ready(_, frame)
+            | Waits::Wake(_, frame)
             | Waits::Marker(_, frame)
             | Waits::Retired(_, frame)
             | Waits::At(_, frame)
@@ -390,6 +402,11 @@ impl Completions {
         self.add(Waits::Ready(ready, frame));
     }
 
+    /// Emits `frame` once `wake` holds. Nothing is allocated: the registration holds a clone of the `Arc`.
+    pub(crate) fn after_wake(&self, wake: Arc<dyn Wake>, frame: Box<dyn Frame>) {
+        self.add(Waits::Wake(wake, frame));
+    }
+
     /// Emits `frame` once `marker`'s work completed (a completion edge on a device lane). A marker of a queue that
     /// is not in this source's pool is never reached, so its frame is never emitted.
     pub fn after_marker(&self, marker: Marker, frame: Box<dyn Frame>) {
@@ -472,6 +489,7 @@ impl Completions {
             // queried again (a query may have effects: a driver call that fetches the result).
             let done = match &mut entry.what {
                 Waits::Ready(ready, _) => ready.is_ready(),
+                Waits::Wake(wake, _) => wake.is_ready(),
                 Waits::Marker(marker, _) => self.lanes.reached(*marker),
                 Waits::Retired(cell, _) => cell.arrived(),
                 Waits::At(deadline, _) => now >= *deadline,
@@ -491,9 +509,10 @@ impl Completions {
                 continue;
             }
             entry.what = match std::mem::replace(&mut entry.what, Waits::Moving) {
-                Waits::Ready(_, frame) | Waits::Marker(_, frame) | Waits::Retired(_, frame) => {
-                    Waits::Done(frame, entry.last_seen)
-                }
+                Waits::Ready(_, frame)
+                | Waits::Wake(_, frame)
+                | Waits::Marker(_, frame)
+                | Waits::Retired(_, frame) => Waits::Done(frame, entry.last_seen),
                 Waits::At(deadline, frame) => Waits::Done(frame, deadline),
                 done @ Waits::Done(..) => done,
                 Waits::Pending(_) | Waits::Moving => unreachable!("resolved above"),
@@ -732,6 +751,44 @@ mod tests {
         assert_eq!(poll(&completions), [1]);
         assert_eq!(completions.pending(), 0);
         assert!(poll(&completions).is_empty(), "emitted once");
+    }
+
+    /// A condition its owner keeps and registers again after each emission.
+    #[derive(Default)]
+    struct Flag {
+        set: AtomicBool,
+        queries: AtomicUsize,
+    }
+
+    impl Wake for Flag {
+        fn is_ready(&self) -> bool {
+            self.queries.fetch_add(1, Ordering::Relaxed);
+            self.set.load(Ordering::Acquire)
+        }
+    }
+
+    #[test]
+    fn a_kept_wake_is_emitted_when_it_holds_and_can_be_registered_again() {
+        let (completions, _) = setup();
+        let flag = Arc::new(Flag::default());
+        for round in 1..=3u64 {
+            completions.after_wake(flag.clone(), tagged(round));
+            assert_eq!(completions.pending(), 1);
+            assert!(poll(&completions).is_empty(), "round {round}: not yet");
+            assert_eq!(flag.queries.load(Ordering::Relaxed), 1, "queried once");
+            flag.queries.store(0, Ordering::Relaxed);
+            flag.set.store(true, Ordering::Release);
+            assert_eq!(poll(&completions), [round]);
+            assert_eq!(completions.pending(), 0);
+            assert_eq!(
+                Arc::strong_count(&flag),
+                1,
+                "the source let go of it when it emitted"
+            );
+            flag.set.store(false, Ordering::Release);
+            flag.queries.store(0, Ordering::Relaxed);
+        }
+        assert!(poll(&completions).is_empty(), "emitted once each");
     }
 
     #[test]

@@ -237,7 +237,10 @@ must return the marker of the work it submitted on its lane (`Lane::submit_marke
 and any `Busy` comes before any work, so a retried stage has submitted nothing). A stage holds what its work reads and
 releases it in `Stage::retired`, which runs once the quantum's device work ended. A stage that waits for host-side readiness holds itself at its gate (`Stage::pass_gate` returns `false` after taking a `Gate`) and
 whatever makes it ready releases the gate, once, from any thread that may publish frames: no polling, and no stream waits for
-the host (`GateRef::hold` consumes the reference: a stage takes one gate). A stage that never submitted is abandoned
+the host (`GateRef::hold` consumes the reference: a stage takes one gate). A wait that only running can find (the stage starts
+and the state it needs is not ready) holds the stage from `run`: it takes the gate with `cx.hold()` and answers
+`StageError::Held`; the release runs it again exactly once, with no retry and no allocation (the contract is on `Stage::run`:
+who may release, a release before `run` returns, a kill, `Gate::fail` and a dropped gate). A stage that never submitted is abandoned
 (`Stage::abandoned(quantum, home)`) at quiesce, after the quantum's lanes joined the home lane and before later quanta are
 released and the retirement is armed on home, so what the hook submits to home is covered by the retirement. A stage that finds its resources busy answers `StageError::Retry` and
 runs again when a lane of the pool made progress, or after `GraphRuntime::retry_backstop` (default
@@ -259,8 +262,8 @@ retired yet.
 
 Quanta are **pooled**. `start` takes a retired quantum's state from a bounded pool and `retire` gives it back,
 as the graph's frames go back to theirs, so after warm-up a quantum allocates nothing and takes no lock of its own. (A stage
-that returns a host completion allocates it; a retried stage and a completion that waits for both a marker and a
-host completion allocate their wake-ups.) `start` takes its external edges as any iterator of `ExternalEdge`s, so
+that returns a host completion allocates it, and a completion that waits for both a marker and a host completion
+allocates its wake-up; a retried stage's wake-up is pooled with its run, so a retry allocates nothing.) `start` takes its external edges as any iterator of `ExternalEdge`s, so
 an array or an `Option` needs no `Vec`.
 
 ### Lakes
