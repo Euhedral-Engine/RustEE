@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use euhedral_core::frames::{Frame, FrameError, FrameHeader};
 use euhedral_core::generics::{
-    DownstreamSlot, KeySlot, LatticeReceiver, LatticeSource, SourceCell, SourceGuard,
+    DownstreamSlot, KeyPacing, KeySlot, LatticeReceiver, LatticeSource, SourceCell, SourceGuard,
 };
 use euhedral_data_structures::queues::{Consumer, MpscQueue, Multi, Producer, Single, SpscQueue};
 use euhedral_data_structures::sync::HotScope;
@@ -48,12 +48,17 @@ pub trait Pending: Send {
 /// [`register`](Self::register) may be called from any thread. **Looking at the operations is a frame's
 /// work, not the source's.** The source's `request` and `pull` hand out the continuations that are already
 /// ready, within the demand, and never query an operation. While operations wait and no poll frame is out,
-/// `request` or `pull` pushes the source's one key frame, the *poll frame* (an idle lattice calls `pull` on a handle far
-/// more often than `request`), and a worker runs it like any other frame:
+/// `request` or `pull` pushes the source's one key frame, the *poll frame* (`pull` as well as `request` pushes it: a
+/// Direct worker that is busy never calls `request` on a source, and an idle one can phase-lock so that `request`
+/// never reaches half of its handles, backlog #130), and a worker runs it like any other frame:
 /// its `execute` ([`reap`](Self::reap)) queries each pending operation once (a completion's `is_ready`, a
 /// [`Pending`]'s `poll`, a marker, a timer) and queues the continuations of those that completed, in the
-/// order they were registered, for the hand-out. When the frame has run it goes home, and the next `request`
-/// may push it again. So an operation's query is measured as the frame's cost, and nothing is pushed while
+/// order they were registered, for the hand-out. When the frame has run it goes home, and the next `request` or
+/// `pull` may push it again, unless it found nothing: then the visits that follow skip it, twice as many after each
+/// empty poll up to [`KeyPacing::MAX_WINDOW`](euhedral_core::generics::KeyPacing::MAX_WINDOW) (a find, or a new
+/// registration, ends the back-off), so that a source that only waits reads unproductive and the worker parks.
+/// If a query panics (a `Ready`, a `Wake`, a `Pending`), its entry is finished without running (or dropped), counted
+/// ([`panicked`](Self::panicked)) and logged, and the entries behind it are queried all the same. So an operation's query is measured as the frame's cost, and nothing is pushed while
 /// nothing waits.
 ///
 /// **Driving it by hand** (tests, or any caller outside a lattice): call [`reap`](Self::reap), which does
@@ -119,6 +124,10 @@ pub struct Completions {
     lateness: Histogram,
     /// The poll frame, while it is home.
     key: KeySlot<PollFrame>,
+    /// The back-off of the poll frame: a poll that found nothing makes the next visits skip it.
+    pacing: KeyPacing,
+    /// Entries whose query panicked: finished without running (their frame) or dropped, and counted.
+    panicked: AtomicUsize,
 }
 
 /// What travels through the registration queue.
@@ -205,7 +214,13 @@ impl Frame for PollFrame {
 
     fn execute(&mut self) -> Result<(), FrameError> {
         if let Some(source) = self.source.upgrade() {
-            source.reap();
+            // A poll that found nothing makes the visits that follow skip this frame, so that the handle reads
+            // unproductive between polls and the worker parks.
+            if source.reap() > 0 {
+                source.pacing.found();
+            } else {
+                source.pacing.empty();
+            }
         }
         Ok(())
     }
@@ -316,6 +331,8 @@ impl Completions {
             leaked: Arc::new(AtomicUsize::new(0)),
             lateness: Histogram::new(),
             key: KeySlot::with_key(PollFrame::new(me.clone())),
+            pacing: KeyPacing::new(),
+            panicked: AtomicUsize::new(0),
         })
     }
 
@@ -339,6 +356,8 @@ impl Completions {
         // between here and the queue.
         self.pending.fetch_add(1, Ordering::AcqRel);
         self.waiting.fetch_add(1, Ordering::AcqRel);
+        // Something new to wait for: poll at the next visit, whatever the back-off had come to.
+        self.pacing.reset();
         let slot = Slot::Waiting(Waiting {
             what,
             last_seen: Instant::now(),
@@ -508,12 +527,18 @@ impl Completions {
     /// complete. The key is a control frame, not part of the demand (like a hot source's pushes), and there is at
     /// most one. Does nothing without a downstream (a caller driving by hand has none).
     fn push_poll(&self) {
-        if self.waiting.load(Ordering::Acquire) == 0 || self.complete.load(Ordering::Acquire) {
+        if self.waiting.load(Ordering::Acquire) == 0
+            || self.complete.load(Ordering::Acquire)
+            || !self.key.is_home()
+        {
             return;
         }
         let Some(downstream) = self.downstream.receiver() else {
             return;
         };
+        if !self.pacing.due() {
+            return;
+        }
         let Some(mut key) = self.key.take() else {
             return;
         };
@@ -560,6 +585,11 @@ impl Completions {
     /// counter outlives the source.
     pub fn leaked_unreached(&self) -> Arc<AtomicUsize> {
         self.leaked.clone()
+    }
+
+    /// Entries lost because their query panicked (see [`reap`](Self::reap)).
+    pub fn panicked(&self) -> usize {
+        self.panicked.load(Ordering::Relaxed)
     }
 
     /// Operations still in flight.
@@ -628,17 +658,29 @@ impl Completions {
             let entry = &mut waiting[index];
             // Each operation is queried once, and a completed one leaves the list, so it is never
             // queried again (a query may have effects: a driver call that fetches the result).
-            let mut yielded = None;
-            let done = match &mut entry.what {
-                Waits::Ready(ready, _) => ready.is_ready(),
-                Waits::Wake(wake, _) => wake.is_ready(),
-                Waits::Marker(marker, _) => self.lanes.reached(*marker),
-                Waits::Retired(cell, _) => cell.arrived(),
-                Waits::At(deadline, _) => now >= *deadline,
+            // A query is the application's code: one that panics loses its entry (finished without running, or
+            // dropped), is counted, and does not stop the entries behind it.
+            let queried = panic::catch_unwind(AssertUnwindSafe(|| match &mut entry.what {
+                Waits::Ready(ready, _) => (ready.is_ready(), None),
+                Waits::Wake(wake, _) => (wake.is_ready(), None),
+                Waits::Marker(marker, _) => (self.lanes.reached(*marker), None),
+                Waits::Retired(cell, _) => (cell.arrived(), None),
+                Waits::At(deadline, _) => (now >= *deadline, None),
                 Waits::Pending(pending) => {
-                    yielded = pending.poll();
-                    yielded.is_some()
+                    let yielded = pending.poll();
+                    (yielded.is_some(), yielded)
                 }
+            }));
+            let Ok((done, mut yielded)) = queried else {
+                self.panicked.fetch_add(1, Ordering::Relaxed);
+                log::error!("an operation's query panicked; its entry is dropped");
+                if let Some(Waiting { what, .. }) = waiting.remove(index) {
+                    // Ending it runs the application's `do_finally`, which may panic too.
+                    let _ = panic::catch_unwind(AssertUnwindSafe(|| self.cancel(what)));
+                }
+                self.pending.fetch_sub(1, Ordering::AcqRel);
+                self.waiting.fetch_sub(1, Ordering::AcqRel);
+                continue;
             };
             if !done {
                 entry.last_seen = now;
@@ -654,7 +696,10 @@ impl Completions {
                 | Waits::Marker(_, frame)
                 | Waits::Retired(_, frame) => (frame, last_seen),
                 Waits::At(deadline, frame) => (frame, deadline),
-                Waits::Pending(_) => (yielded.expect("a pending that is done yielded"), last_seen),
+                Waits::Pending(_) => (
+                    yielded.take().expect("a pending that is done yielded"),
+                    last_seen,
+                ),
             };
             self.waiting.fetch_sub(1, Ordering::AcqRel);
             // The poll claim is held, so one thread records at a time.
@@ -784,9 +829,9 @@ impl LatticeSource for Completions {
     /// the flag costs nothing in correctness: the frame is queued and handled by position, never
     /// stranded in a state with no owner.
     ///
-    /// What the queue cannot give is a poll. A frame behind the marker is cancelled by the next `pull`
-    /// or `request` (a late `add` also tries to, through `sweep`), and if no poll ever comes, when
-    /// the last `Arc` drops (`Drop`): no frame is left without an end. Slots a producer has
+    /// What the queue cannot give is a poll. A frame behind the marker is cancelled by the next poll
+    /// ([`reap`](Completions::reap): the poll frame's work; `request` and `pull` cancel nothing), by a late `add`'s own
+    /// `sweep`, and if no poll ever comes, when the last `Arc` drops (`Drop`): no frame is left without an end. Slots a producer has
     /// claimed but not yet published are invisible to a drain; they are drained by a later poll,
     /// and (`Drop` has `&mut self`) a producer cannot still be inside `offer` then.
     fn complete(&self) {
@@ -2101,12 +2146,110 @@ mod tests {
             "the demand is untouched"
         );
         hands.run();
-        // A pull pushes it too, with no demand at all: it is home again.
+        // The poll found nothing, so the next visit is skipped (the back-off); then a pull pushes it, with no demand
+        // at all, now that it is home again.
+        completions.pull(&mut |_| panic!("nothing is ready"), &mut |_| false, 1);
+        assert_eq!(hands.kept(), 0);
         completions.pull(&mut |_| panic!("nothing is ready"), &mut |_| false, 1);
         assert_eq!(hands.kept(), 1);
         // One at a time.
         completions.pull(&mut |_| panic!("nothing is ready"), &mut |_| false, 1);
         completions.request(1);
         assert_eq!(hands.kept(), 1);
+    }
+
+    /// A pending operation that never ends, counting its polls.
+    struct NeverReady(Arc<AtomicUsize>);
+
+    impl Pending for NeverReady {
+        fn poll(&mut self) -> Option<Box<dyn Frame>> {
+            self.0.fetch_add(1, Ordering::AcqRel);
+            None
+        }
+    }
+
+    #[test]
+    fn a_registration_that_never_completes_is_polled_ever_less_often_and_the_source_reads_unproductive_between()
+     {
+        // A worker that finds nothing to do parks only if the handle it visits reads unproductive: a visit that
+        // pushes a frame does not. So between polls, a visit must push nothing.
+        let (completions, _) = setup();
+        let hands = Arc::new(Hands::default());
+        completions.clone().add_downstream(hands.clone());
+        let polls = Arc::new(AtomicUsize::new(0));
+        completions.register(Box::new(NeverReady(polls.clone())));
+        const VISITS: usize = 20_000;
+        let mut pushes = 0;
+        for visit in 0..VISITS {
+            if visit % 2 == 0 {
+                completions.pull(&mut |_| panic!("nothing is ready"), &mut |_| false, 8);
+            } else {
+                completions.request(8);
+            }
+            pushes += hands.run();
+        }
+        let polled = polls.load(Ordering::Relaxed);
+        assert_eq!(
+            polled, pushes,
+            "one poll per poll frame, and nothing else polls"
+        );
+        assert!(polled >= 8, "it is still polled ({polled})");
+        assert!(
+            polled <= 120,
+            "{polled} polls in {VISITS} visits: the back-off did not grow"
+        );
+        // A new registration is polled at the next visit, however far the back-off had grown, and finding
+        // something ends the back-off.
+        completions.at(Instant::now(), tagged(9));
+        completions.pull(&mut |_| panic!("nothing is ready"), &mut |_| false, 8);
+        assert_eq!(hands.run(), 1, "a registration asks for a poll at once");
+        assert_eq!(polls.load(Ordering::Relaxed), polled + 1);
+        assert_eq!(hands.ids(), [9], "and what it found goes out");
+        hands.run();
+        completions.pull(&mut |_| panic!("nothing is ready"), &mut |_| false, 8);
+        assert_eq!(hands.kept(), 1, "it found something: no back-off");
+    }
+
+    /// A pending operation whose poll panics.
+    struct PanicsOnPoll;
+
+    impl Pending for PanicsOnPoll {
+        fn poll(&mut self) -> Option<Box<dyn Frame>> {
+            panic!("a poll failed");
+        }
+    }
+
+    /// A completion whose query panics.
+    struct PanicsOnQuery;
+
+    impl Ready for PanicsOnQuery {
+        fn is_ready(&mut self) -> bool {
+            panic!("a query failed");
+        }
+    }
+
+    #[test]
+    fn a_query_that_panics_loses_its_entry_and_not_the_others() {
+        let (completions, _) = setup();
+        let (before, before_ends) = counted(1);
+        let (panicking, panicking_ends) = counted(2);
+        completions.at(Instant::now(), tagged(0));
+        completions.after(Box::new(PanicsOnQuery), panicking);
+        completions.register(Box::new(PanicsOnPoll));
+        completions.at(Instant::now(), tagged(3));
+        completions.at(Instant::now(), before);
+        // The reap does not unwind, and goes on to the entries behind the one that panicked.
+        assert_eq!(completions.reap(), 3);
+        assert_eq!(poll(&completions), [0, 3, 1]);
+        assert_eq!(completions.pending(), 0, "the lost entries left `pending`");
+        assert_eq!(
+            panicking_ends.load(Ordering::Acquire),
+            1,
+            "the frame of the entry that panicked was finished, not run"
+        );
+        assert_eq!(before_ends.load(Ordering::Acquire), 0);
+        assert_eq!(completions.waiting.load(Ordering::Acquire), 0);
+        // And nothing loops: the entries are gone.
+        assert_eq!(completions.reap(), 0);
     }
 }

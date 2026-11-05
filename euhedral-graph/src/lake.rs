@@ -33,8 +33,9 @@
 //! unit count, and when it last reached zero) and push nothing while the lake is busy. When the lake has
 //! been idle for the idle time, the call pushes the watch's one key frame, and the worker that runs it
 //! detaches the set (taking the attach lock, completing the sinks), where its cost is measured like any
-//! other frame's. (Both calls look: an idle lattice calls `pull` on a handle far more often than `request`.) A frame that finds the lake busy again leaves the set alone and goes home, and the
-//! watch pushes it again at the next idle time.
+//! other frame's. (Both calls look: a Direct worker that is busy never calls `request` on a source, and an idle one
+//! can phase-lock so that `request` never reaches half of its handles, backlog #130.) A frame that finds the lake
+//! busy again leaves the set alone and goes home, and the watch pushes it again at the next idle time.
 //!
 //! **The hot side is lock-free** (Java's volatile `generation`): the attached set is a cell of the lattice's registry,
 //! so [`Lake::offer`] and [`Lake::admit`] read it from the calling thread's view with no lock. A producer thread gets a

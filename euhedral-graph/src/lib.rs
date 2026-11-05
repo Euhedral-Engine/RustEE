@@ -6,7 +6,7 @@
 //! - **the submission** (a device successor orders itself behind the predecessor's [`Marker`] on
 //!   the device);
 //! - **the completion**, found when a lattice worker runs the poll frame of [`Completions`] or of
-//!   `euhedral-io`'s `AsyncIo` (the source's `request` pushes it; the source runs no work itself).
+//!   `euhedral-io`'s `AsyncIo` (the source's `request` or `pull` pushes it; the source runs no work itself).
 //!
 //! No stage frame takes a lock of its own. A [`StageGraph`]'s per-quantum state is a pooled run, handed from stage to
 //! stage by counts, plain fields and closable stacks, and after warm-up a quantum allocates nothing. The pools of runs
