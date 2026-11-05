@@ -42,9 +42,10 @@ pub trait LatticeReceiver: LatticeTerminal {
 /// batches and decides to idle or take part. A source with such work owns a *key frame* ([`KeySlot`](super::KeySlot)):
 /// `request` or `pull` pushes it to the downstream when the work is due and it is home, a worker runs its `execute`, and
 /// its `recycle` sends it home. (`pull` as well as `request`: a Direct worker that is busy never calls `request` on a
-/// source, and an idle one can phase-lock so that `request` never reaches half of its handles, backlog #130.) The key
-/// is a control frame, not part of the demand, and `pull` never hands it to its `consumer`. A key that polls is paced
-/// ([`KeyPacing`](super::KeyPacing)): it is not pushed at every visit while nothing ends, or the worker never parks.
+/// source, and an idle one can phase-lock so that `request` never reaches half of its handles; see the changelog.) The key
+/// is a control frame, not part of the demand, and `pull` never hands it to its `consumer`. A key that polls blind is
+/// paced ([`KeyPacing`](super::KeyPacing)): it is not pushed at every visit while nothing ends, or the worker never
+/// parks.
 pub trait LatticeSource: Send + Sync {
     /// Attaches the receiver this source pushes to. A source that tells the receiver about itself
     /// does so through [`LatticeTerminal::add_upstream`], passing this `Arc`.

@@ -19,7 +19,8 @@
 
 use std::marker::PhantomData;
 use std::ptr;
-use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 /// The home of one key: empty while the key is away.
 ///
@@ -81,71 +82,120 @@ impl<K> KeySlot<K> {
     }
 }
 
-/// The back-off of a key that polls: after a poll that finds nothing the source skips visits before it pushes the key
-/// again, twice as many as after the previous empty poll, up to [`MAX_WINDOW`](Self::MAX_WINDOW), and any find, or a
-/// new thing to wait for, ends it.
+/// The back-off of a key that polls blind: one that asks a device or the operating system whether something ended, with
+/// nothing to say when it does.
 ///
-/// A visit is a `request` or a `pull` of the source. The count is of visits, not of time, so it is deterministic and
-/// costs a few relaxed loads and stores; nothing here is a clock or a timer. Between pushes the visit pushes nothing,
-/// so the handle reads unproductive and the worker parks as it did when the poll ran in the source and found nothing.
-/// The cost is latency: an operation that ends while the window is at its cap is found within that many visits.
+/// A key pushed at every visit while nothing ends would keep a worker busy for ever. After a poll that found nothing the
+/// source pushes the key again only after a **time** window: [`BASE_WINDOW`](Self::BASE_WINDOW), twice as long after each
+/// further empty poll, up to [`MAX_WINDOW`](Self::MAX_WINDOW). Between pushes a visit pushes nothing, so the handle reads
+/// unproductive and the worker parks. The window is time, not a count of visits, because a visit's interval varies by
+/// two orders of magnitude with the load: the latency a poll adds stays within the window, whatever the load. It is
+/// small on purpose (tens of microseconds).
 ///
-/// The key's `execute` calls [`found`](Self::found) or [`empty`](Self::empty); the source's visits call
-/// [`due`](Self::due), which the lattice serializes; whatever registers a new wait calls [`reset`](Self::reset).
-/// The fields are atomics only because the key runs on another thread; each is written by the side that owns it and
-/// a stale read costs one visit.
-#[derive(Debug, Default)]
+/// Two things end the wait at once, and a source must not leave them to the window:
+/// - **Events.** The source keeps a counter of the things that give the key something new to look at (a registration, a
+///   submission, a move, a bell that rang). The key records the count before it polls ([`polling`](Self::polling)); a
+///   poll that found nothing backs off only if the count did not move since ([`empty`](Self::empty)), and a visit
+///   finds the count moved ([`fresh`](Self::fresh)). A counter, not a flag that the registering thread resets, so a
+///   registration that races a poll is never lost.
+/// - **A known time.** A wait that has a deadline (a timer) needs no polling before it: the source compares the
+///   deadline with the clock itself.
+///
+/// The key's `execute` calls [`polling`](Self::polling) first, then [`found`](Self::found) or [`empty`](Self::empty).
+/// The source's visits call [`fresh`](Self::fresh) and [`ready`](Self::ready), which the lattice serializes. The fields
+/// are atomics only because the key runs on another thread; each is written by the key alone and a stale read costs one
+/// visit. Nothing here loops or takes a lock; the clock is read only while a window is open.
+#[derive(Debug)]
 pub struct KeyPacing {
-    /// Visits left to skip.
-    skip: AtomicU32,
-    /// Visits skipped after the next empty poll (0: none yet).
-    window: AtomicU32,
+    epoch: Instant,
+    /// Nanoseconds since `epoch`, plus one, before which a blind poll is not due; 0 when none is waited for.
+    not_before: AtomicU64,
+    /// Empty polls in a row, capped where the window reaches the maximum.
+    step: AtomicU32,
+    /// The event count the last poll started from.
+    polled: AtomicU64,
 }
 
 impl KeyPacing {
-    /// The most visits skipped between two pushes.
-    pub const MAX_WINDOW: u32 = 256;
+    /// The wait after the first empty poll.
+    pub const BASE_WINDOW: Duration = Duration::from_micros(16);
+    /// The longest wait between two blind polls.
+    pub const MAX_WINDOW: Duration = Duration::from_micros(100);
 
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
-            skip: AtomicU32::new(0),
-            window: AtomicU32::new(0),
+            epoch: Instant::now(),
+            not_before: AtomicU64::new(0),
+            step: AtomicU32::new(0),
+            polled: AtomicU64::new(0),
         }
     }
 
-    /// A visit asks whether to push the key now: `true` once the skipped visits have been spent. Call it only when
-    /// there is something to poll for.
-    pub fn due(&self) -> bool {
-        let skip = self.skip.load(Ordering::Relaxed);
-        if skip == 0 {
-            return true;
-        }
-        self.skip.store(skip - 1, Ordering::Relaxed);
-        false
+    fn nanos(&self, at: Instant) -> u64 {
+        u64::try_from(at.saturating_duration_since(self.epoch).as_nanos()).unwrap_or(u64::MAX - 1)
     }
 
-    /// The poll found nothing: the next window is twice the last, up to the cap.
-    pub fn empty(&self) {
-        let window = self
-            .window
-            .load(Ordering::Relaxed)
-            .saturating_mul(2)
-            .clamp(1, Self::MAX_WINDOW);
-        self.window.store(window, Ordering::Relaxed);
-        self.skip.store(window, Ordering::Relaxed);
+    /// The key starts a poll that will have seen `events`.
+    pub fn polling(&self, events: u64) {
+        self.polled.store(events, Ordering::Relaxed);
+    }
+
+    /// Whether `events` moved since the last poll started: something new to look at, whatever the window.
+    pub fn fresh(&self, events: u64) -> bool {
+        events != self.polled.load(Ordering::Relaxed)
+    }
+
+    /// Whether the window of the last empty poll is over. Reads the clock only while a window is open.
+    pub fn ready(&self) -> bool {
+        self.ready_at(Instant::now())
+    }
+
+    /// [`ready`](Self::ready) at `now`.
+    pub fn ready_at(&self, now: Instant) -> bool {
+        let not_before = self.not_before.load(Ordering::Relaxed);
+        not_before == 0 || self.nanos(now) + 1 >= not_before
+    }
+
+    /// Whether a blind poll is due: something new, or the window is over.
+    pub fn due(&self, events: u64) -> bool {
+        self.fresh(events) || self.ready()
     }
 
     /// The poll found something: poll again at the next visit.
     pub fn found(&self) {
-        self.reset();
+        if self.not_before.load(Ordering::Relaxed) != 0 || self.step.load(Ordering::Relaxed) != 0 {
+            self.step.store(0, Ordering::Relaxed);
+            self.not_before.store(0, Ordering::Relaxed);
+        }
     }
 
-    /// There is something new to wait for: poll at the next visit.
-    pub fn reset(&self) {
-        if self.window.load(Ordering::Relaxed) != 0 || self.skip.load(Ordering::Relaxed) != 0 {
-            self.window.store(0, Ordering::Relaxed);
-            self.skip.store(0, Ordering::Relaxed);
+    /// The poll found nothing, with `events` counted at its end: if the count moved since it started, something new
+    /// arrived meanwhile and may not have been seen, so there is no back-off; otherwise the next window opens.
+    pub fn empty(&self, events: u64) {
+        self.empty_at(events, Instant::now());
+    }
+
+    /// [`empty`](Self::empty) at `now`.
+    pub fn empty_at(&self, events: u64, now: Instant) {
+        if self.fresh(events) {
+            self.found();
+            return;
         }
+        let step = self.step.load(Ordering::Relaxed);
+        let window = Self::BASE_WINDOW
+            .saturating_mul(1u32.checked_shl(step).unwrap_or(u32::MAX))
+            .min(Self::MAX_WINDOW);
+        if window < Self::MAX_WINDOW {
+            self.step.store(step + 1, Ordering::Relaxed);
+        }
+        let until = self.nanos(now) + u64::try_from(window.as_nanos()).unwrap_or(u64::MAX / 2) + 1;
+        self.not_before.store(until, Ordering::Relaxed);
+    }
+}
+
+impl Default for KeyPacing {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -259,36 +309,52 @@ mod tests {
     }
 
     #[test]
-    fn the_back_off_doubles_after_each_empty_poll_up_to_the_cap_and_a_find_ends_it() {
+    fn the_window_doubles_after_each_empty_poll_up_to_the_cap_and_a_find_ends_it() {
         let pacing = KeyPacing::new();
-        assert!(pacing.due(), "nothing was empty yet");
+        let t0 = Instant::now();
+        assert!(pacing.ready_at(t0), "nothing was empty yet");
+        let us = Duration::from_micros;
         let mut windows = Vec::new();
-        for _ in 0..12 {
-            pacing.empty();
-            let mut skipped = 0;
-            while !pacing.due() {
-                skipped += 1;
+        for _ in 0..8 {
+            pacing.polling(0);
+            pacing.empty_at(0, t0);
+            // The window is the time until the poll is due: probe it.
+            let mut waited = 0;
+            while !pacing.ready_at(t0 + us(waited)) {
+                waited += 1;
             }
-            windows.push(skipped);
+            windows.push(waited);
         }
-        assert_eq!(windows, [1, 2, 4, 8, 16, 32, 64, 128, 256, 256, 256, 256]);
-        pacing.empty();
-        assert!(!pacing.due());
+        assert_eq!(windows, [16, 32, 64, 100, 100, 100, 100, 100]);
+        pacing.empty_at(0, t0);
+        assert!(!pacing.ready_at(t0 + us(99)));
         pacing.found();
-        assert!(pacing.due(), "a find polls at the next visit");
-        pacing.empty();
-        let mut skipped = 0;
-        while !pacing.due() {
-            skipped += 1;
-        }
-        assert_eq!(skipped, 1, "and the window starts again");
-        pacing.empty();
-        pacing.empty();
-        pacing.reset();
+        assert!(pacing.ready_at(t0), "a find polls at the next visit");
+        pacing.empty_at(0, t0);
+        assert!(!pacing.ready_at(t0 + us(15)));
+        assert!(pacing.ready_at(t0 + us(16)), "and the window starts again");
+    }
+
+    #[test]
+    fn an_event_that_races_a_poll_is_never_lost() {
+        let pacing = KeyPacing::new();
+        let t0 = Instant::now();
+        // The poll starts having seen 3 events; a fourth arrives while it runs; it finds nothing.
+        pacing.polling(3);
+        pacing.empty_at(4, t0);
         assert!(
-            pacing.due(),
-            "a new thing to wait for polls at the next visit"
+            pacing.ready_at(t0),
+            "no back-off: the fourth may not have been seen"
         );
+        assert!(pacing.fresh(4), "and the next visit sees it");
+        // The next poll sees all 4 and finds nothing: now it backs off.
+        pacing.polling(4);
+        pacing.empty_at(4, t0);
+        assert!(!pacing.fresh(4));
+        assert!(!pacing.ready_at(t0));
+        // A fifth event ends the wait at once, whatever the window.
+        assert!(pacing.fresh(5));
+        assert!(pacing.due(5));
     }
 
     #[test]
