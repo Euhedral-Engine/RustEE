@@ -3,6 +3,23 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## A pull that finds nothing holds the handle for the request that follows (2026-11-05)
+
+**What.** `UpstreamQueue::pull` holds back a handle whose pull found no frames (and did not stop at one), so the next `request` services that same handle first. Until now only a handle whose pull stopped at a frame was held back.
+
+**Why.** A demand under `pull_bucket_target` (2048) is one bucket, so a pull and a request each service one handle. A Direct worker that finds nothing runs one pull and then one request, so the rotation moved two handles per cycle. With an even number of handles the pulls always landed on one half of them and the requests on the other: the half that was only ever requested never read as empty, so its productivity stayed at its initial value for ever and `productive_handle_count()` never reached 0; and the half that was only ever pulled was never requested, so a source that does its work in `request` was never reached. An idle lattice with an even number of idle sources kept its first-ranked worker out of the unproductive park: one CPU with 6 handles and nothing to do, against 0.32 with 5.
+
+**How to use it.** Nothing to change. It is how the queue now reads its own rotation: every handle gets both a pull and a request, one handle per cycle, whatever the number of handles.
+
+**Semantics.**
+- A pull that ends having found 0 frames and without a stop holds its handle in `pending_request`; the request that follows takes it first, and returns it to the queue behind the others. The rotation therefore advances by one handle per pull-and-request cycle. The same holds when the pull could not be made at all (a closed or draining handle): its request does nothing either.
+- A handle that found nothing never displaces one that stopped at a frame: the frame still gets its request first.
+- A handle held for finding nothing goes back to the queue when the next pull comes before any request, so pulls reach it again; a complete one is dropped then. A handle held for a stop stays held until a request, as before.
+- A pull that found frames holds nothing; a lattice with work behaves as before. Productivity is unchanged: a pull that found nothing marks the handle unproductive, and the request after it is no evidence to the contrary.
+- Java's `UpstreamQueue` has the same rotation and gets the same change.
+
+**Tests.** `flow_control::upstream_queue::tests` (`every_idle_handle_is_pulled_and_requested_whatever_their_number`, `idle_handles_are_serviced_evenly_by_pulls_and_requests`, `a_lattice_of_idle_handles_reads_as_unproductive_whatever_their_number`: 1000 cycles of `pull(64)` then `request(64)` over idle handles, 1 to 8 of them, each is pulled and requested and the productive count reaches 0; `a_pull_that_found_nothing_holds_the_handle_for_the_request_that_follows`, `a_pull_that_found_frames_does_not_hold_the_handle`, `a_handle_that_found_nothing_is_pulled_again_when_no_request_comes`, `a_handle_that_found_nothing_does_not_displace_one_that_stopped`); `control_plane::fragment::tests::a_worker_over_idle_handles_reaches_the_unproductive_park_whatever_their_number` (a worker's real cycles over 1 to 8 idle handles reach a productive count of 0 within twice as many cycles as handles). Each fails on the code before.
+
 ## The benchmark times one push in 64, not one frame in 64 (2026-11-05)
 
 **What.** The benchmark's latency sampling is decided by the source, per push: each source counts its pushes and stamps the 1st, 65th, 129th and so on. It was decided by the frame: one frame in 64 was made as a sampled frame and stamped every time it was pushed.

@@ -1399,3 +1399,97 @@ fn a_worker_that_sits_out_probes_once_per_interval() {
         "at most one probe per interval: {entries} in {elapsed:?}"
     );
 }
+
+/// An upstream handle with nothing to give, which counts its pulls and its requests apart.
+#[derive(Default)]
+struct Empty {
+    pulls: AtomicU64,
+    requests: AtomicU64,
+}
+
+impl UpstreamHandle for Empty {
+    fn sequence(&self) -> u64 {
+        0
+    }
+
+    fn pull(
+        &self,
+        _claim: &mut Claim,
+        _consumer: &mut dyn FnMut(Box<dyn Frame>),
+        _stop: &mut dyn FnMut(&dyn Frame) -> bool,
+        _demand: u64,
+    ) -> Option<u64> {
+        self.pulls.fetch_add(1, Ordering::AcqRel);
+        Some(0)
+    }
+
+    fn request(&self, _claim: &mut Claim, _demand: u64) {
+        self.requests.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn is_complete(&self) -> bool {
+        false
+    }
+}
+
+/// A lone worker over `count` handles with nothing to give reaches the unproductive park within a
+/// bounded number of cycles, however many handles there are.
+///
+/// A Direct cycle that finds nothing is one pull and then one request, and each services one handle
+/// when the demand is a single bucket. If the request took the handle after the one the pull took,
+/// an even number of handles would split in two: the half that is only requested never reads as
+/// empty and keeps its worker from parking.
+#[test]
+fn a_worker_over_idle_handles_reaches_the_unproductive_park_whatever_their_number() {
+    let Some((core, cpu)) = *SINGLE_CORE else {
+        return;
+    };
+    for count in 1..=8_usize {
+        let idle = quick_idle().with_unproductive_park(Duration::from_nanos(1));
+        let config = FragmentConfig::default().with_idle_policy(idle.clone());
+        let fixture = Fixture::new(&config, core, &[cpu]);
+        let registry = fixture.registry().clone();
+        registry.register_with(|| Some(fixture.fragment.cpu));
+        let handles: Vec<Arc<Empty>> = (0..count).map(|_| Arc::new(Empty::default())).collect();
+        for handle in &handles {
+            registry.add_handle(handle.clone());
+        }
+        let mut policy = DecisionTree::with_thresholds(
+            idle,
+            BodyCost::new(),
+            Duration::from_micros(1),
+            Duration::from_micros(1),
+        );
+        let mut cycle = Cycle::new(0, None);
+        cycle.registered_workers = 1;
+
+        // The bound: one cycle per handle services each handle once, a second round makes sure.
+        let bound = 2 * count;
+        let mut parked_at = None;
+        for index in 1..=bound {
+            fixture.fragment.run_cycle(&mut policy, &mut cycle);
+            let productive = registry
+                .with_thread_queue(|queue| queue.productive_handle_count())
+                .unwrap();
+            if productive == 0 {
+                parked_at = Some(index);
+                break;
+            }
+        }
+        assert!(
+            parked_at.is_some(),
+            "{count} idle handles: still productive after {bound} cycles"
+        );
+        for (index, handle) in handles.iter().enumerate() {
+            assert!(
+                handle.pulls.load(Ordering::Acquire) > 0,
+                "{count} idle handles: handle {index} was never pulled"
+            );
+            assert!(
+                handle.requests.load(Ordering::Acquire) > 0,
+                "{count} idle handles: handle {index} was never requested"
+            );
+        }
+        registry.remove_thread();
+    }
+}

@@ -477,6 +477,136 @@ fn an_ordered_frame_progresses_when_pulls_and_requests_alternate_with_an_idle_so
     );
 }
 
+/// One idle Direct cycle: a pull that finds nothing, then the request that follows it.
+fn idle_cycle(fixture: &mut Fixture) {
+    fixture.pull(64);
+    fixture.queue.request(64);
+}
+
+/// A fixture of `count` handles whose sources are empty.
+fn idle_fixture(count: usize) -> (Fixture, Vec<Arc<TestHandle>>) {
+    let fixture = Fixture::new();
+    let handles = (0..count)
+        .map(|_| {
+            let handle = fixture.add_test();
+            handle.set_pull_result(Some(0));
+            handle
+        })
+        .collect();
+    (fixture, handles)
+}
+
+#[test]
+fn every_idle_handle_is_pulled_and_requested_whatever_their_number() {
+    // A demand under the bucket target is one bucket, so a pull and a request each service one handle. If the
+    // pull took one handle and the request the next, an even number of handles would be split in two: half
+    // never requested, the other half never pulled.
+    for count in [1, 2, 3, 4, 5, 6, 8] {
+        let (mut fixture, handles) = idle_fixture(count);
+        for _ in 0..1000 {
+            idle_cycle(&mut fixture);
+        }
+        for (index, handle) in handles.iter().enumerate() {
+            assert!(
+                handle.requested() > 0,
+                "{count} handles: handle {index} was never requested"
+            );
+            assert!(
+                handle.pulled() > 0,
+                "{count} handles: handle {index} was never pulled"
+            );
+        }
+    }
+}
+
+#[test]
+fn idle_handles_are_serviced_evenly_by_pulls_and_requests() {
+    for count in [2, 4, 6] {
+        let (mut fixture, handles) = idle_fixture(count);
+        for _ in 0..600 {
+            idle_cycle(&mut fixture);
+        }
+        for handle in &handles {
+            assert_eq!(handle.requested(), 600 / count as u64 * 64);
+            assert_eq!(handle.pulled(), 600 / count as u64 * 64);
+        }
+    }
+}
+
+#[test]
+fn a_lattice_of_idle_handles_reads_as_unproductive_whatever_their_number() {
+    for count in [1, 2, 4, 5, 6] {
+        let (mut fixture, _handles) = idle_fixture(count);
+        for _ in 0..1000 {
+            idle_cycle(&mut fixture);
+        }
+        assert_eq!(
+            fixture.queue.productive_handle_count(),
+            0,
+            "{count} idle handles"
+        );
+    }
+}
+
+#[test]
+fn a_pull_that_found_nothing_holds_the_handle_for_the_request_that_follows() {
+    let (mut fixture, handles) = idle_fixture(2);
+
+    fixture.pull(64);
+    fixture.queue.request(64);
+
+    assert_eq!(handles[0].pulled(), 64);
+    assert_eq!(handles[0].requested(), 64);
+    assert_eq!(handles[1].pulled() + handles[1].requested(), 0);
+    assert_eq!(fixture.held(), 2);
+}
+
+#[test]
+fn a_pull_that_found_frames_does_not_hold_the_handle() {
+    let mut fixture = Fixture::new();
+    let busy = fixture.add_test();
+    let idle = fixture.add_test();
+
+    fixture.pull(64);
+    fixture.queue.request(64);
+
+    assert_eq!(busy.pulled(), 64);
+    assert_eq!(busy.requested(), 0);
+    assert_eq!(idle.requested(), 64);
+}
+
+#[test]
+fn a_handle_that_found_nothing_is_pulled_again_when_no_request_comes() {
+    let mut fixture = Fixture::new();
+    let upstream = fixture.add_test();
+    upstream.set_pull_result(Some(0));
+
+    fixture.pull(8);
+    fixture.pull(8);
+    fixture.pull(8);
+
+    assert_eq!(upstream.pulled(), 24, "a held handle must not starve pulls");
+    assert_eq!(fixture.held(), 1);
+}
+
+#[test]
+fn a_handle_that_found_nothing_does_not_displace_one_that_stopped() {
+    let mut fixture = Fixture::new();
+    let ready = fixture.add(SourceHandle::with_frames([ordered(5)]));
+    fixture.add_test().set_pull_result(Some(0));
+    fixture.queue.pull_bucket_target = NonZeroU64::new(1).unwrap();
+
+    // Both handles are visited in one pull; whichever order they come in, the stopped one is held.
+    fixture.pull_until_ordered(2);
+    fixture.queue.request(1);
+
+    assert_eq!(
+        ready.routed(),
+        [5],
+        "the frame is routed by the first request"
+    );
+}
+
 #[test]
 fn a_held_back_handle_honours_demand_and_its_lock() {
     let mut fixture = Fixture::new();

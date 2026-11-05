@@ -185,10 +185,17 @@ pub struct UpstreamQueue {
     shuffle: Vec<Entry>,
     shuffle_window: usize,
     seed: u64,
-    /// A handle whose last pull stopped at a frame that has to be routed. It is kept out of the
-    /// queue and serviced first by the next request, so the frame does not wait behind every other
-    /// handle.
+    /// A handle whose last pull stopped at a frame that has to be routed, or found nothing. It is
+    /// kept out of the queue and serviced first by the next request. A stopped frame then does not
+    /// wait behind every other handle. And a pull and the request after it, each of which services
+    /// one handle when the demand is a single bucket, service the same one: if each took the next
+    /// handle of the rotation, an even number of handles would be split in two, one half only ever
+    /// requested and the other half only ever pulled.
     pending_request: Option<Entry>,
+    /// Whether `pending_request` stopped a pull at a frame, rather than finding nothing. A handle
+    /// that found nothing gives way to one that stopped, and goes back to the queue when a pull
+    /// comes before the request, so that pulls reach it again.
+    pending_stopped: bool,
 
     upstream_count: Arc<PaddedAtomicLong>,
     cached_up_count: u64,
@@ -238,6 +245,7 @@ impl UpstreamQueue {
             shuffle_window,
             seed: crate::internal::random::next_u64(),
             pending_request: None,
+            pending_stopped: false,
             upstream_count,
             cached_up_count: 0,
             nonproductive_count: 0,
@@ -401,6 +409,7 @@ impl UpstreamQueue {
         let mut live = Vec::new();
         live.append(&mut self.shuffle);
         live.extend(self.pending_request.take());
+        self.pending_stopped = false;
         for _ in 0..self.handles.size_long() {
             live.extend(self.handles.poll());
         }
@@ -457,6 +466,17 @@ impl UpstreamQueue {
         self.true_upstream_count();
         if demand == 0 || self.cached_up_count == 0 {
             return 0;
+        }
+
+        if pull.is_some()
+            && !self.pending_stopped
+            && let Some(entry) = self.pending_request.take()
+        {
+            if entry.handle.is_complete() {
+                self.observe_removal(&entry);
+            } else {
+                self.buffer_for_requeue(entry);
+            }
         }
 
         let bucket = self.pull_buckets(demand);
@@ -533,8 +553,14 @@ impl UpstreamQueue {
         entry.productive = productive;
     }
 
-    /// Holds `entry` back for the next request, returning any handle held before to the queue.
-    fn hold_for_request(&mut self, entry: Entry) {
+    /// Holds `entry` back for the next request, returning any handle held before to the queue. A
+    /// handle that found nothing does not displace one that stopped at a frame.
+    fn hold_for_request(&mut self, entry: Entry, stopped: bool) {
+        if !stopped && self.pending_stopped && self.pending_request.is_some() {
+            self.buffer_for_requeue(entry);
+            return;
+        }
+        self.pending_stopped = stopped;
         if let Some(previous) = self.pending_request.replace(entry) {
             self.buffer_for_requeue(previous);
         }
@@ -664,6 +690,7 @@ struct Acquired<'a> {
     entry: Option<Entry>,
     claim: Option<Claim>,
     hold_for_request: bool,
+    stopped: bool,
 }
 
 impl<'a> Acquired<'a> {
@@ -673,6 +700,7 @@ impl<'a> Acquired<'a> {
             entry: Some(entry),
             claim: Some(claim),
             hold_for_request: false,
+            stopped: false,
         }
     }
 
@@ -686,12 +714,16 @@ impl<'a> Acquired<'a> {
     ///   request has no empty result: the view stays as it was.
     /// - A pull that stopped at a frame, or that could not be made (the handle was closed or
     ///   draining, had no demand, or its source panicked), changes nothing.
+    ///
+    /// A pull that stopped at a frame, or that found no frames, also has the queue hold the handle
+    /// back for the request that follows (`UpstreamQueue::pending_request`).
     fn service(mut self, pull: Option<&mut Pull<'_>>, demand: u64) -> u64 {
         let Self {
             queue,
             entry,
             claim,
             hold_for_request,
+            stopped: pull_stopped,
         } = &mut self;
         let entry = entry.as_mut().expect("the entry is held until dropped");
         let claim = claim.as_mut().expect("the claim is held until dropped");
@@ -708,7 +740,8 @@ impl<'a> Acquired<'a> {
                 let result = entry
                     .handle
                     .pull(claim, &mut **consumer, &mut watch, demand);
-                *hold_for_request = stopped;
+                *pull_stopped = stopped;
+                *hold_for_request = stopped || result.unwrap_or(0) == 0;
                 let productive = match result {
                     Some(0) if !stopped => observing.pushed(),
                     Some(0) | None => was_productive,
@@ -744,7 +777,7 @@ impl Drop for Acquired<'_> {
             entry.handle.release(claim);
         }
         if self.hold_for_request {
-            self.queue.hold_for_request(entry);
+            self.queue.hold_for_request(entry, self.stopped);
         } else {
             self.queue.buffer_for_requeue(entry);
         }
