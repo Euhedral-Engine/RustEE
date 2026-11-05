@@ -575,3 +575,63 @@ fn a_tiered_consumer_whose_required_units_do_not_fit_is_refused_or_dropped() {
     assert_eq!(a.placed[1], Placed::Dropped);
     assert!(a.tiers[1].is_empty());
 }
+
+/// A receiver that keeps what a source pushes, to be run by the test as a worker would.
+#[derive(Default)]
+struct Keep {
+    frames: std::sync::Mutex<Vec<Box<dyn euhedral_core::frames::Frame>>>,
+}
+
+impl euhedral_core::generics::LatticeTerminal for Keep {
+    fn add_upstream(&self, _upstream: std::sync::Arc<dyn euhedral_core::generics::LatticeSource>) {}
+}
+
+impl euhedral_core::generics::LatticeReceiver for Keep {
+    fn push(&self, frame: Box<dyn euhedral_core::frames::Frame>) {
+        self.frames.lock().unwrap().push(frame);
+    }
+
+    fn on_complete(&self) {}
+
+    fn on_error(&self, _error: euhedral_core::frames::Failure) {}
+}
+
+#[test]
+fn a_give_back_order_runs_its_handler_only_when_its_frame_executes() {
+    use euhedral_core::generics::LatticeSource;
+    use std::sync::{Arc, Mutex};
+    let p = two_locations();
+    let dev = p.location(LocationKind::Device { ordinal: 0 }).unwrap();
+    let got: Arc<Mutex<Vec<euhedral_memory::GiveBack>>> = Arc::default();
+    let g = got.clone();
+    let buffer = p.open_owner(
+        OwnerSpec::new("buffer", Priority(1), Scope::Epoch(1))
+            .on_give_back(Arc::new(move |o| g.lock().unwrap().push(o))),
+    );
+    let _held = p.elastic(buffer, dev, 0, 100 * GIB, "slots").unwrap();
+    let plan = p.open_owner(OwnerSpec::new("plan", Priority(100), Scope::Plan(1)));
+    // The source hands frames out and does no work: neither a pull nor a request runs the owner's handler.
+    let source = p.give_backs();
+    let keep = Arc::new(Keep::default());
+    source.clone().add_downstream(keep.clone());
+    assert!(matches!(
+        p.claim_or_reclaim(plan, dev, GIB, "x"),
+        ClaimResult::Reclaiming(_)
+    ));
+    source.request(8);
+    let mut pulled = Vec::new();
+    source.pull(&mut |f| pulled.push(f), &mut |_| false, 8);
+    assert!(
+        got.lock().unwrap().is_empty(),
+        "the handler is the frame's work"
+    );
+    let mut frames = std::mem::take(&mut *keep.frames.lock().unwrap());
+    frames.extend(pulled);
+    assert_eq!(frames.len(), 1, "one order, one frame");
+    // A worker executes it.
+    for mut frame in frames {
+        frame.execute().unwrap();
+        frame.do_finally();
+    }
+    assert_eq!(got.lock().unwrap().len(), 1);
+}
