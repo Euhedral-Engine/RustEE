@@ -34,6 +34,15 @@ pub trait LatticeReceiver: LatticeTerminal {
 }
 
 /// Where frames come from.
+///
+/// **A source runs no work in `request` or `pull`.** They assemble frames, hand them out and push them: pop a
+/// ready frame, read a counter that says whether work is due. Anything that costs more (looking at a device or the
+/// operating system, finishing copies, calling continuations, detaching sinks) is a frame's work, because a worker
+/// can only measure how long work takes when the frame comes back through its executor, and that is how it sizes its
+/// batches and decides to idle or take part. A source with such work owns a *key frame* ([`KeySlot`](super::KeySlot)):
+/// `request` (or `pull`, which an idle lattice calls far more often) pushes it to the downstream when the work is due
+/// and it is home, a worker runs its `execute`, and its `recycle` sends it home. The key is a control frame, not part of
+/// the demand, and `pull` never hands it to its `consumer`.
 pub trait LatticeSource: Send + Sync {
     /// Attaches the receiver this source pushes to. A source that tells the receiver about itself
     /// does so through [`LatticeTerminal::add_upstream`], passing this `Arc`.

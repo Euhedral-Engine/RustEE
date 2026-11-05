@@ -4,12 +4,14 @@
 mod cloneable;
 mod downstream_slot;
 mod executor;
+mod key_slot;
 mod lattice;
 mod source_cell;
 
 pub use cloneable::CloneableObject;
 pub use downstream_slot::{AlreadyAttached, DownstreamSlot};
 pub use executor::AbstractExecutor;
+pub use key_slot::KeySlot;
 pub use lattice::{LatticeInterceptor, LatticeReceiver, LatticeSource, LatticeTerminal};
 pub use source_cell::{SourceCell, SourceGuard};
 
