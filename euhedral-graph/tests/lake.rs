@@ -317,12 +317,7 @@ fn a_frame_that_completes_its_sink_does_not_panic() {
     lattice.close();
 }
 
-// A key leaves a source only by a `request`, and an idle lattice can phase-lock so that a `request` never reaches the
-// idle watch's handle (each `UpstreamQueue` pull and request services one handle, and an idle cycle is one empty pull
-// then one request): the set never detaches. The upstream queue's phase fix, in the change on top of this stack,
-// fixes it and removes this `ignore`.
 #[test]
-#[ignore = "needs the upstream queue's phase fix (the last change of the stack)"]
 fn offers_racing_an_idle_detach_land_in_exactly_one_set() {
     const THREADS: u64 = 8;
     const BURSTS: u64 = 25;

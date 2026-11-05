@@ -3,6 +3,25 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## A pull that finds nothing holds the handle for the request that follows (2026-11-05)
+
+**What.** `UpstreamQueue::pull` holds back a handle whose pull found no frames (and did not stop at one), so the next `request` services that same handle first. Until now only a handle whose pull stopped at a frame was held back.
+
+**Why.** A demand under `pull_bucket_target` (2048) is one bucket, so a pull and a request each service one handle. A Direct worker that finds nothing runs one pull and then one request, so the rotation moved two handles per cycle. With an even number of handles the pulls always landed on one half of them and the requests on the other: the half that was only ever requested never read as empty, so its productivity stayed at its initial value for ever and `productive_handle_count()` never reached 0; and the half that was only ever pulled was never requested, so a source that does its work in `request` was never reached. An idle lattice with an even number of idle sources kept its first-ranked worker out of the unproductive park: one CPU with 6 handles and nothing to do, against 0.32 with 5.
+
+**How to use it.** Nothing to change. It is how the queue now reads its own rotation: every handle gets both a pull and a request, one handle per cycle, whatever the number of handles.
+
+**Semantics.**
+- A pull that ends having found 0 frames and without a stop holds its handle in `pending_request`; the request that follows takes it first, and returns it to the queue behind the others. The rotation therefore advances by one handle per pull-and-request cycle. The same holds when the pull could not be made at all (a closed or draining handle): its request does nothing either.
+- A handle that found nothing never displaces one that stopped at a frame: the frame still gets its request first.
+- A handle held for finding nothing goes back to the queue when the next pull comes before any request, so pulls reach it again; a complete one is dropped then. A handle held for a stop stays held until a request, as before.
+- A pull that found frames holds nothing; a lattice with work behaves as before. Productivity is unchanged: a pull that found nothing marks the handle unproductive, and the request after it is no evidence to the contrary.
+- Java's `UpstreamQueue` has the same rotation and gets the same change. Java leaves the held handle in the queue as a hint and clears the hint at the start of a pull that is not holding a stop; here the entry itself is released at that point, so the request services the same handles in both.
+
+**Sources whose key frame leaves only by `request`.** The sources of the change below this one (`Completions`, `AsyncIo`, `Moves`, the lake's idle watch) push their key frame from `request` alone: a `pull` pushes nothing. Before this change an idle or loaded lattice reached only half of an even number of handles with a `request`, so such a key was not pushed for as long as the load lasted: `offers_racing_an_idle_detach_land_in_exactly_one_set` (the lake's idle watch) timed out waiting for the set to detach, and a timer was not seen (`timer_latency`, run by hand). With this change every handle gets a request, and that test is no longer ignored.
+
+**Tests.** `flow_control::upstream_queue::tests`: five fail on the code before: `every_idle_handle_is_pulled_and_requested_whatever_their_number`, `idle_handles_are_serviced_evenly_by_pulls_and_requests`, `a_lattice_of_idle_handles_reads_as_unproductive_whatever_their_number` (1000 cycles, or 600 for the even split, of `pull(64)` then `request(64)` over 1, 2, 3, 4, 5, 6 and 8 idle handles: each is pulled and requested, and the productive count reaches 0), `a_pull_that_found_nothing_holds_the_handle_for_the_request_that_follows` and `control_plane::fragment::tests::a_worker_over_idle_handles_reaches_the_unproductive_park_whatever_their_number` (a worker's real cycles over 1 to 8 idle handles reach a productive count of 0 within twice as many cycles as handles). The others are guards that pass before and after: `a_pull_that_found_frames_does_not_hold_the_handle`, `a_handle_that_found_nothing_is_pulled_again_when_no_request_comes`, `a_handle_that_found_nothing_does_not_displace_one_that_stopped`, `a_hint_to_an_empty_handle_is_gone_when_a_later_pull_finds_frames` (a pull of A finds nothing, a pull of B finds frames, the request goes to the queue's front as in Java).
+
 ## `request` and `pull` do no heavy or high-frequency work (2026-11-05)
 
 **What.** Five places did heavy or high-frequency work inside a source's `request` or `pull`. Four of them no longer do:
