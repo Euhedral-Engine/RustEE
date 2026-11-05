@@ -633,12 +633,18 @@ fn a_request_or_pull_of_the_moves_source_drives_no_move_and_a_frame_does() {
     source.request(8);
     assert_eq!(keep.frames.lock().unwrap().len(), 1, "one pump at a time");
 
-    // The worker that runs the frame polls the copy, as many times as the requests that follow ask it to.
-    for _ in 0..16 {
+    // The worker that runs the frame polls the copy, as many times as the requests that follow ask it to (a poll that
+    // found nothing is followed by a window of time in which a visit pushes nothing).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
         keep.run();
         if r.mover.in_flight() == 0 {
             break;
         }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the copy never retired"
+        );
         source.request(8);
     }
     assert!(queries.load(Ordering::Relaxed) >= 2, "the frame polled it");
@@ -713,26 +719,30 @@ fn a_copy_that_never_retires_is_polled_ever_less_often_and_the_source_reads_unpr
     let source = r.mover.moves();
     let keep = Arc::new(Keep::default());
     source.clone().add_downstream(keep.clone());
-    const VISITS: usize = 20_000;
+    let started = std::time::Instant::now();
+    let mut visits = 0_u32;
     let mut pushes = 0;
-    for visit in 0..VISITS {
-        if visit % 2 == 0 {
+    while started.elapsed() < std::time::Duration::from_millis(30) {
+        if visits.is_multiple_of(2) {
             source.pull(&mut |_| panic!("nothing is done"), &mut |_| false, 8);
         } else {
             source.request(8);
         }
-        let pushed = keep.run();
-        pushes += pushed;
+        visits += 1;
+        pushes += keep.run();
     }
+    let elapsed = started.elapsed().as_micros() as usize;
     let polls = queries.load(Ordering::Relaxed) as usize;
     assert_eq!(
         polls, pushes,
         "one query per pump frame, and nothing else queries"
     );
-    assert!(polls >= 8, "it is still polled ({polls})");
+    assert!(polls >= 4, "it is still polled ({polls})");
+    // The window between polls grows from 16 us to 100 us, whatever the visit rate: after the first four polls, one
+    // per 100 us of the run at most.
     assert!(
-        polls <= 120,
-        "{polls} polls in {VISITS} visits: the back-off did not grow"
+        polls <= 6 + elapsed / 100,
+        "{polls} polls in {elapsed} us and {visits} visits: the back-off did not grow"
     );
     // A new move is polled at the next visit, however far the back-off had grown.
     let before = queries.load(Ordering::Relaxed);
