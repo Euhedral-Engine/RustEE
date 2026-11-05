@@ -8,7 +8,8 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use euhedral_core::generics::LatticeSource;
+use euhedral_core::frames::{Failure, Frame};
+use euhedral_core::generics::{LatticeReceiver, LatticeSource, LatticeTerminal};
 use euhedral_memory::{
     ClaimResult, Copier, CopyError, LocationId, LocationKind, LocationSpec, MoveDone, MoveError,
     MoveHandler, Mover, OwnerId, OwnerSpec, Planner, Priority, Retired, Scope, TierPool,
@@ -488,4 +489,365 @@ fn a_host_copier_copies_rows_between_layouts_with_their_own_pitches() {
         )
     };
     assert!(refused.is_err());
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// The source hands frames out; the moves are driven by a frame (a worker), not by the source's request or pull.
+
+/// Counts how often a copy is asked whether it retired.
+struct Queried {
+    queries: Arc<AtomicU32>,
+    left: AtomicU32,
+}
+
+impl Retired for Queried {
+    fn retired(&self) -> bool {
+        self.queries.fetch_add(1, Ordering::Relaxed);
+        self.left
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+            .is_err()
+    }
+}
+
+#[derive(Debug)]
+struct QueriedCopier {
+    pairs: Vec<(LocationId, LocationId)>,
+    queries: Arc<AtomicU32>,
+    /// How many queries say "not yet" before a copy retires.
+    left: u32,
+}
+
+impl Copier for QueriedCopier {
+    fn joins(&self, from: LocationId, to: LocationId) -> bool {
+        self.pairs.contains(&(from, to))
+    }
+
+    unsafe fn start(
+        &self,
+        _from: LocationId,
+        src: u64,
+        _to: LocationId,
+        dst: u64,
+        bytes: u64,
+    ) -> Result<Box<dyn Retired>, CopyError> {
+        // SAFETY: the mover's contract: two leased slots of host memory, `bytes` each.
+        unsafe { std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, bytes as usize) };
+        Ok(Box::new(Queried {
+            queries: self.queries.clone(),
+            left: AtomicU32::new(self.left),
+        }))
+    }
+}
+
+/// A receiver that keeps what the source pushes, to be run by the test as a worker would.
+#[derive(Default)]
+struct Keep {
+    frames: std::sync::Mutex<Vec<Box<dyn Frame>>>,
+}
+
+impl Keep {
+    fn take(&self) -> Vec<Box<dyn Frame>> {
+        std::mem::take(&mut *self.frames.lock().unwrap())
+    }
+
+    /// Runs every frame kept, as a worker's executor does, and returns how many.
+    fn run(&self) -> usize {
+        let frames = self.take();
+        let n = frames.len();
+        for mut frame in frames {
+            frame.execute().unwrap();
+            frame.do_finally();
+        }
+        n
+    }
+}
+
+impl LatticeTerminal for Keep {
+    fn add_upstream(&self, _upstream: Arc<dyn LatticeSource>) {}
+}
+
+impl LatticeReceiver for Keep {
+    fn push(&self, frame: Box<dyn Frame>) {
+        self.frames.lock().unwrap().push(frame);
+    }
+
+    fn on_complete(&self) {}
+
+    fn on_error(&self, _error: Failure) {}
+}
+
+/// A rig whose copies count how often they are asked whether they retired, with one resident moving from the
+/// fast tier to the middle one.
+fn moving_rig() -> (Rig, Arc<AtomicU32>, Arc<std::sync::Mutex<Vec<MoveDone>>>) {
+    moving_rig_with(2)
+}
+
+/// As [`moving_rig`], with a copy that retires after `left` queries.
+fn moving_rig_with(left: u32) -> (Rig, Arc<AtomicU32>, Arc<std::sync::Mutex<Vec<MoveDone>>>) {
+    let mut r = rig([2, 2, 2], 8);
+    let queries = Arc::new(AtomicU32::new(0));
+    let [a, b, c] = r.locations;
+    let copier: Arc<dyn Copier> = Arc::new(QueriedCopier {
+        pairs: vec![(a, b), (b, a), (b, c), (c, b)],
+        queries: queries.clone(),
+        left,
+    });
+    r.mover = Mover::new(&r.planner, r.pools.clone(), vec![copier], Some(b), 8);
+    let o = r
+        .planner
+        .open_owner(OwnerSpec::new("consumer", Priority(50), Scope::Process));
+    let seen: Arc<std::sync::Mutex<Vec<MoveDone>>> = Arc::default();
+    let s = seen.clone();
+    let id = r
+        .mover
+        .place(o, a, SLOT, Arc::new(move |d| s.lock().unwrap().push(d)))
+        .unwrap();
+    r.mover.move_to(id, b).unwrap();
+    assert_eq!(r.mover.in_flight(), 1);
+    (r, queries, seen)
+}
+
+#[test]
+fn a_request_or_pull_of_the_moves_source_drives_no_move_and_a_frame_does() {
+    let (r, queries, seen) = moving_rig();
+    let source = r.mover.moves();
+    let keep = Arc::new(Keep::default());
+    source.clone().add_downstream(keep.clone());
+
+    // A pull hands out what is done and nothing else: it does not ask the copy whether it retired.
+    assert_eq!(
+        source.pull(&mut |_| panic!("nothing is done"), &mut |_| false, 8),
+        0
+    );
+    assert_eq!(queries.load(Ordering::Relaxed), 0, "a pull polls no copy");
+    assert_eq!(
+        keep.frames.lock().unwrap().len(),
+        0,
+        "and pushes no pump frame: that is long, so only a request sends it"
+    );
+
+    // A request pushes one frame to drive the moves; it polls no copy itself.
+    source.request(8);
+    assert_eq!(
+        queries.load(Ordering::Relaxed),
+        0,
+        "a request polls no copy"
+    );
+    assert_eq!(keep.frames.lock().unwrap().len(), 1, "one frame to pump");
+    // That frame is the only one out: a request while it is away pushes no second.
+    source.request(8);
+    assert_eq!(keep.frames.lock().unwrap().len(), 1, "one pump at a time");
+
+    // The worker that runs the frame polls the copy, as many times as the requests that follow ask it to (a poll that
+    // found nothing is followed by a window of time in which a visit pushes nothing).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        keep.run();
+        if r.mover.in_flight() == 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the copy never retired"
+        );
+        source.request(8);
+    }
+    assert!(queries.load(Ordering::Relaxed) >= 2, "the frame polled it");
+    assert_eq!(r.mover.in_flight(), 0, "and finished the move");
+
+    // The completion is a frame of the source, run like any other (the handler is the owner's).
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "the handler runs in a frame"
+    );
+    source.request(8);
+    assert!(keep.run() >= 1);
+    assert_eq!(seen.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn a_source_with_nothing_in_flight_pushes_no_pump_frame() {
+    let r = rig([2, 2, 2], 8);
+    let source = r.mover.moves();
+    let keep = Arc::new(Keep::default());
+    source.clone().add_downstream(keep.clone());
+    for _ in 0..4 {
+        source.request(8);
+    }
+    assert!(keep.take().is_empty(), "the absence of work is the signal");
+}
+
+#[test]
+fn a_freed_slot_asks_for_one_pump_to_bring_a_spilled_resident_home() {
+    let r = rig([1, 2, 2], 8);
+    let [a, b, _] = r.locations;
+    let lo = r
+        .planner
+        .open_owner(OwnerSpec::new("low", Priority(10), Scope::Process));
+    let hi = r
+        .planner
+        .open_owner(OwnerSpec::new("high", Priority(90), Scope::Process));
+    let low = r.mover.place(lo, a, SLOT, quiet()).unwrap();
+    let high = r.mover.place(hi, a, SLOT, quiet()).unwrap();
+    settle(&r.mover);
+    // The high-priority resident took the fast tier's slot and the low one was spilled below it.
+    assert_eq!(r.mover.whereabouts(high).unwrap().0, a);
+    assert_eq!(r.mover.whereabouts(low).unwrap().0, b);
+    let source = r.mover.moves();
+    let keep = Arc::new(Keep::default());
+    source.clone().add_downstream(keep.clone());
+    // The eviction's completion goes out first, as a frame like any other.
+    source.request(8);
+    keep.run();
+    source.request(8);
+    assert!(
+        keep.take().is_empty(),
+        "nothing is due while the slot is taken"
+    );
+    // The high one leaves: its slot is free at home, and the spilled one is due to come back.
+    r.mover.release(high);
+    source.request(8);
+    assert_eq!(keep.run(), 1, "one pump frame");
+    settle(&r.mover);
+    assert_eq!(r.mover.whereabouts(low).unwrap().0, a, "brought home");
+    source.request(8);
+    keep.run();
+    source.request(8);
+    assert!(keep.take().is_empty(), "and nothing is due again");
+}
+
+#[test]
+fn a_copy_that_never_retires_is_polled_ever_less_often_and_the_source_reads_unproductive_between() {
+    // A worker that finds nothing to do parks only if the handle it visits reads unproductive: a visit that
+    // pushes a frame does not. So between polls, a visit must push nothing.
+    let (r, queries, _seen) = moving_rig_with(u32::MAX);
+    let source = r.mover.moves();
+    let keep = Arc::new(Keep::default());
+    source.clone().add_downstream(keep.clone());
+    let started = std::time::Instant::now();
+    let mut visits = 0_u32;
+    let mut pushes = 0;
+    while started.elapsed() < std::time::Duration::from_millis(30) {
+        if visits.is_multiple_of(2) {
+            source.pull(&mut |_| panic!("nothing is done"), &mut |_| false, 8);
+        } else {
+            source.request(8);
+        }
+        visits += 1;
+        pushes += keep.run();
+    }
+    let elapsed = started.elapsed().as_micros() as usize;
+    let polls = queries.load(Ordering::Relaxed) as usize;
+    assert_eq!(
+        polls, pushes,
+        "one query per pump frame, and nothing else queries"
+    );
+    assert!(polls >= 4, "it is still polled ({polls})");
+    // The window between polls grows from 16 us to 100 us, whatever the visit rate: after the first four polls, one
+    // per 100 us of the run at most.
+    assert!(
+        polls <= 6 + elapsed / 100,
+        "{polls} polls in {elapsed} us and {visits} visits: the back-off did not grow"
+    );
+    // A new move is polled at the next visit, however far the back-off had grown.
+    let before = queries.load(Ordering::Relaxed);
+    let [a, b, _] = r.locations;
+    let o = r
+        .planner
+        .open_owner(OwnerSpec::new("second", Priority(50), Scope::Process));
+    let id = r.mover.place(o, a, SLOT, quiet()).unwrap();
+    r.mover.move_to(id, b).unwrap();
+    source.request(8);
+    assert_eq!(keep.run(), 1, "a new move asks for a pump at once");
+    assert!(queries.load(Ordering::Relaxed) > before);
+}
+
+#[test]
+fn a_freed_slot_asks_for_a_pump_whatever_the_back_off() {
+    let (r, _queries, _seen) = moving_rig_with(u32::MAX);
+    let source = r.mover.moves();
+    let keep = Arc::new(Keep::default());
+    source.clone().add_downstream(keep.clone());
+    for visit in 0..2_000 {
+        if visit % 2 == 0 {
+            source.pull(&mut |_| panic!("nothing is done"), &mut |_| false, 8);
+        } else {
+            source.request(8);
+        }
+        keep.run();
+    }
+    // A slot frees: the next visit pushes the pump, back-off or not.
+    let [a, ..] = r.locations;
+    let o = r
+        .planner
+        .open_owner(OwnerSpec::new("other", Priority(50), Scope::Process));
+    let id = r.mover.place(o, a, SLOT, quiet()).unwrap();
+    keep.run();
+    r.mover.release(id);
+    source.request(8);
+    assert_eq!(keep.run(), 1);
+}
+
+#[test]
+fn a_resident_busy_when_its_home_frees_still_comes_home() {
+    let r = rig([1, 2, 2], 8);
+    let [a, b, _] = r.locations;
+    let lo = r
+        .planner
+        .open_owner(OwnerSpec::new("low", Priority(10), Scope::Process));
+    let hi = r
+        .planner
+        .open_owner(OwnerSpec::new("high", Priority(90), Scope::Process));
+    let low = r.mover.place(lo, a, SLOT, quiet()).unwrap();
+    let high = r.mover.place(hi, a, SLOT, quiet()).unwrap();
+    settle(&r.mover);
+    assert_eq!(r.mover.whereabouts(high).unwrap().0, a);
+    assert_eq!(r.mover.whereabouts(low).unwrap().0, b);
+    // The home slot frees, and a pump runs, while the spilled resident is busy (its owner is inside `with`).
+    r.mover
+        .with(low, |_, _| {
+            assert!(r.mover.release(high));
+            r.mover.pump();
+        })
+        .expect("resident and idle");
+    assert!(
+        r.mover.pump_due(),
+        "the pump could not move the busy resident: another is due"
+    );
+    settle(&r.mover);
+    assert_eq!(r.mover.whereabouts(low).unwrap().0, a, "brought home");
+}
+
+#[test]
+fn a_pull_pushes_and_hands_out_no_key_a_request_pushes_it_and_a_key_out_is_never_out_twice() {
+    let (r, queries, _seen) = moving_rig_with(u32::MAX);
+    let source = r.mover.moves();
+    let keep = Arc::new(Keep::default());
+    source.clone().add_downstream(keep.clone());
+    // A pump is due (a move is in flight and new) and the frame is home: a pull, whatever it is asked, hands out and
+    // pushes nothing. The pump is long (a device query per copy, a scan of every resident), so only a request sends it.
+    for demand in [1, 8, u64::MAX] {
+        for stop in [false, true] {
+            assert_eq!(
+                source.pull(
+                    &mut |_| panic!("a key is not handed out by a pull"),
+                    &mut |_| stop,
+                    demand
+                ),
+                0
+            );
+        }
+    }
+    assert_eq!(keep.frames.lock().unwrap().len(), 0, "no pull pushed it");
+    assert_eq!(queries.load(Ordering::Relaxed), 0);
+    source.request(1);
+    assert_eq!(keep.frames.lock().unwrap().len(), 1, "a request pushes it");
+    // It is out: neither another request nor a pull sends a second.
+    source.request(1);
+    source.pull(
+        &mut |_| panic!("a key is not handed out by a pull"),
+        &mut |_| false,
+        8,
+    );
+    assert_eq!(keep.frames.lock().unwrap().len(), 1);
 }

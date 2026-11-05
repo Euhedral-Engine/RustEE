@@ -1,8 +1,8 @@
 # euhedral-io
 
 Asynchronous file and socket I/O on the RustEE lattice. `AsyncIo` is a `LatticeSource` of
-continuations: each operation returns at once, and the lattice's own polls reap the completions and
-emit the continuation frames. See the [top-level glossary](../GLOSSARY.md) for the terms a user meets and
+continuations: each operation returns at once, a frame the source pushes (its reap frame) reaps the completions on a
+worker, and the source hands out the continuation frames. See the [top-level glossary](../GLOSSARY.md) for the terms a user meets and
 [`GLOSSARY.md`](GLOSSARY.md) for this crate's implementation-level terms.
 
 Its operations are reads, writes, sends, receives, accepts and connects.
@@ -39,9 +39,13 @@ platform's: descriptors on Linux and Android, `HANDLE`s and `SOCKET`s on Windows
 completion holds a worker for long. The `AsyncIo` type is the same everywhere; an engine under it
 starts operations and finds their ends, and `src/lib.rs` does the rest.
 
-The source side takes no lock: the continuations a pull's `stop` held back are plain state of the polling
-call, and the downstream is a `DownstreamSlot`. A `request` that finds a poll running banks its demand and
-leaves a wakeup, which the running poll serves as it lets go.
+The source side takes no lock: the continuations a pull's `stop` held back are plain state of the hand-out,
+and the downstream is a `DownstreamSlot`. **Reaping is a frame's work** (it asks the kernel, takes a lock and calls the
+continuations, at every visit): `request` and `pull` only hand out
+what was reaped, and `request` pushes one reap frame (a `pull` pushes nothing and hands no reap frame out) while operations are in flight, whose `execute` is
+`AsyncIo::reap` (a caller outside a lattice calls it before it pulls). A `request` that finds a hand-out running
+banks its demand and leaves a wakeup, which the next `request` serves (a `pull` pushes nothing, so it does not serve it
+as it lets go).
 
 **Reads into memory you own.** `read_into(file, offset, buf, then)` reads straight into a region the
 caller owns, such as a pinned host arena, so the bytes land in place with no copy. `buf` is any

@@ -262,6 +262,7 @@ mod streams {
         );
         // The test thread is the worker: it polls until the continuation is emitted.
         assert!(wait_until(Duration::from_secs(5), || {
+            completions.reap();
             completions.pull(
                 &mut |mut frame| {
                     frame.execute().unwrap();

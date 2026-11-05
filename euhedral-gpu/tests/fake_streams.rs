@@ -351,6 +351,7 @@ fn a_poisoned_device_still_emits_retire_into_continuations() {
         if completions.pending() == 0 {
             break;
         }
+        completions.reap();
         emitted += completions.pull(
             &mut |mut frame| {
                 frame.execute().unwrap();

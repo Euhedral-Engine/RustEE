@@ -260,6 +260,7 @@ fn overlapping_quanta(window: usize) {
                         continue;
                     }
                     let mut frame = None;
+                    completions.reap();
                     completions.pull(&mut |f| frame = Some(f), &mut |_| false, 1);
                     match frame {
                         Some(frame) => run_frame(frame),

@@ -93,6 +93,7 @@ fn poll(io: &AsyncIo, count: usize) -> Vec<Done> {
     let deadline = Instant::now() + Duration::from_secs(10);
     while out.len() < count {
         assert!(Instant::now() < deadline, "the operations did not complete");
+        io.reap();
         io.pull(
             &mut |frame| {
                 out.push(
@@ -372,6 +373,7 @@ fn a_send_and_a_receive_over_loopback() {
         let deadline = Instant::now() + Duration::from_secs(10);
         while got.len() < data.len() {
             assert!(Instant::now() < deadline, "the send did not finish");
+            io.reap();
             io.pull(
                 &mut |frame| {
                     let done = (frame as Box<dyn std::any::Any>)
@@ -409,6 +411,7 @@ fn a_send_and_a_receive_over_loopback() {
 }
 
 fn poll_until_sent(io: &AsyncIo, sent: &mut bool) {
+    io.reap();
     io.pull(
         &mut |frame| {
             let done = (frame as Box<dyn std::any::Any>)
@@ -595,6 +598,7 @@ fn a_datagram_larger_than_the_buffer_ends_once_with_wsaemsgsize() {
             );
             // Nothing else ends, however long the port is polled.
             let mut extra = Vec::new();
+            io.reap();
             io.pull(&mut |frame| extra.push(frame), &mut |_| false, u64::MAX);
             assert!(extra.is_empty());
         }

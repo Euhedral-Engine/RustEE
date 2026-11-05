@@ -34,6 +34,21 @@ pub trait LatticeReceiver: LatticeTerminal {
 }
 
 /// Where frames come from.
+///
+/// **`request` and `pull` do no heavy or high-frequency work.** They run at every visit of a worker. They assemble
+/// frames, hand them out and push them, and a small continuation may run there: pop a ready frame, read a counter that
+/// says whether work is due. Anything heavy (looking at a device or the operating system, finishing copies, a lock and
+/// a system call, detaching sinks), or that would recur at the rate of the visits (querying every operation that waits),
+/// is a frame's work, because a worker can only measure how long work takes when the frame comes back through its
+/// executor, and that is how it sizes its batches and decides to idle or take part. A source with such work owns a *key frame* ([`KeySlot`](super::KeySlot)):
+/// `request` pushes it to the downstream when the work is due and it is home, a worker runs its `execute`, and
+/// its `recycle` sends it home. **No `push` is reachable from `pull`**: a `pull` runs on a worker that has entered
+/// from a pull, and the downstream's push is for a `request`. A `pull` does not hand the key to its `consumer` either:
+/// the pulling worker would run it through its executor while the source's handle is held, and the work behind a key is
+/// long, so nothing else could take ready work from the source meanwhile. So a key leaves only through `request`'s push.
+/// The key is a control frame, not part of the demand. A key that polls blind is
+/// paced ([`KeyPacing`](super::KeyPacing)): it is not pushed at every visit while nothing ends, or the worker never
+/// parks.
 pub trait LatticeSource: Send + Sync {
     /// Attaches the receiver this source pushes to. A source that tells the receiver about itself
     /// does so through [`LatticeTerminal::add_upstream`], passing this `Arc`.

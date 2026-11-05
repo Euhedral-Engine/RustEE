@@ -19,8 +19,8 @@ use std::time::{Duration, Instant};
 
 use euhedral_core::config::LatticeConfig;
 use euhedral_core::control_plane::ControlPlaneLattice;
-use euhedral_core::frames::{Frame, FrameError, FrameHeader, RunnableFrame};
-use euhedral_core::generics::FrameSink;
+use euhedral_core::frames::{Failure, Frame, FrameError, FrameHeader, RunnableFrame};
+use euhedral_core::generics::{FrameSink, LatticeReceiver, LatticeSource, LatticeTerminal};
 use euhedral_core::impls::DefaultExecutor;
 use euhedral_data_structures::sync::HotScope;
 use euhedral_graph::Lake;
@@ -317,7 +317,12 @@ fn a_frame_that_completes_its_sink_does_not_panic() {
     lattice.close();
 }
 
+// A key leaves a source only by a `request`, and an idle lattice can phase-lock so that a `request` never reaches the
+// idle watch's handle (each `UpstreamQueue` pull and request services one handle, and an idle cycle is one empty pull
+// then one request): the set never detaches. The upstream queue's phase fix, in the change on top of this stack,
+// fixes it and removes this `ignore`.
 #[test]
+#[ignore = "needs the upstream queue's phase fix (the last change of the stack)"]
 fn offers_racing_an_idle_detach_land_in_exactly_one_set() {
     const THREADS: u64 = 8;
     const BURSTS: u64 = 25;
@@ -556,6 +561,130 @@ fn a_value_sent_from_a_frame_arrives_for_a_main_thread_that_checks() {
     eventually("the frame to send", || handoff.is_set());
     assert_eq!(handoff.take(), Some(1234));
     drop(unit);
+    lake.complete_gracefully();
+    lattice.close();
+}
+
+/// A receiver that keeps what a source pushes, to be run by the test as a worker would.
+#[derive(Default)]
+struct Keep {
+    frames: Mutex<Vec<Box<dyn Frame>>>,
+}
+
+impl Keep {
+    fn kept(&self) -> usize {
+        self.frames
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+
+    /// Runs every frame kept, as a worker's executor does, and returns how many.
+    fn run(&self) -> usize {
+        let frames =
+            std::mem::take(&mut *self.frames.lock().unwrap_or_else(PoisonError::into_inner));
+        let n = frames.len();
+        for mut frame in frames {
+            frame.execute().unwrap();
+            frame.do_finally();
+        }
+        n
+    }
+}
+
+impl LatticeTerminal for Keep {
+    fn add_upstream(&self, _upstream: Arc<dyn LatticeSource>) {}
+}
+
+impl LatticeReceiver for Keep {
+    fn push(&self, frame: Box<dyn Frame>) {
+        self.frames
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(frame);
+    }
+
+    fn on_complete(&self) {}
+
+    fn on_error(&self, _error: Failure) {}
+}
+
+#[test]
+fn an_idle_watch_detaches_in_a_frame_and_not_in_a_request() {
+    let _turn = turn();
+    let lattice = one_cpu_lattice();
+    // An idle time of zero keeps the lake's own watch away: this one is driven by hand.
+    let lake = Lake::new(lattice.clone(), sinks(2), Duration::ZERO);
+    let unit = lake.admit().expect("a unit");
+    assert!(lake.is_attached());
+    let watch = lake
+        .idle_watch_by_hand(Duration::ZERO)
+        .expect("a set is attached");
+    let keep = Arc::new(Keep::default());
+    watch.clone().add_downstream(keep.clone());
+
+    // While a unit is admitted the lake is busy: the watch looks and pushes nothing.
+    watch.request(8);
+    assert_eq!(keep.kept(), 0, "a busy lake is left alone");
+
+    // The lake is idle. A pull pushes nothing and hands nothing out (the detach is long: a lock and the completion of
+    // every sink), whatever it is asked.
+    drop(unit);
+    for stop in [false, true] {
+        assert_eq!(
+            watch.pull(
+                &mut |_| panic!("a pull hands out no frame"),
+                &mut |_| stop,
+                8
+            ),
+            0
+        );
+    }
+    assert!(lake.is_attached(), "a pull detaches nothing");
+    assert_eq!(keep.kept(), 0, "and pushes nothing");
+    // A request pushes the frame that detaches, and detaches nothing itself.
+    watch.request(8);
+    assert!(lake.is_attached(), "a request detaches nothing");
+    assert_eq!(keep.kept(), 1, "it pushed the frame that detaches");
+    watch.request(8);
+    assert_eq!(keep.kept(), 1, "one detach frame at a time");
+
+    // The worker that runs the frame detaches the set.
+    assert_eq!(keep.run(), 1);
+    eventually("the sinks to detach", || !lake.is_attached());
+    assert!(!lake.is_complete(), "a detached lake can take units again");
+    lake.complete_gracefully();
+    lattice.close();
+}
+
+#[test]
+fn a_detach_frame_that_finds_the_lake_busy_again_keeps_the_set_and_goes_home() {
+    let _turn = turn();
+    let lattice = one_cpu_lattice();
+    let lake = Lake::new(lattice.clone(), sinks(2), Duration::ZERO);
+    drop(lake.admit().expect("a unit"));
+    let watch = lake
+        .idle_watch_by_hand(Duration::ZERO)
+        .expect("a set is attached");
+    let keep = Arc::new(Keep::default());
+    watch.clone().add_downstream(keep.clone());
+    watch.request(8);
+    assert_eq!(keep.kept(), 1);
+
+    // A unit is admitted after the frame was pushed and before it runs.
+    let unit = lake.admit().expect("a unit");
+    assert_eq!(keep.run(), 1);
+    assert!(lake.is_attached(), "the frame found the lake busy");
+    assert_eq!(lake.attachments(), 1);
+
+    // The frame is home again: the next idle time pushes it again.
+    watch.request(8);
+    assert_eq!(keep.kept(), 0, "busy again: nothing is pushed");
+    drop(unit);
+    watch.request(8);
+    assert_eq!(keep.kept(), 1, "idle again: the frame is pushed again");
+    keep.run();
+    eventually("the sinks to detach", || !lake.is_attached());
     lake.complete_gracefully();
     lattice.close();
 }

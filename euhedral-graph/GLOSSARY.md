@@ -9,8 +9,9 @@ stage graphs.
 ## Completions and sequencing
 
 **late registration** ([`Completions`](src/completions.rs)): a registration that lands behind the marker
-`complete` appended to the registration queue. The next poll (`pull` or `request`) finishes its frame
-through `do_finally` without running it, and so does the last drop of the source if no poll comes. It does
+`complete` appended to the registration queue. The next poll (`Completions::reap`, the poll frame's work, or a late
+registration's own sweep) finishes its frame through `do_finally` without running it, and so does the last drop of
+the source if no poll comes. It does
 not panic: only the polling thread sees it, and it cannot tell a misuse from a poll that was late.
 
 **leaked registration** ([`Completions::leaked_unreached`](src/completions.rs)): a registration that waits
@@ -64,8 +65,8 @@ detaching are rebalance work.
 
 **busy period, idle watch** ([`Lake`](src/lake.rs)): the sinks of a lake are attached to the lattice only
 while it has units. Beside the sinks a lake attaches an idle watch, a source the workers poll that holds no
-frames; when no unit has been admitted for the lake's idle release time, the watch detaches the sinks and
-itself, so the lattice has nothing left to poll. The next `admit` attaches a fresh set. An idle release of
+frames; when no unit has been admitted for the lake's idle release time, the watch pushes one frame (its key
+frame) and the worker that runs it detaches the sinks and the watch, so the lattice has nothing left to poll. The next `admit` attaches a fresh set. An idle release of
 `Duration::ZERO` keeps the sinks attached.
 
 ## Stage graphs

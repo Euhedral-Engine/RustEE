@@ -188,6 +188,7 @@ fn quanta_run_by_8_workers_allocate_nothing_after_warm_up() {
                         continue;
                     }
                     let mut frame = None;
+                    completions.reap();
                     completions.pull(&mut |f| frame = Some(f), &mut |_| false, 1);
                     if let Some(frame) = frame {
                         run_frame(frame);
