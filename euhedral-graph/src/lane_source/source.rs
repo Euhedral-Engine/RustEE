@@ -122,7 +122,7 @@ impl<S: LaneSubmit, X: LaneState, W> Drop for Inner<S, X, W> {
 ///
 /// Everything the lane keeps is plain state in a `SourceCell`, entered inside `request` and `pull`,
 /// which the lattice serializes. The cell's claim is checked in every build: a `request` that finds
-/// it taken (a direct call racing the lattice, or a call from inside an item) has banked its demand
+/// it taken (a call from inside an item, or a caller that is not a worker) has banked its demand
 /// and left a wakeup, and a holder that is a `request` serves it when it lets go; a holder that is a `pull` serves
 /// nothing (a worker that entered from a pull must not push, and serving runs items), so the wakeup waits for the
 /// lattice's next `request` of this source. A `pull` that finds the cell taken hands over nothing. The lifecycle
@@ -597,7 +597,7 @@ impl<S: LaneSubmit, X: LaneState, W: LaneWork<S, X>> LatticeSource for LaneSourc
         }
         let started = Instant::now();
         // The lattice serializes `pull` and `request`, so the claim is free. A caller that finds it
-        // taken (a direct call racing the lattice, or a call from inside an item) hands over
+        // taken (a call from inside an item, or a caller that is not a worker) hands over
         // nothing, as the ingest sinks' `pull` does when their drain is taken.
         let Some(mut inner) = self.cell.try_enter() else {
             return 0;

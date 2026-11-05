@@ -756,6 +756,49 @@ fn a_request_made_by_the_consumer_of_a_pull_is_served_by_the_next_request_and_th
 }
 
 #[test]
+fn an_outside_delivery_while_a_pull_holds_the_lane_is_run_by_a_workers_next_request() {
+    // An outside thread (a submitter) puts work in the lane's intake and returns: it never calls `request` or `pull`.
+    // The workers take it on their own visits: a visit is a pull, and a request when the pull found nothing.
+    let rig = Rig::new(1, &[]);
+    rig.deliver(rig.job(1).frame(), rig.lane(0));
+    rig.deliver(rig.job(2).frame(), rig.lane(0));
+    rig.sources[0].request(1);
+    assert_eq!(rig.received(0), vec![1]);
+    assert_eq!(rig.sources[0].banked(), 0);
+    let mut pulled = Vec::new();
+    // The outside delivery lands while a worker's pull holds the lane.
+    let n = rig.sources[0].pull(
+        &mut |frame| {
+            pulled.push(frame.header().id_hash());
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| rig.deliver(rig.job(3).frame(), rig.lane(0)))
+                    .join()
+                    .unwrap();
+            });
+        },
+        &mut |_| false,
+        1,
+    );
+    assert_eq!((n, pulled), (1, vec![2]));
+    assert_eq!(rig.probe.ran(), vec![1, 2], "the delivery only enqueued");
+    // The pulls of later visits hand out nothing and serve nothing, however many there are.
+    for _ in 0..1_000 {
+        assert_eq!(rig.sources[0].pull(&mut |_| {}, &mut |_| false, 64), 0);
+    }
+    assert_eq!(rig.probe.ran(), vec![1, 2], "a pull never admits the item");
+    // The worker's visit that found nothing in its pull requests the source: that serves the item.
+    rig.sources[0].request(1);
+    assert_eq!(rig.probe.ran(), vec![1, 2, 3]);
+    assert_eq!(rig.received(0), vec![1, 3]);
+    assert_eq!(
+        rig.sources[0].banked(),
+        0,
+        "nobody outside the lattice banked demand: the only requests were the workers'"
+    );
+}
+
+#[test]
 fn a_failed_mark_ends_the_item_with_failed_and_the_lane_goes_on() {
     let rig = Rig::new(1, &[]);
     rig.fake.fail_marks(LaneId(0), 1);
