@@ -50,13 +50,16 @@ pub trait Pending: Send {
 /// ready, within the demand, and never query an operation. While operations wait and no poll frame is out,
 /// `request` or `pull` pushes the source's one key frame, the *poll frame* (`pull` as well as `request` pushes it: a
 /// Direct worker that is busy never calls `request` on a source, and an idle one can phase-lock so that `request`
-/// never reaches half of its handles, backlog #130), and a worker runs it like any other frame:
+/// never reaches half of its handles; see the changelog), and a worker runs it like any other frame:
 /// its `execute` ([`reap`](Self::reap)) queries each pending operation once (a completion's `is_ready`, a
 /// [`Pending`]'s `poll`, a marker, a timer) and queues the continuations of those that completed, in the
 /// order they were registered, for the hand-out. When the frame has run it goes home, and the next `request` or
-/// `pull` may push it again, unless it found nothing: then the visits that follow skip it, twice as many after each
-/// empty poll up to [`KeyPacing::MAX_WINDOW`](euhedral_core::generics::KeyPacing::MAX_WINDOW) (a find, or a new
-/// registration, ends the back-off), so that a source that only waits reads unproductive and the worker parks.
+/// `pull` may push it again, but only when there is something to look at, so that a source that only waits reads
+/// unproductive and the worker parks: a registration since the last poll, a timer's deadline (`at`; a timer is not
+/// polled before it), a bell that rang (`after_retired`: the lane's callback rings the source's bell when it fills the
+/// cell, so the wait costs nothing until then), or, for a wait that can only be polled blind (a marker, a `Ready`, a
+/// `Wake`, a `Pending`), the end of a window of time after an empty poll (16 us, doubling to 100 us:
+/// [`KeyPacing`](euhedral_core::generics::KeyPacing)). A find ends the window.
 /// If a query panics (a `Ready`, a `Wake`, a `Pending`), its entry is finished without running (or dropped), counted
 /// ([`panicked`](Self::panicked)) and logged, and the entries behind it are queried all the same. So an operation's query is measured as the frame's cost, and nothing is pushed while
 /// nothing waits.
@@ -124,8 +127,18 @@ pub struct Completions {
     lateness: Histogram,
     /// The poll frame, while it is home.
     key: KeySlot<PollFrame>,
-    /// The back-off of the poll frame: a poll that found nothing makes the next visits skip it.
+    /// The back-off of the poll frame while it polls blind (see [`KeyPacing`]).
     pacing: KeyPacing,
+    /// The things that give the poll frame something new to look at: a registration (counted after it is queued) and a
+    /// bell that rang (a retirement callback that filled its cell). Shared with the cells that ring it.
+    events: Arc<AtomicU64>,
+    /// What the clock is measured from: the deadlines below are nanoseconds since it.
+    epoch: Instant,
+    /// The earliest deadline of the timers waiting (`u64::MAX`: none), as the last poll saw them or a registration
+    /// lowered it. A timer needs no polling before its deadline.
+    next_at: AtomicU64,
+    /// Some waiting entry can only be polled blind (a query that has no deadline and rings no bell).
+    blind: AtomicBool,
     /// Entries whose query panicked: finished without running (their frame) or dropped, and counted.
     panicked: AtomicUsize,
 }
@@ -214,12 +227,13 @@ impl Frame for PollFrame {
 
     fn execute(&mut self) -> Result<(), FrameError> {
         if let Some(source) = self.source.upgrade() {
-            // A poll that found nothing makes the visits that follow skip this frame, so that the handle reads
-            // unproductive between polls and the worker parks.
+            // A blind poll that found nothing is followed by a window of time in which a visit pushes this frame only for
+            // something new, so that the handle reads unproductive between polls and the worker parks.
+            source.pacing.polling(source.events.load(Ordering::Acquire));
             if source.reap() > 0 {
                 source.pacing.found();
             } else {
-                source.pacing.empty();
+                source.pacing.empty(source.events.load(Ordering::Acquire));
             }
         }
         Ok(())
@@ -332,6 +346,10 @@ impl Completions {
             lateness: Histogram::new(),
             key: KeySlot::with_key(PollFrame::new(me.clone())),
             pacing: KeyPacing::new(),
+            events: Arc::new(AtomicU64::new(0)),
+            epoch: Instant::now(),
+            next_at: AtomicU64::new(u64::MAX),
+            blind: AtomicBool::new(false),
             panicked: AtomicUsize::new(0),
         })
     }
@@ -356,8 +374,10 @@ impl Completions {
         // between here and the queue.
         self.pending.fetch_add(1, Ordering::AcqRel);
         self.waiting.fetch_add(1, Ordering::AcqRel);
-        // Something new to wait for: poll at the next visit, whatever the back-off had come to.
-        self.pacing.reset();
+        let deadline = match &what {
+            Waits::At(deadline, _) => Some(self.nanos(*deadline)),
+            _ => None,
+        };
         let slot = Slot::Waiting(Waiting {
             what,
             last_seen: Instant::now(),
@@ -369,6 +389,12 @@ impl Completions {
             self.cancel(what);
             return;
         }
+        // Published: tell the poll frame. The deadline first, the count last: a visit that sees the count move sees
+        // the deadline.
+        if let Some(deadline) = deadline {
+            self.next_at.fetch_min(deadline, Ordering::Release);
+        }
+        self.events.fetch_add(1, Ordering::Release);
         // Racing `complete`: the flag may be set by now, and this one may be behind the marker.
         // Do not wait for the next poll to find it (best effort; the poll, or the last drop, is
         // what guarantees it).
@@ -523,6 +549,28 @@ impl Completions {
         }
     }
 
+    /// Nanoseconds from the epoch to `at` (0 for an instant before it).
+    fn nanos(&self, at: Instant) -> u64 {
+        u64::try_from(at.saturating_duration_since(self.epoch).as_nanos()).unwrap_or(u64::MAX - 1)
+    }
+
+    /// Whether there is something to look at now: an event since the last poll started (a registration, a bell), a
+    /// timer's deadline, or, for entries that can only be polled blind, the end of the back-off window. Nothing else
+    /// is: an entry that waits for a bell, or for a deadline not yet reached, is not polled. One clock read, and only
+    /// while a timer or a blind entry waits.
+    fn poll_due(&self) -> bool {
+        if self.pacing.fresh(self.events.load(Ordering::Acquire)) {
+            return true;
+        }
+        let blind = self.blind.load(Ordering::Relaxed);
+        let next_at = self.next_at.load(Ordering::Relaxed);
+        if !blind && next_at == u64::MAX {
+            return false;
+        }
+        let now = Instant::now();
+        (blind && self.pacing.ready_at(now)) || (next_at != u64::MAX && self.nanos(now) >= next_at)
+    }
+
     /// Pushes the poll frame to the downstream: operations wait, no poll frame is out, and the source is not
     /// complete. The key is a control frame, not part of the demand (like a hot source's pushes), and there is at
     /// most one. Does nothing without a downstream (a caller driving by hand has none).
@@ -536,7 +584,7 @@ impl Completions {
         let Some(downstream) = self.downstream.receiver() else {
             return;
         };
-        if !self.pacing.due() {
+        if !self.poll_due() {
             return;
         }
         let Some(mut key) = self.key.take() else {
@@ -567,6 +615,9 @@ impl Completions {
     /// armed has ended, and `cell` holds its status. Nothing is allocated: the registration holds a clone of the `Arc`.
     /// A source dropped before the callback arrived leaks the registration, as it does for a marker not reached.
     pub fn after_retired(&self, cell: Arc<RetireCell>, frame: Box<dyn Frame>) {
+        // The callback rings this source's bell when it fills the cell: the wait costs nothing until then. (A cell
+        // another source claimed is polled blind.) One look follows from the registration itself.
+        cell.ring(&self.events);
         self.add(Waits::Retired(cell, frame));
     }
 
@@ -649,11 +700,16 @@ impl Completions {
         self.cancel_late(late);
         let Poll { waiting, ready, .. } = &mut **poll;
         if waiting.is_empty() {
+            self.next_at.store(u64::MAX, Ordering::Relaxed);
+            self.blind.store(false, Ordering::Relaxed);
             return 0;
         }
         let now = Instant::now();
         let mut queued = 0;
         let mut index = 0;
+        // What the entries left behind need next: the earliest deadline, and whether any can only be polled blind.
+        let mut earliest = u64::MAX;
+        let mut blind = false;
         while index < waiting.len() {
             let entry = &mut waiting[index];
             // Each operation is queried once, and a completed one leaves the list, so it is never
@@ -684,6 +740,11 @@ impl Completions {
             };
             if !done {
                 entry.last_seen = now;
+                match &entry.what {
+                    Waits::At(deadline, _) => earliest = earliest.min(self.nanos(*deadline)),
+                    Waits::Retired(cell, _) if cell.rings(&self.events) => {}
+                    _ => blind = true,
+                }
                 index += 1;
                 continue;
             }
@@ -709,6 +770,10 @@ impl Completions {
             let _ = ready.offer(frame);
             queued += 1;
         }
+        // A registration that raced this scan moved the event count, which the key's `execute` sees: the values it
+        // overwrites here are looked at again at the next visit.
+        self.next_at.store(earliest, Ordering::Relaxed);
+        self.blind.store(blind, Ordering::Relaxed);
         queued
     }
 
@@ -2146,10 +2211,12 @@ mod tests {
             "the demand is untouched"
         );
         hands.run();
-        // The poll found nothing, so the next visit is skipped (the back-off); then a pull pushes it, with no demand
-        // at all, now that it is home again.
+        // A timer an hour away needs no polling.
         completions.pull(&mut |_| panic!("nothing is ready"), &mut |_| false, 1);
+        completions.request(1);
         assert_eq!(hands.kept(), 0);
+        // A new registration is something new to look at: a pull pushes the frame, with no demand at all.
+        completions.at(Instant::now() + Duration::from_secs(3600), tagged(2));
         completions.pull(&mut |_| panic!("nothing is ready"), &mut |_| false, 1);
         assert_eq!(hands.kept(), 1);
         // One at a time.
@@ -2172,34 +2239,40 @@ mod tests {
     fn a_registration_that_never_completes_is_polled_ever_less_often_and_the_source_reads_unproductive_between()
      {
         // A worker that finds nothing to do parks only if the handle it visits reads unproductive: a visit that
-        // pushes a frame does not. So between polls, a visit must push nothing.
+        // pushes a frame does not. So between polls, a visit must push nothing. The polls of a blind wait are
+        // spaced by a window of time that doubles from 16 us to 100 us, whatever the visit rate.
         let (completions, _) = setup();
         let hands = Arc::new(Hands::default());
         completions.clone().add_downstream(hands.clone());
         let polls = Arc::new(AtomicUsize::new(0));
         completions.register(Box::new(NeverReady(polls.clone())));
-        const VISITS: usize = 20_000;
+        let started = Instant::now();
+        let mut visits = 0_u32;
         let mut pushes = 0;
-        for visit in 0..VISITS {
-            if visit % 2 == 0 {
+        while started.elapsed() < Duration::from_millis(30) {
+            if visits.is_multiple_of(2) {
                 completions.pull(&mut |_| panic!("nothing is ready"), &mut |_| false, 8);
             } else {
                 completions.request(8);
             }
+            visits += 1;
             pushes += hands.run();
         }
+        let elapsed = started.elapsed().as_micros() as usize;
         let polled = polls.load(Ordering::Relaxed);
         assert_eq!(
             polled, pushes,
             "one poll per poll frame, and nothing else polls"
         );
-        assert!(polled >= 8, "it is still polled ({polled})");
+        assert!(polled >= 4, "it is still polled ({polled})");
+        // After the first polls (the window starts at 16 us and reaches 100 us at the fourth) no two polls are less
+        // than 100 us apart, so there are at most one per 100 us of the run, and a few more at the start.
         assert!(
-            polled <= 120,
-            "{polled} polls in {VISITS} visits: the back-off did not grow"
+            polled <= 6 + elapsed / 100,
+            "{polled} polls in {elapsed} us and {visits} visits: the back-off did not grow"
         );
-        // A new registration is polled at the next visit, however far the back-off had grown, and finding
-        // something ends the back-off.
+        // A new registration is polled at the next visit, however far the window had grown, and finding something
+        // ends the back-off.
         completions.at(Instant::now(), tagged(9));
         completions.pull(&mut |_| panic!("nothing is ready"), &mut |_| false, 8);
         assert_eq!(hands.run(), 1, "a registration asks for a poll at once");
@@ -2207,7 +2280,145 @@ mod tests {
         assert_eq!(hands.ids(), [9], "and what it found goes out");
         hands.run();
         completions.pull(&mut |_| panic!("nothing is ready"), &mut |_| false, 8);
-        assert_eq!(hands.kept(), 1, "it found something: no back-off");
+        assert_eq!(hands.kept(), 1, "it found something: no window");
+    }
+
+    #[test]
+    fn a_timer_needs_no_polling_before_its_deadline_and_is_polled_at_the_first_visit_after_it() {
+        let (completions, _) = setup();
+        let hands = Arc::new(Hands::default());
+        completions.clone().add_downstream(hands.clone());
+        let deadline = Instant::now() + Duration::from_millis(3);
+        completions.at(deadline, tagged(5));
+        // The registration is something new: one poll, which finds nothing and learns the deadline.
+        completions.pull(&mut |_| panic!("nothing is ready"), &mut |_| false, 8);
+        assert_eq!(hands.run(), 1);
+        // No visit pushes anything while the deadline is ahead (a visit that ended before it read the clock before it).
+        let mut visits = 0_u32;
+        loop {
+            if visits.is_multiple_of(2) {
+                completions.pull(&mut |_| panic!("nothing is ready"), &mut |_| false, 8);
+            } else {
+                completions.request(8);
+            }
+            visits += 1;
+            if Instant::now() >= deadline {
+                break;
+            }
+            assert_eq!(hands.kept(), 0, "polled before the deadline");
+        }
+        // The first visit after the deadline pushes the poll frame, which finds the timer.
+        while Instant::now() < deadline {}
+        if hands.kept() == 0 {
+            completions.pull(&mut |_| panic!("nothing is ready"), &mut |_| false, 8);
+        }
+        assert_eq!(
+            hands.run(),
+            1,
+            "polled at the first visit after the deadline"
+        );
+        // What it found went out within the demand the requests banked.
+        assert_eq!(hands.ids(), [5]);
+        assert_eq!(completions.pending(), 0);
+    }
+
+    #[test]
+    fn a_timer_registered_earlier_than_the_one_waiting_is_polled_at_its_own_deadline() {
+        let (completions, _) = setup();
+        let hands = Arc::new(Hands::default());
+        completions.clone().add_downstream(hands.clone());
+        completions.at(Instant::now() + Duration::from_secs(3600), tagged(1));
+        completions.pull(&mut |_| panic!("nothing is ready"), &mut |_| false, 8);
+        hands.run();
+        completions.pull(&mut |_| panic!("nothing is ready"), &mut |_| false, 8);
+        assert_eq!(hands.kept(), 0, "an hour away: nothing to look at");
+        let soon = Instant::now() + Duration::from_millis(1);
+        completions.at(soon, tagged(2));
+        completions.pull(&mut |_| panic!("nothing is ready"), &mut |_| false, 8);
+        assert_eq!(hands.run(), 1, "the new timer is something new to look at");
+        while Instant::now() < soon {}
+        completions.pull(&mut |_| panic!("nothing is ready"), &mut |_| false, 8);
+        assert_eq!(
+            hands.run(),
+            1,
+            "and it is polled at its deadline, not the hour's"
+        );
+    }
+
+    #[test]
+    fn a_wait_that_rings_a_bell_is_not_polled_until_it_rings() {
+        let (completions, _) = setup();
+        let hands = Arc::new(Hands::default());
+        completions.clone().add_downstream(hands.clone());
+        let cell = Arc::new(RetireCell::new());
+        completions.after_retired(cell.clone(), tagged(8));
+        completions.pull(&mut |_| panic!("nothing is ready"), &mut |_| false, 8);
+        assert_eq!(hands.run(), 1, "one look, from the registration");
+        for visit in 0..20_000 {
+            if visit % 2 == 0 {
+                completions.pull(&mut |_| panic!("nothing is ready"), &mut |_| false, 8);
+            } else {
+                completions.request(8);
+            }
+            assert_eq!(
+                hands.kept(),
+                0,
+                "a wait with a bell costs nothing while it waits"
+            );
+        }
+        // The callback fills the cell and rings the bell: the next visit looks.
+        cell.arrive(0);
+        completions.pull(&mut |_| panic!("nothing is ready"), &mut |_| false, 8);
+        assert_eq!(hands.run(), 1);
+        assert_eq!(hands.ids(), [8], "and what it found goes out");
+    }
+
+    #[test]
+    fn a_cell_another_source_claimed_is_polled_blind() {
+        let (first, _) = setup();
+        let (second, _) = setup();
+        let hands = Arc::new(Hands::default());
+        second.clone().add_downstream(hands.clone());
+        let cell = Arc::new(RetireCell::new());
+        first.after_retired(cell.clone(), tagged(1));
+        // The cell rings the first source's bell, not this one's: this one cannot wait for a ring.
+        second.after_retired(cell.clone(), tagged(2));
+        second.pull(&mut |_| panic!("nothing is ready"), &mut |_| false, 8);
+        hands.run();
+        cell.arrive(0);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut out = Vec::new();
+        while out.is_empty() {
+            assert!(Instant::now() < deadline, "the cell was never seen");
+            second.pull(&mut |f| out.push(f.header().id_hash()), &mut |_| false, 8);
+            hands.run();
+        }
+        assert_eq!(out, [2]);
+    }
+
+    #[test]
+    fn a_registration_that_races_a_poll_is_not_lost_to_its_back_off() {
+        let (completions, _) = setup();
+        let hands = Arc::new(Hands::default());
+        completions.clone().add_downstream(hands.clone());
+        let polls = Arc::new(AtomicUsize::new(0));
+        completions.register(Box::new(NeverReady(polls.clone())));
+        completions.pull(&mut |_| panic!("nothing is ready"), &mut |_| false, 8);
+        hands.run();
+        // The key starts a poll; a registration arrives while it runs; the poll ends empty.
+        completions
+            .pacing
+            .polling(completions.events.load(Ordering::Acquire));
+        completions.register(Box::new(NeverReady(polls.clone())));
+        completions
+            .pacing
+            .empty(completions.events.load(Ordering::Acquire));
+        completions.pull(&mut |_| panic!("nothing is ready"), &mut |_| false, 8);
+        assert_eq!(
+            hands.kept(),
+            1,
+            "the new registration is polled at the next visit"
+        );
     }
 
     /// A pending operation whose poll panics.

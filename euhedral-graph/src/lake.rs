@@ -34,7 +34,7 @@
 //! been idle for the idle time, the call pushes the watch's one key frame, and the worker that runs it
 //! detaches the set (taking the attach lock, completing the sinks), where its cost is measured like any
 //! other frame's. (Both calls look: a Direct worker that is busy never calls `request` on a source, and an idle one
-//! can phase-lock so that `request` never reaches half of its handles, backlog #130.) A frame that finds the lake
+//! can phase-lock so that `request` never reaches half of its handles; see the changelog.) A frame that finds the lake
 //! busy again leaves the set alone and goes home, and the watch pushes it again at the next idle time.
 //!
 //! **The hot side is lock-free** (Java's volatile `generation`): the attached set is a cell of the lattice's registry,

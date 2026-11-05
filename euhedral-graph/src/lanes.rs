@@ -2,8 +2,8 @@
 
 use std::fmt;
 use std::num::NonZeroU64;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use crate::sync::AtomicI64;
 
@@ -127,6 +127,9 @@ impl std::error::Error for ControlError {}
 pub struct RetireCell {
     /// `PENDING`, or the status the callback stored.
     state: AtomicI64,
+    /// The doorbell of the [`Completions`](crate::Completions) that waits for this cell: the callback adds one to it
+    /// after its store, so the source looks at the cell when it fills and not before. At most one source claims a cell.
+    bell: OnceLock<Arc<AtomicU64>>,
 }
 
 const PENDING: i64 = i64::MIN;
@@ -136,12 +139,29 @@ impl RetireCell {
     pub fn new() -> Self {
         Self {
             state: AtomicI64::new(PENDING),
+            bell: OnceLock::new(),
         }
     }
 
-    /// The callback's one store: the status of the work before the retirement (0 for success).
+    /// The callback's one store: the status of the work before the retirement (0 for success), and one add to the
+    /// doorbell if a source claimed the cell.
     pub fn arrive(&self, status: i32) {
         self.state.store(i64::from(status), Ordering::Release);
+        if let Some(bell) = self.bell.get() {
+            bell.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    /// Claims the cell for the source whose event counter is `bell`: from now on the callback adds one to it. Returns
+    /// whether the cell rings that bell (it does, unless another source claimed it first). A callback that arrived
+    /// before the claim rang nothing, so the caller must look at the cell once after claiming it.
+    pub(crate) fn ring(&self, bell: &Arc<AtomicU64>) -> bool {
+        Arc::ptr_eq(self.bell.get_or_init(|| bell.clone()), bell)
+    }
+
+    /// Whether the cell rings `bell`.
+    pub(crate) fn rings(&self, bell: &Arc<AtomicU64>) -> bool {
+        self.bell.get().is_some_and(|ours| Arc::ptr_eq(ours, bell))
     }
 
     /// Whether the callback arrived.
