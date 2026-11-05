@@ -238,8 +238,8 @@ impl QueueSource {
     }
 
     /// Hands every queued frame to `consume`, unless a drain holds the queue: that drain hands the
-    /// frames queued behind it on when it lets go (Java's `discardQueued`). A panic in `consume` is
-    /// raised after the rest are handed over and the release's tail has run.
+    /// frames queued behind it on when it lets go (Java's `discardQueued`). It serves no request. A panic in `consume`
+    /// is raised after the rest are handed over and the release's tail has run.
     pub(super) fn discard_queued(&self, mut consume: impl FnMut(Box<dyn Frame>)) {
         let mut panicked = None;
         loop {
@@ -254,8 +254,10 @@ impl QueueSource {
                 break;
             }
         }
+        // No `drain_requests` here, as Java's `discardQueued` has none: this runs from the tail of a pull (the owner's
+        // `drain_finished`) when a kill is under way, and a worker that entered from a pull must not push. The kill
+        // completes the downstream right after, so no request is lost by leaving one pending.
         panicked = self.apply_clear().or(panicked);
-        self.drain_requests();
         if let Some(panic) = panicked {
             panic::resume_unwind(panic);
         }

@@ -591,6 +591,64 @@ impl Owner for Discarding {
     }
 }
 
+/// An owner whose kill is under way: once `killing` is set, the tail of every drain discards what is queued, as a
+/// runner's does between its kill switch and the close that completes the downstream.
+struct Killing(std::sync::atomic::AtomicBool);
+
+impl Owner for Killing {
+    fn complete(&self, source: &QueueSource) {
+        source.close();
+    }
+
+    fn drain_finished(&self, source: &QueueSource) {
+        if self.0.load(Ordering::SeqCst) {
+            source.discard_queued(|frame| frame.do_finally_with_error(FrameError::Cancelled));
+        }
+    }
+}
+
+#[test]
+fn a_discard_from_the_tail_of_a_pull_during_a_kill_serves_no_request() {
+    let source = QueueSource::new(NonZeroUsize::MIN, 64, Ending::Gracefully);
+    let owner = Arc::new(Killing(std::sync::atomic::AtomicBool::new(false)));
+    let as_owner: Arc<dyn Owner> = owner.clone();
+    source.set_owner(Arc::downgrade(&as_owner));
+    let receiver = TestReceiver::new();
+    source.clone().add_downstream(receiver.clone());
+    for id in 1..=3 {
+        assert!(source.offer(frame(id)).is_ok());
+    }
+    let inner = source.clone();
+    let pulled = source.pull(
+        &mut |_frame| {
+            // The queue is held: the request banks its demand and leaves its wakeup. The kill switch is set while the
+            // pull is inside, so the tail of this pull runs the owner's discard.
+            inner.request(1);
+            owner.0.store(true, Ordering::SeqCst);
+        },
+        &mut |frame| frame.header().id_hash() == 2,
+        3,
+    );
+    assert_eq!(pulled, 1);
+    assert_eq!(
+        source.size(),
+        0,
+        "the kill's discard from the tail of the pull cancelled the frames left in the queue"
+    );
+    assert!(
+        receiver.received().is_empty(),
+        "nothing was pushed from the pull"
+    );
+    // Only a request takes the wakeup (the swap in `drain_requests`): the discard used to take it, and to push what
+    // was queued behind its last emptiness check, from inside the pull. The kill completes the downstream right
+    // after, so a request left pending is not lost.
+    assert!(
+        source.request_pending.load(Ordering::SeqCst),
+        "the discard left the wakeup for the next request"
+    );
+    assert_eq!(source.demand(), 1, "and its banked demand");
+}
+
 #[test]
 fn a_publish_after_close_is_discarded_by_someone() {
     const PUBLISHERS: u64 = 4;
