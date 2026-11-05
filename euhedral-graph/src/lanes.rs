@@ -2,10 +2,10 @@
 
 use std::fmt;
 use std::num::NonZeroU64;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
 
-use crate::sync::AtomicI64;
+use crate::sync::{AtomicI64, AtomicPtr};
 
 /// Which lane of a [`LanePool`] a marker belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -117,19 +117,23 @@ impl fmt::Display for ControlError {
 
 impl std::error::Error for ControlError {}
 
+/// A source's event counter, which a [`RetireCell`] rings.
+pub(crate) type Bell = crate::sync::AtomicU64;
+
 /// Where a lane's retirement callback leaves its status: the sink an arm names (Java's `notifyRetired(listener)`).
 ///
-/// The callback only fills the cell with one store: it makes no driver call, takes no lock and allocates nothing.
-/// Whoever armed the retirement finds the cell filled by polling it ([`Completions::after_retired`](crate::Completions)
-/// does) and settles the status in a frame, so a retirement is never anonymous: two parties arming on one lane each
-/// read their own cell.
+/// The callback only fills the cell with one atomic exchange (and rings a bell with one add, if a source claimed the
+/// cell): it makes no driver call, takes no lock and allocates nothing. Whoever armed the retirement finds the cell
+/// filled by polling it ([`Completions::after_retired`](crate::Completions) does) and settles the status in a frame,
+/// so a retirement is never anonymous: two parties arming on one lane each read their own cell.
 #[derive(Debug)]
 pub struct RetireCell {
     /// `PENDING`, or the status the callback stored.
     state: AtomicI64,
-    /// The doorbell of the [`Completions`](crate::Completions) that waits for this cell: the callback adds one to it
-    /// after its store, so the source looks at the cell when it fills and not before. At most one source claims a cell.
-    bell: OnceLock<Arc<AtomicU64>>,
+    /// The doorbell of the [`Completions`](crate::Completions) that waits for this cell: a `Bell` the cell holds a
+    /// strong reference to (`Arc::into_raw`), or null. The callback adds one to it after it filled the cell, so the
+    /// source looks at the cell when it fills and not before. At most one source claims a cell.
+    bell: AtomicPtr<Bell>,
 }
 
 const PENDING: i64 = i64::MIN;
@@ -139,29 +143,74 @@ impl RetireCell {
     pub fn new() -> Self {
         Self {
             state: AtomicI64::new(PENDING),
-            bell: OnceLock::new(),
+            bell: AtomicPtr::new(std::ptr::null_mut()),
         }
     }
 
-    /// The callback's one store: the status of the work before the retirement (0 for success), and one add to the
+    /// The callback's one exchange: the status of the work before the retirement (0 for success), and one add to the
     /// doorbell if a source claimed the cell.
+    ///
+    /// The exchange is a read-modify-write and not a store, so that it is ordered against the claim's own
+    /// ([`ring`](Self::ring)): the two are totally ordered on `state`. If the claim came first, this call reads what the
+    /// claim wrote, which was written after the bell was installed, so it sees the bell and rings it. If this call came
+    /// first, the claim reads the status it stored, so everything the source does after the claim sees the cell
+    /// filled. A plain store followed by a load of the bell would let both sides read the old value (a store followed by
+    /// a load is not ordered by release and acquire alone), and the wake-up would be lost.
+    #[allow(
+        unsafe_code,
+        reason = "the bell is an `Arc::into_raw` the cell keeps alive; SAFETY below"
+    )]
     pub fn arrive(&self, status: i32) {
-        self.state.store(i64::from(status), Ordering::Release);
-        if let Some(bell) = self.bell.get() {
-            bell.fetch_add(1, Ordering::Release);
+        self.state.swap(i64::from(status), Ordering::AcqRel);
+        let bell = self.bell.load(Ordering::Acquire);
+        if !bell.is_null() {
+            // SAFETY: a non-null bell is an `Arc::into_raw` that the cell owns a strong reference to until it drops, and
+            // `&self` keeps the cell alive.
+            unsafe { &*bell }.fetch_add(1, Ordering::Release);
         }
     }
 
     /// Claims the cell for the source whose event counter is `bell`: from now on the callback adds one to it. Returns
-    /// whether the cell rings that bell (it does, unless another source claimed it first). A callback that arrived
-    /// before the claim rang nothing, so the caller must look at the cell once after claiming it.
-    pub(crate) fn ring(&self, bell: &Arc<AtomicU64>) -> bool {
-        Arc::ptr_eq(self.bell.get_or_init(|| bell.clone()), bell)
+    /// whether the cell rings that bell (it does, unless another source claimed it first).
+    ///
+    /// A callback that arrived before the claim rang nothing, and the claim cannot miss it: installing the bell is
+    /// followed by a read-modify-write of the status (see [`arrive`](Self::arrive)), and what the source does after
+    /// this call (it publishes an event, then its key reads the cell) sees that or a later value. So the source does not
+    /// need a look of its own, only to publish the event after the claim.
+    #[allow(
+        unsafe_code,
+        reason = "reclaims the reference a lost exchange did not hand over; SAFETY below"
+    )]
+    pub(crate) fn ring(&self, bell: &Arc<Bell>) -> bool {
+        let mine = Arc::as_ptr(bell).cast_mut();
+        let current = self.bell.load(Ordering::Acquire);
+        if !current.is_null() {
+            return current == mine;
+        }
+        let raw = Arc::into_raw(Arc::clone(bell)).cast_mut();
+        match self.bell.compare_exchange(
+            std::ptr::null_mut(),
+            raw,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                // Orders this claim against a callback that is running: either it reads this write and rings the bell,
+                // or this reads its status.
+                self.state.fetch_add(0, Ordering::AcqRel);
+                true
+            }
+            Err(other) => {
+                // SAFETY: `raw` is the reference made above, which the failed exchange did not hand to the cell.
+                drop(unsafe { Arc::from_raw(raw) });
+                other == mine
+            }
+        }
     }
 
     /// Whether the cell rings `bell`.
-    pub(crate) fn rings(&self, bell: &Arc<AtomicU64>) -> bool {
-        self.bell.get().is_some_and(|ours| Arc::ptr_eq(ours, bell))
+    pub(crate) fn rings(&self, bell: &Arc<Bell>) -> bool {
+        self.bell.load(Ordering::Acquire) == Arc::as_ptr(bell).cast_mut()
     }
 
     /// Whether the callback arrived.
@@ -180,6 +229,20 @@ impl RetireCell {
     /// Readies the cell for another retirement. Only once the last one arrived and was settled.
     pub fn rearm(&self) {
         self.state.store(PENDING, Ordering::Release);
+    }
+}
+
+impl Drop for RetireCell {
+    #[allow(
+        unsafe_code,
+        reason = "releases the reference `ring` handed to the cell; SAFETY below"
+    )]
+    fn drop(&mut self) {
+        let bell = self.bell.swap(std::ptr::null_mut(), Ordering::Acquire);
+        if !bell.is_null() {
+            // SAFETY: the cell's strong reference (see `ring`), released once, here.
+            drop(unsafe { Arc::from_raw(bell) });
+        }
     }
 }
 
@@ -434,6 +497,48 @@ impl LanePoolBuilder {
 mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
+
+    #[test]
+    fn a_cell_rings_the_bell_of_the_source_that_claimed_it_and_no_other() {
+        let (ours, theirs) = (Arc::new(Bell::new(0)), Arc::new(Bell::new(0)));
+        let cell = RetireCell::new();
+        assert!(!cell.rings(&ours), "unclaimed");
+        assert!(cell.ring(&ours));
+        assert!(cell.ring(&ours), "claiming again changes nothing");
+        assert!(!cell.ring(&theirs), "a cell has one bell");
+        assert!(cell.rings(&ours) && !cell.rings(&theirs));
+        cell.arrive(0);
+        assert_eq!(
+            (ours.load(Ordering::Acquire), theirs.load(Ordering::Acquire)),
+            (1, 0)
+        );
+        assert_eq!(Arc::strong_count(&ours), 2, "the cell holds the bell");
+        assert_eq!(Arc::strong_count(&theirs), 1, "and not the one it refused");
+        drop(cell);
+        assert_eq!(
+            Arc::strong_count(&ours),
+            1,
+            "and lets go of it with the cell"
+        );
+    }
+
+    #[test]
+    fn a_callback_that_arrived_before_the_claim_rings_nothing_and_the_claim_finds_it_filled() {
+        let bell = Arc::new(Bell::new(0));
+        let cell = RetireCell::new();
+        cell.arrive(3);
+        assert!(cell.ring(&bell));
+        assert_eq!(
+            bell.load(Ordering::Acquire),
+            0,
+            "nothing was claimed to ring"
+        );
+        assert_eq!(
+            cell.status(),
+            Some(3),
+            "what the source looks at after the claim"
+        );
+    }
 
     #[derive(Debug)]
     struct Idle(QueueId);
@@ -759,6 +864,32 @@ mod loom_tests {
             assert!(matches!(seen, None | Some(2)), "never the settled 1");
             callback.join().unwrap();
             assert_eq!(cell.status(), Some(2));
+        });
+    }
+
+    /// A source claims the cell, publishes its event and looks at the cell, while the callback arrives. The look that
+    /// finds the cell still pending is always followed by a ring: the wake-up is never lost. (With the callback's
+    /// status a plain store and the bell read after it, both sides can read the old value and nothing wakes the source.)
+    #[test]
+    fn loom_a_claim_racing_the_callback_never_loses_the_wake_up() {
+        loom::model(|| {
+            let cell = Arc::new(RetireCell::new());
+            let bell = std::sync::Arc::new(Bell::new(0));
+            let callback = {
+                let cell = cell.clone();
+                thread::spawn(move || cell.arrive(0))
+            };
+            // The source: claim the cell, publish the event (the registration), and look (the key's poll).
+            assert!(cell.ring(&bell));
+            bell.fetch_add(1, Ordering::Release);
+            let seen = cell.arrived();
+            callback.join().unwrap();
+            if !seen {
+                assert!(
+                    bell.load(Ordering::Acquire) >= 2,
+                    "the look found the cell pending and the callback rang nothing"
+                );
+            }
         });
     }
 }

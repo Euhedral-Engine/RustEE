@@ -17,7 +17,7 @@ use euhedral_data_structures::sync::HotScope;
 
 use euhedral_core::metrics::Histogram;
 
-use crate::lanes::{LanePool, Marker, RetireCell};
+use crate::lanes::{Bell, LanePool, Marker, RetireCell};
 
 /// Whether an operation has completed. One cheap query; never blocks.
 pub trait Ready: Send {
@@ -131,7 +131,7 @@ pub struct Completions {
     pacing: KeyPacing,
     /// The things that give the poll frame something new to look at: a registration (counted after it is queued) and a
     /// bell that rang (a retirement callback that filled its cell). Shared with the cells that ring it.
-    events: Arc<AtomicU64>,
+    events: Arc<Bell>,
     /// What the clock is measured from: the deadlines below are nanoseconds since it.
     epoch: Instant,
     /// The earliest deadline of the timers waiting (`u64::MAX`: none), as the last poll saw them or a registration
@@ -346,7 +346,7 @@ impl Completions {
             lateness: Histogram::new(),
             key: KeySlot::with_key(PollFrame::new(me.clone())),
             pacing: KeyPacing::new(),
-            events: Arc::new(AtomicU64::new(0)),
+            events: Arc::new(Bell::new(0)),
             epoch: Instant::now(),
             next_at: AtomicU64::new(u64::MAX),
             blind: AtomicBool::new(false),
@@ -2371,6 +2371,22 @@ mod tests {
         completions.pull(&mut |_| panic!("nothing is ready"), &mut |_| false, 8);
         assert_eq!(hands.run(), 1);
         assert_eq!(hands.ids(), [8], "and what it found goes out");
+    }
+
+    #[test]
+    fn a_callback_that_arrived_before_the_registration_is_found_by_the_look_it_asks_for() {
+        let (completions, _) = setup();
+        let hands = Arc::new(Hands::default());
+        completions.clone().add_downstream(hands.clone());
+        let cell = Arc::new(RetireCell::new());
+        cell.arrive(0);
+        completions.after_retired(cell.clone(), tagged(4));
+        // The callback rang nothing (nobody had claimed the cell), and the wait is not blind: the registration is the
+        // event that makes the key look, and the look finds the cell filled.
+        completions.pull(&mut |_| panic!("nothing is ready"), &mut |_| false, 8);
+        assert_eq!(hands.run(), 1);
+        completions.request(8);
+        assert_eq!(hands.ids(), [4]);
     }
 
     #[test]
