@@ -1,0 +1,96 @@
+# Warms the caches the pull-request workflow (ci.yml) restores. A pull request can restore only caches made on the
+# default branch, and ci.yml does not run again for a push to main (the pull request ran it already), so this workflow
+# runs there instead: it fetches and builds the dependencies for every toolchain and profile the jobs of ci.yml use,
+# and tests nothing. The cache keys are shared with ci.yml (`shared-key`): keep the two in step.
+#
+#   workspace-<os>  Clippy (`check` builds), the test build, the release build and, on Linux, the loom build
+#                   (`--cfg loom`) and the CUDA-feature builds, with the toolchain pinned in mise.toml;
+#   miri            Miri's sysroot and the dependencies of every Miri test selection, with the dated nightly in
+#                   scripts/ci/miri-toolchain.
+#
+# The builds are best effort: a pull request that builds fewer crates, or other features, finds what overlaps.
+name: cache-warm
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# A warm-up runs to its end (an aborted one saves nothing); the next waits for it.
+concurrency:
+  group: cache-warm
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  workspace:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the toolchain pinned in mise.toml
+        run: |
+          version=$(sed -n 's/^rust = .*version = "\([^"]*\)".*/\1/p' mise.toml)
+          rustup toolchain install "$version" --profile minimal --component rustfmt --component clippy
+          rustup default "$version"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-${{ matrix.os }}
+
+      - name: Dependencies for Clippy (check builds)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Dependencies for the tests
+        run: cargo test --workspace --no-run
+
+      - name: Dependencies for the release tests
+        run: cargo test --release -p euhedral-core -p euhedral-graph --no-run
+
+      - name: Dependencies for the loom models
+        if: runner.os == 'Linux'
+        env:
+          RUSTFLAGS: --cfg loom
+        run: cargo test --release -p euhedral-data-structures -p euhedral-graph -p euhedral-gpu --lib --no-run
+
+      - name: Dependencies for the CUDA backend
+        if: runner.os == 'Linux'
+        run: |
+          cargo clippy -p euhedral-memory -p euhedral-gpu --all-targets --features cuda -- -D warnings
+          cargo test -p euhedral-gpu --features cuda --no-run
+
+  miri:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned nightly toolchain with Miri
+        run: |
+          toolchain=$(cat scripts/ci/miri-toolchain)
+          rustup toolchain install "$toolchain" --profile minimal --component miri --component rust-src
+          echo "RUSTUP_TOOLCHAIN=$toolchain" >> "$GITHUB_ENV"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: miri
+          cache-directories: ~/.cache/miri
+
+      - name: Build Miri's sysroot and the dependencies of every test selection
+        run: |
+          cargo miri setup
+          python3 scripts/ci/miri_build.py --all > miri-build.sh
+          bash -ex miri-build.sh

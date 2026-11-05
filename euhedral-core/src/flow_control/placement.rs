@@ -200,7 +200,7 @@ mod tests {
         thread::scope(|scope| {
             for _ in 0..3 {
                 scope.spawn(|| {
-                    for round in 0..20 {
+                    for round in 0..if cfg!(miri) { 4 } else { 20 } {
                         let mut frame = BenchmarkFrame::new(round, None);
                         assert!(placement.apply(&registry, &mut frame));
                         assert_eq!(frame.header().routing_hash(), 2);

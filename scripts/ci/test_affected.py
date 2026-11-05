@@ -93,9 +93,9 @@ class Affected(unittest.TestCase):
 
 class Miri(unittest.TestCase):
     SHARDS = [
-        {"name": "a", "crate": "core", "commands": ["c1", "c2"]},
-        {"name": "b", "crate": "graph", "commands": ["c3"]},
-        {"name": "c", "crate": "ds", "commands": ["c4"]},
+        {"name": "a", "crate": "core", "seeds": 16, "commands": ["c1", "c2"]},
+        {"name": "b", "crate": "graph", "seeds": 4, "commands": ["c3"]},
+        {"name": "c", "crate": "ds", "seeds": 1, "commands": ["c4"]},
     ]
 
     def matrix(self, *files):
@@ -104,7 +104,7 @@ class Miri(unittest.TestCase):
 
     def test_only_affected_crates_have_shards(self):
         out = self.matrix("euhedral-graph/src/a.rs")
-        self.assertEqual(json.loads(out["miri_matrix"]), {"include": [{"name": "b", "commands": "c3"}]})
+        self.assertEqual(json.loads(out["miri_matrix"]), {"include": [{"name": "b", "seeds": 4, "commands": "c3"}]})
         self.assertEqual(out["miri"], "true")
 
     def test_a_lower_layer_brings_the_shards_above(self):
@@ -126,8 +126,24 @@ class Miri(unittest.TestCase):
         self.assertTrue(shards)
         for s in shards:
             self.assertTrue(s["name"] and s["commands"], s)
-            self.assertTrue(all(c.startswith("cargo +nightly miri test ") for c in s["commands"]), s)
+            self.assertTrue(all(c.startswith("cargo miri test ") for c in s["commands"]), s)
             self.assertTrue(all(f"-p {s['crate']} " in c for c in s["commands"]), s)
+        self.assertEqual(A.shard_problems(shards), [])
+
+    def test_a_shard_needs_its_seeds_a_name_and_miri_commands(self):
+        good = {"name": "a", "crate": "core", "seeds": 4, "commands": ["cargo miri test -p core --lib"]}
+        self.assertEqual(A.shard_problems([good]), [])
+        for bad in [
+            {**good, "seeds": 0},
+            {**good, "seeds": "4"},
+            {**good, "seeds": True},
+            {k: v for k, v in good.items() if k != "seeds"},
+            {**good, "commands": ["cargo +nightly miri test -p core --lib"]},
+            {**good, "commands": []},
+            {**good, "crate": ""},
+        ]:
+            self.assertTrue(A.shard_problems([bad]), bad)
+        self.assertTrue(A.shard_problems([good, good]), "a name is used once")
 
 
 class Metadata(unittest.TestCase):

@@ -25,7 +25,8 @@ Outputs (stdout as `key=value`, and to --github-output):
   crates       the affected crate names, space separated
   <crate>      `true` or `false` per workspace crate, the name with `-` as `_` (euhedral_core)
   miri         `true` if any Miri shard runs
-  miri_matrix  a `{"include": [...]}` matrix of the Miri shards (scripts/ci/miri-shards.json) whose crate is affected
+  miri_matrix  a `{"include": [...]}` matrix of the Miri shards (scripts/ci/miri-shards.json) whose crate is affected;
+               each entry has the shard's name, its commands (newline-joined) and its seeds (how many seeds Miri runs)
   reason       one line saying why
 """
 
@@ -147,10 +148,32 @@ def affected(graph, files):
     return out, out == set(graph.dirs), "changed: " + " ".join(sorted(seed))
 
 
+def shard_problems(shards):
+    """What is wrong with the shard list: a shard needs a unique name, a crate, `seeds` (a positive whole number) and
+    commands that are `cargo miri test` runs (the toolchain is the job's)."""
+    problems, names = [], set()
+    for s in shards:
+        name = s.get("name")
+        if not name or name in names:
+            problems.append(f"shard name missing or repeated: {name!r}")
+        names.add(name)
+        if not s.get("crate"):
+            problems.append(f"{name}: no crate")
+        seeds = s.get("seeds")
+        if type(seeds) is not int or seeds < 1:
+            problems.append(f"{name}: seeds must be a positive whole number, not {seeds!r}")
+        commands = s.get("commands")
+        if not commands or not all(c.startswith("cargo miri test ") for c in commands):
+            problems.append(f"{name}: commands must be `cargo miri test ...` runs")
+    return problems
+
+
 def miri_matrix(shards, crates):
     """The matrix for the Miri jobs: one entry per shard whose crate is affected."""
     include = [
-        {"name": s["name"], "commands": "\n".join(s["commands"])} for s in shards if s["crate"] in crates
+        {"name": s["name"], "seeds": s["seeds"], "commands": "\n".join(s["commands"])}
+        for s in shards
+        if s["crate"] in crates
     ]
     return {"include": include}
 
@@ -213,6 +236,8 @@ def main(argv=None):
 
     with open(args.miri_shards) as f:
         shards = json.load(f)
+    for problem in shard_problems(shards):
+        ap.error(f"{args.miri_shards}: {problem}")
     unknown = {s["crate"] for s in shards} - set(graph.dirs)
     if unknown:
         ap.error(f"{args.miri_shards} names crates that are not in the workspace: {sorted(unknown)}")
