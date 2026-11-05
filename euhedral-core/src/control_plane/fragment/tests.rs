@@ -438,11 +438,12 @@ fn workers_run_frames_from_their_upstreams() {
     let source = Source::with((0..500).map(|id| unordered(id, id + 1)));
     fixture.registry().add_handle(source.clone());
 
-    wait_until("every upstream frame to run", || {
-        fixture.receiver.received().len() == 500
-    });
-    // With nothing run, a direct cycle asks its upstreams for a batch.
-    assert!(source.requested.load(Ordering::Acquire) > 0);
+    // The 500th frame can run inside the worker's last productive pull; with nothing run, a later direct cycle asks
+    // its upstreams for a batch. So the wait covers both.
+    wait_until(
+        "every upstream frame to run and a cycle that ran nothing to request",
+        || fixture.receiver.received().len() == 500 && source.requested.load(Ordering::Acquire) > 0,
+    );
     let mut received = fixture.receiver.received();
     received.sort_unstable();
     assert_eq!(received, (0..500).collect::<Vec<_>>());
