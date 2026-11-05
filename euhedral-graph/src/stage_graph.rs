@@ -295,7 +295,7 @@ pub trait Stage<Q, L: DeviceQueue + ?Sized = dyn DeviceQueue>: Send + Sync {
     ///   quantum's boundary, like any stage that never submitted. A holder that learns of a kill releases the gate, fails
     ///   it or drops it; any of the three is harmless, and with the kill switch set each ends the quantum as
     ///   [`QuantumOutcome::Killed`] (the kill is noted before the failure of a `fail` or a drop, so it is the first
-    ///   cause).
+    ///   cause), unless the quantum had failed already: the first cause stands.
     /// - **Fail and drop.** [`Gate::fail`] fails the quantum with the given error, as for a gate taken in
     ///   [`pass_gate`](Self::pass_gate): the stage does not run again and the count is dropped. A gate dropped unspent
     ///   fails the quantum with [`StageError::Fatal`] the same way, and `Held` or `Retry` given to `fail` become
@@ -437,7 +437,7 @@ impl Gate {
     /// The gate cannot be released because what the stage waits for failed: the quantum fails with `error`, and the held
     /// stage's count is dropped. `Retry` and `Held` are no failures, so a gate failed with either fails the quantum with
     /// [`StageError::Fatal`]. If the quantum's kill switch is set, the quantum ends as [`QuantumOutcome::Killed`] instead,
-    /// whichever way the gate is spent (release, `fail` or drop).
+    /// whichever way the gate is spent (release, `fail` or drop), unless the quantum had failed already: the first cause stands.
     pub fn fail(mut self, error: StageError) {
         if let Some((target, stage)) = self.held.take() {
             let error = match error {
@@ -2484,16 +2484,39 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> GateTarget for
     }
 
     fn fail_gate(self: Arc<Self>, stage: StageId, error: StageError) {
-        // Noted before the gate is spent: once it is, the end of the run may drop the stage's count, and with the last
-        // count the quantum retires. A killed quantum ends as killed, whichever way its gate is spent.
-        if self.kill_set() {
-            self.note(QuantumOutcome::Killed);
-        }
-        self.fail(stage, error);
-        if self.stages[usize::from(stage.0)].spend_gate(GATE_FAILED) == Spend::Now {
+        let spend = fail_gate_of(
+            &self.cause,
+            &self.stopped,
+            &self.stages[usize::from(stage.0)],
+            stage,
+            error,
+            self.kill_set(),
+        );
+        if spend == Spend::Now {
             self.finish_one();
         }
     }
+}
+
+/// Fails the quantum for a gate of `stage_run` that is spent as failed, and spends it.
+///
+/// The cause is noted before the gate is spent: once it is, the end of the run may drop the stage's count, and with the
+/// last count the quantum retires and reads the cause. A killed quantum ends as killed, whichever way its gate is spent
+/// (unless it had failed already: the first cause stands). A function of its own so that the loom model runs this code.
+fn fail_gate_of(
+    cause: &FirstCause<QuantumOutcome>,
+    stopped: &AtomicBool,
+    stage_run: &StageRun,
+    stage: StageId,
+    error: StageError,
+    killed: bool,
+) -> Spend {
+    if killed {
+        cause.claim(QuantumOutcome::Killed);
+    }
+    cause.claim(QuantumOutcome::Failed { stage, error });
+    stopped.store(true, Ordering::Release);
+    stage_run.spend_gate(GATE_FAILED)
 }
 
 impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Upstream for Run<Q, L> {
@@ -2913,30 +2936,36 @@ mod loom_tests {
         });
     }
 
-    // The same for a gate that fails: the failer notes the cause before it spends the gate, and the party that acts drops
-    // the stage's count, once. The end of the run that finds the gate failed reads the cause: it sees it whenever it sees
-    // `GATE_FAILED` (so the cause is written before the spend, as `fail_gate` does it).
+    // The same for a gate that fails, through the code `fail_gate` runs (`fail_gate_of`): the failer notes the cause
+    // before it spends the gate, and the party that acts drops the stage's count, once. The end of the run that finds the
+    // gate failed sees the cause claimed, whenever it sees `GATE_FAILED`.
     #[test]
     fn loom_the_second_of_a_runs_end_and_its_gates_failure_drops_the_count_once_and_sees_the_cause()
     {
         loom::model(|| {
             let stage = Arc::new(StageRun::new());
-            let cause = Arc::new(Owned::new(0u32));
+            let cause = Arc::new(FirstCause::<QuantumOutcome>::new());
+            let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let drops = Arc::new(crate::sync::AtomicUsize::new(0));
             stage.gate.store(GATE_RUNNING, Ordering::Relaxed);
             let failer = {
-                let (stage, cause, drops) = (stage.clone(), cause.clone(), drops.clone());
+                let (stage, cause, stopped, drops) =
+                    (stage.clone(), cause.clone(), stopped.clone(), drops.clone());
                 thread::spawn(move || {
-                    // SAFETY: only this thread writes the cell; the run's end reads it after seeing the failure.
-                    unsafe { cause.write(|c| *c = 5) };
-                    if stage.spend_gate(GATE_FAILED) == Spend::Now {
+                    let error = StageError::Corrupt("the artifact would not read".into());
+                    if fail_gate_of(&cause, &stopped, &stage, StageId(0), error, false)
+                        == Spend::Now
+                    {
                         drops.fetch_add(1, Ordering::AcqRel);
                     }
                 })
             };
             if stage.run_ended_with_gate() == RunEnd::Failed {
-                // SAFETY: the exchange that found the gate failed follows the failer's write.
-                assert_eq!(unsafe { cause.read(|c| *c) }, 5, "the cause is there");
+                assert!(cause.is_claimed(), "the run's end sees the cause");
+                assert!(
+                    stopped.load(std::sync::atomic::Ordering::Acquire),
+                    "and that the quantum stopped"
+                );
                 drops.fetch_add(1, Ordering::AcqRel);
             }
             failer.join().unwrap();
