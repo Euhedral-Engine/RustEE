@@ -56,10 +56,30 @@ class Affected(unittest.TestCase):
         self.assertFalse(everything)
 
     def test_root_build_files_are_everything(self):
-        for f in ["Cargo.lock", "Cargo.toml", "mise.toml", "clippy.toml", "rustfmt.toml", ".github/workflows/ci.yml", "scripts/ci/affected.py", "build.rs"]:
+        for f in [
+            "Cargo.lock", "Cargo.toml", "mise.toml", "clippy.toml", ".clippy.toml", "rustfmt.toml", ".rustfmt.toml",
+            "rust-toolchain", "rust-toolchain.toml", ".cargo/config.toml", "build.rs",
+        ]:
             crates, everything = run(f)
             self.assertTrue(everything, f)
             self.assertEqual(sorted(crates), sorted(NAMES), f)
+
+    def test_the_workflow_runs_the_workspace_jobs_in_full(self):
+        self.assertEqual(run(".github/workflows/ci.yml"), (sorted(NAMES), True))
+
+    def test_ci_files_that_select_no_crate(self):
+        for f in [
+            ".github/workflows/cache-warm.yml", "scripts/ci/affected.py", "scripts/ci/test_affected.py",
+            "scripts/ci/miri_build.py", "scripts/ci/miri-shards.json", "scripts/ci/miri-toolchain",
+        ]:
+            self.assertEqual(run(f), ([], False), f)
+
+    def test_other_ci_files_are_still_root_build_files(self):
+        for f in [".github/CODEOWNERS", ".github/workflows/other.yml", "scripts/ci/run.sh"]:
+            self.assertEqual(run(f), (sorted(NAMES), True), f)
+
+    def test_a_ci_file_beside_a_crate_change_adds_nothing(self):
+        self.assertEqual(run("scripts/ci/miri-toolchain", "euhedral-gpu/src/a.rs"), (["gpu"], False))
 
     def test_unknown_file_is_everything(self):
         self.assertTrue(run("tools/new.sh")[1])
@@ -95,29 +115,82 @@ class Miri(unittest.TestCase):
     SHARDS = [
         {"name": "a", "crate": "core", "seeds": 16, "commands": ["c1", "c2"]},
         {"name": "b", "crate": "graph", "seeds": 4, "commands": ["c3"]},
-        {"name": "c", "crate": "ds", "seeds": 1, "commands": ["c4"]},
+        {"name": "c", "crate": "ds", "seeds": 1, "canary": True, "commands": ["c4"]},
     ]
+
+    def select(self, *files, old=None):
+        old = self.SHARDS if old is None else old
+        return A.miri_selection(G, list(files), self.SHARDS, old)
+
+    def names(self, *files, **kw):
+        return [s["name"] for s, _ in self.select(*files, **kw)]
 
     def matrix(self, *files):
         crates, everything, reason = A.affected(G, list(files))
-        return A.outputs(G, crates, everything, reason, self.SHARDS)
+        return A.outputs(G, crates, everything, reason, self.select(*files))
 
     def test_only_affected_crates_have_shards(self):
         out = self.matrix("euhedral-graph/src/a.rs")
-        self.assertEqual(json.loads(out["miri_matrix"]), {"include": [{"name": "b", "seeds": 4, "commands": "c3"}]})
+        include = json.loads(out["miri_matrix"])["include"]
+        self.assertEqual([(e["name"], e["seeds"], e["commands"]) for e in include], [("b", 4, "c3")])
+        self.assertIn("graph is affected", include[0]["reason"])
         self.assertEqual(out["miri"], "true")
+        self.assertTrue(out["miri_reasons"].startswith("b: graph is affected"))
 
     def test_a_lower_layer_brings_the_shards_above(self):
-        names = [s["name"] for s in json.loads(self.matrix("euhedral-ds/src/a.rs")["miri_matrix"])["include"]]
-        self.assertEqual(names, ["a", "b", "c"])
+        self.assertEqual(self.names("euhedral-ds/src/a.rs"), ["a", "b", "c"])
 
     def test_no_shard_when_none_is_affected(self):
-        for f in ["README.md", "euhedral-io/src/a.rs"]:
+        for f in ["README.md", "euhedral-io/src/a.rs", ".github/workflows/cache-warm.yml", "scripts/ci/affected.py"]:
             out = self.matrix(f)
-            self.assertEqual((out["miri"], json.loads(out["miri_matrix"])), ("false", {"include": []}), f)
+            self.assertEqual((out["miri"], json.loads(out["miri_matrix"])["include"]), ("false", []), f)
+
+    def test_root_build_files_run_every_shard(self):
+        for f in ["Cargo.lock", "mise.toml", ".cargo/config.toml", ".github/CODEOWNERS", "scripts/ci/run.sh"]:
+            self.assertEqual(self.names(f), ["a", "b", "c"], f)
+
+    def test_the_pinned_nightly_runs_every_shard_and_nothing_else_runs(self):
+        self.assertEqual(self.names("scripts/ci/miri-toolchain"), ["a", "b", "c"])
+        crates, everything, reason = A.affected(G, ["scripts/ci/miri-toolchain"])
+        self.assertEqual((crates, everything), (set(), False))
+        self.assertIn("nightly", self.select("scripts/ci/miri-toolchain")[0][1])
+
+    def test_the_workflow_runs_the_canary_and_what_the_crates_select(self):
+        self.assertEqual(self.names(".github/workflows/ci.yml"), ["c"])
+        self.assertIn("canary", self.select(".github/workflows/ci.yml")[0][1])
+        self.assertEqual(self.names(".github/workflows/ci.yml", "euhedral-core/src/a.rs"), ["a", "b", "c"])
+        self.assertEqual(self.names(".github/workflows/ci.yml", "euhedral-graph/src/a.rs"), ["b", "c"])
+
+    def test_the_workflow_without_a_canary_runs_no_shard(self):
+        shards = [{k: v for k, v in s.items() if k != "canary"} for s in self.SHARDS]
+        self.assertEqual(A.miri_selection(G, [".github/workflows/ci.yml"], shards, shards), [])
+
+    def test_the_shards_file_runs_the_shards_added_or_changed(self):
+        shards_file = "scripts/ci/miri-shards.json"
+        self.assertEqual(self.names(shards_file), [])
+        changed = [dict(self.SHARDS[0], seeds=4), self.SHARDS[1], self.SHARDS[2]]
+        self.assertEqual(self.names(shards_file, old=changed), ["a"])
+        self.assertIn("new or changed", self.select(shards_file, old=changed)[0][1])
+        self.assertEqual(self.names(shards_file, old=self.SHARDS[:2]), ["c"])
+        self.assertEqual(self.names(shards_file, old=[]), ["a", "b", "c"])
+
+    def test_the_shards_file_adds_to_what_the_crates_select(self):
+        changed = [self.SHARDS[0], dict(self.SHARDS[1], seeds=16), self.SHARDS[2]]
+        names = self.names("scripts/ci/miri-shards.json", "euhedral-core/src/a.rs", old=changed)
+        self.assertEqual(names, ["a", "b"])
+        why = dict((s["name"], w) for s, w in self.select("scripts/ci/miri-shards.json", "euhedral-gpu/src/x.rs", old=changed))
+        self.assertEqual(list(why), ["b"])
+        self.assertIn("new or changed", why["b"])
+
+    def test_every_reason_is_given(self):
+        for f in [["euhedral-core/src/a.rs"], ["Cargo.lock"], ["scripts/ci/miri-toolchain"], [".github/workflows/ci.yml"]]:
+            self.assertTrue(all(why for _, why in self.select(*f)), f)
 
     def test_commands_are_newline_joined(self):
         self.assertEqual(json.loads(self.matrix("euhedral-core/src/a.rs")["miri_matrix"])["include"][0]["commands"], "c1\nc2")
+
+    def test_all_asks_for_every_shard(self):
+        self.assertEqual([s["name"] for s, _ in A.miri_everything(self.SHARDS, "on demand")], ["a", "b", "c"])
 
     def test_the_real_shards_name_workspace_crates_only(self):
         here = os.path.dirname(os.path.abspath(__file__))
@@ -129,6 +202,7 @@ class Miri(unittest.TestCase):
             self.assertTrue(all(c.startswith("cargo miri test ") for c in s["commands"]), s)
             self.assertTrue(all(f"-p {s['crate']} " in c for c in s["commands"]), s)
         self.assertEqual(A.shard_problems(shards), [])
+        self.assertEqual([s["name"] for s in shards if s.get("canary")], ["hardware-utils: CPU sets"])
 
     def test_a_shard_needs_its_seeds_a_name_and_miri_commands(self):
         good = {"name": "a", "crate": "core", "seeds": 4, "commands": ["cargo miri test -p core --lib"]}
@@ -141,9 +215,11 @@ class Miri(unittest.TestCase):
             {**good, "commands": ["cargo +nightly miri test -p core --lib"]},
             {**good, "commands": []},
             {**good, "crate": ""},
+            {**good, "canary": False},
         ]:
             self.assertTrue(A.shard_problems([bad]), bad)
         self.assertTrue(A.shard_problems([good, good]), "a name is used once")
+        self.assertTrue(A.shard_problems([{**good, "canary": True}, {**good, "name": "b", "canary": True}]), "one canary")
 
 
 class Metadata(unittest.TestCase):

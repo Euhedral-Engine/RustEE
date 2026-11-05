@@ -8,9 +8,14 @@
 #
 # The first job, `changes`, runs scripts/ci/affected.py: it maps the changed files to crates, adds every crate
 # that depends on one (transitively, read from `cargo metadata`), and publishes the set. Layers below a change
-# are not run. A root build file (Cargo.toml, Cargo.lock, mise.toml, clippy.toml, anything under .github/ or
-# scripts/ci/) or a manual run affects everything; a change to documentation alone affects nothing, and every
-# later job then skips. `ci-ok` always runs and fails only if a job failed, so it is the one check to require.
+# are not run. A root build file (Cargo.toml, Cargo.lock, mise.toml, the Clippy and rustfmt configuration,
+# rust-toolchain, .cargo/, a file under .github/ or scripts/ci/ that nothing below names) or a manual run affects
+# everything; a change to documentation alone affects nothing, and every later job then skips. The CI files select
+# less (the rules are in scripts/ci/affected.py): this workflow runs the workspace jobs in full and, of Miri, the
+# shards the crates select plus a canary; the shards file runs the shards that changed; the pinned Miri nightly runs
+# every Miri shard; the scripts and cache-warm.yml run no crate (`changes` runs the script tests). Each Miri shard
+# that runs has its reason in the `miri_reasons` output and in the log of `changes`.
+# `ci-ok` always runs and fails only if a job failed, so it is the one check to require.
 #
 # windows-2025 is Windows Server 2025 (build 26100), which has IoRing, so euhedral-io's
 # Windows engine runs on its kernel ring there (each of its tests also runs forced onto the

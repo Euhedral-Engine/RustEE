@@ -29,7 +29,8 @@
   "seeds": 1,
   "commands": [
    "cargo miri test -p euhedral-hardware-utils --lib -- util::cpu_set"
-  ]
+  ],
+  "canary": true
  },
  {
   "name": "core: single-threaded",
