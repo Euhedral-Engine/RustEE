@@ -12,7 +12,15 @@
   "crate": "euhedral-data-structures",
   "seeds": 4,
   "commands": [
-   "cargo miri test -p euhedral-data-structures --lib -- --exact sync::claim_cell::tests::a_second_claim_fails_while_the_first_is_held sync::claim_cell::tests::a_wakeup_set_before_a_failed_claim_is_seen_after_the_holders_release sync::claim_cell::tests::claims_from_8_threads_never_overlap sync::claim_cell::tests::writes_under_one_claim_are_seen_by_the_next"
+   "cargo miri test -p euhedral-data-structures --lib -- --exact sync::claim_cell::tests::a_second_claim_fails_while_the_first_is_held sync::claim_cell::tests::claims_from_8_threads_never_overlap sync::claim_cell::tests::writes_under_one_claim_are_seen_by_the_next"
+  ]
+ },
+ {
+  "name": "data-structures: claims, threads (not modelled)",
+  "crate": "euhedral-data-structures",
+  "seeds": 16,
+  "commands": [
+   "cargo miri test -p euhedral-data-structures --lib -- --exact sync::claim_cell::tests::a_wakeup_set_before_a_failed_claim_is_seen_after_the_holders_release"
   ]
  },
  {
@@ -37,8 +45,8 @@
    "cargo miri test -p euhedral-core --lib -- ingest::queue::tests::a_request_while ingest::queue::tests::a_request_refused ingest::queue::tests::request_pushes --skip ingest::queue::tests::a_request_refused_by_a_clear_holder_is_served --skip ingest::queue::tests::a_request_while_a_pull_holds_the_queue_is_served_when_the_pull_releases",
    "cargo miri test -p euhedral-core --lib -- ingest::queue::tests::concurrent_publishers ingest::queue::tests::frames_queued --skip ingest::queue::tests::concurrent_publishers_and_requesters_deliver_every_frame_once",
    "cargo miri test -p euhedral-core --lib -- flow_control::edge::tests::close_while_pushing flow_control::edge::tests::a_closed_edge_refuses flow_control::edge::tests::a_receiver_refused --skip flow_control::edge::tests::close_while_pushing_finishes_or_delivers_every_frame",
-   "cargo miri test -p euhedral-core --lib -- flow_control::vertex::tests::pushes_racing --skip flow_control::vertex::tests::pushes_racing_remaps_always_reach_an_open_downstream",
-   "cargo miri test -p euhedral-core --lib -- flow_control::vertex::tests::the_last_reader flow_control::vertex::tests::a_panicking_routing_function flow_control::vertex::tests::close_retirements"
+   "cargo miri test -p euhedral-core --lib -- flow_control::vertex::tests::pushes_racing --skip flow_control::vertex::tests::pushes_racing_remaps_always_reach_an_open_downstream --skip flow_control::vertex::tests::pushes_racing_remaps_reach_only_validated_downstreams",
+   "cargo miri test -p euhedral-core --lib -- flow_control::vertex::tests::the_last_reader flow_control::vertex::tests::a_panicking_routing_function flow_control::vertex::tests::close_retirements --skip flow_control::vertex::tests::the_last_reader_of_a_retired_generation_closes_its_dropped_downstreams_once"
   ]
  },
  {
@@ -64,6 +72,14 @@
   "commands": [
    "cargo miri test -p euhedral-core --lib -- --exact ingest::single_use::tests::a_frame_is_delivered_or_cancelled_exactly_once ingest::single_use::tests::a_pull_that_stops_gives_the_frame_back_and_a_racing_complete_still_cancels_it",
    "cargo miri test -p euhedral-core --lib -- --exact metrics::histogram::tests::a_reader_alongside_an_owner_sees_a_consistent_prefix flow_control::placement::tests::a_policy_set_before_the_threads_start_runs_on_every_thread_with_the_published_cpus flow_control::views::tests::a_thread_that_exits_withdraws_its_mailbox flow_control::views::tests::readers_see_every_generation_in_order_and_each_is_dropped_once"
+  ]
+ },
+ {
+  "name": "core: threads, vertex remaps",
+  "crate": "euhedral-core",
+  "seeds": 16,
+  "commands": [
+   "cargo miri test -p euhedral-core --lib -- --exact flow_control::vertex::tests::pushes_racing_remaps_reach_only_validated_downstreams flow_control::vertex::tests::the_last_reader_of_a_retired_generation_closes_its_dropped_downstreams_once"
   ]
  },
  {
@@ -106,7 +122,7 @@
   "crate": "euhedral-graph",
   "seeds": 4,
   "commands": [
-   "cargo miri test -p euhedral-graph --lib -- --exact sequencer::tests::offers_from_many_threads_conclude_in_the_order_they_were_offered sequencer::tests::slots_completed_on_many_threads_conclude_once_each_in_order_on_one_thread_at_a_time take_all::tests::pushes_racing_a_seal_are_either_taken_or_handed_back stage_graph::tests::a_diamond_on_8_workers_runs_the_join_with_every_input stage_graph::tests::concurrent_incoming_edges_publish_the_join_exactly_once stage_graph::tests::the_first_failure_wins_among_8_failing_stages stage_graph::tests::a_stage_held_at_its_gate_runs_when_the_gate_is_released_from_another_thread stage_graph::tests::gates_released_from_four_threads_at_once_publish_each_stage_and_the_join_once stage_graph::tests::a_gate_taken_in_run_holds_the_stage_until_a_release_from_another_thread_runs_it_once_more stage_graph::tests::a_gate_taken_in_run_by_four_stages_and_released_from_four_threads_at_once_runs_each_once_more_and_the_join_once stage_graph::tests::a_gate_taken_in_run_released_by_a_racing_thread_runs_the_stage_once_more_whoever_is_first"
+   "cargo miri test -p euhedral-graph --lib -- --exact sequencer::tests::slots_completed_on_many_threads_conclude_once_each_in_order_on_one_thread_at_a_time take_all::tests::pushes_racing_a_seal_are_either_taken_or_handed_back stage_graph::tests::a_diamond_on_8_workers_runs_the_join_with_every_input stage_graph::tests::concurrent_incoming_edges_publish_the_join_exactly_once stage_graph::tests::the_first_failure_wins_among_8_failing_stages stage_graph::tests::a_stage_held_at_its_gate_runs_when_the_gate_is_released_from_another_thread stage_graph::tests::gates_released_from_four_threads_at_once_publish_each_stage_and_the_join_once stage_graph::tests::a_gate_taken_in_run_holds_the_stage_until_a_release_from_another_thread_runs_it_once_more stage_graph::tests::a_gate_taken_in_run_by_four_stages_and_released_from_four_threads_at_once_runs_each_once_more_and_the_join_once stage_graph::tests::a_gate_taken_in_run_released_by_a_racing_thread_runs_the_stage_once_more_whoever_is_first"
   ]
  },
  {
@@ -114,7 +130,7 @@
   "crate": "euhedral-graph",
   "seeds": 16,
   "commands": [
-   "cargo miri test -p euhedral-graph --lib -- --exact completions::tests::a_consumer_that_panics_does_not_strand_a_request_refused_meanwhile completions::tests::a_marker_registration_racing_complete_on_an_unreached_lane_is_not_emitted completions::tests::a_panicking_push_keeps_demand_exact_and_serves_the_request_refused_meanwhile completions::tests::a_request_while_another_thread_polls_returns_at_once completions::tests::a_sweep_that_finds_the_poll_held_is_run_by_the_holder_when_it_lets_go completions::tests::registrations_racing_complete_are_each_cancelled_or_emitted_once stage_graph::tests::quanta_started_on_four_threads_retire_once_each_while_the_pool_serves_them lanes::tests::a_fixed_placement_is_a_function_of_the_stage_whichever_thread_asks"
+   "cargo miri test -p euhedral-graph --lib -- --exact completions::tests::a_consumer_that_panics_does_not_strand_a_request_refused_meanwhile completions::tests::a_marker_registration_racing_complete_on_an_unreached_lane_is_not_emitted completions::tests::a_panicking_push_keeps_demand_exact_and_serves_the_request_refused_meanwhile completions::tests::a_request_while_another_thread_polls_returns_at_once completions::tests::a_sweep_that_finds_the_poll_held_is_run_by_the_holder_when_it_lets_go completions::tests::registrations_racing_complete_are_each_cancelled_or_emitted_once stage_graph::tests::quanta_started_on_four_threads_retire_once_each_while_the_pool_serves_them lanes::tests::a_fixed_placement_is_a_function_of_the_stage_whichever_thread_asks sequencer::tests::offers_from_many_threads_conclude_in_the_order_they_were_offered"
   ]
  },
  {
@@ -133,8 +149,8 @@
   "crate": "euhedral-gpu",
   "seeds": 4,
   "commands": [
-   "cargo miri test -p euhedral-gpu --lib -- --exact ring::tests::a_granted_pin_always_sees_its_own_marker_in_the_slot ring::tests::many_threads_make_distinct_markers_and_all_complete",
-   "cargo miri test -p euhedral-gpu --features fake --lib -- --exact graph_cache::shared_tests::workers_running_one_key_at_once_each_get_their_own_instance_and_no_one_waits handles::tests::a_take_never_misses_and_a_give_is_never_refused_while_a_handle_is_stocked_and_the_population_fits handles::tests::threads_never_hold_one_handle_at_once instances::tests::many_threads_never_share_an_instance_and_never_wait"
+   "cargo miri test -p euhedral-gpu --lib -- --exact ring::tests::many_threads_make_distinct_markers_and_all_complete",
+   "cargo miri test -p euhedral-gpu --features fake --lib -- --exact handles::tests::threads_never_hold_one_handle_at_once instances::tests::many_threads_never_share_an_instance_and_never_wait"
   ]
  },
  {
@@ -142,7 +158,9 @@
   "crate": "euhedral-gpu",
   "seeds": 16,
   "commands": [
-   "cargo miri test -p euhedral-gpu --test fake_shared_lane -- --exact many_parties_arming_at_once_each_see_exactly_their_own_retirement many_workers_submit_to_one_lane_and_every_marker_completes"
+   "cargo miri test -p euhedral-gpu --test fake_shared_lane -- --exact many_parties_arming_at_once_each_see_exactly_their_own_retirement many_workers_submit_to_one_lane_and_every_marker_completes",
+   "cargo miri test -p euhedral-gpu --lib -- --exact ring::tests::a_granted_pin_always_sees_its_own_marker_in_the_slot",
+   "cargo miri test -p euhedral-gpu --features fake --lib -- --exact handles::tests::a_take_never_misses_and_a_give_is_never_refused_while_a_handle_is_stocked_and_the_population_fits graph_cache::shared_tests::workers_running_one_key_at_once_each_get_their_own_instance_and_no_one_waits"
   ]
  }
 ]

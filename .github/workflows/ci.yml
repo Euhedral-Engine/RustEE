@@ -102,6 +102,11 @@ jobs:
           cargo --version
 
       # Restored from the caches the push to main saved (cache-warm.yml); this run saves nothing.
+      # The preinstalled stable is not used, and its hash changes with the runner image: drop it before the cache key
+      # is computed.
+      - name: Drop the preinstalled stable toolchain
+        run: rustup toolchain uninstall stable || true
+
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: workspace-${{ matrix.os }}
@@ -133,9 +138,8 @@ jobs:
       - name: Source-invariant stress tests in release (euhedral-graph)
         if: needs.changes.outputs.euhedral_graph == 'true'
         run: |
-          cargo test --release -p euhedral-graph --lib sequencer
+          cargo test --release -p euhedral-graph --lib -- sequencer completions::
           cargo test --release -p euhedral-graph --test lake
-          cargo test --release -p euhedral-graph --lib completions::
 
       - name: Loom models (euhedral-data-structures)
         if: runner.os == 'Linux' && needs.changes.outputs.euhedral_data_structures == 'true'
@@ -171,9 +175,10 @@ jobs:
   # (scripts/ci/miri-shards.json), one job each, so they run in parallel; `changes` keeps only the shards of affected
   # crates (a change in a lower layer affects the crates above it), and the jobs are skipped if none is left.
   #
-  # Each shard says how many seeds Miri runs: 1 for a test with one thread (Miri's seeds vary only what threads
-  # race on), 4 where a loom model of the same handshake covers every interleaving (Miri then looks for undefined
-  # behaviour and aliasing), 16 for threads no model covers.
+  # Each shard says how many seeds Miri runs. A seed fixes the scheduler's choices, the addresses and which weak
+  # compare-exchanges fail spuriously, so seeds matter where threads race and little in a test with one thread: 1 for
+  # such a test. A test with threads gets 4 only if a loom model runs the same code and asserts the same property (Miri
+  # then looks for undefined behaviour and aliasing; loom does not check SeqCst store-to-load orderings); otherwise 16.
   #
   # Nothing is built twice: `miri-build` builds Miri's sysroot and, once, every selection of tests the shards run, and
   # hands its target directory and sysroot to the shards as an artifact (a tarball, which keeps file times), so a
@@ -194,6 +199,9 @@ jobs:
           rustup toolchain install "$toolchain" --profile minimal --component miri --component rust-src
           echo "RUSTUP_TOOLCHAIN=$toolchain" >> "$GITHUB_ENV"
 
+      - name: Drop the preinstalled stable toolchain
+        run: rustup toolchain uninstall stable || true
+
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: miri
@@ -207,14 +215,19 @@ jobs:
           python3 scripts/ci/miri_build.py --matrix "$MATRIX" > miri-build.sh
           bash -ex miri-build.sh
 
+      # The commit the build is of: a shard refuses a build that is not of its own checkout.
       - name: Pack the target directory and the sysroot
-        run: tar --use-compress-program="zstd -T0 -3" -C / -cf "$RUNNER_TEMP/miri-build.tar.zst" "${GITHUB_WORKSPACE#/}/target/miri" "${HOME#/}/.cache/miri"
+        run: |
+          git rev-parse HEAD > target/miri/built-from-commit
+          tar --use-compress-program="zstd -T0 -3" -C / -cf "$RUNNER_TEMP/miri-build.tar.zst" "${GITHUB_WORKSPACE#/}/target/miri" "${HOME#/}/.cache/miri"
 
       - uses: actions/upload-artifact@v4
         with:
           name: miri-build
           path: ${{ runner.temp }}/miri-build.tar.zst
-          retention-days: 1
+          # A re-run of one shard days later still finds it; a re-run of the build replaces it.
+          retention-days: 7
+          overwrite: true
           compression-level: 0
 
   miri:
@@ -249,7 +262,10 @@ jobs:
           path: ${{ runner.temp }}
 
       - name: Unpack the target directory and the sysroot
-        run: tar --use-compress-program="zstd -T0" -C / -xf "$RUNNER_TEMP/miri-build.tar.zst"
+        run: |
+          tar --use-compress-program="zstd -T0" -C / -xf "$RUNNER_TEMP/miri-build.tar.zst"
+          built=$(cat target/miri/built-from-commit)
+          test "$built" = "$(git rev-parse HEAD)" || { echo "the build is of $built, this checkout is $(git rev-parse HEAD): re-run the build job"; exit 1; }
 
       # -e stops at the first failing command; -x logs each command as it starts.
       - name: Miri
