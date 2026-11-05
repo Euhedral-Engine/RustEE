@@ -70,6 +70,12 @@ pub trait LatticeSource: Send + Sync {
     /// The source may push during this call or later from another thread. Each push is a separate
     /// admission that uses whatever routing is live when that push begins: returning from `request`
     /// reserves nothing for frames pushed later.
+    ///
+    /// A `request` made while a `pull` of the same source holds it (from the pull's consumer, or from another thread)
+    /// banks its demand and is not served by that pull: a pull pushes nothing, not even as it lets go. The source
+    /// serves it at the lattice's next `request` of that source, which comes when a worker's whole cycle processed
+    /// nothing (its cache included), and `request` returns nothing, so a caller cannot tell it was refused. Frames
+    /// the source already holds are handed out by the pulls meanwhile.
     fn request(&self, demand: u64);
 
     /// Finishes the source.

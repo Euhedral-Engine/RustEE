@@ -123,8 +123,10 @@ impl<S: LaneSubmit, X: LaneState, W> Drop for Inner<S, X, W> {
 /// Everything the lane keeps is plain state in a `SourceCell`, entered inside `request` and `pull`,
 /// which the lattice serializes. The cell's claim is checked in every build: a `request` that finds
 /// it taken (a direct call racing the lattice, or a call from inside an item) has banked its demand
-/// and left a wakeup, and the holder serves it when it lets go; a `pull` that finds it taken hands
-/// over nothing. The lifecycle (`complete`) touches atomics only.
+/// and left a wakeup, and a holder that is a `request` serves it when it lets go; a holder that is a `pull` serves
+/// nothing (a worker that entered from a pull must not push, and serving runs items), so the wakeup waits for the
+/// lattice's next `request` of this source. A `pull` that finds the cell taken hands over nothing. The lifecycle
+/// (`complete`) touches atomics only.
 ///
 /// Work an item answers `Wait` for stays in this source, even when it came from the group's shared
 /// intake: it runs when this lane's state meets the wait.
