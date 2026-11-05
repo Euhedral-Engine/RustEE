@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
-/// One frame in this many is stamped and timed.
+/// One push in this many, counted by each source, is stamped and timed.
 pub const SAMPLE_EVERY: u64 = 64;
 
 /// How many frames a source circulates.
@@ -165,18 +165,17 @@ pub struct NoOpFrame {
     /// The source's queue, or `None` for a frame of a pooled source, which goes back to the pool of the thread that
     /// finished it.
     home: Option<Home>,
-    /// Where the latency of a sampled frame is recorded; `None` for a frame that is not sampled.
+    /// Where the latency of a timed push is recorded; `None` when latency is not sampled.
     latency: Option<Arc<Recorders>>,
-    /// When the source handed the frame out, if it is being sampled.
+    /// When the source handed the frame out, if this push is being timed.
     stamp: Option<Instant>,
 }
 
 impl NoOpFrame {
-    /// Notes the time a sampled frame leaves its source.
-    fn stamp(&mut self) {
-        if self.latency.is_some() {
-            self.stamp = Some(Instant::now());
-        }
+    /// Notes, as a source hands the frame out, the time of a push that is timed, and that a push that is not is not
+    /// (the stamp of a frame that was never executed, a killed one, is not the next push's).
+    fn stamp(&mut self, timed: bool) {
+        self.stamp = (timed && self.latency.is_some()).then(Instant::now);
     }
 }
 
@@ -189,7 +188,7 @@ impl Frame for NoOpFrame {
         &mut self.header
     }
 
-    /// Records the time since a sampled frame left its source, on the worker that runs it.
+    /// Records the time since a timed push left its source, on the worker that runs it.
     fn execute(&mut self) -> Result<(), euhedral_core::frames::FrameError> {
         if let Some(stamp) = self.stamp.take()
             && let Some(recorders) = &self.latency
@@ -258,11 +257,7 @@ impl Maker {
             header,
             tally: self.tally.clone(),
             home: None,
-            latency: self
-                .latency
-                .as_ref()
-                .filter(|_| index.is_multiple_of(SAMPLE_EVERY))
-                .cloned(),
+            latency: self.latency.clone(),
             stamp: None,
         })
     }
@@ -286,8 +281,7 @@ pub fn generate(
                 header,
                 tally: tally.clone(),
                 home: Some(home),
-                // One frame in `SAMPLE_EVERY` is sampled, every time it circulates.
-                latency: latency.filter(|_| index % SAMPLE_EVERY == 0).cloned(),
+                latency: latency.cloned(),
                 stamp: None,
             })
         })
@@ -301,6 +295,19 @@ struct Inner {
     frames: Option<Consumer<Box<NoOpFrame>, Single>>,
     /// Banked demand; `u64::MAX` is unbounded. The demand a request leaves unmet stays banked for the next one.
     demand: u64,
+    /// The pushes made so far; every [`SAMPLE_EVERY`]th is timed, the first included.
+    pushes: u64,
+}
+
+impl Inner {
+    /// Whether the next push is timed, and counts it. Which pushes are timed is the source's to decide: a frame that
+    /// was timed once is not timed again, because a pooled source pushes the frames that came back last, not the ones
+    /// it made first, so what a frame is does not say how often it runs.
+    fn next_push_is_timed(&mut self) -> bool {
+        let timed = self.pushes.is_multiple_of(SAMPLE_EVERY);
+        self.pushes = self.pushes.wrapping_add(1);
+        timed
+    }
 }
 
 /// A source that pushes a fixed set of [`NoOpFrame`]s over and over (`RepeatingSink` upstream): a request or pull takes
@@ -340,6 +347,7 @@ impl RepeatingSource {
             inner: SourceCell::new(Inner {
                 frames: Some(queue.consumer()),
                 demand: 0,
+                pushes: 0,
             }),
             home: Some(home),
             maker: None,
@@ -361,6 +369,7 @@ impl RepeatingSource {
             inner: SourceCell::new(Inner {
                 frames: None,
                 demand: 0,
+                pushes: 0,
             }),
             home: None,
             maker: Some(Maker {
@@ -408,7 +417,7 @@ impl RepeatingSource {
                 inner.demand -= 1;
             }
             let mut frame = frame;
-            frame.stamp();
+            frame.stamp(inner.next_push_is_timed());
             receiver.push(frame);
         }
     }
@@ -438,7 +447,7 @@ impl LatticeSource for RepeatingSource {
                 break;
             }
             let mut frame = frame;
-            frame.stamp();
+            frame.stamp(inner.next_push_is_timed());
             consumer(frame);
             taken += 1;
         }
@@ -554,5 +563,97 @@ mod tests {
         second.increment();
         assert_eq!(first.adder().sum(), 1);
         assert_eq!(second.adder().sum(), 1);
+    }
+
+    use crate::latency::Recorders;
+    use euhedral_core::frames::Failure;
+    use euhedral_core::generics::{LatticeReceiver, LatticeTerminal};
+    #[allow(
+        clippy::disallowed_types,
+        reason = "a test fixture: the test thread takes the frames the source pushed"
+    )]
+    use std::sync::Mutex;
+
+    /// A receiver that keeps what the source pushes, for the test to run and finish by hand.
+    #[derive(Default)]
+    #[allow(
+        clippy::disallowed_types,
+        reason = "a test fixture: the test thread takes the frames the source pushed"
+    )]
+    struct Collector {
+        frames: Mutex<Vec<Box<dyn Frame>>>,
+    }
+
+    impl LatticeTerminal for Collector {
+        fn add_upstream(&self, _upstream: Arc<dyn LatticeSource>) {}
+    }
+
+    impl LatticeReceiver for Collector {
+        fn push(&self, frame: Box<dyn Frame>) {
+            self.frames.lock().unwrap().push(frame);
+        }
+        fn on_complete(&self) {}
+        fn on_error(&self, _error: Failure) {}
+    }
+
+    impl Collector {
+        /// Executes and finishes every frame pushed so far, in the order they were pushed.
+        fn finish_all(&self) -> usize {
+            let frames = std::mem::take(&mut *self.frames.lock().unwrap());
+            let count = frames.len();
+            for mut frame in frames {
+                frame.execute().unwrap();
+                frame.do_finally();
+            }
+            count
+        }
+    }
+
+    /// Verifies a source samples one push in `SAMPLE_EVERY` however its frames circulate: the frames a pooled source
+    /// pushes are the ones that came back last, so which frames circulate is not up to the source, and a frame's
+    /// identity cannot decide what is sampled. Two frames are made and both finish, then one frame is requested at a
+    /// time: the pool hands back the same one every time and the other never runs again.
+    fn assert_one_push_in_64_is_timed(source: Arc<RepeatingSource>, recorders: &Recorders) {
+        let collector = Arc::new(Collector::default());
+        source.clone().add_downstream(collector.clone());
+        source.request(2);
+        assert_eq!(collector.finish_all(), 2);
+        let pushes: u64 = 2 + 640;
+        for _ in 0..640 {
+            source.request(1);
+            assert_eq!(collector.finish_all(), 1);
+        }
+        assert_eq!(
+            recorders.snapshot().count(),
+            pushes.div_ceil(SAMPLE_EVERY),
+            "pushes 0, 64, 128, ... are timed"
+        );
+    }
+
+    #[test]
+    fn a_pooled_source_times_one_push_in_64_whichever_frames_circulate() {
+        let tally = Arc::new(Tally::new(128, CpuSet::range(100, 101)));
+        let recorders = Arc::new(Recorders::new(tally.cells()));
+        let source = RepeatingSource::pooled(1, 2, &tally, Some(&recorders));
+        assert_one_push_in_64_is_timed(source, &recorders);
+    }
+
+    #[test]
+    fn a_returning_source_times_one_push_in_64() {
+        let tally = Arc::new(Tally::new(128, CpuSet::range(100, 101)));
+        let recorders = Arc::new(Recorders::new(tally.cells()));
+        let source = RepeatingSource::new(1, 8, 2, &tally, Some(&recorders));
+        assert_one_push_in_64_is_timed(source, &recorders);
+    }
+
+    #[test]
+    fn a_source_without_recorders_times_nothing() {
+        let tally = Arc::new(Tally::new(128, CpuSet::range(100, 101)));
+        let source = RepeatingSource::pooled(1, 2, &tally, None);
+        let collector = Arc::new(Collector::default());
+        source.clone().add_downstream(collector.clone());
+        source.request(200);
+        assert_eq!(collector.finish_all(), 200);
+        assert_eq!(tally.adder().sum(), 200);
     }
 }

@@ -3,6 +3,16 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## The benchmark times one push in 64, not one frame in 64 (2026-11-05)
+
+**What.** The benchmark's latency sampling is decided by the source, per push: each source counts its pushes and stamps the 1st, 65th, 129th and so on. It was decided by the frame: one frame in 64 was made as a sampled frame and stamped every time it was pushed.
+
+**Why.** A pooled source pushes the frames that came back last, not the ones it made first, so which frames run is up to the pools and the scheduling, and a frame's identity says nothing of how often it runs. With a few workers a pool can hold the sampled frame at the bottom of its stack while the others circulate, or a source can make fewer than 65 frames in a run, and an iteration then times nothing: its quantiles are `None`, and `a_fork_with_pooled_frames_completes_and_records_latency` failed on that (once in CI; and once in five runs with the workers limited to 2 CPUs, which timed none in 39 invocations). Counting pushes makes the rate the same whichever frames run, and makes an iteration that completes `tasks` frames time about `tasks / 64` of them.
+
+**Semantics.** Unchanged for the reports: one frame in 64 handed out is stamped and timed from the hand-out to a worker starting it. A push that is not timed clears its frame's stamp, so a frame that never ran (a killed one) leaves nothing for its next push. Frames of both kinds of source now hold the recorders, as the sampled ones alone did.
+
+**Tests.** `no_op::tests` (`a_pooled_source_times_one_push_in_64_whichever_frames_circulate`, `a_returning_source_times_one_push_in_64`, `a_source_without_recorders_times_nothing`): a source whose two frames both finish and then run one frame at a time times exactly pushes 0, 64, 128, ... (the pooled source timed 1 of 11 before). The smoke test of pooled frames asserts that the measured iteration timed some.
+
 ## A quantum that touched no lane concludes in its last frame (2026-11-05)
 
 **What.** A quantum whose stages name no device lane runs to its end in the frames of its stages. The conclude rule, per quantum:
