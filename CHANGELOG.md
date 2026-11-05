@@ -3,6 +3,25 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## A pull serves no request: `LaneSource` and the ingest queue (2026-11-05)
+
+**What.** Two more sources pushed from the tail of a `pull`. Neither does now.
+- `LaneSource::pull` ended by serving the requests that arrived while it held the source's claim (`drain_requests`). Serving drains the lane's retirements, runs its waiting items and admits new ones (the lane's work), and pushes the ready frames within the banked demand. A frame the pulling worker runs inline can request the lane, and so can another thread, while the pull holds the claim.
+- The ingest queue (`QueueSource`, behind `QueueIngestSink`) ended every pull with `after_release`: the waiting `clear` and the owner's hook, then `drain_requests`, which pushes the queued frames to the receiver within the banked demand. It was reached when a request raced a pull outside the lattice's serialization, or came from the pull's own consumer.
+
+**Why.** A worker that has entered from a pull must not push: only `request` and a push keep the order of frames, and a worker stops its pull before an ordered frame. The lane's serving is also long work (items run there), and nothing long may go out through a `pull`.
+
+**How to use it.** Nothing to change for a lattice. A caller that drives these sources by hand and relied on a pull to serve a request it made from inside a consumer (or from another thread while the pull held the source) now calls `request` again; the demand was banked by the first call.
+
+**Semantics.**
+- The tail of a `LaneSource` pull does nothing more than record its metric. The tail of a queue pull is the lifecycle work only: the waiting `clear` and the owner's drain hook (`drain_finished`). Both leave the wakeup set and the demand banked.
+- **No request is lost.** A refused `request` set the wakeup after it banked its demand, and the wakeup stays set until a `request` takes it (the swap in `drain_requests`). The next `request` of any size serves it within everything banked, and so does a `request` made inside a pull that found nothing. Who requests next: a lattice worker that finds nothing in a pull requests the same source in the same cycle (a Direct cycle is an empty pull and then a request, and the upstream queue gives every handle both), and a pull that found frames is followed by another visit. So the pending request waits for the next idle cycle of the worker at the longest. Frames already queued or ready are handed out by the next `pull` without any request.
+- Another place that pushes, `clear` and the discard of the queue (producer-side calls, not a worker's pull), still serves the requests refused while they held the queue.
+
+**Java correspondence.** Java's `QueueIngestSink.Delegate.hookOnPull` called `drainRequests()` in its `finally`, the same place. It no longer does, in a small Java change stacked on the Java counterpart of the upstream queue change. Java has no `LaneSource`.
+
+**Tests (each failed on the code before, and passes now).** `euhedral-graph/tests/lane_source.rs`: `a_request_made_by_the_consumer_of_a_pull_is_served_by_the_next_request_and_the_pull_pushes_nothing` (a frame the pulling worker runs requests the lane: before, the receiver got item 3's frame before the pull returned and the item ran in the pull; now neither, and the next `request` runs the item and pushes the frame). `euhedral-core/src/ingest/queue/tests.rs`: `a_request_inside_a_pull_consumer_is_delivered_by_the_next_request_and_the_pull_pushes_nothing` and `a_request_while_a_pull_holds_the_queue_is_delivered_by_the_next_request_not_by_the_pull` (the same with a request from another thread). Each asserts the receiver saw nothing when the pull returned, then that the next request delivers.
+
 ## A pull that finds nothing holds the handle for the request that follows (2026-11-05)
 
 **What.** `UpstreamQueue::pull` holds back a handle whose pull found no frames (and did not stop at one), so the next `request` services that same handle first. Until now only a handle whose pull stopped at a frame was held back.
