@@ -49,13 +49,13 @@ pub trait Pending: Send {
 /// work.** `request` and `pull` run at every visit of a worker, and querying every operation that waits (with the
 /// application's code) is high-frequency work, so they hand out the continuations that are already ready, within the
 /// demand, and query no operation. While operations wait and no poll frame is out,
-/// `request` or `pull` pushes the source's one key frame, the *poll frame* (`pull` as well as `request` pushes it: a
-/// Direct worker that is busy never calls `request` on a source, and an idle one can phase-lock so that `request`
-/// never reaches half of its handles; see the changelog), and a worker runs it like any other frame:
-/// its `execute` ([`reap`](Self::reap)) queries each pending operation once (a completion's `is_ready`, a
+/// `request` pushes the source's one key frame, the *poll frame*, and a worker runs it like any other frame. The poll is
+/// long work (every registration, and the application's `Pending::poll` code, whatever it costs), so it leaves only
+/// through a `request`'s push. A `pull` neither pushes it nor hands it out: a worker that was handed it by a pull would
+/// run it through its executor while it holds the handle's lock, and nothing else could take ready work. Its `execute` ([`reap`](Self::reap)) queries each pending operation once (a completion's `is_ready`, a
 /// [`Pending`]'s `poll`, a marker, a timer) and queues the continuations of those that completed, in the
-/// order they were registered, for the hand-out. When the frame has run it goes home, and the next `request` or
-/// `pull` may push it again, but only when there is something to look at, so that a source that only waits reads
+/// order they were registered, for the hand-out. When the frame has run it goes home, and the next `request`
+/// may push it again, but only when there is something to look at, so that a source that only waits reads
 /// unproductive and the worker parks: a registration since the last poll, a timer's deadline (`at`; a timer is not
 /// polled before it), a bell that rang (`after_retired`: the lane's callback rings the source's bell when it fills the
 /// cell, so the wait costs nothing until then), or, for a wait that can only be polled blind (a marker, a `Ready`, a
@@ -250,12 +250,14 @@ impl Frame for PollFrame {
 
 impl Drop for PollFrame {
     /// A key that is dropped without having run (a lattice that discarded it) must not strand the polling: a new
-    /// one goes home. A key that is homed does not get here.
+    /// one goes home. A key that is homed does not get here, and there is no other: the slot is empty.
     fn drop(&mut self) {
-        if let Some(source) = self.source.upgrade()
-            && !source.key.is_home()
-        {
-            source.key.home(PollFrame::new(self.source.clone()));
+        if let Some(source) = self.source.upgrade() {
+            source
+                .key
+                .home_replacement(PollFrame::new(self.source.clone()), |frame| {
+                    frame.source = Weak::new();
+                });
         }
     }
 }
@@ -286,10 +288,14 @@ impl Drop for Completions {
     }
 }
 
-/// Serves what was refused the poll while it was held, when a poll lets go.
+/// Serves what was refused the poll while it was held, when a poll lets go. `serves` says whether the holder may also
+/// serve the requests that arrived meanwhile, which pushes: a `request` and a poll frame may, a `pull` may not (it
+/// only runs the sweeps; the requests wait in `request_pending` and the ready continuations in `out`, for the next
+/// `pull` to hand out or the next `request` to serve).
 struct AfterRelease<'a> {
     source: &'a Completions,
     armed: bool,
+    serves: bool,
 }
 
 impl Drop for AfterRelease<'_> {
@@ -300,9 +306,10 @@ impl Drop for AfterRelease<'_> {
         // The entry is a plain drop on the unwinding path: order the reads below after it.
         fence(Ordering::SeqCst);
         if std::thread::panicking() {
-            let _ = panic::catch_unwind(AssertUnwindSafe(|| self.source.after_release()));
+            let _ =
+                panic::catch_unwind(AssertUnwindSafe(|| self.source.after_release(self.serves)));
         } else {
-            self.source.after_release();
+            self.source.after_release(self.serves);
         }
     }
 }
@@ -494,10 +501,13 @@ impl Completions {
     }
 
     /// What a holder of a claim does after it lets go: the sweeps and requests that arrived while
-    /// it held the claim (and so were refused it), as a queue sink's holder serves its requests.
-    fn after_release(&self) {
+    /// it held the claim (and so were refused it), as a queue sink's holder serves its requests. A pull's `serves` is
+    /// false: the requests refused meanwhile stay banked, since a pull must not push.
+    fn after_release(&self, serves: bool) {
         self.run_sweeps();
-        self.serve_requests();
+        if serves {
+            self.serve_requests();
+        }
     }
 
     /// Pushes the ready continuations to the downstream, up to the banked demand, while requests are
@@ -542,7 +552,7 @@ impl Completions {
                 if let Err(panic) = handed {
                     // The wakeups refused meanwhile are still served.
                     out.release_seq_cst();
-                    let _ = panic::catch_unwind(AssertUnwindSafe(|| self.after_release()));
+                    let _ = panic::catch_unwind(AssertUnwindSafe(|| self.after_release(true)));
                     panic::resume_unwind(panic);
                 }
             }
@@ -572,14 +582,12 @@ impl Completions {
         (blind && self.pacing.ready_at(now)) || (next_at != u64::MAX && self.nanos(now) >= next_at)
     }
 
-    /// Pushes the poll frame to the downstream: operations wait, no poll frame is out, and the source is not
-    /// complete. The key is a control frame, not part of the demand (like a hot source's pushes), and there is at
-    /// most one. Does nothing without a downstream (a caller driving by hand has none).
+    /// Pushes the poll frame to the downstream: operations wait, there is something to look at, the source is not
+    /// complete and the poll frame is home. The key is a control frame, not part of the demand (like a hot source's
+    /// pushes), and there is at most one. Does nothing without a downstream (a caller driving by hand has none). Only
+    /// `request` calls it: the key is long, so no `pull` hands it out or pushes it.
     fn push_poll(&self) {
-        if self.waiting.load(Ordering::Acquire) == 0
-            || self.complete.load(Ordering::Acquire)
-            || !self.key.is_home()
-        {
+        if self.waiting.load(Ordering::Acquire) == 0 || self.complete.load(Ordering::Acquire) {
             return;
         }
         let Some(downstream) = self.downstream.receiver() else {
@@ -680,6 +688,7 @@ impl Completions {
         let mut after = AfterRelease {
             source: self,
             armed: false,
+            serves: true,
         };
         let Some(mut poll) = self.poll.try_enter() else {
             return 0;
@@ -819,9 +828,10 @@ impl LatticeSource for Completions {
     }
 
     /// Hands up to `demand` ready continuations to `consumer`, unless another thread holds the
-    /// hand-out: then it returns 0 at once, and the holder serves the requests that arrived meanwhile
-    /// when it lets go. It queries no operation: that is the poll frame's work (see [`reap`](Self::reap)), which it
-    /// pushes to the downstream, if there is one, while operations wait.
+    /// hand-out: then it returns 0 at once. It pushes nothing, not even as it lets go (a request that arrived meanwhile
+    /// stays banked for the next `request`, or for the next `pull` to hand out what is ready), and it hands out no
+    /// poll frame. It queries no operation: that is the poll frame's work (see [`reap`](Self::reap)), which a
+    /// `request` pushes to the downstream, if there is one, while operations wait.
     fn pull(
         &self,
         consumer: &mut dyn FnMut(Box<dyn Frame>),
@@ -836,6 +846,7 @@ impl LatticeSource for Completions {
         let mut after = AfterRelease {
             source: self,
             armed: false,
+            serves: false,
         };
         let Some(mut out) = self.out.try_enter() else {
             return 0;
@@ -843,13 +854,13 @@ impl LatticeSource for Completions {
         after.armed = true;
         let handed = self.hand_out(&mut out, consumer, stop, demand);
         out.release_seq_cst();
-        self.push_poll();
         handed
     }
 
     /// Banks `demand`, pushes the ready continuations to the downstream up to the total, and pushes the
     /// poll frame while operations wait (the frame is not part of the demand). If another thread holds the hand-out the request returns at
-    /// once, and the holder pushes when it lets go.
+    /// once, and the holder pushes when it lets go if it is a `request` or a poll frame; a holder that is a `pull` pushes
+    /// nothing, and the next `request` serves it.
     fn request(&self, demand: u64) {
         if demand == 0
             || self.complete.load(Ordering::SeqCst)
@@ -1717,12 +1728,19 @@ mod tests {
             release.wait();
             assert_eq!(puller.join().unwrap(), 1);
         });
-        assert_eq!(
-            *recorder.ids.lock().unwrap(),
-            [2],
-            "the poll served the request as it let go"
+        assert!(
+            recorder.ids.lock().unwrap().is_empty(),
+            "the pull pushed nothing as it let go: a pull never pushes"
         );
-        assert_eq!(completions.demand.load(Ordering::Acquire), 0);
+        assert_eq!(
+            completions.pending(),
+            1,
+            "the continuation waits in the hand-out"
+        );
+        // The next request serves it, within the demand banked (1, and this request's 1).
+        completions.request(1);
+        assert_eq!(*recorder.ids.lock().unwrap(), [2]);
+        assert_eq!(completions.demand.load(Ordering::Acquire), 1);
         assert_eq!(completions.pending(), 0);
     }
 
@@ -1832,7 +1850,7 @@ mod tests {
     }
 
     #[test]
-    fn a_consumer_that_panics_does_not_strand_a_request_refused_meanwhile() {
+    fn a_consumer_that_panics_leaves_a_request_refused_meanwhile_to_the_next_request() {
         let (completions, _) = setup();
         let recorder = Arc::new(Recorder::default());
         completions.clone().add_downstream(recorder.clone());
@@ -1860,10 +1878,15 @@ mod tests {
             release.wait();
             assert!(puller.join().unwrap().is_err());
         });
+        assert!(
+            recorder.ids.lock().unwrap().is_empty(),
+            "the unwinding pull pushed nothing"
+        );
+        completions.request(1);
         assert_eq!(
             *recorder.ids.lock().unwrap(),
             [2],
-            "the unwinding poll still served the request"
+            "the next request served it: the banked demand was not lost"
         );
     }
 
@@ -2090,7 +2113,8 @@ mod tests {
         let polls = Arc::new(AtomicUsize::new(0));
         completions.register(Box::new(PollsInAFrame(polls.clone())));
 
-        // Neither call looks at an operation, and nothing is ready to hand out. The first pushes the poll frame.
+        // Neither call looks at an operation, and nothing is ready to hand out. A pull hands out and pushes no poll
+        // frame (it is long); a request pushes it.
         assert_eq!(
             completions.pull(&mut |_| panic!("nothing is ready"), &mut |_| false, 9),
             0
@@ -2100,8 +2124,9 @@ mod tests {
             0,
             "no query in a pull"
         );
-        assert_eq!(hands.ids(), [KEY_ID], "a pull pushes the poll frame");
+        assert_eq!(hands.kept(), 0, "a pull pushes nothing");
         completions.request(4);
+        assert_eq!(hands.ids(), [KEY_ID], "a request pushes the poll frame");
         completions.request(4);
         assert_eq!(
             token.queries.load(Ordering::Relaxed),
@@ -2199,7 +2224,7 @@ mod tests {
     }
 
     #[test]
-    fn the_poll_frame_is_not_part_of_the_demand_and_is_pushed_without_one() {
+    fn the_poll_frame_is_not_part_of_the_demand_and_a_pull_neither_pushes_nor_hands_it_out() {
         let (completions, _) = setup();
         let hands = Arc::new(Hands::default());
         completions.clone().add_downstream(hands.clone());
@@ -2216,12 +2241,27 @@ mod tests {
         completions.pull(&mut |_| panic!("nothing is ready"), &mut |_| false, 1);
         completions.request(1);
         assert_eq!(hands.kept(), 0);
-        // A new registration is something new to look at: a pull pushes the frame, with no demand at all.
+        // A new registration is something new to look at, and the poll is wanted. A pull neither pushes the frame nor
+        // hands it to its consumer: it is long (it queries every operation, with the application's code), and a frame a
+        // worker runs from its pull keeps the worker in the handle meanwhile. A request pushes it.
         completions.at(Instant::now() + Duration::from_secs(3600), tagged(2));
-        completions.pull(&mut |_| panic!("nothing is ready"), &mut |_| false, 1);
+        assert_eq!(
+            completions.pull(
+                &mut |_| panic!("a key is not handed out by a pull"),
+                &mut |_| false,
+                8
+            ),
+            0
+        );
+        assert_eq!(hands.kept(), 0, "a pull pushes nothing");
+        completions.request(1);
         assert_eq!(hands.kept(), 1);
-        // One at a time.
-        completions.pull(&mut |_| panic!("nothing is ready"), &mut |_| false, 1);
+        // One at a time, whichever way it was asked for.
+        completions.pull(
+            &mut |_| panic!("a key is not handed out by a pull"),
+            &mut |_| false,
+            8,
+        );
         completions.request(1);
         assert_eq!(hands.kept(), 1);
     }
@@ -2275,12 +2315,12 @@ mod tests {
         // A new registration is polled at the next visit, however far the window had grown, and finding something
         // ends the back-off.
         completions.at(Instant::now(), tagged(9));
-        completions.pull(&mut |_| panic!("nothing is ready"), &mut |_| false, 8);
+        completions.request(8);
         assert_eq!(hands.run(), 1, "a registration asks for a poll at once");
         assert_eq!(polls.load(Ordering::Relaxed), polled + 1);
         assert_eq!(hands.ids(), [9], "and what it found goes out");
         hands.run();
-        completions.pull(&mut |_| panic!("nothing is ready"), &mut |_| false, 8);
+        completions.request(8);
         assert_eq!(hands.kept(), 1, "it found something: no window");
     }
 
@@ -2292,7 +2332,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_millis(3);
         completions.at(deadline, tagged(5));
         // The registration is something new: one poll, which finds nothing and learns the deadline.
-        completions.pull(&mut |_| panic!("nothing is ready"), &mut |_| false, 8);
+        completions.request(8);
         assert_eq!(hands.run(), 1);
         // No visit pushes anything while the deadline is ahead (a visit that ended before it read the clock before it).
         let mut visits = 0_u32;
@@ -2308,10 +2348,12 @@ mod tests {
             }
             assert_eq!(hands.kept(), 0, "polled before the deadline");
         }
-        // The first visit after the deadline pushes the poll frame, which finds the timer.
+        // The first request after the deadline pushes the poll frame, which finds the timer. (A pull pushes nothing.)
         while Instant::now() < deadline {}
         if hands.kept() == 0 {
             completions.pull(&mut |_| panic!("nothing is ready"), &mut |_| false, 8);
+            assert_eq!(hands.kept(), 0, "a pull pushes nothing");
+            completions.request(8);
         }
         assert_eq!(
             hands.run(),
@@ -2329,16 +2371,16 @@ mod tests {
         let hands = Arc::new(Hands::default());
         completions.clone().add_downstream(hands.clone());
         completions.at(Instant::now() + Duration::from_secs(3600), tagged(1));
-        completions.pull(&mut |_| panic!("nothing is ready"), &mut |_| false, 8);
+        completions.request(8);
         hands.run();
-        completions.pull(&mut |_| panic!("nothing is ready"), &mut |_| false, 8);
+        completions.request(8);
         assert_eq!(hands.kept(), 0, "an hour away: nothing to look at");
         let soon = Instant::now() + Duration::from_millis(1);
         completions.at(soon, tagged(2));
-        completions.pull(&mut |_| panic!("nothing is ready"), &mut |_| false, 8);
+        completions.request(8);
         assert_eq!(hands.run(), 1, "the new timer is something new to look at");
         while Instant::now() < soon {}
-        completions.pull(&mut |_| panic!("nothing is ready"), &mut |_| false, 8);
+        completions.request(8);
         assert_eq!(
             hands.run(),
             1,
@@ -2353,7 +2395,7 @@ mod tests {
         completions.clone().add_downstream(hands.clone());
         let cell = Arc::new(RetireCell::new());
         completions.after_retired(cell.clone(), tagged(8));
-        completions.pull(&mut |_| panic!("nothing is ready"), &mut |_| false, 8);
+        completions.request(8);
         assert_eq!(hands.run(), 1, "one look, from the registration");
         for visit in 0..20_000 {
             if visit % 2 == 0 {
@@ -2369,7 +2411,7 @@ mod tests {
         }
         // The callback fills the cell and rings the bell: the next visit looks.
         cell.arrive(0);
-        completions.pull(&mut |_| panic!("nothing is ready"), &mut |_| false, 8);
+        completions.request(8);
         assert_eq!(hands.run(), 1);
         assert_eq!(hands.ids(), [8], "and what it found goes out");
     }
@@ -2384,7 +2426,7 @@ mod tests {
         completions.after_retired(cell.clone(), tagged(4));
         // The callback rang nothing (nobody had claimed the cell), and the wait is not blind: the registration is the
         // event that makes the key look, and the look finds the cell filled.
-        completions.pull(&mut |_| panic!("nothing is ready"), &mut |_| false, 8);
+        completions.request(8);
         assert_eq!(hands.run(), 1);
         completions.request(8);
         assert_eq!(hands.ids(), [4]);
@@ -2400,17 +2442,15 @@ mod tests {
         first.after_retired(cell.clone(), tagged(1));
         // The cell rings the first source's bell, not this one's: this one cannot wait for a ring.
         second.after_retired(cell.clone(), tagged(2));
-        second.pull(&mut |_| panic!("nothing is ready"), &mut |_| false, 8);
+        second.request(8);
         hands.run();
         cell.arrive(0);
         let deadline = Instant::now() + Duration::from_secs(5);
-        let mut out = Vec::new();
-        while out.is_empty() {
+        while !hands.ids().contains(&2) {
             assert!(Instant::now() < deadline, "the cell was never seen");
-            second.pull(&mut |f| out.push(f.header().id_hash()), &mut |_| false, 8);
+            second.request(8);
             hands.run();
         }
-        assert_eq!(out, [2]);
     }
 
     #[test]
@@ -2420,7 +2460,7 @@ mod tests {
         completions.clone().add_downstream(hands.clone());
         let polls = Arc::new(AtomicUsize::new(0));
         completions.register(Box::new(NeverReady(polls.clone())));
-        completions.pull(&mut |_| panic!("nothing is ready"), &mut |_| false, 8);
+        completions.request(8);
         hands.run();
         // The key starts a poll; a registration arrives while it runs; the poll ends empty.
         completions
@@ -2430,7 +2470,7 @@ mod tests {
         completions
             .pacing
             .empty(completions.events.load(Ordering::Acquire));
-        completions.pull(&mut |_| panic!("nothing is ready"), &mut |_| false, 8);
+        completions.request(8);
         assert_eq!(
             hands.kept(),
             1,
@@ -2479,5 +2519,90 @@ mod tests {
         assert_eq!(completions.waiting.load(Ordering::Acquire), 0);
         // And nothing loops: the entries are gone.
         assert_eq!(completions.reap(), 0);
+    }
+
+    #[test]
+    fn the_poll_frame_is_pushed_by_a_request_never_by_a_pull_and_a_key_out_is_never_out_twice() {
+        let (completions, _) = setup();
+        let hands = Arc::new(Hands::default());
+        completions.clone().add_downstream(hands.clone());
+        let polls = Arc::new(AtomicUsize::new(0));
+        completions.register(Box::new(NeverReady(polls.clone())));
+        // The poll is wanted (a registration) and the frame is home, and every pull, with whatever demand, hands out and
+        // pushes nothing: only a request sends the poll frame.
+        for demand in [1, 8, u64::MAX] {
+            assert_eq!(
+                completions.pull(
+                    &mut |_| panic!("a key is not handed out by a pull"),
+                    &mut |_| true,
+                    demand
+                ),
+                0
+            );
+            assert_eq!(
+                completions.pull(
+                    &mut |_| panic!("a key is not handed out by a pull"),
+                    &mut |_| false,
+                    demand
+                ),
+                0
+            );
+        }
+        assert_eq!(hands.kept(), 0, "no pull pushed it");
+        assert_eq!(polls.load(Ordering::Relaxed), 0, "and none polled");
+        completions.request(1);
+        assert_eq!(hands.kept(), 1, "a request pushes it");
+        // It is out: neither another request nor a pull sends a second.
+        completions.request(1);
+        completions.pull(
+            &mut |_| panic!("a key is not handed out by a pull"),
+            &mut |_| false,
+            8,
+        );
+        assert_eq!(hands.kept(), 1);
+        assert_eq!(hands.run(), 1);
+        assert_eq!(polls.load(Ordering::Relaxed), 1, "it polled once");
+    }
+
+    #[test]
+    fn a_poll_frame_that_runs_while_a_pull_holds_the_hand_out_leaves_the_pushing_to_a_request() {
+        let (completions, _) = setup();
+        let hands = Arc::new(Hands::default());
+        completions.clone().add_downstream(hands.clone());
+        let done = |tag: u64| {
+            let token = Token::default();
+            token.done.store(true, Ordering::Release);
+            completions.after(Box::new(token), tagged(tag));
+        };
+        for tag in [1, 2, 3] {
+            done(tag);
+        }
+        assert_eq!(completions.reap(), 3);
+        let mut handed = Vec::new();
+        completions.pull(
+            &mut |frame| {
+                handed.push(frame.header().id_hash());
+                if handed.len() > 1 {
+                    return;
+                }
+                // The worker that ran the poll frame while this pull holds the hand-out: a request banks demand, and a
+                // reap finds one more. Neither can enter the hand-out, so what they leave is the next call's.
+                completions.request(8);
+                done(4);
+                assert_eq!(completions.reap(), 1);
+            },
+            &mut |_| false,
+            1,
+        );
+        assert_eq!(handed, [1]);
+        assert_eq!(
+            hands.kept(),
+            0,
+            "the pull's release pushed nothing: a pull never pushes"
+        );
+        // The next request serves what waited, within the demand it banked.
+        completions.request(1);
+        assert_eq!(hands.ids(), [2, 3, 4]);
+        assert_eq!(completions.pending(), 0);
     }
 }

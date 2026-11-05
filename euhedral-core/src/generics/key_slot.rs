@@ -4,15 +4,22 @@
 //! continuation (O(1) bookkeeping, handing out a result that is ready) may run there, but anything that costs more or
 //! recurs at the rate of the visits would hide from the workers, which measure what a frame costs and learn the shape
 //! of the workload only from the frames they execute. A source that has such work (polling a device or the operating
-//! system, finishing copies, detaching a set of sinks) therefore hands out a *key frame* whose `execute` does it. The source owns one reusable frame, the key. It leaves the
-//! source by a push from `request` or `pull`, and the work happens in `execute` on whichever worker
-//! the frame was routed to. Once the frame has finished, its [`recycle`](crate::frames::Frame::recycle)
-//! sends it home. While the key is out the source has no second one to push, so at most one worker is
-//! ever in that work, and a `request` or `pull` that finds the key away has nothing to push.
+//! system, finishing copies, detaching a set of sinks) therefore hands out a *key frame* whose `execute` does it.
 //!
-//! [`KeySlot`] is the home: one atomic reference to the key. Taking it is a swap with `Acquire`, homing
-//! it a swap (`AcqRel`, so that a second key is found and dropped, never leaked), and a `request` or `pull` that finds the key away reads one flag and does nothing
-//! more.
+//! The source owns one reusable frame, the key. A worker that is run the frame does the work, and the frame's
+//! [`recycle`](crate::frames::Frame::recycle) sends it home. While the key is out the source has no second one, so at most
+//! one worker is ever in that work.
+//!
+//! **A key leaves a source only through `request`, which pushes it** to the downstream; the downstream routes it to a
+//! worker (it is unordered, so any worker). A `pull` never pushes, and it never hands the key to its consumer either: the
+//! pulling worker would run the frame through its executor while it still holds the source's handle, so that nothing
+//! else could take ready work from the source until the work is done, and the work behind a key is long (a poll of every
+//! registration, a system call, a device query per copy, a lock and the completion of every sink).
+//!
+//! [`KeySlot`] is the home: one atomic reference to the key. Taking it ([`KeySlot::take`]) is one swap with `Acquire`
+//! and a null result means the key is away (there is no flag to read first); homing it is a swap (`AcqRel`, so that a
+//! key found at home is dropped and never leaked). A key that is dropped without having run is replaced by a new one
+//! ([`KeySlot::home_replacement`]), which never displaces what is there.
 //!
 //! A key that **polls** (asks a device or the operating system whether something ended) must not be pushed at
 //! every visit while nothing ends: a pushed key reads as a productive handle and counts as work the worker ran, so
@@ -50,25 +57,18 @@ impl<K> KeySlot<K> {
         }
     }
 
-    /// Whether the key is at home now. A hint: it may leave or return right after the read.
-    pub fn is_home(&self) -> bool {
-        !self.home.load(Ordering::Relaxed).is_null()
-    }
-
-    /// Takes the key out, or `None` if it is away. Reads the flag first, so a key that is away costs
-    /// no read-modify-write.
+    /// Takes the key out for a `request`, which pushes it to the downstream, or `None` if it is away. One swap, and
+    /// nothing read before it: a null result is the key being away.
     pub fn take(&self) -> Option<Box<K>> {
-        if !self.is_home() {
-            return None;
-        }
         let key = self.home.swap(ptr::null_mut(), Ordering::Acquire);
-        // SAFETY: a non-null pointer in the slot was made by `Box::into_raw` in `with_key` or `home`,
-        // and the swap took it out, so this call alone owns the allocation now.
+        // SAFETY: a non-null pointer in the slot was made by `Box::into_raw` in `with_key`, `home` or
+        // `home_replacement`, and the swap took it out, so this call alone owns the allocation now.
         (!key.is_null()).then(|| unsafe { Box::from_raw(key) })
     }
 
     /// Sends the key home. The slot must be empty: there is one key, and only its holder homes it. (A second key,
-    /// a bug, is dropped in place of the first in every build, and fails a debug build; it is never leaked.)
+    /// a bug, displaces the key found there, which is dropped, in every build, and fails a debug build; nothing is
+    /// leaked.)
     pub fn home(&self, key: Box<K>) {
         let previous = self.home.swap(Box::into_raw(key), Ordering::AcqRel);
         debug_assert!(
@@ -76,9 +76,27 @@ impl<K> KeySlot<K> {
             "a key was homed while the slot already held one"
         );
         if !previous.is_null() {
-            // SAFETY: a non-null pointer in the slot is a `Box::into_raw` from `with_key` or `home`, and the swap
-            // took it out, so this call alone owns the allocation now.
+            // SAFETY: a non-null pointer in the slot is a `Box::into_raw` from `with_key`, `home` or
+            // `home_replacement`, and the swap took it out, so this call alone owns the allocation now.
             drop(unsafe { Box::from_raw(previous) });
+        }
+    }
+
+    /// Homes the replacement of a key that was dropped without having run, only if the slot is empty (one
+    /// compare-exchange; it is a cold path). If the slot already holds a key (the dropped one was a stray, or a second
+    /// key was homed over it), the replacement is not wanted: `disarm` makes it inert, so that its own drop does not
+    /// make another replacement, and it is dropped. A chain of replacements therefore ends at once.
+    pub fn home_replacement(&self, key: Box<K>, disarm: impl FnOnce(&mut K)) {
+        let raw = Box::into_raw(key);
+        if self
+            .home
+            .compare_exchange(ptr::null_mut(), raw, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            // SAFETY: the exchange failed, so `raw` was not stored and this call still owns the allocation.
+            let mut key = unsafe { Box::from_raw(raw) };
+            disarm(&mut key);
+            drop(key);
         }
     }
 }
@@ -204,7 +222,7 @@ impl<K> Drop for KeySlot<K> {
     fn drop(&mut self) {
         let key = *self.home.get_mut();
         if !key.is_null() {
-            // SAFETY: the slot owns what it holds (see `take`), and `&mut self` means no other thread
+            // SAFETY: the slot owns what it holds (a `Box::into_raw` allocation), and `&mut self` means no other thread
             // can take it.
             drop(unsafe { Box::from_raw(key) });
         }
@@ -220,7 +238,7 @@ impl<K> Default for KeySlot<K> {
 impl<K> std::fmt::Debug for KeySlot<K> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("KeySlot")
-            .field("home", &self.is_home())
+            .field("home", &!self.home.load(Ordering::Relaxed).is_null())
             .finish()
     }
 }
@@ -232,30 +250,46 @@ unsafe impl<K: Send> Sync for KeySlot<K> {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::frames::{Frame, FrameHeader};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
     use std::thread;
 
-    /// Counts its drops.
-    struct Key(Arc<AtomicUsize>);
+    /// A key that counts its drops and what it was told.
+    struct Key {
+        drops: Arc<AtomicUsize>,
+        /// Plain state of whoever holds the key.
+        turns: u64,
+    }
+
+    impl Key {
+        fn boxed(drops: &Arc<AtomicUsize>) -> Box<Self> {
+            Box::new(Self {
+                drops: drops.clone(),
+                turns: 0,
+            })
+        }
+    }
 
     impl Drop for Key {
         fn drop(&mut self) {
-            self.0.fetch_add(1, SeqCst);
+            self.drops.fetch_add(1, SeqCst);
         }
     }
 
     #[test]
     fn the_key_is_taken_once_and_comes_back_when_homed() {
         let drops = Arc::new(AtomicUsize::new(0));
-        let slot = KeySlot::with_key(Box::new(Key(drops.clone())));
-        assert!(slot.is_home());
+        let slot = KeySlot::with_key(Key::boxed(&drops));
         let key = slot.take().expect("at home");
-        assert!(!slot.is_home());
         assert!(slot.take().is_none(), "away: nothing to take");
         slot.home(key);
-        assert!(slot.is_home());
-        assert_eq!(drops.load(SeqCst), 0, "homing frees nothing");
+        assert!(slot.take().is_some(), "home again");
+        assert_eq!(
+            drops.load(SeqCst),
+            1,
+            "only the take that was dropped here freed it"
+        );
     }
 
     #[test]
@@ -263,7 +297,7 @@ mod tests {
         let drops = Arc::new(AtomicUsize::new(0));
         let slot = KeySlot::<Key>::empty();
         assert!(slot.take().is_none());
-        slot.home(Box::new(Key(drops.clone())));
+        slot.home(Key::boxed(&drops));
         assert!(slot.take().is_some(), "the key was dropped by the take");
         assert_eq!(drops.load(SeqCst), 1);
     }
@@ -271,10 +305,10 @@ mod tests {
     #[test]
     fn the_slot_frees_the_key_it_holds_and_not_one_that_is_away() {
         let drops = Arc::new(AtomicUsize::new(0));
-        let slot = KeySlot::with_key(Box::new(Key(drops.clone())));
+        let slot = KeySlot::with_key(Key::boxed(&drops));
         drop(slot);
         assert_eq!(drops.load(SeqCst), 1, "a key at home goes with the slot");
-        let slot = KeySlot::with_key(Box::new(Key(drops.clone())));
+        let slot = KeySlot::with_key(Key::boxed(&drops));
         let away = slot.take().expect("at home");
         drop(slot);
         assert_eq!(drops.load(SeqCst), 1, "a key that is away is its holder's");
@@ -283,10 +317,91 @@ mod tests {
     }
 
     #[test]
+    fn a_replacement_homes_only_into_an_empty_slot_and_a_chain_of_them_ends() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let slot = KeySlot::<Key>::empty();
+        slot.home_replacement(Key::boxed(&drops), |_| panic!("homed: not disarmed"));
+        assert_eq!(drops.load(SeqCst), 0, "the replacement is at home");
+        // The slot holds a key: the replacement is disarmed and dropped, the key at home stays.
+        let disarmed = Arc::new(AtomicUsize::new(0));
+        slot.home_replacement(Key::boxed(&drops), |k| {
+            disarmed.fetch_add(1, SeqCst);
+            k.turns = 99;
+        });
+        assert_eq!(disarmed.load(SeqCst), 1);
+        assert_eq!(drops.load(SeqCst), 1, "the refused replacement was dropped");
+        assert_eq!(slot.take().expect("the first stays").turns, 0);
+    }
+
+    /// A key whose drop replaces it, as a source's keys do, and whose replacement is disarmed when it is refused.
+    struct Replacing {
+        header: FrameHeader,
+        slot: std::sync::Weak<KeySlot<Replacing>>,
+        made: Arc<AtomicUsize>,
+    }
+
+    impl Replacing {
+        fn boxed(slot: &Arc<KeySlot<Replacing>>, made: &Arc<AtomicUsize>) -> Box<Self> {
+            Box::new(Self {
+                header: FrameHeader::new(1),
+                slot: Arc::downgrade(slot),
+                made: made.clone(),
+            })
+        }
+    }
+
+    impl Frame for Replacing {
+        fn header(&self) -> &FrameHeader {
+            &self.header
+        }
+
+        fn header_mut(&mut self) -> &mut FrameHeader {
+            &mut self.header
+        }
+    }
+
+    impl Drop for Replacing {
+        fn drop(&mut self) {
+            if let Some(slot) = self.slot.upgrade() {
+                self.made.fetch_add(1, SeqCst);
+                let replacement = Box::new(Replacing {
+                    header: FrameHeader::new(1),
+                    slot: self.slot.clone(),
+                    made: self.made.clone(),
+                });
+                slot.home_replacement(replacement, |k| k.slot = std::sync::Weak::new());
+            }
+        }
+    }
+
+    #[test]
+    fn a_stray_key_that_is_dropped_does_not_start_a_chain_of_replacements() {
+        let made = Arc::new(AtomicUsize::new(0));
+        let slot = Arc::new(KeySlot::<Replacing>::empty());
+        slot.home(Replacing::boxed(&slot, &made));
+        // A second key that is not in the slot (the bug the debug assertion of `home` catches) is dropped: it makes one
+        // replacement, which the full slot refuses, and the refused one makes none: it ends there, not at a stack overflow.
+        drop(Replacing::boxed(&slot, &made));
+        assert_eq!(made.load(SeqCst), 1, "one replacement, refused, inert");
+        // (A key taken out of the slot by the test is made inert before it is dropped, or its drop would replace it.)
+        let take_inert = || {
+            let mut key = slot.take().expect("a key at home");
+            key.slot = std::sync::Weak::new();
+        };
+        take_inert();
+        // Dropped with the slot empty: its replacement goes home.
+        drop(Replacing::boxed(&slot, &made));
+        assert_eq!(made.load(SeqCst), 2);
+        take_inert();
+        assert!(slot.take().is_none(), "and no chain left a third");
+    }
+
+    #[test]
     fn eight_threads_never_hold_the_key_at_once() {
         const ROUNDS: usize = if cfg!(miri) { 20 } else { 20_000 };
         // The key holds a counter that only its holder touches, as a source's state would be.
-        let slot = Arc::new(KeySlot::with_key(Box::new(0_u64)));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let slot = Arc::new(KeySlot::with_key(Key::boxed(&drops)));
         let threads: Vec<_> = (0..8)
             .map(|_| {
                 let slot = slot.clone();
@@ -295,8 +410,8 @@ mod tests {
                     for _ in 0..ROUNDS {
                         if let Some(mut key) = slot.take() {
                             // A plain read-modify-write: a second holder would lose updates.
-                            let v = *key;
-                            *key = v + 1;
+                            let v = key.turns;
+                            key.turns = v + 1;
                             held += 1;
                             slot.home(key);
                         }
@@ -306,7 +421,7 @@ mod tests {
             })
             .collect();
         let total: u64 = threads.into_iter().map(|t| t.join().unwrap()).sum();
-        assert_eq!(*slot.take().expect("home at the end"), total);
+        assert_eq!(slot.take().expect("home at the end").turns, total);
     }
 
     #[test]
@@ -362,8 +477,8 @@ mod tests {
     #[cfg(not(debug_assertions))]
     fn a_second_key_is_dropped_not_leaked_in_a_release_build() {
         let drops = Arc::new(AtomicUsize::new(0));
-        let slot = KeySlot::with_key(Box::new(Key(drops.clone())));
-        slot.home(Box::new(Key(drops.clone())));
+        let slot = KeySlot::with_key(Key::boxed(&drops));
+        slot.home(Key::boxed(&drops));
         assert_eq!(drops.load(SeqCst), 1, "the first was dropped");
         drop(slot);
         assert_eq!(drops.load(SeqCst), 2);

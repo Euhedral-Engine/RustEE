@@ -42,7 +42,7 @@ Work is **submitted** and the call returns at once. What follows it starts on on
 `Completions` and `euhedral-io`'s `AsyncIo` are `LatticeSource`s, so they attach to a lattice with `add_upstream`.
 Looking at the pending operations is a frame's work: `request` and `pull` run at every visit, so they do no heavy or
 high-frequency work (querying every pending operation, with the application's code, would be both). They hand out what
-is ready, and a `request` or `pull` pushes the source's one *poll frame* while operations wait, which a worker runs like any other frame
+is ready, and a `request` pushes the source's one *poll frame* while operations wait (a `pull` pushes nothing and hands no poll frame out), which a worker runs like any other frame
 (so what a poll costs is measured as a frame's cost). There is no timer thread, no completion thread and no channel.
 A poll never blocks: a lane's completed value is one atomic read (`DeviceQueue::completed`), and an io_uring
 completion queue is read without entering the kernel.
@@ -79,7 +79,8 @@ for the hand-out. The frame goes home once it has run. A caller outside a lattic
 then `pull`.
 
 One poll runs at a time and none waits. A `request` that finds a hand-out running banks its demand and leaves a wakeup,
-and the running hand-out pushes within the demand as it lets go; the same holds for the sweep that cancels a
+and the running hand-out pushes within the demand as it lets go (a hand-out that is a `pull` pushes nothing: the
+next `request` serves what waited); the same holds for the sweep that cancels a
 registration made after `complete`, which waits for the holder of a poll.
 
 This runs one by hand, with a `Sequencer` that concludes in offer order whatever order the

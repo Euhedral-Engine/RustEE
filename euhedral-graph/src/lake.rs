@@ -30,11 +30,11 @@
 //! [`Duration::ZERO`] as the idle time keeps the sinks attached.
 //!
 //! **The watch only looks; a frame detaches.** The watch's `request` and `pull` read two atomics (the
-//! unit count, and when it last reached zero) and push nothing while the lake is busy. When the lake has
-//! been idle for the idle time, the call pushes the watch's one key frame, and the worker that runs it
+//! unit count, and when it last reached zero) and push nothing while the lake is busy (a `pull` pushes nothing at all). When the lake has
+//! been idle for the idle time, a `request` pushes the watch's one key frame, and the worker that runs it
 //! detaches the set (taking the attach lock, completing the sinks), where its cost is measured like any
-//! other frame's. (Both calls look: a Direct worker that is busy never calls `request` on a source, and an idle one
-//! can phase-lock so that `request` never reaches half of its handles; see the changelog.) A frame that finds the lake
+//! other frame's. A `pull` neither hands the frame out nor pushes it: the detach is long work (a lock, and the
+//! completion of every sink), which no pulling worker should run while it holds the handle. A frame that finds the lake
 //! busy again leaves the set alone and goes home, and the watch pushes it again at the next idle time.
 //!
 //! **The hot side is lock-free** (Java's volatile `generation`): the attached set is a cell of the lattice's registry,
@@ -599,18 +599,27 @@ impl IdleWatch {
         })
     }
 
-    /// Pushes the detach frame when the lake has been idle for the idle time and the frame is home. The
-    /// look is two atomic loads while the lake is busy; it detaches nothing itself.
+    /// Whether the detach frame is wanted now: the lake has been idle for the idle time and the watch has a
+    /// downstream. The look is two atomic loads while the lake is busy; it detaches nothing itself.
+    fn detach_due(&self) -> bool {
+        !self.downstream.is_complete()
+            && self.downstream.receiver().is_some()
+            && self.admission.idle_for(self.idle)
+    }
+
+    /// Pushes the detach frame when it is wanted and home. Only `request` calls it: the detach is long (a lock and the
+    /// completion of every sink), so no `pull` hands it out or pushes it.
     fn push_detach(&self) {
-        if self.downstream.is_complete() || !self.admission.idle_for(self.idle) {
-            return;
-        }
         let Some(receiver) = self.downstream.receiver() else {
             return;
         };
-        let Some(frame) = self.detach.take() else {
+        if !self.detach_due() {
+            return;
+        }
+        let Some(mut frame) = self.detach.take() else {
             return;
         };
+        frame.arm();
         receiver.push(frame);
     }
 }
@@ -619,6 +628,8 @@ impl IdleWatch {
 struct DetachFrame {
     header: FrameHeader,
     watch: Weak<IdleWatch>,
+    /// Counts the pushes, so that each is routed by a hash of its own.
+    seed: u64,
 }
 
 impl DetachFrame {
@@ -626,7 +637,14 @@ impl DetachFrame {
         Box::new(Self {
             header: FrameHeader::new(0x9e37_79b9_7f4a_7c15),
             watch,
+            seed: 0,
         })
+    }
+
+    /// Unordered, and a new routing hash for each push: the detach may run on any worker.
+    fn arm(&mut self) {
+        self.seed = self.seed.wrapping_add(1);
+        self.header.randomize_hash(self.seed);
     }
 }
 
@@ -662,12 +680,14 @@ impl Frame for DetachFrame {
 
 impl Drop for DetachFrame {
     /// A frame that is dropped without having run (a lattice that discarded it) must not leave the lake
-    /// attached for good: a new one goes home. A frame that is homed does not get here.
+    /// attached for good: a new one goes home. A frame that is homed does not get here, and there is no other: the slot is empty.
     fn drop(&mut self) {
-        if let Some(watch) = self.watch.upgrade()
-            && !watch.detach.is_home()
-        {
-            watch.detach.home(DetachFrame::new(self.watch.clone()));
+        if let Some(watch) = self.watch.upgrade() {
+            watch
+                .detach
+                .home_replacement(DetachFrame::new(self.watch.clone()), |frame| {
+                    frame.watch = Weak::new();
+                });
         }
     }
 }
@@ -678,19 +698,18 @@ impl LatticeSource for IdleWatch {
         self.downstream.attach(source, downstream);
     }
 
-    /// It holds no frames to hand over: it looks at the lake (two atomic loads while it is busy) and, once it has
-    /// been idle for the idle time, pushes the frame that detaches the set.
+    /// It holds no frames to hand over, and a `pull` pushes nothing: the detach frame leaves only through `request`.
     fn pull(
         &self,
         _consumer: &mut dyn FnMut(Box<dyn Frame>),
         _stop: &mut dyn FnMut(&dyn Frame) -> bool,
         _demand: u64,
     ) -> u64 {
-        self.push_detach();
         0
     }
 
-    /// As [`pull`](Self::pull): looks, and pushes the frame that detaches the set once the lake is idle.
+    /// Looks at the lake (two atomic loads while it is busy) and, once it has been idle for the idle time, pushes the
+    /// frame that detaches the set.
     fn request(&self, _demand: u64) {
         self.push_detach();
     }

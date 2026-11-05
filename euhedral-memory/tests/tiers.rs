@@ -620,8 +620,13 @@ fn a_request_or_pull_of_the_moves_source_drives_no_move_and_a_frame_does() {
         0
     );
     assert_eq!(queries.load(Ordering::Relaxed), 0, "a pull polls no copy");
+    assert_eq!(
+        keep.frames.lock().unwrap().len(),
+        0,
+        "and pushes no pump frame: that is long, so only a request sends it"
+    );
 
-    // The pull pushed one frame to drive the moves (a request does the same); it polled no copy itself.
+    // A request pushes one frame to drive the moves; it polls no copy itself.
     source.request(8);
     assert_eq!(
         queries.load(Ordering::Relaxed),
@@ -752,7 +757,7 @@ fn a_copy_that_never_retires_is_polled_ever_less_often_and_the_source_reads_unpr
         .open_owner(OwnerSpec::new("second", Priority(50), Scope::Process));
     let id = r.mover.place(o, a, SLOT, quiet()).unwrap();
     r.mover.move_to(id, b).unwrap();
-    source.pull(&mut |_| panic!("nothing is done"), &mut |_| false, 8);
+    source.request(8);
     assert_eq!(keep.run(), 1, "a new move asks for a pump at once");
     assert!(queries.load(Ordering::Relaxed) > before);
 }
@@ -811,4 +816,38 @@ fn a_resident_busy_when_its_home_frees_still_comes_home() {
     );
     settle(&r.mover);
     assert_eq!(r.mover.whereabouts(low).unwrap().0, a, "brought home");
+}
+
+#[test]
+fn a_pull_pushes_and_hands_out_no_key_a_request_pushes_it_and_a_key_out_is_never_out_twice() {
+    let (r, queries, _seen) = moving_rig_with(u32::MAX);
+    let source = r.mover.moves();
+    let keep = Arc::new(Keep::default());
+    source.clone().add_downstream(keep.clone());
+    // A pump is due (a move is in flight and new) and the frame is home: a pull, whatever it is asked, hands out and
+    // pushes nothing. The pump is long (a device query per copy, a scan of every resident), so only a request sends it.
+    for demand in [1, 8, u64::MAX] {
+        for stop in [false, true] {
+            assert_eq!(
+                source.pull(
+                    &mut |_| panic!("a key is not handed out by a pull"),
+                    &mut |_| stop,
+                    demand
+                ),
+                0
+            );
+        }
+    }
+    assert_eq!(keep.frames.lock().unwrap().len(), 0, "no pull pushed it");
+    assert_eq!(queries.load(Ordering::Relaxed), 0);
+    source.request(1);
+    assert_eq!(keep.frames.lock().unwrap().len(), 1, "a request pushes it");
+    // It is out: neither another request nor a pull sends a second.
+    source.request(1);
+    source.pull(
+        &mut |_| panic!("a key is not handed out by a pull"),
+        &mut |_| false,
+        8,
+    );
+    assert_eq!(keep.frames.lock().unwrap().len(), 1);
 }

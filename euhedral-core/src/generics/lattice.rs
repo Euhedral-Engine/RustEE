@@ -41,10 +41,12 @@ pub trait LatticeReceiver: LatticeTerminal {
 /// a system call, detaching sinks), or that would recur at the rate of the visits (querying every operation that waits),
 /// is a frame's work, because a worker can only measure how long work takes when the frame comes back through its
 /// executor, and that is how it sizes its batches and decides to idle or take part. A source with such work owns a *key frame* ([`KeySlot`](super::KeySlot)):
-/// `request` or `pull` pushes it to the downstream when the work is due and it is home, a worker runs its `execute`, and
-/// its `recycle` sends it home. (`pull` as well as `request`: a Direct worker that is busy never calls `request` on a
-/// source, and an idle one can phase-lock so that `request` never reaches half of its handles; see the changelog.) The key
-/// is a control frame, not part of the demand, and `pull` never hands it to its `consumer`. A key that polls blind is
+/// `request` pushes it to the downstream when the work is due and it is home, a worker runs its `execute`, and
+/// its `recycle` sends it home. **No `push` is reachable from `pull`**: a `pull` runs on a worker that has entered
+/// from a pull, and the downstream's push is for a `request`. A `pull` does not hand the key to its `consumer` either:
+/// the pulling worker would run it through its executor while the source's handle is held, and the work behind a key is
+/// long, so nothing else could take ready work from the source meanwhile. So a key leaves only through `request`'s push.
+/// The key is a control frame, not part of the demand. A key that polls blind is
 /// paced ([`KeyPacing`](super::KeyPacing)): it is not pushed at every visit while nothing ends, or the worker never
 /// parks.
 pub trait LatticeSource: Send + Sync {

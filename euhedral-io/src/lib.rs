@@ -552,9 +552,10 @@ type Platform = win::Engine;
 /// anything. The reaping
 /// (looking at the kernel's completions, resubmitting a short read, calling each operation's
 /// continuation to build its frame) is the work of a *key frame*: the source owns one, and a
-/// `request` or `pull` pushes it into the lattice while operations are in flight and no reap frame is out (`pull` as
-/// well as `request`: a Direct worker that is busy never calls `request` on a source, and an idle one can phase-lock so
-/// that `request` never reaches half of its handles; see the changelog).
+/// `request` pushes it into the lattice while operations are in flight and no reap frame is out. A reap is long work (a
+/// system call, the operation table's lock, the application's continuations), so it leaves only through a `request`'s
+/// push. A `pull` neither pushes it nor hands it out (a worker handed it by a pull would run it through its executor
+/// with the handle's lock held).
 /// A worker runs it, as it runs any frame, so its cost is measured like any other frame's; its
 /// recycle sends the key home. At most one reap runs at a time. A reap that found nothing is followed by a window of
 /// time (16 us, doubling to 100 us: `KeyPacing`) in which a visit pushes the key again only for something new (a
@@ -599,7 +600,7 @@ pub struct AsyncIo {
 /// `ready`. The *hand-out* side (`out`) is entered by `request` and `pull`, which only take frames
 /// out of `ready` and pass them on. Like Java's `AsyncReads.Delegate` (an ingest sink's delegate),
 /// `request` banks its demand and pushes what is ready within it; a request that finds the hand-out
-/// side entered leaves a wakeup that the holder serves as it lets go.
+/// side entered leaves a wakeup that the next `request` serves (a holder that is a `pull` pushes nothing).
 pub(crate) struct Front {
     /// The reaping side: the producer end of the queue the continuations' frames wait in.
     reaper: SourceCell<Producer<Box<dyn Frame>, Single>>,
@@ -865,12 +866,13 @@ impl Frame for ReapFrame {
 
 impl Drop for ReapFrame {
     /// A key that is dropped without having run (a lattice that discarded it) must not strand the
-    /// reaping: a new one goes home. A key that is homed does not get here.
+    /// reaping: a new one goes home. A key that is homed does not get here, and there is no other: the slot is empty.
     fn drop(&mut self) {
-        if let Some(io) = self.io.upgrade()
-            && !io.key.is_home()
-        {
-            io.key.home(ReapFrame::new(self.io.clone()));
+        if let Some(io) = self.io.upgrade() {
+            io.key
+                .home_replacement(ReapFrame::new(self.io.clone()), |frame| {
+                    frame.io = std::sync::Weak::new();
+                });
         }
     }
 }
@@ -970,20 +972,23 @@ impl AsyncIo {
         self.panicked.load(Ordering::Relaxed)
     }
 
-    /// Pushes the key frame to the downstream: operations are in flight and no reap is out. The key is a control
-    /// frame, not part of the demand (like a hot source's pushes), and there is at most one. Does nothing without a
-    /// downstream (a caller driving by hand has none).
+    /// Whether the key frame is wanted now: operations are in flight, the source is not complete, there is a
+    /// downstream (a caller driving by hand has none), and there is something to look at.
+    fn key_due(&self) -> bool {
+        self.unreaped.load(Ordering::Acquire) != 0
+            && !self.front.is_complete()
+            && self.front.downstream.receiver().is_some()
+            && self.pacing.due(self.events.load(Ordering::Acquire))
+    }
+
+    /// Pushes the key frame to the downstream when it is wanted and home. The key is a control frame, not part of the
+    /// demand (like a hot source's pushes), and there is at most one. Only `request` calls it: the key is long, so no
+    /// `pull` hands it out or pushes it.
     fn push_reap(&self) {
-        if self.unreaped.load(Ordering::Acquire) == 0
-            || self.front.is_complete()
-            || !self.key.is_home()
-        {
-            return;
-        }
         let Some(downstream) = self.front.downstream.receiver() else {
             return;
         };
-        if !self.pacing.due(self.events.load(Ordering::Acquire)) {
+        if !self.key_due() {
             return;
         }
         let Some(mut key) = self.key.take() else {
@@ -1198,34 +1203,17 @@ impl LatticeSource for AsyncIo {
     }
 
     /// Hands up to `demand` reaped continuations' frames to `consumer`, unless another hand-out is
-    /// inside: then it returns 0 at once, and that hand-out serves the requests that arrived
-    /// meanwhile when it lets go. It asks the engine for nothing: reaping is a frame's work (see
-    /// [`reap`](AsyncIo::reap)), which it pushes to the downstream, if there is one, while operations are in
-    /// flight.
+    /// inside: then it returns 0 at once. It pushes nothing, whatever it finds: a request that arrived while it held the
+    /// hand-out stays banked, and the next `pull` hands the ready frames out or the next `request` pushes them. It asks
+    /// the engine for nothing: reaping is a frame's work (see [`reap`](AsyncIo::reap)), which a `request` pushes to the
+    /// downstream, if there is one, while operations are in flight.
     fn pull(
         &self,
         consumer: &mut dyn FnMut(Box<dyn Frame>),
         stop: &mut dyn FnMut(&dyn Frame) -> bool,
         demand: u64,
     ) -> u64 {
-        // Serves the requests refused meanwhile also when `consumer` unwinds.
-        struct Serve<'a>(&'a AsyncIo);
-        impl Drop for Serve<'_> {
-            fn drop(&mut self) {
-                std::sync::atomic::fence(Ordering::SeqCst);
-                if std::thread::panicking() {
-                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        self.0.front.serve_requests()
-                    }));
-                } else {
-                    self.0.front.serve_requests();
-                }
-            }
-        }
-        let _serve = Serve(self);
-        let handed = self.front.pull(consumer, stop, demand);
-        self.push_reap();
-        handed
+        self.front.pull(consumer, stop, demand)
     }
 
     /// Banks `demand`, pushes reaped continuations' frames to the downstream up to the total, and

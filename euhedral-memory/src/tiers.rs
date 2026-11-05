@@ -1197,10 +1197,11 @@ impl Drop for Mover {
 /// Driving the moves ([`Mover::pump`]: asking each copy whether it retired, starting second hops, bringing spilled
 /// residents home) is heavy work (a device query per copy in flight, a scan of every resident, copy submissions), and a
 /// pull used to do it at every visit, so it is a frame's work: `request` and `pull` only hand out the completions that
-/// are done. When a pump is due ([`Mover::pump_due`]), `request` or `pull` pushes the source's one *pump frame*
-/// (`pull` as well as `request`: a Direct worker that is busy never calls `request` on a source, and an idle one can
-/// phase-lock so that `request` never reaches half of its handles; see the changelog), whose `execute` pumps on whichever
-/// worker it is routed to; once it has run, the frame goes home and the next call may push it again. A worker that has
+/// are done. When a pump is due ([`Mover::pump_due`]), `request` pushes the source's one *pump frame*, whose `execute`
+/// pumps on whichever worker it is routed to; once it has run, the frame goes home and the next `request` may push it
+/// again. A pump is long work (a device query per copy, a scan of every resident, copy submissions), so the frame leaves only
+/// through a `request`'s push. A `pull` neither pushes it nor hands it out (a worker handed it by a pull would run it
+/// with the handle's lock held). A worker that has
 /// no pump to run sees no frame. A pump that finished nothing is followed by a window of time (16 us, doubling to 100 us:
 /// [`KeyPacing`]) in which a visit pushes the frame again only for something new, while the mover only polls (copies in
 /// flight, a resident that could not be brought home); a freed slot, a new move or a find ends the window.
@@ -1278,12 +1279,15 @@ impl Frame for PumpFrame {
 
 impl Drop for PumpFrame {
     /// A key that is dropped without having run (a lattice that discarded it) must not strand the pump: a new
-    /// one goes home. A key that is homed does not get here.
+    /// one goes home. A key that is homed does not get here, and there is no other: the slot is empty.
     fn drop(&mut self) {
-        if let Some(mover) = self.mover.upgrade()
-            && !mover.source.key.is_home()
-        {
-            mover.source.key.home(PumpFrame::new(self.mover.clone()));
+        if let Some(mover) = self.mover.upgrade() {
+            mover
+                .source
+                .key
+                .home_replacement(PumpFrame::new(self.mover.clone()), |frame| {
+                    frame.mover = Weak::new();
+                });
         }
     }
 }
@@ -1371,23 +1375,28 @@ impl Moves {
         }
     }
 
-    /// Pushes the pump frame when a pump is due and no pump frame is out. The key is a control frame, not part of the
-    /// demand (like a hot source's pushes), and there is at most one. Does nothing without a downstream.
-    fn push_pump(&self) {
-        if self.complete.load(Ordering::Acquire) || !self.key.is_home() {
-            return;
+    /// Whether the pump frame is wanted now: the source is not complete, there is a downstream, and a pump is due. A
+    /// freed slot asks for a pump at once; only the polling (copies in flight, a resident that could not be brought
+    /// home) is paced.
+    fn key_due(&self) -> bool {
+        if self.complete.load(Ordering::Acquire) || self.downstream.get().is_none() {
+            return false;
         }
+        let Some(m) = self.mover.upgrade() else {
+            return false;
+        };
+        m.pump_signalled()
+            || (m.pump_polling() && self.pacing.due(self.events.load(Ordering::Acquire)))
+    }
+
+    /// Pushes the pump frame when a pump is due and the pump frame is home. The key is a control frame, not part of
+    /// the demand (like a hot source's pushes), and there is at most one. Does nothing without a downstream. Only
+    /// `request` calls it: the key is long, so no `pull` hands it out or pushes it.
+    fn push_pump(&self) {
         let Some(downstream) = self.downstream.get() else {
             return;
         };
-        let Some(m) = self.mover.upgrade() else {
-            return;
-        };
-        // A freed slot asks for a pump at once; only the polling (copies in flight, a resident that could not be
-        // brought home) is paced.
-        if !(m.pump_signalled()
-            || (m.pump_polling() && self.pacing.due(self.events.load(Ordering::Acquire))))
-        {
+        if !self.key_due() {
             return;
         }
         let Some(mut key) = self.key.take() else {
@@ -1415,9 +1424,7 @@ impl LatticeSource for Moves {
         stop: &mut dyn FnMut(&dyn Frame) -> bool,
         demand: u64,
     ) -> u64 {
-        let handed = self.emit(consumer, stop, demand);
-        self.push_pump();
-        handed
+        self.emit(consumer, stop, demand)
     }
 
     fn request(&self, demand: u64) {

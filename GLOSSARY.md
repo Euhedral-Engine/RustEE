@@ -402,11 +402,12 @@ the operating system, finishing copies, a lock with a system call, querying ever
 sinks therefore run in a frame (see **key frame**).
 
 **key frame, KeySlot** ([`KeySlot`](euhedral-core/src/generics/key_slot.rs)): the one reusable frame a source owns
-for work that is due now and then (a poll of the operations it holds, a device pump, a detach). The source pushes it
-from `request` or `pull` only when an O(1) check says there is work and the key is home (it is a control frame, not part of
-the demand); a worker runs its `execute`; its `recycle` sends it home. So at most one worker is in that work, and a source with
-nothing to do pushes nothing. The home is one atomic reference: `take` is a swap with `Acquire` behind a `Relaxed`
-read, `home` a store with `Release`. A key that is dropped without having run is replaced by a new one.
+for work that is due now and then (a poll of the operations it holds, a device pump, a detach). A `request`
+pushes it only when an O(1) check says there is work and the key is home (it is a control frame, not part of
+the demand); a `pull` never pushes and never hands the key to its consumer, because the
+pulling worker would run it with the source's handle held and the work behind a key is long. A worker runs its `execute`; its `recycle` sends it home. So at most one worker is in that
+work, and a source with nothing to do pushes nothing. The home is one atomic reference: `take` is a swap with `Acquire`
+alone (null means the key is away), `home` a swap with `AcqRel`. A key that is dropped without having run is replaced by a new one.
 `Completions`, `AsyncIo`, the memory `Moves` and the lake's idle watch use one; a caller outside a lattice runs the
 work by hand (`Completions::reap`, `AsyncIo::reap`, `Mover::pump`).
 

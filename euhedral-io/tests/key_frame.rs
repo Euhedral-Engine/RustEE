@@ -263,3 +263,105 @@ fn a_continuation_that_panics_loses_its_operation_and_not_the_others() {
     assert_eq!(ran.load(Ordering::Acquire), 1);
     assert_eq!(io.panicked(), 1);
 }
+
+#[test]
+fn a_pull_pushes_and_hands_out_no_key_a_request_pushes_it_and_a_key_out_is_never_out_twice() {
+    use std::os::fd::AsRawFd;
+    let (ours, _theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+    let io = AsyncIo::open().unwrap();
+    let keep = Arc::new(Keep::default());
+    io.clone().add_downstream(keep.clone());
+    io.recv(
+        ours.as_raw_fd(),
+        IoBuf {
+            bytes: vec![0; 16],
+            filled: 0,
+        },
+        Box::new(|_| Box::new(Ended(FrameHeader::new(3)))),
+    )
+    .unwrap();
+    // The reap is wanted (a submission) and the frame is home: a pull, whatever it is asked, hands out and pushes
+    // nothing. The reap is long (a system call, a lock, the application's continuations), so only a request sends it.
+    for demand in [1, 8, u64::MAX] {
+        for stop in [false, true] {
+            assert_eq!(
+                io.pull(
+                    &mut |_| panic!("a key is not handed out by a pull"),
+                    &mut |_| stop,
+                    demand
+                ),
+                0
+            );
+        }
+    }
+    assert_eq!(keep.kept(), 0, "no pull pushed it");
+    io.request(1);
+    assert_eq!(keep.kept(), 1, "a request pushes it");
+    // It is out: neither another request nor a pull sends a second.
+    io.request(1);
+    io.pull(
+        &mut |_| panic!("a key is not handed out by a pull"),
+        &mut |_| false,
+        8,
+    );
+    assert_eq!(keep.kept(), 1);
+}
+
+#[test]
+fn a_reap_that_runs_while_a_pull_holds_the_hand_out_leaves_the_pushing_to_a_request() {
+    use std::os::fd::AsRawFd;
+    let (_guard, file) = temp_file("held", &[7; 4096]);
+    let io = AsyncIo::open().unwrap();
+    let keep = Arc::new(Keep::default());
+    io.clone().add_downstream(keep.clone());
+    let read = |id: u64| {
+        io.read(
+            file.as_raw_fd(),
+            0,
+            IoBuf {
+                bytes: vec![0; 64],
+                filled: 0,
+            },
+            Box::new(move |_| Box::new(Ended(FrameHeader::new(id)))),
+        )
+        .unwrap();
+    };
+    // Reaps until `n` more operations have been reaped, as the key frame's worker would.
+    let reap = |n: usize| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut reaped = 0;
+        while reaped < n {
+            assert!(Instant::now() < deadline, "the reads did not complete");
+            reaped += io.reap();
+        }
+    };
+    for id in [1, 2, 3] {
+        read(id);
+    }
+    reap(3);
+    let mut handed = 0;
+    io.pull(
+        &mut |_| {
+            handed += 1;
+            if handed > 1 {
+                return;
+            }
+            // The worker that ran the reap frame while this pull holds the hand-out: a request banks demand, and a
+            // reap finds one more. Neither can enter the hand-out, so what they leave is the next call's.
+            io.request(8);
+            read(4);
+            reap(1);
+        },
+        &mut |_| false,
+        1,
+    );
+    assert_eq!(handed, 1);
+    assert_eq!(
+        keep.kept(),
+        0,
+        "the pull's release pushed nothing: a pull never pushes"
+    );
+    // The next request serves what waited, within the demand it banked.
+    io.request(1);
+    assert_eq!(keep.kept(), 3);
+}
