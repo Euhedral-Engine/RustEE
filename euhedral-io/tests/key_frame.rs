@@ -194,20 +194,25 @@ fn an_operation_that_never_ends_is_reaped_ever_less_often() {
     .unwrap();
     // A worker that finds nothing parks only if the handle it visits reads unproductive: a visit that pushes a
     // frame does not. Between reaps a visit pushes nothing.
-    const VISITS: usize = 20_000;
+    let started = Instant::now();
+    let mut visits = 0_u32;
     let mut pushes = 0;
-    for visit in 0..VISITS {
-        if visit % 2 == 0 {
+    while started.elapsed() < Duration::from_millis(30) {
+        if visits.is_multiple_of(2) {
             io.pull(&mut |_| panic!("nothing ended"), &mut |_| false, 8);
         } else {
             io.request(8);
         }
+        visits += 1;
         pushes += keep.run();
     }
-    assert!(pushes >= 8, "it is still reaped ({pushes})");
+    let elapsed = started.elapsed().as_micros() as usize;
+    assert!(pushes >= 4, "it is still reaped ({pushes})");
+    // The window between reaps grows from 16 us to 100 us, whatever the visit rate: after the first four, one per
+    // 100 us of the run at most.
     assert!(
-        pushes <= 120,
-        "{pushes} reaps in {VISITS} visits: the back-off did not grow"
+        pushes <= 6 + elapsed / 100,
+        "{pushes} reaps in {elapsed} us and {visits} visits: the back-off did not grow"
     );
     // The peer sends: a new operation resets the back-off, and the data is found within the window.
     (&theirs).write_all(b"ping").unwrap();
@@ -251,9 +256,10 @@ fn a_continuation_that_panics_loses_its_operation_and_not_the_others() {
     let deadline = Instant::now() + Duration::from_secs(10);
     while io.pending() > 0 {
         assert!(Instant::now() < deadline, "the operations did not drain");
-        // The reap does not unwind: the panicking operation is lost, counted and logged.
+        // The reap does not unwind: the panicking operation's frame is one that does nothing, and it is counted.
         io.reap();
         io.pull(&mut |_| {}, &mut |_| false, 8);
     }
     assert_eq!(ran.load(Ordering::Acquire), 1);
+    assert_eq!(io.panicked(), 1);
 }
