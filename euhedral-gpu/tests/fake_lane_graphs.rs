@@ -239,6 +239,7 @@ impl Fixture {
                     run_frame(frame);
                 }
                 let mut frame = None;
+                self.completions.reap();
                 self.completions
                     .pull(&mut |f| frame = Some(f), &mut |_| false, 1);
                 match frame {
@@ -374,6 +375,7 @@ impl Fixture {
                 run_frame(frame);
             }
             let mut frame = None;
+            self.completions.reap();
             self.completions
                 .pull(&mut |f| frame = Some(f), &mut |_| false, 1);
             match frame {

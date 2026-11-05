@@ -39,11 +39,12 @@ Work is **submitted** and the call returns at once. What follows it starts on on
 - the **completion**, found when a lattice worker polls a source. The continuation is a frame the
   source emits, and the lattice runs it like any other.
 
-`Completions` and `euhedral-io`'s `AsyncIo` are `LatticeSource`s, so they attach to a lattice with `add_upstream`
-and the workers' own polls (`pull` and `request`) query each pending operation once. There is no
-timer thread, no completion thread and no channel. A poll never blocks: a lane's completed value
-is one atomic read (`DeviceQueue::completed`), and an io_uring completion queue is read without
-entering the kernel.
+`Completions` and `euhedral-io`'s `AsyncIo` are `LatticeSource`s, so they attach to a lattice with `add_upstream`.
+Looking at the pending operations is a frame's work, not the source's: a source's `request` and `pull` only hand out,
+and a `request` pushes the source's one *poll frame* while operations wait, which a worker runs like any other frame
+(so what a poll costs is measured as a frame's cost). There is no timer thread, no completion thread and no channel.
+A poll never blocks: a lane's completed value is one atomic read (`DeviceQueue::completed`), and an io_uring
+completion queue is read without entering the kernel.
 
 The crate's clippy bans (see [`clippy.toml`](clippy.toml)) keep it that way: no threads, sleeps,
 channels, `Condvar`, blocking `std::fs` or `std::net` calls.
@@ -69,9 +70,16 @@ frame whose kill switch is set is still emitted: the executor skips it and runs 
 which ends what it holds, so `pending()` drains to zero on its own. `lateness_us()` reports how
 late emissions were: the cost of finding completions by polls.
 
-One poll runs at a time and none waits. A `request` that finds a poll running banks its demand and leaves a wakeup,
-and the running poll pushes within the demand as it lets go; the same holds for the sweep that cancels a
-registration made after `complete`.
+**Who does what.** `request` and `pull` hand out the continuations that are ready, within the demand, and query no
+operation. While operations wait and no poll frame is out, `request` pushes the source's poll frame (it costs one frame of
+the demand, is unordered and is routed by a hash of its own for each push); its `execute` is `Completions::reap`,
+which queries each pending operation once and queues the continuations of those that completed, in registration order,
+for the hand-out. The frame goes home once it has run. A caller outside a lattice drives a `Completions` by hand: `reap`,
+then `pull`.
+
+One poll runs at a time and none waits. A `request` that finds a hand-out running banks its demand and leaves a wakeup,
+and the running hand-out pushes within the demand as it lets go; the same holds for the sweep that cancels a
+registration made after `complete`, which waits for the holder of a poll.
 
 This runs one by hand, with a `Sequencer` that concludes in offer order whatever order the
 items finished in:
@@ -111,8 +119,10 @@ for (seq, after_ms) in [(0u32, 6), (1, 0), (2, 3)] {
     completions.at(now + Duration::from_millis(after_ms), continuation);
 }
 
-// A lattice worker does this on its own polls; here the loop is the worker.
+// A lattice worker runs the source's poll frame and takes what it found with `request` and `pull`; here the loop is
+// the worker, and `reap` is what the poll frame does.
 while completions.pending() > 0 {
+    completions.reap();
     completions.pull(
         &mut |mut frame| {
             frame.execute().unwrap();
@@ -277,9 +287,9 @@ through (`GraphRuntime::stages` is any `Arc<dyn FrameSink>`). Use one lake per k
 A lake takes frames only while a **unit** is admitted. `admit()` counts a unit in and returns a
 `UnitGuard`; the unit ends when the guard drops. For a stage graph the unit is the quantum: admit
 before `start`, drop the guard in `retire`. The first unit attaches the sinks to the lattice, and
-once no unit has been admitted for the idle release time, an idle watch (a source of no frames
-that the workers poll) detaches them, so an idle lake costs the lattice nothing to poll; the next
-unit attaches a fresh set. `complete_gracefully` closes admission, and the sinks drain and complete
+once no unit has been admitted for the idle release time, an idle watch (a source the workers poll, which looks at
+two atomics and pushes one frame to detach) detaches them, so an idle lake costs the lattice nothing to poll; the
+next unit attaches a fresh set. `complete_gracefully` closes admission, and the sinks drain and complete
 once the last unit ends.
 
 ```rust,no_run

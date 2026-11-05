@@ -3564,6 +3564,7 @@ mod tests {
                 .delegate()
                 .pull(&mut |f| frame = Some(f), &mut |_| false, 1);
             if frame.is_none() {
+                self.runtime.completions.reap();
                 self.runtime
                     .completions
                     .pull(&mut |f| frame = Some(f), &mut |_| false, 1);
@@ -4766,6 +4767,7 @@ mod tests {
                                 .delegate()
                                 .pull(&mut |f| frame = Some(f), &mut |_| false, 1);
                             if frame.is_none() {
+                                h.runtime.completions.reap();
                                 h.runtime.completions.pull(
                                     &mut |f| frame = Some(f),
                                     &mut |_| false,
@@ -4848,6 +4850,7 @@ mod tests {
             sink.delegate()
                 .pull(&mut |f| frame = Some(f), &mut |_| false, 1);
             if frame.is_none() {
+                completions.reap();
                 completions.pull(&mut |f| frame = Some(f), &mut |_| false, 1);
             }
             match frame {

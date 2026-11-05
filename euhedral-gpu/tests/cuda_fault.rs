@@ -148,6 +148,7 @@ fn a_device_fault_surfaces_through_confirm_retired_and_poisons_the_device() {
 
     // The continuation behind the fault is still emitted by the lattice's own poll.
     assert!(wait_until(Duration::from_secs(10), || {
+        completions.reap();
         completions.pull(
             &mut |mut frame| {
                 frame.execute().unwrap();

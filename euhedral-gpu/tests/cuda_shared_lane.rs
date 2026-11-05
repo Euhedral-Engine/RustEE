@@ -281,6 +281,7 @@ fn stages_submit_on_their_lanes_and_the_boundary_covers_both() {
                         continue;
                     }
                     let mut frame = None;
+                    completions.reap();
                     completions.pull(&mut |f| frame = Some(f), &mut |_| false, 1);
                     match frame {
                         Some(frame) => run_frame(frame),
@@ -393,12 +394,14 @@ fn a_retirement_cell_is_settled_in_a_frame_after_the_work_before_it() {
     completions.after_retired(cell.clone(), Box::new(DummyFrame::INSTANCE));
     let mut frames = Vec::new();
     assert!(wait_until(Duration::from_secs(20), || {
+        completions.reap();
         completions.pull(&mut |f| frames.push(f), &mut |_| false, 8);
         !frames.is_empty()
     }));
     assert_eq!(frames.len(), 1, "the continuation is a frame");
     assert_eq!(cell.status(), Some(0));
     assert_eq!(lane.confirm_retired(0).map(|e| e.to_string()), None);
+    completions.reap();
     completions.pull(&mut |f| frames.push(f), &mut |_| false, 8);
     assert_eq!(frames.len(), 1, "once");
 }
@@ -499,6 +502,7 @@ fn what_stages_hold_is_released_by_their_hooks_once_per_quantum() {
                         continue;
                     }
                     let mut frame = None;
+                    completions.reap();
                     completions.pull(&mut |f| frame = Some(f), &mut |_| false, 1);
                     match frame {
                         Some(frame) => run_frame(frame),

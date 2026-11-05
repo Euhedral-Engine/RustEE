@@ -5,8 +5,8 @@
 //! starts on one of two events:
 //! - **the submission** (a device successor orders itself behind the predecessor's [`Marker`] on
 //!   the device);
-//! - **the completion**, found when a lattice worker polls [`Completions`] or `euhedral-io`'s
-//!   `AsyncIo`.
+//! - **the completion**, found when a lattice worker runs the poll frame of [`Completions`] or of
+//!   `euhedral-io`'s `AsyncIo` (the source's `request` pushes it; the source runs no work itself).
 //!
 //! No stage frame takes a lock of its own. A [`StageGraph`]'s per-quantum state is a pooled run, handed from stage to
 //! stage by counts, plain fields and closable stacks, and after warm-up a quantum allocates nothing. The pools of runs
@@ -15,8 +15,8 @@
 //! stop and rebalance take, not frames.)
 //!
 //! No piece owns a thread. The sources ([`Completions`], and `euhedral-io`'s `AsyncIo`) are
-//! `LatticeSource`s that the lattice's own polls drive, and the rest are structures run from frame
-//! callbacks.
+//! `LatticeSource`s that the lattice's own requests drive (each pushes a poll frame that a worker runs), and the
+//! rest are structures run from frame callbacks.
 //!
 //! | Piece | Module | What it is |
 //! |---|---|---|
@@ -29,8 +29,8 @@
 //! Every public type is also re-exported at the crate root. Types of `euhedral-core` (`Frame`,
 //! `LatticeSource`, ...) are not: import them from `euhedral_core`.
 //!
-//! Feature: `testing` adds `testing::FakeDevice`. Asynchronous file and socket I/O (`AsyncIo`) is in
-//! `euhedral-io`.
+//! Feature: `testing` adds `testing::FakeDevice` and `Lake::idle_watch_by_hand`. Asynchronous file and socket I/O
+//! (`AsyncIo`) is in `euhedral-io`.
 
 // `ThreadUsage` makes system calls and `Sequencer` shares its entries across threads, each with a
 // `// SAFETY:` comment; nowhere else.

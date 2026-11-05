@@ -228,6 +228,7 @@ fn warm_stages_submit_and_quanta_run_without_allocating() {
                 run_frame(frame);
             }
             let mut frame = None;
+            completions.reap();
             completions.pull(&mut |f| frame = Some(f), &mut |_| false, 1);
             if let Some(frame) = frame {
                 run_frame(frame);

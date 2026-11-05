@@ -89,7 +89,8 @@ pub struct RetireError<S, T = ()> {
 /// [`Stream::confirm_retired`], submits more, and arms the next retirement with the stream it was given. If the arming
 /// fails the stream comes back in the error.
 ///
-/// `completions` polls the stream's retirement queue ([`Stream::poll_retired`]); there is no per-retirement cell. The
+/// `completions` polls the stream's retirement queue ([`Stream::poll_retired`]), in its poll frame (a worker runs it; the
+/// source's `request` and `pull` poll nothing), so the listeners and `then` run in a frame; there is no per-retirement cell. The
 /// stream must have no other listener-free retirement outstanding ([`Stream::outstanding_tickets`]): its ticket would
 /// reach this continuation in place of the one armed here, possibly before the work this retirement follows. In that
 /// case nothing is armed and the stream comes back in the error.

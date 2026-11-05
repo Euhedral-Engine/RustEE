@@ -234,9 +234,11 @@ retire_into(copy_lane, &completions, {
 })
 .unwrap_or_else(|e| panic!("{}", e.error));
 
-// A fake device runs when it is stepped; a real one runs by itself. Here the loop is the worker.
+// A fake device runs when it is stepped; a real one runs by itself. Here the loop is the worker (`reap` is what the
+// source's poll frame does).
 gpu.run_until_idle();
 while completions.pending() > 0 {
+    completions.reap();
     completions.pull(
         &mut |mut frame| {
             frame.execute().unwrap();

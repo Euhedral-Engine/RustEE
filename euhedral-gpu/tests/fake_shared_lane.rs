@@ -183,6 +183,7 @@ fn after_retired(completions: &Arc<Completions>, cell: &Arc<RetireCell>) {
 
 fn pull(completions: &Arc<Completions>) -> usize {
     let mut frames = Vec::new();
+    completions.reap();
     completions.pull(&mut |f| frames.push(f), &mut |_| false, 8);
     frames.len()
 }
@@ -377,6 +378,7 @@ impl Fixture {
                 run_frame(frame);
             }
             let mut frame = None;
+            self.completions.reap();
             self.completions
                 .pull(&mut |f| frame = Some(f), &mut |_| false, 1);
             match frame {

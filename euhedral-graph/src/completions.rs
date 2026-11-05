@@ -4,15 +4,15 @@ use std::cell::Cell;
 use std::collections::VecDeque;
 use std::fmt;
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering, fence};
+use std::sync::{Arc, Weak};
 use std::time::Instant;
 
-use euhedral_core::frames::Frame;
+use euhedral_core::frames::{Frame, FrameError, FrameHeader};
 use euhedral_core::generics::{
-    DownstreamSlot, LatticeReceiver, LatticeSource, SourceCell, SourceGuard,
+    DownstreamSlot, KeySlot, LatticeReceiver, LatticeSource, SourceCell, SourceGuard,
 };
-use euhedral_data_structures::queues::{Consumer, MpscQueue, Multi, Producer, Single};
+use euhedral_data_structures::queues::{Consumer, MpscQueue, Multi, Producer, Single, SpscQueue};
 use euhedral_data_structures::sync::HotScope;
 
 use euhedral_core::metrics::Histogram;
@@ -45,16 +45,27 @@ pub trait Pending: Send {
 /// A [`LatticeSource`] of continuations behind completions.
 ///
 /// [`after`](Self::after), [`after_marker`](Self::after_marker), [`at`](Self::at) and
-/// [`register`](Self::register) may be called from any thread. The lattice's polls
-/// (`pull`/`request`, one thread at a time) query each pending operation once and emit the
-/// continuations of those that completed, in the order they were registered. Nothing waits.
+/// [`register`](Self::register) may be called from any thread. **Looking at the operations is a frame's
+/// work, not the source's.** The source's `request` and `pull` hand out the continuations that are already
+/// ready, within the demand, and never query an operation. While operations wait and no poll frame is out,
+/// `request` or `pull` pushes the source's one key frame, the *poll frame* (an idle lattice calls `pull` on a handle far
+/// more often than `request`), and a worker runs it like any other frame:
+/// its `execute` ([`reap`](Self::reap)) queries each pending operation once (a completion's `is_ready`, a
+/// [`Pending`]'s `poll`, a marker, a timer) and queues the continuations of those that completed, in the
+/// order they were registered, for the hand-out. When the frame has run it goes home, and the next `request`
+/// may push it again. So an operation's query is measured as the frame's cost, and nothing is pushed while
+/// nothing waits.
 ///
-/// A `pull` stops before the first completed continuation its `stop` matches, leaving it (and
-/// everything registered after it) for a later poll; the lattice's direct pulls stop before ordered
-/// frames, which then go out through `request`'s pushes and the lattice's routing, so continuations
-/// on one ordered lane keep their registration order. A completed operation is never queried again.
+/// **Driving it by hand** (tests, or any caller outside a lattice): call [`reap`](Self::reap), which does
+/// what the poll frame does, then `pull`, which hands the ready continuations to its `consumer`. A reap
+/// finds only what completed by then: reap and pull again until the continuations you expect came out.
 ///
-/// A continuation is emitted even if its frame has died (its kill switch is set): the executor then
+/// A `pull` stops before the first ready continuation its `stop` matches, leaving it (and everything
+/// registered after it) for a later hand-out; the lattice's direct pulls stop before ordered frames, which
+/// then go out through `request`'s pushes and the lattice's routing, so continuations on one ordered lane
+/// keep their registration order. A completed operation is never queried again.
+///
+/// A continuation is handed out even if its frame has died (its kill switch is set): the executor then
 /// skips it and runs its `do_finally`, which ends what it holds. So at shutdown
 /// [`pending`](Self::pending) drains to zero on its own.
 ///
@@ -68,10 +79,11 @@ pub trait Pending: Send {
 ///
 /// A registration that races `complete` (the flag was not yet visible to it) lands in the queue
 /// and ends exactly one way: ahead of `complete`'s marker in the queue it is a registration like
-/// any other and is emitted; behind it, the next poll (`pull` or `request`) cancels it through
-/// `do_finally` without running it, and so does the last drop of the source if no poll comes. That
-/// cancellation does not panic: only the polling thread sees it, and it cannot tell a misuse from a
-/// poll that was late.
+/// any other and is handed out; behind it, the next poll ([`reap`](Self::reap): the poll frame, or a
+/// registration's own sweep) cancels it through `do_finally` without running it, and so does the last drop
+/// of the source if no poll comes. That cancellation does not panic: only the polling thread sees it, and it
+/// cannot tell a misuse from a poll that was late. A `request` or `pull` of a completed source cancels
+/// nothing (it runs no application code of its own), and a completed source pushes no poll frame.
 pub struct Completions {
     /// The lanes polled for markers: fixed for the source's life and dropped with it. A marker
     /// counts as reached when its lane says so, also after the source has completed.
@@ -79,17 +91,24 @@ pub struct Completions {
     /// Registered since the last poll; any thread appends, lock-free. [`LatticeSource::complete`]
     /// appends one [`Slot::Closed`] marker: what is behind it was registered too late.
     incoming: Producer<Slot, Multi>,
-    /// The polling side: the queue's consumer and what it drained and has not emitted. State the
-    /// holder mutates, so a `SourceCell`: `pull` and `request` (one thread at a time) enter it
-    /// without contention, a late registration's sweep enters it only if free, and whoever finds it
-    /// entered leaves its work to the holder, which looks for it after letting go.
+    /// The polling side (the poll frame's, or a caller driving by hand): the queue's consumer, what
+    /// it drained and has not found completed, and the end of the queue the completed continuations go to.
+    /// State the holder mutates, so a `SourceCell`: [`reap`](Self::reap) enters it, a late registration's
+    /// sweep enters it only if free, and whoever finds it entered leaves its work to the holder, which
+    /// looks for it after letting go.
     poll: SourceCell<Poll>,
+    /// The hand-out side (`request` and `pull`): the continuations found completed, waiting to go out.
+    out: SourceCell<Out>,
     /// A sweep waiting for the holder of `poll`: set before the claim is tried, read by the holder
     /// after it releases.
     sweep_pending: AtomicBool,
-    /// A request waiting for the holder of `poll`; its demand is already banked in `demand`.
+    /// A request waiting for the holder of `out`; its demand is already banked in `demand`.
     request_pending: AtomicBool,
+    /// Registered and not yet handed out.
     pending: AtomicUsize,
+    /// Registered and not yet found completed: what a poll has to look at. The poll frame is pushed only
+    /// while it is not zero.
+    waiting: AtomicUsize,
     demand: AtomicU64,
     downstream: DownstreamSlot,
     complete: AtomicBool,
@@ -98,6 +117,8 @@ pub struct Completions {
     leaked: Arc<AtomicUsize>,
     /// How late each emission was, in µs, since the start (lock-free: polls record, readers copy).
     lateness: Histogram,
+    /// The poll frame, while it is home.
+    key: KeySlot<PollFrame>,
 }
 
 /// What travels through the registration queue.
@@ -108,13 +129,23 @@ enum Slot {
     Closed,
 }
 
-/// What only the polling thread touches.
+/// What only the polling side touches.
 struct Poll {
     consumer: Consumer<Slot, Single>,
-    /// Drained from the queue, oldest first; entries are marked done in place.
+    /// Drained from the queue, oldest first, and not yet found completed.
     waiting: VecDeque<Waiting>,
     /// The `Closed` marker was drained: whatever is drained from now on is late.
     closed: bool,
+    /// Where the continuations found completed go, in the order they were found.
+    ready: Producer<Box<dyn Frame>, Single>,
+}
+
+/// What only the hand-out side touches.
+struct Out {
+    /// The continuations found completed, in the order they were found.
+    ready: Consumer<Box<dyn Frame>, Single>,
+    /// Continuations a pull's `stop` matched, the oldest first: they go out before anything in `ready`.
+    held: VecDeque<Box<dyn Frame>>,
 }
 
 /// A registered operation and when it was last seen in flight (an upper bound on when it completed
@@ -133,17 +164,77 @@ enum Waits {
     Retired(Arc<RetireCell>, Box<dyn Frame>),
     At(Instant, Box<dyn Frame>),
     Pending(Box<dyn Pending>),
-    /// Completed, its frame held back by a pull's `stop` (with when it was last seen in flight, or
-    /// its deadline): handed on by a later poll, before anything registered after it.
-    Done(Box<dyn Frame>, Instant),
-    /// Only while an entry changes into `Done`.
-    Moving,
+}
+
+/// The id hash of the poll frame. The routing hash of each push is this mixed with the push's own seed, which
+/// spreads the pushes over the workers.
+const KEY_ID: u64 = 0x9e37_79b9_7f4a_7c15;
+
+/// The key frame of a [`Completions`]: its `execute` polls ([`Completions::reap`]).
+struct PollFrame {
+    header: FrameHeader,
+    source: Weak<Completions>,
+    /// Counts the pushes, so that each is routed by a hash of its own.
+    seed: u64,
+}
+
+impl PollFrame {
+    fn new(source: Weak<Completions>) -> Box<Self> {
+        Box::new(Self {
+            header: FrameHeader::new(KEY_ID),
+            source,
+            seed: 0,
+        })
+    }
+
+    /// Unordered, and a new routing hash for each push: the poll may run on any worker.
+    fn arm(&mut self) {
+        self.seed = self.seed.wrapping_add(1);
+        self.header.randomize_hash(self.seed);
+    }
+}
+
+impl Frame for PollFrame {
+    fn header(&self) -> &FrameHeader {
+        &self.header
+    }
+
+    fn header_mut(&mut self) -> &mut FrameHeader {
+        &mut self.header
+    }
+
+    fn execute(&mut self) -> Result<(), FrameError> {
+        if let Some(source) = self.source.upgrade() {
+            source.reap();
+        }
+        Ok(())
+    }
+
+    /// The key goes home. (A source that is gone has no home: the frame is dropped.)
+    fn recycle(self: Box<Self>) {
+        if let Some(source) = self.source.upgrade() {
+            source.key.home(self);
+        }
+    }
+}
+
+impl Drop for PollFrame {
+    /// A key that is dropped without having run (a lattice that discarded it) must not strand the polling: a new
+    /// one goes home. A key that is homed does not get here.
+    fn drop(&mut self) {
+        if let Some(source) = self.source.upgrade()
+            && !source.key.is_home()
+        {
+            source.key.home(PollFrame::new(self.source.clone()));
+        }
+    }
 }
 
 impl Drop for Completions {
     /// The last owner lets go: no thread can register any more, and none will poll. What is still
-    /// in the queue, and what was absorbed and never emitted, ends here through `Completions::cancel`
-    /// (finished, or leaked when its marker is unreached), so no registration is left without an end.
+    /// in the queue, and what was absorbed and never found completed, ends here through `Completions::cancel`
+    /// (finished, or leaked when its marker is unreached), and so do the continuations that were found
+    /// completed and never handed out, so no registration is left without an end.
     fn drop(&mut self) {
         let poll = self.poll.get_mut();
         let mut ends = Self::absorb(poll);
@@ -154,6 +245,13 @@ impl Drop for Completions {
         );
         for what in ends {
             self.cancel(what);
+        }
+        let out = self.out.get_mut();
+        while let Some(frame) = out.held.pop_front() {
+            frame.do_finally();
+        }
+        while let Some(frame) = out.ready.poll() {
+            frame.do_finally();
         }
     }
 }
@@ -194,22 +292,30 @@ impl Completions {
     /// Polls of `marker`s use `lanes`.
     pub fn new(lanes: Arc<LanePool>) -> Arc<Self> {
         let queue: MpscQueue<Slot> = MpscQueue::with_pool(INCOMING_CHUNK, 2);
-        Arc::new(Self {
+        let ready: SpscQueue<Box<dyn Frame>> = SpscQueue::with_pool(INCOMING_CHUNK, 2);
+        Arc::new_cyclic(|me| Self {
             lanes,
             incoming: queue.producer(),
             poll: SourceCell::new(Poll {
                 consumer: queue.consumer(),
                 waiting: VecDeque::new(),
                 closed: false,
+                ready: ready.producer(),
+            }),
+            out: SourceCell::new(Out {
+                ready: ready.consumer(),
+                held: VecDeque::new(),
             }),
             sweep_pending: AtomicBool::new(false),
             request_pending: AtomicBool::new(false),
             pending: AtomicUsize::new(0),
+            waiting: AtomicUsize::new(0),
             demand: AtomicU64::new(0),
             downstream: DownstreamSlot::new(),
             complete: AtomicBool::new(false),
             leaked: Arc::new(AtomicUsize::new(0)),
             lateness: Histogram::new(),
+            key: KeySlot::with_key(PollFrame::new(me.clone())),
         })
     }
 
@@ -232,6 +338,7 @@ impl Completions {
         // Counted before it can be seen, so `pending` never reads zero while a registration is
         // between here and the queue.
         self.pending.fetch_add(1, Ordering::AcqRel);
+        self.waiting.fetch_add(1, Ordering::AcqRel);
         let slot = Slot::Waiting(Waiting {
             what,
             last_seen: Instant::now(),
@@ -239,6 +346,7 @@ impl Completions {
         if let Err(Slot::Waiting(Waiting { what, .. })) = self.incoming.offer(slot) {
             // Unreachable for the unbounded queue; ends the frame rather than losing it.
             self.pending.fetch_sub(1, Ordering::AcqRel);
+            self.waiting.fetch_sub(1, Ordering::AcqRel);
             self.cancel(what);
             return;
         }
@@ -274,10 +382,8 @@ impl Completions {
             | Waits::Wake(_, frame)
             | Waits::Marker(_, frame)
             | Waits::Retired(_, frame)
-            | Waits::At(_, frame)
-            | Waits::Done(frame, _) => frame.do_finally(),
+            | Waits::At(_, frame) => frame.do_finally(),
             Waits::Pending(pending) => drop(pending),
-            Waits::Moving => {}
         }
     }
 
@@ -289,6 +395,7 @@ impl Completions {
             consumer,
             waiting,
             closed,
+            ..
         } = poll;
         let mut late = Vec::new();
         consumer.drain_all(|slot| match slot {
@@ -309,11 +416,12 @@ impl Completions {
             self.cancel(what);
         }
         self.pending.fetch_sub(count, Ordering::AcqRel);
+        self.waiting.fetch_sub(count, Ordering::AcqRel);
     }
 
     /// Cancels what landed too late now, unless a poll holds the claim: that holder absorbs the
-    /// queue itself, and looks for this sweep after it lets go. For a late registration, and for a
-    /// `request` of a completed source (which emits nothing, but is a poll).
+    /// queue itself, and looks for this sweep after it lets go. For a late registration (which is the
+    /// registering thread's own work; `request` and `pull` cancel nothing).
     fn sweep(&self) {
         // The wakeup is published before the claim is tried: the releasing holder either sees it,
         // or this call takes the claim itself.
@@ -339,24 +447,24 @@ impl Completions {
         }
     }
 
-    /// What a holder of the claim does after it lets go: the sweeps and requests that arrived while
+    /// What a holder of a claim does after it lets go: the sweeps and requests that arrived while
     /// it held the claim (and so were refused it), as a queue sink's holder serves its requests.
     fn after_release(&self) {
         self.run_sweeps();
         self.serve_requests();
     }
 
-    /// Pushes completions to the downstream, up to the banked demand, while requests are waiting and
-    /// the claim is free.
+    /// Pushes the ready continuations to the downstream, up to the banked demand, while requests are
+    /// waiting and the hand-out side is free.
     fn serve_requests(&self) {
         while self.request_pending.load(Ordering::SeqCst) {
-            let Some(mut poll) = self.poll.try_enter() else {
+            let Some(mut out) = self.out.try_enter() else {
                 return;
             };
             // As in `run_sweeps`: the read-modify-write sees the demand banked before the request's
             // store, which a plain store of `false` over a racing request's would not guarantee.
             if !self.request_pending.swap(false, Ordering::SeqCst) {
-                poll.release_seq_cst();
+                out.release_seq_cst();
                 continue;
             }
             if let Some(downstream) = self.downstream.receiver()
@@ -365,9 +473,9 @@ impl Completions {
                 // Counted before each push, so a push that panics still counts: the frame left
                 // the source.
                 let pushed = Cell::new(0_u64);
-                let emitted = panic::catch_unwind(AssertUnwindSafe(|| {
-                    self.emit(
-                        &mut poll,
+                let handed = panic::catch_unwind(AssertUnwindSafe(|| {
+                    self.hand_out(
+                        &mut out,
                         &mut |frame| {
                             pushed.set(pushed.get() + 1);
                             downstream.push(frame);
@@ -377,7 +485,7 @@ impl Completions {
                     )
                 }));
                 if pushed.get() > 0 {
-                    // Accounted before the claim is released, so the next holder cannot
+                    // Accounted before the side is released, so the next holder cannot
                     // over-deliver.
                     let _ = self
                         .demand
@@ -385,16 +493,32 @@ impl Completions {
                             Some(d.saturating_sub(pushed.get()))
                         });
                 }
-                if let Err(panic) = emitted {
+                if let Err(panic) = handed {
                     // The wakeups refused meanwhile are still served.
-                    poll.release_seq_cst();
+                    out.release_seq_cst();
                     let _ = panic::catch_unwind(AssertUnwindSafe(|| self.after_release()));
                     panic::resume_unwind(panic);
                 }
             }
-            poll.release_seq_cst();
-            self.run_sweeps();
+            out.release_seq_cst();
         }
+    }
+
+    /// Pushes the poll frame to the downstream: operations wait, no poll frame is out, and the source is not
+    /// complete. The key is a control frame, not part of the demand (like a hot source's pushes), and there is at
+    /// most one. Does nothing without a downstream (a caller driving by hand has none).
+    fn push_poll(&self) {
+        if self.waiting.load(Ordering::Acquire) == 0 || self.complete.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(downstream) = self.downstream.receiver() else {
+            return;
+        };
+        let Some(mut key) = self.key.take() else {
+            return;
+        };
+        key.arm();
+        downstream.push(key);
     }
 
     /// Emits `frame` once `ready` reports completion.
@@ -461,87 +585,120 @@ impl Completions {
         )
     }
 
-    /// One poll, by the holder of the claim: every operation is queried once, and up to `demand`
-    /// continuations of the completed ones go to `consumer`, in registration order. Returns how
-    /// many.
-    fn emit(
-        &self,
-        poll: &mut SourceGuard<'_, Poll>,
-        consumer: &mut dyn FnMut(Box<dyn Frame>),
-        stop: &mut dyn FnMut(&dyn Frame) -> bool,
-        demand: u64,
-    ) -> u64 {
-        if demand == 0 {
+    /// Polls once: every operation is queried once, and the continuations of those that completed are
+    /// queued, in the order they were registered, for the hand-out ([`pull`](LatticeSource::pull) and
+    /// `request`). Returns how many it queued. Returns 0 at once if another poll is inside.
+    ///
+    /// This is the work of the poll frame that `request` pushes into a lattice, which runs on a worker like
+    /// any other frame; `request` and `pull` never do it. A caller that drives a `Completions` by hand calls
+    /// it before it pulls. A completed source is polled too (it cancels what landed behind its marker).
+    pub fn reap(&self) -> usize {
+        // Declared before the claim, so it runs after the claim is let go, also when a query unwinds: the
+        // requests and sweeps refused meanwhile are still served.
+        let mut after = AfterRelease {
+            source: self,
+            armed: false,
+        };
+        let Some(mut poll) = self.poll.try_enter() else {
             return 0;
+        };
+        after.armed = true;
+        let queued = self.reap_entered(&mut poll);
+        poll.release_seq_cst();
+        if queued > 0 && self.demand.load(Ordering::SeqCst) > 0 {
+            // What was found goes out within the demand already banked, without waiting for the next
+            // request: `after` serves it as it drops.
+            self.request_pending.store(true, Ordering::SeqCst);
         }
+        queued
+    }
+
+    /// [`reap`](Self::reap) by the holder of the claim.
+    fn reap_entered(&self, poll: &mut SourceGuard<'_, Poll>) -> usize {
         let late = Self::absorb(poll);
         self.cancel_late(late);
-        if poll.waiting.is_empty() {
+        let Poll { waiting, ready, .. } = &mut **poll;
+        if waiting.is_empty() {
             return 0;
         }
-        let waiting = &mut poll.waiting;
         let now = Instant::now();
-        let mut emitted = 0;
+        let mut queued = 0;
         let mut index = 0;
-        while index < waiting.len() && emitted < demand {
+        while index < waiting.len() {
             let entry = &mut waiting[index];
-            // Each operation is queried once; a completed one becomes `Done`, so it is never
+            // Each operation is queried once, and a completed one leaves the list, so it is never
             // queried again (a query may have effects: a driver call that fetches the result).
+            let mut yielded = None;
             let done = match &mut entry.what {
                 Waits::Ready(ready, _) => ready.is_ready(),
                 Waits::Wake(wake, _) => wake.is_ready(),
                 Waits::Marker(marker, _) => self.lanes.reached(*marker),
                 Waits::Retired(cell, _) => cell.arrived(),
                 Waits::At(deadline, _) => now >= *deadline,
-                Waits::Pending(pending) => match pending.poll() {
-                    Some(frame) => {
-                        entry.what = Waits::Done(frame, entry.last_seen);
-                        true
-                    }
-                    None => false,
-                },
-                Waits::Done(..) => true,
-                Waits::Moving => unreachable!("an entry is moving only inside this match"),
+                Waits::Pending(pending) => {
+                    yielded = pending.poll();
+                    yielded.is_some()
+                }
             };
             if !done {
                 entry.last_seen = now;
                 index += 1;
                 continue;
             }
-            entry.what = match std::mem::replace(&mut entry.what, Waits::Moving) {
+            let Some(Waiting { what, last_seen }) = waiting.remove(index) else {
+                unreachable!("a done entry at index")
+            };
+            let (frame, since) = match what {
                 Waits::Ready(_, frame)
                 | Waits::Wake(_, frame)
                 | Waits::Marker(_, frame)
-                | Waits::Retired(_, frame) => Waits::Done(frame, entry.last_seen),
-                Waits::At(deadline, frame) => Waits::Done(frame, deadline),
-                done @ Waits::Done(..) => done,
-                Waits::Pending(_) | Waits::Moving => unreachable!("resolved above"),
+                | Waits::Retired(_, frame) => (frame, last_seen),
+                Waits::At(deadline, frame) => (frame, deadline),
+                Waits::Pending(_) => (yielded.expect("a pending that is done yielded"), last_seen),
             };
-            let Waits::Done(frame, _) = &entry.what else {
-                unreachable!("just made done")
-            };
-            // The lattice's direct pulls stop before ordered frames (they go through its routing,
-            // which keeps their order): leave it, and everything after it, for a later poll.
-            if stop(&**frame) {
-                break;
-            }
-            let Some(Waiting {
-                what: Waits::Done(frame, since),
-                ..
-            }) = waiting.remove(index)
-            else {
-                unreachable!("a done entry at index")
-            };
-            // The frame leaves the source here: it is off `pending` (and its lateness recorded)
-            // before the consumer sees it, so a consumer that unwinds leaves both exact.
-            self.pending.fetch_sub(1, Ordering::AcqRel);
+            self.waiting.fetch_sub(1, Ordering::AcqRel);
             // The poll claim is held, so one thread records at a time.
             self.lateness
                 .record_owned(now.saturating_duration_since(since).as_micros() as f64);
-            emitted += 1;
+            // The queue is unbounded: an offer is never refused.
+            let _ = ready.offer(frame);
+            queued += 1;
+        }
+        queued
+    }
+
+    /// Hands up to `demand` ready continuations to `consumer`, in the order they were found, holding back
+    /// the first one `stop` matches. Returns how many.
+    fn hand_out(
+        &self,
+        out: &mut SourceGuard<'_, Out>,
+        consumer: &mut dyn FnMut(Box<dyn Frame>),
+        stop: &mut dyn FnMut(&dyn Frame) -> bool,
+        demand: u64,
+    ) -> u64 {
+        let mut handed = 0;
+        while handed < demand {
+            // What an earlier pull's `stop` held back goes first.
+            let frame = match out.held.pop_front() {
+                Some(frame) => frame,
+                None => match out.ready.poll() {
+                    Some(frame) => frame,
+                    None => break,
+                },
+            };
+            // The lattice's direct pulls stop before ordered frames (they go through its routing,
+            // which keeps their order): leave it, and everything after it, for a later hand-out.
+            if stop(&*frame) {
+                out.held.push_front(frame);
+                break;
+            }
+            // The frame leaves the source here: it is off `pending` before the consumer sees it, so a
+            // consumer that unwinds leaves it exact.
+            self.pending.fetch_sub(1, Ordering::AcqRel);
+            handed += 1;
             consumer(frame);
         }
-        emitted
+        handed
     }
 }
 
@@ -550,9 +707,10 @@ impl LatticeSource for Completions {
         self.downstream.attach(self.clone(), downstream);
     }
 
-    /// Hands up to `demand` completed continuations to `consumer`, unless another thread holds the
-    /// poll: then it returns 0 at once, and the holder serves the requests that arrived meanwhile
-    /// when it lets go.
+    /// Hands up to `demand` ready continuations to `consumer`, unless another thread holds the
+    /// hand-out: then it returns 0 at once, and the holder serves the requests that arrived meanwhile
+    /// when it lets go. It queries no operation: that is the poll frame's work (see [`reap`](Self::reap)), which it
+    /// pushes to the downstream, if there is one, while operations wait.
     fn pull(
         &self,
         consumer: &mut dyn FnMut(Box<dyn Frame>),
@@ -568,26 +726,24 @@ impl LatticeSource for Completions {
             source: self,
             armed: false,
         };
-        let Some(mut poll) = self.poll.try_enter() else {
+        let Some(mut out) = self.out.try_enter() else {
             return 0;
         };
         after.armed = true;
-        let emitted = self.emit(&mut poll, consumer, stop, demand);
-        poll.release_seq_cst();
-        emitted
+        let handed = self.hand_out(&mut out, consumer, stop, demand);
+        out.release_seq_cst();
+        self.push_poll();
+        handed
     }
 
-    /// Banks `demand` and pushes completed continuations to the downstream up to the total. If
-    /// another thread holds the poll the request returns at once, and the holder pushes when it lets
-    /// go.
+    /// Banks `demand`, pushes the ready continuations to the downstream up to the total, and pushes the
+    /// poll frame while operations wait (the frame is not part of the demand). If another thread holds the hand-out the request returns at
+    /// once, and the holder pushes when it lets go.
     fn request(&self, demand: u64) {
-        if self.complete.load(Ordering::SeqCst) {
-            // Nothing is requested of a completed source, but this is a poll: it cancels what
-            // was registered too late.
-            self.sweep();
-            return;
-        }
-        if demand == 0 || self.downstream.receiver().is_none() {
+        if demand == 0
+            || self.complete.load(Ordering::SeqCst)
+            || self.downstream.receiver().is_none()
+        {
             return;
         }
         // Java's `accumulate`: saturating.
@@ -598,6 +754,7 @@ impl LatticeSource for Completions {
             });
         self.request_pending.store(true, Ordering::SeqCst);
         self.serve_requests();
+        self.push_poll();
     }
 
     /// # Why every registration ends exactly one way, whatever races this
@@ -730,7 +887,9 @@ mod tests {
         (Completions::new(pool), lane)
     }
 
+    /// One poll by hand: what the poll frame does, then a pull of what it found.
     fn poll(completions: &Completions) -> Vec<u64> {
+        completions.reap();
         let mut out = Vec::new();
         completions.pull(
             &mut |frame| out.push(frame.header().id_hash()),
@@ -862,6 +1021,7 @@ mod tests {
         for i in 0..5 {
             completions.at(Instant::now(), tagged(i));
         }
+        completions.reap();
         let mut out = Vec::new();
         assert_eq!(
             completions.pull(&mut |f| out.push(f.header().id_hash()), &mut |_| false, 2),
@@ -880,6 +1040,7 @@ mod tests {
         token.done.store(true, Ordering::Release);
         completions.after(Box::new(token.clone()), tagged(1));
         completions.at(Instant::now(), tagged(2));
+        completions.reap();
         let mut out = Vec::new();
         let pulled = completions.pull(
             &mut |f| out.push(f.header().id_hash()),
@@ -1007,15 +1168,26 @@ mod tests {
         for i in 0..3 {
             completions.at(Instant::now(), tagged(i));
         }
+        // Nothing is found yet (a request polls nothing), so each continuation waits: the poll frame is what the
+        // request pushes, and it is not part of the demand.
         completions.request(1);
-        assert_eq!(*recorder.ids.lock().unwrap(), [0]);
+        assert_eq!(*recorder.ids.lock().unwrap(), [KEY_ID]);
+        // What the poll finds goes out within the demand already banked (1), and the rest with the next requests.
+        completions.reap();
+        assert_eq!(*recorder.ids.lock().unwrap(), [KEY_ID, 0]);
+        completions.request(1);
+        assert_eq!(
+            *recorder.ids.lock().unwrap(),
+            [KEY_ID, 0, 1],
+            "the demand banked by the requests, up to the total"
+        );
         completions.request(5);
-        assert_eq!(*recorder.ids.lock().unwrap(), [0, 1, 2]);
+        assert_eq!(*recorder.ids.lock().unwrap(), [KEY_ID, 0, 1, 2]);
         completions.at(Instant::now(), tagged(3));
         completions.request(0);
         assert_eq!(
             recorder.ids.lock().unwrap().len(),
-            3,
+            4,
             "demand left over from earlier requests is not a request"
         );
         completions.complete();
@@ -1092,6 +1264,7 @@ mod tests {
 
     /// A pull as the executor would see it: the continuations are run to their end.
     fn pull_and_end(completions: &Completions) -> usize {
+        completions.reap();
         let mut emitted = 0;
         completions.pull(
             &mut |frame| {
@@ -1107,6 +1280,7 @@ mod tests {
     /// Behind the marker, by position: queued as a registration that missed the flag would be.
     fn queue_behind_the_marker(completions: &Completions, frame: Box<dyn Frame>) {
         completions.pending.fetch_add(1, Ordering::AcqRel);
+        completions.waiting.fetch_add(1, Ordering::AcqRel);
         let queued = completions.incoming.offer(Slot::Waiting(Waiting {
             what: Waits::At(Instant::now(), frame),
             last_seen: Instant::now(),
@@ -1123,6 +1297,7 @@ mod tests {
         let (behind, behind_ends) = counted(2);
         queue_behind_the_marker(&completions, behind);
         assert_eq!(completions.pending(), 2);
+        completions.reap();
         let mut seen = Vec::new();
         completions.pull(
             &mut |frame| {
@@ -1149,12 +1324,18 @@ mod tests {
     }
 
     #[test]
-    fn a_request_of_a_completed_source_cancels_what_landed_behind_the_marker() {
+    fn a_reap_of_a_completed_source_cancels_what_landed_behind_the_marker_and_a_request_does_not() {
         let (completions, _) = setup();
+        let hands = Arc::new(Hands::default());
+        completions.clone().add_downstream(hands.clone());
         completions.complete();
         let (behind, ends) = counted(3);
         queue_behind_the_marker(&completions, behind);
+        // A request runs no application code, and a completed source pushes no poll frame.
         completions.request(1);
+        assert_eq!(hands.kept(), 0);
+        assert_eq!(ends.load(Ordering::Acquire), 0, "a request cancels nothing");
+        completions.reap();
         assert_eq!(ends.load(Ordering::Acquire), 1);
         assert_eq!(completions.pending(), 0);
     }
@@ -1277,6 +1458,7 @@ mod tests {
                     Instant::now() < deadline,
                     "the continuations did not all arrive"
                 );
+                completions.reap();
                 completions.pull(
                     &mut |frame| {
                         let id = frame.header().id_hash();
@@ -1298,7 +1480,7 @@ mod tests {
         });
     }
 
-    /// A receiver that ends each frame it is pushed, as an executor does.
+    /// A receiver that runs each frame it is pushed and ends it, as an executor does.
     struct Finisher;
 
     impl euhedral_core::generics::LatticeTerminal for Finisher {
@@ -1306,7 +1488,8 @@ mod tests {
     }
 
     impl LatticeReceiver for Finisher {
-        fn push(&self, frame: Box<dyn Frame>) {
+        fn push(&self, mut frame: Box<dyn Frame>) {
+            frame.execute().unwrap();
             frame.do_finally();
         }
 
@@ -1389,12 +1572,13 @@ mod tests {
     }
 
     #[test]
-    fn a_request_while_another_thread_polls_returns_at_once() {
+    fn a_request_while_another_thread_hands_out_returns_at_once() {
         let (completions, _) = setup();
         let recorder = Arc::new(Recorder::default());
         completions.clone().add_downstream(recorder.clone());
         completions.at(Instant::now(), tagged(1));
         completions.at(Instant::now(), tagged(2));
+        completions.reap();
         let inside = std::sync::Barrier::new(2);
         let release = std::sync::Barrier::new(2);
         std::thread::scope(|scope| {
@@ -1431,42 +1615,58 @@ mod tests {
         assert_eq!(completions.pending(), 0);
     }
 
+    /// A pending operation whose poll waits for the test, inside the poll.
+    struct HeldPoll {
+        inside: Arc<std::sync::Barrier>,
+        release: Arc<std::sync::Barrier>,
+    }
+
+    impl Pending for HeldPoll {
+        fn poll(&mut self) -> Option<Box<dyn Frame>> {
+            self.inside.wait();
+            self.release.wait();
+            Some(tagged(1))
+        }
+    }
+
     #[test]
     fn a_sweep_that_finds_the_poll_held_is_run_by_the_holder_when_it_lets_go() {
         let (completions, _) = setup();
-        completions.at(Instant::now(), tagged(1));
+        let (inside, release) = (
+            Arc::new(std::sync::Barrier::new(2)),
+            Arc::new(std::sync::Barrier::new(2)),
+        );
+        completions.register(Box::new(HeldPoll {
+            inside: inside.clone(),
+            release: release.clone(),
+        }));
         let (behind, ends) = counted(9);
-        let inside = std::sync::Barrier::new(2);
-        let release = std::sync::Barrier::new(2);
         std::thread::scope(|scope| {
-            let puller = scope.spawn(|| {
-                completions.pull(
-                    &mut |_frame| {
-                        inside.wait();
-                        release.wait();
-                    },
-                    &mut |_| false,
-                    1,
-                )
-            });
+            let poller = scope.spawn(|| completions.reap());
             inside.wait();
             completions.complete();
             queue_behind_the_marker(&completions, behind);
-            // A poll of a completed source is a sweep; the holder has the claim.
-            completions.request(1);
+            // A late registration's sweep; the holder has the claim.
+            completions.sweep();
             assert_eq!(
                 ends.load(Ordering::Acquire),
                 0,
                 "the sweep left it to the holder"
             );
             release.wait();
-            puller.join().unwrap();
+            assert_eq!(poller.join().unwrap(), 1);
         });
         assert_eq!(
             ends.load(Ordering::Acquire),
             1,
             "the holder swept as it let go"
         );
+        assert_eq!(
+            completions.pending(),
+            1,
+            "the continuation waits for a hand-out"
+        );
+        assert_eq!(poll(&completions), [1]);
         assert_eq!(completions.pending(), 0);
     }
 
@@ -1527,6 +1727,7 @@ mod tests {
         completions.clone().add_downstream(recorder.clone());
         completions.at(Instant::now(), tagged(1));
         completions.at(Instant::now(), tagged(2));
+        completions.reap();
         let inside = std::sync::Barrier::new(2);
         let release = std::sync::Barrier::new(2);
         std::thread::scope(|scope| {
@@ -1560,6 +1761,7 @@ mod tests {
         let (completions, _) = setup();
         completions.at(Instant::now(), tagged(1));
         assert_eq!(completions.pending(), 1);
+        completions.reap();
         let pulled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             completions.pull(&mut |_| panic!("consumer failed"), &mut |_| false, 1)
         }));
@@ -1610,6 +1812,7 @@ mod tests {
         completions.clone().add_downstream(receiver.clone());
         completions.at(Instant::now(), tagged(1));
         completions.at(Instant::now(), tagged(2));
+        completions.reap();
         std::thread::scope(|scope| {
             let requester = scope.spawn(|| {
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| completions.request(1)))
@@ -1663,6 +1866,7 @@ mod tests {
         let late_marker = |seq: u64, id: u64| {
             let (frame, ends) = counted(id);
             completions.pending.fetch_add(1, Ordering::AcqRel);
+            completions.waiting.fetch_add(1, Ordering::AcqRel);
             let queued = completions.incoming.offer(Slot::Waiting(Waiting {
                 what: Waits::Marker(Marker::new(lane.id, LaneId(0), seq), frame),
                 last_seen: Instant::now(),
@@ -1673,7 +1877,7 @@ mod tests {
         let unreached = late_marker(9, 1);
         let reached = late_marker(0, 2);
         // A poll of a completed source sweeps what landed behind the marker.
-        completions.request(1);
+        completions.reap();
         assert_eq!(
             unreached.load(Ordering::Acquire),
             0,
@@ -1694,5 +1898,215 @@ mod tests {
         }));
         assert_eq!(refused.load(Ordering::Acquire), 0);
         assert_eq!(leaks.load(Ordering::Acquire), 2);
+    }
+
+    thread_local! {
+        /// This thread is executing a frame: what a lattice worker is doing when it runs one.
+        static IN_FRAME: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// A receiver that keeps what the source pushes, to be run by the test as a worker would.
+    #[derive(Default)]
+    struct Hands {
+        frames: Mutex<Vec<Box<dyn Frame>>>,
+    }
+
+    impl Hands {
+        fn kept(&self) -> usize {
+            self.frames.lock().unwrap().len()
+        }
+
+        /// The ids of what is kept, the poll frame's apart.
+        fn ids(&self) -> Vec<u64> {
+            self.frames
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|f| f.header().id_hash())
+                .collect()
+        }
+
+        /// Runs every frame kept, as a worker's executor does, and returns how many.
+        fn run(&self) -> usize {
+            let frames = std::mem::take(&mut *self.frames.lock().unwrap());
+            let n = frames.len();
+            for mut frame in frames {
+                IN_FRAME.set(true);
+                let ran = frame.execute();
+                IN_FRAME.set(false);
+                ran.unwrap();
+                frame.do_finally();
+            }
+            n
+        }
+    }
+
+    impl euhedral_core::generics::LatticeTerminal for Hands {
+        fn add_upstream(&self, _: Arc<dyn LatticeSource>) {}
+    }
+
+    impl LatticeReceiver for Hands {
+        fn push(&self, frame: Box<dyn Frame>) {
+            self.frames.lock().unwrap().push(frame);
+        }
+
+        fn on_complete(&self) {}
+
+        fn on_error(&self, _: euhedral_core::frames::Failure) {}
+    }
+
+    /// A pending operation whose poll must run inside a frame's execution.
+    struct PollsInAFrame(Arc<AtomicUsize>);
+
+    impl Pending for PollsInAFrame {
+        fn poll(&mut self) -> Option<Box<dyn Frame>> {
+            assert!(
+                IN_FRAME.get(),
+                "an operation was polled outside a frame's execution (in a request or a pull)"
+            );
+            self.0.fetch_add(1, Ordering::AcqRel);
+            Some(tagged(2))
+        }
+    }
+
+    #[test]
+    fn request_and_pull_query_nothing_and_the_poll_frame_does() {
+        let (completions, _) = setup();
+        let hands = Arc::new(Hands::default());
+        completions.clone().add_downstream(hands.clone());
+        let token = Token::default();
+        completions.after(Box::new(token.clone()), tagged(1));
+        let polls = Arc::new(AtomicUsize::new(0));
+        completions.register(Box::new(PollsInAFrame(polls.clone())));
+
+        // Neither call looks at an operation, and nothing is ready to hand out. The first pushes the poll frame.
+        assert_eq!(
+            completions.pull(&mut |_| panic!("nothing is ready"), &mut |_| false, 9),
+            0
+        );
+        assert_eq!(
+            token.queries.load(Ordering::Relaxed),
+            0,
+            "no query in a pull"
+        );
+        assert_eq!(hands.ids(), [KEY_ID], "a pull pushes the poll frame");
+        completions.request(4);
+        completions.request(4);
+        assert_eq!(
+            token.queries.load(Ordering::Relaxed),
+            0,
+            "no query in a request"
+        );
+        assert_eq!(polls.load(Ordering::Relaxed), 0, "no poll in a request");
+        assert_eq!(hands.kept(), 1, "one poll frame at a time");
+
+        // The worker that runs it queries each operation once; what it found goes out within the demand banked
+        // (8 requested; the poll frame is not part of it).
+        assert_eq!(hands.run(), 1);
+        assert_eq!(token.queries.load(Ordering::Relaxed), 1);
+        assert_eq!(polls.load(Ordering::Relaxed), 1);
+        assert_eq!(hands.ids(), [2], "the pending operation's continuation");
+        hands.run();
+
+        // The token completes: the next request pushes the poll frame again (it came home), and its
+        // continuation follows.
+        token.done.store(true, Ordering::Release);
+        completions.request(1);
+        assert_eq!(hands.ids(), [KEY_ID]);
+        hands.run();
+        assert_eq!(hands.ids(), [1]);
+        hands.run();
+        assert_eq!(completions.pending(), 0);
+        assert_eq!(token.queries.load(Ordering::Relaxed), 2);
+        completions.request(1);
+        assert_eq!(hands.kept(), 0, "nothing waits: nothing is pushed");
+    }
+
+    #[test]
+    fn a_pull_hands_out_what_a_reap_found_without_querying_again() {
+        let (completions, _) = setup();
+        let token = Token::default();
+        token.done.store(true, Ordering::Release);
+        completions.after(Box::new(token.clone()), tagged(1));
+        completions.at(Instant::now(), tagged(2));
+        assert_eq!(completions.reap(), 2);
+        assert_eq!(completions.pending(), 2, "found, not yet handed out");
+        let mut out = Vec::new();
+        let queries = token.queries.load(Ordering::Relaxed);
+        for _ in 0..3 {
+            completions.pull(&mut |f| out.push(f.header().id_hash()), &mut |_| false, 1);
+        }
+        assert_eq!(out, [1, 2]);
+        assert_eq!(token.queries.load(Ordering::Relaxed), queries);
+        assert_eq!(completions.pending(), 0);
+    }
+
+    /// Drops what it is pushed, unrun: a lattice that discarded the frame.
+    #[derive(Default)]
+    struct Discard {
+        pushed: AtomicUsize,
+    }
+
+    impl euhedral_core::generics::LatticeTerminal for Discard {
+        fn add_upstream(&self, _: Arc<dyn LatticeSource>) {}
+    }
+
+    impl LatticeReceiver for Discard {
+        fn push(&self, _frame: Box<dyn Frame>) {
+            self.pushed.fetch_add(1, Ordering::AcqRel);
+        }
+
+        fn on_complete(&self) {}
+
+        fn on_error(&self, _: euhedral_core::frames::Failure) {}
+    }
+
+    #[test]
+    fn a_poll_frame_that_was_dropped_unrun_is_replaced_so_the_polling_is_not_stranded() {
+        let (completions, _) = setup();
+        let discard = Arc::new(Discard::default());
+        completions.clone().add_downstream(discard.clone());
+        completions.at(Instant::now() + Duration::from_secs(3600), tagged(1));
+        completions.request(1);
+        assert_eq!(discard.pushed.load(Ordering::Relaxed), 1);
+        // The frame was dropped without running: a new one is at home, and the next request pushes it.
+        completions.request(1);
+        assert_eq!(discard.pushed.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn a_poll_frame_whose_source_is_gone_does_nothing() {
+        let (completions, _) = setup();
+        let hands = Arc::new(Hands::default());
+        completions.clone().add_downstream(hands.clone());
+        completions.at(Instant::now() + Duration::from_secs(3600), tagged(1));
+        completions.request(1);
+        assert_eq!(hands.kept(), 1);
+        drop(completions);
+        // The frame holds the source weakly: it runs and ends without one.
+        assert_eq!(hands.run(), 1);
+    }
+
+    #[test]
+    fn the_poll_frame_is_not_part_of_the_demand_and_is_pushed_without_one() {
+        let (completions, _) = setup();
+        let hands = Arc::new(Hands::default());
+        completions.clone().add_downstream(hands.clone());
+        completions.at(Instant::now() + Duration::from_secs(3600), tagged(1));
+        completions.request(1);
+        assert_eq!(hands.kept(), 1);
+        assert_eq!(
+            completions.demand.load(Ordering::SeqCst),
+            1,
+            "the demand is untouched"
+        );
+        hands.run();
+        // A pull pushes it too, with no demand at all: it is home again.
+        completions.pull(&mut |_| panic!("nothing is ready"), &mut |_| false, 1);
+        assert_eq!(hands.kept(), 1);
+        // One at a time.
+        completions.pull(&mut |_| panic!("nothing is ready"), &mut |_| false, 1);
+        completions.request(1);
+        assert_eq!(hands.kept(), 1);
     }
 }
