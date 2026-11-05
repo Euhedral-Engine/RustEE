@@ -128,5 +128,11 @@ fn a_fork_with_pooled_frames_completes_and_records_latency() {
     };
     let outcome = run_fork(&options, |_| {}, |_| {}).unwrap_or_else(|e| panic!("{} {e}", file!()));
     assert!(outcome.samples[0].invocations >= 1);
-    assert!(outcome.measured_latency.quantiles().is_some());
+    // One push in 64 of each source is timed, whichever frames the pools hand back: an iteration that completes
+    // 20,000 frames has timed some, on any number of workers.
+    let q = outcome
+        .measured_latency
+        .quantiles()
+        .expect("timed pushes were executed");
+    assert!(q.count > 0);
 }
