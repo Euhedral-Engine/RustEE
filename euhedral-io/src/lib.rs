@@ -39,7 +39,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use euhedral_core::frames::{Frame, FrameError, FrameHeader};
 use euhedral_core::generics::{
-    DownstreamSlot, KeySlot, LatticeReceiver, LatticeSource, SourceCell,
+    DownstreamSlot, KeyPacing, KeySlot, LatticeReceiver, LatticeSource, SourceCell,
 };
 use euhedral_data_structures::queues::{Consumer, Producer, Single, SpscQueue};
 use euhedral_data_structures::sync::HotScope;
@@ -506,10 +506,15 @@ type Platform = win::Engine;
 /// that were already reaped, within the demand, and never ask the engine for anything. The reaping
 /// (looking at the kernel's completions, resubmitting a short read, calling each operation's
 /// continuation to build its frame) is the work of a *key frame*: the source owns one, and a
-/// `request` or `pull` pushes it into the lattice while operations are in flight and no reap frame is out
-/// (an idle lattice calls `pull` on a handle far more often than `request`).
+/// `request` or `pull` pushes it into the lattice while operations are in flight and no reap frame is out (`pull` as
+/// well as `request`: a Direct worker that is busy never calls `request` on a source, and an idle one can phase-lock so
+/// that `request` never reaches half of its handles, backlog #130).
 /// A worker runs it, as it runs any frame, so its cost is measured like any other frame's; its
-/// recycle sends the key home. At most one reap runs at a time.
+/// recycle sends the key home. At most one reap runs at a time. A reap that found nothing makes the visits that follow
+/// skip the key, twice as many after each empty reap up to `KeyPacing::MAX_WINDOW` (a find, or a new operation, ends
+/// the back-off), so that a source that only waits reads unproductive and the worker parks. A continuation that
+/// panics loses its operation (counted, [`panicked`](AsyncIo::panicked)) and the panic does not unwind out of the
+/// reap.
 ///
 /// **Driving it by hand** (tests, or any caller outside a lattice): call [`reap`](AsyncIo::reap),
 /// which does what the key frame does, then `pull(consumer, &mut |_| false, u64::MAX)`, which hands
@@ -532,6 +537,10 @@ pub struct AsyncIo {
     unreaped: AtomicUsize,
     /// The key frame whose `execute` reaps, while it is home.
     key: KeySlot<ReapFrame>,
+    /// The back-off of the key: a reap that found nothing makes the next visits skip it.
+    pacing: KeyPacing,
+    /// Operations lost because their continuation (or the engine's reap) panicked.
+    panicked: AtomicUsize,
 }
 
 /// The portable state of the `LatticeSource`.
@@ -592,21 +601,34 @@ impl Front {
     /// frames for the hand-out. Returns how many. Returns 0 at once if another reap is inside.
     ///
     /// This is the work of the reap frame; it is never done by `request` or `pull`.
-    pub(crate) fn reap_ready(&self, engine: &dyn Engine) -> usize {
+    pub(crate) fn reap_ready(&self, engine: &dyn Engine) -> (usize, usize) {
         if self.pending() == 0 {
-            return 0;
+            return (0, 0);
         }
         let Some(mut ready) = self.reaper.try_enter() else {
-            return 0;
+            return (0, 0);
         };
-        let mut reaped = 0;
-        engine.poll(&mut || true, &mut |frame| {
-            // The queue is unbounded: an offer is never refused.
-            let _ = ready.offer(frame);
-            reaped += 1;
-            true
-        });
-        reaped
+        let reaped = std::cell::Cell::new(0);
+        let mut lost = 0;
+        loop {
+            // The engine calls each operation's continuation to make its frame: the application's code. One that
+            // panics has already taken its operation out of the engine, so the operation is lost (counted), the
+            // panic stops here, and the engine is asked again for the operations behind it.
+            let polled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                engine.poll(&mut || true, &mut |frame| {
+                    // The queue is unbounded: an offer is never refused.
+                    let _ = ready.offer(frame);
+                    reaped.set(reaped.get() + 1);
+                    true
+                });
+            }));
+            if polled.is_ok() {
+                break;
+            }
+            lost += 1;
+            self.pending.fetch_sub(1, Ordering::AcqRel);
+        }
+        (reaped.get(), lost)
     }
 
     /// One poll of the old, direct kind, for the tests of the engines: hands up to `demand` frames to
@@ -785,7 +807,13 @@ impl Frame for ReapFrame {
 
     fn execute(&mut self) -> Result<(), FrameError> {
         if let Some(io) = self.io.upgrade() {
-            io.reap();
+            // A reap that found nothing makes the visits that follow skip this frame, so that the handle reads
+            // unproductive between reaps and the worker parks.
+            if io.reap() > 0 {
+                io.pacing.found();
+            } else {
+                io.pacing.empty();
+            }
         }
         Ok(())
     }
@@ -867,6 +895,8 @@ impl AsyncIo {
             engine,
             unreaped: AtomicUsize::new(0),
             key: KeySlot::with_key(ReapFrame::new(me.clone())),
+            pacing: KeyPacing::new(),
+            panicked: AtomicUsize::new(0),
         })
     }
 
@@ -877,9 +907,15 @@ impl AsyncIo {
     /// This is the work of the key frame that `request` pushes into a lattice, which runs on a worker
     /// like any other frame. A caller that drives an `AsyncIo` by hand calls it before it pulls.
     pub fn reap(&self) -> usize {
-        let reaped = self.front.reap_ready(&self.engine);
+        let (reaped, lost) = self.front.reap_ready(&self.engine);
+        if lost > 0 {
+            self.panicked.fetch_add(lost, Ordering::Relaxed);
+        }
+        let ended = reaped + lost;
+        if ended > 0 {
+            self.unreaped.fetch_sub(ended, Ordering::AcqRel);
+        }
         if reaped > 0 {
-            self.unreaped.fetch_sub(reaped, Ordering::AcqRel);
             // What was found goes out within the demand already banked, without waiting for the
             // next request: the worker that found it is the one that has it.
             if self.front.demand.load(Ordering::SeqCst) > 0 {
@@ -887,19 +923,32 @@ impl AsyncIo {
                 self.front.serve_requests();
             }
         }
-        reaped
+        ended
+    }
+
+    /// Operations lost because their continuation panicked while the engine reaped them: the operation is gone (its
+    /// frame was never made), the panic did not unwind out of [`reap`](Self::reap), and the operations behind it were
+    /// reaped all the same.
+    pub fn panicked(&self) -> usize {
+        self.panicked.load(Ordering::Relaxed)
     }
 
     /// Pushes the key frame to the downstream: operations are in flight and no reap is out. The key is a control
     /// frame, not part of the demand (like a hot source's pushes), and there is at most one. Does nothing without a
     /// downstream (a caller driving by hand has none).
     fn push_reap(&self) {
-        if self.unreaped.load(Ordering::Acquire) == 0 || self.front.is_complete() {
+        if self.unreaped.load(Ordering::Acquire) == 0
+            || self.front.is_complete()
+            || !self.key.is_home()
+        {
             return;
         }
         let Some(downstream) = self.front.downstream.receiver() else {
             return;
         };
+        if !self.pacing.due() {
+            return;
+        }
         let Some(mut key) = self.key.take() else {
             return;
         };
@@ -916,6 +965,8 @@ impl AsyncIo {
         // not pending.
         self.front.pending.fetch_add(1, Ordering::AcqRel);
         self.unreaped.fetch_add(1, Ordering::AcqRel);
+        // Something new to wait for: reap at the next visit, whatever the back-off had come to.
+        self.pacing.reset();
         let started = self.engine.submit(request, buf, then);
         if started.is_err() {
             self.front.pending.fetch_sub(1, Ordering::AcqRel);

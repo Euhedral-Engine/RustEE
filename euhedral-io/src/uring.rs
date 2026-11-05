@@ -624,8 +624,13 @@ impl Engine for Uring {
         let rings: Vec<Arc<Ring>> = lock!(&self.rings).clone();
         for ring in &rings {
             ring.flush_waiting(&*self.enter);
-            let Ok(_reaping) = ring.cq.try_lock() else {
-                continue;
+            // A continuation that panics while this thread reaps unwinds through the guard and poisons the lock (the
+            // reap catches the panic, see `Front::reap_ready`); the lock guards no state of its own, so the next reap
+            // takes it all the same.
+            let _reaping = match ring.cq.try_lock() {
+                Ok(guard) => guard,
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => continue,
             };
             loop {
                 if !room() {

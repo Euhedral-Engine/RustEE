@@ -171,3 +171,89 @@ fn no_key_frame_is_pushed_while_nothing_is_in_flight() {
     }
     assert_eq!(keep.kept(), 0, "the absence of work is the signal");
 }
+
+#[test]
+fn an_operation_that_never_ends_is_reaped_ever_less_often() {
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+    let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+    let io = AsyncIo::open().unwrap();
+    let keep = Arc::new(Keep::default());
+    io.clone().add_downstream(keep.clone());
+    io.recv(
+        ours.as_raw_fd(),
+        IoBuf {
+            bytes: vec![0; 16],
+            filled: 0,
+        },
+        Box::new(|done| {
+            assert_eq!(done.result.unwrap(), 4);
+            Box::new(Ended(FrameHeader::new(3)))
+        }),
+    )
+    .unwrap();
+    // A worker that finds nothing parks only if the handle it visits reads unproductive: a visit that pushes a
+    // frame does not. Between reaps a visit pushes nothing.
+    const VISITS: usize = 20_000;
+    let mut pushes = 0;
+    for visit in 0..VISITS {
+        if visit % 2 == 0 {
+            io.pull(&mut |_| panic!("nothing ended"), &mut |_| false, 8);
+        } else {
+            io.request(8);
+        }
+        pushes += keep.run();
+    }
+    assert!(pushes >= 8, "it is still reaped ({pushes})");
+    assert!(
+        pushes <= 120,
+        "{pushes} reaps in {VISITS} visits: the back-off did not grow"
+    );
+    // The peer sends: a new operation resets the back-off, and the data is found within the window.
+    (&theirs).write_all(b"ping").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while io.pending() > 0 {
+        assert!(Instant::now() < deadline, "the receive did not complete");
+        io.pull(&mut |_| {}, &mut |_| false, 8);
+        io.request(8);
+        keep.run();
+    }
+}
+
+#[test]
+fn a_continuation_that_panics_loses_its_operation_and_not_the_others() {
+    use std::os::fd::AsRawFd;
+    let (_guard, file) = temp_file("panic", &[7; 4096]);
+    let io = AsyncIo::open().unwrap();
+    let buf = || IoBuf {
+        bytes: vec![0; 64],
+        filled: 0,
+    };
+    let ran = Arc::new(AtomicUsize::new(0));
+    io.read(
+        file.as_raw_fd(),
+        0,
+        buf(),
+        Box::new(|_| panic!("a continuation failed")),
+    )
+    .unwrap();
+    let r = ran.clone();
+    io.read(
+        file.as_raw_fd(),
+        0,
+        buf(),
+        Box::new(move |_| {
+            r.fetch_add(1, Ordering::AcqRel);
+            Box::new(Ended(FrameHeader::new(2)))
+        }),
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while io.pending() > 0 {
+        assert!(Instant::now() < deadline, "the operations did not drain");
+        // The reap does not unwind: the panicking operation is lost, counted and logged.
+        io.reap();
+        io.pull(&mut |_| {}, &mut |_| false, 8);
+    }
+    assert_eq!(ran.load(Ordering::Acquire), 1);
+}
