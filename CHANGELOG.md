@@ -62,6 +62,25 @@ Now the work is a frame's. Each of these sources owns one reusable **key frame**
 
 **Tests.** `no_op::tests` (`a_pooled_source_times_one_push_in_64_whichever_frames_circulate`, `a_returning_source_times_one_push_in_64`, `a_source_without_recorders_times_nothing`): a source whose two frames both finish and then run one frame at a time times exactly pushes 0, 64, 128, ... (the pooled source timed 1 of 11 before). The smoke test of pooled frames asserts that the measured iteration timed some.
 
+## A quantum that touched no lane concludes only in its own last frame (2026-11-05)
+
+**What.** The conclude rule for a quantum that touched no lane (the entry below) names where it concludes: in its own last frame, or in one pooled frame.
+- **In its own last frame**: the call that drops the quantum's last live count is the end of one of its frames (a stage, a host completion, an external edge's marker, a retry, or the frame that abandons its stages) and nothing else holds the quantum. The `retired` hooks, `retire` and the return of the run to the pool happen there.
+- **In one pooled `Retire` frame**: the last hold goes anywhere else. That is a dropped `QuantumRef`, a later quantum's stage releasing its pin, a gate failed from outside the quantum, the arrival of an external edge, or a drop inside another quantum's `retire`. The frame is offered at that drop and `retire` runs on the thread that takes it.
+- **A home lane that cannot arm a retirement** (`DeviceQueue::control()` is `None`): a quantum whose only unsubmitted hooks are of stages that name a lane touched no lane either, since a hook given such a lane has nothing to enqueue. It follows the same rule and costs the frames of its stages.
+- A quantum that touched a lane keeps its boundary, and so does one whose lane-naming hooks ran on a home lane that arms retirements (a refused arming still falls back to the pooled frame).
+
+**Java correspondence.** Java concludes every quantum through the retirement frame, which is a frame whoever dropped the last hold. The pooled frame for a foreign last drop is that structure; only the quantum's own last frame skips it, because there the frame already exists.
+
+**Why.** The entry below concluded on whichever thread dropped the last hold. A `retire` that panicked there unwound through the dropping thread: when that was a later quantum's stage releasing its pin, the later quantum never finished (its live count was never dropped), and it was stranded. A quantum whose state holds the `QuantumRef` of an earlier quantum, in a chain, concluded one nested call per link, so the stack grew with the length of the chain. Both are gone: `retire` never runs inside the call that drops a hold.
+
+**Contract** (module documentation, `StageGraph`, `StageGraph::new`, `Stage::retired`, `QuantumRef`, README and GLOSSARY; pinned by tests with no tolerance):
+- `retire` and the `retired` hooks of a quantum that touched no lane run in the quantum's own last frame, or in the one pooled frame offered by the drop of its last hold. They do not run inside a `QuantumRef` drop, a pin release, a gate failure or an edge's arrival.
+- Retirements armed by such a quantum: 0. Frames: one per stage frame run, plus one per host completion, plus one pooled frame when the last hold goes elsewhere.
+- Frames are pooled; the pooled frame allocates nothing after warm-up.
+
+**Tests.** `stage_graph::tests` (names start `a_quantum_that_used_no_lane` and `a_killed_quantum_that_used_no_lane`, which the Miri shard selects): a quantum whose `retire` panics after a later quantum's stage released its pin concludes in a pooled frame and the later quantum retires (before: the later quantum was stranded); a chain of 100000 quanta, each holding the reference of the one before in its state, retires one pooled frame per quantum on a thread with a 256 KiB stack (before: stack overflow); a dropped last reference and a gate failed from outside each conclude in exactly one pooled frame; a killed quantum whose unsubmitted stages name a lane, on a query-only home lane, costs exactly the frame of its root (before: two).
+
 ## A quantum that touched no lane concludes in its last frame (2026-11-05)
 
 **What.** A quantum whose stages name no device lane runs to its end in the frames of its stages. The conclude rule, per quantum:
@@ -76,7 +95,7 @@ Now the work is a frame's. Each of these sources owns one reusable **key frame**
 **Contract** (stated on `Stage::abandoned`, `StageSpec::lanes`, `StageGraph` and in the module documentation; pinned by tests with no tolerance):
 - The hook of a stage that names no lane runs at the same place with the same arguments as before (once, in stage order, with the home lane). A retirement covers the hooks of stages that name a lane.
 - Retirements armed by a quantum that touched no lane: 0, for a run, a kill and an abandon, on a lane that arms retirements and on a query-only lane. Frames: one per stage frame run, plus one per host completion.
-- `retire` and the `retired` hooks of such a quantum run on the thread that drops its last count or hold.
+- `retire` and the `retired` hooks of such a quantum run on the thread that drops its last count or hold. (The entry above refines this: a last hold that goes outside the quantum's own frames takes one pooled frame.)
 
 **Migration.** A stage that names no lane and enqueues work on the home lane from `abandoned` names that lane in `StageSpec::lanes`.
 
