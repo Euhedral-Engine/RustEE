@@ -730,6 +730,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(10);
         while out.len() < count {
             assert!(Instant::now() < deadline, "the operations did not complete");
+            io.reap();
             io.pull(
                 &mut |frame| {
                     let tag = frame.header().id_hash();
@@ -908,6 +909,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(10);
         while io.pending() > 0 {
             assert!(Instant::now() < deadline, "the reads did not complete");
+            io.reap();
             io.pull(&mut |frame| drop(frame), &mut |_| false, u64::MAX);
         }
         let returned = std::mem::take(&mut *lock!(&returned));
@@ -942,6 +944,7 @@ mod tests {
                     while lock!(&results).len() < 64 {
                         assert!(Instant::now() < deadline, "the reads did not complete");
                         let _one_poller = lock!(&poller);
+                        io.reap();
                         io.pull(
                             &mut |frame| lock!(&results).push(frame),
                             &mut |_| false,
@@ -1035,6 +1038,7 @@ mod tests {
         assert_eq!(io.pending(), 1);
         let mut out = poll(&io, 1);
         for _ in 0..100 {
+            io.reap();
             io.pull(
                 &mut |_| panic!("nothing else completes"),
                 &mut |_| false,
@@ -1200,6 +1204,7 @@ mod tests {
         while seen < 4 {
             assert!(Instant::now() < deadline);
             let mut batch = 0;
+            io.reap();
             io.pull(&mut |_| batch += 1, &mut |_| false, 1);
             assert!(batch <= 1);
             seen += batch;
@@ -1215,8 +1220,9 @@ mod tests {
         let io = AsyncIo::open().unwrap();
         io.read(file.as_raw_fd(), 0, buf(8), then(1)).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
-        while io.front.held.enter().is_empty() {
+        while io.front.out.enter().held.is_empty() {
             assert!(Instant::now() < deadline, "the read did not complete");
+            io.reap();
             let pulled = io.pull(&mut |_| panic!("held back"), &mut |_| true, u64::MAX);
             assert_eq!(pulled, 0);
         }
@@ -1583,8 +1589,11 @@ mod tests {
             fn add_upstream(&self, _: Arc<dyn LatticeSource>) {}
         }
         impl LatticeReceiver for Recorder {
-            fn push(&self, frame: Box<dyn Frame>) {
+            fn push(&self, mut frame: Box<dyn Frame>) {
                 lock!(&self.0).push(frame.header().id_hash());
+                // As a worker does: the reap frame reaps, and what it reaped is pushed within the demand.
+                frame.execute().unwrap();
+                frame.do_finally();
             }
             fn on_complete(&self) {
                 self.1.store(true, Ordering::Release);
@@ -1597,11 +1606,17 @@ mod tests {
         io.clone().add_downstream(recorder.clone());
         io.read(file.as_raw_fd(), 0, buf(8), then(5)).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
-        while lock!(&recorder.0).is_empty() {
+        while !lock!(&recorder.0).contains(&5) {
             assert!(Instant::now() < deadline);
             io.request(1);
         }
-        assert_eq!(*lock!(&recorder.0), [5]);
+        let pushed = lock!(&recorder.0).clone();
+        assert_eq!(
+            pushed.iter().filter(|id| **id == crate::KEY_ID).count(),
+            pushed.len() - 1,
+            "the reap frame, as many times as it was pushed, and the one completion"
+        );
+        assert_eq!(pushed.iter().filter(|id| **id == 5).count(), 1);
         io.complete();
         assert!(recorder.1.load(Ordering::Acquire));
     }

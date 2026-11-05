@@ -57,6 +57,7 @@ fn drain(io: &AsyncIo) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while io.pending() > 0 {
         assert!(Instant::now() < deadline, "the operations did not complete");
+        io.reap();
         io.pull(&mut |frame| drop(frame), &mut |_| false, u64::MAX);
     }
 }
@@ -226,8 +227,15 @@ impl euhedral_core::generics::LatticeTerminal for Collector {
 }
 
 impl euhedral_core::generics::LatticeReceiver for Collector {
-    fn push(&self, frame: Box<dyn Frame>) {
-        self.tags.lock().unwrap().push(frame.header().id_hash());
+    fn push(&self, mut frame: Box<dyn Frame>) {
+        // As a worker does: the reap frame the source pushes reaps, and what it reaped comes out within the demand.
+        // Only the completions' frames (small tags) are recorded.
+        let id = frame.header().id_hash();
+        frame.execute().unwrap();
+        frame.do_finally();
+        if id < 1 << 32 {
+            self.tags.lock().unwrap().push(id);
+        }
     }
 
     fn on_complete(&self) {}
@@ -326,6 +334,7 @@ fn a_request_while_a_pull_holds_the_front_returns_at_once_and_is_served_after() 
             let deadline = Instant::now() + Duration::from_secs(10);
             loop {
                 assert!(Instant::now() < deadline, "no read completed");
+                io.reap();
                 let got = io.pull(
                     &mut |frame| {
                         pulled.lock().unwrap().push(frame.header().id_hash());

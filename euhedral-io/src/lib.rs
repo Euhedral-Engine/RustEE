@@ -37,8 +37,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-use euhedral_core::frames::Frame;
-use euhedral_core::generics::{DownstreamSlot, LatticeReceiver, LatticeSource, SourceCell};
+use euhedral_core::frames::{Frame, FrameError, FrameHeader};
+use euhedral_core::generics::{
+    DownstreamSlot, KeySlot, LatticeReceiver, LatticeSource, SourceCell,
+};
+use euhedral_data_structures::queues::{Consumer, Producer, Single, SpscQueue};
 use euhedral_data_structures::sync::HotScope;
 
 /// Locks a mutex for the engines' remaining shared tables, taking the state of a lock a panic poisoned.
@@ -499,16 +502,24 @@ type Platform = win::Engine;
 /// - **Dropping** an `AsyncIo` with operations in flight leaks their buffers (the kernel may still
 ///   write them).
 ///
-/// **Driving it by hand** (tests, or any caller outside a lattice): `pull(consumer, &mut |_|
-/// false, u64::MAX)` reaps on its own; no `request` is needed before it (a `request` only pushes
-/// to an attached downstream). During the pull, each ended operation's continuation is called and
-/// its frame handed to `consumer`; `AsyncIo` never runs a frame. The consumer decides when the
-/// frame runs: a lattice queues it for a worker (so it runs after the pull returns), and a test
-/// may run it inside the consumer or after `pull` returns. A pull finds only what completed by
-/// then: poll again until the completions you expect came out.
+/// **Who does what.** The source's `request` and `pull` only hand out: they pass on the continuations
+/// that were already reaped, within the demand, and never ask the engine for anything. The reaping
+/// (looking at the kernel's completions, resubmitting a short read, calling each operation's
+/// continuation to build its frame) is the work of a *key frame*: the source owns one, and a
+/// `request` or `pull` pushes it into the lattice while operations are in flight and no reap frame is out
+/// (an idle lattice calls `pull` on a handle far more often than `request`).
+/// A worker runs it, as it runs any frame, so its cost is measured like any other frame's; its
+/// recycle sends the key home. At most one reap runs at a time.
+///
+/// **Driving it by hand** (tests, or any caller outside a lattice): call [`reap`](AsyncIo::reap),
+/// which does what the key frame does, then `pull(consumer, &mut |_| false, u64::MAX)`, which hands
+/// the reaped continuations' frames to `consumer`. `AsyncIo` never runs a frame. The consumer
+/// decides when the frame runs: a lattice queues it for a worker, and a test may run it inside the
+/// consumer or after `pull` returns. A reap finds only what completed by then: reap and pull again
+/// until the completions you expect came out.
 ///
 /// A pull stops before the first continuation its `stop` matches; that one (and what is reaped
-/// after it) goes out on a later poll, in order. The lattice's direct pulls stop before ordered
+/// after it) goes out on a later pull, in order. The lattice's direct pulls stop before ordered
 /// frames, which so reach their ordered lane through `request`'s pushes and the lattice's routing,
 /// in the order they were reaped.
 ///
@@ -516,29 +527,52 @@ type Platform = win::Engine;
 pub struct AsyncIo {
     front: Front,
     engine: Platform,
+    /// Operations submitted and not yet reaped: what a reap has to find. The key is pushed only
+    /// while there are some.
+    unreaped: AtomicUsize,
+    /// The key frame whose `execute` reaps, while it is home.
+    key: KeySlot<ReapFrame>,
 }
 
 /// The portable state of the `LatticeSource`.
 ///
-/// Like Java's `AsyncReads.Delegate` (an ingest sink's delegate), `request` banks its demand and
-/// pushes what has ended within it; a request that finds the front entered leaves a wakeup that
-/// the holder serves as it lets go.
+/// Two sides, each plain state in a cell that one thread enters at a time. The *reaping* side
+/// (`reaper`) is entered by the reap frame, or by a caller driving by hand: it asks the engine for the
+/// operations that ended and puts the continuations' frames, in the order they were reaped, in
+/// `ready`. The *hand-out* side (`out`) is entered by `request` and `pull`, which only take frames
+/// out of `ready` and pass them on. Like Java's `AsyncReads.Delegate` (an ingest sink's delegate),
+/// `request` banks its demand and pushes what is ready within it; a request that finds the hand-out
+/// side entered leaves a wakeup that the holder serves as it lets go.
 pub(crate) struct Front {
-    /// Continuations reaped while a pull's `stop` matched them, the oldest first. Plain state of
-    /// the polling call, as Java's reap state is ("reaped by one thread at a time"): entered only
-    /// from `reap`.
-    held: SourceCell<VecDeque<Box<dyn Frame>>>,
+    /// The reaping side: the producer end of the queue the continuations' frames wait in.
+    reaper: SourceCell<Producer<Box<dyn Frame>, Single>>,
+    /// The hand-out side.
+    out: SourceCell<Out>,
     pending: AtomicUsize,
     demand: AtomicU64,
-    /// A request waiting for the holder of `held`; its demand is already banked.
+    /// A request waiting for the holder of `out`; its demand is already banked.
     request_pending: AtomicBool,
     downstream: DownstreamSlot,
 }
 
+/// What only the hand-out side touches.
+struct Out {
+    /// The reaped continuations' frames, in the order they were reaped.
+    ready: Consumer<Box<dyn Frame>, Single>,
+    /// Continuations a pull's `stop` matched, the oldest first: they go out before anything in
+    /// `ready`.
+    held: VecDeque<Box<dyn Frame>>,
+}
+
 impl Front {
     pub(crate) fn new() -> Self {
+        let queue = SpscQueue::<Box<dyn Frame>>::with_pool(64, 2);
         Self {
-            held: SourceCell::new(VecDeque::new()),
+            reaper: SourceCell::new(queue.producer()),
+            out: SourceCell::new(Out {
+                ready: queue.consumer(),
+                held: VecDeque::new(),
+            }),
             pending: AtomicUsize::new(0),
             demand: AtomicU64::new(0),
             request_pending: AtomicBool::new(false),
@@ -554,8 +588,32 @@ impl Front {
         self.downstream.is_complete()
     }
 
-    /// One poll: holds back or hands up to `demand` continuations' frames to `consumer`. Returns 0
-    /// at once if another poll is inside.
+    /// The reaping: asks the engine for the operations that ended and queues their continuations'
+    /// frames for the hand-out. Returns how many. Returns 0 at once if another reap is inside.
+    ///
+    /// This is the work of the reap frame; it is never done by `request` or `pull`.
+    pub(crate) fn reap_ready(&self, engine: &dyn Engine) -> usize {
+        if self.pending() == 0 {
+            return 0;
+        }
+        let Some(mut ready) = self.reaper.try_enter() else {
+            return 0;
+        };
+        let mut reaped = 0;
+        engine.poll(&mut || true, &mut |frame| {
+            // The queue is unbounded: an offer is never refused.
+            let _ = ready.offer(frame);
+            reaped += 1;
+            true
+        });
+        reaped
+    }
+
+    /// One poll of the old, direct kind, for the tests of the engines: hands up to `demand` frames to
+    /// `consumer`, the held-back and the already reaped first, then what the engine has ended, which it is asked
+    /// for only while the demand has room (so that a packet it has no room for stays with the engine). A lattice
+    /// reaps in a frame and hands out in `request` and `pull`.
+    #[cfg(test)]
     pub(crate) fn reap(
         &self,
         engine: &dyn Engine,
@@ -566,51 +624,75 @@ impl Front {
         if demand == 0 || self.pending() == 0 {
             return 0;
         }
-        let Some(mut held) = self.held.try_enter() else {
+        let Some(mut out) = self.out.try_enter() else {
             return 0;
         };
-        Self::reap_entered(&self.pending, &mut held, engine, consumer, stop, demand)
+        let handed = Self::hand_out(&self.pending, &mut out, consumer, stop, demand);
+        if handed >= demand || !out.held.is_empty() {
+            return handed;
+        }
+        let handed = std::cell::Cell::new(handed);
+        engine.poll(&mut || handed.get() < demand, &mut |frame| {
+            if stop(&*frame) {
+                out.held.push_back(frame);
+                return false;
+            }
+            self.pending.fetch_sub(1, Ordering::AcqRel);
+            consumer(frame);
+            handed.set(handed.get() + 1);
+            true
+        });
+        handed.get()
     }
 
-    /// [`reap`](Self::reap) by the holder of `held`.
-    fn reap_entered(
-        pending: &AtomicUsize,
-        held: &mut VecDeque<Box<dyn Frame>>,
-        engine: &dyn Engine,
+    /// The hand-out of a pull: hands up to `demand` reaped frames to `consumer`, holding back the
+    /// first one `stop` matches. Returns 0 at once if another hand-out is inside.
+    pub(crate) fn pull(
+        &self,
         consumer: &mut dyn FnMut(Box<dyn Frame>),
         stop: &mut dyn FnMut(&dyn Frame) -> bool,
         demand: u64,
     ) -> u64 {
-        if demand == 0 || pending.load(Ordering::Acquire) == 0 {
+        if demand == 0 || self.pending() == 0 {
             return 0;
         }
-        let mut emitted = 0u64;
-        // Continuations an earlier pull's `stop` held back go first, in the order they were reaped.
-        while emitted < demand {
-            let Some(frame) = held.front() else { break };
-            if stop(&**frame) {
-                return emitted;
-            }
-            let frame = held.pop_front().expect("the front");
-            pending.fetch_sub(1, Ordering::AcqRel);
-            consumer(frame);
-            emitted += 1;
-        }
-        let emitted = std::cell::Cell::new(emitted);
-        engine.poll(&mut || emitted.get() < demand, &mut |frame| {
+        let Some(mut out) = self.out.try_enter() else {
+            return 0;
+        };
+        Self::hand_out(&self.pending, &mut out, consumer, stop, demand)
+    }
+
+    /// [`pull`](Self::pull) by the holder of `out`.
+    fn hand_out(
+        pending: &AtomicUsize,
+        out: &mut Out,
+        consumer: &mut dyn FnMut(Box<dyn Frame>),
+        stop: &mut dyn FnMut(&dyn Frame) -> bool,
+        demand: u64,
+    ) -> u64 {
+        let mut handed = 0u64;
+        while handed < demand {
+            // Continuations an earlier pull's `stop` held back go first, in the order they were
+            // reaped.
+            let frame = match out.held.pop_front() {
+                Some(frame) => frame,
+                None => match out.ready.poll() {
+                    Some(frame) => frame,
+                    None => break,
+                },
+            };
             if stop(&*frame) {
                 // The lattice's direct pulls stop before ordered frames: this one goes out
                 // through a later poll (the lattice's routing), and nothing reaped after it
                 // passes it.
-                held.push_back(frame);
-                return false;
+                out.held.push_front(frame);
+                break;
             }
             pending.fetch_sub(1, Ordering::AcqRel);
             consumer(frame);
-            emitted.set(emitted.get() + 1);
-            true
-        });
-        emitted.get()
+            handed += 1;
+        }
+        handed
     }
 
     /// Adds `demand` (Java's `accumulate`: saturating) and returns the total.
@@ -622,20 +704,20 @@ impl Front {
             });
     }
 
-    /// Pushes ended operations' frames to the downstream, up to the banked demand, while requests
-    /// are waiting and the front is free (Java's `drainRequests`).
-    fn serve_requests(&self, engine: &dyn Engine) {
-        // The wakeup is published before the front is entered: the releasing holder either sees
-        // it, or the requester enters the front itself.
+    /// Pushes reaped frames to the downstream, up to the banked demand, while requests are waiting
+    /// and the hand-out side is free (Java's `drainRequests`).
+    fn serve_requests(&self) {
+        // The wakeup is published before the side is entered: the releasing holder either sees
+        // it, or the requester enters it itself.
         while self.request_pending.load(Ordering::SeqCst) {
-            let Some(mut held) = self.held.try_enter() else {
+            let Some(mut out) = self.out.try_enter() else {
                 return;
             };
             // One read-modify-write takes the wakeup and synchronizes with the store that set it, so
             // the demand banked before that store is seen below (a plain store of `false` could
             // overwrite a racing request's and leave this holder reading older demand).
             if !self.request_pending.swap(false, Ordering::SeqCst) {
-                drop(held);
+                drop(out);
                 continue;
             }
             let Some(downstream) = self.downstream.receiver() else {
@@ -644,22 +726,87 @@ impl Front {
             if self.is_complete() {
                 return;
             }
-            let emitted = Self::reap_entered(
+            let handed = Self::hand_out(
                 &self.pending,
-                &mut held,
-                engine,
+                &mut out,
                 &mut |frame| downstream.push(frame),
                 &mut |_| false,
                 self.demand.load(Ordering::SeqCst),
             );
-            if emitted > 0 {
-                // Accounted before the front is let go, so the next holder cannot over-deliver.
+            if handed > 0 {
+                // Accounted before the side is let go, so the next holder cannot over-deliver.
                 let _ = self
                     .demand
                     .try_update(Ordering::SeqCst, Ordering::SeqCst, |d| {
-                        Some(d.saturating_sub(emitted))
+                        Some(d.saturating_sub(handed))
                     });
             }
+        }
+    }
+}
+
+/// The id hash of the key frame. The routing hash of each push is this mixed with the push's own seed, which spreads
+/// the pushes over the workers.
+const KEY_ID: u64 = 0x9e37_79b9_7f4a_7c15;
+
+/// The key frame of an [`AsyncIo`]: its `execute` reaps. Pushed by `request` while operations are in
+/// flight, and home again once it has run.
+struct ReapFrame {
+    header: FrameHeader,
+    io: std::sync::Weak<AsyncIo>,
+    /// Counts the pushes, so that each is routed by a hash of its own.
+    seed: u64,
+}
+
+impl ReapFrame {
+    fn new(io: std::sync::Weak<AsyncIo>) -> Box<Self> {
+        Box::new(Self {
+            header: FrameHeader::new(KEY_ID),
+            io,
+            seed: 0,
+        })
+    }
+
+    /// Unordered, and a new routing hash for each push: the reap may run on any worker.
+    fn arm(&mut self) {
+        self.seed = self.seed.wrapping_add(1);
+        self.header.randomize_hash(self.seed);
+    }
+}
+
+impl Frame for ReapFrame {
+    fn header(&self) -> &FrameHeader {
+        &self.header
+    }
+
+    fn header_mut(&mut self) -> &mut FrameHeader {
+        &mut self.header
+    }
+
+    fn execute(&mut self) -> Result<(), FrameError> {
+        if let Some(io) = self.io.upgrade() {
+            io.reap();
+        }
+        Ok(())
+    }
+
+    /// The key goes home. (A source that is gone has no home: the frame is dropped.)
+    fn recycle(self: Box<Self>) {
+        if let Some(io) = self.io.upgrade() {
+            let slot = &io.key;
+            slot.home(self);
+        }
+    }
+}
+
+impl Drop for ReapFrame {
+    /// A key that is dropped without having run (a lattice that discarded it) must not strand the
+    /// reaping: a new one goes home. A key that is homed does not get here.
+    fn drop(&mut self) {
+        if let Some(io) = self.io.upgrade()
+            && !io.key.is_home()
+        {
+            io.key.home(ReapFrame::new(self.io.clone()));
         }
     }
 }
@@ -715,10 +862,49 @@ fn owned_sock(raw: usize) -> OwnedSock {
 
 impl AsyncIo {
     fn from_engine(engine: Platform) -> Arc<Self> {
-        Arc::new(Self {
+        Arc::new_cyclic(|me| Self {
             front: Front::new(),
             engine,
+            unreaped: AtomicUsize::new(0),
+            key: KeySlot::with_key(ReapFrame::new(me.clone())),
         })
+    }
+
+    /// Reaps once, by the caller: asks the engine for the operations that ended and queues their
+    /// continuations' frames for [`pull`](LatticeSource::pull) and `request`. Returns how many it
+    /// found. Returns 0 at once if another reap is inside.
+    ///
+    /// This is the work of the key frame that `request` pushes into a lattice, which runs on a worker
+    /// like any other frame. A caller that drives an `AsyncIo` by hand calls it before it pulls.
+    pub fn reap(&self) -> usize {
+        let reaped = self.front.reap_ready(&self.engine);
+        if reaped > 0 {
+            self.unreaped.fetch_sub(reaped, Ordering::AcqRel);
+            // What was found goes out within the demand already banked, without waiting for the
+            // next request: the worker that found it is the one that has it.
+            if self.front.demand.load(Ordering::SeqCst) > 0 {
+                self.front.request_pending.store(true, Ordering::SeqCst);
+                self.front.serve_requests();
+            }
+        }
+        reaped
+    }
+
+    /// Pushes the key frame to the downstream: operations are in flight and no reap is out. The key is a control
+    /// frame, not part of the demand (like a hot source's pushes), and there is at most one. Does nothing without a
+    /// downstream (a caller driving by hand has none).
+    fn push_reap(&self) {
+        if self.unreaped.load(Ordering::Acquire) == 0 || self.front.is_complete() {
+            return;
+        }
+        let Some(downstream) = self.front.downstream.receiver() else {
+            return;
+        };
+        let Some(mut key) = self.key.take() else {
+            return;
+        };
+        key.arm();
+        downstream.push(key);
     }
 
     fn submit(&self, request: Request, buf: Buf, then: Then) -> io::Result<()> {
@@ -729,9 +915,11 @@ impl AsyncIo {
         // Counted before the engine may see the operation: a poll then never finds an end that is
         // not pending.
         self.front.pending.fetch_add(1, Ordering::AcqRel);
+        self.unreaped.fetch_add(1, Ordering::AcqRel);
         let started = self.engine.submit(request, buf, then);
         if started.is_err() {
             self.front.pending.fetch_sub(1, Ordering::AcqRel);
+            self.unreaped.fetch_sub(1, Ordering::AcqRel);
         }
         started
     }
@@ -919,9 +1107,11 @@ impl LatticeSource for AsyncIo {
         self.front.downstream.attach(self.clone(), downstream);
     }
 
-    /// Hands up to `demand` ended operations' frames to `consumer`, unless another poll is inside:
-    /// then it returns 0 at once, and that poll serves the requests that arrived meanwhile when it
-    /// lets go.
+    /// Hands up to `demand` reaped continuations' frames to `consumer`, unless another hand-out is
+    /// inside: then it returns 0 at once, and that hand-out serves the requests that arrived
+    /// meanwhile when it lets go. It asks the engine for nothing: reaping is a frame's work (see
+    /// [`reap`](AsyncIo::reap)), which it pushes to the downstream, if there is one, while operations are in
+    /// flight.
     fn pull(
         &self,
         consumer: &mut dyn FnMut(Box<dyn Frame>),
@@ -935,25 +1125,29 @@ impl LatticeSource for AsyncIo {
                 std::sync::atomic::fence(Ordering::SeqCst);
                 if std::thread::panicking() {
                     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        self.0.front.serve_requests(&self.0.engine)
+                        self.0.front.serve_requests()
                     }));
                 } else {
-                    self.0.front.serve_requests(&self.0.engine);
+                    self.0.front.serve_requests();
                 }
             }
         }
         let _serve = Serve(self);
-        self.front.reap(&self.engine, consumer, stop, demand)
+        let handed = self.front.pull(consumer, stop, demand);
+        self.push_reap();
+        handed
     }
 
-    /// Banks `demand` and pushes ended operations' frames to the downstream up to the total.
+    /// Banks `demand`, pushes reaped continuations' frames to the downstream up to the total, and
+    /// pushes the key frame that reaps while operations are in flight (the frame is not part of the demand).
     fn request(&self, demand: u64) {
         if demand == 0 || self.front.is_complete() || self.front.downstream.receiver().is_none() {
             return;
         }
         self.front.add_demand(demand);
         self.front.request_pending.store(true, Ordering::SeqCst);
-        self.front.serve_requests(&self.engine);
+        self.front.serve_requests();
+        self.push_reap();
     }
 
     /// Stops new submissions (they fail) and tells the downstream. Complete it once
