@@ -42,8 +42,10 @@ pub(super) trait Owner: Send + Sync {
 /// demand, and a [`FrameSink`] that queues them.
 ///
 /// One drain holds the queue at a time: the `consumer` claim is Java's `draining` flag. A drain
-/// blocked out by another leaves the delivery to it: the holder runs again for requests that
-/// arrived while it held the queue, and nothing ever waits.
+/// blocked out by another leaves the delivery to it: a holder that is a `request` (or a `clear` or a discard) runs
+/// again for requests that arrived while it held the queue, and nothing ever waits. A holder that is a `pull` does not:
+/// a worker that entered from a pull must not push, so the request stays pending, with its demand banked, for the next
+/// `request`.
 ///
 /// Lifecycle calls set atomics and try the claim once: `close` sets `publication_closed` and
 /// completes the downstream slot, a kill sets the owner's kill switch, and `clear` sets
@@ -219,16 +221,6 @@ impl QueueSource {
         }
     }
 
-    /// The tail of every release of the queue: the waiting `clear`, the owner's hook, and the
-    /// requests that were refused the queue while it was held.
-    fn after_release(&self) {
-        let finished = panic::catch_unwind(AssertUnwindSafe(|| self.drain_finished()));
-        self.drain_requests();
-        if let Err(panic) = finished {
-            panic::resume_unwind(panic);
-        }
-    }
-
     /// Completes the source once the queue has drained, as its [`Ending`] says.
     pub(super) fn finish(&self) {
         self.finish.store(true, Ordering::Release);
@@ -395,9 +387,9 @@ impl LatticeSource for QueueSource {
         self.downstream.attach(self.clone(), downstream);
     }
 
-    /// Hands queued frames to `consumer`, unless another drain holds the queue. Requests that
-    /// arrive meanwhile are delivered once the pull lets go. A drain stops once the source
-    /// completes.
+    /// Hands queued frames to `consumer`, unless another drain holds the queue. It pushes nothing,
+    /// not even as it lets go: a request that arrives meanwhile stays pending, with its demand
+    /// banked, and the next `request` delivers it. A drain stops once the source completes.
     fn pull(
         &self,
         consumer: &mut dyn FnMut(Box<dyn Frame>),
@@ -418,7 +410,10 @@ impl LatticeSource for QueueSource {
             )
         }));
         queue.release_seq_cst();
-        let finished = panic::catch_unwind(AssertUnwindSafe(|| self.after_release()));
+        // The tail of a pull is lifecycle work only: the waiting `clear` and the owner's hook. It serves no request and
+        // pushes nothing (a worker that entered from a pull must not push): a request refused the queue while this pull
+        // held it stays pending, with its demand banked, for the next `request`.
+        let finished = panic::catch_unwind(AssertUnwindSafe(|| self.drain_finished()));
         let pulled = pulled.unwrap_or_else(|panic| panic::resume_unwind(panic));
         if let Err(panic) = finished {
             panic::resume_unwind(panic);

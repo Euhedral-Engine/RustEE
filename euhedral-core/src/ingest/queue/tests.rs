@@ -121,7 +121,7 @@ fn nothing_is_delivered_without_a_receiver() {
 }
 
 #[test]
-fn a_request_inside_a_pull_consumer_is_delivered_after_the_pull_lets_go() {
+fn a_request_inside_a_pull_consumer_is_delivered_by_the_next_request_and_the_pull_pushes_nothing() {
     let (sink, source, receiver) = attached();
     offer(&sink, 1..=3);
     let inner = source.clone();
@@ -129,6 +129,8 @@ fn a_request_inside_a_pull_consumer_is_delivered_after_the_pull_lets_go() {
     let count = source.pull(
         &mut |frame| {
             pulled.push(frame.header().id_hash());
+            // The queue is held, as when a frame the pulling worker runs inline requests the source: the request banks
+            // its demand and leaves a wakeup, and delivers nothing.
             inner.request(1);
             assert!(receiver.received().is_empty());
         },
@@ -137,8 +139,16 @@ fn a_request_inside_a_pull_consumer_is_delivered_after_the_pull_lets_go() {
     );
     assert_eq!(count, 1);
     assert_eq!(pulled, [1]);
-    assert_eq!(receiver.received(), [2]);
-    assert_eq!(sink.size(), 1);
+    assert!(
+        receiver.received().is_empty(),
+        "the pull pushed nothing as it let go (it used to deliver frame 2 to the receiver)"
+    );
+    assert_eq!(sink.size(), 2, "frames 2 and 3 are still queued");
+    assert_eq!(sink.demand(), 1, "the demand the consumer banked is kept");
+    // The next request delivers it, within the banked demand (1, and this request's 1).
+    source.request(1);
+    assert_eq!(receiver.received(), [2, 3]);
+    assert_eq!(sink.size(), 0);
     assert_eq!(sink.demand(), 0);
 }
 
@@ -482,7 +492,7 @@ fn complete_before_attach_tells_the_late_receiver_once() {
 }
 
 #[test]
-fn a_request_while_a_pull_holds_the_queue_is_served_when_the_pull_releases() {
+fn a_request_while_a_pull_holds_the_queue_is_delivered_by_the_next_request_not_by_the_pull() {
     use std::sync::Barrier;
     let (sink, source, receiver) = attached();
     offer(&sink, 0..5);
@@ -513,12 +523,16 @@ fn a_request_while_a_pull_holds_the_queue_is_served_when_the_pull_releases() {
         release.wait();
         assert_eq!(puller.join().unwrap(), 1);
     });
-    assert_eq!(
-        receiver.received().len(),
-        4,
-        "the pull served the request as it let go"
+    assert!(
+        receiver.received().is_empty(),
+        "the pull pushed nothing as it let go: a pull never pushes"
     );
-    assert_eq!(sink.demand(), 0);
+    assert_eq!(sink.demand(), 4, "the refused request's demand is kept");
+    assert_eq!(sink.size(), 4);
+    // The next request serves the wakeup: it delivers within the demand banked (4, and its own 1).
+    source.request(1);
+    assert_eq!(receiver.received().len(), 4);
+    assert_eq!(sink.demand(), 1);
     assert_eq!(sink.size(), 0);
 }
 
