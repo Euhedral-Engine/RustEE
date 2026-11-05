@@ -589,6 +589,36 @@ fn a_handle_that_found_nothing_is_pulled_again_when_no_request_comes() {
     assert_eq!(fixture.held(), 1);
 }
 
+/// A pull of A finds nothing, a pull of B finds frames, then a request: the hint to A is gone, so the
+/// request goes to the front of the queue (C). Java's queue has the same test.
+#[test]
+fn a_hint_to_an_empty_handle_is_gone_when_a_later_pull_finds_frames() {
+    let mut fixture = Fixture::new();
+    let first = fixture.add_test();
+    first.set_pull_result(Some(0));
+    let second = fixture.add_test();
+    let third = fixture.add_test();
+
+    fixture.pull(1);
+    fixture.pull(1);
+    fixture.queue.request(1);
+
+    assert_eq!(first.pulled(), 1);
+    assert_eq!(second.pulled(), 1);
+    assert_eq!(
+        first.requested(),
+        0,
+        "the empty handle is no longer the hint"
+    );
+    assert_eq!(second.requested(), 0);
+    assert_eq!(
+        third.requested(),
+        1,
+        "the request goes to the front of the queue"
+    );
+    assert_eq!(fixture.held(), 3);
+}
+
 #[test]
 fn a_handle_that_found_nothing_does_not_displace_one_that_stopped() {
     let mut fixture = Fixture::new();

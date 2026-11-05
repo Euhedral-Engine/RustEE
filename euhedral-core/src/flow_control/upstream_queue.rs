@@ -191,10 +191,18 @@ pub struct UpstreamQueue {
     /// one handle when the demand is a single bucket, service the same one: if each took the next
     /// handle of the rotation, an even number of handles would be split in two, one half only ever
     /// requested and the other half only ever pulled.
+    ///
+    /// Java's queue leaves the handle in the queue and keeps only a hint to it; this queue owns its
+    /// entries, so the entry itself is moved out and back. The two services are the same: a handle
+    /// that found nothing is released when a pull comes before the request (at the start of that
+    /// pull, to the back of the queue), so the request goes to the queue's front as in Java. What
+    /// still differs is only when the entry rejoins the queue (Java's never left), which changes the
+    /// order handles return in, not which handles are serviced.
     pending_request: Option<Entry>,
     /// Whether `pending_request` stopped a pull at a frame, rather than finding nothing. A handle
     /// that found nothing gives way to one that stopped, and goes back to the queue when a pull
-    /// comes before the request, so that pulls reach it again.
+    /// comes before the request, so that pulls reach it again. Meaningful only while
+    /// `pending_request` is set.
     pending_stopped: bool,
 
     upstream_count: Arc<PaddedAtomicLong>,
@@ -475,7 +483,7 @@ impl UpstreamQueue {
             if entry.handle.is_complete() {
                 self.observe_removal(&entry);
             } else {
-                self.buffer_for_requeue(entry);
+                self.offer(entry);
             }
         }
 
@@ -715,8 +723,9 @@ impl<'a> Acquired<'a> {
     /// - A pull that stopped at a frame, or that could not be made (the handle was closed or
     ///   draining, had no demand, or its source panicked), changes nothing.
     ///
-    /// A pull that stopped at a frame, or that found no frames, also has the queue hold the handle
-    /// back for the request that follows (`UpstreamQueue::pending_request`).
+    /// A pull that stopped at a frame, that found no frames, or that could not be made (`None`)
+    /// also has the queue hold the handle back for the request that follows
+    /// (`UpstreamQueue::pending_request`).
     fn service(mut self, pull: Option<&mut Pull<'_>>, demand: u64) -> u64 {
         let Self {
             queue,
