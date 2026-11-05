@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU16, AtomicU32, AtomicU64, 
 use std::sync::{Arc, OnceLock, Weak};
 
 use euhedral_core::frames::{Frame, FrameError, FrameHeader, RunnableFrame};
-use euhedral_core::generics::{KeySlot, LatticeReceiver, LatticeSource};
+use euhedral_core::generics::{KeyPacing, KeySlot, LatticeReceiver, LatticeSource};
 use euhedral_data_structures::queues::{Consumer, MpmcQueue, Multi, Producer};
 use euhedral_data_structures::sync::HotScope;
 use euhedral_graph::{DeviceQueue, Marker};
@@ -530,6 +530,9 @@ pub struct Mover {
     /// The pools' `frees` as of the last pump: a change says a slot freed since, so a spilled resident may be able
     /// to come home.
     pumped_frees: AtomicU64,
+    /// A pump found a spilled resident that it could not bring home although its home has room (the resident was
+    /// busy, or the move could not start): the next pump is due, paced like the polling of copies.
+    retry: AtomicBool,
 }
 
 impl fmt::Debug for Mover {
@@ -578,6 +581,7 @@ impl Mover {
             source: Arc::new(Moves::new(weak.clone())),
             moves_started: AtomicU64::new(0),
             pumped_frees: AtomicU64::new(frees),
+            retry: AtomicBool::new(false),
         })
     }
 
@@ -823,6 +827,8 @@ impl Mover {
             Ok(retired) => {
                 self.in_flight.fetch_add(1, Ordering::AcqRel);
                 self.moves_started.fetch_add(1, Ordering::AcqRel);
+                // A copy to wait for: poll it at the next visit, whatever the back-off had come to.
+                self.source.pacing.reset();
                 let task = Box::new(MoveTask {
                     resident: id,
                     bytes,
@@ -885,11 +891,24 @@ impl Mover {
             .fold(0, u64::wrapping_add)
     }
 
-    /// Whether a pump has something to do: a move is in flight (its copy may have retired), or a slot freed since
-    /// the last pump (a spilled resident's home may have room). Two atomic loads per pool; it queries no copy and
-    /// scans no resident. [`Moves`] asks it before it pushes its pump frame, so an idle mover costs no frame.
+    /// Whether a slot freed since the last pump: a spilled resident's home may have room. A signal, so a pump
+    /// follows it at once.
+    fn pump_signalled(&self) -> bool {
+        self.frees() != self.pumped_frees.load(Ordering::Acquire)
+    }
+
+    /// Whether a pump has to look again though nothing signalled: a move is in flight (its copy may have retired), or
+    /// the last pump could not bring a resident home. A poll, so a source paces it.
+    fn pump_polling(&self) -> bool {
+        self.in_flight() > 0 || self.retry.load(Ordering::Acquire)
+    }
+
+    /// Whether a pump has something to do: a slot freed since the last pump (a spilled resident's home may have
+    /// room), a move is in flight (its copy may have retired), or the last pump could not bring a resident home. A few
+    /// atomic loads; it queries no copy and scans no resident. [`Moves`] asks it before it pushes its pump frame, so an
+    /// idle mover costs no frame (and a mover that only waits for copies is polled ever less often).
     pub fn pump_due(&self) -> bool {
-        self.in_flight() > 0 || self.frees() != self.pumped_frees.load(Ordering::Acquire)
+        self.pump_signalled() || self.pump_polling()
     }
 
     /// Drives the moves: finishes those whose copy retired (or starts their second hop), then brings spilled
@@ -901,6 +920,8 @@ impl Mover {
     pub fn pump(&self) -> u32 {
         // Read before the scan: a slot that frees during it is not covered by this pump.
         self.pumped_frees.store(self.frees(), Ordering::Release);
+        // `bring_back` sets it again if it must.
+        self.retry.store(false, Ordering::Release);
         let mut finished = 0;
         let mut keep = Vec::new();
         let limit = self.moves.1.size_long();
@@ -1078,6 +1099,19 @@ impl Mover {
                 .max_by_key(|(_, c)| c.priority.load(Ordering::Acquire))
                 .map(|(i, c)| (i as u32, c.generation.load(Ordering::Acquire)));
             let Some((index, generation)) = candidate else {
+                // None to move now. One that is away from a home with room but not idle (busy in `with`, or
+                // moving) is not forgotten: the room is a signal that this pump has consumed.
+                let waiting = self.cells.iter().any(|c| {
+                    let home = c.home.load(Ordering::Acquire);
+                    let location = c.location.load(Ordering::Acquire);
+                    matches!(c.state.load(Ordering::Acquire), BUSY | MOVING)
+                        && location != home
+                        && self.pool(LocationId(home)).is_some_and(|p| p.free() > 0)
+                        && self.tier(LocationId(home)) < self.tier(LocationId(location))
+                });
+                if waiting {
+                    self.retry.store(true, Ordering::Release);
+                }
                 return;
             };
             let c = &self.cells[index as usize];
@@ -1093,6 +1127,8 @@ impl Mover {
                 .is_err()
             {
                 c.state.store(RESIDENT, Ordering::Release);
+                // The home has room and the move could not start: try again (paced).
+                self.retry.store(true, Ordering::Release);
                 return;
             }
         }
@@ -1161,9 +1197,12 @@ impl Drop for Mover {
 /// Driving the moves ([`Mover::pump`]: asking each copy whether it retired, starting second hops, bringing spilled
 /// residents home) is a frame's work, never the source's: `request` and `pull` only hand out the completions that
 /// are done. When a pump is due ([`Mover::pump_due`]), `request` or `pull` pushes the source's one *pump frame*
-/// (an idle lattice calls `pull` on a handle far more often than `request`), whose `execute` pumps on whichever worker
-/// it is routed to; once it has run, the frame goes home and the next call may push it again. A worker that has no
-/// pump to run sees no frame.
+/// (`pull` as well as `request`: a Direct worker that is busy never calls `request` on a source, and an idle one can
+/// phase-lock so that `request` never reaches half of its handles, backlog #130), whose `execute` pumps on whichever
+/// worker it is routed to; once it has run, the frame goes home and the next call may push it again. A worker that has
+/// no pump to run sees no frame. A pump that finished nothing makes the visits that follow skip the frame while the
+/// mover only polls (copies in flight, a resident that could not be brought home), twice as many after each empty pump
+/// up to `KeyPacing::MAX_WINDOW`; a freed slot, a new move or a find ends the back-off.
 pub struct Moves {
     mover: Weak<Mover>,
     downstream: OnceLock<Arc<dyn LatticeReceiver>>,
@@ -1171,6 +1210,9 @@ pub struct Moves {
     complete: AtomicBool,
     /// The pump frame, while it is home.
     key: KeySlot<PumpFrame>,
+    /// The back-off of the pump frame while it only polls (a pump that finished nothing makes the next visits skip
+    /// it); a freed slot is a signal and is never backed off.
+    pacing: KeyPacing,
 }
 
 /// The key frame of a [`Moves`] source: its `execute` pumps the mover.
@@ -1209,7 +1251,14 @@ impl Frame for PumpFrame {
 
     fn execute(&mut self) -> Result<(), FrameError> {
         if let Some(mover) = self.mover.upgrade() {
-            mover.pump();
+            let started = mover.moves_started();
+            // A pump that finished no move and started none found nothing: the visits that follow skip this frame
+            // while the mover only polls, so that the handle reads unproductive and the worker parks.
+            if mover.pump() > 0 || mover.moves_started() != started {
+                mover.source.pacing.found();
+            } else {
+                mover.source.pacing.empty();
+            }
         }
         Ok(())
     }
@@ -1246,6 +1295,7 @@ impl Moves {
     fn new(mover: Weak<Mover>) -> Self {
         Moves {
             key: KeySlot::with_key(PumpFrame::new(mover.clone())),
+            pacing: KeyPacing::new(),
             mover,
             downstream: OnceLock::new(),
             demand: AtomicU64::new(0),
@@ -1318,7 +1368,7 @@ impl Moves {
     /// Pushes the pump frame when a pump is due and no pump frame is out. The key is a control frame, not part of the
     /// demand (like a hot source's pushes), and there is at most one. Does nothing without a downstream.
     fn push_pump(&self) {
-        if self.complete.load(Ordering::Acquire) {
+        if self.complete.load(Ordering::Acquire) || !self.key.is_home() {
             return;
         }
         let Some(downstream) = self.downstream.get() else {
@@ -1327,7 +1377,9 @@ impl Moves {
         let Some(m) = self.mover.upgrade() else {
             return;
         };
-        if !m.pump_due() {
+        // A freed slot asks for a pump at once; only the polling (copies in flight, a resident that could not be
+        // brought home) is paced.
+        if !(m.pump_signalled() || (m.pump_polling() && self.pacing.due())) {
             return;
         }
         let Some(mut key) = self.key.take() else {

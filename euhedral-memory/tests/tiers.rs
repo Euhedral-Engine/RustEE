@@ -513,6 +513,8 @@ impl Retired for Queried {
 struct QueriedCopier {
     pairs: Vec<(LocationId, LocationId)>,
     queries: Arc<AtomicU32>,
+    /// How many queries say "not yet" before a copy retires.
+    left: u32,
 }
 
 impl Copier for QueriedCopier {
@@ -532,7 +534,7 @@ impl Copier for QueriedCopier {
         unsafe { std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, bytes as usize) };
         Ok(Box::new(Queried {
             queries: self.queries.clone(),
-            left: AtomicU32::new(2),
+            left: AtomicU32::new(self.left),
         }))
     }
 }
@@ -577,12 +579,18 @@ impl LatticeReceiver for Keep {
 /// A rig whose copies count how often they are asked whether they retired, with one resident moving from the
 /// fast tier to the middle one.
 fn moving_rig() -> (Rig, Arc<AtomicU32>, Arc<std::sync::Mutex<Vec<MoveDone>>>) {
+    moving_rig_with(2)
+}
+
+/// As [`moving_rig`], with a copy that retires after `left` queries.
+fn moving_rig_with(left: u32) -> (Rig, Arc<AtomicU32>, Arc<std::sync::Mutex<Vec<MoveDone>>>) {
     let mut r = rig([2, 2, 2], 8);
     let queries = Arc::new(AtomicU32::new(0));
     let [a, b, c] = r.locations;
     let copier: Arc<dyn Copier> = Arc::new(QueriedCopier {
         pairs: vec![(a, b), (b, a), (b, c), (c, b)],
         queries: queries.clone(),
+        left,
     });
     r.mover = Mover::new(&r.planner, r.pools.clone(), vec![copier], Some(b), 8);
     let o = r
@@ -695,4 +703,102 @@ fn a_freed_slot_asks_for_one_pump_to_bring_a_spilled_resident_home() {
     keep.run();
     source.request(8);
     assert!(keep.take().is_empty(), "and nothing is due again");
+}
+
+#[test]
+fn a_copy_that_never_retires_is_polled_ever_less_often_and_the_source_reads_unproductive_between() {
+    // A worker that finds nothing to do parks only if the handle it visits reads unproductive: a visit that
+    // pushes a frame does not. So between polls, a visit must push nothing.
+    let (r, queries, _seen) = moving_rig_with(u32::MAX);
+    let source = r.mover.moves();
+    let keep = Arc::new(Keep::default());
+    source.clone().add_downstream(keep.clone());
+    const VISITS: usize = 20_000;
+    let mut pushes = 0;
+    for visit in 0..VISITS {
+        if visit % 2 == 0 {
+            source.pull(&mut |_| panic!("nothing is done"), &mut |_| false, 8);
+        } else {
+            source.request(8);
+        }
+        let pushed = keep.run();
+        pushes += pushed;
+    }
+    let polls = queries.load(Ordering::Relaxed) as usize;
+    assert_eq!(
+        polls, pushes,
+        "one query per pump frame, and nothing else queries"
+    );
+    assert!(polls >= 8, "it is still polled ({polls})");
+    assert!(
+        polls <= 120,
+        "{polls} polls in {VISITS} visits: the back-off did not grow"
+    );
+    // A new move is polled at the next visit, however far the back-off had grown.
+    let before = queries.load(Ordering::Relaxed);
+    let [a, b, _] = r.locations;
+    let o = r
+        .planner
+        .open_owner(OwnerSpec::new("second", Priority(50), Scope::Process));
+    let id = r.mover.place(o, a, SLOT, quiet()).unwrap();
+    r.mover.move_to(id, b).unwrap();
+    source.pull(&mut |_| panic!("nothing is done"), &mut |_| false, 8);
+    assert_eq!(keep.run(), 1, "a new move asks for a pump at once");
+    assert!(queries.load(Ordering::Relaxed) > before);
+}
+
+#[test]
+fn a_freed_slot_asks_for_a_pump_whatever_the_back_off() {
+    let (r, _queries, _seen) = moving_rig_with(u32::MAX);
+    let source = r.mover.moves();
+    let keep = Arc::new(Keep::default());
+    source.clone().add_downstream(keep.clone());
+    for visit in 0..2_000 {
+        if visit % 2 == 0 {
+            source.pull(&mut |_| panic!("nothing is done"), &mut |_| false, 8);
+        } else {
+            source.request(8);
+        }
+        keep.run();
+    }
+    // A slot frees: the next visit pushes the pump, back-off or not.
+    let [a, ..] = r.locations;
+    let o = r
+        .planner
+        .open_owner(OwnerSpec::new("other", Priority(50), Scope::Process));
+    let id = r.mover.place(o, a, SLOT, quiet()).unwrap();
+    keep.run();
+    r.mover.release(id);
+    source.request(8);
+    assert_eq!(keep.run(), 1);
+}
+
+#[test]
+fn a_resident_busy_when_its_home_frees_still_comes_home() {
+    let r = rig([1, 2, 2], 8);
+    let [a, b, _] = r.locations;
+    let lo = r
+        .planner
+        .open_owner(OwnerSpec::new("low", Priority(10), Scope::Process));
+    let hi = r
+        .planner
+        .open_owner(OwnerSpec::new("high", Priority(90), Scope::Process));
+    let low = r.mover.place(lo, a, SLOT, quiet()).unwrap();
+    let high = r.mover.place(hi, a, SLOT, quiet()).unwrap();
+    settle(&r.mover);
+    assert_eq!(r.mover.whereabouts(high).unwrap().0, a);
+    assert_eq!(r.mover.whereabouts(low).unwrap().0, b);
+    // The home slot frees, and a pump runs, while the spilled resident is busy (its owner is inside `with`).
+    r.mover
+        .with(low, |_, _| {
+            assert!(r.mover.release(high));
+            r.mover.pump();
+        })
+        .expect("resident and idle");
+    assert!(
+        r.mover.pump_due(),
+        "the pump could not move the busy resident: another is due"
+    );
+    settle(&r.mover);
+    assert_eq!(r.mover.whereabouts(low).unwrap().0, a, "brought home");
 }
