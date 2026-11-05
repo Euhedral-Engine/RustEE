@@ -29,7 +29,15 @@
 //!     quantum's stage releasing its pin, a gate failed from outside, the arrival of an external edge, or a drop inside
 //!     another quantum's `retire`. `retire` runs on the thread that took that frame, never inside the call that
 //!     dropped the hold, so a `retire` that panics or drops further references stays on its own frame and a chain of
-//!     quanta that hold one another concludes one frame at a time.
+//!     quanta that hold one another concludes one frame at a time. A sink that refuses the frame (it is closing, or
+//!     full) has it end in place on the offering thread, and a panic of `retire` there is contained.
+//! - **A `retire` that panics.** Java's `conclude` catches it and records it on the quantum. Here the outcome is
+//!   `retire`'s argument, so the quantum has concluded (its run is pooled again and its counts are dropped) when the
+//!   panic leaves it: in a frame of the quantum (its own last frame, the pooled `Retire` frame, a retirement frame) it
+//!   is rethrown to the executor that ran the frame, and where a refused frame ends in place (an offer the sink
+//!   refuses, a gate released into a refusing sink) it is contained and its payload dropped, so the thread that
+//!   offered the frame, and the quantum it works for, go on. A frame that a [`Completions`] source cancels, or drops
+//!   with the source, ends in place only after the source completed (shutdown).
 
 #![allow(
     unsafe_code,
@@ -363,8 +371,9 @@ pub trait Stage<Q, L: DeviceQueue + ?Sized = dyn DeviceQueue>: Send + Sync {
 
     /// The quantum's device work ended (its boundary was reached and settled) and this stage ran: the place to release
     /// what the stage kept for its work, such as the host buffers a copy read, which its quantum holds (Java
-    /// `StageFrame.retired`). Called once, on a worker in the retirement frame (or in the quantum's own last frame when
-    /// it touched no lane: the conclude rule in the module documentation), in stage order, before the quantum
+    /// `StageFrame.retired`). Called once, in the retirement frame (or, for a quantum that touched no lane, in its own
+    /// last frame or in one pooled frame: the conclude rule in the module documentation) on the thread that runs that
+    /// frame (a worker, or the thread that offered it to a sink that refused it), in stage order, before the quantum
     /// is handed to `retire`. `committed` is true only when the whole quantum succeeded and this stage submitted:
     /// publish externally visible state then, and release temporary resources either way.
     fn retired(&self, quantum: &Q, committed: bool) {
@@ -526,6 +535,15 @@ impl<L: DeviceQueue + ?Sized> fmt::Debug for GraphRuntime<L> {
     }
 }
 
+/// Ends a frame in place, on the thread that found its sink refusing it. The end may conclude a quantum, and a `retire`
+/// that panics there is contained: the quantum has concluded (its run is back in the pool, its count dropped) by the time
+/// the panic is caught, and the caller, which holds a count of another quantum or of this one, goes on. The payload is
+/// dropped. (Java `conclude` catches a throwing `retire` and records it on the quantum; here the outcome is `retire`'s
+/// argument, so there is no quantum left to record it on.)
+fn contained(end: impl FnOnce()) {
+    let _ = catch_unwind(AssertUnwindSafe(end));
+}
+
 /// Where a call that drops a quantum's last live count, or its last hold, comes from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Ends {
@@ -548,7 +566,8 @@ enum Ends {
 ///
 /// Dropping the last reference of a quantum that ended runs no `retire` on the dropping thread: the quantum concludes in
 /// one pooled frame (and a quantum's state may hold references of earlier quanta, which then conclude in their own
-/// frames, one after another).
+/// frames, one after another). A sink that refuses the frame (it is closing, or full) has it end in place on the
+/// dropping thread, and a panic of `retire` there is contained.
 pub struct QuantumRef {
     /// The pinned quantum; taken by the drop, which lets go of one hold.
     run: Option<Arc<dyn Upstream>>,
@@ -923,7 +942,9 @@ const POOLED_FRAMES: usize = 4096;
 impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> StageGraph<Q, L> {
     /// `stages[i]` implements `spec.stages()[i]`. `retire` runs once per quantum, in a frame, after its boundary: the
     /// retirement's frame, or for a quantum that touched no lane its own last frame, or else one pooled frame (the
-    /// conclude rule in the module documentation). It never runs inside the call that drops a [`QuantumRef`].
+    /// conclude rule in the module documentation). It never runs inside the call that drops a [`QuantumRef`], except
+    /// that a sink that refuses the frame (it is closing, or full) has it end in place on that thread, where a panic of
+    /// `retire` is contained.
     pub fn new(
         spec: StageGraphSpec,
         stages: Vec<Arc<dyn Stage<Q, L>>>,
@@ -1596,10 +1617,10 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Run<Q, L> {
         }
     }
 
-    /// Offers `frame`; a refused one (the sink completed) ends in place.
+    /// Offers `frame`; a refused one (the sink completed or is full) ends in place, contained.
     fn offer_frame(&self, frame: Box<dyn Frame>) {
         if let Err(frame) = self.core.runtime.stages.offer(frame) {
-            frame.do_finally();
+            contained(|| frame.do_finally());
         }
     }
 
@@ -1614,7 +1635,7 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Run<Q, L> {
                 stage,
                 StageError::Fatal("the stage sink no longer takes frames".into()),
             );
-            frame.do_finally();
+            contained(|| frame.do_finally());
         }
     }
 
@@ -1635,12 +1656,12 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Run<Q, L> {
             .frame(self, Kind::Stage(stage), self.header(None, true));
         if let Err(mut frame) = self.core.runtime.stages.offer(frame) {
             if !frame.is_alive() {
-                frame.do_finally();
+                contained(|| frame.do_finally());
                 return;
             }
             match frame.execute() {
-                Ok(()) | Err(FrameError::Cancelled) => frame.do_finally(),
-                Err(error) => frame.do_finally_with_error(error),
+                Ok(()) | Err(FrameError::Cancelled) => contained(|| frame.do_finally()),
+                Err(error) => contained(|| frame.do_finally_with_error(error)),
             }
         }
     }
@@ -3590,11 +3611,12 @@ mod tests {
             .unwrap()
         }
 
-        /// As `graph`, with `retire` after the log entry of each retired quantum.
+        /// As `gated_graph`, with `retire` after the log entry of each retired quantum.
         fn graph_with_retire(
             &self,
             stages: &[(Option<u64>, &[u16], Act)],
             edges: &[(u16, u16, EdgeKind)],
+            gates: &[GateAct],
             retire: impl Fn(u64) + Send + Sync + 'static,
         ) -> Arc<StageGraph<u64>> {
             let mut spec = StageGraphSpec::new();
@@ -3607,7 +3629,7 @@ mod tests {
                 });
                 let probe = Probe {
                     act: act.clone(),
-                    gate: GateAct::Pass,
+                    gate: gates.get(i).cloned().unwrap_or(GateAct::Pass),
                     log: self.log.clone(),
                     hands: self.hands.clone(),
                 };
@@ -5971,7 +5993,7 @@ mod tests {
     fn a_quantum_that_used_no_lane_whose_retire_panics_after_a_later_quantum_released_it_strands_nothing()
      {
         for h in both_kinds_of_lane() {
-            let earlier = h.graph_with_retire(&[(None, &[], Act::Cpu)], &[], |q| {
+            let earlier = h.graph_with_retire(&[(None, &[], Act::Cpu)], &[], &[], |q| {
                 assert_ne!(q, 1, "the retire of quantum 1 panics");
             });
             let later = h.graph(&[(None, &[], Act::Cpu)], &[]);
@@ -6012,12 +6034,99 @@ mod tests {
         }
     }
 
+    /// The panic scenario with a sink that refuses the pooled frame: the frame ends in place on the thread that dropped the
+    /// hold (a later quantum's stage), and the panic of `retire` is contained there, so the later quantum still retires.
+    #[test]
+    fn a_quantum_that_used_no_lane_whose_retire_panics_in_place_on_a_refusing_sink_strands_nothing()
+    {
+        for mut h in both_kinds_of_lane() {
+            let sink = Arc::new(Refuses {
+                inner: h.sink.clone(),
+                refuse: AtomicBool::new(false),
+            });
+            h.runtime.stages = sink.clone();
+            let earlier = h.graph_with_retire(&[(None, &[], Act::Cpu)], &[], &[], |q| {
+                assert_ne!(q, 1, "the retire of quantum 1 panics");
+            });
+            let later = h.graph(&[(None, &[], Act::Cpu)], &[]);
+            let first = earlier.start(1, alive(), Vec::new());
+            assert_eq!(h.pump(), 1);
+            let edge = ExternalEdge {
+                from: first.clone(),
+                from_stage: StageId(0),
+                to_stage: StageId(0),
+                kind: Submission,
+            };
+            drop(first);
+            let _ = later.start(2, alive(), vec![edge]);
+            sink.refuse.store(true, Ordering::Release);
+            let mut panics = 0;
+            loop {
+                match catch_unwind(AssertUnwindSafe(|| h.pump_once())) {
+                    Ok(true) => {}
+                    Ok(false) => break,
+                    Err(_) => panics += 1,
+                }
+            }
+            assert_eq!(panics, 0, "the panic stayed where the frame ended");
+            assert_eq!(h.retired(2), [QuantumOutcome::Completed], "not stranded");
+            let order: Vec<u64> = h
+                .events()
+                .into_iter()
+                .filter_map(|e| match e {
+                    Event::Retired { q, .. } => Some(q),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                order,
+                [1, 2],
+                "quantum 1 retired in place, inside quantum 2's frame"
+            );
+            assert_eq!((earlier.live(), later.live()), (0, 0));
+        }
+    }
+
+    /// A gate released into a sink that refuses the stage's frame (the stage, ordered or not, ends in place on the
+    /// releasing thread): the quantum concludes there, and a panic of `retire` does not unwind into the releaser.
+    #[test]
+    fn a_quantum_that_used_no_lane_whose_retire_panics_after_a_gate_released_into_a_refusing_sink_returns_to_the_releaser()
+     {
+        for ordered in [None, Some(7)] {
+            for mut h in both_kinds_of_lane() {
+                let sink = Arc::new(Refuses {
+                    inner: h.sink.clone(),
+                    refuse: AtomicBool::new(false),
+                });
+                h.runtime.stages = sink.clone();
+                let held = Arc::new(Mutex::new(Vec::new()));
+                let graph = h.graph_with_retire(
+                    &[(ordered, &[], Act::Cpu)],
+                    &[],
+                    &[GateAct::Hold(held.clone())],
+                    |q| assert_ne!(q, 1, "the retire of quantum 1 panics"),
+                );
+                let _ = graph.start(1, alive(), Vec::new());
+                assert_eq!(h.pump(), 0, "the stage is held at its gate");
+                sink.refuse.store(true, Ordering::Release);
+                let gate = lock(&held).pop().unwrap();
+                let released = catch_unwind(AssertUnwindSafe(|| gate.release()));
+                assert!(
+                    released.is_ok(),
+                    "the panic of retire stayed in the frame's end"
+                );
+                assert_eq!(h.retired(1).len(), 1, "retired once, in place");
+                assert_eq!(graph.live(), 0);
+            }
+        }
+    }
+
     /// Quanta that hold each other: each quantum's state holds the reference of the one before. Dropping the last reference
     /// concludes the chain one pooled frame at a time, so the stack stays flat however long the chain is.
     #[test]
     fn a_quantum_that_used_no_lane_held_by_the_next_ones_state_retires_a_long_chain_in_a_flat_stack()
      {
-        struct Chain(Option<QuantumRef>);
+        struct Chain(Option<QuantumRef>, u64);
 
         struct Host;
 
@@ -6048,16 +6157,18 @@ mod tests {
                     h.runtime.clone(),
                     move |link: Chain, outcome| {
                         assert_eq!(outcome, QuantumOutcome::Completed);
-                        counted.fetch_sub(1, Ordering::AcqRel);
+                        let Chain(held, index) = link;
+                        // The last quantum started retires first, then the one before it, and so on.
+                        let expected = counted.fetch_sub(1, Ordering::AcqRel) - 1;
+                        assert_eq!(index, expected, "retired out of order");
                         // The state holds the reference of the quantum before: dropping it is that quantum's last hold.
-                        let Chain(held) = link;
                         drop(held);
                     },
                 )
                 .unwrap();
                 let mut previous = None;
-                for _ in 0..length {
-                    let started = graph.start(Chain(previous.take()), alive(), Vec::new());
+                for index in 0..length as u64 {
+                    let started = graph.start(Chain(previous.take(), index), alive(), Vec::new());
                     assert_eq!(h.pump(), 1, "a quantum runs its one frame");
                     previous = Some(started);
                 }

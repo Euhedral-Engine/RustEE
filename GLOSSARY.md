@@ -208,7 +208,8 @@ A lane is a `LaneSource`, and the source owns the lane's submitter.
    receives the quantum and its `QuantumOutcome` (`Completed`, `Failed` or `Killed`). Drop the `UnitGuard`
    there. A quantum that touched no lane has no boundary: `retire` runs in its own last frame, or in one pooled
    frame when its last hold goes elsewhere (a dropped `QuantumRef`, a later quantum's release); never inside the call
-   that drops a hold.
+   that drops a hold, except that a sink that refuses the frame (it is closing, or full) has it end in place on that
+   thread, where a panic of `retire` is contained.
 6. **Close.** `Lake::complete_gracefully()` closes admission. Once every unit ended, the sinks drain,
    complete and detach. A running unit may still `fork` another unit.
 
