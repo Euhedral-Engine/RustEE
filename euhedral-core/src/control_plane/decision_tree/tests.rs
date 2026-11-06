@@ -571,10 +571,10 @@ fn idle_workers(
 ///   lattice is the same as one with one more lane source. One that pushes on every request is
 ///   made productive again by each request that follows the pull, so the count stays at 1 and no
 ///   worker reaches the unproductive park.
-/// - Where they only request (costly bodies, the Staged path), nothing is found empty, so every handle
-///   counts as productive whether it pushes or not: the count is the number of handles, up to the one
-///   below the number of workers, where a worker that has a handle per worker pulls (the Direct
-///   path) and finds one empty. A request that routes nothing is no evidence of an empty source.
+/// - Where they only request (costly bodies, the Staged path), a request that issues no frame shows its
+///   handle empty as a pull does, so a lane source and a push-only source that does not push are found
+///   empty, and the count falls to 0 as it does on the Direct path; one that pushes on every request is
+///   the one productive handle.
 #[test]
 fn a_source_that_only_pushes_is_productive_when_it_pushes() {
     // Never reached in the cycles run.
@@ -603,16 +603,20 @@ fn a_source_that_only_pushes_is_productive_when_it_pushes() {
             "{pushing:?} parks as often as {lanes:?}"
         );
 
-        // Costly bodies: a push-only source counts as a lane source does, pushing or not.
+        // Costly bodies: a push-only source that does not push is found empty by its requests like a lane source;
+        // one that pushes on every request is the one productive handle.
         let lanes = idle_workers(8, total, 0, 0, 1_200, 100);
         let quiet = idle_workers(8, total - 1, 1, QUIET, 1_200, 100);
         let pushing = idle_workers(8, total - 1, 1, 1, 1_200, 100);
-        assert_eq!(lanes.productive, [total.min(7); 8], "{lanes:?}");
+        // (The view of a worker that sits out from its first cycle is the one it began with, so only the
+        // first-ranked worker, which always enters its handles, is compared across the lattices.)
+        assert_eq!(lanes.productive[0], 0, "{lanes:?}");
         assert_eq!(quiet.productive, lanes.productive, "{quiet:?} {lanes:?}");
-        assert_eq!(quiet.awake, lanes.awake, "{quiet:?} {lanes:?}");
-        assert_eq!(
-            pushing.productive, lanes.productive,
-            "{pushing:?} {lanes:?}"
+        assert_eq!((lanes.awake, quiet.awake), (0, 0), "{quiet:?} {lanes:?}");
+        assert_eq!(pushing.productive[0], 1, "{pushing:?}");
+        assert!(
+            pushing.parks < lanes.parks,
+            "{pushing:?} parks as often as {lanes:?}"
         );
     }
 }

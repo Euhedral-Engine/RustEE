@@ -718,8 +718,9 @@ impl<'a> Acquired<'a> {
     /// - A pull that finds frames shows a productive source. One that finds none shows an empty
     ///   source, unless a frame was routed through the handle during the call.
     /// - A request that routes a frame through the handle, or satisfies the thread's request, shows
-    ///   a productive source. A request that does not is no evidence of an empty source, since a
-    ///   request has no empty result: the view stays as it was.
+    ///   a productive source. One that issues no frame shows an empty source, as a pull that finds
+    ///   none does: whether frames were issued is the only evidence of productivity (Java's
+    ///   `UpstreamQueue` checks whether the satisfied-request counter moved across the request).
     /// - A pull that stopped at a frame, or that could not be made (the handle was closed or
     ///   draining, had no demand, or its source panicked), changes nothing.
     ///
@@ -761,8 +762,7 @@ impl<'a> Acquired<'a> {
             None => {
                 let before = satisfied_request();
                 entry.handle.request(claim, demand);
-                let productive =
-                    was_productive || observing.pushed() || satisfied_request() != before;
+                let productive = observing.pushed() || satisfied_request() != before;
                 (0, productive)
             }
         };

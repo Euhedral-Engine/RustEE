@@ -3,6 +3,21 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## A request that issues no frame shows its handle empty (2026-11-06)
+
+**What.** A worker's view of an upstream handle after a request is productive only if the request issued frames: a push through the handle was routed, or the thread's satisfied-request counter moved across the request. A request that issued none marks the view unproductive, as a pull that finds nothing does. Before, a request kept the view the worker already had.
+
+**Why.** Whether frames were issued is the evidence of productivity, for a request as for a pull (Java's worker checks whether its satisfied-request counter changed after the request). Keeping the prior view meant that a view could turn productive and never turn back for a worker that only requests, as one on the Staged path does: a handle whose polling key had once been pushed read productive for good, `should_idle` kept the worker in, and it yielded in a loop it never left. A lattice that had run work (a body-cost history, a body estimate of a few hundred nanoseconds from the polls) lost its workers to that loop one at a time, until every core was at 100 % running a few thousand cheap frames a second.
+
+**How to use it.** Nothing to change. A source that issues frames only on some requests (a polled key at its pacing) makes its handle productive for the requests that issue them, and a worker that finds only such sources parks between them.
+
+**Semantics.**
+- A request that issued a frame (a routed push through the handle, or a moved satisfied-request counter) shows the handle productive; one that issued none shows it unproductive, whatever the view was.
+- A pull is as before: frames found show productive, none shows unproductive, a pull that stopped at a frame or could not be made changes nothing.
+- A handle never serviced by a worker is still productive in that worker's view.
+
+**Tests.** `a_request_that_issues_no_frame_shows_an_empty_source`, `a_worker_on_the_staged_path_stops_entering_a_source_that_issues_nothing` (a worker with a body-cost history on the Staged path over a source that issues one key and then nothing: it entered the handle at every cycle before); the acquisition, last-push and push-only-source tests state the rule.
+
 ## A pull serves no request: `LaneSource` and the ingest queue (2026-11-05)
 
 **What.** Two more sources pushed from the tail of a `pull`. Neither does now.

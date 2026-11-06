@@ -47,8 +47,10 @@ pub trait LatticeReceiver: LatticeTerminal {
 /// the pulling worker would run it through its executor while the source's handle is held, and the work behind a key is
 /// long, so nothing else could take ready work from the source meanwhile. So a key leaves only through `request`'s push.
 /// The key is a control frame, not part of the demand. A key that polls blind is
-/// paced ([`KeyPacing`](super::KeyPacing)): it is not pushed at every visit while nothing ends, or the worker never
-/// parks.
+/// paced ([`KeyPacing`](super::KeyPacing)): it is not pushed at every visit while nothing ends. A worker takes a
+/// handle as productive only if its last service issued frames: a request that issued none (the key was not due) shows
+/// the handle empty, as a pull that finds none does, and a request that pushed the key shows it productive for that one
+/// service, so a worker that sees only keys at their pacing parks between them.
 ///
 /// **Only the lattice's workers call `request` and `pull`.** Work that comes from outside (a submitter, a completion
 /// poller, another runtime) is offered into a queue the source owns, an MPSC the source's `pull` and `request` take
@@ -76,7 +78,9 @@ pub trait LatticeSource: Send + Sync {
     /// Signals demand for `demand` more frames; `u64::MAX` means unbounded and `0` asks for nothing.
     /// The source may push during this call or later from another thread. Each push is a separate
     /// admission that uses whatever routing is live when that push begins: returning from `request`
-    /// reserves nothing for frames pushed later.
+    /// reserves nothing for frames pushed later. A source that pushes only later, from another thread, shows no issued
+    /// frame at any request, so a worker reads its handle as empty each time (its frames still run from the caches;
+    /// only the worker's participation changes).
     ///
     /// Only a worker calls it (see the trait's documentation). A `request` made while a `pull` of the same source holds
     /// it (from the pull's consumer, or from a caller that is not a worker) banks its demand and is not served by that pull: a pull pushes nothing, not even as it lets go. The source

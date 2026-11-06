@@ -1215,10 +1215,12 @@ fn metrics_cost_per_cycle() {
     }
 }
 
-/// An upstream handle with nothing to give, which counts how often a worker enters it.
+/// An upstream handle with nothing to give, which counts how often a worker enters it. With `key_once` set, its
+/// first request issues one frame (a key a source pushes after a poll) and no request after it issues any.
 #[derive(Default)]
 struct Entered {
     entries: AtomicU64,
+    key_once: AtomicBool,
 }
 
 impl UpstreamHandle for Entered {
@@ -1237,8 +1239,11 @@ impl UpstreamHandle for Entered {
         Some(0)
     }
 
-    fn request(&self, _claim: &mut Claim, _demand: u64) {
+    fn request(&self, claim: &mut Claim, _demand: u64) {
         self.entries.fetch_add(1, Ordering::AcqRel);
+        if self.key_once.swap(false, Ordering::AcqRel) {
+            crate::flow_control::note_routed_push(claim.owner(), true);
+        }
     }
 
     fn is_complete(&self) -> bool {
@@ -1376,6 +1381,52 @@ fn a_worker_sits_out_between_probes() {
         sitting.cycle();
     }
     assert_eq!(sitting.entries(), 0, "the worker sat out every cycle");
+}
+
+/// A worker on the Staged path, with a body-cost history that keeps the model from sitting it out, over a source
+/// whose request issued one frame (a key) and then issues none: the one request made the handle productive in the
+/// worker's view, and the next, which issues nothing, shows it empty, so the worker sits out again and does not
+/// enter the handle at every cycle. Before, a request kept the view it found, and the Staged path, which never
+/// pulls, never changed it: the worker yielded in a loop it never left.
+#[test]
+fn a_worker_on_the_staged_path_stops_entering_a_source_that_issues_nothing() {
+    const INTERVAL: Duration = Duration::from_millis(50);
+    const ENTRIES_PER_PROBE: u64 = 4;
+    let idle = quick_idle().with_probe_interval(INTERVAL);
+    let Some(mut sitting) = Sitting::new(idle.clone()) else {
+        return;
+    };
+    // Bodies of 800 ns (a poll) against a direct threshold of 100 ns.
+    sitting.policy = DecisionTree::with_thresholds(
+        idle,
+        BodyCost::new(),
+        Duration::from_nanos(100),
+        Duration::from_nanos(100),
+    );
+    for _ in 0..128 {
+        sitting
+            .policy
+            .body_cost_mut()
+            .record(Duration::from_nanos(800));
+    }
+    // With the handle productive in its view, the model keeps the worker in, on the Staged path.
+    assert!(!sitting.policy.should_idle(0, 1, 2, Some(2)));
+    assert_eq!(
+        sitting.policy.select_path(1, 1, 2, 0),
+        ExecutionPath::Staged
+    );
+    sitting.handle.key_once.store(true, Ordering::Release);
+    let start = Instant::now();
+    while start.elapsed() < 6 * INTERVAL {
+        sitting.cycle();
+    }
+    let elapsed = start.elapsed();
+    let most = (elapsed.as_nanos() / INTERVAL.as_nanos() + 1) as u64 * ENTRIES_PER_PROBE;
+    let entries = sitting.entries();
+    assert!(
+        entries <= most,
+        "the worker keeps entering a source that issues nothing: {entries} entries in {elapsed:?}"
+    );
 }
 
 /// A probe is one Direct cycle (a pull of one handle, then a request of the next when the pull ran
