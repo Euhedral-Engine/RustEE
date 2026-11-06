@@ -52,13 +52,15 @@ of a handle (one acquisition) changes it by what that service showed:
 - a **pull** that finds frames shows it productive; a pull that finds none shows it unproductive, unless the last frame
   pushed through the handle during the call was routed (a frame that finds no downstream shows nothing);
 - a **request** whose last push through the handle was routed (or that satisfies the thread's request) shows it productive.
-  A request that routes nothing shows nothing, because a request has no empty result: the view stays as it was;
-- a pull that stopped at a frame, and a service that could not be made (the handle was complete, had no
-  demand, its lattice was closed or was draining, or its source panicked), leave the view as it was.
+  A request that issues no frame shows it unproductive, as a pull that finds none does: whether frames were issued
+  (the satisfied-request counter moved, or a push through the handle was routed) is the only evidence;
+- a pull that stopped at a frame, and a pull that could not be made (the handle was complete, had no
+  demand, its lattice was closed or was draining, or its source panicked), leave the view as it was. (A request that
+  could not be made issued no frame, so it shows the handle unproductive.)
 
 A frame routed through some other handle, or by another thread, is no evidence about this one. The decision tree
-and idle timing use the count of productive handles per worker. A handle that a worker only requests, never
-pulls (a worker on the Staged path), stays productive for that worker.
+and idle timing use the count of productive handles per worker. A worker on the Staged path, which only requests,
+finds a handle empty by a request that issues nothing.
 
 **contention** ([`UpstreamQueue`](src/flow_control/upstream_queue.rs),
 [`ACQUIRE_CONTENTION_SCALE`](src/utils/average_flow.rs)): the share of handles a worker found locked by

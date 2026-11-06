@@ -23,7 +23,9 @@
 //!
 //! A key that **polls** (asks a device or the operating system whether something ended) must not be pushed at
 //! every visit while nothing ends: a pushed key reads as a productive handle and counts as work the worker ran, so
-//! the worker would never park. [`KeyPacing`] is the back-off a polling source keeps beside its key.
+//! the worker would never park. [`KeyPacing`] is the back-off a polling source keeps beside its key. A request that
+//! pushes the key shows the handle productive for that service only; the next request, which pushes nothing, shows it
+//! empty again, because a request's only evidence of productivity is that it issued frames.
 
 use std::marker::PhantomData;
 use std::ptr;
@@ -106,8 +108,9 @@ impl<K> KeySlot<K> {
 ///
 /// A key pushed at every visit while nothing ends would keep a worker busy for ever. After a poll that found nothing the
 /// source pushes the key again only after a **time** window: [`BASE_WINDOW`](Self::BASE_WINDOW), twice as long after each
-/// further empty poll, up to [`MAX_WINDOW`](Self::MAX_WINDOW). Between pushes a visit pushes nothing, so the handle reads
-/// unproductive and the worker parks. The window is time, not a count of visits, because a visit's interval varies by
+/// further empty poll, up to [`MAX_WINDOW`](Self::MAX_WINDOW). Between pushes a visit pushes nothing, so the request
+/// issued no frame and the handle reads unproductive (a request that issues no frame shows its handle empty, as a pull
+/// that finds none does), and the worker parks. The window is time, not a count of visits, because a visit's interval varies by
 /// two orders of magnitude with the load: the latency a poll adds stays within the window, whatever the load. It is
 /// small on purpose (tens of microseconds).
 ///

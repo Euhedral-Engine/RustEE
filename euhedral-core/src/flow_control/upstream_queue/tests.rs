@@ -353,29 +353,41 @@ fn productivity_returns_with_useful_work() {
     assert_eq!(fixture.queue.nonproductive_count, 0);
 }
 
-/// A request has no empty-source result: it either routes a frame or says nothing, so a request
-/// that routes nothing leaves the worker's view as it was. A pull that found 0 stays unproductive
-/// through it, and a handle that was never pulled stays productive. This is the rule of Java's
-/// `UpstreamQueue.serviceAcquiredHandle` ("Without a synchronous push, it supplies no new evidence
-/// and retains the worker's prior observation"), pinned there by
-/// `UpstreamQueueTest.shouldNotTreatRequestOnlyServiceAsEmptyPullEvidence`.
+/// Whether frames were issued is the only evidence of productivity, for a request as for a pull: a request
+/// that issues none shows the source empty. The rule is Java's: the worker checks whether the satisfied-request
+/// counter changed across the request (or a frame was pushed through the handle). A source that issues a frame
+/// once, and nothing after, makes its handle productive for that one service.
 #[test]
-fn a_request_is_not_evidence_of_an_empty_source() {
+fn a_request_that_issues_no_frame_shows_an_empty_source() {
     let mut fixture = Fixture::new();
-    let upstream = fixture.add_test();
+    let source = fixture.add(Arc::new(SourceHandle::default()));
 
-    fixture.queue.request(64);
+    // Never serviced: productive until a service shows otherwise.
     assert_eq!(fixture.queue.productive_handle_count(), 1);
 
-    upstream.set_pull_result(Some(0));
-    fixture.pull(64);
     fixture.queue.request(64);
-
     assert_eq!(
         fixture.queue.productive_handle_count(),
         0,
-        "a request keeps the worker's last view"
+        "a request that issued nothing shows the handle empty"
     );
+
+    source.frames.lock().unwrap().push_back(unordered(1));
+    fixture.queue.request(64);
+    assert_eq!(source.routed(), [1]);
+    assert_eq!(
+        fixture.queue.productive_handle_count(),
+        1,
+        "a request that issued a frame shows it productive"
+    );
+
+    fixture.queue.request(64);
+    assert_eq!(
+        fixture.queue.productive_handle_count(),
+        0,
+        "the next one, which issued nothing, shows it empty again"
+    );
+    assert_eq!(fixture.queue.nonproductive_count, 1);
 }
 
 #[test]
@@ -678,7 +690,11 @@ fn a_completed_held_back_handle_lets_demand_reach_another() {
     fixture.queue.request(1);
 
     assert_eq!(live.requested(), 1);
-    assert_eq!(fixture.queue.productive_handle_count(), 1);
+    assert_eq!(
+        fixture.queue.productive_handle_count(),
+        0,
+        "it issued no frame"
+    );
     assert_eq!(fixture.held(), 1);
 }
 
@@ -1635,9 +1651,10 @@ impl UpstreamHandle for Scripted {
 /// - a routed push through the handle during the acquisition, or a pull that finds frames, shows it
 ///   productive;
 /// - a pull that finds nothing shows it unproductive;
-/// - a request that routes nothing, a pull that stopped at a frame, and a pull that could not be made
-///   (Java's early exits: no demand, no work in progress, closed, draining, complete, a throw) all
-///   restore the view the worker had.
+/// - a request that routes nothing issued no frames, so it shows it unproductive, like a pull that finds
+///   nothing (the satisfied-request counter, or a push through the handle, is the only evidence);
+/// - a pull that stopped at a frame, and a pull that could not be made (Java's early exits: no demand, no
+///   work in progress, closed, draining, complete, a throw) restore the view the worker had.
 #[test]
 fn an_acquisition_marks_the_handle_by_what_it_showed() {
     // (what the acquisition does, is it a pull, found, unserviceable, stops, push in pull,
@@ -1652,7 +1669,7 @@ fn an_acquisition_marks_the_handle_by_what_it_showed() {
             false,
             false,
             false,
-            true,
+            false,
         ),
         (
             "a request that pushes",
@@ -1740,7 +1757,7 @@ fn an_acquisition_marks_the_handle_by_what_it_showed() {
             false,
             false,
             false,
-            true,
+            false,
         ),
         (
             "a pull that found frames and stopped",
@@ -1874,10 +1891,10 @@ fn each_worker_has_its_own_view_of_a_handle() {
 fn the_last_push_through_a_handle_wins() {
     // (kind of push, in a pull, view after from an unproductive start, from a productive start)
     let cases = [
-        // A request that pushes only what finds no downstream shows nothing: the view is kept.
-        (UNROUTABLE, false, false, true),
-        // A routed push and then an unroutable one: the unroutable one is the last, so nothing shown.
-        (ROUTED_THEN_UNROUTABLE, false, false, true),
+        // A request that pushes only what finds no downstream issued no frame: unproductive.
+        (UNROUTABLE, false, false, false),
+        // A routed push and then an unroutable one: the unroutable one is the last, so no frame was issued.
+        (ROUTED_THEN_UNROUTABLE, false, false, false),
         // A pull that finds nothing, with a push that finds no downstream: unproductive.
         (UNROUTABLE, true, false, false),
         (ROUTED_THEN_UNROUTABLE, true, false, false),
