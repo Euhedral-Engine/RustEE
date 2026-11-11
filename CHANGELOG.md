@@ -3,6 +3,29 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## A failed recording is not a failed unit of work (2026-11-10)
+
+**What.** Three changes to `SharedGraphCache` and the CUDA capture.
+- A re-record whose capture fails (`GpuError::Capture`) after the body ran returns `Ok(Ran::Direct)` instead of the error; with the body not run, the unit runs directly. Any other error is still an error.
+- A capture that fails to end returns an error that carries the first refused shadow call, then the end-of-capture error.
+- A key whose first recording failed is recorded again at its next sighting, and is marked unrecordable after `MAX_FAILED_RECORDINGS` (3) consecutive failed recordings or re-records. `GraphStats` gains `failed_rerecords`, `failed_records` and `unrecordable_keys`.
+
+**Why.** A recording runs the real launches on the lane first and captures on a shadow stream, so a capture that the driver invalidates (another thread's work in the same context can do it) comes after the work ran. The first-recording path already returned `Ran::Direct` for it; the re-record path sent the error to the caller with `?`, who then saw a failure for a unit of work that was done. The end-of-capture error ("the capture was invalidated") hid the call the driver had refused, which is the one that names the cause. And one such failure marked the key unrecordable for the life of the cache, with no count to read.
+
+**How to use it.** Nothing to change. A caller that reads `GraphStats` sees the new fields (a struct literal of `GraphStats` needs `..Default::default()`). `failed_records`, `failed_rerecords` and `unrecordable_keys` are a shared cache's; the owned `GraphCache` leaves them at 0.
+
+**Semantics.**
+- A failed re-record replaces nothing: the instance keeps its old recording and goes back to the pool, so the key's next run finds the shape changed again and tries again.
+- `Ran::Direct` after a failed recording or re-record means the body ran exactly once, as direct launches. A failure to instantiate the recorded graph (out of memory included) after the work ran is a failed recording too. An error of the body itself is returned as it is, never absorbed; so is any error that is not a `Capture`.
+- A key has one count of *consecutive* failed recordings and re-records, saturated at 3 and cleared by a successful recording or re-record (never on the replay path). At `MAX_FAILED_RECORDINGS` the key is marked unrecordable; a failed re-record at the bound also drops the instance. After that no unit of the key pays a capture: a free instance whose shape changed is dropped and the unit runs directly, and a unit with no free instance runs directly. A free instance whose shape still matches keeps replaying.
+- A failed first recording leaves no instance; the next sighting records (the key was seen).
+- The counts live in a fixed table (a third sightings table, in the two spare bits of the tag's word): no lock, no allocation and no wider entry on the run path. A key whose probe of eight slots is taken by other keys' words is counted at the bound at once, so an overflow marks the key rather than letting keys erase each other's counts.
+- A body that asks for the library stream is unrecordable at once (a property, not a failure); it counts in `unrecordable_keys`, not in `failed_records`.
+- `failed_rerecords`, `failed_records` and `unrecordable_keys` are the shared cache's only.
+- A capture that fails to end returns the first refused shadow call, then the end-of-capture error; an earlier error of another kind (a failed join of the real streams) is returned as it is.
+
+**Tests.** `graph_cache::shared_tests`: `a_rerecord_that_fails_after_the_body_ran_is_a_direct_unit_and_the_next_run_records_again`, `a_rerecord_that_fails_before_the_body_ran_runs_the_unit_directly`, `a_capture_that_fails_once_runs_the_work_and_the_key_records_at_a_later_sighting`, `a_key_whose_recordings_keep_failing_becomes_unrecordable`, `a_capture_that_fails_before_the_body_ran_still_runs_the_unit_once`, `failed_recordings_are_counted_per_key`, `rerecords_that_keep_failing_mark_the_key_and_drop_its_instance`, `a_marked_keys_instance_replays_while_its_shape_matches_and_goes_when_it_changes`, `a_full_probe_counts_a_key_at_the_bound`, `a_recording_that_succeeds_clears_the_keys_count`, `failures_apart_do_not_add_up`, `threads_failing_one_key_together_lose_no_update`, `a_bodys_own_capture_error_is_returned_not_absorbed`; `cuda::graph::tests`: `a_failed_end_of_capture_names_the_first_refused_call`, `a_failed_end_of_capture_alone_is_reported_as_it_is`, `an_earlier_error_of_another_kind_is_returned_as_it_is`. The device stress tests in `tests/cuda_lane_graphs.rs` assert that no recording failed.
+
 ## A request that issues no frame shows its handle empty (2026-11-06)
 
 **What.** A worker's view of an upstream handle after a request is productive only if the request issued frames: a push through the handle was routed, or the thread's satisfied-request counter moved across the request. A request that issued none marks the view unproductive, as a pull that finds nothing does. Before, a request kept the view the worker already had.
