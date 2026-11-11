@@ -45,7 +45,8 @@ pub enum Ran {
     Recorded,
     /// The body's shape changed: it ran for real and the graph was recorded again.
     Rerecorded,
-    /// Caching is off: the body ran as direct launches.
+    /// The body ran as direct launches, exactly once: caching is off, the key is not recorded yet or is unrecordable, or a
+    /// recording or re-record of it failed. A failed recording is counted in [`GraphStats`] and is not an error.
     Direct,
     /// A warm-up found the key recorded already and did nothing.
     Present,
@@ -60,6 +61,11 @@ pub struct GraphStats {
     pub directs: u64,
     /// Re-records that failed (the unit still ran, as direct launches).
     pub failed_rerecords: u64,
+    /// First recordings that failed (the unit still ran, as direct launches); a shared cache's only.
+    pub failed_records: u64,
+    /// Keys marked unrecordable: a key whose recordings failed [`MAX_FAILED_RECORDINGS`] times, or whose body asked for the
+    /// library stream; a shared cache's only.
+    pub unrecordable_keys: u64,
 }
 
 struct Entry<G: Gpu, K> {
@@ -229,14 +235,27 @@ type LaneOf<G> = <<G as Gpu>::Stream as Stream>::Lane;
 const SEEN: u64 = 1;
 const UNRECORDABLE: u64 = 2;
 
+/// The failed recordings of a key after which it is unrecordable. One transient refusal by the driver (another thread's work
+/// in the context can invalidate a capture) does not cost the key its replay; a key that keeps failing stops paying for
+/// recordings that run its work and are thrown away. At most 3: a key's count shares the word of its tag (two spare bits).
+pub const MAX_FAILED_RECORDINGS: u64 = 3;
+const _: () = assert!(MAX_FAILED_RECORDINGS >= 1 && MAX_FAILED_RECORDINGS <= 3);
+
+/// Where a failed table's word keeps the key's count of failed recordings: above the 62 bits of the tag.
+const COUNT_SHIFT: u32 = 62;
+const TAG_MASK: u64 = (1 << COUNT_SHIFT) - 1;
+
 /// Java's per-key sightings (`Capture.sightings`, `Capture.unrecordable`) in fixed tables of atomic words holding a key's
-/// tag: a key is recorded on its second sighting, and a key whose capture failed is never recorded again. The two live in
-/// separate tables, so a crowd of ordinary sightings never forgets an unrecordable mark (which would make the key record,
-/// fail and run its work again). A slot is found by probing a few from the key's tag; a sightings table that is full
-/// forgets: the key it overwrites is seen for the first time again, which only delays its recording by a unit.
+/// tag: a key is recorded on its second sighting, a key whose capture failed [`MAX_FAILED_RECORDINGS`] times is never recorded
+/// again, and one that asked for the library stream at once. The tables are separate, so a crowd of ordinary sightings never
+/// forgets an unrecordable mark (which would make the key record, fail and run its work again). A slot is found by probing a
+/// few from the key's tag; a sightings table that is full forgets: the key it overwrites is seen for the first time again,
+/// which only delays its recording by a unit (in the failed table, its count starts again).
 struct Sightings {
     seen: Box<[AtomicU64]>,
     unrecordable: Box<[AtomicU64]>,
+    /// A key's word is `(failures << 62) | tag`, never 0 once a failure is in.
+    failed: Box<[AtomicU64]>,
 }
 
 impl Sightings {
@@ -251,6 +270,7 @@ impl Sightings {
         Self {
             seen: table(slots),
             unrecordable: table(slots),
+            failed: table(slots),
         }
     }
 
@@ -293,8 +313,37 @@ impl Sightings {
         bad | seen
     }
 
-    fn mark_unrecordable(&self, tag: u64) {
-        Self::find(&self.unrecordable, tag, true);
+    /// Marks `tag` unrecordable; whether it was not marked before.
+    fn mark_unrecordable(&self, tag: u64) -> bool {
+        !Self::find(&self.unrecordable, tag, true)
+    }
+
+    /// Counts a failed recording of `tag`; returns the key's count of them now (it saturates at 3; a full probe forgets
+    /// what it overwrites, so the count starts again at 1).
+    fn failed_recording(&self, tag: u64) -> u64 {
+        let table = &self.failed;
+        let n = table.len();
+        let start = (tag % n as u64) as usize;
+        for step in 0..Self::PROBES {
+            let slot = &table[(start + step) % n];
+            let mut word = slot.load(Ordering::Relaxed);
+            loop {
+                let count = word >> COUNT_SHIFT;
+                let next = if word == 0 {
+                    1 << COUNT_SHIFT | tag
+                } else if word & TAG_MASK == tag {
+                    (count + 1).min(3) << COUNT_SHIFT | tag
+                } else {
+                    break;
+                };
+                match slot.compare_exchange(word, next, Ordering::Relaxed, Ordering::Relaxed) {
+                    Ok(_) => return next >> COUNT_SHIFT,
+                    Err(now) => word = now,
+                }
+            }
+        }
+        table[start].store(1 << COUNT_SHIFT | tag, Ordering::Relaxed);
+        1
     }
 }
 
@@ -318,7 +367,12 @@ impl Sightings {
 ///   `MAX_CAPTURES` is least recently used too). If every instance is in use, the unit runs directly: nothing is recorded
 ///   to be thrown away. Dropping an instance is safe whatever its launches are doing: the driver frees an executable once
 ///   they end.
-/// - **A capture that fails** (the work still ran, for real) marks the key unrecordable: it runs directly from then on.
+/// - **A capture that fails** (the work still ran, for real) is not an error: the unit is [`Ran::Direct`], the failure is
+///   counted ([`GraphStats::failed_records`]), and the key is recorded again at its next sighting. After
+///   [`MAX_FAILED_RECORDINGS`] failed recordings of one key it is unrecordable ([`GraphStats::unrecordable_keys`]) and runs
+///   directly from then on. A re-record that fails the same way is [`Ran::Direct`] too ([`GraphStats::failed_rerecords`]);
+///   the instance keeps its old recording, so the key's next run finds the shape changed and records again. A failure
+///   that is not a capture's (a call refused before the body ran, a lost device) is an error.
 /// - **A body that does library work** (it asks for `LaneStream::raw_stream`) cannot be replayed or recorded: a pass has
 ///   no stream to lend, so the library call would be skipped. A probe pass before the recording, and the update pass of a
 ///   hit, find the request out; the key is then unrecordable and its units run directly, every time, with the call made.
@@ -354,6 +408,8 @@ pub struct SharedGraphCache<G: Gpu, K> {
     records: AtomicU64,
     rerecords: AtomicU64,
     failed_rerecords: AtomicU64,
+    failed_records: AtomicU64,
+    unrecordable_keys: AtomicU64,
     directs: AtomicU64,
 }
 
@@ -386,6 +442,8 @@ impl<G: Gpu, K: Copy + Eq + Hash + Send> SharedGraphCache<G, K> {
             records: AtomicU64::new(0),
             rerecords: AtomicU64::new(0),
             failed_rerecords: AtomicU64::new(0),
+            failed_records: AtomicU64::new(0),
+            unrecordable_keys: AtomicU64::new(0),
             directs: AtomicU64::new(0),
         }
     }
@@ -401,6 +459,8 @@ impl<G: Gpu, K: Copy + Eq + Hash + Send> SharedGraphCache<G, K> {
             records: self.records.load(Ordering::Relaxed),
             rerecords: self.rerecords.load(Ordering::Relaxed),
             failed_rerecords: self.failed_rerecords.load(Ordering::Relaxed),
+            failed_records: self.failed_records.load(Ordering::Relaxed),
+            unrecordable_keys: self.unrecordable_keys.load(Ordering::Relaxed),
             directs: self.directs.load(Ordering::Relaxed),
         }
     }
@@ -480,7 +540,7 @@ impl<G: Gpu, K: Copy + Eq + Hash + Send> SharedGraphCache<G, K> {
                 // skip: it is not replayable. Nothing ran (an update touches no device): the unit runs directly, now and
                 // every time.
                 lease.discard();
-                self.sightings.mark_unrecordable(tag);
+                self.mark_unrecordable(tag);
                 return self.direct(lane, waits, body, hold);
             }
             let graph = lease.get();
@@ -537,7 +597,7 @@ impl<G: Gpu, K: Copy + Eq + Hash + Send> SharedGraphCache<G, K> {
             done
         })?;
         if asked.get() {
-            self.sightings.mark_unrecordable(tag);
+            self.mark_unrecordable(tag);
             return self.direct(lane, waits, body, hold);
         }
         // A slot is reserved first; with none free, the unit runs directly (nothing is recorded to be thrown away).
@@ -557,8 +617,12 @@ impl<G: Gpu, K: Copy + Eq + Hash + Send> SharedGraphCache<G, K> {
                 Ok(Ran::Recorded)
             }
             Err(GpuError::Capture(_)) => {
-                // Only the recording failed: the key runs directly from now on.
-                self.sightings.mark_unrecordable(tag);
+                // Only the recording failed. The key is recorded again at its next sighting; after the bound of failed
+                // recordings it runs directly from then on.
+                self.failed_records.fetch_add(1, Ordering::Relaxed);
+                if self.sightings.failed_recording(tag) >= MAX_FAILED_RECORDINGS {
+                    self.mark_unrecordable(tag);
+                }
                 drop(slot);
                 if ran.get() {
                     // The body ran for real, unaffected by the failed capture: the unit is done.
@@ -570,6 +634,13 @@ impl<G: Gpu, K: Copy + Eq + Hash + Send> SharedGraphCache<G, K> {
                 }
             }
             Err(other) => Err(other),
+        }
+    }
+
+    /// Marks the key unrecordable, and counts it once.
+    fn mark_unrecordable(&self, tag: u64) {
+        if self.sightings.mark_unrecordable(tag) {
+            self.unrecordable_keys.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -1098,22 +1169,52 @@ mod shared_tests {
         assert!(!cache.contains(&(1, 0, 1)), "the least recently used went");
     }
 
+    /// One failed recording is transient: the key is recorded at its next sighting and replays after.
     #[test]
-    fn a_capture_that_fails_runs_the_work_and_marks_the_key_unrecordable() {
+    fn a_capture_that_fails_once_runs_the_work_and_the_key_records_at_a_later_sighting() {
         let (gpu, lane, kernel, at) = rig();
         let cache = SharedGraphCache::<FakeGpu, _>::new();
         let mut hold = GraphHold::new();
         let mut b = body(&kernel, at, 1, 1);
-        assert_eq!(
-            cache.run(&gpu, &lane, KEY, &mut b, &mut hold).unwrap(),
-            Ran::Direct
-        );
+        let mut run = || cache.run(&gpu, &lane, KEY, &mut b, &mut hold).unwrap();
+        assert_eq!(run(), Ran::Direct, "first sighting");
         gpu.fail_next_recording();
         assert_eq!(
-            cache.run(&gpu, &lane, KEY, &mut b, &mut hold).unwrap(),
+            run(),
             Ran::Direct,
             "the capture failed: the unit ran directly"
         );
+        assert!(cache.is_empty(), "a failed recording leaves no slot behind");
+        assert_eq!(run(), Ran::Recorded, "tried again");
+        assert_eq!(run(), Ran::Replayed);
+        gpu.run_until_idle();
+        assert_eq!(word(&gpu, at), 4, "every unit's work ran once");
+        let stats = cache.stats();
+        assert_eq!((stats.failed_records, stats.unrecordable_keys), (1, 0));
+        assert_eq!((stats.records, stats.replays, stats.directs), (1, 1, 2));
+    }
+
+    /// A key whose recordings fail the bound's number of times runs directly from then on, and the cache says so.
+    #[test]
+    fn a_key_whose_recordings_keep_failing_becomes_unrecordable() {
+        let (gpu, lane, kernel, at) = rig();
+        let cache = SharedGraphCache::<FakeGpu, _>::new();
+        let mut hold = GraphHold::new();
+        let mut b = body(&kernel, at, 1, 1);
+        cache.run(&gpu, &lane, KEY, &mut b, &mut hold).unwrap(); // first sighting
+        for failed in 1..=MAX_FAILED_RECORDINGS {
+            gpu.fail_next_recording();
+            assert_eq!(
+                cache.run(&gpu, &lane, KEY, &mut b, &mut hold).unwrap(),
+                Ran::Direct
+            );
+            let stats = cache.stats();
+            assert_eq!(stats.failed_records, failed);
+            assert_eq!(
+                stats.unrecordable_keys,
+                u64::from(failed == MAX_FAILED_RECORDINGS)
+            );
+        }
         for _ in 0..3 {
             assert_eq!(
                 cache.run(&gpu, &lane, KEY, &mut b, &mut hold).unwrap(),
@@ -1122,9 +1223,9 @@ mod shared_tests {
             );
         }
         assert_eq!(cache.stats().records, 0);
-        assert!(cache.is_empty(), "a failed recording leaves no slot behind");
+        assert!(cache.is_empty());
         gpu.run_until_idle();
-        assert_eq!(word(&gpu, at), 5, "every unit's work ran once");
+        assert_eq!(word(&gpu, at), 1 + 3 + 3, "every unit's work ran once");
         // A key that never failed still records.
         assert_eq!(
             cache
@@ -1153,9 +1254,24 @@ mod shared_tests {
         assert!(cache.is_empty());
         assert_eq!(
             cache.run(&gpu, &lane, KEY, &mut b, &mut hold).unwrap(),
-            Ran::Direct,
-            "the key is unrecordable"
+            Ran::Recorded,
+            "the key is tried again"
         );
+    }
+
+    /// The counts of failed recordings are per key, and survive other keys' failures.
+    #[test]
+    fn failed_recordings_are_counted_per_key() {
+        let sightings = Sightings::new(64);
+        let (a, b) = (tag_of(&(1u16, 1u32, 1u64)), tag_of(&(2u16, 2u32, 2u64)));
+        assert_eq!(sightings.failed_recording(a), 1);
+        assert_eq!(sightings.failed_recording(b), 1);
+        assert_eq!(sightings.failed_recording(a), 2);
+        assert_eq!(sightings.failed_recording(a), 3);
+        assert_eq!(sightings.failed_recording(a), 3, "saturates");
+        assert_eq!(sightings.failed_recording(b), 2);
+        assert!(sightings.mark_unrecordable(a));
+        assert!(!sightings.mark_unrecordable(a), "marked once");
     }
 
     /// An unrecordable mark is not forgotten by a crowd of other keys\' sightings.
