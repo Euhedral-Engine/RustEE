@@ -373,7 +373,9 @@ impl CudaSequence<'_> {
         let code = unsafe { (self.gpu.fns.stream_end_capture)(self.real[0].shadow, &mut graph) };
         self.capturing = false;
         if let Err(e) = self.gpu.check("cuStreamEndCapture", code) {
-            failure.get_or_insert(GpuError::Capture(e.to_string()));
+            // An earlier refusal (a join) comes first and the end of the capture follows it.
+            let end = GpuError::Capture(e.to_string());
+            failure = Some(capture_failure(failure.take(), end));
         }
         match failure {
             None => Ok(graph),
@@ -592,7 +594,7 @@ impl CudaGpu {
                 Err(e)
             }
             (Err(e), _) => Err(e),
-            (Ok(()), Err(e)) => Err(e),
+            (Ok(()), Err(e)) => Err(capture_failure(rec.failed.take(), e)),
             (Ok(()), Ok(None)) => Err(GpuError::Capture("the capture never began".into())),
             (Ok(()), Ok(Some(graph))) => {
                 if let Some(e) = rec.failed.take() {
@@ -641,5 +643,52 @@ impl CudaGpu {
             streams,
             kept: rec.frozen,
         })
+    }
+}
+
+/// The error of a capture that failed to end: when a shadow call was refused earlier (`first`), it comes first, since it names
+/// the cause and the end of the capture only reports that the capture was invalidated.
+fn capture_failure(first: Option<GpuError>, end: GpuError) -> GpuError {
+    let what = |e: GpuError| match e {
+        GpuError::Capture(what) => what,
+        other => other.to_string(),
+    };
+    match first {
+        None => end,
+        Some(first) => GpuError::Capture(format!(
+            "{}; the capture then failed to end: {}",
+            what(first),
+            what(end)
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_end_of_capture_names_the_first_refused_call() {
+        let first = GpuError::Capture(
+            "cuEventRecord: operation not permitted when stream is capturing".into(),
+        );
+        let end = GpuError::Capture("cuStreamEndCapture: the capture was invalidated (901)".into());
+        let GpuError::Capture(text) = capture_failure(Some(first), end) else {
+            panic!("a capture error");
+        };
+        let at = |needle: &str| {
+            text.find(needle)
+                .unwrap_or_else(|| panic!("{needle} in {text}"))
+        };
+        assert!(at("cuEventRecord") < at("cuStreamEndCapture"), "{text}");
+    }
+
+    #[test]
+    fn a_failed_end_of_capture_alone_is_reported_as_it_is() {
+        let end = GpuError::Capture("cuStreamEndCapture: failed".into());
+        assert_eq!(
+            capture_failure(None, end),
+            GpuError::Capture("cuStreamEndCapture: failed".into())
+        );
     }
 }
