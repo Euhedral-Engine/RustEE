@@ -58,6 +58,8 @@ pub struct GraphStats {
     pub records: u64,
     pub rerecords: u64,
     pub directs: u64,
+    /// Re-records that failed (the unit still ran, as direct launches).
+    pub failed_rerecords: u64,
 }
 
 struct Entry<G: Gpu, K> {
@@ -351,6 +353,7 @@ pub struct SharedGraphCache<G: Gpu, K> {
     replays: AtomicU64,
     records: AtomicU64,
     rerecords: AtomicU64,
+    failed_rerecords: AtomicU64,
     directs: AtomicU64,
 }
 
@@ -382,6 +385,7 @@ impl<G: Gpu, K: Copy + Eq + Hash + Send> SharedGraphCache<G, K> {
             replays: AtomicU64::new(0),
             records: AtomicU64::new(0),
             rerecords: AtomicU64::new(0),
+            failed_rerecords: AtomicU64::new(0),
             directs: AtomicU64::new(0),
         }
     }
@@ -396,6 +400,7 @@ impl<G: Gpu, K: Copy + Eq + Hash + Send> SharedGraphCache<G, K> {
             replays: self.replays.load(Ordering::Relaxed),
             records: self.records.load(Ordering::Relaxed),
             rerecords: self.rerecords.load(Ordering::Relaxed),
+            failed_rerecords: self.failed_rerecords.load(Ordering::Relaxed),
             directs: self.directs.load(Ordering::Relaxed),
         }
     }
@@ -488,11 +493,32 @@ impl<G: Gpu, K: Copy + Eq + Hash + Send> SharedGraphCache<G, K> {
                 Err(GpuError::ShapeChanged { .. }) => {
                     // The body is not the recorded sequence any more: record it again (in place when the driver can).
                     wait_all(lane, waits)?;
-                    gpu.rerecord_on(graph, &[lane], hold, |seq| {
+                    let ran = std::cell::Cell::new(false);
+                    let again = gpu.rerecord_on(graph, &[lane], hold, |seq| {
+                        ran.set(true);
                         seq.submit(0, |enq| body.enqueue(enq))
-                    })?;
-                    self.rerecords.fetch_add(1, Ordering::Relaxed);
-                    Ok(Ran::Rerecorded)
+                    });
+                    match again {
+                        Ok(_) => {
+                            self.rerecords.fetch_add(1, Ordering::Relaxed);
+                            Ok(Ran::Rerecorded)
+                        }
+                        Err(GpuError::Capture(_)) => {
+                            // Only the recording failed, and a failed re-record leaves the instance as it was (the old
+                            // fingerprint), so the lease puts it back and the next run of the key sees the change again
+                            // and records again. The key is not marked: one failure is not a property of the key.
+                            self.failed_rerecords.fetch_add(1, Ordering::Relaxed);
+                            if ran.get() {
+                                // The body ran for real, unaffected by the failed capture: the unit is done.
+                                self.directs.fetch_add(1, Ordering::Relaxed);
+                                Ok(Ran::Direct)
+                            } else {
+                                // The capture failed before the body ran: the unit has not run.
+                                self.direct(lane, &[], body, hold)
+                            }
+                        }
+                        Err(other) => Err(other),
+                    }
                 }
                 Err(other) => Err(other),
             };
@@ -668,7 +694,8 @@ mod tests {
                 replays: 2,
                 records: 1,
                 rerecords: 0,
-                directs: 0
+                directs: 0,
+                ..Default::default()
             }
         );
         assert_eq!(cache.len(), 1);
@@ -741,7 +768,8 @@ mod tests {
                 replays: 0,
                 records: 1,
                 rerecords: 0,
-                directs: 0
+                directs: 0,
+                ..Default::default()
             }
         );
         assert_eq!(
@@ -936,10 +964,70 @@ mod shared_tests {
                 replays: 1,
                 records: 1,
                 rerecords: 0,
-                directs: 1
+                directs: 1,
+                ..Default::default()
             }
         );
         assert_eq!(cache.len(), 1);
+    }
+
+    /// A re-record whose capture fails after the body ran is a unit that ran: not an error, counted, and the instance
+    /// stays as it was, so the next run of the key records again.
+    #[test]
+    fn a_rerecord_that_fails_after_the_body_ran_is_a_direct_unit_and_the_next_run_records_again() {
+        let (gpu, lane, kernel, at) = rig();
+        let cache = SharedGraphCache::<FakeGpu, _>::new();
+        let mut hold = GraphHold::new();
+        let mut b = body(&kernel, at, 2, 1);
+        assert_eq!(
+            cache.warm(&gpu, &lane, KEY, &mut b, &mut hold).unwrap(),
+            Ran::Recorded
+        ); // +2
+        b.launches = 3;
+        gpu.fail_next_recording();
+        assert_eq!(
+            cache.run(&gpu, &lane, KEY, &mut b, &mut hold).unwrap(),
+            Ran::Direct
+        ); // +3, once
+        assert_eq!(cache.stats().failed_rerecords, 1);
+        assert_eq!(cache.stats().rerecords, 0);
+        assert_eq!(cache.len(), 1, "the instance stays in the pool");
+        assert_eq!(
+            cache.run(&gpu, &lane, KEY, &mut b, &mut hold).unwrap(),
+            Ran::Rerecorded
+        ); // +3
+        assert_eq!(
+            cache.run(&gpu, &lane, KEY, &mut b, &mut hold).unwrap(),
+            Ran::Replayed
+        ); // +3
+        gpu.run_until_idle();
+        assert_eq!(word(&gpu, at), 2 + 3 + 3 + 3, "every unit ran exactly once");
+        let stats = cache.stats();
+        assert_eq!((stats.rerecords, stats.failed_rerecords), (1, 1));
+        assert_eq!((stats.replays, stats.directs), (1, 1));
+    }
+
+    /// A re-record that fails before the body ran leaves the unit to run directly, once.
+    #[test]
+    fn a_rerecord_that_fails_before_the_body_ran_runs_the_unit_directly() {
+        let (gpu, lane, kernel, at) = rig();
+        let cache = SharedGraphCache::<FakeGpu, _>::new();
+        let mut hold = GraphHold::new();
+        let mut b = body(&kernel, at, 2, 1);
+        cache.warm(&gpu, &lane, KEY, &mut b, &mut hold).unwrap(); // +2
+        b.launches = 3;
+        gpu.fail_next_recording_before_the_body();
+        assert_eq!(
+            cache.run(&gpu, &lane, KEY, &mut b, &mut hold).unwrap(),
+            Ran::Direct
+        ); // +3
+        assert_eq!(cache.stats().failed_rerecords, 1);
+        assert_eq!(
+            cache.run(&gpu, &lane, KEY, &mut b, &mut hold).unwrap(),
+            Ran::Rerecorded
+        ); // +3
+        gpu.run_until_idle();
+        assert_eq!(word(&gpu, at), 2 + 3 + 3);
     }
 
     #[test]
@@ -1210,7 +1298,8 @@ mod shared_tests {
                 replays: N as u64,
                 records: N as u64,
                 rerecords: 0,
-                directs: 0
+                directs: 0,
+                ..Default::default()
             }
         );
     }
