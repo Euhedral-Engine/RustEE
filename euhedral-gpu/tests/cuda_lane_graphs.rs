@@ -534,16 +534,16 @@ fn six_workers_replaying_under_contention_make_no_private_stream_after_warm_up()
         "at most a stream per worker (and the recording's): {warmed}"
     );
     rounds(1_500);
-    assert_eq!(
-        lane.forks_made(),
-        warmed,
-        "no stream was made after warm-up: no take missed, however the workers raced"
-    );
     let stats = cache.stats();
-    assert!(stats.replays > 1_000, "{stats:?}");
     assert_eq!(
         (stats.failed_records, stats.failed_rerecords),
         (0, 0),
         "no recording failed on the device: {stats:?}"
     );
+    assert_eq!(
+        lane.forks_made(),
+        warmed,
+        "no stream was made after warm-up: no take missed, however the workers raced (stats {stats:?})"
+    );
+    assert!(stats.replays > 1_000, "{stats:?}");
 }

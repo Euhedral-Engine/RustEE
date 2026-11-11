@@ -250,7 +250,8 @@ const TAG_MASK: u64 = (1 << COUNT_SHIFT) - 1;
 /// not recorded again, and one that asked for the library stream at once. The tables are separate, so a crowd of ordinary sightings never
 /// forgets an unrecordable mark (which would make the key record, fail and run its work again). A slot is found by probing a
 /// few from the key's tag; a sightings table that is full forgets: the key it overwrites is seen for the first time again,
-/// which only delays its recording by a unit (in the failed table, its count starts again).
+/// which only delays its recording by a unit. The failed table cannot forget: a key that finds its probe full of other keys' words is
+/// counted at the bound, which marks it.
 struct Sightings {
     seen: Box<[AtomicU64]>,
     unrecordable: Box<[AtomicU64]>,
@@ -592,9 +593,8 @@ impl<G: Gpu, K: Copy + Eq + Hash + Send> SharedGraphCache<G, K> {
                         // A marked key pays no capture: this instance is out of date and goes, and the unit runs
                         // directly. (An instance whose shape still matches keeps replaying.)
                         lease.discard();
-                        return self.direct(lane, waits, body, hold);
+                        return self.direct(lane, &[], body, hold);
                     }
-                    wait_all(lane, waits)?;
                     let (entered, body_error) =
                         (std::cell::Cell::new(false), std::cell::Cell::new(false));
                     let again = gpu.rerecord_on(graph, &[lane], hold, |seq| {
@@ -1421,27 +1421,39 @@ mod shared_tests {
         assert_eq!(stats.unrecordable_keys, 0);
     }
 
-    /// Two threads counting one key lose no update, and the bound is reached exactly once.
+    /// Threads counting one key at the same instant lose no update, and each count up to the bound is handed out once.
     #[test]
-    fn two_threads_failing_one_key_lose_no_update() {
-        for _ in 0..(if cfg!(miri) { 5 } else { 2_000 }) {
-            let sightings = Sightings::new(16);
-            let tag = tag_of(&KEY);
-            let seen = std::sync::Mutex::new(Vec::new());
-            let (sightings, counts) = (&sightings, &seen);
-            std::thread::scope(|scope| {
-                for calls in [2, 1] {
-                    scope.spawn(move || {
-                        for _ in 0..calls {
-                            let c = sightings.failed_recording(tag);
-                            counts.lock().unwrap().push(c);
-                        }
-                    });
-                }
-            });
-            let mut counts = seen.into_inner().unwrap();
+    fn threads_failing_one_key_together_lose_no_update() {
+        use std::sync::Barrier;
+        const THREADS: usize = 3;
+        let rounds = if cfg!(miri) { 5 } else { 20_000 };
+        // Fresh tables and keys per round, so a round starts from no word; the barrier releases the threads together.
+        let tables: Vec<Sightings> = (0..rounds).map(|_| Sightings::new(16)).collect();
+        let start = Barrier::new(THREADS);
+        let results: Vec<Vec<u64>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..THREADS)
+                .map(|_| {
+                    scope.spawn(|| {
+                        tables
+                            .iter()
+                            .map(|table| {
+                                start.wait();
+                                table.failed_recording(tag_of(&KEY))
+                            })
+                            .collect::<Vec<u64>>()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        for round in 0..rounds {
+            let mut counts: Vec<u64> = results.iter().map(|r| r[round]).collect();
             counts.sort_unstable();
-            assert_eq!(counts, [1, 2, 3], "each count was handed out once");
+            assert_eq!(
+                counts,
+                [1, 2, 3],
+                "round {round}: each count handed out once"
+            );
         }
     }
 

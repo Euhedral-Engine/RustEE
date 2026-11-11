@@ -652,9 +652,6 @@ impl CudaGpu {
 fn capture_failure(first: Option<GpuError>, end: GpuError) -> GpuError {
     match (first, end) {
         (None, end) => end,
-        (Some(GpuError::Capture(first)), GpuError::Capture(end)) => {
-            GpuError::Capture(format!("{first}; the capture then failed to end: {end}"))
-        }
         (Some(GpuError::Capture(first)), end) => {
             GpuError::Capture(format!("{first}; the capture then failed to end: {end}"))
         }
