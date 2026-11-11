@@ -646,20 +646,19 @@ impl CudaGpu {
     }
 }
 
-/// The error of a capture that failed to end: when a shadow call was refused earlier (`first`), it comes first, since it names
-/// the cause and the end of the capture only reports that the capture was invalidated.
+/// The error of a capture that failed to end: when a shadow call was refused earlier (`first`, a `Capture`), it comes first,
+/// since it names the cause and the end of the capture only reports that the capture was invalidated. An earlier error of
+/// another kind (a failed join of the real streams) is returned as it is, with its type.
 fn capture_failure(first: Option<GpuError>, end: GpuError) -> GpuError {
-    let what = |e: GpuError| match e {
-        GpuError::Capture(what) => what,
-        other => other.to_string(),
-    };
-    match first {
-        None => end,
-        Some(first) => GpuError::Capture(format!(
-            "{}; the capture then failed to end: {}",
-            what(first),
-            what(end)
-        )),
+    match (first, end) {
+        (None, end) => end,
+        (Some(GpuError::Capture(first)), GpuError::Capture(end)) => {
+            GpuError::Capture(format!("{first}; the capture then failed to end: {end}"))
+        }
+        (Some(GpuError::Capture(first)), end) => {
+            GpuError::Capture(format!("{first}; the capture then failed to end: {end}"))
+        }
+        (Some(first), _) => first,
     }
 }
 
@@ -690,5 +689,12 @@ mod tests {
             capture_failure(None, end),
             GpuError::Capture("cuStreamEndCapture: failed".into())
         );
+    }
+
+    #[test]
+    fn an_earlier_error_of_another_kind_is_returned_as_it_is() {
+        let join = GpuError::Invalid("a join failed".into());
+        let end = GpuError::Capture("cuStreamEndCapture: failed".into());
+        assert_eq!(capture_failure(Some(join.clone()), end), join);
     }
 }

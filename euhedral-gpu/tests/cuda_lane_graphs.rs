@@ -329,6 +329,11 @@ fn overlapping_quanta(window: usize) {
     }
     let stats = cache.stats();
     assert_eq!(
+        (stats.failed_records, stats.failed_rerecords),
+        (0, 0),
+        "no recording failed on the device: {stats:?}"
+    );
+    assert_eq!(
         stats.replays + stats.records + stats.directs,
         2 * QUANTA as u64,
         "every stage run was one of the three: {stats:?}"
@@ -534,5 +539,11 @@ fn six_workers_replaying_under_contention_make_no_private_stream_after_warm_up()
         warmed,
         "no stream was made after warm-up: no take missed, however the workers raced"
     );
-    assert!(cache.stats().replays > 1_000);
+    let stats = cache.stats();
+    assert!(stats.replays > 1_000, "{stats:?}");
+    assert_eq!(
+        (stats.failed_records, stats.failed_rerecords),
+        (0, 0),
+        "no recording failed on the device: {stats:?}"
+    );
 }
