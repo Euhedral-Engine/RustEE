@@ -3,6 +3,25 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## A kernel can take a tensor map by value (2026-11-13)
+
+**What.** `TensorMap` (exactly 128 bytes, `#[repr(C, align(64))]`, a `KernelArg`), `TiledMap` (the description), the enums `MapDataType`, `Interleave`, `Swizzle`, `L2Promotion`, `OobFill`, and `MAX_RANK` (5), at the crate root. `TensorMap::tiled(&CudaGpu, &TiledMap)` (feature `cuda`) encodes one with `cuTensorMapEncodeTiled`; `TiledMap::check` refuses an invalid description first; `TensorMap::fake(&TiledMap)` (feature `fake`) makes a stand-in. `MAX_ALIGN` (64) is the largest alignment `Args` takes. `GpuFns` gains `tensor_map_encode_tiled`, an `Option`.
+
+**Why.** A kernel that moves tiles with the Tensor Memory Accelerator (compute capability 9.0 and newer) needs a driver-encoded descriptor of the global tensor as a by-value argument: the call was not bound, and `Args` refused an argument aligned above 16 bytes, which the descriptor is.
+
+**Breaking:** none for callers. `Args` used to panic on an argument aligned above 16 bytes and now takes up to 64; only a type that was refused before is affected. `GpuFns` is a public struct with a new field, so **Migration:** code that builds one by a struct literal adds `tensor_map_encode_tiled` (nothing in this repository does).
+
+**How to use it.** In a prepare, `TensorMap::tiled(&gpu, &TiledMap { address, data_type, rank, dims, strides, box_dims, element_strides, interleave, swizzle, l2_promotion, oob_fill })` with the tensor's device address, then `Args::new()...arg(map)` for a parameter declared `const __grid_constant__ CUtensorMap map`, in a lane, eager, recorded or updated. Keep the memory allocated until the last kernel that reads it retired. The map is a copy of bytes: no drop, and no driver call to pass it again.
+
+**Semantics.**
+- `Args` storage is now made of 64-byte, 64-aligned chunks (it was 16-byte), so an argument aligned to up to 64 bytes sits at an address of that alignment. The driver reads each argument through the pointer the launch gives it, for the size of the kernel's parameter (`cuLaunchKernel` takes an array of pointers and lays the parameter buffer out from the kernel's own offsets), so the host alignment is no condition of the launch; it keeps the bytes where Rust and the C compiler expect them. An argument aligned above 64 bytes is still refused with a panic.
+- The shape fingerprint and an argument's layout hash see a tensor map as 128 bytes at alignment 64, like any value: another map is the same shape, so a recorded launch updates in place with it.
+- `tiled` makes the context current for the call (the driver wants one) and is a host-side computation. `check` refuses a rank outside 1 to 5, an address off 16 bytes, a zero or over-2^32 extent, a box over 256, a traversal stride outside 1 to 8, a byte stride that is zero, off 16 or over 2^40, interleave below rank 3, and the NaN fill for a non-floating-point type, as `GpuError::Invalid` naming the field. What depends on the element's size (box width against the swizzle span) is the driver's to refuse, as an error naming `cuTensorMapEncodeTiled`. A driver without the call (older than CUDA 12.0) gives an `Invalid` saying libcuda has no `cuTensorMapEncodeTiled`.
+- The value types are in every backend's build; the fake map is a deterministic function of its description and no descriptor a device could use, so a fake-backed test can record, replay and update a launch that takes one.
+- The alignment is 64, as the driver's documentation requires of the map's address; the CUDA 13 header declares `alignas(128)`, which nothing on the host depends on.
+
+**Tests.** Unit: size, alignment and `KernelArg`; each refusal of `check`; `Args` holds a map after other arguments and gives its bytes back, `set` and `assign` move it whole, an argument aligned to 128 is still refused; the fake map follows its description. `tests/fake_tensor_map.rs`: a kernel with a map is recorded, fingerprinted, updated and replayed. Device: `tests/cuda_tensor_map.rs` `a_tile_copied_through_a_tensor_map_equals_its_source` (a kernel copies one tile through `cp.async.bulk.tensor` into shared memory and out; the result equals the source tile eagerly, from a recording, its replay and the replay after an update, and a map one row down reads the tile one row down, so a wrong or shifted descriptor fails it; skips below compute capability 9.0 or without the call).
+
 ## A kernel can be opted in to more dynamic shared memory (2026-11-13)
 
 **What.** `Module::kernel_with(name, KernelOptions { max_dynamic_shared_bytes })`, beside `Module::kernel`, which is unchanged and equal to `kernel_with(name, KernelOptions::default())`. `KernelOptions` is `Default` (0 leaves the driver's default). `CudaKernel::max_dynamic_shared_bytes()` (an `Option`: `None` when the driver would not report its default and the kernel was not opted in) and `FakeKernel::max_dynamic_shared_bytes()` report the limit.

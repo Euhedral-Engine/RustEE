@@ -70,3 +70,8 @@ the ring is full of open or unread spans, and a stream opened with 0 refuses the
 described by a `View` (filter, address and coordinate modes). The object does not own the memory. A view
 whose base or pitch misses the device's alignment, or whose pitch is less than a row, is an `Err` before
 the driver is asked.
+
+**tensor map** ([`tensor_map`](src/tensor_map.rs)): `TensorMap`, the driver-encoded descriptor of a global tensor (`CUtensorMap`,
+128 bytes aligned to 64) that a kernel takes by value to move tiles with the Tensor Memory Accelerator. A `TiledMap`
+describes the tensor and the box one copy moves; `TensorMap::tiled` encodes it (a prepare's driver call), after
+`TiledMap::check` refuses an invalid description. The map does not own the memory.

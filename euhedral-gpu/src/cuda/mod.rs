@@ -12,6 +12,7 @@ mod module;
 pub mod nvrtc;
 mod retire;
 mod stream;
+mod tensor_map;
 pub mod texture;
 
 pub use enqueue::CudaEnqueue;

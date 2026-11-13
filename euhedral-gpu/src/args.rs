@@ -26,6 +26,18 @@ unsafe impl<T: KernelArg, const N: usize> KernelArg for [T; N] {}
 /// The most arguments one launch takes: a launch lists their addresses on the stack, so it allocates nothing.
 pub const MAX_ARGS: usize = 64;
 
+/// The storage unit of [`Args`]: 64 bytes at a 64-byte alignment, so an argument of up to [`MAX_ALIGN`] bytes' alignment sits
+/// at an address of that alignment.
+#[derive(Clone, Copy, Debug)]
+#[repr(C, align(64))]
+struct Chunk([u8; CHUNK]);
+
+const CHUNK: usize = 64;
+const ZERO: Chunk = Chunk([0; CHUNK]);
+
+/// The largest alignment of a kernel argument (a `CUtensorMap` is aligned to 64 bytes).
+pub const MAX_ALIGN: usize = CHUNK;
+
 /// The arguments of one kernel launch: values packed in order, each at its own alignment.
 ///
 /// Build with [`Args::new`] and [`arg`](Args::arg); a device address from `euhedral-memory`'s `Block::addr` goes in
@@ -37,8 +49,8 @@ pub const MAX_ARGS: usize = 64;
 /// [`assign`](Args::assign) copies another value's arguments into this one's storage.
 #[derive(Clone, Debug, Default)]
 pub struct Args {
-    /// 16-byte aligned storage; slot offsets are byte offsets into it.
-    storage: Vec<u128>,
+    /// 64-byte aligned storage; slot offsets are byte offsets into it.
+    storage: Vec<Chunk>,
     /// (byte offset, size, alignment) per argument.
     slots: Vec<(u32, u16, u16)>,
     /// Bytes used.
@@ -53,13 +65,13 @@ impl Args {
     /// Appends `value`.
     ///
     /// # Panics
-    /// If the type is aligned beyond 16 bytes or larger than 64 KiB: a misuse found when the arguments are built.
+    /// If the type is aligned beyond 64 bytes or larger than 64 KiB: a misuse found when the arguments are built.
     #[must_use]
     pub fn arg<T: KernelArg>(mut self, value: T) -> Self {
         let (size, align) = (size_of::<T>(), align_of::<T>());
         assert!(
-            align <= 16,
-            "a kernel argument is aligned to at most 16 bytes"
+            align <= MAX_ALIGN,
+            "a kernel argument is aligned to at most 64 bytes"
         );
         assert!(
             size <= usize::from(u16::MAX),
@@ -67,7 +79,7 @@ impl Args {
         );
         let offset = self.used.next_multiple_of(align);
         let end = offset + size;
-        self.storage.resize(end.div_ceil(16), 0);
+        self.storage.resize(end.div_ceil(CHUNK), ZERO);
         // SAFETY: `storage` holds at least `end` bytes; the source is a live `T` of `size` bytes and the ranges
         // cannot overlap (the source is a local).
         unsafe {
@@ -95,8 +107,8 @@ impl Args {
     pub fn push<T: KernelArg>(&mut self, value: T) -> &mut Self {
         let (size, align) = (size_of::<T>(), align_of::<T>());
         assert!(
-            align <= 16,
-            "a kernel argument is aligned to at most 16 bytes"
+            align <= MAX_ALIGN,
+            "a kernel argument is aligned to at most 64 bytes"
         );
         assert!(
             size <= usize::from(u16::MAX),
@@ -104,8 +116,8 @@ impl Args {
         );
         let offset = self.used.next_multiple_of(align);
         let end = offset + size;
-        if end.div_ceil(16) > self.storage.len() {
-            self.storage.resize(end.div_ceil(16), 0);
+        if end.div_ceil(CHUNK) > self.storage.len() {
+            self.storage.resize(end.div_ceil(CHUNK), ZERO);
         }
         // SAFETY: `storage` holds at least `end` bytes; the source is a live `T` of `size` bytes and the ranges
         // cannot overlap (the source is a local).
