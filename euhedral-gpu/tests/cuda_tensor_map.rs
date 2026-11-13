@@ -50,10 +50,16 @@ extern "C" __global__ void tile_copy(unsigned* out, int c0, int c1, const __grid
         asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];"
                      ::"r"(smem_address(tile)), "l"(&map), "r"(c0), "r"(c1), "r"(smem_address(&bar)) : "memory");
     }
+    // Bounded, so a descriptor that does not arrive fails the launch fast instead of hanging it.
     asm volatile(
-        "{\n.reg .pred p;\nWAIT_%=:\n"
+        "{\n.reg .pred p;\n.reg .u32 n;\nmov.u32 n, 0;\nWAIT_%=:\n"
         "mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n"
-        "@!p bra WAIT_%=;\n}" ::"r"(smem_address(&bar)), "r"(0u) : "memory");
+        "@p bra DONE_%=;\n"
+        "add.u32 n, n, 1;\n"
+        "setp.lt.u32 p, n, 100000;\n"
+        "@p bra WAIT_%=;\n"
+        "trap;\n"
+        "DONE_%=:\n}" ::"r"(smem_address(&bar)), "r"(0u) : "memory");
     out[threadIdx.x] = tile[threadIdx.x];
 }
 "#;

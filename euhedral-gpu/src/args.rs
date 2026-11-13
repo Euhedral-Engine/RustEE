@@ -26,17 +26,10 @@ unsafe impl<T: KernelArg, const N: usize> KernelArg for [T; N] {}
 /// The most arguments one launch takes: a launch lists their addresses on the stack, so it allocates nothing.
 pub const MAX_ARGS: usize = 64;
 
-/// The storage unit of [`Args`]: 64 bytes at a 64-byte alignment, so an argument of up to [`MAX_ALIGN`] bytes' alignment sits
-/// at an address of that alignment.
-#[derive(Clone, Copy, Debug)]
-#[repr(C, align(64))]
-struct Chunk([u8; CHUNK]);
-
-const CHUNK: usize = 64;
-const ZERO: Chunk = Chunk([0; CHUNK]);
-
-/// The largest alignment of a kernel argument (a `CUtensorMap` is aligned to 64 bytes).
-pub const MAX_ALIGN: usize = CHUNK;
+/// The largest alignment of a kernel argument (a `CUtensorMap` is aligned to 64 bytes). An argument aligned to `a` bytes is
+/// placed at an offset that is a multiple of `a` in the storage; the storage itself is 16-byte aligned, and the driver reads
+/// each argument through its pointer for its size, so the host address is no condition of a launch.
+pub const MAX_ALIGN: usize = 64;
 
 /// The arguments of one kernel launch: values packed in order, each at its own alignment.
 ///
@@ -49,8 +42,8 @@ pub const MAX_ALIGN: usize = CHUNK;
 /// [`assign`](Args::assign) copies another value's arguments into this one's storage.
 #[derive(Clone, Debug, Default)]
 pub struct Args {
-    /// 64-byte aligned storage; slot offsets are byte offsets into it.
-    storage: Vec<Chunk>,
+    /// 16-byte aligned storage; slot offsets are byte offsets into it.
+    storage: Vec<u128>,
     /// (byte offset, size, alignment) per argument.
     slots: Vec<(u32, u16, u16)>,
     /// Bytes used.
@@ -79,7 +72,7 @@ impl Args {
         );
         let offset = self.used.next_multiple_of(align);
         let end = offset + size;
-        self.storage.resize(end.div_ceil(CHUNK), ZERO);
+        self.storage.resize(end.div_ceil(16), 0);
         // SAFETY: `storage` holds at least `end` bytes; the source is a live `T` of `size` bytes and the ranges
         // cannot overlap (the source is a local).
         unsafe {
@@ -116,8 +109,8 @@ impl Args {
         );
         let offset = self.used.next_multiple_of(align);
         let end = offset + size;
-        if end.div_ceil(CHUNK) > self.storage.len() {
-            self.storage.resize(end.div_ceil(CHUNK), ZERO);
+        if end.div_ceil(16) > self.storage.len() {
+            self.storage.resize(end.div_ceil(16), 0);
         }
         // SAFETY: `storage` holds at least `end` bytes; the source is a live `T` of `size` bytes and the ranges
         // cannot overlap (the source is a local).
@@ -399,6 +392,45 @@ mod tests {
         let mut other = source.clone();
         other.set(0, 6u32).unwrap();
         assert_ne!(other, source);
+    }
+
+    #[test]
+    fn offsets_and_layout_of_small_alignments_are_as_they_were() {
+        let a = Args::new()
+            .arg(1u8)
+            .arg(2u64)
+            .arg(3u16)
+            .arg([7u64, 9])
+            .arg(5u32);
+        assert_eq!(
+            a.slots,
+            [(0, 1, 1), (8, 8, 8), (16, 2, 2), (24, 16, 8), (40, 4, 4)]
+        );
+        assert_eq!(a.used, 44);
+        let mut literal = Vec::new();
+        for (size, align) in [(1u16, 1u16), (8, 8), (2, 2), (16, 8), (4, 4)] {
+            literal.extend_from_slice(&size.to_le_bytes());
+            literal.extend_from_slice(&align.to_le_bytes());
+        }
+        assert_eq!(a.layout(), hash_bytes_with_seed(&literal, 0));
+        // SAFETY: `used` initialized bytes.
+        let bytes = unsafe { std::slice::from_raw_parts(a.storage.as_ptr().cast::<u8>(), a.used) };
+        assert_eq!(bytes[0], 1);
+        assert_eq!(&bytes[8..16], &2u64.to_ne_bytes());
+        assert_eq!(&bytes[16..18], &3u16.to_ne_bytes());
+        assert_eq!(&bytes[24..32], &7u64.to_ne_bytes());
+        assert_eq!(&bytes[40..44], &5u32.to_ne_bytes());
+    }
+
+    #[test]
+    fn a_64_aligned_argument_sits_at_a_64_aligned_offset() {
+        #[derive(Clone, Copy)]
+        #[repr(C, align(64))]
+        struct Wide([u8; 64]);
+        // SAFETY: plain bytes, no padding.
+        unsafe impl KernelArg for Wide {}
+        let a = Args::new().arg(1u8).arg(Wide([4; 64])).arg(2u8);
+        assert_eq!(a.slots, [(0, 1, 1), (64, 64, 64), (128, 1, 1)]);
     }
 
     #[test]

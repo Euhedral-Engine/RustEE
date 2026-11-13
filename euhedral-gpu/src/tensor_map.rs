@@ -5,7 +5,10 @@
 //! extents, traversal strides, interleave, swizzle, L2 promotion, out-of-bounds fill). On CUDA
 //! `cuda::TensorMap::tiled` (this type, built by the driver) encodes it with `cuTensorMapEncodeTiled`: a driver call that belongs
 //! to a prepare, never to a unit of work. [`TiledMap::check`] refuses what the driver's documented limits refuse (rank, zero
-//! extents, box and stride limits, alignments) before the driver is asked. In a kernel the argument is
+//! extents, box and stride limits, alignments) before the driver is asked; it covers the general limits only, and the driver
+//! still refuses the rest (32-byte address and strides for 32-byte interleave and the 16-byte-aligned packed types, the packed
+//! types' extent and box rules, a box row that is not a multiple of 16 bytes or wider than the swizzle span, interleave and
+//! swizzle combinations) as an error naming the call. In a kernel the argument is
 //! `const __grid_constant__ CUtensorMap map` and a copy is `cp.async.bulk.tensor` with its address. The map does not own the
 //! memory: whoever does keeps it allocated until the last kernel that reads it retired, and a value is a copy of bytes, so it
 //! needs no drop and no driver call to pass again.
@@ -204,8 +207,11 @@ pub struct TiledMap {
 }
 
 impl TiledMap {
-    /// Refuses what `cuTensorMapEncodeTiled` documents as invalid, as `GpuError::Invalid` naming the field, before the driver
-    /// is asked. It does not check what depends on the element's size (box width against the swizzle span): the driver does.
+    /// Refuses the general limits of `cuTensorMapEncodeTiled`, as `GpuError::Invalid` naming the field, before the driver is
+    /// asked. It is not the driver's whole list: the driver still refuses, as a call error, what depends on the element type
+    /// or the layout (a 32-byte address and strides for 32-byte interleave and the 16-byte-aligned packed types; the packed
+    /// types' `dims[0]` multiples and `box_dims[0] == 128`; a `box_dims[0]` times the element size that is not a multiple of
+    /// 16 bytes, or wider than the swizzle span; interleave and swizzle combinations).
     pub fn check(&self) -> Result<(), GpuError> {
         let bad = |what: String| Err(GpuError::Invalid(format!("tensor map: {what}")));
         let rank = self.rank as usize;
@@ -293,12 +299,13 @@ impl TensorMap {
         put(0, description.address);
         put(1, u64::from(description.data_type.code()));
         put(2, u64::from(description.rank));
-        for i in 0..MAX_RANK {
+        let rank = description.rank as usize;
+        for i in 0..rank {
             put(3 + i, description.dims[i]);
             put(8 + i, u64::from(description.box_dims[i]));
             put(13 + i, u64::from(description.element_strides[i]));
         }
-        for i in 0..MAX_RANK - 1 {
+        for i in 0..rank - 1 {
             put(18 + i, description.strides[i]);
         }
         put(
@@ -422,6 +429,73 @@ mod tests {
     }
 
     #[test]
+    fn the_documented_limits_are_accepted_at_the_edge_and_refused_past_it() {
+        // Accepted: 2^32 elements, a 256 box, a traversal stride of 8, rank 5, the largest byte stride under 2^40.
+        let edge = TiledMap {
+            rank: 5,
+            dims: [1 << 32; 5],
+            strides: [(1 << 40) - 16; 4],
+            box_dims: [256; 5],
+            element_strides: [8; 5],
+            ..tiled()
+        };
+        assert!(edge.check().is_ok());
+        refused(&TiledMap { rank: 6, ..edge }, "rank 6");
+        refused(
+            &TiledMap {
+                dims: [(1 << 32) + 1; 5],
+                ..edge
+            },
+            "dims[0]",
+        );
+        refused(
+            &TiledMap {
+                box_dims: [257; 5],
+                ..edge
+            },
+            "box_dims[0]",
+        );
+        refused(
+            &TiledMap {
+                element_strides: [9; 5],
+                ..edge
+            },
+            "element_strides[0]",
+        );
+        refused(
+            &TiledMap {
+                strides: [1 << 40; 4],
+                ..edge
+            },
+            "strides[0]",
+        );
+        refused(
+            &TiledMap {
+                strides: [(1 << 40) - 16, (1 << 40) - 16, (1 << 40) - 8, 16],
+                ..edge
+            },
+            "strides[2]",
+        );
+        refused(
+            &TiledMap {
+                strides: [0; 4],
+                ..edge
+            },
+            "strides[0]",
+        );
+        // Rank 3 with interleave is the smallest that is accepted.
+        assert!(
+            TiledMap {
+                rank: 3,
+                interleave: Interleave::B32,
+                ..edge
+            }
+            .check()
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn args_hold_a_tensor_map_on_its_own_alignment_and_give_its_bytes_back() {
         let mut words = [0u64; WORDS];
         for (i, w) in words.iter_mut().enumerate() {
@@ -489,5 +563,17 @@ mod tests {
             assert_ne!(a, TensorMap::fake(&changed).unwrap());
         }
         assert!(TensorMap::fake(&TiledMap { rank: 0, ..tiled() }).is_err());
+        // Entries past the rank are not part of it.
+        assert_eq!(
+            a,
+            TensorMap::fake(&TiledMap {
+                dims: [64, 32, 7, 8, 9],
+                strides: [256, 99, 98, 97],
+                box_dims: [16, 8, 5, 5, 5],
+                element_strides: [1, 1, 4, 4, 4],
+                ..tiled()
+            })
+            .unwrap()
+        );
     }
 }
