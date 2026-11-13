@@ -2,6 +2,7 @@
 
 use std::any::Any;
 
+use crate::api::check_pitched;
 use crate::hold::{Frozen, freeze};
 use crate::shape::{CopyKind, ShapeHasher};
 use euhedral_graph::{LaneId, Marker};
@@ -35,6 +36,14 @@ pub(crate) enum RecOp {
         dst: u64,
         src: u64,
         bytes: usize,
+    },
+    OnDevicePitched {
+        dst: u64,
+        dst_pitch: usize,
+        src: u64,
+        src_pitch: usize,
+        row_bytes: usize,
+        rows: usize,
     },
     Memset {
         dst: u64,
@@ -248,6 +257,46 @@ impl LaneEnqueue for FakeEnqueue<'_> {
             }
         }
         self.push(QOp::OnDevice { dst, src, bytes });
+        Ok(())
+    }
+
+    unsafe fn copy_pitched_on_device(
+        &mut self,
+        dst: u64,
+        dst_pitch: usize,
+        src: u64,
+        src_pitch: usize,
+        row_bytes: usize,
+        rows: usize,
+    ) -> Result<(), GpuError> {
+        check_pitched(dst_pitch, src_pitch, row_bytes, rows)?;
+        if let Some((rec, stream)) = &mut self.rec {
+            rec.hasher.copy_pitched(
+                *stream,
+                [dst, dst_pitch as u64],
+                [src, src_pitch as u64],
+                row_bytes as u64,
+                rows as u64,
+            );
+            if rec.mode == Mode::Record {
+                rec.ops.push(RecOp::OnDevicePitched {
+                    dst,
+                    dst_pitch,
+                    src,
+                    src_pitch,
+                    row_bytes,
+                    rows,
+                });
+            }
+        }
+        self.push(QOp::OnDevicePitched {
+            dst,
+            dst_pitch,
+            src,
+            src_pitch,
+            row_bytes,
+            rows,
+        });
         Ok(())
     }
 

@@ -170,6 +170,14 @@ pub(crate) enum QOp {
         src: u64,
         bytes: usize,
     },
+    OnDevicePitched {
+        dst: u64,
+        dst_pitch: usize,
+        src: u64,
+        src_pitch: usize,
+        row_bytes: usize,
+        rows: usize,
+    },
     Memset {
         dst: u64,
         value: u8,
@@ -492,6 +500,38 @@ impl FakeGpu {
                         st.memory
                             .bytes_mut(dst, bytes)
                             .map(|to| to.copy_from_slice(&data))
+                    })
+            }
+            QOp::OnDevicePitched {
+                dst,
+                dst_pitch,
+                src,
+                src_pitch,
+                row_bytes,
+                rows,
+            } => {
+                st.log.push(FakeOp::Copy { lane });
+                // The spans were checked at enqueue; there is nothing to copy when either count is zero.
+                let empty = rows == 0 || row_bytes == 0;
+                let span = |pitch: usize| {
+                    if empty {
+                        0
+                    } else {
+                        (rows - 1) * pitch + row_bytes
+                    }
+                };
+                st.memory
+                    .bytes(src, span(src_pitch))
+                    .map(<[u8]>::to_vec)
+                    .and_then(|data| {
+                        st.memory.bytes_mut(dst, span(dst_pitch)).map(|to| {
+                            if !empty {
+                                for row in 0..rows {
+                                    to[row * dst_pitch..][..row_bytes]
+                                        .copy_from_slice(&data[row * src_pitch..][..row_bytes]);
+                                }
+                            }
+                        })
                     })
             }
             QOp::Memset { dst, value, bytes } => {

@@ -27,6 +27,7 @@ const TAG_LAUNCH: u8 = 1;
 const TAG_COPY: u8 = 2;
 const TAG_MEMSET: u8 = 3;
 const TAG_ORDER: u8 = 4;
+const TAG_COPY_PITCHED: u8 = 5;
 
 impl ShapeHasher {
     fn put(&mut self, tag: u8, fields: &[u64]) {
@@ -57,6 +58,30 @@ impl ShapeHasher {
 
     pub fn copy(&mut self, stream: usize, kind: CopyKind, dst: u64, src: u64, bytes: u64) {
         self.put(TAG_COPY, &[stream as u64, kind as u64, dst, src, bytes]);
+    }
+
+    /// A device-to-device copy of `rows` rows of `row_bytes` bytes at the pitches given: another pitch, row length or
+    /// row count is another shape.
+    pub fn copy_pitched(
+        &mut self,
+        stream: usize,
+        dst: [u64; 2],
+        src: [u64; 2],
+        row_bytes: u64,
+        rows: u64,
+    ) {
+        self.put(
+            TAG_COPY_PITCHED,
+            &[
+                stream as u64,
+                dst[0],
+                dst[1],
+                src[0],
+                src[1],
+                row_bytes,
+                rows,
+            ],
+        );
     }
 
     pub fn memset(&mut self, stream: usize, dst: u64, value: u8, bytes: u64) {

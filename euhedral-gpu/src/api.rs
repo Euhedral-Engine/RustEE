@@ -385,11 +385,65 @@ pub trait LaneEnqueue {
     /// As [`copy_to_device`](Self::copy_to_device).
     unsafe fn copy_on_device(&mut self, dst: u64, src: u64, bytes: usize) -> Result<(), GpuError>;
 
+    /// Copies `rows` rows of `row_bytes` bytes each between device addresses: row `i` is read at
+    /// `src + i * src_pitch` and written at `dst + i * dst_pitch`. The bytes between the rows (the gaps of each pitch) are
+    /// neither read nor written, and the last row's gap is not part of either range.
+    ///
+    /// Each pitch is the distance in bytes between the starts of consecutive rows, and at least `row_bytes`
+    /// (`GpuError::Invalid` otherwise, as when `pitch * (rows - 1) + row_bytes` overflows `usize` for either side). With
+    /// zero `rows` or zero `row_bytes` nothing is copied, and nothing is enqueued on the device (the operation still
+    /// counts in a recorded shape). A copy whose rows are contiguous on both sides (`rows == 1`, or both pitches equal
+    /// to `row_bytes`) is one plain copy. Recorded into a graph, it replays as recorded; an update pass checks its
+    /// shape (the addresses, pitches, `row_bytes` and `rows`) like any other copy.
+    ///
+    /// # Safety
+    /// As [`copy_to_device`](Self::copy_to_device), for the bytes of every row; the source and destination rows do not
+    /// overlap.
+    unsafe fn copy_pitched_on_device(
+        &mut self,
+        dst: u64,
+        dst_pitch: usize,
+        src: u64,
+        src_pitch: usize,
+        row_bytes: usize,
+        rows: usize,
+    ) -> Result<(), GpuError>;
+
     /// Sets `bytes` at the device address `dst` to `value`.
     ///
     /// # Safety
     /// As [`copy_to_device`](Self::copy_to_device).
     unsafe fn memset(&mut self, dst: u64, value: u8, bytes: usize) -> Result<(), GpuError>;
+}
+
+/// Checks the arguments of [`LaneEnqueue::copy_pitched_on_device`] and returns the bytes of one side's range, which
+/// ends at the last row's last byte (`pitch * (rows - 1) + row_bytes`), as `(dst_span, src_span)`. Zero for both when
+/// there is nothing to copy.
+pub(crate) fn check_pitched(
+    dst_pitch: usize,
+    src_pitch: usize,
+    row_bytes: usize,
+    rows: usize,
+) -> Result<(usize, usize), GpuError> {
+    if dst_pitch < row_bytes || src_pitch < row_bytes {
+        return Err(GpuError::Invalid(format!(
+            "a pitched copy's row pitch ({dst_pitch} for the destination, {src_pitch} for the source) is shorter than its row ({row_bytes} bytes)"
+        )));
+    }
+    let span = |pitch: usize| {
+        (rows - 1)
+            .checked_mul(pitch)
+            .and_then(|n| n.checked_add(row_bytes))
+            .ok_or_else(|| {
+                GpuError::Invalid(format!(
+                    "a pitched copy of {rows} rows of {row_bytes} bytes at pitch {pitch} overflows the address range"
+                ))
+            })
+    };
+    if rows == 0 || row_bytes == 0 {
+        return Ok((0, 0));
+    }
+    Ok((span(dst_pitch)?, span(src_pitch)?))
 }
 
 /// A driver stream lent for the closure of a submission, for library calls that enqueue on a stream of their own accord. It

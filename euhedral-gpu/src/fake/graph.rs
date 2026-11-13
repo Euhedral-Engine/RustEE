@@ -101,6 +101,21 @@ impl FakeGraph {
                     src: *src,
                     bytes: *bytes,
                 },
+                RecOp::OnDevicePitched {
+                    dst,
+                    dst_pitch,
+                    src,
+                    src_pitch,
+                    row_bytes,
+                    rows,
+                } => QOp::OnDevicePitched {
+                    dst: *dst,
+                    dst_pitch: *dst_pitch,
+                    src: *src,
+                    src_pitch: *src_pitch,
+                    row_bytes: *row_bytes,
+                    rows: *rows,
+                },
                 RecOp::Memset { dst, value, bytes } => QOp::Memset {
                     dst: *dst,
                     value: *value,

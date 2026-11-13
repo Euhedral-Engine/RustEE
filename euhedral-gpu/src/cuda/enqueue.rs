@@ -3,8 +3,10 @@
 use std::any::Any;
 use std::ffi::c_void;
 
-use euhedral_memory::cuda::CuStream;
+use euhedral_memory::PitchedCopy;
+use euhedral_memory::cuda::{CuStream, Memcpy2D};
 
+use crate::api::check_pitched;
 use crate::hold::{Frozen, freeze};
 use crate::shape::{CopyKind, ShapeHasher};
 use crate::{
@@ -355,6 +357,53 @@ impl LaneEnqueue for CudaEnqueue<'_> {
         let f = self.gpu.device().driver.fns.memcpy_dtod_async;
         // SAFETY: as above.
         self.run("cuMemcpyDtoDAsync", |s| unsafe { f(dst, src, bytes, s) })
+    }
+
+    unsafe fn copy_pitched_on_device(
+        &mut self,
+        dst: u64,
+        dst_pitch: usize,
+        src: u64,
+        src_pitch: usize,
+        row_bytes: usize,
+        rows: usize,
+    ) -> Result<(), GpuError> {
+        check_pitched(dst_pitch, src_pitch, row_bytes, rows)?;
+        if let Some((rec, stream)) = &mut self.rec {
+            rec.hasher.copy_pitched(
+                *stream,
+                [dst, dst_pitch as u64],
+                [src, src_pitch as u64],
+                row_bytes as u64,
+                rows as u64,
+            );
+        }
+        if rows == 0 || row_bytes == 0 {
+            return Ok(());
+        }
+        if rows == 1 || (dst_pitch == row_bytes && src_pitch == row_bytes) {
+            let f = self.gpu.device().driver.fns.memcpy_dtod_async;
+            // SAFETY: as above; the rows are contiguous, so the range is `rows * row_bytes` (no overflow: it is the
+            // span `check_pitched` computed).
+            return self.run("cuMemcpyDtoDAsync", |s| unsafe {
+                f(dst, src, row_bytes * rows, s)
+            });
+        }
+        let description = Memcpy2D::pitched(
+            true,
+            true,
+            &PitchedCopy {
+                src,
+                src_pitch: src_pitch as u64,
+                dst,
+                dst_pitch: dst_pitch as u64,
+                row_bytes: row_bytes as u64,
+                rows: rows as u64,
+            },
+        );
+        let f = self.gpu.device().driver.fns.memcpy_2d_async;
+        // SAFETY: as above, for every row; the description outlives the calls, which read it before they return.
+        self.run("cuMemcpy2DAsync", |s| unsafe { f(&description, s) })
     }
 
     unsafe fn memset(&mut self, dst: u64, value: u8, bytes: usize) -> Result<(), GpuError> {
