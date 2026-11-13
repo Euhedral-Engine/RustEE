@@ -26,6 +26,14 @@ pub struct FakeModule {
     id: u64,
     /// The dynamic shared limit of each kernel looked up so far, shared by every handle of it.
     limits: Mutex<HashMap<String, Arc<AtomicU32>>>,
+    arch_specific: bool,
+}
+
+impl FakeModule {
+    /// Whether the module was asked for with `CompileOptions::arch_specific`.
+    pub fn arch_specific(&self) -> bool {
+        self.arch_specific
+    }
 }
 
 /// A fake kernel.
@@ -78,12 +86,13 @@ impl Module for FakeModule {
     fn from_source(
         gpu: &Arc<FakeGpu>,
         source: &str,
-        _options: &CompileOptions,
+        options: &CompileOptions,
     ) -> Result<Self, GpuError> {
         Ok(Self {
             gpu: gpu.clone(),
             id: hash_bytes(source.as_bytes()),
             limits: Mutex::default(),
+            arch_specific: options.arch_specific,
         })
     }
 
@@ -92,6 +101,7 @@ impl Module for FakeModule {
             gpu: gpu.clone(),
             id: hash_bytes(image),
             limits: Mutex::default(),
+            arch_specific: false,
         })
     }
 
