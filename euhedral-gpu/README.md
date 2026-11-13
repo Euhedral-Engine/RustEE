@@ -133,7 +133,9 @@ Asynchronous, backend-neutral GPU access for the RustEE control plane. A lattice
     callback runs, the continuation is emitted at once with `POISONED_STATUS`, so nothing is stranded.
 - **Kernels from outside.** A `Module` loads from `from_source` or from `from_image`; the crate enumerates no kernels.
   - `from_source` compiles CUDA C with NVRTC for the device's exact architecture (or PTX for the newest architecture
-    NVRTC knows, which the driver compiles forward), with the options, include paths and in-memory headers of
+    NVRTC knows, which the driver compiles forward; `CompileOptions::arch_specific` asks for the architecture-specific
+    `sm_XYa` machine code instead, and is an error naming the architecture when NVRTC does not list it, with no
+    fallback to the generic target or to PTX), with the options, include paths and in-memory headers of
     `CompileOptions`. With `cache_dir` set, the result is cached under a 128-bit hash of the source, the options, the
     headers, the include paths, the target and NVRTC's version. A cache entry that will not load is rebuilt, and writes
     are atomic renames.

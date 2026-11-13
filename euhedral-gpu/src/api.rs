@@ -141,6 +141,16 @@ pub trait Gpu: Send + Sync + fmt::Debug + Sized + 'static {
     fn update<F>(&self, graph: &mut Self::Graph, f: F) -> Result<(), GpuError>
     where
         F: FnOnce(&mut Self::Sequence<'_>) -> Result<(), GpuError>;
+
+    /// Whether `f` is the recording as it is: the same shape and the same arguments in every launch. Applies nothing
+    /// (it is an update pass that only compares). A sequence of another shape is `Err(ShapeChanged)`. `Ok(None)` is
+    /// "cannot tell" (the default, which does not run `f`): the caller falls back to [`update`](Self::update).
+    fn unchanged<F>(&self, _graph: &mut Self::Graph, _f: F) -> Result<Option<bool>, GpuError>
+    where
+        F: FnOnce(&mut Self::Sequence<'_>) -> Result<(), GpuError>,
+    {
+        Ok(None)
+    }
 }
 
 /// The submitter of one ordered queue of device work, and a lane of a [`LanePool`].
@@ -690,6 +700,11 @@ pub struct CompileOptions {
     pub cache_dir: Option<PathBuf>,
     /// The run-time compiler library to load, else the backend's search order.
     pub compiler: Option<PathBuf>,
+    /// Compile for the architecture-specific target of the device (`sm_XYa`, for example `sm_120a`), so kernels
+    /// that use instructions of one architecture variant compile. The module runs on that architecture only. When
+    /// the compiler does not list the device's exact architecture, the compile is an error; there is no fallback to
+    /// the generic target or to PTX. The target is part of the cache key.
+    pub arch_specific: bool,
 }
 
 /// How [`Gpu::rerecord`] made the new recording executable.

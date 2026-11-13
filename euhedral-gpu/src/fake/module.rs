@@ -14,6 +14,14 @@ use super::{FakeGpu, FakeKernelFn};
 pub struct FakeModule {
     gpu: Arc<FakeGpu>,
     id: u64,
+    arch_specific: bool,
+}
+
+impl FakeModule {
+    /// Whether the module was asked for with `CompileOptions::arch_specific`.
+    pub fn arch_specific(&self) -> bool {
+        self.arch_specific
+    }
 }
 
 /// A fake kernel.
@@ -48,11 +56,12 @@ impl Module for FakeModule {
     fn from_source(
         gpu: &Arc<FakeGpu>,
         source: &str,
-        _options: &CompileOptions,
+        options: &CompileOptions,
     ) -> Result<Self, GpuError> {
         Ok(Self {
             gpu: gpu.clone(),
             id: hash_bytes(source.as_bytes()),
+            arch_specific: options.arch_specific,
         })
     }
 
@@ -60,6 +69,7 @@ impl Module for FakeModule {
         Ok(Self {
             gpu: gpu.clone(),
             id: hash_bytes(image),
+            arch_specific: false,
         })
     }
 
