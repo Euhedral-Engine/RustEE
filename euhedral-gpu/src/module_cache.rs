@@ -185,6 +185,19 @@ mod tests {
     }
 
     #[test]
+    fn the_arch_specific_target_has_its_own_key() {
+        let generic = Inputs {
+            target: "sm_120".into(),
+            ..inputs()
+        };
+        let specific = Inputs {
+            target: "sm_120a".into(),
+            ..inputs()
+        };
+        assert_ne!(key(&generic), key(&specific));
+    }
+
+    #[test]
     #[allow(clippy::disallowed_methods, reason = "a test fixture")]
     fn stores_are_atomic_renames() {
         let dir = scratch("atomic");

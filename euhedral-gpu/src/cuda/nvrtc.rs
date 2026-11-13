@@ -21,6 +21,9 @@ type Program = *mut c_void;
 pub enum Target {
     /// Machine code (cubin) for `sm_XY`; the number is `X * 10 + Y`.
     Cubin(u32),
+    /// Machine code for the architecture-specific `sm_XYa`; the number is `X * 10 + Y`. It runs on that
+    /// architecture only, and `__CUDA_ARCH_SPECIFIC__` is defined while it compiles.
+    CubinSpecific(u32),
     /// PTX for `compute_XY`, which the driver compiles forward to the device.
     Ptx(u32),
 }
@@ -39,6 +42,31 @@ pub(crate) fn pick_target(supported: &[u32], sm: u32) -> Option<Target> {
             .max()
             .map(Target::Ptx)
     }
+}
+
+impl Target {
+    /// The name NVRTC is given as `--gpu-architecture`, and the name in the module cache key.
+    pub fn name(self) -> String {
+        match self {
+            Self::Cubin(sm) => format!("sm_{sm}"),
+            Self::CubinSpecific(sm) => format!("sm_{sm}a"),
+            Self::Ptx(cc) => format!("compute_{cc}"),
+        }
+    }
+
+    /// The extension of a cached image of this target.
+    pub fn extension(self) -> &'static str {
+        match self {
+            Self::Cubin(_) | Self::CubinSpecific(_) => "cubin",
+            Self::Ptx(_) => "ptx",
+        }
+    }
+}
+
+/// The architecture-specific target for a device of `sm` (`X * 10 + Y`) among the architectures NVRTC `supported`:
+/// only its exact architecture, never an older one, PTX or the generic target.
+pub(crate) fn pick_arch_specific_target(supported: &[u32], sm: u32) -> Option<Target> {
+    supported.contains(&sm).then_some(Target::CubinSpecific(sm))
 }
 
 /// A place to try loading the library from.
@@ -429,6 +457,18 @@ impl Nvrtc {
         })
     }
 
+    /// `sm_XYa` machine code for the device's exact architecture. An error that names the architecture when NVRTC
+    /// does not list it; there is no fallback to the generic target or to PTX.
+    pub fn arch_specific_target_for(&self, arch: (i32, i32)) -> Result<Target, GpuError> {
+        let sm = u32::try_from(arch.0 * 10 + arch.1).unwrap_or(0);
+        pick_arch_specific_target(&self.supported, sm).ok_or_else(|| {
+            GpuError::Load(format!(
+                "NVRTC {}.{} does not support the architecture sm_{sm}a",
+                self.version.0, self.version.1
+            ))
+        })
+    }
+
     /// Compiles `source` for `target`: a cubin, or PTX with a trailing NUL. `options.options` are passed as given,
     /// then the architecture and each include path.
     pub fn compile(
@@ -457,10 +497,7 @@ impl Nvrtc {
             .map(|(_, b)| cstr(b))
             .collect::<Result<Vec<_>, _>>()?;
         let mut flags: Vec<String> = options.options.clone();
-        flags.push(match target {
-            Target::Cubin(sm) => format!("--gpu-architecture=sm_{sm}"),
-            Target::Ptx(cc) => format!("--gpu-architecture=compute_{cc}"),
-        });
+        flags.push(format!("--gpu-architecture={}", target.name()));
         for path in &options.include_paths {
             flags.push(format!("--include-path={}", path.display()));
         }
@@ -512,7 +549,9 @@ impl Nvrtc {
             });
         }
         let (size_fn, get_fn, call) = match target {
-            Target::Cubin(_) => (self.fns.get_cubin_size, self.fns.get_cubin, "nvrtcGetCUBIN"),
+            Target::Cubin(_) | Target::CubinSpecific(_) => {
+                (self.fns.get_cubin_size, self.fns.get_cubin, "nvrtcGetCUBIN")
+            }
             Target::Ptx(_) => (self.fns.get_ptx_size, self.fns.get_ptx, "nvrtcGetPTX"),
         };
         let mut size = 0usize;
@@ -609,5 +648,19 @@ mod tests {
         // A device older than everything NVRTC knows has no target.
         assert_eq!(pick_target(&supported, 61), None);
         assert_eq!(pick_target(&[], 120), None);
+    }
+
+    #[test]
+    fn the_arch_specific_target_is_the_exact_architecture_or_nothing() {
+        let supported = [80, 90, 100, 120];
+        let target = pick_arch_specific_target(&supported, 120).unwrap();
+        assert_eq!(target, Target::CubinSpecific(120));
+        assert_eq!(target.name(), "sm_120a");
+        assert_ne!(target.name(), Target::Cubin(120).name());
+        assert_eq!(target.extension(), "cubin");
+        // Not listed: an error, never the generic target, an older architecture or PTX.
+        assert_eq!(pick_arch_specific_target(&supported, 121), None);
+        assert_eq!(pick_arch_specific_target(&supported, 89), None);
+        assert_eq!(pick_arch_specific_target(&[], 120), None);
     }
 }
