@@ -1,7 +1,6 @@
 //! The CUDA allocation backends.
 
 use std::ffi::c_void;
-use std::os::fd::{FromRawFd, OwnedFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -10,11 +9,32 @@ use euhedral_data_structures::queues::{Consumer, MpmcQueue, Multi, Producer};
 use super::{
     AccessDesc, AllocationProp, CuDevicePtr, CuMemHandle, CuMemPool, CuStream, CudaError, Device,
     MEM_ACCESS_FLAGS_READWRITE, MEM_ALLOC_GRANULARITY_MINIMUM, MEM_ALLOCATION_TYPE_PINNED,
-    MEM_HANDLE_TYPE_NONE, MEM_HANDLE_TYPE_POSIX_FD, MEM_LOCATION_TYPE_DEVICE,
-    MEMPOOL_ATTR_RELEASE_THRESHOLD, MemLocation, STREAM_NON_BLOCKING,
+    MEM_HANDLE_TYPE_NONE, MEM_HANDLE_TYPE_SHAREABLE, MEM_LOCATION_TYPE_DEVICE,
+    MEMPOOL_ATTR_RELEASE_THRESHOLD, MemLocation, STREAM_NON_BLOCKING, ShareableHandle,
 };
 use crate::backend::{AllocError, Backend, Block};
 use crate::planner::LocationId;
+
+/// The security attributes an exportable allocation is created with: the default descriptor, the handle not
+/// inheritable. The driver requires them for an NT handle (`CU_MEM_HANDLE_TYPE_WIN32`); no other handle type reads
+/// them.
+fn default_security() -> *mut c_void {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+        struct Shared(SECURITY_ATTRIBUTES);
+        // SAFETY: immutable, and its descriptor pointer is null.
+        unsafe impl Sync for Shared {}
+        static DEFAULT: Shared = Shared(SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: std::ptr::null_mut(),
+            bInheritHandle: 0,
+        });
+        (&raw const DEFAULT.0).cast_mut().cast()
+    }
+    #[cfg(not(windows))]
+    std::ptr::null_mut()
+}
 
 /// `CUDA_ERROR_OUT_OF_MEMORY`.
 const OUT_OF_MEMORY: i32 = 2;
@@ -265,7 +285,7 @@ impl Vmm {
         AllocationProp {
             kind: MEM_ALLOCATION_TYPE_PINNED,
             requested_handle_types: if exportable {
-                MEM_HANDLE_TYPE_POSIX_FD
+                MEM_HANDLE_TYPE_SHAREABLE
             } else {
                 MEM_HANDLE_TYPE_NONE
             },
@@ -273,7 +293,11 @@ impl Vmm {
                 kind: MEM_LOCATION_TYPE_DEVICE,
                 id: device.ordinal,
             },
-            win32_handle_meta_data: std::ptr::null_mut(),
+            win32_handle_meta_data: if exportable {
+                default_security()
+            } else {
+                std::ptr::null_mut()
+            },
             compression_type: 0,
             gpu_direct_rdma_capable: 0,
             usage: 0,
@@ -344,22 +368,31 @@ impl Vmm {
         })
     }
 
-    /// A new POSIX fd for the allocation (the caller owns it; Vulkan's import takes it).
-    pub fn export_fd(&self, block: &VmmBlock) -> Result<OwnedFd, CudaError> {
+    /// A new shareable handle for the allocation (the caller owns it; the other API's import takes it): a POSIX fd
+    /// on Unix, an NT handle on Windows.
+    pub fn export_fd(&self, block: &VmmBlock) -> Result<ShareableHandle, CudaError> {
         let d = &self.device;
         let _c = d.enter()?;
-        let mut fd: i32 = -1;
-        // SAFETY: an int out pointer for a POSIX fd handle.
+        #[cfg(unix)]
+        let mut raw: i32 = -1;
+        #[cfg(windows)]
+        let mut raw: *mut c_void = std::ptr::null_mut();
+        // SAFETY: an out pointer of the handle's type (`int` for a POSIX fd, `HANDLE` for an NT handle).
         d.check("cuMemExportToShareableHandle", unsafe {
             (d.driver.fns.mem_export_to_shareable_handle)(
-                (&raw mut fd).cast::<c_void>(),
+                (&raw mut raw).cast::<c_void>(),
                 block.handle,
-                MEM_HANDLE_TYPE_POSIX_FD,
+                MEM_HANDLE_TYPE_SHAREABLE,
                 0,
             )
         })?;
-        // SAFETY: a new fd from the driver, owned by the caller.
-        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+        // SAFETY: a new handle from the driver, owned by the caller.
+        #[cfg(unix)]
+        let owned = unsafe { std::os::fd::FromRawFd::from_raw_fd(raw) };
+        // SAFETY: as above.
+        #[cfg(windows)]
+        let owned = unsafe { std::os::windows::io::FromRawHandle::from_raw_handle(raw) };
+        Ok(owned)
     }
 
     /// # Safety

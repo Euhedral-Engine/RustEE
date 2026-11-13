@@ -79,7 +79,6 @@ dependencies = [
  "euhedral-hardware-utils",
  "euhedral-hashing",
  "euhedral-memory",
- "libc",
  "loom",
 ]
 
@@ -132,6 +131,7 @@ dependencies = [
  "euhedral-graph",
  "euhedral-hashing",
  "libc",
+ "windows-sys",
 ]
 
 [[package]]

@@ -1,22 +1,25 @@
-//! The CUDA driver backend (feature `cuda`): `libcuda.so.1` loaded with `dlopen` at run time, so building needs no
-//! CUDA toolkit and a machine without a driver only loses this module.
+//! The CUDA driver backend (feature `cuda`): `libcuda.so.1` (Linux) or `nvcuda.dll` (Windows) loaded at run time
+//! through [`loader`], so building needs no CUDA toolkit and a machine without a driver only loses this module.
 //!
 //! - [`Driver`]: the entry points this crate uses, and [`Device`]: a device's primary context, made current around
 //!   each call.
 //! - Backends ([`backends`]): [`DeviceMemory`] (`cuMemAlloc`), [`StreamPool`] (`cuMemAllocAsync` from the device's
-//!   default pool, kept by a release threshold), [`Vmm`] (`cuMemCreate` + `cuMemMap`, exportable as a POSIX fd that
-//!   Vulkan imports with `VK_KHR_external_memory_fd`) and [`PinnedHost`] (`cuMemHostAlloc`, released buffers kept by
+//!   default pool, kept by a release threshold), [`Vmm`] (`cuMemCreate` + `cuMemMap`, exportable as a
+//!   [`ShareableHandle`]: a POSIX fd that Vulkan imports with `VK_KHR_external_memory_fd`, or a Win32 handle for
+//!   `VK_KHR_external_memory_win32`) and [`PinnedHost`] (`cuMemHostAlloc`, released buffers kept by
 //!   power-of-two size class up to a limit: a pinned free synchronizes the device).
 //! - [`StreamCopier`]: the [`Copier`](crate::Copier) between a device and host memory for the tiers' moves:
 //!   `cuMemcpy*Async` on one stream, completion by a ring of events created once.
 
 mod backends;
 mod copier;
+pub mod loader;
 
 pub use backends::{DeviceMemory, PinnedHost, StreamPool, Vmm, VmmBlock};
 pub use copier::StreamCopier;
 
 use euhedral_data_structures::sync::{HotScope, LifecycleMutex};
+use loader::Library;
 use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
 use std::fmt;
 use std::sync::{Arc, OnceLock};
@@ -163,12 +166,37 @@ pub struct ExternalMemoryBufferDesc {
 
 pub type CuExternalMemory = *mut c_void;
 pub const EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD: c_uint = 1;
+/// `CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32`: an NT handle (not a KMT handle).
+pub const EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32: c_uint = 2;
+/// The handle type the platform imports: an fd on Unix, an NT handle on Windows.
+pub const EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE: c_uint = if cfg!(windows) {
+    EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32
+} else {
+    EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD
+};
 /// `CUDA_EXTERNAL_MEMORY_DEDICATED`: the memory is a Vulkan dedicated allocation.
 pub const EXTERNAL_MEMORY_DEDICATED: c_uint = 1;
 
 pub const MEM_ALLOCATION_TYPE_PINNED: c_int = 1;
 pub const MEM_HANDLE_TYPE_NONE: c_int = 0;
 pub const MEM_HANDLE_TYPE_POSIX_FD: c_int = 1;
+pub const MEM_HANDLE_TYPE_WIN32: c_int = 2;
+/// The handle type the platform exports allocations as: a POSIX fd on Unix, an NT handle on Windows.
+pub const MEM_HANDLE_TYPE_SHAREABLE: c_int = if cfg!(windows) {
+    MEM_HANDLE_TYPE_WIN32
+} else {
+    MEM_HANDLE_TYPE_POSIX_FD
+};
+/// The owned form of a shareable allocation handle: an `OwnedFd` on Unix, an `OwnedHandle` on Windows. It closes
+/// itself on drop. [`Vmm::export_fd`] returns one and [`Device::import_fd`] takes one; the names say "fd" on both
+/// platforms.
+#[cfg(unix)]
+pub type ShareableHandle = std::os::fd::OwnedFd;
+/// The owned form of a shareable allocation handle: an `OwnedFd` on Unix, an `OwnedHandle` on Windows. It closes
+/// itself on drop. [`Vmm::export_fd`] returns one and [`Device::import_fd`] takes one; the names say "fd" on both
+/// platforms.
+#[cfg(windows)]
+pub type ShareableHandle = std::os::windows::io::OwnedHandle;
 pub const MEM_LOCATION_TYPE_DEVICE: c_int = 1;
 pub const MEM_ACCESS_FLAGS_READWRITE: c_int = 3;
 pub const MEM_ALLOC_GRANULARITY_MINIMUM: c_int = 0;
@@ -185,12 +213,12 @@ macro_rules! driver_fns {
 
         impl Fns {
             /// # Safety
-            /// `lib` is a live `dlopen` handle of the CUDA driver library.
-            unsafe fn load(lib: *mut c_void) -> Result<Self, String> {
+            /// `lib` is the CUDA driver library, and stays loaded for the process.
+            unsafe fn load(lib: &Library) -> Result<Self, String> {
                 Ok(Fns {
                     $( $field: {
-                        // SAFETY: a NUL-terminated name; the handle is live.
-                        let p = unsafe { libc::dlsym(lib, concat!($sym, "\0").as_ptr() as *const c_char) };
+                        let name = CStr::from_bytes_with_nul(concat!($sym, "\0").as_bytes()).map_err(|e| e.to_string())?;
+                        let p = lib.symbol(name);
                         if p.is_null() {
                             return Err(format!("libcuda: no {}", $sym));
                         }
@@ -257,8 +285,8 @@ type ErrorNameFn = unsafe extern "C" fn(CuResult, *mut *const c_char) -> CuResul
 pub struct Driver {
     pub fns: Fns,
     error_name: ErrorNameFn,
-    /// The `dlopen` handle, kept as an integer so `Driver` stays `Send + Sync`. The library is never closed.
-    lib: usize,
+    /// The driver library, never closed.
+    lib: Library,
 }
 
 impl fmt::Debug for Driver {
@@ -284,18 +312,15 @@ impl fmt::Display for CudaError {
 impl std::error::Error for CudaError {}
 
 impl Driver {
-    /// Loads `libcuda.so.1` and runs `cuInit`.
+    /// Loads the driver library ([`loader::DRIVER_LIBRARY`]: `libcuda.so.1`, or `nvcuda.dll` on Windows) and runs
+    /// `cuInit`. A machine without the library gets `Err("<library> not found")`.
     pub fn load() -> Result<Arc<Self>, String> {
-        // SAFETY: a NUL-terminated library name; the handle is never closed (the driver stays for the process).
-        let lib =
-            unsafe { libc::dlopen(c"libcuda.so.1".as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL) };
-        if lib.is_null() {
-            return Err("libcuda.so.1 not found".into());
-        }
-        // SAFETY: the handle is live.
-        let fns = unsafe { Fns::load(lib)? };
-        // SAFETY: as above.
-        let p = unsafe { libc::dlsym(lib, c"cuGetErrorName".as_ptr()) };
+        // The driver stays for the process: the library is never closed.
+        let lib = Library::open(loader::DRIVER_LIBRARY)
+            .map_err(|_| format!("{} not found", loader::DRIVER_LIBRARY))?;
+        // SAFETY: the library is loaded and stays so.
+        let fns = unsafe { Fns::load(&lib)? };
+        let p = lib.symbol(c"cuGetErrorName");
         if p.is_null() {
             return Err("libcuda: no cuGetErrorName".into());
         }
@@ -304,7 +329,7 @@ impl Driver {
         let d = Driver {
             fns,
             error_name,
-            lib: lib as usize,
+            lib,
         };
         // SAFETY: flags must be 0.
         d.check("cuInit", unsafe { (d.fns.init)(0) })
@@ -337,8 +362,7 @@ impl Driver {
 
     /// An entry point beyond [`Fns`], looked up in the loaded library; null when the driver lacks it.
     pub fn symbol(&self, name: &CStr) -> *mut c_void {
-        // SAFETY: the handle is live for the process (never closed) and `name` is NUL-terminated.
-        unsafe { libc::dlsym(self.lib as *mut c_void, name.as_ptr()) }
+        self.lib.symbol(name)
     }
 
     /// `Ok` for `CUDA_SUCCESS`, else the error with its name.
@@ -485,20 +509,19 @@ impl Device {
         self.driver.check(call, code)
     }
 
-    /// Imports memory another API exported as an opaque fd (a Vulkan allocation) and maps `size` bytes of it.
-    /// CUDA takes the fd on success.
+    /// Imports memory another API exported as an opaque handle (a Vulkan allocation) and maps `size` bytes of it.
+    /// On Unix the handle is a POSIX fd and CUDA takes it on success. On Windows it is an NT handle, which CUDA
+    /// does not take: it is closed when this call returns, the import keeping its own reference.
     pub fn import_fd(
         &self,
-        fd: std::os::fd::OwnedFd,
+        handle: ShareableHandle,
         size: u64,
         dedicated: bool,
     ) -> Result<Imported<'_>, CudaError> {
-        use std::os::fd::IntoRawFd;
         let f = &self.driver.fns;
         let _c = self.enter()?;
-        let raw = fd.into_raw_fd();
-        let desc = ExternalMemoryHandleDesc {
-            kind: EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD,
+        let mut desc = ExternalMemoryHandleDesc {
+            kind: EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE,
             handle: ExternalHandle {
                 win32: [std::ptr::null_mut(); 2],
             },
@@ -510,17 +533,31 @@ impl Device {
             },
             reserved: [0; 16],
         };
-        let mut desc = desc;
-        desc.handle.fd = raw;
-        let mut ext = std::ptr::null_mut();
-        // SAFETY: a valid descriptor; on success CUDA owns the fd.
-        if let Err(e) = self.check("cuImportExternalMemory", unsafe {
-            (f.import_external_memory)(&mut ext, &desc)
-        }) {
-            // SAFETY: the import failed: the fd is still ours.
-            unsafe { libc::close(raw) };
-            return Err(e);
+        #[cfg(unix)]
+        let raw = {
+            use std::os::fd::IntoRawFd;
+            let raw = handle.into_raw_fd();
+            desc.handle.fd = raw;
+            raw
+        };
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            desc.handle.win32 = [handle.as_raw_handle(), std::ptr::null_mut()];
         }
+        let mut ext = std::ptr::null_mut();
+        // SAFETY: a valid descriptor; on success (Unix) CUDA owns the fd, and on Windows the handle stays ours and
+        // is closed when `handle` drops.
+        let imported = self.check("cuImportExternalMemory", unsafe {
+            (f.import_external_memory)(&mut ext, &desc)
+        });
+        #[cfg(unix)]
+        if imported.is_err() {
+            use std::os::fd::FromRawFd;
+            // SAFETY: the import failed: the fd is still ours.
+            drop(unsafe { ShareableHandle::from_raw_fd(raw) });
+        }
+        imported?;
         let buf = ExternalMemoryBufferDesc {
             offset: 0,
             size,
