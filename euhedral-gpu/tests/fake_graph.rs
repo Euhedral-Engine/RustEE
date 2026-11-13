@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use euhedral_gpu::fake::{FakeGpu, FakeKernel, FakeModule, FakeStream};
+use euhedral_gpu::fake::{FakeGpu, FakeKernel, FakeModule, FakeOp, FakeStream};
 use euhedral_gpu::{
     Args, CompileOptions, Enqueue, Gpu, GpuError, Graph, LaneEnqueue, Launch, Module, Rerecorded,
     Sequence, Stream, StreamOptions,
@@ -523,7 +523,7 @@ fn the_fake_reports_whether_a_launch_was_programmatic() {
         .log()
         .iter()
         .filter_map(|op| match op {
-            euhedral_gpu::fake::FakeOp::Launch { programmatic, .. } => Some(*programmatic),
+            FakeOp::Launch { programmatic, .. } => Some(*programmatic),
             _ => None,
         })
         .collect();

@@ -1,6 +1,6 @@
 //! The driver launch of one kernel: `cuLaunchKernel`, or `cuLaunchKernelEx` for a programmatic dependent launch.
 
-use std::ffi::{c_uint, c_void};
+use std::ffi::{c_int, c_uint, c_void};
 
 use euhedral_memory::cuda::CuStream;
 
@@ -28,6 +28,15 @@ struct LaunchConfig {
     stream: CuStream,
     attributes: *const LaunchAttribute,
     attribute_count: c_uint,
+}
+
+/// The driver call a launch goes through, for errors.
+pub(crate) fn launch_call(launch: &Launch) -> &'static str {
+    if launch.programmatic {
+        "cuLaunchKernelEx"
+    } else {
+        "cuLaunchKernel"
+    }
 }
 
 /// Whether the driver can make this launch: a programmatic one needs `cuLaunchKernelEx`.
@@ -80,7 +89,8 @@ pub(crate) unsafe fn issue(
         pad: [0; 4],
         value: [0; 8],
     };
-    attribute.value[0] = 1;
+    // SAFETY: the value is 64 bytes at an 8-byte alignment; its first four hold the attribute's int.
+    unsafe { attribute.value.as_mut_ptr().cast::<c_int>().write(1) };
     let config = LaunchConfig {
         grid: [launch.grid.x, launch.grid.y, launch.grid.z],
         block: [launch.block.x, launch.block.y, launch.block.z],

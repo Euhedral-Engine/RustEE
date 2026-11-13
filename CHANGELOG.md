@@ -12,7 +12,7 @@ semantics and the tests that pin it.
 **How to use it.** `Launch::linear(n, block).programmatic(true)`, and the kernel calls `asm volatile("griddepcontrol.wait;");` before it reads the previous kernel's output (without the wait the kernel races). Needs compute capability 9.0 or newer. A struct literal of `Launch` needs the new field; a match on `FakeOp::Launch` needs `..`.
 
 **Semantics.**
-- A recording captures the launch with the attribute, so the captured graph holds a programmatic edge. An update pass only changes node parameters and keeps it.
+- A recording captures the launch with the attribute, so the captured graph holds a programmatic edge (the device test reads the edge type through the `test-hooks` method `CudaGraph::edge_types_into`, and sees a plain edge without the flag). An update pass only changes node parameters, never the edges; the executable's edges are not queryable, so the test pins the results after an update, not the edge.
 - The flag is in the fingerprint: a body with the flag never matches a graph recorded without it (`ShapeChanged` on an update, a re-record in a graph cache), nor the reverse.
 - If the loaded driver has no `cuLaunchKernelEx`, a programmatic launch is `GpuError::Invalid` at the launch call; launches without the flag work as before.
 - The fake backend carries the flag and reports it in `FakeOp::Launch`.
