@@ -363,6 +363,19 @@ mod compiler {
     const OPS: &str = include_str!("kernels/ops.cu");
 
     #[test]
+    fn an_architecture_nvrtc_does_not_list_is_an_error_naming_it() {
+        let Ok(nvrtc) = Nvrtc::shared(None) else {
+            eprintln!("no NVRTC: skipped");
+            return;
+        };
+        let r = nvrtc.arch_specific_target_for((99, 9));
+        assert!(
+            matches!(&r, Err(GpuError::Load(m)) if m.contains("sm_999a")),
+            "{r:?}"
+        );
+    }
+
+    #[test]
     fn nvrtc_compiles_for_this_device() {
         let Some(gpu) = gpu() else { return };
         let Ok(nvrtc) = Nvrtc::shared(None) else {
@@ -676,6 +689,13 @@ extern "C" __global__ void report(unsigned* out) {
         }
         if gpu.arch().0 < 9 {
             eprintln!("no architecture-specific target before sm_90: skipped");
+            return;
+        }
+        let Ok(nvrtc) = Nvrtc::shared(None) else {
+            return;
+        };
+        if let Err(e) = nvrtc.arch_specific_target_for(gpu.arch()) {
+            eprintln!("NVRTC does not list this device: skipped ({e})");
             return;
         }
         let specific = CompileOptions {

@@ -64,9 +64,9 @@ impl Target {
 }
 
 /// The architecture-specific target for a device of `sm` (`X * 10 + Y`) among the architectures NVRTC `supported`:
-/// only its exact architecture, never an older one, PTX or the generic target.
+/// only its exact architecture, never an older one, PTX or the generic target. There is no such target below sm_90.
 pub(crate) fn pick_arch_specific_target(supported: &[u32], sm: u32) -> Option<Target> {
-    supported.contains(&sm).then_some(Target::CubinSpecific(sm))
+    (sm >= 90 && supported.contains(&sm)).then_some(Target::CubinSpecific(sm))
 }
 
 /// A place to try loading the library from.
@@ -661,6 +661,12 @@ mod tests {
         // Not listed: an error, never the generic target, an older architecture or PTX.
         assert_eq!(pick_arch_specific_target(&supported, 121), None);
         assert_eq!(pick_arch_specific_target(&supported, 89), None);
+        // No `a` variant below sm_90, even when NVRTC lists the architecture.
+        assert_eq!(pick_arch_specific_target(&[80, 89, 90], 89), None);
+        assert_eq!(
+            pick_arch_specific_target(&[80, 89, 90], 90),
+            Some(Target::CubinSpecific(90))
+        );
         assert_eq!(pick_arch_specific_target(&[], 120), None);
     }
 }
