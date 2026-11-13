@@ -49,13 +49,14 @@ mod ring;
 mod shape;
 mod spans;
 mod sync;
+mod tensor_map;
 
 pub use api::{
-    CompileOptions, Enqueue, Gpu, Graph, Kernel, Lane, LaneEnqueue, LaneStream, Lanes, Module,
-    POISONED_STATUS, RawStream, Rerecorded, RetireListener, RetireTicket, Sequence, Stream,
-    StreamOptions, StreamPriority,
+    CompileOptions, Enqueue, Gpu, Graph, Kernel, KernelOptions, Lane, LaneEnqueue, LaneStream,
+    Lanes, Module, POISONED_STATUS, RawStream, Rerecorded, RetireListener, RetireTicket, Sequence,
+    Stream, StreamOptions, StreamPriority,
 };
-pub use args::{ArgMismatch, Args, Dim3, KernelArg, Launch, MAX_ARGS};
+pub use args::{ArgMismatch, Args, Dim3, KernelArg, Launch, MAX_ALIGN, MAX_ARGS};
 pub use error::GpuError;
 pub use graph_cache::{DEFAULT_GRAPHS, GraphBody, GraphCache, GraphStats, Ran, SharedGraphCache};
 pub use hold::GraphHold;
@@ -65,6 +66,9 @@ pub use poison::Poison;
 pub use retire::{OnceFrame, RetireError, UNPOLLED_RETIREMENTS, retire_into, retire_into_with};
 pub use shape::{CopyKind, Fingerprint, ShapeHasher};
 pub use spans::Span;
+pub use tensor_map::{
+    Interleave, L2Promotion, MAX_RANK, MapDataType, OobFill, Swizzle, TensorMap, TiledMap,
+};
 
 /// Compiles and runs the examples in the crate README as doctests.
 #[cfg(doctest)]

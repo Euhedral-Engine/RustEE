@@ -19,13 +19,14 @@ Asynchronous, backend-neutral GPU access for the RustEE control plane. A lattice
 
 | Module | Main types |
 |---|---|
-| [`api`](src/api.rs) | The traits: `Gpu`, `Stream`, `Lane`, `LaneEnqueue`, `Enqueue`, `Module`, `Kernel`, `Sequence`, `Graph`, `RetireListener`; `RetireTicket`, `StreamOptions`, `StreamPriority`, `CompileOptions`, `Rerecorded`, `Span` (timed spans, `Stream::span_*`). |
+| [`api`](src/api.rs) | The traits: `Gpu`, `Stream`, `Lane`, `LaneEnqueue`, `Enqueue`, `Module`, `Kernel`, `Sequence`, `Graph`, `RetireListener`; `RetireTicket`, `StreamOptions`, `StreamPriority`, `CompileOptions`, `KernelOptions`, `Rerecorded`, `Span` (timed spans, `Stream::span_*`). |
 | [`lanes`](src/lanes.rs) | `LaneSubmit` for the backends' streams, and `open_lane_sources`: a device's lanes as a pool, its intakes and a `LaneSource` per lane (`LaneSpec`, `OpenedLanes`); `open_shared_lanes`: a device's lanes as a typed pool that any worker submits to (`SharedLanes`). |
 | [`ring`](src/ring.rs) | The lock-free marker ring behind a lane's markers: numbers claimed by compare-and-set, completion found by an in-order scan, the awaiters' pins. No driver; loom-checked. |
 | [`cuda::texture`](src/cuda/texture.rs) | `TexObject`, `View`: texture objects over pitched device memory (filter, address and coordinate modes). |
+| [`tensor_map`](src/tensor_map.rs), [`cuda::tensor_map`](src/cuda/tensor_map.rs) | `TensorMap`, `TiledMap`: the 128-byte, 64-aligned `CUtensorMap` a kernel takes by value for the Tensor Memory Accelerator (compute capability 9.0 and newer); `TensorMap::tiled` encodes one with `cuTensorMapEncodeTiled`, `TensorMap::fake` (feature `fake`) stands in without a driver. |
 | [`graph_cache`](src/graph_cache.rs) | `GraphCache`: an owned lane's graphs by key (a hit updates and replays, a miss records, a warm-up only records), `SharedGraphCache`: the same through a shared lane for any number of workers (instances by key), `GraphBody`, `Ran`. |
 | [`hold`](src/hold.rs) | `GraphHold`: what the work of a run on a shared lane reads, held by the caller until the work ended. |
-| [`args`](src/args.rs) | `KernelArg`, `Args` (the typed argument builder, rewritable in place), `Launch`, `Dim3`. |
+| [`args`](src/args.rs) | `KernelArg`, `Args` (the typed argument builder, rewritable in place), `Launch` (geometry and the programmatic-launch flag), `Dim3`. |
 | [`error`](src/error.rs) | `GpuError`, the one error type. |
 | [`poison`](src/poison.rs) | `Poison`: a device's first fault, set once. |
 | [`kept`](src/kept.rs) | The values a submitter keeps until a retirement is confirmed (a `PlainQueue`), and the frozen values a recording shares. |
@@ -133,17 +134,26 @@ Asynchronous, backend-neutral GPU access for the RustEE control plane. A lattice
     callback runs, the continuation is emitted at once with `POISONED_STATUS`, so nothing is stranded.
 - **Kernels from outside.** A `Module` loads from `from_source` or from `from_image`; the crate enumerates no kernels.
   - `from_source` compiles CUDA C with NVRTC for the device's exact architecture (or PTX for the newest architecture
-    NVRTC knows, which the driver compiles forward), with the options, include paths and in-memory headers of
+    NVRTC knows, which the driver compiles forward; `CompileOptions::arch_specific` asks for the architecture-specific
+    `sm_XYa` machine code instead, and is an error naming the architecture when NVRTC does not list it, with no
+    fallback to the generic target or to PTX), with the options, include paths and in-memory headers of
     `CompileOptions`. With `cache_dir` set, the result is cached under a 128-bit hash of the source, the options, the
     headers, the include paths, the target and NVRTC's version. A cache entry that will not load is rebuilt, and writes
     are atomic renames.
   - `from_image` takes PTX, a cubin or a fatbin that the application produced in its own build. No NVRTC is needed.
-  - NVRTC is loaded with `dlopen`. The search order is the explicit `CompileOptions::compiler`, then `EUHEDRAL_NVRTC`,
-    then the loader's own search, then `$CUDA_HOME/lib64`, `$CUDA_PATH/lib64`, `/usr/local/cuda/lib64` and
-    `/usr/local/cuda-*/lib64`.
+  - NVRTC is loaded at run time (`dlopen` on Linux, `LoadLibrary` on Windows). The search order on Linux is the
+    explicit `CompileOptions::compiler`, then `EUHEDRAL_NVRTC`, then the loader's own search, then `$CUDA_HOME/lib64`,
+    `$CUDA_PATH/lib64`, `/usr/local/cuda/lib64` and `/usr/local/cuda-*/lib64`. On Windows it is the explicit path,
+    `EUHEDRAL_NVRTC`, `nvrtc64_130_0.dll` and `nvrtc64_120_0.dll` found by walking the absolute entries of `PATH`
+    (where a toolkit's installer adds its `bin`; the working directory is never searched), then `bin\x64` and `bin` of
+    `%CUDA_HOME%` and `%CUDA_PATH%`. An absolute file path is loaded with its own directory searched first, so NVRTC
+    finds its builtins library beside it.
   - `Module::kernel(name)` looks a kernel up by its unmangled symbol (declare kernels `extern "C"`). `Args` packs the
     arguments (`Args::new().device(addr).arg(2.5f32)`); where the driver reports the kernel's parameter sizes, a launch
     with arguments that do not fit is `Err(Args)` before the driver sees it.
+  - `Module::kernel_with(name, KernelOptions { max_dynamic_shared_bytes })` opts the kernel in, once at the lookup, to
+    more dynamic shared memory than the driver's default; a launch above the kernel's limit is `Err(Invalid)` naming
+    the kernel, the bytes and the limit. Repeated lookups only raise the limit.
 - **Recurring sequences.**
   - `Gpu::record(&mut [&mut a, &mut b], |q| ...)` runs the closure once for real and records it. The same code path then serves
     `fingerprint` (a probe: nothing reaches the device) and `update` (new argument values: launch *n* of the update
@@ -344,7 +354,7 @@ source, and the last frame hands it back to the source that stops it.
 | Feature | What it adds |
 |---|---|
 | `fake` | `FakeGpu`: a deterministic device for tests of code built on this crate. The crate's own tests enable it through a dev-dependency on itself. |
-| `cuda` | The CUDA backend, on the driver and primary context `euhedral-memory` loads (`Driver::shared`): one library, one context. Linux. |
+| `cuda` | The CUDA backend, on the driver and primary context `euhedral-memory` loads (`Driver::shared`): one library, one context. Linux and Windows. |
 
 The traits and the fake compile on every platform the workspace builds on.
 

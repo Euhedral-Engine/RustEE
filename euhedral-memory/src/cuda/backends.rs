@@ -1,7 +1,6 @@
 //! The CUDA allocation backends.
 
 use std::ffi::c_void;
-use std::os::fd::{FromRawFd, OwnedFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -10,11 +9,43 @@ use euhedral_data_structures::queues::{Consumer, MpmcQueue, Multi, Producer};
 use super::{
     AccessDesc, AllocationProp, CuDevicePtr, CuMemHandle, CuMemPool, CuStream, CudaError, Device,
     MEM_ACCESS_FLAGS_READWRITE, MEM_ALLOC_GRANULARITY_MINIMUM, MEM_ALLOCATION_TYPE_PINNED,
-    MEM_HANDLE_TYPE_NONE, MEM_HANDLE_TYPE_POSIX_FD, MEM_LOCATION_TYPE_DEVICE,
-    MEMPOOL_ATTR_RELEASE_THRESHOLD, MemLocation, STREAM_NON_BLOCKING,
+    MEM_HANDLE_TYPE_NONE, MEM_HANDLE_TYPE_SHAREABLE, MEM_LOCATION_TYPE_DEVICE,
+    MEMPOOL_ATTR_RELEASE_THRESHOLD, MemLocation, STREAM_NON_BLOCKING, ShareableHandle,
 };
 use crate::backend::{AllocError, Backend, Block};
 use crate::planner::LocationId;
+
+/// The `OBJECT_ATTRIBUTES` an exportable allocation is created with (`win32HandleMetaData`): only its length set, so
+/// the handle gets the default security descriptor and no name. The driver requires it for an NT handle
+/// (`CU_MEM_HANDLE_TYPE_WIN32`); no other handle type reads it.
+fn default_object_attributes() -> *mut c_void {
+    #[cfg(windows)]
+    {
+        /// `OBJECT_ATTRIBUTES` (winternl.h): 48 bytes on 64-bit Windows.
+        #[repr(C)]
+        struct ObjectAttributes {
+            length: u32,
+            root_directory: *mut c_void,
+            object_name: *mut c_void,
+            attributes: u32,
+            security_descriptor: *mut c_void,
+            security_quality_of_service: *mut c_void,
+        }
+        // SAFETY: immutable, and every pointer in it is null.
+        unsafe impl Sync for ObjectAttributes {}
+        static DEFAULT: ObjectAttributes = ObjectAttributes {
+            length: size_of::<ObjectAttributes>() as u32,
+            root_directory: std::ptr::null_mut(),
+            object_name: std::ptr::null_mut(),
+            attributes: 0,
+            security_descriptor: std::ptr::null_mut(),
+            security_quality_of_service: std::ptr::null_mut(),
+        };
+        (&raw const DEFAULT).cast_mut().cast()
+    }
+    #[cfg(not(windows))]
+    std::ptr::null_mut()
+}
 
 /// `CUDA_ERROR_OUT_OF_MEMORY`.
 const OUT_OF_MEMORY: i32 = 2;
@@ -216,8 +247,9 @@ impl Drop for StreamPool {
     }
 }
 
-/// A VMM allocation: physical memory (`cuMemCreate`) mapped at a reserved address, optionally exportable as a POSIX
-/// fd for Vulkan (`VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT`).
+/// A VMM allocation: physical memory (`cuMemCreate`) mapped at a reserved address, optionally exportable as a
+/// [`ShareableHandle`]: a POSIX fd for Vulkan (`VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT`) on Unix, an NT handle
+/// (`..._OPAQUE_WIN32_BIT`) on Windows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VmmBlock {
     pub ptr: CuDevicePtr,
@@ -265,7 +297,7 @@ impl Vmm {
         AllocationProp {
             kind: MEM_ALLOCATION_TYPE_PINNED,
             requested_handle_types: if exportable {
-                MEM_HANDLE_TYPE_POSIX_FD
+                MEM_HANDLE_TYPE_SHAREABLE
             } else {
                 MEM_HANDLE_TYPE_NONE
             },
@@ -273,7 +305,11 @@ impl Vmm {
                 kind: MEM_LOCATION_TYPE_DEVICE,
                 id: device.ordinal,
             },
-            win32_handle_meta_data: std::ptr::null_mut(),
+            win32_handle_meta_data: if exportable {
+                default_object_attributes()
+            } else {
+                std::ptr::null_mut()
+            },
             compression_type: 0,
             gpu_direct_rdma_capable: 0,
             usage: 0,
@@ -344,22 +380,31 @@ impl Vmm {
         })
     }
 
-    /// A new POSIX fd for the allocation (the caller owns it; Vulkan's import takes it).
-    pub fn export_fd(&self, block: &VmmBlock) -> Result<OwnedFd, CudaError> {
+    /// A new shareable handle for the allocation (the caller owns it; the other API's import takes it): a POSIX fd
+    /// on Unix, an NT handle on Windows.
+    pub fn export_fd(&self, block: &VmmBlock) -> Result<ShareableHandle, CudaError> {
         let d = &self.device;
         let _c = d.enter()?;
-        let mut fd: i32 = -1;
-        // SAFETY: an int out pointer for a POSIX fd handle.
+        #[cfg(unix)]
+        let mut raw: i32 = -1;
+        #[cfg(windows)]
+        let mut raw: *mut c_void = std::ptr::null_mut();
+        // SAFETY: an out pointer of the handle's type (`int` for a POSIX fd, `HANDLE` for an NT handle).
         d.check("cuMemExportToShareableHandle", unsafe {
             (d.driver.fns.mem_export_to_shareable_handle)(
-                (&raw mut fd).cast::<c_void>(),
+                (&raw mut raw).cast::<c_void>(),
                 block.handle,
-                MEM_HANDLE_TYPE_POSIX_FD,
+                MEM_HANDLE_TYPE_SHAREABLE,
                 0,
             )
         })?;
-        // SAFETY: a new fd from the driver, owned by the caller.
-        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+        // SAFETY: a new handle from the driver, owned by the caller.
+        #[cfg(unix)]
+        let owned = unsafe { std::os::fd::FromRawFd::from_raw_fd(raw) };
+        // SAFETY: as above.
+        #[cfg(windows)]
+        let owned = unsafe { std::os::windows::io::FromRawHandle::from_raw_handle(raw) };
+        Ok(owned)
     }
 
     /// # Safety

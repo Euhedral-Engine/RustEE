@@ -463,6 +463,88 @@ fn workers_running_one_key_at_once_each_get_an_instance_and_every_replay_runs() 
     drop((recorded, replayed));
 }
 
+/// A key that covers every argument may ask for a hit to replay the recording as it is: on a real device the words end
+/// as they do when the same units run eagerly (the cache off).
+#[test]
+fn hits_replayed_as_recorded_give_the_results_of_the_eager_run() {
+    const UNITS: u32 = 5;
+    let Some(gpu) = gpu() else { return };
+    let Some(module) = module(&gpu) else { return };
+    let (_mem, block) = device_word(&gpu);
+    let pinned = Pinned::new(&gpu);
+    let add = module.kernel("add_u32").unwrap();
+    let lanes = lanes(&gpu, 1);
+    let lane = lanes.pool.lane(LaneId(0)).clone();
+
+    struct Add {
+        kernel: CudaKernel,
+        word: u64,
+    }
+    impl GraphBody<CudaGpu> for Add {
+        fn enqueue<E: Enqueue<Kernel = CudaKernel>>(
+            &mut self,
+            enq: &mut E,
+        ) -> Result<(), GpuError> {
+            // SAFETY: the device word is live.
+            unsafe {
+                enq.launch(
+                    &self.kernel,
+                    Launch::linear(1, 1),
+                    &Args::new()
+                        .device(self.word)
+                        .device(self.word)
+                        .arg(3u32)
+                        .arg(1u32),
+                )
+            }
+        }
+    }
+
+    // Word 0 runs through the cache with the option on; word 1 runs eagerly.
+    let run_units = |t: u64, cache: &SharedGraphCache<CudaGpu, u32>| {
+        let mut hold = GraphHold::new();
+        let mut body = Add {
+            kernel: add.clone(),
+            word: block.addr + 4 * t,
+        };
+        let mut ran = Vec::new();
+        for unit in 0..UNITS {
+            ran.push(if unit == 0 {
+                cache.warm(&gpu, &lane, 7, &mut body, &mut hold).unwrap()
+            } else {
+                cache.run(&gpu, &lane, 7, &mut body, &mut hold).unwrap()
+            });
+        }
+        (ran, hold)
+    };
+    let cached = SharedGraphCache::<CudaGpu, u32>::with_capacity(4);
+    cached.set_replay_as_recorded(true);
+    let (ran, hold) = run_units(0, &cached);
+    assert_eq!(ran[0], Ran::Recorded);
+    assert!(ran[1..].iter().all(|r| *r == Ran::Replayed), "{ran:?}");
+    let eager = SharedGraphCache::<CudaGpu, u32>::with_capacity(4);
+    eager.set_enabled(false);
+    let (ran, hold_eager) = run_units(1, &eager);
+    assert!(ran.iter().all(|r| *r == Ran::Direct));
+    let host = pinned.word();
+    for t in 0..2usize {
+        let (_, marker) = lane
+            .submit_marked(|q| {
+                // SAFETY: the pinned block holds the words; the device words are live.
+                unsafe { q.copy_to_host(host.bytes().add(4 * t), block.addr + 4 * t as u64, 4) }
+            })
+            .unwrap();
+        assert!(wait_until(Duration::from_secs(10), || lanes
+            .queues
+            .reached(marker)));
+    }
+    // SAFETY: the copies ended.
+    let seen = |t: usize| unsafe { ((host.bytes() as *const u32).add(t)).read_volatile() };
+    assert_eq!(seen(0), 3 * UNITS);
+    assert_eq!(seen(0), seen(1), "as the eager run");
+    drop((hold, hold_eager));
+}
+
 /// Under contention a replay never makes a private stream once the lane is warm: a take that scanned past a handle another
 /// worker moved retries instead of missing (a miss makes a stream, events and a box on the frame path), and a give always
 /// lands. Six workers replay one key for thousands of rounds: the lane made at most one stream per worker, however the

@@ -78,7 +78,8 @@ fn ops_on_one_stream_run_in_submission_order() {
             FakeOp::Memset { lane: 0 },
             FakeOp::Launch {
                 lane: 0,
-                kernel: "add1".into()
+                kernel: "add1".into(),
+                programmatic: false
             },
             FakeOp::Copy { lane: 0 },
         ]
@@ -222,7 +223,9 @@ fn submitters_move_to_their_own_threads_and_stay_contiguous() {
         let names: Vec<&str> = log
             .iter()
             .filter_map(|o| match o {
-                FakeOp::Launch { lane: l, kernel } if *l == lane => Some(kernel.as_str()),
+                FakeOp::Launch {
+                    lane: l, kernel, ..
+                } if *l == lane => Some(kernel.as_str()),
                 _ => None,
             })
             .collect();
@@ -645,4 +648,18 @@ fn a_stream_opened_with_no_spans_refuses_them() {
         )
         .unwrap();
     assert!(matches!(s[0].span_begin(), Err(GpuError::Invalid(_))));
+}
+
+#[test]
+fn the_fake_module_records_the_arch_specific_option() {
+    let gpu = FakeGpu::new();
+    let build = |arch_specific| {
+        let options = CompileOptions {
+            arch_specific,
+            ..CompileOptions::default()
+        };
+        euhedral_gpu::fake::FakeModule::from_source(&gpu, "// fake source", &options).unwrap()
+    };
+    assert!(build(true).arch_specific());
+    assert!(!build(false).arch_specific());
 }

@@ -141,6 +141,16 @@ pub trait Gpu: Send + Sync + fmt::Debug + Sized + 'static {
     fn update<F>(&self, graph: &mut Self::Graph, f: F) -> Result<(), GpuError>
     where
         F: FnOnce(&mut Self::Sequence<'_>) -> Result<(), GpuError>;
+
+    /// Whether `f` is the recording as it is: the same shape and the same arguments in every launch. Applies nothing
+    /// (it is an update pass that only compares). A sequence of another shape is `Err(ShapeChanged)`. `Ok(None)` is
+    /// "cannot tell" (the default, which does not run `f`): the caller falls back to [`update`](Self::update).
+    fn unchanged<F>(&self, _graph: &mut Self::Graph, _f: F) -> Result<Option<bool>, GpuError>
+    where
+        F: FnOnce(&mut Self::Sequence<'_>) -> Result<(), GpuError>,
+    {
+        Ok(None)
+    }
 }
 
 /// The submitter of one ordered queue of device work, and a lane of a [`LanePool`].
@@ -512,8 +522,48 @@ pub trait Module: Send + Sync + fmt::Debug + Sized {
     /// Loads a prebuilt image (PTX, cubin or fatbin for CUDA).
     fn from_image(gpu: &Arc<Self::Gpu>, image: &[u8]) -> Result<Self, GpuError>;
 
-    /// The kernel named `name` (its unmangled symbol).
+    /// The kernel named `name` (its unmangled symbol), with the driver's default limits: the same as
+    /// `kernel_with(name, KernelOptions::default())`.
     fn kernel(&self, name: &str) -> Result<<Self::Gpu as Gpu>::Kernel, GpuError>;
+
+    /// The kernel named `name`, opted in to `options` once, here, never on the launch path. A value the device
+    /// refuses is an error that names the kernel and the value.
+    ///
+    /// The limit belongs to the kernel of the module, not to the handle: looking the same kernel up again with a
+    /// larger `max_dynamic_shared_bytes` raises the limit for every handle of it, and a lookup with a smaller one
+    /// (or none) never lowers it. A launch whose `shared_bytes` exceed the limit is `GpuError::Invalid`, naming the
+    /// kernel, the bytes asked and the limit.
+    ///
+    /// The default is for a backend with no options: default options are `kernel`, any other is `Invalid`.
+    fn kernel_with(
+        &self,
+        name: &str,
+        options: KernelOptions,
+    ) -> Result<<Self::Gpu as Gpu>::Kernel, GpuError> {
+        if options == KernelOptions::default() {
+            self.kernel(name)
+        } else {
+            Err(GpuError::Invalid(format!(
+                "{name}: kernel options are not supported by this backend"
+            )))
+        }
+    }
+}
+
+/// What a kernel is opted in to when it is looked up ([`Module::kernel_with`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KernelOptions {
+    /// The most dynamic shared memory, in bytes, a launch of the kernel may ask for. 0 leaves the driver's default.
+    /// A value above the default needs the opt-in; the device refuses a value it cannot give.
+    pub max_dynamic_shared_bytes: u32,
+}
+
+/// The error of a launch that asks for more dynamic shared memory than its kernel is opted in to.
+pub(crate) fn over_shared_limit(kernel: &str, asked: u32, limit: u32) -> GpuError {
+    GpuError::Invalid(format!(
+        "{kernel}: a launch asks for {asked} bytes of dynamic shared memory, the kernel allows {limit} \
+         (look it up with `Module::kernel_with` to raise the limit)"
+    ))
 }
 
 /// A recurring sequence of submissions over a fixed set of streams, run as a recording, a probe or an update.
@@ -690,6 +740,11 @@ pub struct CompileOptions {
     pub cache_dir: Option<PathBuf>,
     /// The run-time compiler library to load, else the backend's search order.
     pub compiler: Option<PathBuf>,
+    /// Compile for the architecture-specific target of the device (`sm_XYa`, for example `sm_120a`), so kernels
+    /// that use instructions of one architecture variant compile. The module runs on that architecture only. When
+    /// the compiler does not list the device's exact architecture, the compile is an error; there is no fallback to
+    /// the generic target or to PTX. The target is part of the cache key.
+    pub arch_specific: bool,
 }
 
 /// How [`Gpu::rerecord`] made the new recording executable.

@@ -24,6 +24,114 @@ semantics and the tests that pin it.
 
 **Tests.** `testing::stage::tests`: `run_shows_the_context_it_was_given_and_what_it_submitted`, `a_failing_stage_is_seen_as_failed`, `a_held_run_shows_its_gate_and_how_it_is_spent`, `a_gate_dropped_unspent_arrives_as_fatal_and_held_given_to_fail_too`, `pass_gate_shows_whether_it_held`, `a_second_hold_in_a_run_panics_as_in_a_graph`, `the_abandoned_hook_is_called_with_the_queue_of_the_lane_given`, `the_abandoned_hook_gets_the_lane_it_is_given_not_another`, `the_stage_sees_the_id_it_was_given`, `a_gate_is_spent_for_the_stage_id_of_the_harness`, `waits_are_normalised_as_the_graph_does`, `the_run_says_what_a_graph_makes_of_the_answer`, `pass_gate_says_what_a_graph_makes_of_the_answer`, and (debug builds) `hot::a_lifecycle_lock_in_run_is_a_violation_as_in_a_graph`, `hot::a_lifecycle_lock_in_pass_gate_is_a_violation_as_in_a_graph`; and the doctest on `StageHarness`.
 
+## A kernel can take a tensor map by value (2026-11-13)
+
+**What.** `TensorMap` (exactly 128 bytes, `#[repr(C, align(64))]`, a `KernelArg`), `TiledMap` (the description), the enums `MapDataType`, `Interleave`, `Swizzle`, `L2Promotion`, `OobFill`, and `MAX_RANK` (5), at the crate root. `TensorMap::tiled(&CudaGpu, &TiledMap)` (feature `cuda`) encodes one with `cuTensorMapEncodeTiled`; `TiledMap::check` refuses an invalid description first; `TensorMap::fake(&TiledMap)` (feature `fake`) makes a stand-in. `MAX_ALIGN` (64) is the largest alignment `Args` takes. `GpuFns` gains `tensor_map_encode_tiled`, an `Option`.
+
+**Why.** A kernel that moves tiles with the Tensor Memory Accelerator (compute capability 9.0 and newer) needs a driver-encoded descriptor of the global tensor as a by-value argument: the call was not bound, and `Args` refused an argument aligned above 16 bytes, which the descriptor is.
+
+**Breaking:** none for callers. `Args` used to panic on an argument aligned above 16 bytes and now takes up to 64 (placed at an offset of its alignment); only a type that was refused before is affected. `GpuFns` is a public struct with a new field, so **Migration:** code that builds one by a struct literal adds `tensor_map_encode_tiled` (nothing in this repository does).
+
+**How to use it.** In a prepare, `TensorMap::tiled(&gpu, &TiledMap { address, data_type, rank, dims, strides, box_dims, element_strides, interleave, swizzle, l2_promotion, oob_fill })` with the tensor's device address, then `Args::new()...arg(map)` for a parameter declared `const __grid_constant__ CUtensorMap map`, in a lane, eager, recorded or updated. Keep the memory allocated until the last kernel that reads it retired. The map is a copy of bytes: no drop, and no driver call to pass it again.
+
+**Semantics.**
+- `Args` storage is unchanged (16-byte aligned) and an argument is placed at an offset that is a multiple of its alignment, as before, so the offsets, layout hash and bytes of every argument list of alignment 16 or less are the same as they were; a 64-aligned argument is placed at a 64-aligned offset. The driver reads each argument through the pointer the launch gives it, for the size of the kernel's parameter (`cuLaunchKernel` takes an array of pointers and lays the parameter buffer out from the kernel's own offsets), so the host address is no condition of the launch. An argument aligned above 64 bytes is still refused with a panic.
+- The shape fingerprint and an argument's layout hash see a tensor map as 128 bytes at alignment 64, like any value: another map is the same shape, so a recorded launch updates in place with it.
+- `tiled` makes the context current for the call (the driver wants one) and is a host-side computation. `check` covers the general limits only; the driver still refuses the rest (a 32-byte address and strides for 32-byte interleave and the 16-byte-aligned packed types, the packed types' extent multiples and `box_dims[0] == 128`, a `box_dims[0]` times the element size that is not a multiple of 16 bytes or is wider than the swizzle span, interleave and swizzle combinations) as a call error naming `cuTensorMapEncodeTiled`. `check` refuses a rank outside 1 to 5, an address off 16 bytes, a zero or over-2^32 extent, a box over 256, a traversal stride outside 1 to 8, a byte stride that is zero, off 16 or over 2^40, interleave below rank 3, and the NaN fill for a non-floating-point type, as `GpuError::Invalid` naming the field. A driver without the call (older than CUDA 12.0) gives an `Invalid` saying libcuda has no `cuTensorMapEncodeTiled`.
+- The value types are in every backend's build; the fake map is a deterministic function of its description and no descriptor a device could use, so a fake-backed test can record, replay and update a launch that takes one.
+- The alignment is 64, as the driver's documentation requires of the map's address; the CUDA 13 header declares `alignas(128)`, which nothing on the host depends on.
+
+**Tests.** Unit: size, alignment and `KernelArg`; each refusal of `check`; `Args` offsets, layout hash and bytes of small-alignment lists are as they were (literal expected values), a 64-aligned argument sits at a 64-aligned offset, `Args` holds a map after other arguments and gives its bytes back, `set` and `assign` move it whole, an argument aligned to 128 is still refused; the fake map follows its description. `tests/fake_tensor_map.rs`: a kernel with a map is recorded, fingerprinted, updated and replayed. Device: `tests/cuda_tensor_map.rs` `a_tile_copied_through_a_tensor_map_equals_its_source` (a kernel copies one tile through `cp.async.bulk.tensor` into shared memory and out; the result equals the source tile eagerly, from a recording, its replay and the replay after an update, and a map one row down reads the tile one row down, so a wrong or shifted descriptor fails it; skips below compute capability 9.0 or without the call). `tests/cuda_tensor_map_untiled.rs` `a_map_that_was_never_encoded_fails_the_launch_fast` (a kernel given an all-zero map faults or traps and its launch retires as a failure within a bounded time instead of hanging; its own process, since a fault poisons the context).
+
+## The CUDA backend builds and runs on Windows (2026-11-13)
+
+**What.** Feature `cuda` of `euhedral-memory` and `euhedral-gpu` now builds for Windows and drives the card through `nvcuda.dll`.
+- `euhedral_memory::cuda::loader::Library` is the one dynamic-loader wrapper: `open(name)`, `symbol(name)`, `require(name)` and `file_of(address)`. `dlopen`, `dlsym` and `dladdr` on Unix; `LoadLibraryExW`, `GetProcAddress` and `GetModuleHandleExW` with `GetModuleFileNameW` on Windows. `loader::DRIVER_LIBRARY` is `libcuda.so.1` or `nvcuda.dll`.
+- `cuda::ShareableHandle` is `std::os::fd::OwnedFd` on Unix and `std::os::windows::io::OwnedHandle` on Windows. `Vmm::export_fd` returns it and `Device::import_fd` takes it (the names are unchanged).
+- NVRTC is found on Windows through its own search order (below).
+- `StreamCallback` is `unsafe extern "system" fn`, the declaration of `CUDA_CB`.
+- CI runs the CUDA clippy and test steps of both crates on the Windows runner as well.
+- The `alloc_sweep` and `copy_rate` examples (POSIX fds, `mmap`) are Unix programs; on Windows they print a note and exit. `libc` is a dependency on Unix only; `euhedral-gpu` no longer depends on it.
+
+**Why.** The backend was Linux only: it called `dlopen("libcuda.so.1")` and `dlsym` directly, exported allocations as `OwnedFd`, and found NVRTC with `dladdr` and `.so` names. A program on Windows could not drive an NVIDIA card through `euhedral-gpu`.
+
+**How to use it.** On Linux nothing changes (`ShareableHandle` is `OwnedFd`). On Windows build with `--features cuda`; with no driver `Driver::load()` is `Err("nvcuda.dll not found")` and the device tests skip. Code that passed an `OwnedFd` between `Vmm::export_fd` and `Device::import_fd` names `ShareableHandle` to be portable.
+
+**Semantics.**
+- Library names: `Library::open` is `unsafe` (loading runs the library's initialisers). On Unix a name goes to the dynamic linker. On Windows a bare name is looked for in the system directory only (`LOAD_LIBRARY_SEARCH_SYSTEM32`: never the working directory or `PATH`), an absolute path is loaded with `LOAD_WITH_ALTERED_SEARCH_PATH` so the libraries it depends on (NVRTC's builtins) are looked for beside it, and a relative path is an error. A failed open is `"<name>: <loader's reason>"`; a missing symbol is `"no <symbol>"` (`"libcuda: no <symbol>"` from the driver tables, `"nvrtc: no <symbol>"` from NVRTC, as before). A library is never closed.
+- NVRTC on Windows, in order: the explicit `CompileOptions::compiler` (only it, when given); `EUHEDRAL_NVRTC`; the files `nvrtc64_130_0.dll` and `nvrtc64_120_0.dll` found by walking the absolute entries of `PATH` (the loader's own search is not used: it would try the working directory); then `bin\x64` and `bin` of `CUDA_HOME` and `CUDA_PATH`, each directory's `nvrtc64_<N>_0.dll` files newest first. The `nvrtc-builtins64_*.dll` files beside a chosen file are loaded first. The Linux order is unchanged.
+- Windows export: an allocation made exportable is created with handle type `CU_MEM_HANDLE_TYPE_WIN32` and an `OBJECT_ATTRIBUTES` as `win32HandleMetaData` (the type `cuda.h` documents: only its length set, so the default descriptor and no name); `export_fd` returns an NT handle that the caller owns and closes by dropping it.
+- Windows import: `CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32`. CUDA does not take ownership of an NT handle, so `import_fd` closes the handle it was given when it returns (the import holds its own reference). On Unix CUDA takes the fd on success and `import_fd` closes it on failure, as before.
+- Type widths: no binding uses `long` or `unsigned long`; sizes are `usize` (`size_t`), addresses `u64` (`unsigned long long`), so LLP64 changes nothing.
+- Not verified on a Windows machine with a card: see the tests.
+
+**Tests.** No device needed, on both platforms: `cuda::loader::tests` (`a_missing_library_is_an_error_naming_it`, `a_name_with_a_nul_is_an_error` (asserts the message), `the_driver_library_is_found_or_reported_by_name`, `a_missing_symbol_is_named`, `a_symbol_is_found_and_its_file_is_the_library`, `an_address_outside_any_library_has_no_file`); `cuda::nvrtc::tests::the_windows_search_order_is_explicit_env_names_then_toolkit_bins` and `the_builtins_library_is_recognised_by_platform_name` (the Windows order is a pure function, tested on every host). The existing device tests (`tests/cuda.rs`, `tests/cuda_*.rs`) compile for Windows and skip when `Driver::load()` fails. With a card on Windows: `cargo test -p euhedral-memory --features cuda` and `cargo test -p euhedral-gpu --features cuda`, in particular `vmm_exports_a_shareable_handle`.
+
+## A kernel can be opted in to more dynamic shared memory (2026-11-13)
+
+**What.** `Module::kernel_with(name, KernelOptions { max_dynamic_shared_bytes })`, beside `Module::kernel`, which is unchanged and equal to `kernel_with(name, KernelOptions::default())`. `KernelOptions` is `Default` (0 leaves the driver's default). `CudaKernel::max_dynamic_shared_bytes()` (an `Option`: `None` when the driver would not report its default and the kernel was not opted in) and `FakeKernel::max_dynamic_shared_bytes()` report the limit.
+
+**Why.** A launch that asks for more dynamic shared memory than the driver's default fails in the driver, which wants the kernel opted in with `cuFuncSetAttribute` first; nothing in the crate could do that, and the driver's error does not say which kernel or how many bytes.
+
+**Migration.** Nothing breaks: `Module::kernel_with` is a provided method that forwards default options to `kernel` and refuses any other as `Invalid`; the CUDA and fake backends override it. An implementor of `Module` outside this repository compiles unchanged.
+
+**How to use it.** `module.kernel_with("name", KernelOptions { max_dynamic_shared_bytes: 64 * 1024 })`, then `Launch { shared_bytes: 64 * 1024, ..Launch::linear(n, block) }`.
+
+**Semantics.**
+- On CUDA a value above the kernel's current limit is set once, at the lookup, with `cuFuncSetAttribute(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES)`; the launch path makes no driver call for it. A value the device refuses is an error at the lookup that names the kernel and the value.
+- The limit belongs to the kernel of the module, as the driver's attribute does: every handle of it shares one limit. A second lookup with a larger value raises it for all handles; a lookup with a smaller value or none never lowers it. The limit is the largest value any lookup asked for.
+- A launch (lane, eager, recorded or probed: the check is first, in every mode, one load and a compare) whose `shared_bytes` exceed the limit is `GpuError::Invalid` from the crate, naming the kernel, the bytes asked and the limit, and nothing is enqueued; it comes before the argument-size check. If the driver will not report the default (or reports a value that is no size), the limit is unknown: every opt-in with a value above the largest one set is made, and a launch is left to the driver until one has. Without an opt-in the limit is the driver's own value for the kernel, read at its first lookup with `cuFuncGetAttribute`, not a constant of the crate. `shared_bytes` is in the shape fingerprint, and an update reuses the recorded launch and kernel and changes only arguments, so a recorded launch cannot exceed its limit later.
+- The fake backend records the option and fails a launch above the limit the same way; its limit without an opt-in is `fake::DEFAULT_DYNAMIC_SHARED_BYTES` (48 KiB) and a value above `fake::MAX_DYNAMIC_SHARED_BYTES` (227 KiB) is refused at the lookup; both are what the fake models, no fact about a device.
+
+**Tests.** `tests/fake_kernel_options.rs` (the option is recorded, a default lookup equals default options, a launch above the limit is the named error, in a lane, a recording and a probe, and enqueues and runs nothing; an opted-in launch up to the limit; repeated lookups; a value above the device's maximum refused); device: `tests/cuda_dynamic_shared.rs` `a_launch_with_64_kib_of_dynamic_shared_memory_runs_after_opt_in`.
+
+## A launch can be a programmatic dependent launch (2026-11-13)
+
+**What.** `Launch` gains `programmatic: bool` (false from `Launch::linear`) and the builder-style `Launch::programmatic(bool)`. On CUDA a programmatic launch goes through `cuLaunchKernelEx` with `CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION` set to 1; any other launch still goes through `cuLaunchKernel`, unchanged. The flag is part of the shape fingerprint. `FakeOp::Launch` gains `programmatic`.
+
+**Why.** A kernel that reads what the previous kernel on its stream wrote can overlap its own start-up with the previous kernel's tail, and wait for the data itself, but only if it is launched with the attribute; a lane had no way to ask for it, eagerly or in a graph.
+
+**How to use it.** `Launch::linear(n, block).programmatic(true)`, and the kernel calls `asm volatile("griddepcontrol.wait;");` before it reads the previous kernel's output (without the wait the kernel races). Needs compute capability 9.0 or newer. A struct literal of `Launch` needs the new field; a match on `FakeOp::Launch` needs `..`.
+
+**Semantics.**
+- A recording captures the launch with the attribute, so the captured graph holds a programmatic edge (the device test reads the edge type through the `test-hooks` method `CudaGraph::edge_types_into`, and sees a plain edge without the flag). An update pass only changes node parameters, never the edges; the executable's edges are not queryable, so the test pins the results after an update, not the edge.
+- The flag is in the fingerprint: a body with the flag never matches a graph recorded without it (`ShapeChanged` on an update, a re-record in a graph cache), nor the reverse.
+- If the loaded driver has no `cuLaunchKernelEx`, a programmatic launch is `GpuError::Invalid` at the launch call; launches without the flag work as before.
+- The fake backend carries the flag and reports it in `FakeOp::Launch`.
+
+**Tests.** `tests/fake_graph.rs`: `the_programmatic_flag_changes_the_fingerprint_and_a_body_with_it_does_not_hit_a_recording_without`, `the_fake_reports_whether_a_launch_was_programmatic`; the shape tests in `shape.rs`; device: `tests/cuda_programmatic.rs` `a_programmatic_chain_gives_the_same_result_eagerly_and_from_a_recorded_updated_graph`.
+
+## A hit can replay the recording as it is (2026-11-13)
+
+**What.** `SharedGraphCache::set_replay_as_recorded(bool)`, off by default. With it on, a hit launches the recorded graph without running the body. `Gpu` gains `unchanged`, an update pass that only compares; its default answers `Ok(None)` ("cannot tell"), and the debug check then falls back to the update pass, which catches a changed shape only.
+
+**Why.** Every hit ran the body as an update pass: the whole body on the host, a hash of its shape and a comparison of every launch's arguments. For a recurring unit whose key already fixes every buffer and size, that pass is pure cost.
+
+**How to use it.** Call `set_replay_as_recorded(true)` on the shared cache. **The caller promises that the key covers every argument of the body**: every address, size and value of every launch, and the shape. Two units under one key must be the same launches with the same arguments. Also, **the body does nothing outside its enqueues**: no writes to host buffers, no errors that matter; a release build never runs it on a hit, and a debug build runs it only through the comparing pass, so a violation of this is not caught. A key that forgets a field replays the instance's current arguments (the recording's, or those of the last update made while the option was off) silently, in a release build.
+
+**Semantics.**
+- The option is an atomic of the shared cache: it may change while threads run, and a run reads it once, at its start. Off, nothing changes.
+- A miss records as before, and a recording is the same either way.
+- Release builds run no pass on a hit. Builds with `debug_assertions` still run one, with `Gpu::unchanged`, which applies nothing, and panic if it finds a changed argument or another shape, or a body that now asks for a library stream; the message says that the key does not cover them.
+- A hit that replays this way counts in `replays`, as any replay.
+
+**Tests.** `graph_cache::shared_tests`: `a_hit_replayed_as_recorded_runs_no_pass_of_the_body` (asserts no call of the body in a release build, one per hit in a debug build), `a_hit_replayed_as_recorded_panics_when_the_key_hides_a_changed_argument`, `a_hit_replayed_as_recorded_panics_when_the_key_hides_a_changed_shape`, `a_hit_replayed_as_recorded_panics_when_the_body_now_asks_for_a_library_stream`, `a_backend_that_cannot_compare_falls_back_to_the_update_pass` (debug builds), `with_the_option_off_a_hit_runs_the_pass_and_applies_new_arguments`; device: `hits_replayed_as_recorded_give_the_results_of_the_eager_run` in `tests/cuda_lane_graphs.rs`.
+
+## A kernel module can compile for the architecture-specific target (2026-11-13)
+
+**What.** `CompileOptions::arch_specific: bool` (default `false`). When set, `from_source` compiles `sm_XYa` machine code for the device's exact architecture (for example `sm_120a`), so kernels that use instructions of one architecture variant compile, and `__CUDA_ARCH_SPECIFIC__` is defined. `cuda::Target` gains `CubinSpecific(u32)`, with `name()` and `extension()`; `Nvrtc::arch_specific_target_for` picks it.
+
+**Why.** The target came from the device alone, as `sm_XY` or PTX, so no kernel could use an instruction that only an architecture-specific target accepts.
+
+**How to use it.** Set `arch_specific: true` in the `CompileOptions` of the module. The module loads on that architecture only. Nothing changes for a caller that leaves it `false`, except that a `CompileOptions` struct literal without `..Default::default()` no longer compiles.
+
+**Semantics.**
+- The target is the device's exact architecture with an `a`. If NVRTC does not list that architecture, the compile is a `GpuError::Load` that names it (`sm_XYa`). There is no fallback to the generic target, an older architecture or PTX. There is no `a` variant below sm_90, so such a device gets the same error.
+- The target string is part of the module cache key, so `sm_XY` and `sm_XYa` never share an entry.
+- The fake backend accepts the option and `FakeModule::arch_specific()` returns it.
+
+**Tests.** `cuda::nvrtc::tests::the_arch_specific_target_is_the_exact_architecture_or_nothing`, `an_architecture_nvrtc_does_not_list_is_an_error_naming_it`, `module_cache::tests::the_arch_specific_target_has_its_own_key`, `fake_streams::the_fake_module_records_the_arch_specific_option`; on a device `an_arch_specific_module_compiles_with_the_arch_specific_macro_defined` (a kernel reports whether the macro is defined, with and without the option).
+
 ## A failed recording is not a failed unit of work (2026-11-10)
 
 **What.** Three changes to `SharedGraphCache` and the CUDA capture.

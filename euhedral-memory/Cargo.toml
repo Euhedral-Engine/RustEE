@@ -7,9 +7,9 @@ readme = "README.md"
 
 [features]
 default = []
-# `cuda`: the CUDA driver backend (device, stream-ordered pool, VMM with POSIX-fd export, pinned host), loaded
-# with dlopen at run time: no CUDA toolkit or link-time dependency.
-cuda = ["dep:libc"]
+# `cuda`: the CUDA driver backend (device, stream-ordered pool, VMM with POSIX-fd or Win32-handle export, pinned host),
+# loaded at run time (`dlopen` on Linux, `LoadLibrary` on Windows): no CUDA toolkit or link-time dependency.
+cuda = ["dep:libc", "dep:windows-sys"]
 
 [dependencies]
 # Lock-free queues (owner slots, give-back orders, the reaper, the pinned cache) and LatticeSource / RunnableFrame (the
@@ -19,12 +19,24 @@ euhedral-data-structures = { path = "../euhedral-data-structures" }
 euhedral-hashing = { path = "../euhedral-hashing" }
 # `Marker` and `DeviceQueue`: a lane's marker as the completion test of a copy.
 euhedral-graph = { path = "../euhedral-graph", default-features = false }
-libc = { version = "0.2.174", optional = true }
 
 [dev-dependencies]
 euhedral-core = { path = "../euhedral-core" }
 # The allocation sweep (examples/alloc_sweep.rs) compares CUDA with Vulkan; the library never uses Vulkan.
 ash = "0.38.0"
+
+# The loader on each platform; only the feature `cuda` uses them.
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2.174", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", optional = true, features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+] }
+
+# The examples that map memory by hand (mmap) are Unix programs.
+[target.'cfg(unix)'.dev-dependencies]
 libc = "0.2.174"
 
 [[example]]
