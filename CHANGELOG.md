@@ -8,7 +8,7 @@ semantics and the tests that pin it.
 **What.** `testing::StageHarness` (feature `testing`) calls a `Stage`'s hooks directly. `StageCx` and `GateRef` still cannot be built outside the crate; the harness builds them.
 - `StageHarness::new(lanes)`, with `with_stage_id`, `on_lane` and `waiting_for` to state what the stage sees (`StageCx::stage`, `lane`, `waits`, and the pool).
 - `run(&stage, &quantum) -> HarnessRun` (the stage's answer and whether it took its gate), `pass_gate(..) -> PassGate`, and `abandoned(.., home)` (the lane id of the pool, whose queue the hook is given).
-- `HarnessRun::contract_breach()` and `PassGate::contract_breach()`: the `Fatal` a graph would fail the quantum with where the stage broke the contract (`Held` with no gate taken, a gate taken and `Ok` or `Retry` answered, a marker that is no lane of the pool, `pass_gate` returning `false` without a gate). The graph and the harness share the conditions' messages and the pool test.
+- `HarnessRun::contract_breach()` and `PassGate::contract_breach()` (both `Option<&StageError>`, computed once when the call returns, so no clone on the common path): the `Fatal` a graph would fail the quantum with where the stage broke the contract (`Held` with no gate taken, a gate taken and `Ok` or `Retry` answered, a marker that is no lane of the pool, `pass_gate` returning `false` without a gate). The graph and the harness share the conditions' messages and the pool test.
 - `gate_events() -> Vec<GateEvent>`: how each gate the stage took was spent (`Released`, or `Failed(error)`, a drop unspent arriving as `Fatal`).
 
 **Why.** A user's test of a custom stage had to build a one-stage graph on a running lattice and smuggle its results out with a `'static` transmute and a raw pointer.
@@ -16,7 +16,8 @@ semantics and the tests that pin it.
 **How to use it.** Nothing to change. Enable `testing` in a dev-dependency; the pool can be a `FakeDevice::pool`, and what the stage enqueued is read from the fake device.
 
 **Semantics.**
-- A call runs the hook on the calling thread, inside a hot scope as the graph runs it (a lifecycle lock in `run` or `pass_gate` is a violation), and returns; nothing is scheduled and a panic of the stage propagates (a graph fails the quantum with it).
+- A call runs the hook on the calling thread, inside a hot scope (a lifecycle lock in `run` or `pass_gate` is a violation), and returns; nothing is scheduled and a panic of the stage propagates (a graph fails the quantum with it).
+- `run` is hot in a graph; `pass_gate` is hot there except for a root stage with no pending edges, which is asked at admission. The harness keeps it hot for every stage (the strict side), because a stage's author does not control the topology.
 - `waiting_for` merges the markers as the graph does (the latest per lane) and drops those of the stage's own lane. A second `StageCx::hold` in one run panics as in a graph.
 - A released gate does not run the stage again (the test calls `run` again, as the graph would), and a failed gate fails no quantum: both are recorded.
 - The real path is untouched: the harness constructors are `pub(crate)` and exist only with the feature, and `StageCx`'s fields and the graph's construction of it are as before.

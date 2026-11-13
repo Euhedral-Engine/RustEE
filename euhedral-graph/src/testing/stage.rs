@@ -62,13 +62,14 @@ pub struct PassGate {
     pub open: bool,
     /// Whether it took a gate ([`GateRef::hold`]); in a graph that holds the stage whatever `open` says.
     pub held: bool,
+    breach: Option<StageError>,
 }
 
 impl PassGate {
     /// The [`StageError::Fatal`] a graph would fail the quantum with because `pass_gate` returned `false` without
     /// taking a gate (it holds the stage, and nothing would ever publish it), or `None`.
-    pub fn contract_breach(&self) -> Option<StageError> {
-        (!self.open && !self.held).then(held_at_gate_without_one)
+    pub fn contract_breach(&self) -> Option<&StageError> {
+        self.breach.as_ref()
     }
 }
 
@@ -126,8 +127,9 @@ impl GateSource for Arc<GateLog> {
 /// `testing`.
 ///
 /// What does run is what a graph does around the hook: `run` and `pass_gate` are called inside a
-/// [`HotScope`](euhedral_data_structures::sync::HotScope), so a lifecycle lock taken in them is a violation here as in a
-/// graph, and the markers to wait for are normalised as the graph does (see [`waiting_for`](Self::waiting_for)).
+/// [`HotScope`](euhedral_data_structures::sync::HotScope), so a lifecycle lock taken in them is a violation here (in a
+/// graph `run` is always hot; `pass_gate` is hot except for a root stage with no pending edges, which is asked at
+/// admission; the harness takes the strict side, as a stage's author does not control the topology), and the markers to wait for are normalised as the graph does (see [`waiting_for`](Self::waiting_for)).
 ///
 /// A graph also judges the answers, and fails the quantum with [`StageError::Fatal`] where a stage broke the contract:
 /// `Held` answered without a gate taken, a gate taken and `Ok` or `Retry` answered, a marker that is no lane of the
@@ -260,13 +262,16 @@ impl<L: DeviceQueue + ?Sized> StageHarness<L> {
         let taken = Cell::new(false);
         let gates = self.log.clone();
         let open = {
-            // As the graph's `arrive`, which offers a stage from inside a hot scope.
+            // The graph's `arrive` offers a stage from inside a hot scope, but a root with no pending edges is asked at
+            // admission outside one: the harness takes the strict side, as a stage's author does not control the topology.
             let _hot = HotScope::enter();
             stage.pass_gate(quantum, GateRef::outside_graph(&gates, self.stage, &taken))
         };
+        let held = taken.get();
         PassGate {
             open,
-            held: taken.get(),
+            held,
+            breach: (!open && !held).then(held_at_gate_without_one),
         }
     }
 
@@ -593,7 +598,7 @@ mod tests {
 
     /// Answers as its quantum says: 0 `Held` with no gate, 1 `Held` with a gate, 2 `Ok` with a gate, 3 `Retry` with a
     /// gate, 4 `Retry` with none, 5 `Ok` with a marker of another pool, 6 `Ok` with a marker of the pool, 7 an error
-    /// with a gate taken.
+    /// with a gate taken, 8 `Ok` with a marker of another pool and a gate taken.
     struct Answers {
         own: Arc<FakeDevice>,
         other: Arc<FakeDevice>,
@@ -602,14 +607,14 @@ mod tests {
 
     impl Stage<u64> for Answers {
         fn run(&self, q: &u64, cx: &StageCx<'_>) -> Result<Submitted, StageError> {
-            if matches!(*q, 1..=3 | 7) {
+            if matches!(*q, 1..=3 | 7 | 8) {
                 *self.gate.lock().unwrap() = Some(cx.hold());
             }
             match *q {
                 0 | 1 => Err(StageError::Held),
                 2 | 6 => Ok(Submitted::marker(self.own.submit(Duration::ZERO, &[]))),
                 3 | 4 => Err(StageError::Retry),
-                5 => Ok(Submitted::marker(self.other.submit(Duration::ZERO, &[]))),
+                5 | 8 => Ok(Submitted::marker(self.other.submit(Duration::ZERO, &[]))),
                 _ => Err(StageError::Corrupt("mine".into())),
             }
         }
@@ -663,6 +668,11 @@ mod tests {
         );
         assert_eq!(breach(6), None);
         assert_eq!(breach(7), None, "the stage's own error stands");
+        // The graph checks the gate first: the foreign marker does not change the cause.
+        assert_eq!(
+            breach(8),
+            fatal("a stage that took a gate in run did not answer Held")
+        );
     }
 
     #[test]
@@ -671,7 +681,7 @@ mod tests {
         // 0: false without a gate; 1: false with a gate; 2: true.
         assert_eq!(
             harness.pass_gate(&stage, &0).contract_breach(),
-            Some(StageError::Fatal(
+            Some(&StageError::Fatal(
                 "a stage held itself at its gate without taking one".into()
             ))
         );
