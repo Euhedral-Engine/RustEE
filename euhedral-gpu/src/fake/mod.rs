@@ -711,4 +711,11 @@ impl Gpu for FakeGpu {
     {
         self.update_graph(graph, f)
     }
+
+    fn unchanged<F>(&self, graph: &mut FakeGraph, f: F) -> Result<bool, GpuError>
+    where
+        F: FnOnce(&mut FakeSequence<'_>) -> Result<(), GpuError>,
+    {
+        self.unchanged_graph(graph, f)
+    }
 }

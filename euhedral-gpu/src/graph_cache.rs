@@ -440,6 +440,7 @@ pub struct SharedGraphCache<G: Gpu, K> {
     pool: InstancePool<K, G::Graph>,
     sightings: Sightings,
     enabled: AtomicBool,
+    replay_as_recorded: AtomicBool,
     replays: AtomicU64,
     records: AtomicU64,
     rerecords: AtomicU64,
@@ -474,6 +475,7 @@ impl<G: Gpu, K: Copy + Eq + Hash + Send> SharedGraphCache<G, K> {
             pool: InstancePool::new(instances),
             sightings: Sightings::new(instances.saturating_mul(4)),
             enabled: AtomicBool::new(true),
+            replay_as_recorded: AtomicBool::new(false),
             replays: AtomicU64::new(0),
             records: AtomicU64::new(0),
             rerecords: AtomicU64::new(0),
@@ -487,6 +489,19 @@ impl<G: Gpu, K: Copy + Eq + Hash + Send> SharedGraphCache<G, K> {
     /// Turns caching off or on.
     pub fn set_enabled(&self, on: bool) {
         self.enabled.store(on, Ordering::Relaxed);
+    }
+
+    /// Makes a hit replay the recorded graph as it is, without running the body again as an update pass (off by
+    /// default; the setting is atomic, so it may change while threads run, and a run reads it once, at its start).
+    ///
+    /// **What the caller promises by turning it on:** the key covers every argument of the body (every buffer address,
+    /// size and value of every launch) and its shape, so two units of one key are the same launches with the same
+    /// arguments. The cache then neither runs the body on the host nor compares anything on a hit: it launches the
+    /// recorded graph. A miss records as before. A body whose arguments differ under one key replays the first
+    /// recording's arguments, silently, in a build without debug assertions; with them, the hit still runs the update
+    /// pass and panics if it finds a changed argument or shape, which names the key that forgets a field.
+    pub fn set_replay_as_recorded(&self, on: bool) {
+        self.replay_as_recorded.store(on, Ordering::Relaxed);
     }
 
     pub fn stats(&self) -> GraphStats {
@@ -565,6 +580,27 @@ impl<G: Gpu, K: Copy + Eq + Hash + Send> SharedGraphCache<G, K> {
         }
         let tag = tag_of(&key);
         if let Some(mut lease) = self.pool.take(&key, tag) {
+            if self.replay_as_recorded.load(Ordering::Relaxed) {
+                let graph = lease.get();
+                if cfg!(debug_assertions) {
+                    // The check of the caller's promise: the pass the release build skips, comparing only.
+                    match gpu.unchanged(graph, |seq| seq.submit(0, |enq| body.enqueue(enq))) {
+                        Ok(true) => {}
+                        Ok(false) => panic!(
+                            "SharedGraphCache replay_as_recorded: a hit's body has other arguments than the \
+                             recording; the key does not cover every argument"
+                        ),
+                        Err(GpuError::ShapeChanged { .. }) => panic!(
+                            "SharedGraphCache replay_as_recorded: a hit's body has another shape than the \
+                             recording; the key does not cover the shape"
+                        ),
+                        Err(other) => return Err(other),
+                    }
+                }
+                graph.replay_on(lane, waits, hold)?;
+                self.replays.fetch_add(1, Ordering::Relaxed);
+                return Ok(Ran::Replayed);
+            }
             let asked = std::cell::Cell::new(false);
             let updated = gpu.update(lease.get(), |seq| {
                 let done = seq.submit(0, |enq| body.enqueue(enq));
@@ -1093,6 +1129,108 @@ mod shared_tests {
             }
         );
         assert_eq!(cache.len(), 1);
+    }
+
+    /// A body that counts its calls.
+    struct Calls<'a> {
+        inner: Adds<'a>,
+        calls: usize,
+    }
+
+    impl GraphBody<FakeGpu> for Calls<'_> {
+        fn enqueue<E: Enqueue<Kernel = FakeKernel>>(
+            &mut self,
+            enq: &mut E,
+        ) -> Result<(), GpuError> {
+            self.calls += 1;
+            self.inner.enqueue(enq)
+        }
+    }
+
+    /// A hit replayed as recorded launches the graph: in a release build the body is not called at all; with debug
+    /// assertions it is called once, to check the promise.
+    #[test]
+    fn a_hit_replayed_as_recorded_runs_no_pass_of_the_body() {
+        let (gpu, lane, kernel, at) = rig();
+        let cache = SharedGraphCache::<FakeGpu, _>::new();
+        cache.set_replay_as_recorded(true);
+        let mut hold = GraphHold::new();
+        let mut b = Calls {
+            inner: body(&kernel, at, 2, 10),
+            calls: 0,
+        };
+        assert_eq!(
+            cache.warm(&gpu, &lane, KEY, &mut b, &mut hold).unwrap(),
+            Ran::Recorded
+        ); // +20
+        let after_record = b.calls;
+        for _ in 0..3 {
+            assert_eq!(
+                cache.run(&gpu, &lane, KEY, &mut b, &mut hold).unwrap(),
+                Ran::Replayed
+            ); // +20
+        }
+        let passes = b.calls - after_record;
+        if cfg!(debug_assertions) {
+            assert_eq!(passes, 3, "debug builds check each hit with one pass");
+        } else {
+            assert_eq!(passes, 0, "release builds run no pass");
+        }
+        gpu.run_until_idle();
+        assert_eq!(word(&gpu, at), 80, "the recording ran four times");
+        assert_eq!(cache.stats().replays, 3);
+    }
+
+    /// With the option off a hit runs the update pass, which applies the new arguments.
+    #[test]
+    fn with_the_option_off_a_hit_runs_the_pass_and_applies_new_arguments() {
+        let (gpu, lane, kernel, at) = rig();
+        let cache = SharedGraphCache::<FakeGpu, _>::new();
+        let mut hold = GraphHold::new();
+        let mut b = Calls {
+            inner: body(&kernel, at, 1, 10),
+            calls: 0,
+        };
+        cache.warm(&gpu, &lane, KEY, &mut b, &mut hold).unwrap(); // +10
+        let after_record = b.calls;
+        b.inner.by = 1;
+        assert_eq!(
+            cache.run(&gpu, &lane, KEY, &mut b, &mut hold).unwrap(),
+            Ran::Replayed
+        ); // +1
+        assert_eq!(b.calls - after_record, 1);
+        gpu.run_until_idle();
+        assert_eq!(word(&gpu, at), 11);
+    }
+
+    /// A key that hides a changed argument is caught on the hit in a build with debug assertions.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "the key does not cover every argument")]
+    fn a_hit_replayed_as_recorded_panics_when_the_key_hides_a_changed_argument() {
+        let (gpu, lane, kernel, at) = rig();
+        let cache = SharedGraphCache::<FakeGpu, _>::new();
+        cache.set_replay_as_recorded(true);
+        let mut hold = GraphHold::new();
+        let mut b = body(&kernel, at, 2, 10);
+        cache.warm(&gpu, &lane, KEY, &mut b, &mut hold).unwrap();
+        b.by = 11;
+        let _ = cache.run(&gpu, &lane, KEY, &mut b, &mut hold);
+    }
+
+    /// The same for a changed shape.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "the key does not cover the shape")]
+    fn a_hit_replayed_as_recorded_panics_when_the_key_hides_a_changed_shape() {
+        let (gpu, lane, kernel, at) = rig();
+        let cache = SharedGraphCache::<FakeGpu, _>::new();
+        cache.set_replay_as_recorded(true);
+        let mut hold = GraphHold::new();
+        let mut b = body(&kernel, at, 2, 10);
+        cache.warm(&gpu, &lane, KEY, &mut b, &mut hold).unwrap();
+        b.launches = 3;
+        let _ = cache.run(&gpu, &lane, KEY, &mut b, &mut hold);
     }
 
     /// A re-record whose capture fails after the body ran is a unit that ran: not an error, counted, and the instance

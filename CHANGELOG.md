@@ -3,6 +3,22 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## A hit can replay the recording as it is (2026-11-13)
+
+**What.** `SharedGraphCache::set_replay_as_recorded(bool)`, off by default. With it on, a hit launches the recorded graph without running the body. `Gpu` gains `unchanged`, an update pass that only compares.
+
+**Why.** Every hit ran the body as an update pass: the whole body on the host, a hash of its shape and a comparison of every launch's arguments. For a recurring unit whose key already fixes every buffer and size, that pass is pure cost.
+
+**How to use it.** Call `set_replay_as_recorded(true)` on the shared cache. **The caller promises that the key covers every argument of the body**: every address, size and value of every launch, and the shape. Two units under one key must be the same launches with the same arguments. A key that forgets a field replays the first recording's arguments, silently, in a release build.
+
+**Semantics.**
+- The option is an atomic of the shared cache: it may change while threads run, and a run reads it once, at its start. Off, nothing changes.
+- A miss records as before, and a recording is the same either way.
+- Release builds run no pass on a hit. Builds with `debug_assertions` still run one, with `Gpu::unchanged`, which applies nothing, and panic if it finds a changed argument or another shape; the message says that the key does not cover them.
+- A hit that replays this way counts in `replays`, as any replay.
+
+**Tests.** `graph_cache::shared_tests`: `a_hit_replayed_as_recorded_runs_no_pass_of_the_body` (asserts no call of the body in a release build, one per hit in a debug build), `a_hit_replayed_as_recorded_panics_when_the_key_hides_a_changed_argument`, `a_hit_replayed_as_recorded_panics_when_the_key_hides_a_changed_shape` (debug builds), `with_the_option_off_a_hit_runs_the_pass_and_applies_new_arguments`; device: `hits_replayed_as_recorded_give_the_results_of_the_eager_run` in `tests/cuda_lane_graphs.rs`.
+
 ## A failed recording is not a failed unit of work (2026-11-10)
 
 **What.** Three changes to `SharedGraphCache` and the CUDA capture.

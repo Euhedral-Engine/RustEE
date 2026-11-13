@@ -103,6 +103,34 @@ impl CudaGraph {
         Ok(Rerecorded::Instantiated)
     }
 
+    /// Runs `f` as an update pass that only compares: whether every launch has the recorded arguments. Applies
+    /// nothing. A sequence of another shape is `Err(ShapeChanged)`.
+    pub(crate) fn unchanged<F>(&mut self, f: F) -> Result<bool, GpuError>
+    where
+        F: FnOnce(&mut CudaSequence<'_>) -> Result<(), GpuError>,
+    {
+        let gpu = self.gpu.clone();
+        let mut rec = std::mem::replace(&mut self.scratch, Recording::new(Mode::Update));
+        rec.reset(Mode::Update);
+        let rec = gpu.probe_with(rec, self.streams, f)?;
+        let now = rec.hasher.finish();
+        let shape_ok = now == self.fingerprint && rec.staged_len == self.launches.len();
+        let same = shape_ok
+            && rec.staged[..rec.staged_len]
+                .iter()
+                .zip(&self.launches)
+                .all(|(staged, (_, _, args))| *args == *staged);
+        self.scratch = rec;
+        if shape_ok {
+            Ok(same)
+        } else {
+            Err(GpuError::ShapeChanged {
+                recorded: self.fingerprint,
+                now,
+            })
+        }
+    }
+
     /// Runs `f` as an update pass: new argument values, launch `n` of `f` to launch `n` of the recording. A sequence
     /// of another shape is `Err(ShapeChanged)` and applies nothing. After the first update of a graph it allocates
     /// nothing: the pass, its staged arguments and its hasher are the graph's, reused.
