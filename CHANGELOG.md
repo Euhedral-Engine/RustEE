@@ -3,6 +3,30 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## The CUDA backend builds and runs on Windows (2026-11-13)
+
+**What.** Feature `cuda` of `euhedral-memory` and `euhedral-gpu` now builds for Windows and drives the card through `nvcuda.dll`.
+- `euhedral_memory::cuda::loader::Library` is the one dynamic-loader wrapper: `open(name)`, `symbol(name)`, `require(name)` and `file_of(address)`. `dlopen`, `dlsym` and `dladdr` on Unix; `LoadLibraryExW`, `GetProcAddress` and `GetModuleHandleExW` with `GetModuleFileNameW` on Windows. `loader::DRIVER_LIBRARY` is `libcuda.so.1` or `nvcuda.dll`.
+- `cuda::ShareableHandle` is `std::os::fd::OwnedFd` on Unix and `std::os::windows::io::OwnedHandle` on Windows. `Vmm::export_fd` returns it and `Device::import_fd` takes it (the names are unchanged).
+- NVRTC is found on Windows through its own search order (below).
+- `StreamCallback` is `unsafe extern "system" fn`, the declaration of `CUDA_CB`.
+- CI runs the CUDA clippy and test steps of both crates on the Windows runner as well.
+- The `alloc_sweep` and `copy_rate` examples (POSIX fds, `mmap`) are Unix programs; on Windows they print a note and exit. `libc` is a dependency on Unix only; `euhedral-gpu` no longer depends on it.
+
+**Why.** The backend was Linux only: it called `dlopen("libcuda.so.1")` and `dlsym` directly, exported allocations as `OwnedFd`, and found NVRTC with `dladdr` and `.so` names. A program on Windows could not drive an NVIDIA card through `euhedral-gpu`.
+
+**How to use it.** On Linux nothing changes (`ShareableHandle` is `OwnedFd`). On Windows build with `--features cuda`; with no driver `Driver::load()` is `Err("nvcuda.dll not found")` and the device tests skip. Code that passed an `OwnedFd` between `Vmm::export_fd` and `Device::import_fd` names `ShareableHandle` to be portable.
+
+**Semantics.**
+- Library names: a bare name goes through the loader's own search; on Windows a path is loaded with `LOAD_WITH_ALTERED_SEARCH_PATH`, so the libraries it depends on (NVRTC's builtins) are looked for beside it. A failed open is `"<name>: <loader's reason>"`; a missing symbol is `"no <symbol>"` (`"libcuda: no <symbol>"` from the driver tables, `"nvrtc: no <symbol>"` from NVRTC, as before). A library is never closed.
+- NVRTC on Windows, in order: the explicit `CompileOptions::compiler` (only it, when given); `EUHEDRAL_NVRTC`; the names `nvrtc64_130_0.dll` and `nvrtc64_120_0.dll` through the loader (application directory, system directories, `PATH`); then `bin\x64` and `bin` of `CUDA_HOME` and `CUDA_PATH`, each directory's `nvrtc64_<N>_0.dll` files newest first. The `nvrtc-builtins64_*.dll` files beside a chosen file are loaded first. The Linux order is unchanged.
+- Windows export: an allocation made exportable is created with handle type `CU_MEM_HANDLE_TYPE_WIN32` and default `SECURITY_ATTRIBUTES` (default descriptor, not inheritable); `export_fd` returns an NT handle that the caller owns and closes by dropping it.
+- Windows import: `CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32`. CUDA does not take ownership of an NT handle, so `import_fd` closes the handle it was given when it returns (the import holds its own reference). On Unix CUDA takes the fd on success and `import_fd` closes it on failure, as before.
+- Type widths: no binding uses `long` or `unsigned long`; sizes are `usize` (`size_t`), addresses `u64` (`unsigned long long`), so LLP64 changes nothing.
+- Not verified on a Windows machine with a card: see the tests.
+
+**Tests.** No device needed, on both platforms: `cuda::loader::tests` (`a_missing_library_is_an_error_naming_it`, `a_name_with_a_nul_is_an_error`, `the_driver_library_is_found_or_reported_by_name`, `a_missing_symbol_is_named`, `a_symbol_is_found_and_its_file_is_the_library`, `an_address_outside_any_library_has_no_file`); `cuda::nvrtc::tests::the_windows_search_order_is_explicit_env_names_then_toolkit_bins` and `the_builtins_library_is_recognised_by_platform_name` (the Windows order is a pure function, tested on every host). The existing device tests (`tests/cuda.rs`, `tests/cuda_*.rs`) compile for Windows and skip when `Driver::load()` fails. With a card on Windows: `cargo test -p euhedral-memory --features cuda` and `cargo test -p euhedral-gpu --features cuda`, in particular `vmm_exports_a_shareable_handle`.
+
 ## A failed recording is not a failed unit of work (2026-11-10)
 
 **What.** Three changes to `SharedGraphCache` and the CUDA capture.

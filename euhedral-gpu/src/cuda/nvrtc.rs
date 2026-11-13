@@ -1,4 +1,5 @@
-//! NVRTC, the run-time compiler for kernel source, loaded with `dlopen` (no link-time dependency).
+//! NVRTC, the run-time compiler for kernel source, loaded at run time through the memory crate's loader (`dlopen`
+//! on Linux, `LoadLibrary` on Windows; no link-time dependency).
 //!
 //! The library is found through a search order ([`candidates`]); the first load serves the process. A machine without
 //! NVRTC can still load prebuilt images.
@@ -8,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use euhedral_data_structures::sync::{HotScope, LifecycleMutex};
+use euhedral_memory::cuda::loader::Library;
 
 use crate::{CompileOptions, GpuError};
 
@@ -44,16 +46,30 @@ pub(crate) fn pick_target(supported: &[u32], sm: u32) -> Option<Target> {
 /// A place to try loading the library from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Candidate {
-    /// A name for the dynamic loader.
+    /// A name for the dynamic loader (a soname on Linux, a file name on Windows).
     Soname(&'static str),
     File(PathBuf),
 }
 
 /// The library paths to try, in order, for `explicit` (only it, when given), then `EUHEDRAL_NVRTC`, the loader's
-/// own search, and the toolkit directories (`CUDA_HOME`, `CUDA_PATH`, `/usr/local/cuda`, then
-/// `/usr/local/cuda-*` newest first). A directory contributes its `libnvrtc.so.<N>` files, newest first, then
-/// `libnvrtc.so`. `env` reads the environment and `list` lists a directory's entries as full paths.
+/// own search, and the toolkit directories. `env` reads the environment and `list` lists a directory's entries as
+/// full paths. See [`candidates_unix`] and [`candidates_windows`] for each platform's names and directories.
 pub(crate) fn candidates(
+    explicit: Option<&Path>,
+    env: &dyn Fn(&str) -> Option<OsString>,
+    list: &dyn Fn(&Path) -> Vec<PathBuf>,
+) -> Vec<Candidate> {
+    if cfg!(windows) {
+        candidates_windows(explicit, env, list)
+    } else {
+        candidates_unix(explicit, env, list)
+    }
+}
+
+/// The Linux search order: `explicit` (only it, when given), then `EUHEDRAL_NVRTC`, the loader's own search, and
+/// the toolkit directories (`CUDA_HOME`, `CUDA_PATH`, `/usr/local/cuda`, then `/usr/local/cuda-*` newest first). A
+/// directory contributes its `libnvrtc.so.<N>` files, newest first, then `libnvrtc.so`.
+fn candidates_unix(
     explicit: Option<&Path>,
     env: &dyn Fn(&str) -> Option<OsString>,
     list: &dyn Fn(&Path) -> Vec<PathBuf>,
@@ -114,6 +130,51 @@ pub(crate) fn candidates(
     out
 }
 
+/// The Windows search order: `explicit` (only it, when given), then `EUHEDRAL_NVRTC`, the loader's own search by
+/// file name (the application directory, the system directories and `PATH`, where a toolkit's installer puts its
+/// `bin`), and the toolkit directories `CUDA_HOME` and `CUDA_PATH`, each as `bin\x64` (CUDA 13) then `bin` (CUDA 12
+/// and before). A directory contributes its `nvrtc64_<N>_0.dll` files, newest first.
+fn candidates_windows(
+    explicit: Option<&Path>,
+    env: &dyn Fn(&str) -> Option<OsString>,
+    list: &dyn Fn(&Path) -> Vec<PathBuf>,
+) -> Vec<Candidate> {
+    if let Some(path) = explicit {
+        return vec![Candidate::File(path.to_owned())];
+    }
+    let mut out: Vec<Candidate> = Vec::new();
+    let mut push = |c: Candidate| {
+        if !out.contains(&c) {
+            out.push(c);
+        }
+    };
+    if let Some(path) = env("EUHEDRAL_NVRTC") {
+        push(Candidate::File(PathBuf::from(path)));
+    }
+    for name in ["nvrtc64_130_0.dll", "nvrtc64_120_0.dll"] {
+        push(Candidate::Soname(name));
+    }
+    for var in ["CUDA_HOME", "CUDA_PATH"] {
+        let Some(home) = env(var) else { continue };
+        let home = PathBuf::from(home);
+        for dir in [home.join("bin").join("x64"), home.join("bin")] {
+            let mut libs: Vec<(u64, PathBuf)> = list(&dir)
+                .into_iter()
+                .filter_map(|p| {
+                    let name = p.file_name()?.to_str()?.to_ascii_lowercase();
+                    let number = name.strip_prefix("nvrtc64_")?.strip_suffix("_0.dll")?;
+                    Some((number.parse().ok()?, p))
+                })
+                .collect();
+            libs.sort_by_key(|lib| std::cmp::Reverse(lib.0));
+            for (_, path) in libs {
+                push(Candidate::File(path));
+            }
+        }
+    }
+    out
+}
+
 struct Fns {
     version: unsafe extern "C" fn(*mut c_int, *mut c_int) -> NvrtcResult,
     get_num_supported_archs: unsafe extern "C" fn(*mut c_int) -> NvrtcResult,
@@ -157,62 +218,26 @@ impl std::fmt::Debug for Nvrtc {
     }
 }
 
-fn dl_error() -> String {
-    // SAFETY: `dlerror` returns a NUL-terminated string owned by the loader, or null.
-    let p = unsafe { libc::dlerror() };
-    if p.is_null() {
-        "unknown error".into()
-    } else {
-        // SAFETY: as above; copied before the next loader call.
-        unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
-    }
-}
-
-fn open(name: &CStr) -> Result<*mut c_void, String> {
-    // SAFETY: a NUL-terminated name; the handle is never closed (the compiler stays for the process).
-    let lib = unsafe { libc::dlopen(name.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL) };
-    if lib.is_null() {
-        Err(dl_error())
-    } else {
-        Ok(lib)
-    }
-}
-
-fn symbol(lib: *mut c_void, name: &CStr) -> Result<*mut c_void, GpuError> {
-    // SAFETY: a live handle and a NUL-terminated name.
-    let p = unsafe { libc::dlsym(lib, name.as_ptr()) };
-    if p.is_null() {
-        Err(GpuError::Load(format!(
-            "nvrtc: no {}",
-            name.to_string_lossy()
-        )))
-    } else {
-        Ok(p)
-    }
+fn symbol(lib: &Library, name: &CStr) -> Result<*mut c_void, GpuError> {
+    lib.require(name)
+        .map_err(|e| GpuError::Load(format!("nvrtc: {e}")))
 }
 
 macro_rules! sym {
     ($lib:expr, $name:literal) => {
         // SAFETY: NVRTC exports this symbol with the C signature of the field it fills (nvrtc.h).
-        unsafe { cast(symbol($lib, $name)?) }
+        unsafe { cast(symbol(&$lib, $name)?) }
     };
 }
 
-/// The file the loader mapped the code at `address` from.
-fn library_path(address: *mut c_void) -> Option<PathBuf> {
-    let mut info: libc::Dl_info = libc::Dl_info {
-        dli_fname: std::ptr::null(),
-        dli_fbase: std::ptr::null_mut(),
-        dli_sname: std::ptr::null(),
-        dli_saddr: std::ptr::null_mut(),
-    };
-    // SAFETY: an address inside a loaded library and an out pointer to a zeroed `Dl_info`.
-    if unsafe { libc::dladdr(address, &mut info) } == 0 || info.dli_fname.is_null() {
-        return None;
+/// Whether a file name is NVRTC's builtins library (`libnvrtc-builtins.so*`, `nvrtc-builtins64_*.dll`).
+fn is_builtins(name: &str) -> bool {
+    if cfg!(windows) {
+        let name = name.to_ascii_lowercase();
+        name.starts_with("nvrtc-builtins64_") && name.ends_with(".dll")
+    } else {
+        name.starts_with("libnvrtc-builtins.so")
     }
-    // SAFETY: `dli_fname` is a NUL-terminated path owned by the loader.
-    let name = unsafe { CStr::from_ptr(info.dli_fname) };
-    Some(PathBuf::from(name.to_string_lossy().into_owned()))
 }
 
 /// Whether two paths name one file.
@@ -312,7 +337,7 @@ impl Nvrtc {
                     p.parent().map(Path::to_owned),
                 ),
             };
-            // NVRTC loads its builtins library by soname, and toolkit copies carry no run path: load the one beside
+            // NVRTC loads its builtins library by name, and toolkit copies carry no run path: load the one beside
             // the compiler first, globally, so that load finds it.
             if let Some(dir) = preload {
                 let mut builtins: Vec<PathBuf> = list(&dir)
@@ -320,22 +345,17 @@ impl Nvrtc {
                     .filter(|p| {
                         p.file_name()
                             .and_then(|n| n.to_str())
-                            .is_some_and(|n| n.starts_with("libnvrtc-builtins.so"))
+                            .is_some_and(is_builtins)
                     })
                     .collect();
                 builtins.sort();
                 for path in builtins {
-                    if let Ok(c) = CString::new(path.to_string_lossy().as_bytes()) {
-                        let _ = open(&c);
-                    }
+                    let _ = Library::open(&path.to_string_lossy());
                 }
             }
-            let Ok(cname) = CString::new(name.as_bytes()) else {
-                continue;
-            };
-            match open(&cname) {
+            match Library::open(&name) {
                 Ok(lib) => return Self::bind(lib),
-                Err(e) => tried.push(format!("{name}: {e}")),
+                Err(e) => tried.push(e),
             }
         }
         Err(GpuError::Load(format!(
@@ -344,7 +364,7 @@ impl Nvrtc {
         )))
     }
 
-    fn bind(lib: *mut c_void) -> Result<Self, GpuError> {
+    fn bind(lib: Library) -> Result<Self, GpuError> {
         let fns = Fns {
             version: sym!(lib, c"nvrtcVersion"),
             get_num_supported_archs: sym!(lib, c"nvrtcGetNumSupportedArchs"),
@@ -360,7 +380,7 @@ impl Nvrtc {
             destroy_program: sym!(lib, c"nvrtcDestroyProgram"),
             get_error_string: sym!(lib, c"nvrtcGetErrorString"),
         };
-        let library = library_path(symbol(lib, c"nvrtcVersion")?);
+        let library = Library::file_of(symbol(&lib, c"nvrtcVersion")?);
         let build = library.as_deref().map(build_name).unwrap_or_default();
         let mut nvrtc = Self {
             fns,
@@ -548,7 +568,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_search_order_is_explicit_env_sonames_then_toolkits() {
+    fn the_unix_search_order_is_explicit_env_sonames_then_toolkits() {
         let env = |k: &str| match k {
             "CUDA_HOME" => Some(OsString::from("/x/cuda")),
             _ => None,
@@ -567,7 +587,7 @@ mod tests {
             };
             names.iter().map(|n| dir.join(n)).collect()
         };
-        let got = candidates(None, &env, &list);
+        let got = candidates_unix(None, &env, &list);
         let file = |p: &str| Candidate::File(PathBuf::from(p));
         assert_eq!(
             got,
@@ -586,15 +606,80 @@ mod tests {
             other => env(other),
         };
         assert_eq!(
-            candidates(None, &with_env, &list)[0],
+            candidates_unix(None, &with_env, &list)[0],
             file("/opt/libnvrtc.so.13"),
             "the environment comes first"
         );
         assert_eq!(
-            candidates(Some(Path::new("/elsewhere/nvrtc.so")), &with_env, &list),
+            candidates_unix(Some(Path::new("/elsewhere/nvrtc.so")), &with_env, &list),
             [file("/elsewhere/nvrtc.so")],
             "an explicit path is the only candidate"
         );
+    }
+
+    #[test]
+    fn the_windows_search_order_is_explicit_env_names_then_toolkit_bins() {
+        let root = Path::new("root").join("cuda");
+        let x64 = root.join("bin").join("x64");
+        let bin = root.join("bin");
+        let env = |k: &str| match k {
+            "CUDA_PATH" => Some(root.clone().into_os_string()),
+            _ => None,
+        };
+        let list = |dir: &Path| -> Vec<PathBuf> {
+            let names: &[&str] = if dir == x64 {
+                &[
+                    "nvrtc64_130_0.dll",
+                    "nvrtc-builtins64_130.dll",
+                    "cudart64_13.dll",
+                ]
+            } else if dir == bin {
+                &[
+                    "NVRTC64_120_0.DLL",
+                    "nvrtc64_112_0.dll",
+                    "nvrtc64_120_0.alt.dll",
+                ]
+            } else {
+                &[]
+            };
+            names.iter().map(|n| dir.join(n)).collect()
+        };
+        let got = candidates_windows(None, &env, &list);
+        assert_eq!(
+            got,
+            [
+                Candidate::Soname("nvrtc64_130_0.dll"),
+                Candidate::Soname("nvrtc64_120_0.dll"),
+                Candidate::File(x64.join("nvrtc64_130_0.dll")),
+                Candidate::File(bin.join("NVRTC64_120_0.DLL")),
+                Candidate::File(bin.join("nvrtc64_112_0.dll")),
+            ]
+        );
+        let with_env = |k: &str| match k {
+            "EUHEDRAL_NVRTC" => Some(OsString::from("nvrtc.dll")),
+            other => env(other),
+        };
+        assert_eq!(
+            candidates_windows(None, &with_env, &list)[0],
+            Candidate::File(PathBuf::from("nvrtc.dll")),
+            "the environment comes first"
+        );
+        assert_eq!(
+            candidates_windows(Some(Path::new("other.dll")), &with_env, &list),
+            [Candidate::File(PathBuf::from("other.dll"))],
+            "an explicit path is the only candidate"
+        );
+    }
+
+    #[test]
+    fn the_builtins_library_is_recognised_by_platform_name() {
+        if cfg!(windows) {
+            assert!(is_builtins("nvrtc-builtins64_130.dll"));
+            assert!(!is_builtins("nvrtc64_130_0.dll"));
+        } else {
+            assert!(is_builtins("libnvrtc-builtins.so.13.1"));
+            assert!(!is_builtins("libnvrtc.so.13"));
+        }
     }
 
     #[test]

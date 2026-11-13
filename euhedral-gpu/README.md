@@ -138,9 +138,13 @@ Asynchronous, backend-neutral GPU access for the RustEE control plane. A lattice
     headers, the include paths, the target and NVRTC's version. A cache entry that will not load is rebuilt, and writes
     are atomic renames.
   - `from_image` takes PTX, a cubin or a fatbin that the application produced in its own build. No NVRTC is needed.
-  - NVRTC is loaded with `dlopen`. The search order is the explicit `CompileOptions::compiler`, then `EUHEDRAL_NVRTC`,
-    then the loader's own search, then `$CUDA_HOME/lib64`, `$CUDA_PATH/lib64`, `/usr/local/cuda/lib64` and
-    `/usr/local/cuda-*/lib64`.
+  - NVRTC is loaded at run time (`dlopen` on Linux, `LoadLibrary` on Windows). The search order on Linux is the
+    explicit `CompileOptions::compiler`, then `EUHEDRAL_NVRTC`, then the loader's own search, then `$CUDA_HOME/lib64`,
+    `$CUDA_PATH/lib64`, `/usr/local/cuda/lib64` and `/usr/local/cuda-*/lib64`. On Windows it is the explicit path,
+    `EUHEDRAL_NVRTC`, the loader's search for `nvrtc64_130_0.dll` and `nvrtc64_120_0.dll` (the application directory,
+    the system directories and `PATH`, where a toolkit's installer adds its `bin`), then `bin\x64` and `bin` of
+    `%CUDA_HOME%` and `%CUDA_PATH%`. A file path is loaded with its own directory searched first, so NVRTC finds its
+    builtins library beside it.
   - `Module::kernel(name)` looks a kernel up by its unmangled symbol (declare kernels `extern "C"`). `Args` packs the
     arguments (`Args::new().device(addr).arg(2.5f32)`); where the driver reports the kernel's parameter sizes, a launch
     with arguments that do not fit is `Err(Args)` before the driver sees it.
@@ -344,7 +348,7 @@ source, and the last frame hands it back to the source that stops it.
 | Feature | What it adds |
 |---|---|
 | `fake` | `FakeGpu`: a deterministic device for tests of code built on this crate. The crate's own tests enable it through a dev-dependency on itself. |
-| `cuda` | The CUDA backend, on the driver and primary context `euhedral-memory` loads (`Driver::shared`): one library, one context. Linux. |
+| `cuda` | The CUDA backend, on the driver and primary context `euhedral-memory` loads (`Driver::shared`): one library, one context. Linux and Windows. |
 
 The traits and the fake compile on every platform the workspace builds on.
 

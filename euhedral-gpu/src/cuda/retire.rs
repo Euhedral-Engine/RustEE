@@ -44,12 +44,12 @@ fn tell_cell(user: *mut c_void, status: CuResult) {
 }
 
 /// `CUstreamCallback` of [`CudaQueue::arm_cell`].
-unsafe extern "C" fn trampoline_cell(_stream: CuStream, status: CuResult, user: *mut c_void) {
+unsafe extern "system" fn trampoline_cell(_stream: CuStream, status: CuResult, user: *mut c_void) {
     tell_cell(user, status);
 }
 
 /// `CUstreamCallback`: the driver passes the status of the work before it.
-unsafe extern "C" fn trampoline(_stream: CuStream, status: CuResult, user: *mut c_void) {
+unsafe extern "system" fn trampoline(_stream: CuStream, status: CuResult, user: *mut c_void) {
     tell(user, status);
 }
 

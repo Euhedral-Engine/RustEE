@@ -13,8 +13,9 @@ pub type CuGraph = *mut c_void;
 pub type CuGraphExec = *mut c_void;
 pub type CuGraphNode = *mut c_void;
 
-/// `CUstreamCallback`.
-pub type StreamCallback = unsafe extern "C" fn(CuStream, CuResult, *mut c_void);
+/// `CUstreamCallback` (declared `CUDA_CB`: the platform's callback convention, which is the one C convention on
+/// 64-bit Windows and on Linux).
+pub type StreamCallback = unsafe extern "system" fn(CuStream, CuResult, *mut c_void);
 
 /// `CUDA_KERNEL_NODE_PARAMS_v2`.
 #[repr(C)]

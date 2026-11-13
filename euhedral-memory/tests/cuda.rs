@@ -46,7 +46,7 @@ fn each_backend_allocates_and_frees() {
 }
 
 #[test]
-fn vmm_exports_a_posix_fd() {
+fn vmm_exports_a_shareable_handle() {
     let Some(dev) = device() else { return };
     let vmm = Vmm::new(dev, LocationId(0), true).unwrap();
     assert!(vmm.granularity >= 4096);

@@ -159,15 +159,17 @@ jobs:
         run: cargo test -p euhedral-graph --release --lib -- sequencer::loom stage_graph::loom take_all::loom lanes::loom
 
       - name: Loom models (euhedral-gpu)
-        if: runner.os == 'Linux' && needs.changes.outputs.euhedral_gpu == 'true'
+        if: needs.changes.outputs.euhedral_gpu == 'true'
         env:
           RUSTFLAGS: --cfg loom
         run: cargo test -p euhedral-gpu --release --lib -- ring::loom instances::loom handles::loom
 
-      # Built and linted; the tests skip with no device.
+      # Built and linted on Linux and Windows; the tests skip with no device (no driver library is the skip).
       - name: CUDA backend (euhedral-memory)
-        if: runner.os == 'Linux' && needs.changes.outputs.euhedral_memory == 'true'
-        run: cargo clippy -p euhedral-memory --all-targets --features cuda -- -D warnings
+        if: needs.changes.outputs.euhedral_memory == 'true'
+        run: |
+          cargo clippy -p euhedral-memory --all-targets --features cuda -- -D warnings
+          cargo test -p euhedral-memory --features cuda
 
       - name: CUDA backend (euhedral-gpu)
         if: runner.os == 'Linux' && needs.changes.outputs.euhedral_gpu == 'true'
