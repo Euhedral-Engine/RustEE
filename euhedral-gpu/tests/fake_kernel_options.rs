@@ -12,18 +12,25 @@ use euhedral_gpu::{
     Sequence, Stream, StreamOptions,
 };
 
-/// Runs of the `noop` kernel; only the test that reads it launches it with a refusal in mind, and it reads a delta.
-static RUNS: AtomicUsize = AtomicUsize::new(0);
 const OPT_IN: u32 = 64 * 1024;
 
 fn module() -> (Arc<FakeGpu>, FakeModule) {
+    let (gpu, module, _runs) = counting_module();
+    (gpu, module)
+}
+
+/// A module whose `noop` kernel counts its runs in a counter of its own: the tests run in parallel, so a counter
+/// shared between them would also count the other tests' launches.
+fn counting_module() -> (Arc<FakeGpu>, FakeModule, Arc<AtomicUsize>) {
     let gpu = FakeGpu::new();
-    gpu.define("noop", |_m, _l, _a| {
-        RUNS.fetch_add(1, Ordering::SeqCst);
+    let runs = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&runs);
+    gpu.define("noop", move |_m, _l, _a| {
+        counter.fetch_add(1, Ordering::SeqCst);
         Ok(())
     });
     let module = FakeModule::from_source(&gpu, "// kernels", &CompileOptions::default()).unwrap();
-    (gpu, module)
+    (gpu, module, runs)
 }
 
 fn opted(module: &FakeModule, bytes: u32) -> FakeKernel {
@@ -125,12 +132,12 @@ fn launches(gpu: &FakeGpu) -> usize {
 
 #[test]
 fn a_refused_launch_enqueues_and_runs_nothing() {
-    let (gpu, module) = module();
+    let (gpu, module, runs) = counting_module();
     let kernel = module.kernel("noop").unwrap();
-    let (runs, ops) = (RUNS.load(Ordering::SeqCst), launches(&gpu));
+    let ops = launches(&gpu);
     assert!(launch_with(&gpu, &kernel, DEFAULT_DYNAMIC_SHARED_BYTES + 1).is_err());
     assert_eq!(launches(&gpu), ops);
-    assert_eq!(RUNS.load(Ordering::SeqCst), runs);
+    assert_eq!(runs.load(Ordering::SeqCst), 0);
 }
 
 #[test]

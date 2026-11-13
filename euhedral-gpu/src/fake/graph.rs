@@ -315,4 +315,23 @@ impl FakeGpu {
         graph.args = rec.staged;
         Ok(())
     }
+
+    pub(crate) fn unchanged_graph<F>(
+        &self,
+        graph: &FakeGraph,
+        f: F,
+    ) -> Result<Option<bool>, GpuError>
+    where
+        F: FnOnce(&mut FakeSequence<'_>) -> Result<(), GpuError>,
+    {
+        let rec = self.probe_pass(Mode::Update, graph.streams, f)?;
+        let now = rec.hasher.finish();
+        if now != graph.fingerprint {
+            return Err(GpuError::ShapeChanged {
+                recorded: graph.fingerprint,
+                now,
+            });
+        }
+        Ok(Some(rec.staged == graph.args))
+    }
 }

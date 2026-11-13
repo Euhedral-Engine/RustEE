@@ -164,13 +164,20 @@ jobs:
           RUSTFLAGS: --cfg loom
         run: cargo test -p euhedral-gpu --release --lib -- ring::loom instances::loom handles::loom
 
-      # Built and linted; the tests skip with no device.
+      # The build without debug assertions: a hit replayed as recorded runs no pass of the body.
+      - name: Replay as recorded, release (euhedral-gpu)
+        if: runner.os == 'Linux' && needs.changes.outputs.euhedral_gpu == 'true'
+        run: cargo test -p euhedral-gpu --release --lib --features fake -- graph_cache::shared_tests::a_hit_replayed_as_recorded
+
+      # Built and linted on Linux and Windows; the tests skip with no device (no driver library is the skip).
       - name: CUDA backend (euhedral-memory)
-        if: runner.os == 'Linux' && needs.changes.outputs.euhedral_memory == 'true'
-        run: cargo clippy -p euhedral-memory --all-targets --features cuda -- -D warnings
+        if: needs.changes.outputs.euhedral_memory == 'true'
+        run: |
+          cargo clippy -p euhedral-memory --all-targets --features cuda -- -D warnings
+          cargo test -p euhedral-memory --features cuda
 
       - name: CUDA backend (euhedral-gpu)
-        if: runner.os == 'Linux' && needs.changes.outputs.euhedral_gpu == 'true'
+        if: needs.changes.outputs.euhedral_gpu == 'true'
         run: |
           cargo clippy -p euhedral-gpu --all-targets --features cuda -- -D warnings
           cargo test -p euhedral-gpu --features cuda

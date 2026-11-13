@@ -14,8 +14,8 @@ fake = []
 # of deliberate leaks). Not for production use.
 test-hooks = []
 # `cuda`: the CUDA backend, on the driver `euhedral-memory` loads (one library, one primary context); the run-time
-# compiler (NVRTC) is loaded with dlopen as well.
-cuda = ["euhedral-memory/cuda", "dep:libc"]
+# compiler (NVRTC) is loaded at run time through the same loader.
+cuda = ["euhedral-memory/cuda"]
 
 [dependencies]
 euhedral-core = { path = "../euhedral-core" }
@@ -27,7 +27,6 @@ euhedral-memory = { path = "../euhedral-memory", default-features = false }
 euhedral-data-structures = { path = "../euhedral-data-structures" }
 # The module cache key and the shape fingerprint.
 euhedral-hashing = { path = "../euhedral-hashing" }
-libc = { version = "0.2.174", optional = true }
 
 [dev-dependencies]
 # The crate's own tests use the fake backend.

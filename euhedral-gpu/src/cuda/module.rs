@@ -16,7 +16,7 @@ use crate::{
 };
 
 use super::fns::{CuFunction, CuModule};
-use super::nvrtc::{Nvrtc, Target};
+use super::nvrtc::Nvrtc;
 use super::{CudaGpu, from_cuda};
 
 /// `CU_JIT_ERROR_LOG_BUFFER` and `CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES`.
@@ -230,11 +230,12 @@ impl Module for CudaModule {
         options: &CompileOptions,
     ) -> Result<Self, GpuError> {
         let nvrtc = Nvrtc::shared(options.compiler.as_deref())?;
-        let target = nvrtc.target_for(gpu.arch())?;
-        let (target_name, ext) = match target {
-            Target::Cubin(sm) => (format!("sm_{sm}"), "cubin"),
-            Target::Ptx(cc) => (format!("compute_{cc}"), "ptx"),
+        let target = if options.arch_specific {
+            nvrtc.arch_specific_target_for(gpu.arch())?
+        } else {
+            nvrtc.target_for(gpu.arch())?
         };
+        let (target_name, ext) = (target.name(), target.extension());
         let key = cache_key(&KeyMaterial {
             source,
             options,
