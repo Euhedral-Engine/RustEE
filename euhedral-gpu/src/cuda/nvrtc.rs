@@ -52,7 +52,7 @@ pub(crate) enum Candidate {
 }
 
 /// The library paths to try, in order, for `explicit` (only it, when given), then `EUHEDRAL_NVRTC`, the loader's
-/// own search, and the toolkit directories. `env` reads the environment and `list` lists a directory's entries as
+/// own search (Linux) or `PATH` (Windows), and the toolkit directories. `env` reads the environment and `list` lists a directory's entries as
 /// full paths. See [`candidates_unix`] and [`candidates_windows`] for each platform's names and directories.
 pub(crate) fn candidates(
     explicit: Option<&Path>,
@@ -130,10 +130,11 @@ fn candidates_unix(
     out
 }
 
-/// The Windows search order: `explicit` (only it, when given), then `EUHEDRAL_NVRTC`, the loader's own search by
-/// file name (the application directory, the system directories and `PATH`, where a toolkit's installer puts its
-/// `bin`), and the toolkit directories `CUDA_HOME` and `CUDA_PATH`, each as `bin\x64` (CUDA 13) then `bin` (CUDA 12
-/// and before). A directory contributes its `nvrtc64_<N>_0.dll` files, newest first.
+/// The Windows search order: `explicit` (only it, when given), then `EUHEDRAL_NVRTC`, the files
+/// `nvrtc64_130_0.dll` and `nvrtc64_120_0.dll` in the absolute entries of `PATH` (where a toolkit's installer puts its
+/// `bin`; the loader's own search is not used, as it would try the working directory), and the toolkit directories
+/// `CUDA_HOME` then `CUDA_PATH`, each as `bin\x64` (CUDA 13) then `bin` (CUDA 12 and before). A directory contributes
+/// its `nvrtc64_<N>_0.dll` files, newest first. Every candidate is a file path.
 fn candidates_windows(
     explicit: Option<&Path>,
     env: &dyn Fn(&str) -> Option<OsString>,
@@ -151,8 +152,25 @@ fn candidates_windows(
     if let Some(path) = env("EUHEDRAL_NVRTC") {
         push(Candidate::File(PathBuf::from(path)));
     }
+    // The loader's own search would try the working directory: walk `PATH` here and keep absolute directories.
+    let path_dirs: Vec<PathBuf> = env("PATH")
+        .map(|p| {
+            std::env::split_paths(&p)
+                .filter(|d| d.is_absolute())
+                .collect()
+        })
+        .unwrap_or_default();
     for name in ["nvrtc64_130_0.dll", "nvrtc64_120_0.dll"] {
-        push(Candidate::Soname(name));
+        for dir in &path_dirs {
+            let found = list(dir).into_iter().find(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.eq_ignore_ascii_case(name))
+            });
+            if let Some(file) = found {
+                push(Candidate::File(file));
+            }
+        }
     }
     for var in ["CUDA_HOME", "CUDA_PATH"] {
         let Some(home) = env(var) else { continue };
@@ -350,10 +368,13 @@ impl Nvrtc {
                     .collect();
                 builtins.sort();
                 for path in builtins {
-                    let _ = Library::open(&path.to_string_lossy());
+                    // SAFETY: a builtins library beside the compiler the caller or the toolkit environment chose.
+                    let _ = unsafe { Library::open(&path.to_string_lossy()) };
                 }
             }
-            match Library::open(&name) {
+            // SAFETY: the compiler is the file the caller named, or one the search order found; NVRTC is code the
+            // application trusts by asking for it.
+            match unsafe { Library::open(&name) } {
                 Ok(lib) => return Self::bind(lib),
                 Err(e) => tried.push(e),
             }
@@ -571,6 +592,7 @@ mod tests {
     fn the_unix_search_order_is_explicit_env_sonames_then_toolkits() {
         let env = |k: &str| match k {
             "CUDA_HOME" => Some(OsString::from("/x/cuda")),
+            "CUDA_PATH" => Some(OsString::from("/y/cuda")),
             _ => None,
         };
         let list = |dir: &Path| -> Vec<PathBuf> {
@@ -581,6 +603,7 @@ mod tests {
                     "libnvrtc.so.13",
                     "libnvrtc.so",
                 ],
+                "/y/cuda/lib64" => &["libnvrtc.so.12"],
                 "/usr/local" => &["cuda-12.4", "cuda-11.8", "src"],
                 "/usr/local/cuda-12.4/lib64" => &["libnvrtc.so.12"],
                 _ => &[],
@@ -598,6 +621,7 @@ mod tests {
                 file("/x/cuda/lib64/libnvrtc.so.13"),
                 file("/x/cuda/lib64/libnvrtc.so.12"),
                 file("/x/cuda/lib64/libnvrtc.so"),
+                file("/y/cuda/lib64/libnvrtc.so.12"),
                 file("/usr/local/cuda-12.4/lib64/libnvrtc.so.12"),
             ]
         );
@@ -618,41 +642,58 @@ mod tests {
     }
 
     #[test]
-    fn the_windows_search_order_is_explicit_env_names_then_toolkit_bins() {
-        let root = Path::new("root").join("cuda");
-        let x64 = root.join("bin").join("x64");
-        let bin = root.join("bin");
+    fn the_windows_search_order_is_explicit_env_path_then_toolkit_bins() {
+        let base = std::env::current_dir().unwrap();
+        let home = base.join("home");
+        let cuda_path = base.join("cuda_path");
+        let on_path = base.join("on_path");
+        let other = base.join("other");
+        let path_var =
+            std::env::join_paths([Path::new("relative"), other.as_path(), on_path.as_path()])
+                .unwrap();
         let env = |k: &str| match k {
-            "CUDA_PATH" => Some(root.clone().into_os_string()),
+            "CUDA_HOME" => Some(home.clone().into_os_string()),
+            "CUDA_PATH" => Some(cuda_path.clone().into_os_string()),
+            "PATH" => Some(path_var.clone()),
             _ => None,
         };
+        let home_x64 = home.join("bin").join("x64");
+        let home_bin = home.join("bin");
         let list = |dir: &Path| -> Vec<PathBuf> {
-            let names: &[&str] = if dir == x64 {
+            let names: &[&str] = if dir == on_path {
+                &["Nvrtc64_130_0.dll", "nvrtc-builtins64_130.dll"]
+            } else if dir == home_x64 {
                 &[
                     "nvrtc64_130_0.dll",
                     "nvrtc-builtins64_130.dll",
                     "cudart64_13.dll",
                 ]
-            } else if dir == bin {
+            } else if dir == home_bin {
                 &[
-                    "NVRTC64_120_0.DLL",
+                    "nvrtc64_120_0.dll",
                     "nvrtc64_112_0.dll",
                     "nvrtc64_120_0.alt.dll",
                 ]
+            } else if dir == cuda_path.join("bin") {
+                &["nvrtc64_120_0.dll"]
+            } else if dir == Path::new("relative") {
+                &["nvrtc64_130_0.dll"]
             } else {
                 &[]
             };
             names.iter().map(|n| dir.join(n)).collect()
         };
-        let got = candidates_windows(None, &env, &list);
+        let file = |p: PathBuf| Candidate::File(p);
         assert_eq!(
-            got,
+            candidates_windows(None, &env, &list),
             [
-                Candidate::Soname("nvrtc64_130_0.dll"),
-                Candidate::Soname("nvrtc64_120_0.dll"),
-                Candidate::File(x64.join("nvrtc64_130_0.dll")),
-                Candidate::File(bin.join("NVRTC64_120_0.DLL")),
-                Candidate::File(bin.join("nvrtc64_112_0.dll")),
+                // PATH: found by name, absolute entries only (the relative one is never looked in).
+                file(on_path.join("Nvrtc64_130_0.dll")),
+                // CUDA_HOME before CUDA_PATH; `bin\x64` before `bin`; newest first.
+                file(home_x64.join("nvrtc64_130_0.dll")),
+                file(home_bin.join("nvrtc64_120_0.dll")),
+                file(home_bin.join("nvrtc64_112_0.dll")),
+                file(cuda_path.join("bin").join("nvrtc64_120_0.dll")),
             ]
         );
         let with_env = |k: &str| match k {
@@ -661,12 +702,12 @@ mod tests {
         };
         assert_eq!(
             candidates_windows(None, &with_env, &list)[0],
-            Candidate::File(PathBuf::from("nvrtc.dll")),
+            file(PathBuf::from("nvrtc.dll")),
             "the environment comes first"
         );
         assert_eq!(
             candidates_windows(Some(Path::new("other.dll")), &with_env, &list),
-            [Candidate::File(PathBuf::from("other.dll"))],
+            [file(PathBuf::from("other.dll"))],
             "an explicit path is the only candidate"
         );
     }

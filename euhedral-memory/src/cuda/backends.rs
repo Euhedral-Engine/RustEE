@@ -15,22 +15,33 @@ use super::{
 use crate::backend::{AllocError, Backend, Block};
 use crate::planner::LocationId;
 
-/// The security attributes an exportable allocation is created with: the default descriptor, the handle not
-/// inheritable. The driver requires them for an NT handle (`CU_MEM_HANDLE_TYPE_WIN32`); no other handle type reads
-/// them.
-fn default_security() -> *mut c_void {
+/// The `OBJECT_ATTRIBUTES` an exportable allocation is created with (`win32HandleMetaData`): only its length set, so
+/// the handle gets the default security descriptor and no name. The driver requires it for an NT handle
+/// (`CU_MEM_HANDLE_TYPE_WIN32`); no other handle type reads it.
+fn default_object_attributes() -> *mut c_void {
     #[cfg(windows)]
     {
-        use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
-        struct Shared(SECURITY_ATTRIBUTES);
-        // SAFETY: immutable, and its descriptor pointer is null.
-        unsafe impl Sync for Shared {}
-        static DEFAULT: Shared = Shared(SECURITY_ATTRIBUTES {
-            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
-            lpSecurityDescriptor: std::ptr::null_mut(),
-            bInheritHandle: 0,
-        });
-        (&raw const DEFAULT.0).cast_mut().cast()
+        /// `OBJECT_ATTRIBUTES` (winternl.h): 48 bytes on 64-bit Windows.
+        #[repr(C)]
+        struct ObjectAttributes {
+            length: u32,
+            root_directory: *mut c_void,
+            object_name: *mut c_void,
+            attributes: u32,
+            security_descriptor: *mut c_void,
+            security_quality_of_service: *mut c_void,
+        }
+        // SAFETY: immutable, and every pointer in it is null.
+        unsafe impl Sync for ObjectAttributes {}
+        static DEFAULT: ObjectAttributes = ObjectAttributes {
+            length: size_of::<ObjectAttributes>() as u32,
+            root_directory: std::ptr::null_mut(),
+            object_name: std::ptr::null_mut(),
+            attributes: 0,
+            security_descriptor: std::ptr::null_mut(),
+            security_quality_of_service: std::ptr::null_mut(),
+        };
+        (&raw const DEFAULT).cast_mut().cast()
     }
     #[cfg(not(windows))]
     std::ptr::null_mut()
@@ -236,8 +247,9 @@ impl Drop for StreamPool {
     }
 }
 
-/// A VMM allocation: physical memory (`cuMemCreate`) mapped at a reserved address, optionally exportable as a POSIX
-/// fd for Vulkan (`VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT`).
+/// A VMM allocation: physical memory (`cuMemCreate`) mapped at a reserved address, optionally exportable as a
+/// [`ShareableHandle`]: a POSIX fd for Vulkan (`VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT`) on Unix, an NT handle
+/// (`..._OPAQUE_WIN32_BIT`) on Windows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VmmBlock {
     pub ptr: CuDevicePtr,
@@ -294,7 +306,7 @@ impl Vmm {
                 id: device.ordinal,
             },
             win32_handle_meta_data: if exportable {
-                default_security()
+                default_object_attributes()
             } else {
                 std::ptr::null_mut()
             },

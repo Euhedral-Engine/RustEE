@@ -159,7 +159,7 @@ jobs:
         run: cargo test -p euhedral-graph --release --lib -- sequencer::loom stage_graph::loom take_all::loom lanes::loom
 
       - name: Loom models (euhedral-gpu)
-        if: needs.changes.outputs.euhedral_gpu == 'true'
+        if: runner.os == 'Linux' && needs.changes.outputs.euhedral_gpu == 'true'
         env:
           RUSTFLAGS: --cfg loom
         run: cargo test -p euhedral-gpu --release --lib -- ring::loom instances::loom handles::loom
@@ -172,7 +172,7 @@ jobs:
           cargo test -p euhedral-memory --features cuda
 
       - name: CUDA backend (euhedral-gpu)
-        if: runner.os == 'Linux' && needs.changes.outputs.euhedral_gpu == 'true'
+        if: needs.changes.outputs.euhedral_gpu == 'true'
         run: |
           cargo clippy -p euhedral-gpu --all-targets --features cuda -- -D warnings
           cargo test -p euhedral-gpu --features cuda

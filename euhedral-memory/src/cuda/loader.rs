@@ -22,11 +22,16 @@ pub struct Library {
 }
 
 impl Library {
-    /// Opens the library `name`: a bare name goes through the loader's own search (the dynamic linker's on Unix;
-    /// the application directory, the system directories and `PATH` on Windows); a path is loaded from there, and
-    /// on Windows the libraries it depends on are looked for beside it first. The error names the library and
-    /// carries the loader's reason, e.g. `"nvcuda.dll: ..."`.
-    pub fn open(name: &str) -> Result<Library, String> {
+    /// Opens the library `name`. On Unix a name goes to the dynamic linker as it is. On Windows a bare name (no
+    /// separator) is a system library, looked for in the system directory only (never the working directory, the
+    /// application directory or `PATH`, where a planted file would win); an absolute path is loaded from there, with
+    /// the libraries it depends on looked for beside it first; any other path is an error. The error names the
+    /// library and carries the loader's reason, e.g. `"nvcuda.dll: ..."`.
+    ///
+    /// # Safety
+    /// Loading a library runs its initialisers in this process. The caller trusts the file `name` resolves to: a
+    /// system library, or a path the caller chose.
+    pub unsafe fn open(name: &str) -> Result<Library, String> {
         imp::open(name)
             .map(|handle| Library { handle })
             .map_err(|reason| format!("{name}: {reason}"))
@@ -108,8 +113,8 @@ mod imp {
     use windows_sys::Win32::Foundation::{HMODULE, MAX_PATH};
     use windows_sys::Win32::System::LibraryLoader::{
         GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-        GetModuleFileNameW, GetModuleHandleExW, GetProcAddress, LOAD_WITH_ALTERED_SEARCH_PATH,
-        LoadLibraryExW,
+        GetModuleFileNameW, GetModuleHandleExW, GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32,
+        LOAD_WITH_ALTERED_SEARCH_PATH, LoadLibraryExW,
     };
 
     pub(super) fn open(name: &str) -> Result<usize, String> {
@@ -120,12 +125,14 @@ mod imp {
         if wide[..wide.len() - 1].contains(&0) {
             return Err("the name contains a NUL".into());
         }
-        // A path (absolute) searches its own directory for the libraries it depends on; a bare name uses the
-        // standard search order.
+        // An absolute path searches its own directory for the libraries it depends on; a bare name is searched in
+        // the system directory only.
         let flags = if Path::new(name).is_absolute() {
             LOAD_WITH_ALTERED_SEARCH_PATH
+        } else if name.contains(['/', '\\']) {
+            return Err("a path must be absolute".into());
         } else {
-            0
+            LOAD_LIBRARY_SEARCH_SYSTEM32
         };
         // SAFETY: a NUL-terminated wide name and no file handle (reserved, null); the module is never freed.
         let module = unsafe { LoadLibraryExW(wide.as_ptr(), std::ptr::null_mut(), flags) };
@@ -181,17 +188,28 @@ mod imp {
 mod tests {
     use super::*;
 
-    /// A library every process of the platform can load, a function it exports, and a substring of its file name.
+    /// A library every process of the platform can load, a function it exports, and the file names (lower case,
+    /// substrings) the function's code may be in. On Windows `GetCurrentProcessId` may be a forwarder to
+    /// `kernelbase.dll`, and `GetProcAddress` returns the forwarded address: either file is right.
     #[cfg(windows)]
-    const SYSTEM: (&str, &CStr, &str) = ("kernel32.dll", c"GetCurrentProcessId", "kernel32");
+    const SYSTEM: (&str, &CStr, &[&str]) = (
+        "kernel32.dll",
+        c"GetCurrentProcessId",
+        &["kernel32", "kernelbase"],
+    );
     #[cfg(all(unix, target_os = "macos"))]
-    const SYSTEM: (&str, &CStr, &str) = ("libSystem.B.dylib", c"getpid", "libsystem");
+    const SYSTEM: (&str, &CStr, &[&str]) = ("libSystem.B.dylib", c"getpid", &["libsystem"]);
     #[cfg(all(unix, not(target_os = "macos")))]
-    const SYSTEM: (&str, &CStr, &str) = ("libc.so.6", c"getpid", "libc");
+    const SYSTEM: (&str, &CStr, &[&str]) = ("libc.so.6", c"getpid", &["libc"]);
+
+    fn open(name: &str) -> Result<Library, String> {
+        // SAFETY: the tests load system libraries, or names that do not exist.
+        unsafe { Library::open(name) }
+    }
 
     #[test]
     fn a_missing_library_is_an_error_naming_it() {
-        let err = Library::open("euhedral-no-such-library-4f2a").unwrap_err();
+        let err = open("euhedral-no-such-library-4f2a").unwrap_err();
         assert!(err.starts_with("euhedral-no-such-library-4f2a: "), "{err}");
         assert!(
             err.len() > "euhedral-no-such-library-4f2a: ".len(),
@@ -201,13 +219,14 @@ mod tests {
 
     #[test]
     fn a_name_with_a_nul_is_an_error() {
-        assert!(Library::open("a\0b").is_err());
+        let err = open("a\0b").unwrap_err();
+        assert!(err.contains("NUL"), "{err}");
     }
 
     #[test]
     fn the_driver_library_is_found_or_reported_by_name() {
         // With no driver installed this is the skip path of every device test: an error, never a panic.
-        match Library::open(DRIVER_LIBRARY) {
+        match open(DRIVER_LIBRARY) {
             Ok(lib) => assert!(!lib.symbol(c"cuInit").is_null()),
             Err(e) => assert!(e.starts_with(DRIVER_LIBRARY), "{e}"),
         }
@@ -215,7 +234,7 @@ mod tests {
 
     #[test]
     fn a_missing_symbol_is_named() {
-        let lib = Library::open(SYSTEM.0).unwrap();
+        let lib = open(SYSTEM.0).unwrap();
         assert!(lib.symbol(c"euhedral_no_such_symbol").is_null());
         let err = lib.require(c"euhedral_no_such_symbol").unwrap_err();
         assert_eq!(err, "no euhedral_no_such_symbol");
@@ -223,11 +242,11 @@ mod tests {
 
     #[test]
     fn a_symbol_is_found_and_its_file_is_the_library() {
-        let lib = Library::open(SYSTEM.0).unwrap();
+        let lib = open(SYSTEM.0).unwrap();
         let p = lib.require(SYSTEM.1).unwrap();
         let file = Library::file_of(p).expect("the loader names the file");
         let name = file.file_name().unwrap().to_string_lossy().to_lowercase();
-        assert!(name.contains(SYSTEM.2), "{file:?}");
+        assert!(SYSTEM.2.iter().any(|n| name.contains(n)), "{file:?}");
         assert!(file.parent().is_some());
     }
 

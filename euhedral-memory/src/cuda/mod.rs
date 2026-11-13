@@ -316,7 +316,8 @@ impl Driver {
     /// `cuInit`. A machine without the library gets `Err("<library> not found")`.
     pub fn load() -> Result<Arc<Self>, String> {
         // The driver stays for the process: the library is never closed.
-        let lib = Library::open(loader::DRIVER_LIBRARY)
+        // SAFETY: the driver library is the system's own (the system directory on Windows).
+        let lib = unsafe { Library::open(loader::DRIVER_LIBRARY) }
             .map_err(|_| format!("{} not found", loader::DRIVER_LIBRARY))?;
         // SAFETY: the library is loaded and stays so.
         let fns = unsafe { Fns::load(&lib)? };
