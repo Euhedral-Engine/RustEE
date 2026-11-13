@@ -15,7 +15,7 @@ use crate::{
 
 use euhedral_memory::cuda::CuStream;
 
-use super::launch::{issue, supported};
+use super::launch::{issue, launch_call, supported};
 use super::stream::{CudaQueue, LaneFork};
 use super::{CudaEnqueue, CudaGpu, CudaKernel, from_cuda};
 
@@ -70,7 +70,7 @@ impl LaneEnqueue for CudaLaneEnqueue<'_> {
         let (func, params, stream) = (kernel.raw(), pointers.as_mut_ptr(), self.fork.current());
         // SAFETY: the caller's contract (arguments match the kernel; addresses valid until retired); the pointers
         // address `args`, which outlives the call; the context is current (`Lane::submit`).
-        self.gpu().check("cuLaunchKernel", unsafe {
+        self.gpu().check(launch_call(&launch), unsafe {
             issue(fns, func, &launch, stream, params)
         })
     }

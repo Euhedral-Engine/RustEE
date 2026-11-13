@@ -63,6 +63,25 @@ impl Drop for CudaGraph {
 }
 
 impl CudaGraph {
+    /// A test hook (feature `test-hooks`): the types of the edges into the node of launch `launch` in the recorded
+    /// graph (0 default, 1 programmatic), or `None` when the driver cannot report them.
+    #[cfg(feature = "test-hooks")]
+    pub fn edge_types_into(&self, launch: usize) -> Option<Vec<u8>> {
+        let get = self.gpu.fns.graph_node_get_dependencies?;
+        let node = self.nodes.get(launch)?.0;
+        let _c = self.gpu.device().enter().ok()?;
+        let mut count = 0usize;
+        // SAFETY: a node of the recorded graph; a null array asks for the count; the context is current.
+        (unsafe { get(node, std::ptr::null_mut(), std::ptr::null_mut(), &mut count) } == 0)
+            .then_some(())?;
+        let mut deps = vec![std::ptr::null_mut(); count];
+        let mut data = vec![0u8; count * 8];
+        // SAFETY: arrays of `count` nodes and edge records; the context is current.
+        (unsafe { get(node, deps.as_mut_ptr(), data.as_mut_ptr(), &mut count) } == 0)
+            .then_some(())?;
+        Some(data.chunks(8).take(count).map(|d| d[2]).collect())
+    }
+
     pub(crate) fn gpu(&self) -> &Arc<CudaGpu> {
         &self.gpu
     }

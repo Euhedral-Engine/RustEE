@@ -47,6 +47,7 @@ impl Rig {
         q: &mut S,
         base: u32,
         c: u32,
+        programmatic: bool,
     ) -> Result<(), GpuError> {
         let first = Args::new().device(self.y).arg(base).arg(N as u32);
         let second = Args::new()
@@ -60,7 +61,7 @@ impl Rig {
                 e.launch(&self.produce, Launch::linear(N as u32, 256), &first)?;
                 e.launch(
                     &self.consume,
-                    Launch::linear(N as u32, 256).programmatic(true),
+                    Launch::linear(N as u32, 256).programmatic(programmatic),
                     &second,
                 )?;
                 e.copy_to_host(self.out.cast(), self.z, BYTES)
@@ -160,7 +161,7 @@ fn a_programmatic_chain_gives_the_same_result_eagerly_and_from_a_recorded_update
     // Recorded (the recording runs the work for real), then replayed.
     rig.clear();
     let mut graph = gpu
-        .record(&mut [&mut s[0]], |q| rig.chain(q, 20, 4))
+        .record(&mut [&mut s[0]], |q| rig.chain(q, 20, 4, true))
         .unwrap();
     settle(&mut s[0], &pool);
     assert_eq!(rig.result(), expected(20, 4), "the recording's own run");
@@ -169,9 +170,23 @@ fn a_programmatic_chain_gives_the_same_result_eagerly_and_from_a_recorded_update
     settle(&mut s[0], &pool);
     assert_eq!(rig.result(), expected(20, 4), "the replay");
 
+    // The capture holds a programmatic edge into the second kernel (and a plain one without the flag).
+    match graph.edge_types_into(1) {
+        Some(types) => {
+            assert_eq!(types, [1], "a programmatic edge into the consumer");
+            let plain = gpu
+                .record(&mut [&mut s[0]], |q| rig.chain(q, 1, 1, false))
+                .unwrap();
+            settle(&mut s[0], &pool);
+            assert_eq!(plain.edge_types_into(1), Some(vec![0]), "a plain edge");
+        }
+        None => eprintln!("the driver cannot report edge types: the edge assertion is skipped"),
+    }
+
     // After an update pass with new arguments.
     rig.clear();
-    gpu.update(&mut graph, |q| rig.chain(q, 30, 5)).unwrap();
+    gpu.update(&mut graph, |q| rig.chain(q, 30, 5, true))
+        .unwrap();
     graph.replay(&mut s[0]).unwrap();
     settle(&mut s[0], &pool);
     assert_eq!(rig.result(), expected(30, 5), "the replay after an update");

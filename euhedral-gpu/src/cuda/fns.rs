@@ -152,6 +152,11 @@ pub struct GpuFns {
         unsafe extern "C" fn(CuGraphExec, CuGraph, *mut ExecUpdateResultInfo) -> CuResult,
     pub graph_exec_kernel_node_set_params:
         unsafe extern "C" fn(CuGraphExec, CuGraphNode, *const KernelNodeParams) -> CuResult,
+    /// `cuGraphNodeGetDependencies_v2` (CUDA 12.3 and newer): the node, the dependencies, their edge data (8 bytes
+    /// each, the third is the edge type) and the count.
+    pub graph_node_get_dependencies: Option<
+        unsafe extern "C" fn(CuGraphNode, *mut CuGraphNode, *mut u8, *mut usize) -> CuResult,
+    >,
     pub graph_destroy: unsafe extern "C" fn(CuGraph) -> CuResult,
     pub graph_exec_destroy: unsafe extern "C" fn(CuGraphExec) -> CuResult,
 }
@@ -235,6 +240,8 @@ impl GpuFns {
                 driver,
                 c"cuGraphExecKernelNodeSetParams_v2"
             )?),
+            graph_node_get_dependencies: optional(driver, c"cuGraphNodeGetDependencies_v2")
+                .map(|p| cast!(p)),
             graph_destroy: cast!(required(driver, c"cuGraphDestroy")?),
             graph_exec_destroy: cast!(required(driver, c"cuGraphExecDestroy")?),
         })

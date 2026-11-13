@@ -13,7 +13,7 @@ use crate::{
 };
 
 use super::fns::{CAPTURE_STATUS_ACTIVE, CaptureInfo, CuGraph, CuGraphNode};
-use super::launch::{issue, supported};
+use super::launch::{issue, launch_call, supported};
 use super::stream::LaneFork;
 use super::{CudaGpu, CudaKernel, CudaQueue, CudaStream};
 
@@ -290,7 +290,7 @@ impl LaneEnqueue for CudaEnqueue<'_> {
         let (func, params) = (kernel.raw(), pointers.as_mut_ptr());
         // SAFETY: the caller's contract (arguments match the kernel; addresses valid until retired); the pointers
         // address `args`, which outlives the call; the context is current.
-        self.run("cuLaunchKernel", |stream| unsafe {
+        self.run(launch_call(&launch), |stream| unsafe {
             issue(fns, func, &launch, stream, params)
         })?;
         // While recording: the node this launch made.
