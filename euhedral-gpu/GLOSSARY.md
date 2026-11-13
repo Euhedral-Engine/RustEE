@@ -34,8 +34,14 @@ retirement is confirmed, so the host buffers a copy reads stay live. The submitt
 `PlainQueue`, so releasing them needs no lock. The values a recording keeps are frozen into an immutable
 `Arc<[..]>` that the recording's own run, its graph and every replay share.
 
+**programmatic launch** (`Launch::programmatic`): a programmatic dependent launch. The kernel may start before the
+previous kernel on its stream has finished and must wait for it itself (`griddepcontrol.wait`). The CUDA backend
+launches it with `cuLaunchKernelEx` and the programmatic-stream-serialization attribute; a recording captures it as a
+programmatic edge. A driver without `cuLaunchKernelEx` refuses it (`GpuError::Invalid`) and still makes every other
+launch. Compute capability 9.0 or newer.
+
 **shape and fingerprint** ([`ShapeHasher`, `Fingerprint`](src/shape.rs)): the shape of a sequence is its
-operations in order with their streams, order edges, kernels, geometry, argument layouts and copy
+operations in order with their streams, order edges, kernels, geometry, programmatic flag, argument layouts and copy
 parameters; the fingerprint is 128 bits of it. A changed shape is `GpuError::ShapeChanged`.
 
 **shadow stream** ([`CudaSequence`](src/cuda/graph.rs)): the stream a recording captures a stream's work

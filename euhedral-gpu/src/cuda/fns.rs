@@ -127,6 +127,16 @@ pub struct GpuFns {
         *mut *mut c_void,
         *mut *mut c_void,
     ) -> CuResult,
+    /// `cuLaunchKernelEx` (the driver's launch with attributes), where the driver has it: the config, the function,
+    /// the arguments and the extra.
+    pub launch_kernel_ex: Option<
+        unsafe extern "C" fn(
+            *const c_void,
+            CuFunction,
+            *mut *mut c_void,
+            *mut *mut c_void,
+        ) -> CuResult,
+    >,
     pub device_get_attribute: unsafe extern "C" fn(*mut c_int, c_int, c_int) -> CuResult,
     pub driver_get_version: unsafe extern "C" fn(*mut c_int) -> CuResult,
     pub stream_begin_capture: unsafe extern "C" fn(CuStream, c_int) -> CuResult,
@@ -206,6 +216,7 @@ impl GpuFns {
             func_get_param_count: optional(driver, c"cuFuncGetParamCount").map(|p| cast!(p)),
             func_get_param_info: optional(driver, c"cuFuncGetParamInfo").map(|p| cast!(p)),
             launch_kernel: cast!(required(driver, c"cuLaunchKernel")?),
+            launch_kernel_ex: optional(driver, c"cuLaunchKernelEx").map(|p| cast!(p)),
             device_get_attribute: cast!(required(driver, c"cuDeviceGetAttribute")?),
             driver_get_version: cast!(required(driver, c"cuDriverGetVersion")?),
             stream_begin_capture: cast!(required(driver, c"cuStreamBeginCapture_v2")?),

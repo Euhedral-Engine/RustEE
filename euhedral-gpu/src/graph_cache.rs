@@ -768,6 +768,7 @@ mod tests {
                     grid: Dim3::x(1),
                     block: Dim3::x(32),
                     shared_bytes: 0,
+                    programmatic: false,
                 };
                 // SAFETY: the fake device reads no addresses.
                 unsafe { enq.launch(self.kernel, launch, &Args::new().arg(self.value + i))? };
@@ -1038,6 +1039,7 @@ mod shared_tests {
                     grid: Dim3::x(1),
                     block: Dim3::x(32),
                     shared_bytes: 0,
+                    programmatic: false,
                 };
                 // SAFETY: a live fake allocation.
                 unsafe {

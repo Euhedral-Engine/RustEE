@@ -124,6 +124,8 @@ pub enum FakeOp {
     Launch {
         lane: u16,
         kernel: String,
+        /// The launch was a programmatic dependent launch.
+        programmatic: bool,
     },
     Copy {
         lane: u16,
@@ -461,6 +463,7 @@ impl FakeGpu {
                 st.log.push(FakeOp::Launch {
                     lane,
                     kernel: kernel.name().to_owned(),
+                    programmatic: launch.programmatic,
                 });
                 (kernel.f)(&mut st.memory, &launch, &args)
             }

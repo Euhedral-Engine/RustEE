@@ -3,6 +3,22 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## A launch can be a programmatic dependent launch (2026-11-13)
+
+**What.** `Launch` gains `programmatic: bool` (false from `Launch::linear`) and the builder-style `Launch::programmatic(bool)`. On CUDA a programmatic launch goes through `cuLaunchKernelEx` with `CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION` set to 1; any other launch still goes through `cuLaunchKernel`, unchanged. The flag is part of the shape fingerprint. `FakeOp::Launch` gains `programmatic`.
+
+**Why.** A kernel that reads what the previous kernel on its stream wrote can overlap its own start-up with the previous kernel's tail, and wait for the data itself, but only if it is launched with the attribute; a lane had no way to ask for it, eagerly or in a graph.
+
+**How to use it.** `Launch::linear(n, block).programmatic(true)`, and the kernel calls `asm volatile("griddepcontrol.wait;");` before it reads the previous kernel's output (without the wait the kernel races). Needs compute capability 9.0 or newer. A struct literal of `Launch` needs the new field; a match on `FakeOp::Launch` needs `..`.
+
+**Semantics.**
+- A recording captures the launch with the attribute, so the captured graph holds a programmatic edge. An update pass only changes node parameters and keeps it.
+- The flag is in the fingerprint: a body with the flag never matches a graph recorded without it (`ShapeChanged` on an update, a re-record in a graph cache), nor the reverse.
+- If the loaded driver has no `cuLaunchKernelEx`, a programmatic launch is `GpuError::Invalid` at the launch call; launches without the flag work as before.
+- The fake backend carries the flag and reports it in `FakeOp::Launch`.
+
+**Tests.** `tests/fake_graph.rs`: `the_programmatic_flag_changes_the_fingerprint_and_a_body_with_it_does_not_hit_a_recording_without`, `the_fake_reports_whether_a_launch_was_programmatic`; the shape tests in `shape.rs`; device: `tests/cuda_programmatic.rs` `a_programmatic_chain_gives_the_same_result_eagerly_and_from_a_recorded_updated_graph`.
+
 ## A failed recording is not a failed unit of work (2026-11-10)
 
 **What.** Three changes to `SharedGraphCache` and the CUDA capture.

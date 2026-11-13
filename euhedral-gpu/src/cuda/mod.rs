@@ -7,6 +7,7 @@ mod enqueue;
 pub mod fns;
 mod graph;
 mod lane;
+mod launch;
 mod module;
 pub mod nvrtc;
 mod retire;

@@ -15,6 +15,7 @@ use crate::{
 
 use euhedral_memory::cuda::CuStream;
 
+use super::launch::{issue, supported};
 use super::stream::{CudaQueue, LaneFork};
 use super::{CudaEnqueue, CudaGpu, CudaKernel, from_cuda};
 
@@ -55,6 +56,7 @@ impl LaneEnqueue for CudaLaneEnqueue<'_> {
             )));
         }
         let fns = &self.gpu().fns;
+        supported(fns, &launch)?;
         // The argument addresses go on the stack: a launch allocates nothing.
         let mut pointers = [std::ptr::null_mut::<c_void>(); MAX_ARGS];
         if args.pointers_into(&mut pointers).is_none() {
@@ -68,19 +70,7 @@ impl LaneEnqueue for CudaLaneEnqueue<'_> {
         // SAFETY: the caller's contract (arguments match the kernel; addresses valid until retired); the pointers
         // address `args`, which outlives the call; the context is current (`Lane::submit`).
         self.gpu().check("cuLaunchKernel", unsafe {
-            (fns.launch_kernel)(
-                func,
-                launch.grid.x,
-                launch.grid.y,
-                launch.grid.z,
-                launch.block.x,
-                launch.block.y,
-                launch.block.z,
-                launch.shared_bytes,
-                stream,
-                params,
-                std::ptr::null_mut(),
-            )
+            issue(fns, func, &launch, stream, params)
         })
     }
 
