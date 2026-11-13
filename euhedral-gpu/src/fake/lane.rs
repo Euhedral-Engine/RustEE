@@ -10,6 +10,8 @@ use crate::{
     RawStream,
 };
 
+use crate::api::check_pitched;
+
 use super::enqueue::Real;
 use super::stream::FakeQueue;
 use super::{FakeEnqueue, FakeGpu, FakeKernel, QOp};
@@ -76,6 +78,27 @@ impl LaneEnqueue for FakeLaneEnqueue<'_> {
 
     unsafe fn copy_on_device(&mut self, dst: u64, src: u64, bytes: usize) -> Result<(), GpuError> {
         self.push(QOp::OnDevice { dst, src, bytes });
+        Ok(())
+    }
+
+    unsafe fn copy_pitched_on_device(
+        &mut self,
+        dst: u64,
+        dst_pitch: usize,
+        src: u64,
+        src_pitch: usize,
+        row_bytes: usize,
+        rows: usize,
+    ) -> Result<(), GpuError> {
+        check_pitched(dst_pitch, src_pitch, row_bytes, rows)?;
+        self.push(QOp::OnDevicePitched {
+            dst,
+            dst_pitch,
+            src,
+            src_pitch,
+            row_bytes,
+            rows,
+        });
         Ok(())
     }
 

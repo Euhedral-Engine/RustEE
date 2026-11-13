@@ -8,12 +8,14 @@ use std::sync::Arc;
 
 use euhedral_graph::{ControlError, LaneControl, LaneId, Marker, RetireCell};
 
+use crate::api::check_pitched;
 use crate::{
     Args, GpuError, GraphHold, Kernel, Lane, LaneEnqueue, LaneStream, Launch, MAX_ARGS,
     POISONED_STATUS, RawStream,
 };
 
-use euhedral_memory::cuda::CuStream;
+use euhedral_memory::PitchedCopy;
+use euhedral_memory::cuda::{CuStream, Memcpy2D};
 
 use super::launch::{issue, launch_call, supported};
 use super::stream::{CudaQueue, LaneFork};
@@ -107,6 +109,45 @@ impl LaneEnqueue for CudaLaneEnqueue<'_> {
         self.gpu().check("cuMemcpyDtoDAsync", unsafe {
             f(dst, src, bytes, self.fork.current())
         })
+    }
+
+    unsafe fn copy_pitched_on_device(
+        &mut self,
+        dst: u64,
+        dst_pitch: usize,
+        src: u64,
+        src_pitch: usize,
+        row_bytes: usize,
+        rows: usize,
+    ) -> Result<(), GpuError> {
+        check_pitched(dst_pitch, src_pitch, row_bytes, rows)?;
+        if rows == 0 || row_bytes == 0 {
+            return Ok(());
+        }
+        let stream = self.fork.current();
+        if rows == 1 || (dst_pitch == row_bytes && src_pitch == row_bytes) {
+            let f = self.gpu().device().driver.fns.memcpy_dtod_async;
+            // SAFETY: as above; the rows are contiguous, so the range is `rows * row_bytes`.
+            return self.gpu().check("cuMemcpyDtoDAsync", unsafe {
+                f(dst, src, row_bytes * rows, stream)
+            });
+        }
+        let description = Memcpy2D::pitched(
+            true,
+            true,
+            &PitchedCopy {
+                src,
+                src_pitch: src_pitch as u64,
+                dst,
+                dst_pitch: dst_pitch as u64,
+                row_bytes: row_bytes as u64,
+                rows: rows as u64,
+            },
+        );
+        let f = self.gpu().device().driver.fns.memcpy_2d_async;
+        // SAFETY: as above, for every row; the description outlives the call, which reads it before it returns.
+        self.gpu()
+            .check("cuMemcpy2DAsync", unsafe { f(&description, stream) })
     }
 
     unsafe fn memset(&mut self, dst: u64, value: u8, bytes: usize) -> Result<(), GpuError> {
