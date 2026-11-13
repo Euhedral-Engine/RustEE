@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use euhedral_gpu::fake::{FakeGpu, FakeOp, FakeStream};
-use euhedral_gpu::{Gpu, GpuError, Graph, LaneEnqueue, Sequence, Stream, StreamOptions};
+use euhedral_gpu::{Gpu, GpuError, Graph, Lane, LaneEnqueue, Sequence, Stream, StreamOptions};
 
 const FILL: u8 = 0xEE;
 
@@ -113,9 +113,52 @@ fn nothing_is_copied_for_zero_rows_or_zero_row_bytes() {
     let (dst, src) = buffers(&gpu, 16, 16);
     copy(&mut s, (dst, 8), (src, 8), 4, 0).unwrap();
     copy(&mut s, (dst, 8), (src, 8), 0, 3).unwrap();
-    // Even the pitches' bound and the overflow check apply to nothing when there is nothing to copy.
     gpu.run_until_idle();
     assert_eq!(gpu.read(dst, 16), vec![FILL; 16]);
+    assert!(gpu.log().is_empty(), "nothing is enqueued: {:?}", gpu.log());
+}
+
+#[test]
+fn an_empty_copy_at_addresses_outside_any_allocation_does_not_poison_the_device() {
+    let (gpu, mut s) = one_stream();
+    // Null addresses: a real range here would fault, an empty one touches nothing.
+    copy(&mut s, (0, 8), (0, 8), 4, 0).unwrap();
+    copy(&mut s, (0, 8), (0, 8), 0, 3).unwrap();
+    gpu.run_until_idle();
+    let (dst, src) = buffers(&gpu, 16, 16);
+    copy(&mut s, (dst, 8), (src, 8), 4, 2).unwrap();
+    gpu.run_until_idle();
+    assert_eq!(gpu.log(), [FakeOp::Copy { lane: 0 }]);
+    assert_eq!(gpu.read(dst, 12)[8..12], gpu.read(src, 12)[8..12]);
+}
+
+#[test]
+fn a_short_pitch_is_refused_even_when_there_is_nothing_to_copy() {
+    let (gpu, mut s) = one_stream();
+    let (dst, src) = buffers(&gpu, 16, 16);
+    let refused = copy(&mut s, (dst, 3), (src, 8), 4, 0);
+    assert!(matches!(refused, Err(GpuError::Invalid(_))), "{refused:?}");
+    let refused = copy(&mut s, (dst, 8), (src, 3), 4, 0);
+    assert!(matches!(refused, Err(GpuError::Invalid(_))), "{refused:?}");
+}
+
+#[test]
+fn a_shared_lane_copies_at_each_sides_own_pitch() {
+    let (gpu, s) = one_stream();
+    let lane = s.shared();
+    let (dst, src) = buffers(&gpu, 4 * 12, 4 * 20);
+    lane.submit(|q| {
+        // SAFETY: fake allocations that outlive the run.
+        unsafe { q.copy_pitched_on_device(dst, 20, src, 12, 7, 4) }
+    })
+    .unwrap();
+    gpu.run_until_idle();
+    assert_eq!(gpu.read(dst, 80), expected(80, 20, 12, 7, 4));
+    let refused = lane.submit(|q| {
+        // SAFETY: as above.
+        unsafe { q.copy_pitched_on_device(dst, 6, src, 12, 7, 4) }
+    });
+    assert!(matches!(refused, Err(GpuError::Invalid(_))), "{refused:?}");
 }
 
 #[test]
@@ -147,6 +190,23 @@ fn a_range_that_overflows_is_refused() {
     assert!(gpu.log().is_empty());
 }
 
+fn shape_on(
+    stream: usize,
+    gpu: &FakeGpu,
+    dst: (u64, usize),
+    src: (u64, usize),
+    row_bytes: usize,
+    rows: usize,
+) -> euhedral_gpu::Fingerprint {
+    gpu.fingerprint(2, |q| {
+        q.submit(stream, |e| {
+            // SAFETY: nothing is enqueued on a probe.
+            unsafe { e.copy_pitched_on_device(dst.0, dst.1, src.0, src.1, row_bytes, rows) }
+        })
+    })
+    .unwrap()
+}
+
 fn shape(
     gpu: &FakeGpu,
     dst: (u64, usize),
@@ -154,13 +214,7 @@ fn shape(
     row_bytes: usize,
     rows: usize,
 ) -> euhedral_gpu::Fingerprint {
-    gpu.fingerprint(1, |q| {
-        q.submit(0, |e| {
-            // SAFETY: nothing is enqueued on a probe.
-            unsafe { e.copy_pitched_on_device(dst.0, dst.1, src.0, src.1, row_bytes, rows) }
-        })
-    })
-    .unwrap()
+    shape_on(0, gpu, dst, src, row_bytes, rows)
 }
 
 #[test]
@@ -177,6 +231,10 @@ fn the_shape_tells_the_pitches_the_row_the_rows_and_the_addresses_apart() {
         shape(&gpu, (0x1000, 64), (0x2008, 48), 40, 8),
         // Swapping the two pitches is another copy.
         shape(&gpu, (0x1000, 48), (0x2000, 64), 40, 8),
+        // The stream it is on.
+        shape_on(1, &gpu, (0x1000, 64), (0x2000, 48), 40, 8),
+        // An empty tile.
+        shape(&gpu, (0x1000, 64), (0x2000, 48), 40, 0),
     ] {
         assert_ne!(base, other);
     }

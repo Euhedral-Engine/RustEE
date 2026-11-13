@@ -393,7 +393,8 @@ pub trait LaneEnqueue {
     /// (`GpuError::Invalid` otherwise, as when `pitch * (rows - 1) + row_bytes` overflows `usize` for either side). With
     /// zero `rows` or zero `row_bytes` nothing is copied, and nothing is enqueued on the device (the operation still
     /// counts in a recorded shape). A copy whose rows are contiguous on both sides (`rows == 1`, or both pitches equal
-    /// to `row_bytes`) is one plain copy. Recorded into a graph, it replays as recorded; an update pass checks its
+    /// to `row_bytes`) is one plain copy. The CUDA driver refuses a pitch above the device's maximum
+    /// (`CU_DEVICE_ATTRIBUTE_MAX_PITCH`, usually 2^31 - 1) with a call error. Recorded into a graph, it replays as recorded; an update pass checks its
     /// shape (the addresses, pitches, `row_bytes` and `rows`) like any other copy.
     ///
     /// # Safety
