@@ -105,7 +105,7 @@ impl CudaGraph {
 
     /// Runs `f` as an update pass that only compares: whether every launch has the recorded arguments. Applies
     /// nothing. A sequence of another shape is `Err(ShapeChanged)`.
-    pub(crate) fn unchanged<F>(&mut self, f: F) -> Result<bool, GpuError>
+    pub(crate) fn unchanged<F>(&mut self, f: F) -> Result<Option<bool>, GpuError>
     where
         F: FnOnce(&mut CudaSequence<'_>) -> Result<(), GpuError>,
     {
@@ -122,7 +122,7 @@ impl CudaGraph {
                 .all(|(staged, (_, _, args))| *args == *staged);
         self.scratch = rec;
         if shape_ok {
-            Ok(same)
+            Ok(Some(same))
         } else {
             Err(GpuError::ShapeChanged {
                 recorded: self.fingerprint,

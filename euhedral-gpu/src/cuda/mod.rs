@@ -297,7 +297,7 @@ impl Gpu for CudaGpu {
         graph.update(f)
     }
 
-    fn unchanged<F>(&self, graph: &mut CudaGraph, f: F) -> Result<bool, GpuError>
+    fn unchanged<F>(&self, graph: &mut CudaGraph, f: F) -> Result<Option<bool>, GpuError>
     where
         F: FnOnce(&mut CudaSequence<'_>) -> Result<(), GpuError>,
     {

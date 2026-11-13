@@ -388,7 +388,9 @@ impl Sightings {
 ///   time it sees its capture key). **Second sighting**: it is recorded (the recording runs the work for real). A
 ///   warm-up ([`warm`](Self::warm)) records at once.
 /// - **A hit**: a free instance of the key is taken by one compare-and-set (the entry is claimed, not locked), updated with
-///   the unit's arguments and replayed on the lane. The instance goes back to the table once the replay is enqueued.
+///   the unit's arguments and replayed on the lane. The instance goes back to the table once the replay is enqueued. With
+///   [`set_replay_as_recorded`](Self::set_replay_as_recorded) on, the update is skipped: the instance is replayed with the
+///   arguments it holds.
 /// - **A second concurrent user of a key** finds the instance taken and does not wait or spin: it takes another free
 ///   instance of the key, or records one of its own and pools it for the next. The instances of a key settle at the peak
 ///   number of workers that ran it at once, and a run after warm-up allocates nothing.
@@ -494,12 +496,17 @@ impl<G: Gpu, K: Copy + Eq + Hash + Send> SharedGraphCache<G, K> {
     /// Makes a hit replay the recorded graph as it is, without running the body again as an update pass (off by
     /// default; the setting is atomic, so it may change while threads run, and a run reads it once, at its start).
     ///
-    /// **What the caller promises by turning it on:** the key covers every argument of the body (every buffer address,
-    /// size and value of every launch) and its shape, so two units of one key are the same launches with the same
-    /// arguments. The cache then neither runs the body on the host nor compares anything on a hit: it launches the
-    /// recorded graph. A miss records as before. A body whose arguments differ under one key replays the first
-    /// recording's arguments, silently, in a build without debug assertions; with them, the hit still runs the update
-    /// pass and panics if it finds a changed argument or shape, which names the key that forgets a field.
+    /// **What the caller promises by turning it on:**
+    /// - The key covers every argument of the body (every buffer address, size and value of every launch) and its
+    ///   shape, so two units of one key are the same launches with the same arguments.
+    /// - The body does nothing outside its enqueues: no writes to host buffers, no errors that matter. A release build
+    ///   never runs it on a hit, and a debug build runs it only through the comparing pass, so its other effects happen
+    ///   or not by the build; a debug build cannot catch a violation of this.
+    ///
+    /// A hit then launches the instance's graph with the arguments it holds (the recording's, or those of the last
+    /// update made while the option was off). A miss records as before. If the key forgets a field, a release build
+    /// replays the wrong arguments silently; a build with debug assertions still runs the comparing pass on a hit and
+    /// panics on a changed argument or shape, or on a body that now asks for a library stream, which names the key.
     pub fn set_replay_as_recorded(&self, on: bool) {
         self.replay_as_recorded.store(on, Ordering::Relaxed);
     }
@@ -584,9 +591,33 @@ impl<G: Gpu, K: Copy + Eq + Hash + Send> SharedGraphCache<G, K> {
                 let graph = lease.get();
                 if cfg!(debug_assertions) {
                     // The check of the caller's promise: the pass the release build skips, comparing only.
-                    match gpu.unchanged(graph, |seq| seq.submit(0, |enq| body.enqueue(enq))) {
-                        Ok(true) => {}
-                        Ok(false) => panic!(
+                    let asked = std::cell::Cell::new(false);
+                    let same = gpu.unchanged(graph, |seq| {
+                        let done = seq.submit(0, |enq| body.enqueue(enq));
+                        asked.set(seq.library_stream_requested());
+                        done
+                    });
+                    // A backend that cannot compare falls back to the update pass: it catches a changed shape only.
+                    let same = match same {
+                        Ok(None) => {
+                            asked.set(false);
+                            gpu.update(graph, |seq| {
+                                let done = seq.submit(0, |enq| body.enqueue(enq));
+                                asked.set(seq.library_stream_requested());
+                                done
+                            })
+                            .map(|()| Some(true))
+                        }
+                        other => other,
+                    };
+                    assert!(
+                        !asked.get(),
+                        "SharedGraphCache replay_as_recorded: a hit's body asks for a library stream, which a \
+                         replay cannot make; the key does not cover that the body does library work"
+                    );
+                    match same {
+                        Ok(Some(true) | None) => {}
+                        Ok(Some(false)) => panic!(
                             "SharedGraphCache replay_as_recorded: a hit's body has other arguments than the \
                              recording; the key does not cover every argument"
                         ),
@@ -1215,6 +1246,42 @@ mod shared_tests {
         let mut b = body(&kernel, at, 2, 10);
         cache.warm(&gpu, &lane, KEY, &mut b, &mut hold).unwrap();
         b.by = 11;
+        let _ = cache.run(&gpu, &lane, KEY, &mut b, &mut hold);
+    }
+
+    /// A body that asks for a library stream once `library` is set.
+    struct Library<'a> {
+        inner: Adds<'a>,
+        library: bool,
+    }
+
+    impl GraphBody<FakeGpu> for Library<'_> {
+        fn enqueue<E: Enqueue<Kernel = FakeKernel>>(
+            &mut self,
+            enq: &mut E,
+        ) -> Result<(), GpuError> {
+            if self.library {
+                let _ = enq.raw_stream();
+            }
+            self.inner.enqueue(enq)
+        }
+    }
+
+    /// A hit whose body now does library work is caught in a build with debug assertions.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "asks for a library stream")]
+    fn a_hit_replayed_as_recorded_panics_when_the_body_now_asks_for_a_library_stream() {
+        let (gpu, lane, kernel, at) = rig();
+        let cache = SharedGraphCache::<FakeGpu, _>::new();
+        cache.set_replay_as_recorded(true);
+        let mut hold = GraphHold::new();
+        let mut b = Library {
+            inner: body(&kernel, at, 2, 10),
+            library: false,
+        };
+        cache.warm(&gpu, &lane, KEY, &mut b, &mut hold).unwrap();
+        b.library = true;
         let _ = cache.run(&gpu, &lane, KEY, &mut b, &mut hold);
     }
 

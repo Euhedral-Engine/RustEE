@@ -316,7 +316,11 @@ impl FakeGpu {
         Ok(())
     }
 
-    pub(crate) fn unchanged_graph<F>(&self, graph: &FakeGraph, f: F) -> Result<bool, GpuError>
+    pub(crate) fn unchanged_graph<F>(
+        &self,
+        graph: &FakeGraph,
+        f: F,
+    ) -> Result<Option<bool>, GpuError>
     where
         F: FnOnce(&mut FakeSequence<'_>) -> Result<(), GpuError>,
     {
@@ -328,6 +332,6 @@ impl FakeGpu {
                 now,
             });
         }
-        Ok(rec.staged == graph.args)
+        Ok(Some(rec.staged == graph.args))
     }
 }

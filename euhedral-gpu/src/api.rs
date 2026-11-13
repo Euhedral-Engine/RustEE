@@ -143,10 +143,14 @@ pub trait Gpu: Send + Sync + fmt::Debug + Sized + 'static {
         F: FnOnce(&mut Self::Sequence<'_>) -> Result<(), GpuError>;
 
     /// Whether `f` is the recording as it is: the same shape and the same arguments in every launch. Applies nothing
-    /// (it is an update pass that only compares). A sequence of another shape is `Err(ShapeChanged)`.
-    fn unchanged<F>(&self, graph: &mut Self::Graph, f: F) -> Result<bool, GpuError>
+    /// (it is an update pass that only compares). A sequence of another shape is `Err(ShapeChanged)`. `Ok(None)` is
+    /// "cannot tell" (the default, which does not run `f`): the caller falls back to [`update`](Self::update).
+    fn unchanged<F>(&self, _graph: &mut Self::Graph, _f: F) -> Result<Option<bool>, GpuError>
     where
-        F: FnOnce(&mut Self::Sequence<'_>) -> Result<(), GpuError>;
+        F: FnOnce(&mut Self::Sequence<'_>) -> Result<(), GpuError>,
+    {
+        Ok(None)
+    }
 }
 
 /// The submitter of one ordered queue of device work, and a lane of a [`LanePool`].

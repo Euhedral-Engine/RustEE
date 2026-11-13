@@ -5,19 +5,19 @@ semantics and the tests that pin it.
 
 ## A hit can replay the recording as it is (2026-11-13)
 
-**What.** `SharedGraphCache::set_replay_as_recorded(bool)`, off by default. With it on, a hit launches the recorded graph without running the body. `Gpu` gains `unchanged`, an update pass that only compares.
+**What.** `SharedGraphCache::set_replay_as_recorded(bool)`, off by default. With it on, a hit launches the recorded graph without running the body. `Gpu` gains `unchanged`, an update pass that only compares; its default answers `Ok(None)` ("cannot tell"), and the debug check then falls back to the update pass, which catches a changed shape only.
 
 **Why.** Every hit ran the body as an update pass: the whole body on the host, a hash of its shape and a comparison of every launch's arguments. For a recurring unit whose key already fixes every buffer and size, that pass is pure cost.
 
-**How to use it.** Call `set_replay_as_recorded(true)` on the shared cache. **The caller promises that the key covers every argument of the body**: every address, size and value of every launch, and the shape. Two units under one key must be the same launches with the same arguments. A key that forgets a field replays the first recording's arguments, silently, in a release build.
+**How to use it.** Call `set_replay_as_recorded(true)` on the shared cache. **The caller promises that the key covers every argument of the body**: every address, size and value of every launch, and the shape. Two units under one key must be the same launches with the same arguments. Also, **the body does nothing outside its enqueues**: no writes to host buffers, no errors that matter; a release build never runs it on a hit, and a debug build runs it only through the comparing pass, so a violation of this is not caught. A key that forgets a field replays the instance's current arguments (the recording's, or those of the last update made while the option was off) silently, in a release build.
 
 **Semantics.**
 - The option is an atomic of the shared cache: it may change while threads run, and a run reads it once, at its start. Off, nothing changes.
 - A miss records as before, and a recording is the same either way.
-- Release builds run no pass on a hit. Builds with `debug_assertions` still run one, with `Gpu::unchanged`, which applies nothing, and panic if it finds a changed argument or another shape; the message says that the key does not cover them.
+- Release builds run no pass on a hit. Builds with `debug_assertions` still run one, with `Gpu::unchanged`, which applies nothing, and panic if it finds a changed argument or another shape, or a body that now asks for a library stream; the message says that the key does not cover them.
 - A hit that replays this way counts in `replays`, as any replay.
 
-**Tests.** `graph_cache::shared_tests`: `a_hit_replayed_as_recorded_runs_no_pass_of_the_body` (asserts no call of the body in a release build, one per hit in a debug build), `a_hit_replayed_as_recorded_panics_when_the_key_hides_a_changed_argument`, `a_hit_replayed_as_recorded_panics_when_the_key_hides_a_changed_shape` (debug builds), `with_the_option_off_a_hit_runs_the_pass_and_applies_new_arguments`; device: `hits_replayed_as_recorded_give_the_results_of_the_eager_run` in `tests/cuda_lane_graphs.rs`.
+**Tests.** `graph_cache::shared_tests`: `a_hit_replayed_as_recorded_runs_no_pass_of_the_body` (asserts no call of the body in a release build, one per hit in a debug build), `a_hit_replayed_as_recorded_panics_when_the_key_hides_a_changed_argument`, `a_hit_replayed_as_recorded_panics_when_the_key_hides_a_changed_shape`, `a_hit_replayed_as_recorded_panics_when_the_body_now_asks_for_a_library_stream`, `a_backend_that_cannot_compare_falls_back_to_the_update_pass` (debug builds), `with_the_option_off_a_hit_runs_the_pass_and_applies_new_arguments`; device: `hits_replayed_as_recorded_give_the_results_of_the_eager_run` in `tests/cuda_lane_graphs.rs`.
 
 ## A failed recording is not a failed unit of work (2026-11-10)
 
