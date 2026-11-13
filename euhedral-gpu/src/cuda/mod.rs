@@ -7,10 +7,12 @@ mod enqueue;
 pub mod fns;
 mod graph;
 mod lane;
+mod launch;
 mod module;
 pub mod nvrtc;
 mod retire;
 mod stream;
+mod tensor_map;
 pub mod texture;
 
 pub use enqueue::CudaEnqueue;
@@ -295,6 +297,13 @@ impl Gpu for CudaGpu {
         F: FnOnce(&mut CudaSequence<'_>) -> Result<(), GpuError>,
     {
         graph.update(f)
+    }
+
+    fn unchanged<F>(&self, graph: &mut CudaGraph, f: F) -> Result<Option<bool>, GpuError>
+    where
+        F: FnOnce(&mut CudaSequence<'_>) -> Result<(), GpuError>,
+    {
+        graph.unchanged(f)
     }
 }
 

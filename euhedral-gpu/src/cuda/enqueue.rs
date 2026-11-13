@@ -13,6 +13,7 @@ use crate::{
 };
 
 use super::fns::{CAPTURE_STATUS_ACTIVE, CaptureInfo, CuGraph, CuGraphNode};
+use super::launch::{issue, launch_call, supported};
 use super::stream::LaneFork;
 use super::{CudaGpu, CudaKernel, CudaQueue, CudaStream};
 
@@ -243,6 +244,9 @@ impl LaneEnqueue for CudaEnqueue<'_> {
         launch: Launch,
         args: &Args,
     ) -> Result<(), GpuError> {
+        // First, in every mode: a launch the kernel is not opted in for is refused before it is recorded, probed or
+        // issued (one load and a compare).
+        kernel.check_shared(&launch)?;
         if let Some((rec, stream)) = &mut self.rec {
             rec.hasher
                 .launch(*stream, kernel.id(), &launch, args.layout());
@@ -275,6 +279,7 @@ impl LaneEnqueue for CudaEnqueue<'_> {
             )));
         }
         let fns = &self.gpu.fns;
+        supported(fns, &launch)?;
         // The argument addresses go on the stack: a launch allocates nothing.
         let mut pointers = [std::ptr::null_mut::<c_void>(); MAX_ARGS];
         if args.pointers_into(&mut pointers).is_none() {
@@ -287,20 +292,8 @@ impl LaneEnqueue for CudaEnqueue<'_> {
         let (func, params) = (kernel.raw(), pointers.as_mut_ptr());
         // SAFETY: the caller's contract (arguments match the kernel; addresses valid until retired); the pointers
         // address `args`, which outlives the call; the context is current.
-        self.run("cuLaunchKernel", |stream| unsafe {
-            (fns.launch_kernel)(
-                func,
-                launch.grid.x,
-                launch.grid.y,
-                launch.grid.z,
-                launch.block.x,
-                launch.block.y,
-                launch.block.z,
-                launch.shared_bytes,
-                stream,
-                params,
-                std::ptr::null_mut(),
-            )
+        self.run(launch_call(&launch), |stream| unsafe {
+            issue(fns, func, &launch, stream, params)
         })?;
         // While recording: the node this launch made.
         if let (

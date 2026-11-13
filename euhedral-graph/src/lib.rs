@@ -29,8 +29,8 @@
 //! Every public type is also re-exported at the crate root. Types of `euhedral-core` (`Frame`,
 //! `LatticeSource`, ...) are not: import them from `euhedral_core`.
 //!
-//! Feature: `testing` adds `testing::FakeDevice` and `Lake::idle_watch_by_hand`. Asynchronous file and socket I/O
-//! (`AsyncIo`) is in `euhedral-io`.
+//! Feature: `testing` adds `testing::FakeDevice`, `testing::StageHarness` and `Lake::idle_watch_by_hand`. Asynchronous
+//! file and socket I/O (`AsyncIo`) is in `euhedral-io`.
 
 // `ThreadUsage` makes system calls and `Sequencer` shares its entries across threads, each with a
 // `// SAFETY:` comment; nowhere else.

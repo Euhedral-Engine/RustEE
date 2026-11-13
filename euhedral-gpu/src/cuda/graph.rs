@@ -63,6 +63,25 @@ impl Drop for CudaGraph {
 }
 
 impl CudaGraph {
+    /// A test hook (feature `test-hooks`): the types of the edges into the node of launch `launch` in the recorded
+    /// graph (0 default, 1 programmatic), or `None` when the driver cannot report them.
+    #[cfg(feature = "test-hooks")]
+    pub fn edge_types_into(&self, launch: usize) -> Option<Vec<u8>> {
+        let get = self.gpu.fns.graph_node_get_dependencies?;
+        let node = self.nodes.get(launch)?.0;
+        let _c = self.gpu.device().enter().ok()?;
+        let mut count = 0usize;
+        // SAFETY: a node of the recorded graph; a null array asks for the count; the context is current.
+        (unsafe { get(node, std::ptr::null_mut(), std::ptr::null_mut(), &mut count) } == 0)
+            .then_some(())?;
+        let mut deps = vec![std::ptr::null_mut(); count];
+        let mut data = vec![0u8; count * 8];
+        // SAFETY: arrays of `count` nodes and edge records; the context is current.
+        (unsafe { get(node, deps.as_mut_ptr(), data.as_mut_ptr(), &mut count) } == 0)
+            .then_some(())?;
+        Some(data.chunks(8).take(count).map(|d| d[2]).collect())
+    }
+
     pub(crate) fn gpu(&self) -> &Arc<CudaGpu> {
         &self.gpu
     }
@@ -101,6 +120,34 @@ impl CudaGraph {
         // `fresh` is now the old graph: dropping it frees its executable once its launches in flight end. Replays in
         // flight hold their own handle to its buffers.
         Ok(Rerecorded::Instantiated)
+    }
+
+    /// Runs `f` as an update pass that only compares: whether every launch has the recorded arguments. Applies
+    /// nothing. A sequence of another shape is `Err(ShapeChanged)`.
+    pub(crate) fn unchanged<F>(&mut self, f: F) -> Result<Option<bool>, GpuError>
+    where
+        F: FnOnce(&mut CudaSequence<'_>) -> Result<(), GpuError>,
+    {
+        let gpu = self.gpu.clone();
+        let mut rec = std::mem::replace(&mut self.scratch, Recording::new(Mode::Update));
+        rec.reset(Mode::Update);
+        let rec = gpu.probe_with(rec, self.streams, f)?;
+        let now = rec.hasher.finish();
+        let shape_ok = now == self.fingerprint && rec.staged_len == self.launches.len();
+        let same = shape_ok
+            && rec.staged[..rec.staged_len]
+                .iter()
+                .zip(&self.launches)
+                .all(|(staged, (_, _, args))| *args == *staged);
+        self.scratch = rec;
+        if shape_ok {
+            Ok(Some(same))
+        } else {
+            Err(GpuError::ShapeChanged {
+                recorded: self.fingerprint,
+                now,
+            })
+        }
     }
 
     /// Runs `f` as an update pass: new argument values, launch `n` of `f` to launch `n` of the recording. A sequence

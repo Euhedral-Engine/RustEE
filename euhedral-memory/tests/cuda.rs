@@ -46,14 +46,17 @@ fn each_backend_allocates_and_frees() {
 }
 
 #[test]
-fn vmm_exports_a_posix_fd() {
+fn vmm_exports_a_shareable_handle_that_the_device_imports() {
     let Some(dev) = device() else { return };
-    let vmm = Vmm::new(dev, LocationId(0), true).unwrap();
+    let vmm = Vmm::new(dev.clone(), LocationId(0), true).unwrap();
     assert!(vmm.granularity >= 4096);
     let block = vmm.alloc_vmm(3 << 20).unwrap();
     assert_eq!(block.size % vmm.granularity, 0);
-    let fd = vmm.export_fd(&block).unwrap();
-    drop(fd);
+    let handle = vmm.export_fd(&block).unwrap();
+    // The round trip: the handle the driver exported is one it imports as external memory, mapped at a new address.
+    let imported = dev.import_fd(handle, block.size, false).unwrap();
+    assert_ne!(imported.ptr, 0);
+    drop(imported);
     // SAFETY: unused.
     unsafe { vmm.free_vmm(block) };
 }

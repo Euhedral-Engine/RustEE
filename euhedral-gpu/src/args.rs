@@ -26,6 +26,11 @@ unsafe impl<T: KernelArg, const N: usize> KernelArg for [T; N] {}
 /// The most arguments one launch takes: a launch lists their addresses on the stack, so it allocates nothing.
 pub const MAX_ARGS: usize = 64;
 
+/// The largest alignment of a kernel argument (a `CUtensorMap` is aligned to 64 bytes). An argument aligned to `a` bytes is
+/// placed at an offset that is a multiple of `a` in the storage; the storage itself is 16-byte aligned, and the driver reads
+/// each argument through its pointer for its size, so the host address is no condition of a launch.
+pub const MAX_ALIGN: usize = 64;
+
 /// The arguments of one kernel launch: values packed in order, each at its own alignment.
 ///
 /// Build with [`Args::new`] and [`arg`](Args::arg); a device address from `euhedral-memory`'s `Block::addr` goes in
@@ -53,13 +58,13 @@ impl Args {
     /// Appends `value`.
     ///
     /// # Panics
-    /// If the type is aligned beyond 16 bytes or larger than 64 KiB: a misuse found when the arguments are built.
+    /// If the type is aligned beyond 64 bytes or larger than 64 KiB: a misuse found when the arguments are built.
     #[must_use]
     pub fn arg<T: KernelArg>(mut self, value: T) -> Self {
         let (size, align) = (size_of::<T>(), align_of::<T>());
         assert!(
-            align <= 16,
-            "a kernel argument is aligned to at most 16 bytes"
+            align <= MAX_ALIGN,
+            "a kernel argument is aligned to at most 64 bytes"
         );
         assert!(
             size <= usize::from(u16::MAX),
@@ -95,8 +100,8 @@ impl Args {
     pub fn push<T: KernelArg>(&mut self, value: T) -> &mut Self {
         let (size, align) = (size_of::<T>(), align_of::<T>());
         assert!(
-            align <= 16,
-            "a kernel argument is aligned to at most 16 bytes"
+            align <= MAX_ALIGN,
+            "a kernel argument is aligned to at most 64 bytes"
         );
         assert!(
             size <= usize::from(u16::MAX),
@@ -279,6 +284,9 @@ pub struct Launch {
     pub block: Dim3,
     /// Dynamic shared memory per block, in bytes.
     pub shared_bytes: u32,
+    /// A programmatic dependent launch: the kernel may start before the previous kernel on its stream has finished
+    /// and waits for it itself (`griddepcontrol.wait`). Part of a recording's shape.
+    pub programmatic: bool,
 }
 
 impl Launch {
@@ -288,7 +296,15 @@ impl Launch {
             grid: Dim3::x(n.div_ceil(block.max(1)).max(1)),
             block: Dim3::x(block),
             shared_bytes: 0,
+            programmatic: false,
         }
+    }
+
+    /// This launch as a programmatic dependent launch (or not).
+    #[must_use]
+    pub const fn programmatic(mut self, programmatic: bool) -> Self {
+        self.programmatic = programmatic;
+        self
     }
 }
 
@@ -376,6 +392,45 @@ mod tests {
         let mut other = source.clone();
         other.set(0, 6u32).unwrap();
         assert_ne!(other, source);
+    }
+
+    #[test]
+    fn offsets_and_layout_of_small_alignments_are_as_they_were() {
+        let a = Args::new()
+            .arg(1u8)
+            .arg(2u64)
+            .arg(3u16)
+            .arg([7u64, 9])
+            .arg(5u32);
+        assert_eq!(
+            a.slots,
+            [(0, 1, 1), (8, 8, 8), (16, 2, 2), (24, 16, 8), (40, 4, 4)]
+        );
+        assert_eq!(a.used, 44);
+        let mut literal = Vec::new();
+        for (size, align) in [(1u16, 1u16), (8, 8), (2, 2), (16, 8), (4, 4)] {
+            literal.extend_from_slice(&size.to_le_bytes());
+            literal.extend_from_slice(&align.to_le_bytes());
+        }
+        assert_eq!(a.layout(), hash_bytes_with_seed(&literal, 0));
+        // SAFETY: `used` initialized bytes.
+        let bytes = unsafe { std::slice::from_raw_parts(a.storage.as_ptr().cast::<u8>(), a.used) };
+        assert_eq!(bytes[0], 1);
+        assert_eq!(&bytes[8..16], &2u64.to_ne_bytes());
+        assert_eq!(&bytes[16..18], &3u16.to_ne_bytes());
+        assert_eq!(&bytes[24..32], &7u64.to_ne_bytes());
+        assert_eq!(&bytes[40..44], &5u32.to_ne_bytes());
+    }
+
+    #[test]
+    fn a_64_aligned_argument_sits_at_a_64_aligned_offset() {
+        #[derive(Clone, Copy)]
+        #[repr(C, align(64))]
+        struct Wide([u8; 64]);
+        // SAFETY: plain bytes, no padding.
+        unsafe impl KernelArg for Wide {}
+        let a = Args::new().arg(1u8).arg(Wide([4; 64])).arg(2u8);
+        assert_eq!(a.slots, [(0, 1, 1), (64, 64, 64), (128, 1, 1)]);
     }
 
     #[test]

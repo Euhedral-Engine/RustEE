@@ -13,8 +13,9 @@ pub type CuGraph = *mut c_void;
 pub type CuGraphExec = *mut c_void;
 pub type CuGraphNode = *mut c_void;
 
-/// `CUstreamCallback`.
-pub type StreamCallback = unsafe extern "C" fn(CuStream, CuResult, *mut c_void);
+/// `CUstreamCallback` (declared `CUDA_CB`: the platform's callback convention, which is the one C convention on
+/// 64-bit Windows and on Linux).
+pub type StreamCallback = unsafe extern "system" fn(CuStream, CuResult, *mut c_void);
 
 /// `CUDA_KERNEL_NODE_PARAMS_v2`.
 #[repr(C)]
@@ -127,6 +128,22 @@ pub struct GpuFns {
         *mut *mut c_void,
         *mut *mut c_void,
     ) -> CuResult,
+    /// `cuLaunchKernelEx` (the driver's launch with attributes), where the driver has it: the config, the function,
+    /// the arguments and the extra.
+    pub launch_kernel_ex: Option<
+        unsafe extern "C" fn(
+            *const c_void,
+            CuFunction,
+            *mut *mut c_void,
+            *mut *mut c_void,
+        ) -> CuResult,
+    >,
+    /// `cuFuncGetAttribute`: the value, the attribute, the function.
+    pub func_get_attribute: unsafe extern "C" fn(*mut c_int, c_int, CuFunction) -> CuResult,
+    /// `cuFuncSetAttribute`: the function, the attribute, the value.
+    pub func_set_attribute: unsafe extern "C" fn(CuFunction, c_int, c_int) -> CuResult,
+    /// `cuTensorMapEncodeTiled` (CUDA 12.0 and newer), where the driver has it.
+    pub tensor_map_encode_tiled: Option<super::tensor_map::EncodeTiled>,
     pub device_get_attribute: unsafe extern "C" fn(*mut c_int, c_int, c_int) -> CuResult,
     pub driver_get_version: unsafe extern "C" fn(*mut c_int) -> CuResult,
     pub stream_begin_capture: unsafe extern "C" fn(CuStream, c_int) -> CuResult,
@@ -138,6 +155,11 @@ pub struct GpuFns {
         unsafe extern "C" fn(CuGraphExec, CuGraph, *mut ExecUpdateResultInfo) -> CuResult,
     pub graph_exec_kernel_node_set_params:
         unsafe extern "C" fn(CuGraphExec, CuGraphNode, *const KernelNodeParams) -> CuResult,
+    /// `cuGraphNodeGetDependencies_v2` (CUDA 12.3 and newer): the node, the dependencies, their edge data (8 bytes
+    /// each, the third is the edge type) and the count.
+    pub graph_node_get_dependencies: Option<
+        unsafe extern "C" fn(CuGraphNode, *mut CuGraphNode, *mut u8, *mut usize) -> CuResult,
+    >,
     pub graph_destroy: unsafe extern "C" fn(CuGraph) -> CuResult,
     pub graph_exec_destroy: unsafe extern "C" fn(CuGraphExec) -> CuResult,
 }
@@ -206,6 +228,10 @@ impl GpuFns {
             func_get_param_count: optional(driver, c"cuFuncGetParamCount").map(|p| cast!(p)),
             func_get_param_info: optional(driver, c"cuFuncGetParamInfo").map(|p| cast!(p)),
             launch_kernel: cast!(required(driver, c"cuLaunchKernel")?),
+            launch_kernel_ex: optional(driver, c"cuLaunchKernelEx").map(|p| cast!(p)),
+            func_get_attribute: cast!(required(driver, c"cuFuncGetAttribute")?),
+            func_set_attribute: cast!(required(driver, c"cuFuncSetAttribute")?),
+            tensor_map_encode_tiled: optional(driver, c"cuTensorMapEncodeTiled").map(|p| cast!(p)),
             device_get_attribute: cast!(required(driver, c"cuDeviceGetAttribute")?),
             driver_get_version: cast!(required(driver, c"cuDriverGetVersion")?),
             stream_begin_capture: cast!(required(driver, c"cuStreamBeginCapture_v2")?),
@@ -218,6 +244,8 @@ impl GpuFns {
                 driver,
                 c"cuGraphExecKernelNodeSetParams_v2"
             )?),
+            graph_node_get_dependencies: optional(driver, c"cuGraphNodeGetDependencies_v2")
+                .map(|p| cast!(p)),
             graph_destroy: cast!(required(driver, c"cuGraphDestroy")?),
             graph_exec_destroy: cast!(required(driver, c"cuGraphExecDestroy")?),
         })

@@ -43,7 +43,7 @@ pub use enqueue::FakeEnqueue;
 use enqueue::Real;
 pub use graph::{FakeGraph, FakeSequence};
 pub use lane::{FakeLaneEnqueue, FakeRawStream};
-pub use module::{FakeKernel, FakeModule};
+pub use module::{DEFAULT_DYNAMIC_SHARED_BYTES, FakeKernel, FakeModule, MAX_DYNAMIC_SHARED_BYTES};
 use stream::Placement;
 pub use stream::{FakeQueue, FakeStream};
 
@@ -124,6 +124,8 @@ pub enum FakeOp {
     Launch {
         lane: u16,
         kernel: String,
+        /// The launch was a programmatic dependent launch.
+        programmatic: bool,
     },
     Copy {
         lane: u16,
@@ -461,6 +463,7 @@ impl FakeGpu {
                 st.log.push(FakeOp::Launch {
                     lane,
                     kernel: kernel.name().to_owned(),
+                    programmatic: launch.programmatic,
                 });
                 (kernel.f)(&mut st.memory, &launch, &args)
             }
@@ -710,5 +713,12 @@ impl Gpu for FakeGpu {
         F: FnOnce(&mut FakeSequence<'_>) -> Result<(), GpuError>,
     {
         self.update_graph(graph, f)
+    }
+
+    fn unchanged<F>(&self, graph: &mut FakeGraph, f: F) -> Result<Option<bool>, GpuError>
+    where
+        F: FnOnce(&mut FakeSequence<'_>) -> Result<(), GpuError>,
+    {
+        self.unchanged_graph(graph, f)
     }
 }
