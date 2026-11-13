@@ -37,6 +37,7 @@ impl LaneEnqueue for FakeLaneEnqueue<'_> {
         launch: Launch,
         args: &Args,
     ) -> Result<(), GpuError> {
+        kernel.check_shared(&launch)?;
         self.push(QOp::Launch {
             kernel: kernel.clone(),
             launch,

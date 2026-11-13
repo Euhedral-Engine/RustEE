@@ -27,6 +27,71 @@ semantics and the tests that pin it.
 
 **Tests.** No device needed, on both platforms: `cuda::loader::tests` (`a_missing_library_is_an_error_naming_it`, `a_name_with_a_nul_is_an_error` (asserts the message), `the_driver_library_is_found_or_reported_by_name`, `a_missing_symbol_is_named`, `a_symbol_is_found_and_its_file_is_the_library`, `an_address_outside_any_library_has_no_file`); `cuda::nvrtc::tests::the_windows_search_order_is_explicit_env_names_then_toolkit_bins` and `the_builtins_library_is_recognised_by_platform_name` (the Windows order is a pure function, tested on every host). The existing device tests (`tests/cuda.rs`, `tests/cuda_*.rs`) compile for Windows and skip when `Driver::load()` fails. With a card on Windows: `cargo test -p euhedral-memory --features cuda` and `cargo test -p euhedral-gpu --features cuda`, in particular `vmm_exports_a_shareable_handle`.
 
+## A kernel can be opted in to more dynamic shared memory (2026-11-13)
+
+**What.** `Module::kernel_with(name, KernelOptions { max_dynamic_shared_bytes })`, beside `Module::kernel`, which is unchanged and equal to `kernel_with(name, KernelOptions::default())`. `KernelOptions` is `Default` (0 leaves the driver's default). `CudaKernel::max_dynamic_shared_bytes()` (an `Option`: `None` when the driver would not report its default and the kernel was not opted in) and `FakeKernel::max_dynamic_shared_bytes()` report the limit.
+
+**Why.** A launch that asks for more dynamic shared memory than the driver's default fails in the driver, which wants the kernel opted in with `cuFuncSetAttribute` first; nothing in the crate could do that, and the driver's error does not say which kernel or how many bytes.
+
+**Migration.** Nothing breaks: `Module::kernel_with` is a provided method that forwards default options to `kernel` and refuses any other as `Invalid`; the CUDA and fake backends override it. An implementor of `Module` outside this repository compiles unchanged.
+
+**How to use it.** `module.kernel_with("name", KernelOptions { max_dynamic_shared_bytes: 64 * 1024 })`, then `Launch { shared_bytes: 64 * 1024, ..Launch::linear(n, block) }`.
+
+**Semantics.**
+- On CUDA a value above the kernel's current limit is set once, at the lookup, with `cuFuncSetAttribute(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES)`; the launch path makes no driver call for it. A value the device refuses is an error at the lookup that names the kernel and the value.
+- The limit belongs to the kernel of the module, as the driver's attribute does: every handle of it shares one limit. A second lookup with a larger value raises it for all handles; a lookup with a smaller value or none never lowers it. The limit is the largest value any lookup asked for.
+- A launch (lane, eager, recorded or probed: the check is first, in every mode, one load and a compare) whose `shared_bytes` exceed the limit is `GpuError::Invalid` from the crate, naming the kernel, the bytes asked and the limit, and nothing is enqueued; it comes before the argument-size check. If the driver will not report the default (or reports a value that is no size), the limit is unknown: every opt-in with a value above the largest one set is made, and a launch is left to the driver until one has. Without an opt-in the limit is the driver's own value for the kernel, read at its first lookup with `cuFuncGetAttribute`, not a constant of the crate. `shared_bytes` is in the shape fingerprint, and an update reuses the recorded launch and kernel and changes only arguments, so a recorded launch cannot exceed its limit later.
+- The fake backend records the option and fails a launch above the limit the same way; its limit without an opt-in is `fake::DEFAULT_DYNAMIC_SHARED_BYTES` (48 KiB) and a value above `fake::MAX_DYNAMIC_SHARED_BYTES` (227 KiB) is refused at the lookup; both are what the fake models, no fact about a device.
+
+**Tests.** `tests/fake_kernel_options.rs` (the option is recorded, a default lookup equals default options, a launch above the limit is the named error, in a lane, a recording and a probe, and enqueues and runs nothing; an opted-in launch up to the limit; repeated lookups; a value above the device's maximum refused); device: `tests/cuda_dynamic_shared.rs` `a_launch_with_64_kib_of_dynamic_shared_memory_runs_after_opt_in`.
+
+## A launch can be a programmatic dependent launch (2026-11-13)
+
+**What.** `Launch` gains `programmatic: bool` (false from `Launch::linear`) and the builder-style `Launch::programmatic(bool)`. On CUDA a programmatic launch goes through `cuLaunchKernelEx` with `CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION` set to 1; any other launch still goes through `cuLaunchKernel`, unchanged. The flag is part of the shape fingerprint. `FakeOp::Launch` gains `programmatic`.
+
+**Why.** A kernel that reads what the previous kernel on its stream wrote can overlap its own start-up with the previous kernel's tail, and wait for the data itself, but only if it is launched with the attribute; a lane had no way to ask for it, eagerly or in a graph.
+
+**How to use it.** `Launch::linear(n, block).programmatic(true)`, and the kernel calls `asm volatile("griddepcontrol.wait;");` before it reads the previous kernel's output (without the wait the kernel races). Needs compute capability 9.0 or newer. A struct literal of `Launch` needs the new field; a match on `FakeOp::Launch` needs `..`.
+
+**Semantics.**
+- A recording captures the launch with the attribute, so the captured graph holds a programmatic edge (the device test reads the edge type through the `test-hooks` method `CudaGraph::edge_types_into`, and sees a plain edge without the flag). An update pass only changes node parameters, never the edges; the executable's edges are not queryable, so the test pins the results after an update, not the edge.
+- The flag is in the fingerprint: a body with the flag never matches a graph recorded without it (`ShapeChanged` on an update, a re-record in a graph cache), nor the reverse.
+- If the loaded driver has no `cuLaunchKernelEx`, a programmatic launch is `GpuError::Invalid` at the launch call; launches without the flag work as before.
+- The fake backend carries the flag and reports it in `FakeOp::Launch`.
+
+**Tests.** `tests/fake_graph.rs`: `the_programmatic_flag_changes_the_fingerprint_and_a_body_with_it_does_not_hit_a_recording_without`, `the_fake_reports_whether_a_launch_was_programmatic`; the shape tests in `shape.rs`; device: `tests/cuda_programmatic.rs` `a_programmatic_chain_gives_the_same_result_eagerly_and_from_a_recorded_updated_graph`.
+
+## A hit can replay the recording as it is (2026-11-13)
+
+**What.** `SharedGraphCache::set_replay_as_recorded(bool)`, off by default. With it on, a hit launches the recorded graph without running the body. `Gpu` gains `unchanged`, an update pass that only compares; its default answers `Ok(None)` ("cannot tell"), and the debug check then falls back to the update pass, which catches a changed shape only.
+
+**Why.** Every hit ran the body as an update pass: the whole body on the host, a hash of its shape and a comparison of every launch's arguments. For a recurring unit whose key already fixes every buffer and size, that pass is pure cost.
+
+**How to use it.** Call `set_replay_as_recorded(true)` on the shared cache. **The caller promises that the key covers every argument of the body**: every address, size and value of every launch, and the shape. Two units under one key must be the same launches with the same arguments. Also, **the body does nothing outside its enqueues**: no writes to host buffers, no errors that matter; a release build never runs it on a hit, and a debug build runs it only through the comparing pass, so a violation of this is not caught. A key that forgets a field replays the instance's current arguments (the recording's, or those of the last update made while the option was off) silently, in a release build.
+
+**Semantics.**
+- The option is an atomic of the shared cache: it may change while threads run, and a run reads it once, at its start. Off, nothing changes.
+- A miss records as before, and a recording is the same either way.
+- Release builds run no pass on a hit. Builds with `debug_assertions` still run one, with `Gpu::unchanged`, which applies nothing, and panic if it finds a changed argument or another shape, or a body that now asks for a library stream; the message says that the key does not cover them.
+- A hit that replays this way counts in `replays`, as any replay.
+
+**Tests.** `graph_cache::shared_tests`: `a_hit_replayed_as_recorded_runs_no_pass_of_the_body` (asserts no call of the body in a release build, one per hit in a debug build), `a_hit_replayed_as_recorded_panics_when_the_key_hides_a_changed_argument`, `a_hit_replayed_as_recorded_panics_when_the_key_hides_a_changed_shape`, `a_hit_replayed_as_recorded_panics_when_the_body_now_asks_for_a_library_stream`, `a_backend_that_cannot_compare_falls_back_to_the_update_pass` (debug builds), `with_the_option_off_a_hit_runs_the_pass_and_applies_new_arguments`; device: `hits_replayed_as_recorded_give_the_results_of_the_eager_run` in `tests/cuda_lane_graphs.rs`.
+
+## A kernel module can compile for the architecture-specific target (2026-11-13)
+
+**What.** `CompileOptions::arch_specific: bool` (default `false`). When set, `from_source` compiles `sm_XYa` machine code for the device's exact architecture (for example `sm_120a`), so kernels that use instructions of one architecture variant compile, and `__CUDA_ARCH_SPECIFIC__` is defined. `cuda::Target` gains `CubinSpecific(u32)`, with `name()` and `extension()`; `Nvrtc::arch_specific_target_for` picks it.
+
+**Why.** The target came from the device alone, as `sm_XY` or PTX, so no kernel could use an instruction that only an architecture-specific target accepts.
+
+**How to use it.** Set `arch_specific: true` in the `CompileOptions` of the module. The module loads on that architecture only. Nothing changes for a caller that leaves it `false`, except that a `CompileOptions` struct literal without `..Default::default()` no longer compiles.
+
+**Semantics.**
+- The target is the device's exact architecture with an `a`. If NVRTC does not list that architecture, the compile is a `GpuError::Load` that names it (`sm_XYa`). There is no fallback to the generic target, an older architecture or PTX. There is no `a` variant below sm_90, so such a device gets the same error.
+- The target string is part of the module cache key, so `sm_XY` and `sm_XYa` never share an entry.
+- The fake backend accepts the option and `FakeModule::arch_specific()` returns it.
+
+**Tests.** `cuda::nvrtc::tests::the_arch_specific_target_is_the_exact_architecture_or_nothing`, `an_architecture_nvrtc_does_not_list_is_an_error_naming_it`, `module_cache::tests::the_arch_specific_target_has_its_own_key`, `fake_streams::the_fake_module_records_the_arch_specific_option`; on a device `an_arch_specific_module_compiles_with_the_arch_specific_macro_defined` (a kernel reports whether the macro is defined, with and without the option).
+
 ## A failed recording is not a failed unit of work (2026-11-10)
 
 **What.** Three changes to `SharedGraphCache` and the CUDA capture.

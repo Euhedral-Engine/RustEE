@@ -34,14 +34,24 @@ retirement is confirmed, so the host buffers a copy reads stay live. The submitt
 `PlainQueue`, so releasing them needs no lock. The values a recording keeps are frozen into an immutable
 `Arc<[..]>` that the recording's own run, its graph and every replay share.
 
+**programmatic launch** (`Launch::programmatic`): a programmatic dependent launch. The kernel may start before the
+previous kernel on its stream has finished and must wait for it itself (`griddepcontrol.wait`). The CUDA backend
+launches it with `cuLaunchKernelEx` and the programmatic-stream-serialization attribute; a recording captures it as a
+programmatic edge. A driver without `cuLaunchKernelEx` refuses it (`GpuError::Invalid`) and still makes every other
+launch. Compute capability 9.0 or newer.
+
+**kernel options** (`KernelOptions`, `Module::kernel_with`): what a kernel is opted in to when it is looked up. Today the
+most dynamic shared memory a launch may ask for; CUDA sets it once with `cuFuncSetAttribute`. The limit is per kernel of
+the module, shared by its handles, and a repeated lookup only raises it. A launch above it is `GpuError::Invalid`.
+
 **shape and fingerprint** ([`ShapeHasher`, `Fingerprint`](src/shape.rs)): the shape of a sequence is its
-operations in order with their streams, order edges, kernels, geometry, argument layouts and copy
+operations in order with their streams, order edges, kernels, geometry, programmatic flag, argument layouts and copy
 parameters; the fingerprint is 128 bits of it. A changed shape is `GpuError::ShapeChanged`.
 
 **shadow stream** ([`CudaSequence`](src/cuda/graph.rs)): the stream a recording captures a stream's work
 on, so the real stream is never in capture mode and a failed capture never disturbs the work.
 
-**shared graph cache, instance, graph hold** ([`SharedGraphCache`](src/graph_cache.rs), [`instances`](src/instances.rs), [`GraphHold`](src/hold.rs)): the graph cache of shared lanes. A recorded graph is used by one thread at a time, so a key that several workers run at once has several instances, in a fixed table of slots whose one atomic word says empty, free or busy: a worker takes a free instance of its key by one compare-and-set, and one that finds none records an instance of its own (it never waits). The instance goes back once the replay is enqueued; the recording's host buffers go to the caller's `GraphHold`, which the stage drops in `Stage::retired`, after the device work ended. Capacity counts instances, and a full table evicts the least recently used free one; a key is recorded on its second sighting.
+**shared graph cache, instance, graph hold** ([`SharedGraphCache`](src/graph_cache.rs), [`instances`](src/instances.rs), [`GraphHold`](src/hold.rs)): the graph cache of shared lanes. A recorded graph is used by one thread at a time, so a key that several workers run at once has several instances, in a fixed table of slots whose one atomic word says empty, free or busy: a worker takes a free instance of its key by one compare-and-set, and one that finds none records an instance of its own (it never waits). The instance goes back once the replay is enqueued; the recording's host buffers go to the caller's `GraphHold`, which the stage drops in `Stage::retired`, after the device work ended. Capacity counts instances, and a full table evicts the least recently used free one; a key is recorded on its second sighting. `set_replay_as_recorded` (off by default) makes a hit replay the instance as it is, with no pass of the body: the caller promises the key covers every argument and shape and that the body does nothing outside its enqueues; debug builds still run a comparing pass and panic on a violation they can see.
 
 **private stream, fork** ([`cuda::stream`](src/cuda/stream.rs), [`handles`](src/handles.rs)): a replay on a shared CUDA lane never launches on the lane: with several threads submitting to one stream a `cuGraphLaunch` can overtake the `cuStreamWaitEvent` its own thread issued just before it (driver 615.71.09, CUDA 13.4). The worker takes a stream of its own from the lane's lock-free stock, forks it from the lane (an event recorded on the lane, awaited by the private stream), makes the cross-lane waits and the launch there, and joins the lane back (an event recorded on the private stream, awaited by the lane); the marker follows the join. The same streams are the shadow streams a recording captures on.
 

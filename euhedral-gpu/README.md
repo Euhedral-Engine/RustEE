@@ -19,13 +19,13 @@ Asynchronous, backend-neutral GPU access for the RustEE control plane. A lattice
 
 | Module | Main types |
 |---|---|
-| [`api`](src/api.rs) | The traits: `Gpu`, `Stream`, `Lane`, `LaneEnqueue`, `Enqueue`, `Module`, `Kernel`, `Sequence`, `Graph`, `RetireListener`; `RetireTicket`, `StreamOptions`, `StreamPriority`, `CompileOptions`, `Rerecorded`, `Span` (timed spans, `Stream::span_*`). |
+| [`api`](src/api.rs) | The traits: `Gpu`, `Stream`, `Lane`, `LaneEnqueue`, `Enqueue`, `Module`, `Kernel`, `Sequence`, `Graph`, `RetireListener`; `RetireTicket`, `StreamOptions`, `StreamPriority`, `CompileOptions`, `KernelOptions`, `Rerecorded`, `Span` (timed spans, `Stream::span_*`). |
 | [`lanes`](src/lanes.rs) | `LaneSubmit` for the backends' streams, and `open_lane_sources`: a device's lanes as a pool, its intakes and a `LaneSource` per lane (`LaneSpec`, `OpenedLanes`); `open_shared_lanes`: a device's lanes as a typed pool that any worker submits to (`SharedLanes`). |
 | [`ring`](src/ring.rs) | The lock-free marker ring behind a lane's markers: numbers claimed by compare-and-set, completion found by an in-order scan, the awaiters' pins. No driver; loom-checked. |
 | [`cuda::texture`](src/cuda/texture.rs) | `TexObject`, `View`: texture objects over pitched device memory (filter, address and coordinate modes). |
 | [`graph_cache`](src/graph_cache.rs) | `GraphCache`: an owned lane's graphs by key (a hit updates and replays, a miss records, a warm-up only records), `SharedGraphCache`: the same through a shared lane for any number of workers (instances by key), `GraphBody`, `Ran`. |
 | [`hold`](src/hold.rs) | `GraphHold`: what the work of a run on a shared lane reads, held by the caller until the work ended. |
-| [`args`](src/args.rs) | `KernelArg`, `Args` (the typed argument builder, rewritable in place), `Launch`, `Dim3`. |
+| [`args`](src/args.rs) | `KernelArg`, `Args` (the typed argument builder, rewritable in place), `Launch` (geometry and the programmatic-launch flag), `Dim3`. |
 | [`error`](src/error.rs) | `GpuError`, the one error type. |
 | [`poison`](src/poison.rs) | `Poison`: a device's first fault, set once. |
 | [`kept`](src/kept.rs) | The values a submitter keeps until a retirement is confirmed (a `PlainQueue`), and the frozen values a recording shares. |
@@ -133,7 +133,9 @@ Asynchronous, backend-neutral GPU access for the RustEE control plane. A lattice
     callback runs, the continuation is emitted at once with `POISONED_STATUS`, so nothing is stranded.
 - **Kernels from outside.** A `Module` loads from `from_source` or from `from_image`; the crate enumerates no kernels.
   - `from_source` compiles CUDA C with NVRTC for the device's exact architecture (or PTX for the newest architecture
-    NVRTC knows, which the driver compiles forward), with the options, include paths and in-memory headers of
+    NVRTC knows, which the driver compiles forward; `CompileOptions::arch_specific` asks for the architecture-specific
+    `sm_XYa` machine code instead, and is an error naming the architecture when NVRTC does not list it, with no
+    fallback to the generic target or to PTX), with the options, include paths and in-memory headers of
     `CompileOptions`. With `cache_dir` set, the result is cached under a 128-bit hash of the source, the options, the
     headers, the include paths, the target and NVRTC's version. A cache entry that will not load is rebuilt, and writes
     are atomic renames.
@@ -148,6 +150,9 @@ Asynchronous, backend-neutral GPU access for the RustEE control plane. A lattice
   - `Module::kernel(name)` looks a kernel up by its unmangled symbol (declare kernels `extern "C"`). `Args` packs the
     arguments (`Args::new().device(addr).arg(2.5f32)`); where the driver reports the kernel's parameter sizes, a launch
     with arguments that do not fit is `Err(Args)` before the driver sees it.
+  - `Module::kernel_with(name, KernelOptions { max_dynamic_shared_bytes })` opts the kernel in, once at the lookup, to
+    more dynamic shared memory than the driver's default; a launch above the kernel's limit is `Err(Invalid)` naming
+    the kernel, the bytes and the limit. Repeated lookups only raise the limit.
 - **Recurring sequences.**
   - `Gpu::record(&mut [&mut a, &mut b], |q| ...)` runs the closure once for real and records it. The same code path then serves
     `fingerprint` (a probe: nothing reaches the device) and `update` (new argument values: launch *n* of the update

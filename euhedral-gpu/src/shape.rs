@@ -50,6 +50,7 @@ impl ShapeHasher {
                 u64::from(launch.block.y),
                 u64::from(launch.block.z),
                 u64::from(launch.shared_bytes),
+                u64::from(launch.programmatic),
             ],
         );
     }
@@ -90,6 +91,7 @@ mod tests {
             grid: Dim3::x(x),
             block: Dim3::x(128),
             shared_bytes: 0,
+            programmatic: false,
         }
     }
 
@@ -106,6 +108,18 @@ mod tests {
     fn fingerprints_differ_by_any_shape_field_and_not_by_nothing() {
         assert_eq!(base().finish(), base().finish());
         let variants: Vec<ShapeHasher> = vec![
+            {
+                let mut h = ShapeHasher::default();
+                let programmatic = Launch {
+                    programmatic: true,
+                    ..launch(4)
+                };
+                h.launch(0, 11, &programmatic, 5);
+                h.order(0, 1);
+                h.copy(1, CopyKind::ToHost, 0x10, 0x20, 64);
+                h.memset(0, 0x30, 7, 8);
+                h
+            },
             {
                 let mut h = ShapeHasher::default();
                 h.launch(0, 11, &launch(5), 5);

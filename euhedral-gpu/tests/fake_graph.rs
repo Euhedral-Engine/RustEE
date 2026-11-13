@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use euhedral_gpu::fake::{FakeGpu, FakeKernel, FakeModule, FakeStream};
+use euhedral_gpu::fake::{FakeGpu, FakeKernel, FakeModule, FakeOp, FakeStream};
 use euhedral_gpu::{
     Args, CompileOptions, Enqueue, Gpu, GpuError, Graph, LaneEnqueue, Launch, Module, Rerecorded,
     Sequence, Stream, StreamOptions,
@@ -458,4 +458,74 @@ fn a_graph_dropped_right_after_recording_leaves_the_run_its_buffers() {
     f.gpu.run_until_idle();
     f.confirm_everything(&mut s);
     assert_eq!(Arc::strong_count(&token), 1);
+}
+
+/// One launch of `add1`, programmatic or not, on stream 0.
+fn one_launch<S: Sequence<Kernel = FakeKernel>>(
+    q: &mut S,
+    f: &Fixture,
+    programmatic: bool,
+) -> Result<(), GpuError> {
+    q.submit(0, |e| {
+        // SAFETY: a fake allocation; the kernel reads and writes inside it.
+        unsafe {
+            e.launch(
+                &f.add1,
+                Launch::linear(WORDS as u32, 8).programmatic(programmatic),
+                &Args::new().device(f.y),
+            )
+        }
+    })
+}
+
+#[test]
+fn the_programmatic_flag_changes_the_fingerprint_and_a_body_with_it_does_not_hit_a_recording_without()
+ {
+    let (f, mut s) = Fixture::new();
+    let plain = f.gpu.fingerprint(1, |q| one_launch(q, &f, false)).unwrap();
+    let flagged = f.gpu.fingerprint(1, |q| one_launch(q, &f, true)).unwrap();
+    assert_ne!(plain, flagged);
+    assert_eq!(
+        plain,
+        f.gpu.fingerprint(1, |q| one_launch(q, &f, false)).unwrap()
+    );
+    let mut graph = f
+        .gpu
+        .record(&mut [&mut s[0]], |q| one_launch(q, &f, false))
+        .unwrap();
+    assert_eq!(graph.fingerprint(), plain);
+    let r = f.gpu.update(&mut graph, |q| one_launch(q, &f, true));
+    assert!(matches!(r, Err(GpuError::ShapeChanged { .. })), "{r:?}");
+    f.gpu
+        .update(&mut graph, |q| one_launch(q, &f, false))
+        .unwrap();
+}
+
+#[test]
+fn the_fake_reports_whether_a_launch_was_programmatic() {
+    let (f, mut s) = Fixture::new();
+    for programmatic in [false, true] {
+        s[0].submit(|e| {
+            // SAFETY: a fake allocation.
+            unsafe {
+                e.launch(
+                    &f.add1,
+                    Launch::linear(1, 1).programmatic(programmatic),
+                    &Args::new().device(f.y),
+                )
+            }
+        })
+        .unwrap();
+    }
+    f.gpu.run_until_idle();
+    let flags: Vec<bool> = f
+        .gpu
+        .log()
+        .iter()
+        .filter_map(|op| match op {
+            FakeOp::Launch { programmatic, .. } => Some(*programmatic),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(flags, [false, true]);
 }

@@ -279,6 +279,9 @@ pub struct Launch {
     pub block: Dim3,
     /// Dynamic shared memory per block, in bytes.
     pub shared_bytes: u32,
+    /// A programmatic dependent launch: the kernel may start before the previous kernel on its stream has finished
+    /// and waits for it itself (`griddepcontrol.wait`). Part of a recording's shape.
+    pub programmatic: bool,
 }
 
 impl Launch {
@@ -288,7 +291,15 @@ impl Launch {
             grid: Dim3::x(n.div_ceil(block.max(1)).max(1)),
             block: Dim3::x(block),
             shared_bytes: 0,
+            programmatic: false,
         }
+    }
+
+    /// This launch as a programmatic dependent launch (or not).
+    #[must_use]
+    pub const fn programmatic(mut self, programmatic: bool) -> Self {
+        self.programmatic = programmatic;
+        self
     }
 }
 
