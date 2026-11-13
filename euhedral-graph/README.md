@@ -25,7 +25,7 @@ so it needs no thread of its own. It does not re-export `euhedral-core`: import 
 | [`lanes`](src/lanes.rs) | `LanePool`, `LanePoolBuilder`, `LaneId`, `Marker` and the trait `DeviceQueue`: device timelines that are queried, never waited on. |
 | [`lane_source`](src/lane_source/mod.rs) | `LaneSource`, a `LatticeSource` per device lane; the traits it drives (`LaneSubmit`, `LaneState`, `LaneWork` with `Outcome` and `LaneCx`); `LaneIntakes`, `LaneInputs`, `Deliver` and `GroupId` for delivery; `LaneMetrics`. |
 | [`stage_graph`](src/stage_graph.rs) | `StageGraph` and its spec (`StageGraphSpec`, `StageSpec`, `StageId`, `EdgeKind`), the `Stage` trait with `StageCx`, `Submitted` and `StageError`, `QuantumOutcome`, `ExternalEdge`, `QuantumRef`, `GraphRuntime`, `RetryCounts`, `GraphError` and `DEFAULT_RETRY_BACKSTOP`. |
-| [`testing`](src/testing.rs) | `FakeDevice`, an in-order fake `DeviceQueue`, `FakeLanes`, a stepped fake `LaneSubmit`, and `StageHarness`, which calls a custom `Stage`'s `run`, `pass_gate`, `abandoned` and `retired` directly, with no graph. Feature `testing`. |
+| [`testing`](src/testing.rs) | `FakeDevice`, an in-order fake `DeviceQueue`, `FakeLanes`, a stepped fake `LaneSubmit`, and `StageHarness`, which calls a custom `Stage`'s `run`, `pass_gate` and `abandoned` directly, with no graph. Feature `testing`. |
 | crate root | Every type above, re-exported; `ThreadUsage` (the calling thread's CPU time and involuntary context switches, to tell a preempted callback from a slow one; measured on Linux and Android). |
 
 ## Key concepts

@@ -16,7 +16,7 @@ mod lanes;
 mod stage;
 
 pub use lanes::{FakeLane, FakeLaneError, FakeLanes, FakeOp};
-pub use stage::{GateEvent, StageHarness, StageRun};
+pub use stage::{GateEvent, HarnessRun, PassGate, StageHarness};
 
 /// A fake device queue: submissions run in order, each after the queue's earlier work and after the
 /// markers it waits for (on any lane of its pool), taking its given cost. A query is one comparison

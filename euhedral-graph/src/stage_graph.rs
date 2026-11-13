@@ -760,7 +760,7 @@ const NO_LANE: u32 = u32::MAX;
 
 /// Adds `marker` to `markers`, keeping the latest per queue and lane (a lane runs in order, so it covers
 /// the earlier ones).
-fn merge(markers: &mut Vec<Marker>, marker: Marker) {
+pub(crate) fn merge(markers: &mut Vec<Marker>, marker: Marker) {
     match markers
         .iter_mut()
         .find(|m| m.queue == marker.queue && m.lane == marker.lane)
@@ -768,6 +768,40 @@ fn merge(markers: &mut Vec<Marker>, marker: Marker) {
         Some(m) => m.value = m.value.max(marker.value),
         None => markers.push(marker),
     }
+}
+
+/// Whether `marker` is of a lane of `lanes`, and of that lane's queue. (`testing::StageHarness` judges answers with it.)
+pub(crate) fn is_pool_marker<L: DeviceQueue + ?Sized>(lanes: &LanePool<L>, marker: Marker) -> bool {
+    usize::from(marker.lane.0) < lanes.len() && lanes.lane(marker.lane).id() == marker.queue
+}
+
+/// The failure of a stage whose marker names a queue that is no lane of `lanes`: the boundary could never reach it.
+pub(crate) fn foreign_marker<L: DeviceQueue + ?Sized>(
+    lanes: &LanePool<L>,
+    submitted: &Submitted,
+) -> Option<StageError> {
+    let marker = submitted.marker?;
+    (!is_pool_marker(lanes, marker)).then(|| {
+        StageError::Fatal(format!(
+            "a marker of {} is no lane {} of the lane pool",
+            marker.queue, marker.lane.0
+        ))
+    })
+}
+
+/// The failure of a stage that answered `Held` in a run that took no gate.
+pub(crate) fn held_without_gate() -> StageError {
+    StageError::Fatal("a stage answered Held without taking a gate".into())
+}
+
+/// The failure of a stage that took a gate in `run` and answered `Ok` or `Retry`.
+pub(crate) fn gate_taken_but_not_held() -> StageError {
+    StageError::Fatal("a stage that took a gate in run did not answer Held".into())
+}
+
+/// The failure of a stage whose `pass_gate` returned `false` without taking a gate.
+pub(crate) fn held_at_gate_without_one() -> StageError {
+    StageError::Fatal("a stage held itself at its gate without taking one".into())
 }
 
 /// The edges of a validated spec, by stage.
@@ -1764,10 +1798,7 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Run<Q, L> {
         match passed {
             Ok(true) => self.offer(stage),
             Ok(false) => {
-                self.fail(
-                    stage,
-                    StageError::Fatal("a stage held itself at its gate without taking one".into()),
-                );
+                self.fail(stage, held_at_gate_without_one());
                 self.finish_one(Ends::Elsewhere);
             }
             Err(_) => {
@@ -1898,10 +1929,7 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Run<Q, L> {
                 self.note(QuantumOutcome::Killed);
             }
             Some(Err(StageError::Held)) => {
-                self.fail(
-                    stage,
-                    StageError::Fatal("a stage answered Held without taking a gate".into()),
-                );
+                self.fail(stage, held_without_gate());
                 self.release_pins(stage, None);
             }
             Some(Err(error)) => {
@@ -1933,8 +1961,7 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Run<Q, L> {
         result: Option<Result<Submitted, StageError>>,
         inputs: &[Marker],
     ) -> bool {
-        let broke =
-            || StageError::Fatal("a stage that took a gate in run did not answer Held".into());
+        let broke = gate_taken_but_not_held;
         match result {
             Some(Err(StageError::Held)) | None => {}
             Some(Err(StageError::Retry)) => {
@@ -1981,19 +2008,12 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Run<Q, L> {
     /// The failure of a stage whose marker names a queue that is no lane of the pool: the boundary could never
     /// reach it.
     fn foreign(&self, submitted: &Submitted) -> Option<StageError> {
-        let marker = submitted.marker?;
-        (!self.is_lane_marker(marker)).then(|| {
-            StageError::Fatal(format!(
-                "a marker of {} is no lane {} of the lane pool",
-                marker.queue, marker.lane.0
-            ))
-        })
+        foreign_marker(&self.core.runtime.lanes, submitted)
     }
 
     /// Whether `marker` is of a lane of this graph's pool, and of that lane's queue.
     fn is_lane_marker(&self, marker: Marker) -> bool {
-        let lanes = &self.core.runtime.lanes;
-        usize::from(marker.lane.0) < lanes.len() && lanes.lane(marker.lane).id() == marker.queue
+        is_pool_marker(&self.core.runtime.lanes, marker)
     }
 
     /// A stage frame failed outright (`execute` panicked or returned an error). Returns whether its live count is to be

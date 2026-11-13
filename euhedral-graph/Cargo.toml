@@ -7,7 +7,8 @@ readme = "README.md"
 license = "Apache-2.0"
 
 [features]
-# `testing::FakeDevice`: an in-order fake device queue, for tests of code built on this crate.
+# `testing`: `FakeDevice` (an in-order fake device queue), `FakeLanes` and `StageHarness` (a stage's hooks without a graph),
+# for tests of code built on this crate.
 testing = []
 
 [dependencies]
