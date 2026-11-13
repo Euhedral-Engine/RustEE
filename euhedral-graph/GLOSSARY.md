@@ -106,6 +106,8 @@ nothing is claimed.
 
 **hold from run** ([`StageCx::hold`, `StageError::Held`](src/stage_graph.rs)): a stage holds itself at its gate from inside `run`, when it finds there that what it needs is not ready. It takes the gate with `cx.hold()` and answers `Held`; the release runs it again exactly once. A release that comes before `run` returns publishes the stage when `run` returns, never beside it. It registers nothing with the completions, so it is no retry and allocates nothing.
 
+**stage harness** ([`testing::StageHarness`](src/testing/stage.rs)): calls one custom stage's hooks (`run`, `pass_gate`, `abandoned`, `retired`) on the calling thread with a context the test states (stage id, lane, waits, pool), and returns what the stage answered, whether it took a gate and how the gate was spent. No graph, lattice or worker; a released gate runs nothing. Feature `testing`.
+
 **abandoned hook** ([`Stage::abandoned`](src/stage_graph.rs)): Java `abandoned(home)`. Once per stage that never submitted, in stage order, at the quantum's quiesce: after the other lanes joined the home lane, before later quanta waiting on its stages are released and before the retirement is armed on home, with the home lane.
 
 **retired hook** ([`Stage::retired`](src/stage_graph.rs)): Java `StageFrame.retired`. Once per stage that was attempted,

@@ -3,6 +3,24 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## A custom stage can be tested without a graph (2026-11-13)
+
+**What.** `testing::StageHarness` (feature `testing`) calls a `Stage`'s hooks directly. `StageCx` and `GateRef` still cannot be built outside the crate; the harness builds them.
+- `StageHarness::new(lanes)`, with `with_stage_id`, `on_lane` and `waiting_for` to state what the stage sees (`StageCx::stage`, `lane`, `waits`, and the pool).
+- `run(&stage, &quantum) -> StageRun` (the stage's answer and whether it took its gate), `pass_gate(..) -> PassGate`, `abandoned(.., home)` and `retired(.., committed)`.
+- `gate_events() -> Vec<GateEvent>`: how each gate the stage took was spent (`Released`, or `Failed(error)`, a drop unspent arriving as `Fatal`).
+
+**Why.** A user's test of a custom stage had to build a one-stage graph on a running lattice and smuggle its results out with a `'static` transmute and a raw pointer.
+
+**How to use it.** Nothing to change. Enable `testing` in a dev-dependency; the pool can be a `FakeDevice::pool`, and what the stage enqueued is read from the fake device.
+
+**Semantics.**
+- A call runs the hook on the calling thread and returns; nothing is scheduled and a panic of the stage propagates. A second `StageCx::hold` in one run panics as in a graph.
+- A released gate does not run the stage again (the test calls `run` again, as the graph would), and a failed gate fails no quantum: both are recorded.
+- The real path is untouched: the harness constructors are `pub(crate)` and exist only with the feature, and `StageCx`'s fields and the graph's construction of it are as before.
+
+**Tests.** `testing::stage::tests`: `run_shows_the_context_it_was_given_and_what_it_submitted`, `a_failing_stage_is_seen_as_failed`, `a_held_run_shows_its_gate_and_how_it_is_spent`, `a_gate_dropped_unspent_arrives_as_fatal_and_held_given_to_fail_too`, `pass_gate_shows_whether_it_held`, `a_second_hold_in_a_run_panics_as_in_a_graph`, `the_abandoned_and_retired_hooks_are_called`; and the doctest on `StageHarness`.
+
 ## A failed recording is not a failed unit of work (2026-11-10)
 
 **What.** Three changes to `SharedGraphCache` and the CUDA capture.
