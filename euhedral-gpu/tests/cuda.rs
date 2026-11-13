@@ -363,6 +363,19 @@ mod compiler {
     const OPS: &str = include_str!("kernels/ops.cu");
 
     #[test]
+    fn an_architecture_nvrtc_does_not_list_is_an_error_naming_it() {
+        let Ok(nvrtc) = Nvrtc::shared(None) else {
+            eprintln!("no NVRTC: skipped");
+            return;
+        };
+        let r = nvrtc.arch_specific_target_for((99, 9));
+        assert!(
+            matches!(&r, Err(GpuError::Load(m)) if m.contains("sm_999a")),
+            "{r:?}"
+        );
+    }
+
+    #[test]
     fn nvrtc_compiles_for_this_device() {
         let Some(gpu) = gpu() else { return };
         let Ok(nvrtc) = Nvrtc::shared(None) else {
@@ -378,7 +391,7 @@ mod compiler {
             .compile(OPS, &CompileOptions::default(), target)
             .unwrap();
         match target {
-            Target::Cubin(_) => assert_eq!(&image[..4], b"\x7fELF"),
+            Target::Cubin(_) | Target::CubinSpecific(_) => assert_eq!(&image[..4], b"\x7fELF"),
             Target::Ptx(_) => assert_eq!(image.last(), Some(&0)),
         }
     }
@@ -618,6 +631,85 @@ mod launches {
             mem.free(x_dev);
             pinned.free(x_host);
         }
+    }
+
+    /// Whether `__CUDA_ARCH_SPECIFIC__` was defined while a module compiled with `options`, read back from a kernel.
+    fn arch_specific_macro_defined(
+        gpu: &Arc<CudaGpu>,
+        options: &CompileOptions,
+    ) -> Result<bool, GpuError> {
+        const SOURCE: &str = r#"
+extern "C" __global__ void report(unsigned* out) {
+#ifdef __CUDA_ARCH_SPECIFIC__
+    *out = 1u;
+#else
+    *out = 2u;
+#endif
+}"#;
+        let module = CudaModule::from_source(gpu, SOURCE, options)?;
+        let report = module.kernel("report").unwrap();
+        let (pool, mut s) = gpu
+            .open_lanes(&["compute"], StreamOptions::default())
+            .unwrap();
+        let mem = device_memory(gpu);
+        let pinned = PinnedHost::new(gpu.device().clone(), LocationId(1), 0);
+        let host = pinned.alloc(4).unwrap();
+        let dev = mem.alloc(4).unwrap();
+        // SAFETY: a pinned block of 4 bytes owned by this test.
+        unsafe { (host.addr as *mut u32).write(0) };
+        let args = Args::new().device(dev.addr);
+        s[0].submit(|q| {
+            // SAFETY: the argument matches `report`'s parameter; the buffers live until the marker.
+            unsafe {
+                q.launch(&report, Launch::linear(1, 1), &args)?;
+                q.copy_to_host(host.addr as *mut u8, dev.addr, 4)
+            }
+        })
+        .unwrap();
+        let m = s[0].mark().unwrap();
+        assert!(reached_within(&pool, m, Duration::from_secs(10)));
+        // SAFETY: the pinned block was written by the copy that retired.
+        let value = unsafe { (host.addr as *const u32).read() };
+        drop((pool, s));
+        // SAFETY: the stream ended its work; nothing uses the blocks.
+        unsafe {
+            mem.free(dev);
+            pinned.free(host);
+        }
+        assert!(value == 1 || value == 2, "the kernel ran: {value}");
+        Ok(value == 1)
+    }
+
+    #[test]
+    fn an_arch_specific_module_compiles_with_the_arch_specific_macro_defined() {
+        let Some(gpu) = gpu() else { return };
+        if Nvrtc::shared(None).is_err() {
+            eprintln!("no NVRTC: skipped");
+            return;
+        }
+        if gpu.arch().0 < 9 {
+            eprintln!("no architecture-specific target before sm_90: skipped");
+            return;
+        }
+        let Ok(nvrtc) = Nvrtc::shared(None) else {
+            return;
+        };
+        if let Err(e) = nvrtc.arch_specific_target_for(gpu.arch()) {
+            eprintln!("NVRTC does not list this device: skipped ({e})");
+            return;
+        }
+        let specific = CompileOptions {
+            arch_specific: true,
+            ..CompileOptions::default()
+        };
+        assert!(
+            arch_specific_macro_defined(&gpu, &specific).unwrap(),
+            "defined with the option"
+        );
+        assert!(
+            !arch_specific_macro_defined(&gpu, &CompileOptions::default()).unwrap(),
+            "not defined without it"
+        );
     }
 
     #[test]

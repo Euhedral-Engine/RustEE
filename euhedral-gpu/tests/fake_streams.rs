@@ -646,3 +646,17 @@ fn a_stream_opened_with_no_spans_refuses_them() {
         .unwrap();
     assert!(matches!(s[0].span_begin(), Err(GpuError::Invalid(_))));
 }
+
+#[test]
+fn the_fake_module_records_the_arch_specific_option() {
+    let gpu = FakeGpu::new();
+    let build = |arch_specific| {
+        let options = CompileOptions {
+            arch_specific,
+            ..CompileOptions::default()
+        };
+        euhedral_gpu::fake::FakeModule::from_source(&gpu, "// fake source", &options).unwrap()
+    };
+    assert!(build(true).arch_specific());
+    assert!(!build(false).arch_specific());
+}

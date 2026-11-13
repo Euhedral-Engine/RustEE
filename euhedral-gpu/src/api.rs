@@ -700,6 +700,11 @@ pub struct CompileOptions {
     pub cache_dir: Option<PathBuf>,
     /// The run-time compiler library to load, else the backend's search order.
     pub compiler: Option<PathBuf>,
+    /// Compile for the architecture-specific target of the device (`sm_XYa`, for example `sm_120a`), so kernels
+    /// that use instructions of one architecture variant compile. The module runs on that architecture only. When
+    /// the compiler does not list the device's exact architecture, the compile is an error; there is no fallback to
+    /// the generic target or to PTX. The target is part of the cache key.
+    pub arch_specific: bool,
 }
 
 /// How [`Gpu::rerecord`] made the new recording executable.
