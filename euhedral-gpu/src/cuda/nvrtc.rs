@@ -634,8 +634,10 @@ mod tests {
             "CUDA_PATH" => Some(OsString::from("/y/cuda")),
             _ => None,
         };
+        // The paths are Unix paths: where `join` makes a backslash, compare with slashes.
+        let slashed = |p: &Path| p.to_str().unwrap().replace('\\', "/");
         let list = |dir: &Path| -> Vec<PathBuf> {
-            let names: &[&str] = match dir.to_str().unwrap() {
+            let names: &[&str] = match slashed(dir).as_str() {
                 "/x/cuda/lib64" => &[
                     "libnvrtc.so.12",
                     "libnvrtc-builtins.so.13.1",
@@ -649,8 +651,17 @@ mod tests {
             };
             names.iter().map(|n| dir.join(n)).collect()
         };
-        let got = candidates_unix(None, &env, &list);
         let file = |p: &str| Candidate::File(PathBuf::from(p));
+        let slash_all = |found: Vec<Candidate>| -> Vec<Candidate> {
+            found
+                .into_iter()
+                .map(|c| match c {
+                    Candidate::File(p) => file(&slashed(&p)),
+                    other => other,
+                })
+                .collect()
+        };
+        let got = slash_all(candidates_unix(None, &env, &list));
         assert_eq!(
             got,
             [
@@ -669,12 +680,16 @@ mod tests {
             other => env(other),
         };
         assert_eq!(
-            candidates_unix(None, &with_env, &list)[0],
+            slash_all(candidates_unix(None, &with_env, &list))[0],
             file("/opt/libnvrtc.so.13"),
             "the environment comes first"
         );
         assert_eq!(
-            candidates_unix(Some(Path::new("/elsewhere/nvrtc.so")), &with_env, &list),
+            slash_all(candidates_unix(
+                Some(Path::new("/elsewhere/nvrtc.so")),
+                &with_env,
+                &list
+            )),
             [file("/elsewhere/nvrtc.so")],
             "an explicit path is the only candidate"
         );
