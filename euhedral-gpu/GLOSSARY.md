@@ -40,6 +40,10 @@ launches it with `cuLaunchKernelEx` and the programmatic-stream-serialization at
 programmatic edge. A driver without `cuLaunchKernelEx` refuses it (`GpuError::Invalid`) and still makes every other
 launch. Compute capability 9.0 or newer.
 
+**kernel options** (`KernelOptions`, `Module::kernel_with`): what a kernel is opted in to when it is looked up. Today the
+most dynamic shared memory a launch may ask for; CUDA sets it once with `cuFuncSetAttribute`. The limit is per kernel of
+the module, shared by its handles, and a repeated lookup only raises it. A launch above it is `GpuError::Invalid`.
+
 **shape and fingerprint** ([`ShapeHasher`, `Fingerprint`](src/shape.rs)): the shape of a sequence is its
 operations in order with their streams, order edges, kernels, geometry, programmatic flag, argument layouts and copy
 parameters; the fingerprint is 128 bits of it. A changed shape is `GpuError::ShapeChanged`.

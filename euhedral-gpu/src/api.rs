@@ -512,8 +512,40 @@ pub trait Module: Send + Sync + fmt::Debug + Sized {
     /// Loads a prebuilt image (PTX, cubin or fatbin for CUDA).
     fn from_image(gpu: &Arc<Self::Gpu>, image: &[u8]) -> Result<Self, GpuError>;
 
-    /// The kernel named `name` (its unmangled symbol).
-    fn kernel(&self, name: &str) -> Result<<Self::Gpu as Gpu>::Kernel, GpuError>;
+    /// The kernel named `name` (its unmangled symbol), with the driver's default limits: the same as
+    /// `kernel_with(name, KernelOptions::default())`.
+    fn kernel(&self, name: &str) -> Result<<Self::Gpu as Gpu>::Kernel, GpuError> {
+        self.kernel_with(name, KernelOptions::default())
+    }
+
+    /// The kernel named `name`, opted in to `options` once, here, never on the launch path. A value the device
+    /// refuses is an error that names the kernel and the value.
+    ///
+    /// The limit belongs to the kernel of the module, not to the handle: looking the same kernel up again with a
+    /// larger `max_dynamic_shared_bytes` raises the limit for every handle of it, and a lookup with a smaller one
+    /// (or none) never lowers it. A launch whose `shared_bytes` exceed the limit is `GpuError::Invalid`, naming the
+    /// kernel, the bytes asked and the limit.
+    fn kernel_with(
+        &self,
+        name: &str,
+        options: KernelOptions,
+    ) -> Result<<Self::Gpu as Gpu>::Kernel, GpuError>;
+}
+
+/// What a kernel is opted in to when it is looked up ([`Module::kernel_with`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KernelOptions {
+    /// The most dynamic shared memory, in bytes, a launch of the kernel may ask for. 0 leaves the driver's default.
+    /// A value above the default needs the opt-in; the device refuses a value it cannot give.
+    pub max_dynamic_shared_bytes: u32,
+}
+
+/// The error of a launch that asks for more dynamic shared memory than its kernel is opted in to.
+pub(crate) fn over_shared_limit(kernel: &str, asked: u32, limit: u32) -> GpuError {
+    GpuError::Invalid(format!(
+        "{kernel}: a launch asks for {asked} bytes of dynamic shared memory, the kernel allows {limit} \
+         (look it up with `Module::kernel_with` to raise the limit)"
+    ))
 }
 
 /// A recurring sequence of submissions over a fixed set of streams, run as a recording, a probe or an update.

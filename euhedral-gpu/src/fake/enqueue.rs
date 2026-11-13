@@ -163,6 +163,7 @@ impl LaneEnqueue for FakeEnqueue<'_> {
         launch: Launch,
         args: &Args,
     ) -> Result<(), GpuError> {
+        kernel.check_shared(&launch)?;
         if let Some((rec, stream)) = &mut self.rec {
             rec.hasher
                 .launch(*stream, kernel.id(), &launch, args.layout());

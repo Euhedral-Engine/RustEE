@@ -1,12 +1,19 @@
 //! CUDA modules and kernels: source through NVRTC (cached), or a prebuilt image.
 
+use std::collections::HashMap;
 use std::ffi::{CString, c_int, c_void};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
+use euhedral_data_structures::sync::{HotScope, LifecycleMutex};
 use euhedral_hashing::hasher_api::{hash_bytes, hash_bytes_with_seed};
 use euhedral_memory::cuda::Device;
 
-use crate::{CompileOptions, Gpu, GpuError, Kernel, KeyMaterial, Module, ModuleCache, cache_key};
+use crate::api::over_shared_limit;
+use crate::{
+    CompileOptions, Gpu, GpuError, Kernel, KernelOptions, KeyMaterial, Launch, Module, ModuleCache,
+    cache_key,
+};
 
 use super::fns::{CuFunction, CuModule};
 use super::nvrtc::{Nvrtc, Target};
@@ -17,6 +24,8 @@ const JIT_ERROR_LOG_BUFFER: c_int = 5;
 const JIT_ERROR_LOG_BUFFER_SIZE_BYTES: c_int = 6;
 /// `CUDA_ERROR_NOT_FOUND`.
 const NOT_FOUND: i32 = 500;
+/// `CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES`.
+const MAX_DYNAMIC_SHARED_SIZE_BYTES: c_int = 8;
 /// The first bytes of a cubin, and of a fatbin (little-endian `0xBA55ED50`).
 const ELF_MAGIC: &[u8] = b"\x7fELF";
 const FATBIN_MAGIC: &[u8] = &[0x50, 0xED, 0x55, 0xBA];
@@ -26,6 +35,9 @@ struct ModuleInner {
     raw: CuModule,
     /// What identifies the module in kernel ids: the cache key's first half, or the hash of the image.
     key: u64,
+    /// The dynamic shared limit of each kernel looked up so far, shared by every handle of it. The driver keeps it
+    /// per function, and the function is the module's.
+    limits: LifecycleMutex<HashMap<String, Arc<AtomicU32>>>,
 }
 
 // SAFETY: a module of the primary context, usable from any thread with that context current.
@@ -93,11 +105,28 @@ pub struct CudaKernel {
     name: Arc<str>,
     id: u64,
     params: Option<Arc<[u32]>>,
+    /// The dynamic shared bytes a launch may ask for; `u32::MAX` when the driver would not say.
+    limit: Arc<AtomicU32>,
 }
 
 impl CudaKernel {
     pub(crate) fn raw(&self) -> CuFunction {
         self.func.0
+    }
+
+    /// The most dynamic shared memory, in bytes, a launch of this kernel may ask for: what the driver allows by
+    /// default, or the largest value any lookup of the kernel in its module opted in to.
+    pub fn max_dynamic_shared_bytes(&self) -> u32 {
+        self.limit.load(Ordering::Relaxed)
+    }
+
+    /// `Invalid` if `launch` asks for more dynamic shared memory than the kernel allows.
+    pub(crate) fn check_shared(&self, launch: &Launch) -> Result<(), GpuError> {
+        let limit = self.max_dynamic_shared_bytes();
+        if launch.shared_bytes > limit {
+            return Err(over_shared_limit(&self.name, launch.shared_bytes, limit));
+        }
+        Ok(())
     }
 
     /// The size in bytes of each parameter, when the driver reports them.
@@ -162,6 +191,7 @@ fn load_image(gpu: &Arc<CudaGpu>, image: &[u8], key: u64) -> Result<CudaModule, 
             gpu: gpu.clone(),
             raw,
             key,
+            limits: LifecycleMutex::default(),
         }),
     })
 }
@@ -208,7 +238,11 @@ impl Module for CudaModule {
         load_image(gpu, image, hash_bytes(image))
     }
 
-    fn kernel(&self, name: &str) -> Result<<CudaGpu as Gpu>::Kernel, GpuError> {
+    fn kernel_with(
+        &self,
+        name: &str,
+        options: KernelOptions,
+    ) -> Result<<CudaGpu as Gpu>::Kernel, GpuError> {
         let gpu = &self.inner.gpu;
         let c_name = CString::new(name)
             .map_err(|_| GpuError::Invalid(format!("a NUL byte in the kernel name {name:?}")))?;
@@ -223,13 +257,71 @@ impl Module for CudaModule {
             )));
         }
         gpu.check("cuModuleGetFunction", code)?;
+        let limit = self.opt_in(gpu, func, name, options.max_dynamic_shared_bytes)?;
         Ok(CudaKernel {
             func: Func(func),
             module: self.inner.clone(),
             name: name.into(),
             id: hash_bytes_with_seed(name.as_bytes(), self.inner.key),
             params: parameter_sizes(gpu, func),
+            limit,
         })
+    }
+}
+
+impl CudaModule {
+    /// The shared limit of kernel `name` (its function `func`), raised to `wanted` bytes when that is more. The
+    /// driver's attribute is per function and the last set wins there, so a lookup only ever raises it: the limit
+    /// is the largest value asked, whichever lookup came last.
+    fn opt_in(
+        &self,
+        gpu: &CudaGpu,
+        func: CuFunction,
+        name: &str,
+        wanted: u32,
+    ) -> Result<Arc<AtomicU32>, GpuError> {
+        // A lookup is build-time work, also when a frame makes it.
+        let _cold = HotScope::leave();
+        let mut limits = self.inner.limits.lock();
+        let limit = match limits.get(name) {
+            Some(limit) => Arc::clone(limit),
+            None => {
+                let mut current: c_int = 0;
+                // SAFETY: an out pointer and a function of a loaded module; the context is current.
+                let code = unsafe {
+                    (gpu.fns.func_get_attribute)(&mut current, MAX_DYNAMIC_SHARED_SIZE_BYTES, func)
+                };
+                // A driver that will not say leaves the launch to the driver's own check.
+                let current = if code == 0 {
+                    u32::try_from(current).unwrap_or(0)
+                } else {
+                    u32::MAX
+                };
+                let limit = Arc::new(AtomicU32::new(current));
+                limits.insert(name.to_owned(), Arc::clone(&limit));
+                limit
+            }
+        };
+        if wanted > limit.load(Ordering::Relaxed) {
+            let value = c_int::try_from(wanted).map_err(|_| {
+                GpuError::Invalid(format!(
+                    "{name}: {wanted} bytes of dynamic shared memory is more than the driver can be asked for"
+                ))
+            })?;
+            // SAFETY: a function of a loaded module; the context is current.
+            let code =
+                unsafe { (gpu.fns.func_set_attribute)(func, MAX_DYNAMIC_SHARED_SIZE_BYTES, value) };
+            if let Err(error) = gpu.check("cuFuncSetAttribute", code) {
+                return Err(match error {
+                    fault @ GpuError::Fault { .. } => fault,
+                    other => GpuError::Invalid(format!(
+                        "{name}: the device refused {wanted} bytes of dynamic shared memory: {other}"
+                    )),
+                });
+            }
+            limit.store(wanted, Ordering::Relaxed);
+        }
+        Ok(limit)
     }
 }
 

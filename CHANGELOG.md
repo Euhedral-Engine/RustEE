@@ -3,6 +3,22 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## A kernel can be opted in to more dynamic shared memory (2026-11-13)
+
+**What.** `Module::kernel_with(name, KernelOptions { max_dynamic_shared_bytes })`, beside `Module::kernel`, which is now a provided method equal to `kernel_with(name, KernelOptions::default())`. `KernelOptions` is `Default` (0 leaves the driver's default). `CudaKernel::max_dynamic_shared_bytes()` and `FakeKernel::max_dynamic_shared_bytes()` report the limit. An implementor of `Module` defines `kernel_with` and not `kernel`.
+
+**Why.** A launch that asks for more dynamic shared memory than the driver's default fails in the driver, which wants the kernel opted in with `cuFuncSetAttribute` first; nothing in the crate could do that, and the driver's error does not say which kernel or how many bytes.
+
+**How to use it.** `module.kernel_with("name", KernelOptions { max_dynamic_shared_bytes: 64 * 1024 })`, then `Launch { shared_bytes: 64 * 1024, ..Launch::linear(n, block) }`.
+
+**Semantics.**
+- On CUDA a value above the kernel's current limit is set once, at the lookup, with `cuFuncSetAttribute(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES)`; the launch path makes no driver call for it. A value the device refuses is an error at the lookup that names the kernel and the value.
+- The limit belongs to the kernel of the module, as the driver's attribute does: every handle of it shares one limit. A second lookup with a larger value raises it for all handles; a lookup with a smaller value or none never lowers it. The limit is the largest value any lookup asked for.
+- A launch (eager, lane, or recorded) whose `shared_bytes` exceed the limit is `GpuError::Invalid` from the crate, naming the kernel, the bytes asked and the limit, and nothing is enqueued. Without an opt-in the limit is the driver's own value for the kernel, read at its first lookup with `cuFuncGetAttribute`, not a constant of the crate. A graph update does not re-check `shared_bytes`.
+- The fake backend records the option and fails a launch above the limit the same way; its limit without an opt-in is `fake::DEFAULT_DYNAMIC_SHARED_BYTES` (48 KiB), which the fake models and is no fact about a device.
+
+**Tests.** `tests/fake_kernel_options.rs` (the option is recorded, a default lookup equals default options, a launch above the limit is the named error, an opted-in launch up to the limit, repeated lookups); device: `tests/cuda_dynamic_shared.rs` `a_launch_with_64_kib_of_dynamic_shared_memory_runs_after_opt_in`.
+
 ## A launch can be a programmatic dependent launch (2026-11-13)
 
 **What.** `Launch` gains `programmatic: bool` (false from `Launch::linear`) and the builder-style `Launch::programmatic(bool)`. On CUDA a programmatic launch goes through `cuLaunchKernelEx` with `CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION` set to 1; any other launch still goes through `cuLaunchKernel`, unchanged. The flag is part of the shape fingerprint. `FakeOp::Launch` gains `programmatic`.

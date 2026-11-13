@@ -19,7 +19,7 @@ Asynchronous, backend-neutral GPU access for the RustEE control plane. A lattice
 
 | Module | Main types |
 |---|---|
-| [`api`](src/api.rs) | The traits: `Gpu`, `Stream`, `Lane`, `LaneEnqueue`, `Enqueue`, `Module`, `Kernel`, `Sequence`, `Graph`, `RetireListener`; `RetireTicket`, `StreamOptions`, `StreamPriority`, `CompileOptions`, `Rerecorded`, `Span` (timed spans, `Stream::span_*`). |
+| [`api`](src/api.rs) | The traits: `Gpu`, `Stream`, `Lane`, `LaneEnqueue`, `Enqueue`, `Module`, `Kernel`, `Sequence`, `Graph`, `RetireListener`; `RetireTicket`, `StreamOptions`, `StreamPriority`, `CompileOptions`, `KernelOptions`, `Rerecorded`, `Span` (timed spans, `Stream::span_*`). |
 | [`lanes`](src/lanes.rs) | `LaneSubmit` for the backends' streams, and `open_lane_sources`: a device's lanes as a pool, its intakes and a `LaneSource` per lane (`LaneSpec`, `OpenedLanes`); `open_shared_lanes`: a device's lanes as a typed pool that any worker submits to (`SharedLanes`). |
 | [`ring`](src/ring.rs) | The lock-free marker ring behind a lane's markers: numbers claimed by compare-and-set, completion found by an in-order scan, the awaiters' pins. No driver; loom-checked. |
 | [`cuda::texture`](src/cuda/texture.rs) | `TexObject`, `View`: texture objects over pitched device memory (filter, address and coordinate modes). |
@@ -144,6 +144,9 @@ Asynchronous, backend-neutral GPU access for the RustEE control plane. A lattice
   - `Module::kernel(name)` looks a kernel up by its unmangled symbol (declare kernels `extern "C"`). `Args` packs the
     arguments (`Args::new().device(addr).arg(2.5f32)`); where the driver reports the kernel's parameter sizes, a launch
     with arguments that do not fit is `Err(Args)` before the driver sees it.
+  - `Module::kernel_with(name, KernelOptions { max_dynamic_shared_bytes })` opts the kernel in, once at the lookup, to
+    more dynamic shared memory than the driver's default; a launch above the kernel's limit is `Err(Invalid)` naming
+    the kernel, the bytes and the limit. Repeated lookups only raise the limit.
 - **Recurring sequences.**
   - `Gpu::record(&mut [&mut a, &mut b], |q| ...)` runs the closure once for real and records it. The same code path then serves
     `fingerprint` (a probe: nothing reaches the device) and `update` (new argument values: launch *n* of the update

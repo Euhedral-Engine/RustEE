@@ -57,6 +57,7 @@ impl LaneEnqueue for CudaLaneEnqueue<'_> {
         }
         let fns = &self.gpu().fns;
         supported(fns, &launch)?;
+        kernel.check_shared(&launch)?;
         // The argument addresses go on the stack: a launch allocates nothing.
         let mut pointers = [std::ptr::null_mut::<c_void>(); MAX_ARGS];
         if args.pointers_into(&mut pointers).is_none() {
