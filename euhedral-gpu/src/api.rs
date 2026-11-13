@@ -514,9 +514,7 @@ pub trait Module: Send + Sync + fmt::Debug + Sized {
 
     /// The kernel named `name` (its unmangled symbol), with the driver's default limits: the same as
     /// `kernel_with(name, KernelOptions::default())`.
-    fn kernel(&self, name: &str) -> Result<<Self::Gpu as Gpu>::Kernel, GpuError> {
-        self.kernel_with(name, KernelOptions::default())
-    }
+    fn kernel(&self, name: &str) -> Result<<Self::Gpu as Gpu>::Kernel, GpuError>;
 
     /// The kernel named `name`, opted in to `options` once, here, never on the launch path. A value the device
     /// refuses is an error that names the kernel and the value.
@@ -525,11 +523,21 @@ pub trait Module: Send + Sync + fmt::Debug + Sized {
     /// larger `max_dynamic_shared_bytes` raises the limit for every handle of it, and a lookup with a smaller one
     /// (or none) never lowers it. A launch whose `shared_bytes` exceed the limit is `GpuError::Invalid`, naming the
     /// kernel, the bytes asked and the limit.
+    ///
+    /// The default is for a backend with no options: default options are `kernel`, any other is `Invalid`.
     fn kernel_with(
         &self,
         name: &str,
         options: KernelOptions,
-    ) -> Result<<Self::Gpu as Gpu>::Kernel, GpuError>;
+    ) -> Result<<Self::Gpu as Gpu>::Kernel, GpuError> {
+        if options == KernelOptions::default() {
+            self.kernel(name)
+        } else {
+            Err(GpuError::Invalid(format!(
+                "{name}: kernel options are not supported by this backend"
+            )))
+        }
+    }
 }
 
 /// What a kernel is opted in to when it is looked up ([`Module::kernel_with`]).

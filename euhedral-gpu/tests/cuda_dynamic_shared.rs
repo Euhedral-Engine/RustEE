@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 
 use euhedral_gpu::cuda::{CudaGpu, CudaModule};
 use euhedral_gpu::{
-    Args, CompileOptions, Gpu, GpuError, KernelOptions, LaneEnqueue, Launch, Module, Stream,
-    StreamOptions,
+    Args, CompileOptions, Gpu, GpuError, KernelOptions, LaneEnqueue, Launch, Module, Sequence,
+    Stream, StreamOptions,
 };
 use euhedral_memory::cuda::{DeviceMemory, PinnedHost};
 use euhedral_memory::{Backend, LocationId};
@@ -62,7 +62,9 @@ fn a_launch_with_64_kib_of_dynamic_shared_memory_runs_after_opt_in() {
 
     // Without the opt-in, the launch is refused before the driver sees it, naming the kernel and the numbers.
     let plain = module.kernel("reverse").unwrap();
-    let default_limit = plain.max_dynamic_shared_bytes();
+    let default_limit = plain
+        .max_dynamic_shared_bytes()
+        .expect("the driver reports its default");
     assert!(
         default_limit < SHARED,
         "the default limit is {default_limit}"
@@ -80,6 +82,26 @@ fn a_launch_with_64_kib_of_dynamic_shared_memory_runs_after_opt_in() {
     );
     assert!(text.contains(&default_limit.to_string()), "{text}");
 
+    // The same refusal on the eager and the probing paths, before anything is recorded or issued.
+    let eager = gpu.record(&mut [&mut s[0]], |q| {
+        q.submit(0, |e| {
+            // SAFETY: as above.
+            unsafe { e.launch(&plain, launch, &args) }
+        })
+    });
+    assert!(
+        matches!(eager, Err(GpuError::Invalid(_))),
+        "{:?}",
+        eager.err()
+    );
+    let probed = gpu.fingerprint(1, |q| {
+        q.submit(0, |e| {
+            // SAFETY: as above.
+            unsafe { e.launch(&plain, launch, &args) }
+        })
+    });
+    assert!(matches!(probed, Err(GpuError::Invalid(_))), "{probed:?}");
+
     // With it, the launch runs and the data comes back reversed.
     let kernel = module
         .kernel_with(
@@ -89,7 +111,17 @@ fn a_launch_with_64_kib_of_dynamic_shared_memory_runs_after_opt_in() {
             },
         )
         .unwrap();
-    assert_eq!(kernel.max_dynamic_shared_bytes(), SHARED);
+    assert_eq!(kernel.max_dynamic_shared_bytes(), Some(SHARED));
+    // A later lookup with less does not lower it, for the handle that was there before either.
+    let _smaller = module
+        .kernel_with(
+            "reverse",
+            KernelOptions {
+                max_dynamic_shared_bytes: 1024,
+            },
+        )
+        .unwrap();
+    assert_eq!(plain.max_dynamic_shared_bytes(), Some(SHARED));
     s[0].submit(|e| {
         // SAFETY: matching arguments over live blocks that the test keeps until the work ends.
         unsafe {

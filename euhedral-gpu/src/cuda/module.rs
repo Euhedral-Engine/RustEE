@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::ffi::{CString, c_int, c_void};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use euhedral_data_structures::sync::{HotScope, LifecycleMutex};
 use euhedral_hashing::hasher_api::{hash_bytes, hash_bytes_with_seed};
@@ -37,7 +37,7 @@ struct ModuleInner {
     key: u64,
     /// The dynamic shared limit of each kernel looked up so far, shared by every handle of it. The driver keeps it
     /// per function, and the function is the module's.
-    limits: LifecycleMutex<HashMap<String, Arc<AtomicU32>>>,
+    limits: LifecycleMutex<HashMap<String, Arc<Limit>>>,
 }
 
 // SAFETY: a module of the primary context, usable from any thread with that context current.
@@ -105,8 +105,30 @@ pub struct CudaKernel {
     name: Arc<str>,
     id: u64,
     params: Option<Arc<[u32]>>,
-    /// The dynamic shared bytes a launch may ask for; `u32::MAX` when the driver would not say.
-    limit: Arc<AtomicU32>,
+    limit: Arc<Limit>,
+}
+
+/// The dynamic shared memory a kernel of a module allows, shared by every handle of it.
+#[derive(Debug, Default)]
+struct Limit {
+    bytes: AtomicU32,
+    /// Whether `bytes` is the driver's limit. It is not when the driver would not say what its default is and no
+    /// opt-in has been made: the launch is then left to the driver's own check.
+    known: AtomicBool,
+}
+
+impl Limit {
+    /// The limit, if known.
+    fn get(&self) -> Option<u32> {
+        self.known
+            .load(Ordering::Acquire)
+            .then(|| self.bytes.load(Ordering::Acquire))
+    }
+
+    fn set(&self, bytes: u32) {
+        self.bytes.store(bytes, Ordering::Release);
+        self.known.store(true, Ordering::Release);
+    }
 }
 
 impl CudaKernel {
@@ -116,17 +138,20 @@ impl CudaKernel {
 
     /// The most dynamic shared memory, in bytes, a launch of this kernel may ask for: what the driver allows by
     /// default, or the largest value any lookup of the kernel in its module opted in to.
-    pub fn max_dynamic_shared_bytes(&self) -> u32 {
-        self.limit.load(Ordering::Relaxed)
+    ///
+    /// `None` when the driver would not say what its default is and the kernel has not been opted in.
+    pub fn max_dynamic_shared_bytes(&self) -> Option<u32> {
+        self.limit.get()
     }
 
     /// `Invalid` if `launch` asks for more dynamic shared memory than the kernel allows.
     pub(crate) fn check_shared(&self, launch: &Launch) -> Result<(), GpuError> {
-        let limit = self.max_dynamic_shared_bytes();
-        if launch.shared_bytes > limit {
-            return Err(over_shared_limit(&self.name, launch.shared_bytes, limit));
+        match self.max_dynamic_shared_bytes() {
+            Some(limit) if launch.shared_bytes > limit => {
+                Err(over_shared_limit(&self.name, launch.shared_bytes, limit))
+            }
+            _ => Ok(()),
         }
-        Ok(())
     }
 
     /// The size in bytes of each parameter, when the driver reports them.
@@ -238,6 +263,10 @@ impl Module for CudaModule {
         load_image(gpu, image, hash_bytes(image))
     }
 
+    fn kernel(&self, name: &str) -> Result<<CudaGpu as Gpu>::Kernel, GpuError> {
+        self.kernel_with(name, KernelOptions::default())
+    }
+
     fn kernel_with(
         &self,
         name: &str,
@@ -279,7 +308,7 @@ impl CudaModule {
         func: CuFunction,
         name: &str,
         wanted: u32,
-    ) -> Result<Arc<AtomicU32>, GpuError> {
+    ) -> Result<Arc<Limit>, GpuError> {
         // A lookup is build-time work, also when a frame makes it.
         let _cold = HotScope::leave();
         let mut limits = self.inner.limits.lock();
@@ -291,18 +320,20 @@ impl CudaModule {
                 let code = unsafe {
                     (gpu.fns.func_get_attribute)(&mut current, MAX_DYNAMIC_SHARED_SIZE_BYTES, func)
                 };
-                // A driver that will not say leaves the launch to the driver's own check.
-                let current = if code == 0 {
-                    u32::try_from(current).unwrap_or(0)
-                } else {
-                    u32::MAX
-                };
-                let limit = Arc::new(AtomicU32::new(current));
+                let limit = Arc::new(Limit::default());
+                // A driver that will not say, or says a value that is no size, leaves the limit unknown.
+                if code == 0
+                    && let Ok(current) = u32::try_from(current)
+                {
+                    limit.set(current);
+                }
                 limits.insert(name.to_owned(), Arc::clone(&limit));
                 limit
             }
         };
-        if wanted > limit.load(Ordering::Relaxed) {
+        // An unknown limit is at least 0, so any opt-in is made.
+        let current = limit.get().unwrap_or(0);
+        if wanted > current {
             let value = c_int::try_from(wanted).map_err(|_| {
                 GpuError::Invalid(format!(
                     "{name}: {wanted} bytes of dynamic shared memory is more than the driver can be asked for"
@@ -319,7 +350,7 @@ impl CudaModule {
                     )),
                 });
             }
-            limit.store(wanted, Ordering::Relaxed);
+            limit.set(wanted);
         }
         Ok(limit)
     }

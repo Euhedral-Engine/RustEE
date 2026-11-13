@@ -16,6 +16,9 @@ use super::{FakeGpu, FakeKernelFn};
 /// models, not a fact about any real one.
 pub const DEFAULT_DYNAMIC_SHARED_BYTES: u32 = 48 * 1024;
 
+/// The most dynamic shared memory, in bytes, a fake kernel can be opted in to: what the fake device models.
+pub const MAX_DYNAMIC_SHARED_BYTES: u32 = 227 * 1024;
+
 /// A fake module: its kernels resolve by name in the device's registry.
 #[derive(Debug)]
 pub struct FakeModule {
@@ -38,7 +41,7 @@ impl FakeKernel {
     /// The most dynamic shared memory, in bytes, a launch of this kernel may ask for: the default, or the largest
     /// value any lookup of the kernel in its module opted in to.
     pub fn max_dynamic_shared_bytes(&self) -> u32 {
-        self.limit.load(Ordering::Relaxed)
+        self.limit.load(Ordering::Acquire)
     }
 
     /// `Invalid` if `launch` asks for more dynamic shared memory than the kernel allows.
@@ -92,11 +95,21 @@ impl Module for FakeModule {
         })
     }
 
+    fn kernel(&self, name: &str) -> Result<<FakeGpu as Gpu>::Kernel, GpuError> {
+        self.kernel_with(name, KernelOptions::default())
+    }
+
     fn kernel_with(
         &self,
         name: &str,
         options: KernelOptions,
     ) -> Result<<FakeGpu as Gpu>::Kernel, GpuError> {
+        if options.max_dynamic_shared_bytes > MAX_DYNAMIC_SHARED_BYTES {
+            return Err(GpuError::Invalid(format!(
+                "{name}: the device refused {} bytes of dynamic shared memory (at most {MAX_DYNAMIC_SHARED_BYTES})",
+                options.max_dynamic_shared_bytes
+            )));
+        }
         let f = self
             .gpu
             .kernel_fn(name)
@@ -108,7 +121,7 @@ impl Module for FakeModule {
                 .entry(name.to_owned())
                 .or_insert_with(|| Arc::new(AtomicU32::new(DEFAULT_DYNAMIC_SHARED_BYTES))),
         );
-        limit.fetch_max(options.max_dynamic_shared_bytes, Ordering::Relaxed);
+        limit.fetch_max(options.max_dynamic_shared_bytes, Ordering::AcqRel);
         Ok(FakeKernel {
             name: name.into(),
             id: hash_bytes_with_seed(name.as_bytes(), self.id),

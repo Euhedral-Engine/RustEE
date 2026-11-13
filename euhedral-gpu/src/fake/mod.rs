@@ -43,7 +43,7 @@ pub use enqueue::FakeEnqueue;
 use enqueue::Real;
 pub use graph::{FakeGraph, FakeSequence};
 pub use lane::{FakeLaneEnqueue, FakeRawStream};
-pub use module::{DEFAULT_DYNAMIC_SHARED_BYTES, FakeKernel, FakeModule};
+pub use module::{DEFAULT_DYNAMIC_SHARED_BYTES, FakeKernel, FakeModule, MAX_DYNAMIC_SHARED_BYTES};
 use stream::Placement;
 pub use stream::{FakeQueue, FakeStream};
 

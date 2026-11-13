@@ -2,18 +2,26 @@
 #![cfg(feature = "fake")]
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use euhedral_gpu::fake::{DEFAULT_DYNAMIC_SHARED_BYTES, FakeGpu, FakeKernel, FakeModule};
+use euhedral_gpu::fake::{
+    DEFAULT_DYNAMIC_SHARED_BYTES, FakeGpu, FakeKernel, FakeModule, FakeOp, MAX_DYNAMIC_SHARED_BYTES,
+};
 use euhedral_gpu::{
     Args, CompileOptions, Gpu, GpuError, Kernel, KernelOptions, LaneEnqueue, Launch, Module,
-    Stream, StreamOptions,
+    Sequence, Stream, StreamOptions,
 };
 
+/// Runs of the `noop` kernel; only the test that reads it launches it with a refusal in mind, and it reads a delta.
+static RUNS: AtomicUsize = AtomicUsize::new(0);
 const OPT_IN: u32 = 64 * 1024;
 
 fn module() -> (Arc<FakeGpu>, FakeModule) {
     let gpu = FakeGpu::new();
-    gpu.define("noop", |_m, _l, _a| Ok(()));
+    gpu.define("noop", |_m, _l, _a| {
+        RUNS.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    });
     let module = FakeModule::from_source(&gpu, "// kernels", &CompileOptions::default()).unwrap();
     (gpu, module)
 }
@@ -106,4 +114,74 @@ fn a_second_lookup_raises_the_limit_for_every_handle_and_never_lowers_it() {
         assert_eq!(kernel.max_dynamic_shared_bytes(), OPT_IN);
     }
     launch_with(&gpu, &small, OPT_IN).unwrap();
+}
+
+fn launches(gpu: &FakeGpu) -> usize {
+    gpu.log()
+        .iter()
+        .filter(|op| matches!(op, FakeOp::Launch { .. }))
+        .count()
+}
+
+#[test]
+fn a_refused_launch_enqueues_and_runs_nothing() {
+    let (gpu, module) = module();
+    let kernel = module.kernel("noop").unwrap();
+    let (runs, ops) = (RUNS.load(Ordering::SeqCst), launches(&gpu));
+    assert!(launch_with(&gpu, &kernel, DEFAULT_DYNAMIC_SHARED_BYTES + 1).is_err());
+    assert_eq!(launches(&gpu), ops);
+    assert_eq!(RUNS.load(Ordering::SeqCst), runs);
+}
+
+#[test]
+fn an_eager_launch_over_the_limit_is_refused_in_a_recording_and_in_a_probe() {
+    let (gpu, module) = module();
+    let kernel = module.kernel("noop").unwrap();
+    let (_pool, mut streams) = gpu.open_lanes(&["a"], StreamOptions::default()).unwrap();
+    let launch = Launch {
+        shared_bytes: DEFAULT_DYNAMIC_SHARED_BYTES + 1,
+        ..Launch::linear(1, 1)
+    };
+    let body = |q: &mut euhedral_gpu::fake::FakeSequence<'_>| {
+        q.submit(0, |e| {
+            // SAFETY: the kernel takes no arguments.
+            unsafe { e.launch(&kernel, launch, &Args::new()) }
+        })
+    };
+    let recorded = gpu.record(&mut [&mut streams[0]], body);
+    assert!(
+        matches!(recorded, Err(GpuError::Invalid(_))),
+        "{:?}",
+        recorded.err()
+    );
+    let probed = gpu.fingerprint(1, body);
+    assert!(matches!(probed, Err(GpuError::Invalid(_))), "{probed:?}");
+}
+
+#[test]
+fn a_value_the_device_cannot_give_is_refused_at_the_lookup() {
+    let (_gpu, module) = module();
+    assert!(
+        module
+            .kernel_with(
+                "noop",
+                KernelOptions {
+                    max_dynamic_shared_bytes: MAX_DYNAMIC_SHARED_BYTES
+                }
+            )
+            .is_ok()
+    );
+    let refused = module.kernel_with(
+        "noop",
+        KernelOptions {
+            max_dynamic_shared_bytes: u32::MAX,
+        },
+    );
+    let Err(GpuError::Invalid(text)) = refused else {
+        panic!("{refused:?}")
+    };
+    assert!(
+        text.contains("noop") && text.contains(&u32::MAX.to_string()),
+        "{text}"
+    );
 }
