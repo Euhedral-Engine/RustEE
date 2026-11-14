@@ -95,8 +95,9 @@ pub trait Pending: Send {
 /// nothing (it runs no application code of its own), and a completed source pushes no poll frame.
 pub struct Completions {
     /// The lanes polled for markers: fixed for the source's life and dropped with it. A marker
-    /// counts as reached when its lane says so, also after the source has completed.
-    lanes: Arc<LanePool>,
+    /// counts as reached when its lane says so, also after the source has completed. `None` for a
+    /// source built [`without_lanes`](Self::without_lanes): it takes no markers.
+    lanes: Option<Arc<LanePool>>,
     /// Registered since the last poll; any thread appends, lock-free. [`LatticeSource::complete`]
     /// appends one [`Slot::Closed`] marker: what is behind it was registered too late.
     incoming: Producer<Slot, Multi>,
@@ -328,6 +329,20 @@ const INCOMING_CHUNK: usize = 256;
 impl Completions {
     /// Polls of `marker`s use `lanes`.
     pub fn new(lanes: Arc<LanePool>) -> Arc<Self> {
+        Self::build(Some(lanes))
+    }
+
+    /// A source with no device lanes: for a program with no device open (or between closing one and opening the
+    /// next) that still runs frames at deadlines ([`at`](Self::at)), polls its own pending work
+    /// ([`register`](Self::register), [`after`](Self::after)) and waits on retirement cells
+    /// ([`after_retired`](Self::after_retired), whose cell is filled by whoever armed it). It has no marker to poll, so
+    /// [`after_marker`](Self::after_marker) refuses its frame (see there). Everything else, the poll frame, the bell
+    /// and the reap, is as on a source built by [`new`](Self::new).
+    pub fn without_lanes() -> Arc<Self> {
+        Self::build(None)
+    }
+
+    fn build(lanes: Option<Arc<LanePool>>) -> Arc<Self> {
         let queue: MpscQueue<Slot> = MpscQueue::with_pool(INCOMING_CHUNK, 2);
         let ready: SpscQueue<Box<dyn Frame>> = SpscQueue::with_pool(INCOMING_CHUNK, 2);
         Arc::new_cyclic(|me| Self {
@@ -360,6 +375,13 @@ impl Completions {
             blind: AtomicBool::new(false),
             panicked: AtomicUsize::new(0),
         })
+    }
+
+    /// Whether `marker` is reached: never, with no lanes.
+    fn reached(&self, marker: Marker) -> bool {
+        self.lanes
+            .as_ref()
+            .is_some_and(|lanes| lanes.reached(marker))
     }
 
     /// Registers `what`. Exactly one end for its frame, whatever races `complete` (the argument is
@@ -421,7 +443,11 @@ impl Completions {
     /// could be released while the device may still use them, they are not.
     fn cancel(&self, what: Waits) {
         let unreached = match &what {
-            Waits::Marker(marker, _) => !self.lanes.reached(*marker),
+            // A source without lanes has no marker's work to protect: its frame is finished.
+            Waits::Marker(marker, _) => self
+                .lanes
+                .as_ref()
+                .is_some_and(|lanes| !lanes.reached(*marker)),
             Waits::Retired(cell, _) => !cell.arrived(),
             _ => false,
         };
@@ -615,7 +641,20 @@ impl Completions {
 
     /// Emits `frame` once `marker`'s work completed (a completion edge on a device lane). A marker of a queue that
     /// is not in this source's pool is never reached, so its frame is never emitted.
+    ///
+    /// A source built [`without_lanes`](Self::without_lanes) has no lane for any marker, and refuses the registration
+    /// the way one after [`complete`](LatticeSource::complete) is refused: the frame is finished through `do_finally`
+    /// without running (so whatever it holds ends; nothing is leaked, as no lane can be using it), it is not counted
+    /// by [`pending`](Self::pending), and debug builds panic.
     pub fn after_marker(&self, marker: Marker, frame: Box<dyn Frame>) {
+        if self.lanes.is_none() {
+            self.cancel(Waits::Marker(marker, frame));
+            debug_assert!(
+                false,
+                "a marker registered on a Completions without lanes (its frame was cancelled)"
+            );
+            return;
+        }
         self.add(Waits::Marker(marker, frame));
     }
 
@@ -729,7 +768,7 @@ impl Completions {
             let queried = panic::catch_unwind(AssertUnwindSafe(|| match &mut entry.what {
                 Waits::Ready(ready, _) => (ready.is_ready(), None),
                 Waits::Wake(wake, _) => (wake.is_ready(), None),
-                Waits::Marker(marker, _) => (self.lanes.reached(*marker), None),
+                Waits::Marker(marker, _) => (self.reached(*marker), None),
                 Waits::Retired(cell, _) => (cell.arrived(), None),
                 Waits::At(deadline, _) => (now >= *deadline, None),
                 Waits::Pending(pending) => {
@@ -1314,6 +1353,94 @@ mod tests {
         );
         completions.complete();
         assert!(completions.is_complete() && recorder.completed.load(Ordering::Acquire));
+    }
+
+    fn bare() -> Arc<Completions> {
+        Completions::without_lanes()
+    }
+
+    #[test]
+    fn timers_without_lanes_fire_in_deadline_order_and_not_before_their_deadline() {
+        let completions = bare();
+        let now = Instant::now();
+        completions.at(now + Duration::from_secs(3600), tagged(4));
+        completions.at(now - Duration::from_millis(30), tagged(1));
+        completions.at(now - Duration::from_millis(20), tagged(2));
+        completions.at(now - Duration::from_millis(10), tagged(3));
+        assert_eq!(completions.pending(), 4);
+        assert_eq!(poll(&completions), [1, 2, 3]);
+        assert_eq!(completions.pending(), 1);
+        assert!(poll(&completions).is_empty());
+        let (_, _, max) = completions.lateness_us();
+        assert!(max >= 10_000, "lateness is recorded as with lanes");
+    }
+
+    #[test]
+    fn a_pending_operation_registered_without_lanes_is_polled_and_completes() {
+        struct CountDown(u32);
+        impl Pending for CountDown {
+            fn poll(&mut self) -> Option<Box<dyn Frame>> {
+                self.0 = self.0.saturating_sub(1);
+                (self.0 == 0).then(|| tagged(7))
+            }
+        }
+        let completions = bare();
+        completions.register(Box::new(CountDown(2)));
+        assert!(poll(&completions).is_empty());
+        assert_eq!(poll(&completions), [7]);
+        assert_eq!(completions.pending(), 0);
+    }
+
+    #[test]
+    fn a_ready_token_registered_without_lanes_completes() {
+        let completions = bare();
+        let token = Token::default();
+        completions.after(Box::new(token.clone()), tagged(5));
+        assert!(poll(&completions).is_empty());
+        token.done.store(true, Ordering::Release);
+        assert_eq!(poll(&completions), [5]);
+    }
+
+    #[test]
+    fn a_marker_without_lanes_is_refused_and_its_frame_is_finished_without_running() {
+        let completions = bare();
+        let (executed, finished) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let frame = Finished {
+            header: FrameHeader::new(1),
+            executed: executed.clone(),
+            finished: finished.clone(),
+        };
+        let marker = Marker::new(QueueId::next(), LaneId(0), 1);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            completions.after_marker(marker, Box::new(frame));
+        }));
+        assert!(finished.load(Ordering::Acquire), "its do_finally ran");
+        assert!(!executed.load(Ordering::Acquire), "it was not run");
+        assert_eq!(
+            result.is_err(),
+            cfg!(debug_assertions),
+            "debug builds panic"
+        );
+        assert_eq!(completions.pending(), 0);
+        assert_eq!(completions.leaked_unreached().load(Ordering::Acquire), 0);
+        assert!(poll(&completions).is_empty());
+    }
+
+    #[test]
+    fn pending_and_reap_report_without_lanes() {
+        let completions = bare();
+        assert_eq!(completions.pending(), 0);
+        assert_eq!(completions.reap(), 0);
+        completions.at(Instant::now() + Duration::from_secs(3600), tagged(1));
+        completions.at(Instant::now() - Duration::from_millis(1), tagged(2));
+        assert_eq!(completions.pending(), 2);
+        assert_eq!(completions.reap(), 1, "reap counts what it found completed");
+        assert_eq!(completions.pending(), 2, "found is not yet handed out");
+        assert_eq!(poll(&completions), [2]);
+        assert_eq!(completions.pending(), 1);
     }
 
     #[test]
