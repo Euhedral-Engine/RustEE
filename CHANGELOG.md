@@ -3,6 +3,23 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## A new socket for `connect` (`euhedral-io`) (2026-11-14)
+
+**What.** `AsyncIo::socket_for(to: SocketAddr) -> io::Result<OwnedSock>`: a new unconnected stream socket of `to`'s family, to hand to `connect` or `connect_with`.
+
+**Why.** `connect` takes a socket the caller made, and neither the standard library (its connect blocks) nor safe code can make an unconnected one, so a client had to use `unsafe` and a platform crate.
+
+**Breaking:** none. A new method; the engines' behaviour is unchanged.
+
+**How to use it.** `let socket = io.socket_for(addr)?; io.connect_with(socket.as_raw_fd(), addr, options, then)?;` keep `socket` until the connection ends; dropping it closes it.
+
+**Semantics.**
+- IPv4 for an IPv4 address, IPv6 for an IPv6 one. The result owns the socket: dropped unconnected, nothing stays open.
+- Linux and Android: `socket(2)` with `SOCK_STREAM | SOCK_CLOEXEC`, blocking (the engine waits for the handshake either way). Windows: `WSASocketW` with `WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT`, through the engine's own system layer; the engine binds the socket and joins it to its port when it connects, as for any socket it is given.
+- No operation is started: `pending` is unchanged. An error is the operating system's.
+
+**Tests.** `tests/socket_for.rs` (Linux, real engine): IPv4 and IPv6 sockets connect to a loopback listener and carry data both ways; one dropped unconnected leaves no descriptor open. `win::tests` (the simulated Windows engine): the socket is made for the address's family, is the caller's (not closed by the engine) and connects. The helper in `tests/socket_limits.rs` that called `socket(2)` is replaced by it. The Windows call itself is compile-checked only (`x86_64-pc-windows-gnu` clippy); it has not been run.
+
 ## An HTTP/1.1 server on `AsyncIo` (`euhedral-net`) (2026-11-14)
 
 **What.** `euhedral-net` gains `serve(lattice, io, sink, listener, config, handler, timers) -> io::Result<ServerHandle>`, `ServerConfig`, the `Handler` trait (a closure works), `Responder` (with `cancelled` and `on_cancel`), `ServerHandle { counters, stop }`, `Counters` and `no_work`. Linux, Android and Windows. The crate now depends on `euhedral-core`, `euhedral-data-structures`, `euhedral-graph` and `euhedral-io` (layer 4 over layers 1 to 3).

@@ -416,6 +416,28 @@ fn an_accept_updates_the_context_and_yields_the_new_socket() {
 }
 
 #[test]
+fn a_new_socket_is_made_for_the_family_of_the_address_and_is_the_callers() {
+    let h = Harness::new();
+    for (to, v4) in [
+        (std::net::SocketAddr::from(([127, 0, 0, 1], 80)), true),
+        (std::net::SocketAddr::from(([0u16; 8], 80)), false),
+    ] {
+        let sock = h.engine.new_socket(to).unwrap();
+        assert!(
+            h.sim
+                .log()
+                .iter()
+                .any(|l| l.starts_with(&format!("new socket {sock:#x} v4 {v4}")))
+        );
+        assert!(!h.sim.closed_sockets().contains(&sock));
+        // It connects: the engine joins it to the port and binds it.
+        h.submit(Request::Connect { sock, to }, IoBuf::default(), raw_then(1))
+            .unwrap();
+        assert!(h.one().raw.unwrap().is_ok());
+    }
+}
+
+#[test]
 fn a_failed_accept_closes_the_socket_it_made() {
     for fail_update in [false, true] {
         let h = Harness::new();

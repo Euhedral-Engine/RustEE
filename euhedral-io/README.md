@@ -39,6 +39,13 @@ platform's: descriptors on Linux and Android, `HANDLE`s and `SOCKET`s on Windows
 completion holds a worker for long. The `AsyncIo` type is the same everywhere; an engine under it
 starts operations and finds their ends, and `src/lib.rs` does the rest.
 
+`socket_for(addr)` makes the socket a client's `connect` needs: a new, unconnected stream socket of the address's
+family (IPv4 or IPv6), owned by the result, so that dropping it closes it. The standard library cannot make one
+(its connect blocks), and a caller should not need `unsafe` or a platform crate to get one. It is made as the engine
+wants it (close-on-exec on Linux and Android; overlapped and not inheritable on Windows) and the engine does the rest
+when it connects (the bind and the join to the completion port on Windows). It is no operation: nothing is in
+flight on it and `pending` does not count it. A connect that ended early leaves it in an unknown state: drop it.
+
 The source side takes no lock: the continuations a pull's `stop` held back are plain state of the hand-out,
 and the downstream is a `DownstreamSlot`. **Reaping is a frame's work** (it asks the kernel, takes a lock and calls the
 continuations, at every visit): `request` and `pull` only hand out

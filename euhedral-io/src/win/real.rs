@@ -653,6 +653,25 @@ impl Sys for RealSys {
         Ok(sock)
     }
 
+    fn new_socket(&self, to: std::net::SocketAddr) -> io::Result<Handle> {
+        let family = if to.is_ipv4() { AF_INET } else { AF_INET6 };
+        // SAFETY: a new socket: no protocol info, no group.
+        let sock = unsafe {
+            WSASocketW(
+                i32::from(family),
+                SOCK_STREAM,
+                IPPROTO_TCP,
+                null(),
+                0,
+                WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT,
+            )
+        };
+        if sock == INVALID_SOCKET {
+            return Err(last_error());
+        }
+        Ok(sock)
+    }
+
     fn close_socket(&self, sock: Handle) {
         // SAFETY: a socket this engine made and still owns.
         unsafe { closesocket(sock as SOCKET) };
