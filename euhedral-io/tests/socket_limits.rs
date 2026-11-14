@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use euhedral_core::frames::{Frame, FrameHeader};
 use euhedral_core::generics::LatticeSource;
-use euhedral_io::{AsyncIo, Cancelled, IoBuf, OpOptions};
+use euhedral_io::{AsyncIo, Cancelled, IoBuf, LimitPassed, OpOptions};
 
 /// The frame a continuation emits: it has no work, the outcome went to the list.
 struct Ended(FrameHeader);
@@ -151,7 +151,12 @@ fn a_receive_with_a_limit_on_a_silent_peer_times_out_and_the_socket_receives_aft
     assert_eq!(io.pending(), 1);
     drive(&io, || out.len() == 1);
     let (result, len, filled) = only(&out);
-    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+    let error = result.unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    // Its own marker, not an `ETIMEDOUT` of the system, and not a cancel.
+    assert!(LimitPassed::is(&error) && !Cancelled::is(&error));
+    assert!(error.raw_os_error().is_none());
+    assert_eq!(LimitPassed::moved_of(&error), Some(0));
     assert_eq!((len, filled), (64, 0));
     assert_eq!(io.pending(), 0);
     peer.write_all(b"hello").unwrap();
@@ -275,7 +280,10 @@ fn a_cancelled_receive_ends_once_with_the_cancelled_error_and_the_socket_receive
     let (result, len, filled) = only(&out);
     let error = result.unwrap_err();
     assert!(Cancelled::is(&error));
-    assert_ne!(error.kind(), io::ErrorKind::TimedOut);
+    // Not `Interrupted` (a retry loop would reissue it), not a timeout, and no OS code.
+    assert_eq!(error.kind(), io::ErrorKind::Other);
+    assert!(error.raw_os_error().is_none() && !LimitPassed::is(&error));
+    assert_eq!(Cancelled::moved_of(&error), Some(0));
     assert_eq!((len, filled), (64, 0));
     assert_eq!(io.pending(), 0);
     for _ in 0..100 {
@@ -286,12 +294,39 @@ fn a_cancelled_receive_ends_once_with_the_cancelled_error_and_the_socket_receive
     recv_ok(&io, &ours, b"after");
 }
 
+/// Sets a socket option of integer type.
+fn set_int(socket: &impl AsRawFd, level: i32, name: i32, value: i32) {
+    // SAFETY: `setsockopt(2)` on a socket we own, with a pointer to an int that outlives the call.
+    let set = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            level,
+            name,
+            std::ptr::from_ref(&value).cast(),
+            size_of::<i32>() as libc::socklen_t,
+        )
+    };
+    assert_eq!(set, 0);
+}
+
+/// A connected pair whose buffers are small (a few tens of KiB), so that a megabyte sent to a peer
+/// that never reads cannot fit.
+fn small_pair() -> (TcpStream, TcpStream) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    // The window of the accepted socket comes from the listener's receive buffer at the handshake.
+    set_int(&listener, libc::SOL_SOCKET, libc::SO_RCVBUF, 4096);
+    let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    set_int(&client, libc::SOL_SOCKET, libc::SO_SNDBUF, 4096);
+    let (server, _) = listener.accept().unwrap();
+    (client, server)
+}
+
 #[test]
 fn a_cancelled_send_to_a_peer_with_full_buffers_ends_once_and_a_limited_one_times_out() {
     let io = AsyncIo::open().unwrap();
     // The peer never reads: the socket's buffers fill and the send waits.
-    let (_peer, ours) = pair();
-    let total = 256 * 1024 * 1024;
+    let (_peer, ours) = small_pair();
+    let total = 4 * 1024 * 1024;
     let big = || IoBuf {
         bytes: vec![1; total],
         filled: total,
@@ -304,7 +339,10 @@ fn a_cancelled_send_to_a_peer_with_full_buffers_ends_once_and_a_limited_one_time
     io.cancel(id);
     drive(&io, || out.len() == 1);
     let (result, len, _) = only(&out);
-    assert!(Cancelled::is(&result.unwrap_err()));
+    let error = result.unwrap_err();
+    assert!(Cancelled::is(&error));
+    let sent = Cancelled::moved_of(&error).unwrap();
+    assert!(sent < total, "{sent} of {total} bytes");
     assert_eq!(len, total);
     assert_eq!(io.pending(), 0);
     for _ in 0..100 {
@@ -316,7 +354,9 @@ fn a_cancelled_send_to_a_peer_with_full_buffers_ends_once_and_a_limited_one_time
         .unwrap();
     drive(&io, || out.len() == 1);
     let (result, len, _) = only(&out);
-    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+    let error = result.unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    assert!(LimitPassed::moved_of(&error).is_some_and(|moved| moved < total));
     assert_eq!(len, total);
 }
 
@@ -416,23 +456,61 @@ fn a_limited_accept_with_no_peer_times_out_and_the_listener_accepts_afterwards()
     assert!(out.take().remove(0).is_ok());
 }
 
+/// Starts a connect on a new non-blocking socket without waiting for it; the handshake is left
+/// in progress.
+fn connect_in_progress(to: std::net::SocketAddrV4) -> OwnedFd {
+    let socket = socket_for(SocketAddr::V4(to));
+    // SAFETY: `fcntl(2)` on a descriptor we own.
+    let flags = unsafe { libc::fcntl(socket.as_raw_fd(), libc::F_GETFL) };
+    // SAFETY: as above.
+    let set = unsafe { libc::fcntl(socket.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    assert_eq!(set, 0);
+    let address = libc::sockaddr_in {
+        sin_family: libc::AF_INET as libc::sa_family_t,
+        sin_port: to.port().to_be(),
+        sin_addr: libc::in_addr {
+            s_addr: u32::from(*to.ip()).to_be(),
+        },
+        sin_zero: [0; 8],
+    };
+    // SAFETY: a `connect(2)` with a valid `sockaddr_in` and its length.
+    let connected = unsafe {
+        libc::connect(
+            socket.as_raw_fd(),
+            std::ptr::from_ref(&address).cast(),
+            size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        )
+    };
+    assert_eq!(connected, -1);
+    assert_eq!(
+        io::Error::last_os_error().raw_os_error(),
+        Some(libc::EINPROGRESS)
+    );
+    socket
+}
+
+/// No address that never answers exists on every machine, so the test makes one on loopback: a
+/// listener whose accept queue is full drops the handshakes that come after it, and answers none.
+/// That is the kernel's default (`tcp_abort_on_overflow` 0); a machine that resets such
+/// connections instead answers `ECONNREFUSED`, and the test says so rather than pass.
 #[test]
 fn a_limited_connect_to_a_peer_that_does_not_answer_times_out() {
     let io = AsyncIo::open().unwrap();
-    // A listener whose queue holds one connection and is full: further handshakes are dropped
-    // and never answered.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let to = listener.local_addr().unwrap();
+    let SocketAddr::V4(to) = listener.local_addr().unwrap() else {
+        unreachable!("bound to an IPv4 address")
+    };
     // SAFETY: `listen(2)` on a listening socket of ours only changes its backlog.
     assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 0) }, 0);
+    // One connection fills the queue (a backlog of 0 holds one); the next handshake is dropped.
     let _queued = TcpStream::connect(to).unwrap();
-    let _more = TcpStream::connect_timeout(&to, Duration::from_millis(100));
+    let _dropped = connect_in_progress(to);
     let out: Outcomes<io::Result<()>> = Outcomes::default();
     let sink = out.clone();
-    let socket = socket_for(to);
+    let socket = socket_for(SocketAddr::V4(to));
     io.connect_with(
         socket.as_raw_fd(),
-        to,
+        SocketAddr::V4(to),
         limit(100),
         Box::new(move |result| {
             sink.0.lock().unwrap().push(result);
@@ -441,9 +519,91 @@ fn a_limited_connect_to_a_peer_that_does_not_answer_times_out() {
     )
     .unwrap();
     drive(&io, || out.len() == 1);
+    let error = out.take().remove(0).unwrap_err();
     assert_eq!(
-        out.take().remove(0).unwrap_err().kind(),
-        io::ErrorKind::TimedOut
+        error.kind(),
+        io::ErrorKind::TimedOut,
+        "the kernel answered the handshake: {error}"
     );
+    assert!(LimitPassed::is(&error));
     assert_eq!(io.pending(), 0);
+}
+
+#[test]
+fn a_cancel_from_another_worker_ends_the_operation_once() {
+    let io = AsyncIo::open().unwrap();
+    let (_peer, ours) = pair();
+    let out = Outcomes::default();
+    let id = io
+        .recv_with(ours.as_raw_fd(), buf(64), NEVER, io_then(&out))
+        .unwrap();
+    stay_pending(&io, || out.len());
+    // A cancel is a request any thread may make: here, one that did not submit.
+    let canceller = {
+        let io = io.clone();
+        std::thread::spawn(move || io.cancel(id))
+    };
+    canceller.join().unwrap();
+    drive(&io, || out.len() == 1);
+    let (result, ..) = only(&out);
+    assert!(Cancelled::is(&result.unwrap_err()));
+    for _ in 0..100 {
+        step(&io);
+    }
+    assert_eq!(out.len(), 0);
+    assert_eq!(io.pending(), 0);
+}
+
+#[test]
+fn cancelling_a_limited_operation_ends_it_with_the_cancel_and_no_timeout_follows() {
+    let io = AsyncIo::open().unwrap();
+    let (mut peer, ours) = pair();
+    let out = Outcomes::default();
+    let id = io
+        .recv_with(ours.as_raw_fd(), buf(64), limit(200), io_then(&out))
+        .unwrap();
+    stay_pending(&io, || out.len());
+    io.cancel(id);
+    drive(&io, || out.len() == 1);
+    let (result, ..) = only(&out);
+    let error = result.unwrap_err();
+    assert!(Cancelled::is(&error) && !LimitPassed::is(&error));
+    // Past the limit nothing more comes, and the socket works.
+    let past = Instant::now() + Duration::from_millis(300);
+    while Instant::now() < past {
+        step(&io);
+    }
+    assert_eq!(out.len(), 0);
+    assert_eq!(io.pending(), 0);
+    peer.write_all(b"ok").unwrap();
+    recv_ok(&io, &ours, b"ok");
+}
+
+#[test]
+fn the_id_of_another_asyncio_cancels_nothing() {
+    let first = AsyncIo::open().unwrap();
+    let second = AsyncIo::open().unwrap();
+    let (mut peer, ours) = pair();
+    let out = Outcomes::default();
+    let id = first
+        .recv_with(ours.as_raw_fd(), buf(64), NEVER, io_then(&out))
+        .unwrap();
+    // The same ring index and slot can exist in both engines: only the engine tells them apart.
+    let (_peer2, ours2) = pair();
+    let out2 = Outcomes::default();
+    let id2 = second
+        .recv_with(ours2.as_raw_fd(), buf(64), NEVER, io_then(&out2))
+        .unwrap();
+    assert_ne!(id, id2);
+    second.cancel(id);
+    first.cancel(id2);
+    stay_pending(&first, || out.len());
+    stay_pending(&second, || out2.len());
+    assert_eq!((first.pending(), second.pending()), (1, 1));
+    peer.write_all(b"fine").unwrap();
+    drive(&first, || out.len() == 1);
+    assert_eq!(only(&out).0.unwrap(), 4);
+    second.cancel(id2);
+    drive(&second, || out2.len() == 1);
+    assert!(Cancelled::is(&only(&out2).0.unwrap_err()));
 }

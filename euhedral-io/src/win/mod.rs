@@ -41,7 +41,7 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::io;
 use std::path::PathBuf;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 #[allow(
     clippy::disallowed_types,
     reason = "HOT-FIX(I9), HOT-FIX(I14), HOT-FIX(I15), HOT-FIX(I7), HOT-FIX(I8), HOT-FIX(I10), HOT-FIX(I11), HOT-FIX(I12), HOT-FIX(I13)"
@@ -57,8 +57,8 @@ use self::sys::{
     is_nt_warning,
 };
 use super::{
-    AsyncIo, AsyncIoOptions, Buf, Cancelled, Engine as EngineTrait, MAX_PIECE, OpId, OpenSpec,
-    READ_PIECE, Request, Then, conclude as conclude_io, invalid, timed_out,
+    AsyncIo, AsyncIoOptions, Buf, Cancelled, Engine as EngineTrait, LimitPassed, MAX_PIECE, OpId,
+    OpenSpec, READ_PIECE, Request, Then, conclude as conclude_io, invalid,
 };
 
 #[cfg(all(windows, test))]
@@ -90,6 +90,8 @@ const MAX_OPS: usize = (1 << SLOT_BITS) - 1;
 const GENERATION_MASK: usize = usize::MAX >> SLOT_BITS;
 
 static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
+/// `Engine::next_deadline` when no operation has a limit.
+const NO_DEADLINE: u64 = u64::MAX;
 
 thread_local! {
     /// This thread's ring of each engine it submitted to (by id).
@@ -179,10 +181,13 @@ enum End {
 }
 
 impl End {
-    fn error(self) -> io::Error {
+    /// The error of an operation that ended for this reason after moving `moved` bytes. Neither
+    /// has an OS code, so both are told from an operation the OS aborted (`ERROR_OPERATION_ABORTED`,
+    /// which `std` reads as `TimedOut`, with its code).
+    fn error(self, moved: usize) -> io::Error {
         match self {
-            Self::Cancelled => Cancelled::error(),
-            Self::TimedOut => timed_out(),
+            Self::Cancelled => Cancelled::error(moved),
+            Self::TimedOut => LimitPassed::error(moved),
         }
     }
 }
@@ -443,17 +448,18 @@ pub(super) struct Engine {
     #[allow(clippy::disallowed_types, reason = "HOT-FIX(I13)")]
     rings: Mutex<Vec<Arc<Ring>>>,
     max_piece: usize,
-    /// How many operations have a limit that has not passed or ended (`Table::limits`), so that a
-    /// poll with none takes no lock for them.
-    limited: AtomicUsize,
+    /// The soonest deadline in `Table::limits` (`NO_DEADLINE` when there is none), kept in step
+    /// under the table's lock, so that a poll takes no lock for limits until one has passed.
+    next_deadline: AtomicU64,
     /// Packets and completions of no operation (ignored), for tests.
     strays: AtomicUsize,
 }
 
 /// What a dequeued packet leads to.
 enum Taken {
-    /// The operation, now `Busy`, with the status and byte count of its call.
-    Op(Held, i32, u32),
+    /// The operation, now `Busy`, with the status and byte count of its call and why it was asked
+    /// to end, if it was (read in the lock that made it `Busy`).
+    Op(Held, i32, u32, Option<End>),
     /// Its call is still returning: look again at the next poll.
     Later,
     /// A packet of no operation in flight on the port.
@@ -497,7 +503,7 @@ impl Engine {
             ringed: Mutex::new(HashSet::new()),
             rings: Mutex::new(Vec::new()),
             max_piece: max_piece.clamp(1, MAX_PIECE),
-            limited: AtomicUsize::new(0),
+            next_deadline: AtomicU64::new(NO_DEADLINE),
             strays: AtomicUsize::new(0),
         })
     }
@@ -550,7 +556,7 @@ impl Engine {
         let serial = table.last_serial;
         if let Some(deadline) = op.deadline {
             table.limits.insert((deadline, slot));
-            self.limited.store(table.limits.len(), Ordering::Release);
+            self.publish_deadline(&table);
         }
         let entry = &mut table.slots[slot as usize];
         debug_assert_eq!(entry.state, State::Idle);
@@ -589,8 +595,15 @@ impl Engine {
         })
     }
 
+    /// Moves the slot to `state`. A slot that goes in flight after being asked to end meanwhile
+    /// (a cancel or a limit while its call was being made) has its call cancelled now.
     fn set_state(&self, held: Held, state: State) {
-        lock!(&self.table).slots[held.slot as usize].state = state;
+        let mut table = lock!(&self.table);
+        let entry = &mut table.slots[held.slot as usize];
+        entry.state = state;
+        if state == State::InFlight && entry.end.is_some() {
+            self.cancel_call(entry);
+        }
     }
 
     /// The slot is free again.
@@ -601,7 +614,7 @@ impl Engine {
         // A limit that did not pass leaves the set with its operation.
         if let Some(deadline) = entry.deadline.take() {
             table.limits.remove(&(deadline, held.slot));
-            self.limited.store(table.limits.len(), Ordering::Release);
+            self.publish_deadline(&table);
         }
         table.free.push(held.slot);
     }
@@ -622,17 +635,6 @@ impl Engine {
         }
     }
 
-    /// A call that was made is now in flight (or its end is already queued). If the operation was
-    /// asked to end meanwhile, its call is cancelled now.
-    fn arm(&self, held: Held) {
-        let mut table = lock!(&self.table);
-        let entry = &mut table.slots[held.slot as usize];
-        entry.state = State::InFlight;
-        if entry.end.is_some() {
-            self.cancel_call(entry);
-        }
-    }
-
     /// Asks the operation `serial` of `slot` to end early, for `why`; nothing if it has ended.
     fn request_end(&self, slot: u32, serial: u64, why: End) {
         let mut table = lock!(&self.table);
@@ -650,13 +652,26 @@ impl Engine {
         }
     }
 
+    /// Makes `next_deadline` the soonest of the limits. Under the table's lock.
+    fn publish_deadline(&self, table: &Table) {
+        let soonest = table
+            .limits
+            .first()
+            .map_or(NO_DEADLINE, |&(deadline, _)| deadline);
+        self.next_deadline.store(soonest, Ordering::Release);
+    }
+
     /// Asks every operation whose limit has passed to end, as `request_end` does. A poll's work, so
-    /// that no timer and no thread is needed: a limit ends at the first poll after it passed.
+    /// that no timer and no thread is needed: a limit ends at the first poll after it passed. A
+    /// poll before the soonest deadline takes no lock.
     fn expire_limits(&self) {
-        if self.limited.load(Ordering::Acquire) == 0 {
+        if self.next_deadline.load(Ordering::Acquire) == NO_DEADLINE {
             return;
         }
         let now = self.sys.now_ns();
+        if now < self.next_deadline.load(Ordering::Acquire) {
+            return;
+        }
         let mut table = lock!(&self.table);
         while let Some(&(deadline, slot)) = table.limits.first() {
             if deadline > now {
@@ -671,12 +686,7 @@ impl Engine {
                 }
             }
         }
-        self.limited.store(table.limits.len(), Ordering::Release);
-    }
-
-    /// Why the operation was asked to end early, if it was.
-    fn ending(&self, held: Held) -> Option<End> {
-        lock!(&self.table).slots[held.slot as usize].end
+        self.publish_deadline(&table);
     }
 
     /// The operation whose `OVERLAPPED` is at the packet's address, if it is in flight on the port
@@ -712,6 +722,7 @@ impl Engine {
             return Taken::Stray;
         }
         entry.state = State::Busy;
+        let end = entry.end;
         Taken::Op(
             Held {
                 slot,
@@ -721,6 +732,7 @@ impl Engine {
             },
             status,
             packet.bytes,
+            end,
         )
     }
 
@@ -1059,7 +1071,7 @@ impl Engine {
     /// that completes or fails operations touches the record while it is being filled.
     fn start(&self, op: Op) -> io::Result<OpId> {
         let held = self.begin(op, State::Issuing)?;
-        let id = OpId::new(held.slot, held.serial);
+        let id = OpId::new(self.id as u64, held.slot, held.serial);
         self.launch(held);
         Ok(id)
     }
@@ -1134,7 +1146,7 @@ impl Engine {
         };
         match made {
             // A packet follows. Its slot may be completed from now on.
-            Ok(()) => self.arm(held),
+            Ok(()) => self.set_state(held, State::InFlight),
             // The call failed at once and no packet follows: end it with the error.
             Err(error) => self.fail(held, error),
         }
@@ -1311,7 +1323,7 @@ impl Engine {
                             return None;
                         }
                         // Asked to end between two pieces: the rest does not go in.
-                        Err(why) => Err(why.error()),
+                        Err(why) => Err(why.error(op.moved)),
                     }
                 } else {
                     Ok(op.moved)
@@ -1407,19 +1419,20 @@ impl Engine {
                     self.stray();
                 }
                 Taken::Later => later.push_back(packet),
-                Taken::Op(held, status, bytes) => {
+                Taken::Op(held, status, bytes, end) => {
                     progress = true;
                     let (result, partial) = {
                         // SAFETY: the slot is `Busy`: this thread has the record.
                         let rec = unsafe { &*held.rec.as_ptr() };
-                        let kind = &rec.op.as_ref().expect("an operation in flight").kind;
-                        self.packet_result(kind, status, bytes)
-                    };
-                    // A call that was cancelled for a reason ends with it.
-                    let result = if status == STATUS_CANCELLED {
-                        self.ending(held).map_or(result, |why| Err(why.error()))
-                    } else {
-                        result
+                        let op = rec.op.as_ref().expect("an operation in flight");
+                        let (result, partial) = self.packet_result(&op.kind, status, bytes);
+                        // A call that was cancelled for a reason ends with it.
+                        match end {
+                            Some(why) if status == STATUS_CANCELLED => {
+                                (Err(why.error(op.moved)), partial)
+                            }
+                            _ => (result, partial),
+                        }
                     };
                     if let Some(frame) = self.advance(held, result, partial)
                         && !offer(frame)
@@ -1606,7 +1619,9 @@ impl EngineTrait for Engine {
     }
 
     fn cancel(&self, id: OpId) {
-        self.request_end(id.lane(), id.token(), End::Cancelled);
+        if id.engine() == self.id as u64 {
+            self.request_end(id.lane(), id.token(), End::Cancelled);
+        }
     }
 
     fn poll(&self, room: &mut dyn FnMut() -> bool, offer: &mut dyn FnMut(Box<dyn Frame>) -> bool) {

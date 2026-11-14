@@ -18,7 +18,7 @@ use super::sys::{
 use super::{Engine, MAX_PIECE};
 use crate::{
     AsyncIoOptions, Buf, Cancelled, Create, Engine as EngineTrait, Front, IoBuf, IoDone,
-    IoDoneOwned, OpId, OpenSpec, Region, Request, Then,
+    IoDoneOwned, LimitPassed, OpId, OpenSpec, Region, Request, Then,
 };
 
 /// A completion frame: carries what the operation ended with.
@@ -1425,7 +1425,11 @@ fn a_receive_whose_limit_passed_times_out_at_the_next_poll_and_the_socket_receiv
     assert_eq!(cancels(&h), 0, "not before the limit");
     h.sim.advance(Duration::from_millis(1));
     let done = ended(h.one());
-    assert_eq!(done.result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+    let error = done.result.unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    // Its own marker: an operation the OS aborted is `TimedOut` to std too, with its code.
+    assert!(LimitPassed::is(&error) && !Cancelled::is(&error));
+    assert!(error.raw_os_error().is_none());
     assert_eq!((done.buf.bytes.len(), done.buf.filled), (64, 0));
     assert_eq!(cancels(&h), 1);
     assert_eq!(h.pending(), 0);
@@ -1468,7 +1472,10 @@ fn limited_operations_that_finish_in_time_end_once_and_leave_no_limit_behind() {
         Some(LIMIT),
     )
     .unwrap();
-    assert_eq!(h.engine.limited.load(Ordering::Acquire), 4);
+    assert_ne!(
+        h.engine.next_deadline.load(Ordering::Acquire),
+        super::NO_DEADLINE
+    );
     let done = h.drain(4);
     let mut sizes: Vec<usize> = Vec::new();
     for d in done {
@@ -1482,7 +1489,10 @@ fn limited_operations_that_finish_in_time_end_once_and_leave_no_limit_behind() {
     }
     sizes.sort_unstable();
     assert_eq!(sizes, [3, 250]);
-    assert_eq!(h.engine.limited.load(Ordering::Acquire), 0);
+    assert_eq!(
+        h.engine.next_deadline.load(Ordering::Acquire),
+        super::NO_DEADLINE
+    );
     // Past the limit, nothing more ends and nothing is cancelled.
     h.sim.advance(LIMIT * 2);
     assert!(h.pull_with(&mut |_| false).is_empty());
@@ -1502,8 +1512,9 @@ fn a_cancelled_receive_ends_once_with_the_cancelled_error() {
     h.engine.cancel(id);
     let done = ended(h.one());
     let error = done.result.unwrap_err();
-    assert!(Cancelled::is(&error));
-    assert_ne!(error.kind(), io::ErrorKind::TimedOut);
+    assert!(Cancelled::is(&error) && !LimitPassed::is(&error));
+    assert_eq!(error.kind(), io::ErrorKind::Other);
+    assert!(error.raw_os_error().is_none());
     assert_eq!((done.buf.bytes.len(), done.buf.filled), (64, 0));
     assert!(h.pull_with(&mut |_| false).is_empty());
     // Ended: a cancel now is nothing.
@@ -1649,4 +1660,77 @@ fn a_limited_accept_times_out_and_closes_its_socket_and_a_limited_connect_times_
     let error = h.one().raw.unwrap().unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     assert_eq!(h.pending(), 0);
+}
+
+#[test]
+fn an_operation_the_os_aborted_is_none_of_cancel_and_limit() {
+    let h = Harness::new();
+    let sock = h.sim.sock();
+    // `ERROR_OPERATION_ABORTED` (995), as std reads it: `TimedOut`, with its OS code.
+    h.sim
+        .fail_next_completion(Op::Recv, io::Error::from_raw_os_error(995));
+    h.submit(Request::Recv { sock }, recv_buf(), io_then(1))
+        .unwrap();
+    let error = ended(h.one()).result.unwrap_err();
+    assert_eq!(error.raw_os_error(), Some(995));
+    assert!(!Cancelled::is(&error) && !LimitPassed::is(&error));
+}
+
+#[test]
+fn the_id_of_another_engine_cancels_nothing() {
+    let (a, b) = (Harness::new(), Harness::new());
+    let (sock_a, sock_b) = (a.sim.sock(), b.sim.sock());
+    a.sim.hold(true);
+    b.sim.hold(true);
+    let id_a = a
+        .submit_limited(Request::Recv { sock: sock_a }, recv_buf(), io_then(1), None)
+        .unwrap();
+    let id_b = b
+        .submit_limited(Request::Recv { sock: sock_b }, recv_buf(), io_then(1), None)
+        .unwrap();
+    assert_ne!(id_a, id_b);
+    b.engine.cancel(id_a);
+    a.engine.cancel(id_b);
+    assert_eq!((cancels(&a), cancels(&b)), (0, 0));
+    a.engine.cancel(id_a);
+    assert!(Cancelled::is(&ended(a.one()).result.unwrap_err()));
+}
+
+#[test]
+fn a_cancelled_limited_operation_leaves_the_limit_set_and_ends_once() {
+    let h = Harness::new();
+    let sock = h.sim.sock();
+    h.sim.hold(true);
+    let id = h
+        .submit_limited(Request::Recv { sock }, recv_buf(), io_then(1), Some(LIMIT))
+        .unwrap();
+    assert_eq!(
+        h.engine.next_deadline.load(Ordering::Acquire),
+        u64::try_from(LIMIT.as_nanos()).unwrap()
+    );
+    h.engine.cancel(id);
+    let error = ended(h.one()).result.unwrap_err();
+    assert!(Cancelled::is(&error) && !LimitPassed::is(&error));
+    assert_eq!(
+        h.engine.next_deadline.load(Ordering::Acquire),
+        super::NO_DEADLINE
+    );
+    h.sim.advance(LIMIT * 2);
+    assert!(h.pull_with(&mut |_| false).is_empty());
+}
+
+#[test]
+fn a_send_ended_between_pieces_says_how_many_bytes_went() {
+    let h = Harness::with(None, true, 100);
+    let sock = h.sim.sock();
+    let buf = IoBuf {
+        bytes: vec![1; 250],
+        filled: 250,
+    };
+    let id = h
+        .submit_limited(Request::Send { sock }, buf, io_then(1), None)
+        .unwrap();
+    h.engine.cancel(id);
+    let error = ended(h.one()).result.unwrap_err();
+    assert_eq!(Cancelled::moved_of(&error), Some(100));
 }

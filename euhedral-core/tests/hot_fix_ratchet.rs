@@ -64,7 +64,7 @@ const LOCK_MACRO_SITES: &[(&str, &[&str], usize)] = &[
     (
         "euhedral-io/src/win/mod.rs",
         &["I7", "I8", "I9", "I10", "I11", "I12", "I13", "I14", "I15"],
-        35,
+        33,
     ),
 ];
 
