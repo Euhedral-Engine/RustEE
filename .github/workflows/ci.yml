@@ -55,6 +55,7 @@ jobs:
       euhedral_graph: ${{ steps.affected.outputs.euhedral_graph }}
       euhedral_io: ${{ steps.affected.outputs.euhedral_io }}
       euhedral_memory: ${{ steps.affected.outputs.euhedral_memory }}
+      euhedral_net: ${{ steps.affected.outputs.euhedral_net }}
       euhedral_gpu: ${{ steps.affected.outputs.euhedral_gpu }}
       euhedral_benchmarks: ${{ steps.affected.outputs.euhedral_benchmarks }}
     steps:

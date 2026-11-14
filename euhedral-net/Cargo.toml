@@ -1,0 +1,17 @@
+[package]
+name = "euhedral-net"
+version = "0.1.0"
+edition = "2024"
+description = "HTTP/1.1 for programs built on RustEE: the message types, a strict incremental parser and a writer"
+readme = "README.md"
+license = "Apache-2.0"
+
+[dependencies]
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+dbg_macro = "warn"
+todo = "warn"

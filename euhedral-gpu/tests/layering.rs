@@ -18,6 +18,7 @@ const LAYERS: &[(&str, u8)] = &[
     ("euhedral-graph", 3),
     ("euhedral-io", 3),
     ("euhedral-memory", 4),
+    ("euhedral-net", 4),
     ("euhedral-gpu", 5),
     ("euhedral-benchmarks", 6),
 ];
