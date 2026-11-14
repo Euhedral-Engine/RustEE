@@ -121,6 +121,8 @@ pub struct SharedLanes<L: Lane> {
     /// The typed pool: lane `i` is the `i`-th spec.
     pub pool: Arc<LanePool<L>>,
     /// The same lanes as query queues, for [`Completions`](euhedral_graph::Completions) and the intakes.
+    /// A view of [`pool`](Self::pool): a `Completions` holds it only weakly, so hold it for as long as `pool`, or its
+    /// markers are leaked while the lanes still live.
     pub queues: Arc<LanePool>,
 }
 

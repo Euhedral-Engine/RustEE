@@ -330,15 +330,25 @@ const INCOMING_CHUNK: usize = 256;
 impl Completions {
     /// Polls of `marker`s use `lanes`.
     ///
-    /// The source holds the pool **weakly**: it never keeps the lanes, or the device behind them, alive, so the last
-    /// strong reference, held by the pool's owner, is the one whose drop destroys them, on the thread that drops it,
-    /// whatever the source is doing and wherever the lattice has let go of it. The owner keeps the pool for as long
-    /// as markers of it are registered and completes the source before dropping the pool.
+    /// The source holds the pool **weakly**. The owner's drop of the last strong reference destroys the lanes, on the
+    /// thread that drops it, wherever the lattice has let go of the source, **provided no marker registration is pending
+    /// and no poll is reading a marker at that moment**. A poll upgrades the pool once, at its first marker, and holds
+    /// it until the scan ends: a drop by the owner in that short window is a residual race inherent to a weak
+    /// reference, and the poll's worker then runs the teardown. So the order is required, not advisory: complete the
+    /// source and finish or cancel its marker registrations, then drop the pool, then release the device. Frames a
+    /// source holds may own the pool strongly themselves (a stage graph's continuation does): while such a frame
+    /// is registered the source keeps the pool alive through it, and the last drop happens where the frame ends.
+    ///
+    /// The pool handed in must live as long as the lanes it views: a pool that is a view of another (a typed pool's
+    /// query side, [`as_queues`](LanePool::as_queues)) must be held for as long as that other pool, or markers are
+    /// leaked while the lanes still live.
     ///
     /// A marker registration still pending when the pool is gone can no longer be observed, so it is not finished as
     /// reached: the next poll (or the source's drop) leaks its frame and counts it in
     /// [`leaked_unreached`](Self::leaked_unreached), as for a marker refused unreached. A marker registered after
-    /// that is leaked and counted the same way, at the next poll. Registrations that do not name a lane ([`at`](Self::at),
+    /// that is leaked and counted the same way, at the next poll. A completed source is pushed no poll frame by the
+    /// lattice, so after the pool is gone [`pending`](Self::pending) can stay above zero until the source drops (which
+    /// leaks and counts what is left): assert `pending() == 0` before dropping the pool. Registrations that do not name a lane ([`at`](Self::at),
     /// [`register`](Self::register), [`after`](Self::after), [`after_retired`](Self::after_retired)) are unaffected.
     pub fn new(lanes: &Arc<LanePool>) -> Arc<Self> {
         Self::build(Some(Arc::downgrade(lanes)))
@@ -692,8 +702,9 @@ impl Completions {
     }
 
     /// How many registrations the source leaked, instead of finishing them, because they were
-    /// refused, late or abandoned while their marker was still unreached (see `cancel`). The
-    /// counter outlives the source.
+    /// refused, late or abandoned while their marker was still unreached (see `cancel`), and, once the lane pool is
+    /// gone, every marker registration it ended for that reason, reached or not (a marker of a gone pool cannot be
+    /// observed). The counter outlives the source.
     pub fn leaked_unreached(&self) -> Arc<AtomicUsize> {
         self.leaked.clone()
     }
@@ -766,8 +777,9 @@ impl Completions {
             return 0;
         }
         let now = Instant::now();
-        // One upgrade for the whole scan. `None` once the pool is gone: no marker can be observed then.
-        let pool = self.pool();
+        // Upgraded at the first marker only, once for the whole scan, so a scan with no marker never holds the pool
+        // (application code runs in it). The inner `None` is a pool that is gone: no marker can be observed then.
+        let mut pool: Option<Option<Arc<LanePool>>> = None;
         let mut queued = 0;
         let mut index = 0;
         // What the entries left behind need next: the earliest deadline, and whether any can only be polled blind.
@@ -775,7 +787,9 @@ impl Completions {
         let mut blind = false;
         while index < waiting.len() {
             let entry = &mut waiting[index];
-            if pool.is_none() && matches!(entry.what, Waits::Marker(..)) {
+            let pool_gone = matches!(entry.what, Waits::Marker(..))
+                && pool.get_or_insert_with(|| self.pool()).is_none();
+            if pool_gone {
                 // The pool is gone, so this marker will never be observed and is not known reached: the entry
                 // ends as a refused unreached marker does (leaked and counted by `cancel`), not as reached.
                 if let Some(Waiting { what, .. }) = waiting.remove(index) {
@@ -793,7 +807,9 @@ impl Completions {
                 Waits::Ready(ready, _) => (ready.is_ready(), None),
                 Waits::Wake(wake, _) => (wake.is_ready(), None),
                 Waits::Marker(marker, _) => (
-                    pool.as_ref().is_some_and(|pool| pool.reached(*marker)),
+                    pool.get_or_insert_with(|| self.pool())
+                        .as_ref()
+                        .is_some_and(|pool| pool.reached(*marker)),
                     None,
                 ),
                 Waits::Retired(cell, _) => (cell.arrived(), None),
@@ -1564,13 +1580,64 @@ mod tests {
             1,
             "the lane is destroyed at the owner's drop, not held by the source"
         );
-        assert_eq!(dropped_on.get(), Some(&thread::current().id()));
+        assert!(dropped_on.get().is_some());
         drop(completions);
         assert_eq!(
             drops.load(Ordering::Acquire),
             1,
             "the source's drop touches no lane"
         );
+    }
+
+    #[test]
+    fn the_lanes_are_destroyed_on_the_owners_thread_not_the_one_that_drops_the_source() {
+        let (completions, pool, id, drops, dropped_on) = probed();
+        completions.after_marker(Marker::new(id, LaneId(0), 3), tagged(1));
+        let owner = thread::current().id();
+        // The owner drops the pool here; the source's last reference is dropped on another thread, as a worker's
+        // release is. The scope joins it, so the order is fixed.
+        drop(pool);
+        thread::scope(|scope| {
+            scope.spawn(move || drop(completions));
+        });
+        assert_eq!(drops.load(Ordering::Acquire), 1);
+        assert_eq!(
+            dropped_on.get(),
+            Some(&owner),
+            "destroyed where the owner dropped the pool"
+        );
+    }
+
+    #[test]
+    fn a_scan_with_no_marker_never_holds_the_pool_across_application_code() {
+        struct DropsPool {
+            pool: Option<Arc<LanePool>>,
+            drops: Arc<AtomicUsize>,
+            seen: Arc<AtomicUsize>,
+        }
+        impl Pending for DropsPool {
+            fn poll(&mut self) -> Option<Box<dyn Frame>> {
+                // The owner's last drop, made while the scan is inside this poll.
+                drop(self.pool.take());
+                self.seen
+                    .store(self.drops.load(Ordering::Acquire) + 100, Ordering::Release);
+                Some(tagged(1))
+            }
+        }
+        let (completions, pool, _, drops, _) = probed();
+        let seen = Arc::new(AtomicUsize::new(0));
+        completions.register(Box::new(DropsPool {
+            pool: Some(pool),
+            drops: drops.clone(),
+            seen: seen.clone(),
+        }));
+        completions.reap();
+        assert_eq!(
+            seen.load(Ordering::Acquire),
+            101,
+            "the owner's drop destroyed the lane inside the poll: the scan held no pool"
+        );
+        assert_eq!(drops.load(Ordering::Acquire), 1);
     }
 
     #[test]

@@ -66,16 +66,23 @@ A `Completions` holds frames to emit once something completes:
 - `register(pending)`: a `Pending` operation is polled until it yields its continuation frame, for
   a completion that carries a result.
 
-`Completions::new(&lanes)` takes the device lanes its markers are read from, and holds the pool **weakly**: the owner
-of the pool owns the lanes and decides where they are destroyed, and no source ever keeps them alive (the lattice lets
-go of a completed source on whichever worker releases it last, which must not be where a device is torn down). An owner
-tears down in this order: complete the source, drop the lane pool (the lanes are destroyed there, on that thread), then
-release the device. While the pool lives, markers are read as before. Once it is gone no marker can be observed, so a
-marker registration still pending is never finished as reached: the next poll, or the source's drop, leaks its frame
-and counts it in `leaked_unreached`, as for a refused marker not reached (the device may have used what it holds, and
-nothing says it stopped); a marker registered after that ends the same way at the next poll. `at`, `after`, `register`
-and `after_retired` do not name a lane and are unaffected. The owner therefore keeps the pool for as long as markers of
-it are registered. `Completions::without_lanes()` builds one with
+`Completions::new(&lanes)` takes the device lanes its markers are read from, and holds the pool **weakly**, so that the
+owner of the pool, not whichever worker releases the source last, tears the lanes down. The guarantee is exact: the
+owner's drop of the last strong reference destroys the lanes, on its thread, **when no marker registration is pending
+and no poll is reading a marker at that moment**. The teardown order is therefore required, not advisory: complete the
+source and finish or cancel its marker registrations, drop the lane pool, then release the device. Three limits:
+a poll upgrades the pool at its first marker and holds it to the end of its scan, a short residual window that is inherent
+to a weak reference (an owner that drops inside it has the poll's worker run the teardown); frames a source holds may own
+the pool strongly themselves (a stage graph's continuation does), so a source with pending registrations can keep the pool
+alive through its frames and the last drop happens where the last such frame ends; and the pool handed to `new` must live
+as long as the lanes it views (a typed pool's query side from `as_queues`, or `SharedLanes::queues`, is a view of another
+pool: hold it as long as the typed pool, or markers are leaked while the lanes still live). Mind the drop order of a
+tuple or struct that holds both: `let (completions, pool) = ...` drops the pool first, and fields drop in declaration order.
+Once the pool is gone no marker can be observed, so a marker registration still pending is never finished as reached: the
+next poll, or the source's drop, leaks its frame and counts it in `leaked_unreached` (reached or not: the device may have
+used what it holds), and a marker registered after that ends the same way at the next poll. A completed source gets no
+poll frame, so after the pool is gone `pending()` can stay above zero until the source drops: assert `pending() == 0`
+before dropping the pool. `at`, `after`, `register` and `after_retired` do not name a lane and are unaffected.
 `Completions::without_lanes()` builds one with
 none, for a program with no device open (or between closing one and opening the next) that still runs frames at
 deadlines and registers its own pending work. On it `at`, `after`, `register` and `after_retired` work as on any other;

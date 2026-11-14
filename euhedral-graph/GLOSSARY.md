@@ -19,7 +19,7 @@ not panic: only the polling thread sees it, and it cannot tell a misuse from a p
 **leaked registration** ([`Completions::leaked_unreached`](src/completions.rs)): a registration that waits
 for a lane's marker the lane has still not reached, and is refused, late or abandoned. It is leaked
 (`mem::forget`) and counted, because the device may still use what its frame holds, and finishing the frame
-would release it.
+would release it. Once a source's lane pool is gone, every marker registration it ends is leaked and counted too, reached or not, since a marker of a gone pool cannot be observed.
 
 **source without lanes** ([`Completions::without_lanes`](src/completions.rs)): a `Completions` built with no lane pool.
 Deadlines, `Ready` tokens, `Pending` operations and retirement cells work on it as on any other; a marker registration
