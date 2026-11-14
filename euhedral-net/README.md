@@ -225,7 +225,12 @@ fn fetch(io: &Arc<AsyncIo>, sink: &Arc<QueueIngestSink>, to: SocketAddr) {
   read-to-close and chunked bodies are refused, as the parser refuses them), `OverLimit(ParseError)` (status line,
   header bytes, header count or body over the `Limits` in the config), `UnexpectedInterim(status)`,
   `Write(WriteError)` (the request cannot be written; nothing was sent) and `Abandoned(stage)` (the engine refused to
-  start an operation, was dropped with one in flight, or the call's frame was discarded).
+  start an operation, was dropped with one in flight, or the call's frame was discarded; the engine drops the
+  continuation before it returns its error, so the real error is not available).
+  A peer that answers early and closes while the request is still being sent is reported as the send's error
+  (`Io` in `Send`), and its response is lost. `NetError` and `CallStage` are not `#[non_exhaustive]`, as the
+  crate's other public enums (`ParseError`, `WriteError`) are not; a `time_limit` too long to add to the clock
+  is no limit.
 - **HEAD** reads no body (`set_response_to_head`): the response has the headers, with the length the body would
   have, and an empty body. A response to another method that has a status without a body (204, 304) has none.
 - **Interim responses.** A 1xx response is skipped, up to `MAX_INTERIM_RESPONSES` (8); a `101` is refused, since

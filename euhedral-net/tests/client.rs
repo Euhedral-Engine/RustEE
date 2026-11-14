@@ -336,8 +336,10 @@ fn the_request_is_sent_whole_with_connection_close() {
 #[test]
 fn a_refused_connection_keeps_the_io_error() {
     let mut f = Fixture::new();
-    let addr = Peer::new().addr();
-    // The listener is gone: nothing listens on the port.
+    // A listener of this test holds the port, so no other test can take it, and it does not answer at the address
+    // used: a listener of 127.0.0.1 is not one of 127.0.0.2, which is loopback too, so the connect is refused.
+    let reserved = Peer::new();
+    let addr = SocketAddr::from(([127, 0, 0, 2], reserved.addr().port()));
     let error = outcome(&f.get(addr, config())).unwrap_err();
     match error {
         NetError::Connect(e) => assert_eq!(e.kind(), ErrorKind::ConnectionRefused),
@@ -369,7 +371,7 @@ fn a_request_the_writer_refuses_is_reported_and_nothing_is_sent() {
 fn a_server_that_never_answers_ends_the_call_at_its_limit_in_the_head() {
     let mut f = Fixture::new();
     let peer = Peer::new();
-    let limit = Duration::from_millis(200);
+    let limit = Duration::from_secs(1);
     let started = Instant::now();
     let rx = f.get(
         peer.addr(),
@@ -392,7 +394,7 @@ fn a_server_that_never_answers_ends_the_call_at_its_limit_in_the_head() {
 fn a_server_that_stalls_in_the_body_ends_the_call_at_its_limit_in_the_body() {
     let mut f = Fixture::new();
     let peer = Peer::new();
-    let limit = Duration::from_millis(200);
+    let limit = Duration::from_secs(1);
     let started = Instant::now();
     let rx = f.get(
         peer.addr(),
@@ -535,7 +537,7 @@ fn an_interim_response_is_skipped_and_a_switch_of_protocol_is_refused() {
     let (mut stream, _) = peer.accept();
     // The interim and the final response in two writes, the head split too.
     stream
-        .write_all(b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 O")
+        .write_all(b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early Hints\r\nLink: </a>; rel=preload\r\n\r\nHTTP/1.1 200 O")
         .unwrap();
     stream
         .write_all(b"K\r\nContent-Length: 2\r\n\r\nhi")
@@ -561,6 +563,25 @@ fn an_interim_response_is_skipped_and_a_switch_of_protocol_is_refused() {
         .unwrap();
     let error = outcome(&rx).unwrap_err();
     assert!(matches!(error, NetError::UnexpectedInterim(102)), "{error}");
+    f.finish();
+}
+
+#[test]
+fn a_time_limit_too_long_for_the_clock_is_no_limit() {
+    let mut f = Fixture::new();
+    let peer = Peer::new();
+    let rx = f.get(
+        peer.addr(),
+        ClientConfig {
+            time_limit: Some(Duration::MAX),
+            ..config()
+        },
+    );
+    let (mut stream, _) = peer.accept();
+    stream
+        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi")
+        .unwrap();
+    assert_eq!(outcome(&rx).unwrap().body, b"hi");
     f.finish();
 }
 

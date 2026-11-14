@@ -26,6 +26,7 @@
 use std::error::Error;
 use std::fmt::{self, Formatter};
 use std::io;
+use std::mem::take;
 use std::net::SocketAddr;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
@@ -68,7 +69,9 @@ pub enum NetError {
     Connect(io::Error),
     /// The overall time limit passed, in this stage.
     TimedOut(CallStage),
-    /// An operation failed in this stage for another reason (a reset, a broken pipe). The error is kept.
+    /// An operation failed in this stage for another reason (a reset, a broken pipe). The error is kept. A peer
+    /// that answers early and closes while the request is still being sent shows up here, as the send's error, and
+    /// its response is lost.
     Io { stage: CallStage, error: io::Error },
     /// The peer closed the connection in this stage, before a whole response (`ReceiveHead`: before the head
     /// was complete; `ReceiveBody`: before the body was).
@@ -85,8 +88,9 @@ pub enum NetError {
     UnexpectedInterim(u16),
     /// The request cannot be written (the writer's error is kept); nothing was sent.
     Write(WriteError),
-    /// The call was dropped without having ended: the `AsyncIo` refused to start an operation (it is complete),
-    /// or was dropped with the operation in flight, or the lattice discarded the call's frame.
+    /// The call was dropped without having ended: the `AsyncIo` refused to start an operation (it is complete;
+    /// the engine drops the continuation, and the call with it, before it returns its error, so the real error
+    /// is not available), or was dropped with the operation in flight, or the lattice discarded the call's frame.
     Abandoned(CallStage),
 }
 
@@ -252,7 +256,7 @@ impl Call {
             return;
         };
         let raw = raw_of(socket);
-        let bytes = std::mem::take(&mut self.out);
+        let bytes = take(&mut self.out);
         let filled = bytes.len();
         self.stage = CallStage::Send;
         let _ = io.send_with(
@@ -286,7 +290,7 @@ impl Call {
             return;
         };
         let raw = raw_of(socket);
-        let bytes = std::mem::take(&mut self.spare);
+        let bytes = take(&mut self.spare);
         self.stage = stage;
         let _ = io.recv_with(
             raw,
@@ -336,18 +340,34 @@ impl Drop for Call {
     }
 }
 
-/// Which error class a parser error is.
+/// Which error class a parser error is. Every variant is named, so a new one does not compile until it is placed.
 fn classify(error: ParseError) -> NetError {
     match error {
         ParseError::MissingContentLength
         | ParseError::TransferEncodingNotSupported
-        | ParseError::ChunkedNotSupported => NetError::Unsupported(error),
+        | ParseError::ChunkedNotSupported
+        | ParseError::UnsupportedVersion => NetError::Unsupported(error),
         ParseError::StatusLineTooLong
+        | ParseError::RequestLineTooLong
         | ParseError::HeadersTooLarge
         | ParseError::TooManyHeaders
-        | ParseError::BodyTooLarge
-        | ParseError::RequestLineTooLong => NetError::OverLimit(error),
-        _ => NetError::Malformed(error),
+        | ParseError::BodyTooLarge => NetError::OverLimit(error),
+        ParseError::BadRequestLine
+        | ParseError::BadStatusLine
+        | ParseError::BadMethod
+        | ParseError::BadTarget
+        | ParseError::BadVersion
+        | ParseError::BadLineEnding
+        | ParseError::BadHeaderLine
+        | ParseError::ObsoleteFolding
+        | ParseError::SpaceBeforeColon
+        | ParseError::BadHeaderName
+        | ParseError::BadHeaderValue
+        | ParseError::BadHost
+        | ParseError::BadContentLength
+        | ParseError::ConflictingContentLength
+        | ParseError::TransferEncodingWithContentLength
+        | ParseError::BadTransferEncoding => NetError::Malformed(error),
     }
 }
 
@@ -429,7 +449,10 @@ pub fn request(
         sink: sink.clone(),
         socket: Some(socket),
         to,
-        deadline: config.time_limit.map(|limit| Instant::now() + limit),
+        // A limit too long to add to the clock is no limit.
+        deadline: config
+            .time_limit
+            .and_then(|limit| Instant::now().checked_add(limit)),
         parser,
         out,
         spare: vec![0; config.read_chunk.max(1)],
