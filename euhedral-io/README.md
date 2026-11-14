@@ -127,7 +127,9 @@ fn why(error: &std::io::Error) -> &'static str {
   clock, so the kernel's own timer: no timer thread, no scan) and a cancel is `IORING_OP_ASYNC_CANCEL` by
   the operation's user data. It needs a kernel with linked timeouts (5.5) and absolute timeouts (5.6). A
   limited operation costs one boxed pair of entries per piece, and a ring keeps a part of its completion queue
-  for cancels, so that a cancel never waits for an operation.
+  for cancels, so that a cancel never waits for an operation in the kernel. An operation that still waits for
+  room in the queues (its piece is not in the kernel yet) ends on its cancel, or when its limit passes, without
+  going in, and without any other operation completing.
 - **Windows:** a cancel is `CancelIoEx` on the operation's own `OVERLAPPED`. The crate has no timer, so a
   limit is a deadline kept in the engine's table and checked at the start of each poll: it ends the operation
   at the first poll after it expires (a poll before the soonest deadline takes no lock). Limits and cancel

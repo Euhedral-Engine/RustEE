@@ -155,7 +155,8 @@ pub struct OpOptions {
     /// The longest the operation may stay in flight, from the call that submitted it, the whole
     /// operation (every piece of a send) included. An operation still in flight when it passes
     /// ends with an error of kind [`io::ErrorKind::TimedOut`] carrying a [`LimitPassed`], and the
-    /// socket stays usable. `None` is no limit.
+    /// socket stays usable. This holds for an operation that still waits for room in the engine's
+    /// queues too: it ends at the limit without having started. `None` is no limit.
     pub limit: Option<Duration>,
 }
 

@@ -456,43 +456,10 @@ fn a_limited_accept_with_no_peer_times_out_and_the_listener_accepts_afterwards()
     assert!(out.take().remove(0).is_ok());
 }
 
-/// Starts a connect on a new non-blocking socket without waiting for it; the handshake is left
-/// in progress.
-fn connect_in_progress(to: std::net::SocketAddrV4) -> OwnedFd {
-    let socket = socket_for(SocketAddr::V4(to));
-    // SAFETY: `fcntl(2)` on a descriptor we own.
-    let flags = unsafe { libc::fcntl(socket.as_raw_fd(), libc::F_GETFL) };
-    // SAFETY: as above.
-    let set = unsafe { libc::fcntl(socket.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) };
-    assert_eq!(set, 0);
-    let address = libc::sockaddr_in {
-        sin_family: libc::AF_INET as libc::sa_family_t,
-        sin_port: to.port().to_be(),
-        sin_addr: libc::in_addr {
-            s_addr: u32::from(*to.ip()).to_be(),
-        },
-        sin_zero: [0; 8],
-    };
-    // SAFETY: a `connect(2)` with a valid `sockaddr_in` and its length.
-    let connected = unsafe {
-        libc::connect(
-            socket.as_raw_fd(),
-            std::ptr::from_ref(&address).cast(),
-            size_of::<libc::sockaddr_in>() as libc::socklen_t,
-        )
-    };
-    assert_eq!(connected, -1);
-    assert_eq!(
-        io::Error::last_os_error().raw_os_error(),
-        Some(libc::EINPROGRESS)
-    );
-    socket
-}
-
 /// No address that never answers exists on every machine, so the test makes one on loopback: a
-/// listener whose accept queue is full drops the handshakes that come after it, and answers none.
-/// That is the kernel's default (`tcp_abort_on_overflow` 0); a machine that resets such
-/// connections instead answers `ECONNREFUSED`, and the test says so rather than pass.
+/// listener whose accept queue is full has the kernel drop the SYNs that come after it, and answer
+/// none (whatever `tcp_abort_on_overflow` says: that setting only governs the final ACK of a
+/// handshake that already began).
 #[test]
 fn a_limited_connect_to_a_peer_that_does_not_answer_times_out() {
     let io = AsyncIo::open().unwrap();
@@ -504,7 +471,6 @@ fn a_limited_connect_to_a_peer_that_does_not_answer_times_out() {
     assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 0) }, 0);
     // One connection fills the queue (a backlog of 0 holds one); the next handshake is dropped.
     let _queued = TcpStream::connect(to).unwrap();
-    let _dropped = connect_in_progress(to);
     let out: Outcomes<io::Result<()>> = Outcomes::default();
     let sink = out.clone();
     let socket = socket_for(SocketAddr::V4(to));
