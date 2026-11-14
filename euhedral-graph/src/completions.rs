@@ -334,8 +334,10 @@ impl Completions {
     /// thread that drops it, wherever the lattice has let go of the source, **provided no marker registration is pending
     /// and no poll is reading a marker at that moment**. A poll upgrades the pool once, at its first marker, and holds
     /// it until the scan ends: a drop by the owner in that short window is a residual race inherent to a weak
-    /// reference, and the poll's worker then runs the teardown. So the order is required, not advisory: complete the
-    /// source and finish or cancel its marker registrations, then drop the pool, then release the device. Frames a
+    /// reference, and the poll's worker then runs the teardown. So the order is required, not advisory: let the
+    /// marker registrations be emitted (`pending() == 0`) and only then complete the source (a completed source gets no poll
+    /// frame, so what is pending after `complete` is polled only by a `reap` and `pull` by hand), then drop the pool, then
+    /// release the device. Frames a
     /// source holds may own the pool strongly themselves (a stage graph's continuation does): while such a frame
     /// is registered the source keeps the pool alive through it, and the last drop happens where the frame ends.
     ///

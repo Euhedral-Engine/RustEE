@@ -69,8 +69,10 @@ A `Completions` holds frames to emit once something completes:
 `Completions::new(&lanes)` takes the device lanes its markers are read from, and holds the pool **weakly**, so that the
 owner of the pool, not whichever worker releases the source last, tears the lanes down. The guarantee is exact: the
 owner's drop of the last strong reference destroys the lanes, on its thread, **when no marker registration is pending
-and no poll is reading a marker at that moment**. The teardown order is therefore required, not advisory: complete the
-source and finish or cancel its marker registrations, drop the lane pool, then release the device. Three limits:
+and no poll is reading a marker at that moment**. The teardown order is therefore required, not advisory: let the marker
+registrations be emitted (`pending() == 0`) and only then complete the source (a completed source gets no poll frame, so
+what is still pending after `complete` is polled only by a `reap` and `pull` by hand, and nothing cancels a registration
+from outside), drop the lane pool, then release the device. Three limits:
 a poll upgrades the pool at its first marker and holds it to the end of its scan, a short residual window that is inherent
 to a weak reference (an owner that drops inside it has the poll's worker run the teardown); frames a source holds may own
 the pool strongly themselves (a stage graph's continuation does), so a source with pending registrations can keep the pool
