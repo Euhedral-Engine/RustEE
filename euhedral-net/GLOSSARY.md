@@ -55,3 +55,16 @@ handler.
 **Registry**: the listener's slab of open connections, in the listener's plain state, used to tell each one of a stop. A connection enters it when the listener accepts it and leaves it by an event the connection sends when it ends.
 
 **Cancel frame**: the frame a handler gives `Responder::on_cancel`; the connection offers it to the sink once if the peer goes while the request is handled.
+
+**Call** ([`client`](src/client.rs)): one request of the client, from `request` to its `then`. Its state is passed by
+ownership from the continuation of one operation to the step frame it returns and on into the next operation, so
+that one place owns it at a time and it needs no synchronisation.
+
+**Step frame** ([`client`](src/client.rs)): the frame an operation's continuation returns for a call: it carries the
+call and what the operation brought, and its `execute` handles that and starts the next operation.
+
+**Call stage** ([`CallStage`](src/client.rs)): which part of a call was going on: connecting, sending, reading the head
+or reading the body. Errors that depend on where they happened carry it.
+
+**Overall limit** ([`ClientConfig::time_limit`](src/client.rs)): the one deadline of a call, from the call of `request`;
+each operation is issued with what is left of it.

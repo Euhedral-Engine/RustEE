@@ -1,8 +1,10 @@
-//! HTTP/1.1 for programs built on RustEE: the message types, a strict incremental parser, a writer and a server.
+//! HTTP/1.1 for programs built on RustEE: the message types, a strict incremental parser, a writer, a server and a client.
 //!
 //! The messages, the parsers and the writer do no I/O: see the module notes of [`parse`] for what is refused and
-//! why. The server (`server`, on Linux, Android and Windows) runs on `AsyncIo` and a lattice.
+//! why. The server and the client (`server`, `client`, on Linux, Android and Windows) run on `AsyncIo` and a lattice.
 
+#[cfg(any(target_os = "linux", target_os = "android", windows))]
+pub mod client;
 #[cfg(any(target_os = "linux", target_os = "android", windows))]
 mod connection;
 pub mod message;
@@ -13,6 +15,8 @@ pub mod server;
 mod station;
 pub mod write;
 
+#[cfg(any(target_os = "linux", target_os = "android", windows))]
+pub use client::{CallStage, ClientConfig, MAX_INTERIM_RESPONSES, NetError, request};
 #[cfg(any(target_os = "linux", target_os = "android", windows))]
 pub use connection::Responder;
 pub use message::{

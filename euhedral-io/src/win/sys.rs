@@ -303,6 +303,8 @@ pub(crate) trait Sys: Send + Sync + 'static {
     /// A new overlapped, non-inheritable stream socket of `listener`'s family.
     fn accept_socket(&self, listener: Handle) -> io::Result<Handle>;
     fn close_socket(&self, sock: Handle);
+    /// A new unconnected, overlapped, non-inheritable stream socket of `to`'s family, for the caller to own.
+    fn new_socket(&self, to: std::net::SocketAddr) -> io::Result<Handle>;
     /// Binds `sock` to the unspecified address of `to`'s family, if it is not bound.
     fn bind_any(&self, sock: Handle, to: &SockAddr) -> io::Result<()>;
     fn update_accept(&self, accepted: Handle, listener: Handle) -> io::Result<()>;
