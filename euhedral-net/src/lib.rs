@@ -7,11 +7,11 @@ pub mod parse;
 pub mod write;
 
 pub use message::{
-    Headers, Method, ParseError, Request, Response, Version, WriteError, reason_phrase,
-    status_has_no_body,
+    ConnectionMode, Headers, Method, ParseError, Request, Response, TargetForm, Version,
+    WriteError, reason_phrase, status_has_no_body,
 };
-pub use parse::{Limits, Progress, RequestParser, ResponseParser, State};
-pub use write::{write_continue, write_request, write_response};
+pub use parse::{Limits, PendingHead, Progress, RequestParser, ResponseParser, State};
+pub use write::{write_continue, write_request, write_response, write_response_head};
 
 /// Compiles and runs the examples in the crate README as doctests.
 #[cfg(doctest)]

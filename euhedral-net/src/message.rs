@@ -2,6 +2,28 @@
 
 use std::fmt;
 
+/// What a writer says about the connection: a `Connection: close`, a `Connection: keep-alive` (what an HTTP/1.0
+/// peer needs to keep the connection open), or no `Connection` line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnectionMode {
+    Close,
+    KeepAlive,
+    Unspecified,
+}
+
+/// The form of a request target (RFC 9112 section 3.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TargetForm {
+    /// `/path?query`.
+    Origin,
+    /// `scheme://authority/path`.
+    Absolute,
+    /// `host:port`, for CONNECT.
+    Authority,
+    /// `*`, for OPTIONS.
+    Asterisk,
+}
+
 /// The request method. A method the crate knows by name is one of the named variants; any other token is `Other`.
 /// The parser only builds `Other` for a token that is not one of the named methods.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -171,6 +193,13 @@ impl Request {
         self
     }
 
+    /// The form of the target, or `None` when it is not valid for the method: origin-form begins with `/`;
+    /// asterisk-form is `*` and only for OPTIONS; authority-form is `host:port` and only for CONNECT;
+    /// absolute-form has a scheme and `://` and an authority. Every byte is visible ASCII and there is no `#`.
+    pub fn target_form(&self) -> Option<TargetForm> {
+        target_form(&self.method, &self.target)
+    }
+
     /// Whether the connection stays open after this request's response (RFC 9112 section 9.3): HTTP/1.1 keeps
     /// it open unless `Connection` holds `close`; HTTP/1.0 closes it unless `Connection` holds `keep-alive`
     /// (and not `close`).
@@ -286,7 +315,8 @@ pub enum ParseError {
     BadStatusLine,
     /// The method is not a token (400).
     BadMethod,
-    /// The target is empty or holds a byte that is not visible ASCII, or a fragment (400).
+    /// The target is not one of the four forms its method allows, or holds a byte that is not visible ASCII, or a
+    /// fragment (400).
     BadTarget,
     /// The version is not `HTTP/` digit `.` digit (400).
     BadVersion,
@@ -304,7 +334,8 @@ pub enum ParseError {
     BadHeaderName,
     /// A header value with a control character or a byte above 0x7e (400).
     BadHeaderValue,
-    /// An HTTP/1.1 request without exactly one `Host` line (400).
+    /// A request with more than one `Host` line, an HTTP/1.1 request without one, or a `Host` that is not a host
+    /// and an optional port (400).
     BadHost,
     /// A `Content-Length` that is not a list of digits that fit in 64 bits (400).
     BadContentLength,
@@ -314,7 +345,10 @@ pub enum ParseError {
     TransferEncodingWithContentLength,
     /// A request with a chunked body, which this crate does not read (411).
     ChunkedNotSupported,
-    /// A `Transfer-Encoding` that is not chunked (501).
+    /// A `Transfer-Encoding` on a request whose final coding is not `chunked`: the body's length cannot be told
+    /// (400, RFC 9112 section 6.3).
+    BadTransferEncoding,
+    /// A response with a `Transfer-Encoding`, which the client does not read.
     TransferEncodingNotSupported,
     /// A response whose body has no `Content-Length` and which is not a status without a body (the client's
     /// limit: it cannot read to the end of the connection).
@@ -332,12 +366,13 @@ pub enum ParseError {
 }
 
 impl ParseError {
-    /// The status a server answers a request with this error.
-    pub fn status(self) -> u16 {
+    /// The status a server answers a request with this error, or `None` for an error only the response parser
+    /// reports (`BadStatusLine`, `StatusLineTooLong`, `MissingContentLength`, `TransferEncodingNotSupported`),
+    /// which no server answers with a status.
+    pub fn status(self) -> Option<u16> {
         use ParseError::*;
-        match self {
+        Some(match self {
             BadRequestLine
-            | BadStatusLine
             | BadMethod
             | BadTarget
             | BadVersion
@@ -351,20 +386,28 @@ impl ParseError {
             | BadContentLength
             | ConflictingContentLength
             | TransferEncodingWithContentLength
-            | MissingContentLength => 400,
+            | BadTransferEncoding => 400,
             ChunkedNotSupported => 411,
             BodyTooLarge => 413,
-            RequestLineTooLong | StatusLineTooLong => 414,
+            RequestLineTooLong => 414,
             HeadersTooLarge | TooManyHeaders => 431,
-            TransferEncodingNotSupported => 501,
             UnsupportedVersion => 505,
-        }
+            BadStatusLine
+            | StatusLineTooLong
+            | MissingContentLength
+            | TransferEncodingNotSupported => {
+                return None;
+            }
+        })
     }
 }
 
 impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self:?} (status {})", self.status())
+        match self.status() {
+            Some(status) => write!(f, "{self:?} (status {status})"),
+            None => write!(f, "{self:?}"),
+        }
     }
 }
 
@@ -375,7 +418,7 @@ impl std::error::Error for ParseError {}
 pub enum WriteError {
     /// The method is not a token.
     BadMethod,
-    /// The target is empty or holds a byte that is not visible ASCII.
+    /// The target is not valid for the method (see [`Request::target_form`]).
     BadTarget,
     /// The status is outside 100 to 599.
     BadStatus,
@@ -383,11 +426,14 @@ pub enum WriteError {
     BadReason,
     /// A header name that is not a token.
     BadHeaderName,
+    /// A request without exactly one `Host` line, or with a `Host` that is not a valid host and optional port.
+    BadHost,
     /// A header value with a control character (CR and LF included), a byte above 0x7e, or whitespace at either end.
     BadHeaderValue,
     /// The caller set `Content-Length`, `Transfer-Encoding` or `Connection`, which the writer owns.
     ReservedHeader,
-    /// A body on a response whose status has none (1xx, 204, 304).
+    /// A body, or a length, on a response whose status has none (1xx, 204, 304; a 304 may have a length), or a
+    /// body given to the head-only writer.
     BodyNotAllowed,
 }
 
@@ -398,3 +444,107 @@ impl fmt::Display for WriteError {
 }
 
 impl std::error::Error for WriteError {}
+
+/// The form of `target` for `method`; see [`Request::target_form`].
+pub(crate) fn target_form(method: &Method, target: &str) -> Option<TargetForm> {
+    if target.is_empty()
+        || !target
+            .bytes()
+            .all(|b| (0x21..=0x7e).contains(&b) && b != b'#')
+    {
+        return None;
+    }
+    if *method == Method::Connect {
+        return valid_authority(target, true).then_some(TargetForm::Authority);
+    }
+    if target == "*" {
+        return (*method == Method::Options).then_some(TargetForm::Asterisk);
+    }
+    if target.starts_with('/') {
+        return Some(TargetForm::Origin);
+    }
+    let (scheme, rest) = target.split_once("://")?;
+    let mut chars = scheme.chars();
+    let scheme_ok = chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c));
+    let authority = rest.split(['/', '?']).next().unwrap_or_default();
+    (scheme_ok && !authority.is_empty() && valid_authority(authority, false))
+        .then_some(TargetForm::Absolute)
+}
+
+/// `uri-host [":" port]` with a non-empty host; the port is digits, and must be present when `port_required`.
+fn valid_authority(value: &str, port_required: bool) -> bool {
+    let (host, port) = if let Some(inner) = value.strip_prefix('[') {
+        let Some((literal, rest)) = inner.split_once(']') else {
+            return false;
+        };
+        if !valid_ip_literal(literal) {
+            return false;
+        }
+        match rest.strip_prefix(':') {
+            Some(port) => (literal, Some(port)),
+            None if rest.is_empty() => (literal, None),
+            None => return false,
+        }
+    } else {
+        match value.split_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (value, None),
+        }
+    };
+    let host_ok = if value.starts_with('[') {
+        true
+    } else {
+        valid_reg_name(host)
+    };
+    let port_ok = match port {
+        Some(port) => {
+            port.bytes().all(|b| b.is_ascii_digit()) && !(port_required && port.is_empty())
+        }
+        None => !port_required,
+    };
+    host_ok && port_ok
+}
+
+/// A registered name or IPv4 address: unreserved characters and percent-encodings only. This is stricter than
+/// RFC 3986, which also allows the sub-delimiters (`a,b`, `a;b`): none belongs in a host name.
+fn valid_reg_name(host: &str) -> bool {
+    let bytes = host.as_bytes();
+    let mut i = 0;
+    while let Some(&b) = bytes.get(i) {
+        if b == b'%' {
+            if !bytes
+                .get(i + 1..i + 3)
+                .is_some_and(|h| h.iter().all(u8::is_ascii_hexdigit))
+            {
+                return false;
+            }
+            i += 3;
+            continue;
+        }
+        if !(b.is_ascii_alphanumeric() || b"-._~".contains(&b)) {
+            return false;
+        }
+        i += 1;
+    }
+    !bytes.is_empty()
+}
+
+/// The inside of `[...]`: an IPv6 address (hex digits, colons, a dotted tail) or an IPvFuture literal.
+fn valid_ip_literal(literal: &str) -> bool {
+    if let Some(rest) = literal.strip_prefix(['v', 'V']) {
+        return rest.contains('.')
+            && rest
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=:".contains(&b));
+    }
+    literal.contains(':')
+        && literal
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() || b == b':' || b == b'.')
+}
+
+/// A `Host` field value: empty (an authority that is missing, RFC 9112 section 3.2) or `uri-host [":" port]`.
+pub(crate) fn valid_host_value(value: &str) -> bool {
+    value.is_empty() || valid_authority(value, false)
+}

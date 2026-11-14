@@ -18,3 +18,9 @@ because two parsers that frame differently can be made to read one request as tw
 
 **Reserved header**: `Content-Length`, `Transfer-Encoding` and `Connection`, which the writer sets itself; a caller's
 line with one of these names is refused ([`write`](src/write.rs)).
+
+**Connection mode** ([`ConnectionMode`](src/message.rs)): what the writer says about the connection: nothing, `keep-alive` or `close`.
+
+**Target form** ([`TargetForm`](src/message.rs)): origin, absolute, authority or asterisk, the four request-target shapes of RFC 9112 section 3.2. The parser checks the form against the method.
+
+**Pending head** ([`PendingHead`](src/parse.rs)): the request head a parser holds while its body is still arriving, readable through `pending_head`.

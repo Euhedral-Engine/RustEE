@@ -33,18 +33,32 @@
 //!   values are always ASCII);
 //! - `Content-Length` values that differ, or that are not digits (section 6.3), and `Transfer-Encoding` together
 //!   with `Content-Length`;
-//! - a request line with more than single spaces between its parts, or a lowercase or malformed version;
-//! - an HTTP/1.1 request without exactly one `Host` line (RFC 9112 section 3.2).
+//! - a request line with more than single spaces between its parts, or a lowercase or malformed version, and any
+//!   version but 1.0 and 1.1 (HTTP/1.2 is 505 too: this crate speaks the two it knows);
+//! - a request with more than one `Host` line, on any version, an HTTP/1.1 request without one (section 3.2), and
+//!   a `Host` that is not a host and an optional port (a registered name or IPv4 address, or a bracketed IP
+//!   literal; stricter than RFC 3986, which also lets a name hold `,` `;` and the like). An empty value is allowed;
+//! - a request target that is not one of the four forms (section 3.2): origin-form begins with `/`, asterisk-form
+//!   `*` only with OPTIONS, authority-form `host:port` only with CONNECT, absolute-form a scheme, `://` and an
+//!   authority;
+//! - a status line with no space after the status code, even when the reason is empty (`HTTP/1.1 200` is refused;
+//!   `HTTP/1.1 200 ` is the form with an empty reason).
 //!
 //! # Limits of the crate
 //!
-//! A request with `Transfer-Encoding` is refused: 411 when it names `chunked` (this crate does not decode a
-//! chunked request body), 501 for any other coding. A response must have a `Content-Length`, unless it answers a
-//! HEAD request or has a status without a body (1xx, 204, 304): a response with `Transfer-Encoding`, or one that
-//! ends with the connection, is an error. An `Expect` other than `100-continue` is ignored. The client side is
-//! minimal by design.
+//! A request with `Transfer-Encoding` is refused. Where `chunked` is not the final coding (or is the only one
+//! missing) the length of the body cannot be told: 400 (section 6.3). Where `chunked` is the final coding the
+//! request is well formed but this crate does not decode a chunked request body: 411. A response must have a
+//! `Content-Length`, unless it answers a HEAD request or has a status without a body (1xx, 204, 304): a response
+//! with `Transfer-Encoding`, or one that ends with the connection, is an error. An `Expect` other than
+//! `100-continue` is ignored. The client side is minimal by design.
 
-use crate::message::{Headers, Method, ParseError, Request, Response, Version, status_has_no_body};
+use std::mem::{replace, take};
+
+use crate::message::{
+    Headers, Method, ParseError, Request, Response, Version, status_has_no_body, target_form,
+    valid_host_value,
+};
 
 /// How many empty lines before a request line are skipped before the input is refused.
 pub const MAX_LEADING_EMPTY_LINES: usize = 4;
@@ -218,9 +232,9 @@ impl HeadReader {
         }
     }
 
-    /// The bytes held.
+    /// The bytes of the head held: the partial line, the start line with its CRLF and the header lines.
     fn buffered(&self) -> usize {
-        self.line.len() + self.start.as_ref().map_or(0, Vec::len) + self.header_bytes
+        self.line.len() + self.start.as_ref().map_or(0, |s| s.len() + 2) + self.header_bytes
     }
 
     /// Consumes input up to the end of the head. Returns the bytes consumed and whether the head is complete.
@@ -238,16 +252,16 @@ impl HeadReader {
                 )
             };
             let lf = rest.iter().position(|&b| b == b'\n');
-            let take = lf.map_or(rest.len(), |p| p + 1);
-            if self.line.len().saturating_add(take) > budget {
+            let chunk = lf.map_or(rest.len(), |p| p + 1);
+            if self.line.len().saturating_add(chunk) > budget {
                 return Err(too_long);
             }
-            self.line.extend_from_slice(&rest[..take]);
-            used += take;
+            self.line.extend_from_slice(&rest[..chunk]);
+            used += chunk;
             if lf.is_none() {
                 break;
             }
-            let line = std::mem::take(&mut self.line);
+            let line = take(&mut self.line);
             let Some(content) = line.strip_suffix(b"\r\n") else {
                 return Err(ParseError::BadLineEnding);
             };
@@ -282,14 +296,15 @@ impl HeadReader {
         Ok((used, false))
     }
 
-    /// The start line and the headers of a complete head, and the reader ready for the next one.
-    fn take(&mut self) -> (Vec<u8>, Headers) {
+    /// The start line, the headers and the bytes of the head, and the reader ready for the next one.
+    fn take(&mut self) -> (Vec<u8>, Headers, usize) {
+        let head_bytes = self.buffered();
         let start = self.start.take().unwrap_or_default();
-        let headers = std::mem::take(&mut self.headers);
+        let headers = take(&mut self.headers);
         self.line.clear();
         self.header_bytes = 0;
         self.leading = 0;
-        (start, headers)
+        (start, headers, head_bytes)
     }
 
     fn reset(&mut self) {
@@ -346,10 +361,21 @@ enum Stage<T> {
     Head,
     Body {
         message: T,
+        /// The bytes of the head, which the parser holds in `message`.
+        head_bytes: usize,
         expect_continue: bool,
         remaining: usize,
     },
     Failed(ParseError),
+}
+
+/// The head of a request whose body has not all arrived.
+#[derive(Clone, Copy, Debug)]
+pub struct PendingHead<'a> {
+    pub method: &'a Method,
+    pub target: &'a str,
+    pub version: Version,
+    pub headers: &'a Headers,
 }
 
 /// Reads requests, for a server.
@@ -389,14 +415,33 @@ impl RequestParser {
         }
     }
 
-    /// The bytes the parser holds for the message being read. At most the limits' sum, and never more than
-    /// the input fed so far.
+    /// Every byte the parser holds for the message being read: the partial line, the start line and the header
+    /// lines (with their CRLFs, also while a body is pending) and the body so far. Leading empty lines are not
+    /// held. At most the limits' sum, and equal to the bytes of the message fed so far until it completes.
     pub fn buffered(&self) -> usize {
         self.reader.buffered()
             + match &self.stage {
-                Stage::Body { message, .. } => message.body.len(),
+                Stage::Body {
+                    message,
+                    head_bytes,
+                    ..
+                } => head_bytes + message.body.len(),
                 _ => 0,
             }
+    }
+
+    /// The head of the request whose body is pending (after `HeadComplete`, before `Complete`), borrowed: a server
+    /// looks at the target and headers to choose between `100 Continue` and an early final status.
+    pub fn pending_head(&self) -> Option<PendingHead<'_>> {
+        match &self.stage {
+            Stage::Body { message, .. } => Some(PendingHead {
+                method: &message.method,
+                target: &message.target,
+                version: message.version,
+                headers: &message.headers,
+            }),
+            _ => None,
+        }
     }
 
     /// Consumes bytes of the current request; see the module's notes on feeding.
@@ -417,7 +462,7 @@ impl RequestParser {
                 if !done {
                     return Ok((used, Progress::NeedMore));
                 }
-                let (start, headers) = self.reader.take();
+                let (start, headers, head_bytes) = self.reader.take();
                 let (request, length) = request_head(&start, headers, &self.reader.limits)?;
                 if length == 0 {
                     return Ok((used, Progress::Complete(request)));
@@ -425,6 +470,7 @@ impl RequestParser {
                 let expect_continue = request.expects_continue();
                 self.stage = Stage::Body {
                     message: request,
+                    head_bytes,
                     expect_continue,
                     remaining: length,
                 };
@@ -443,14 +489,22 @@ impl RequestParser {
                 if *remaining > 0 {
                     return Ok((used, Progress::NeedMore));
                 }
-                let Stage::Body { message, .. } = std::mem::replace(&mut self.stage, Stage::Head)
-                else {
+                let Stage::Body { message, .. } = replace(&mut self.stage, Stage::Head) else {
                     return Err(ParseError::BadRequestLine);
                 };
                 Ok((used, Progress::Complete(message)))
             }
         }
     }
+}
+
+/// Whether the last coding of the last `Transfer-Encoding` line is `chunked` (RFC 9112 section 6.3).
+fn final_coding_is_chunked(headers: &Headers) -> bool {
+    headers
+        .get_all("Transfer-Encoding")
+        .last()
+        .and_then(|value| value.split(',').next_back())
+        .is_some_and(|coding| coding.trim().eq_ignore_ascii_case("chunked"))
 }
 
 /// The request a start line and headers make, and the length of its body.
@@ -478,10 +532,16 @@ fn request_head(
         return Err(ParseError::BadTarget);
     }
     let version = parse_version(version)?;
-    if version == Version::Http11 {
+    let method = Method::from_token(&ascii(method, ParseError::BadMethod)?);
+    let target = ascii(target, ParseError::BadTarget)?;
+    if target_form(&method, &target).is_none() {
+        return Err(ParseError::BadTarget);
+    }
+    {
         let mut hosts = headers.get_all("Host");
         match (hosts.next(), hosts.next()) {
-            (Some(host), None) if !host.contains([' ', '\t']) => {}
+            (None, _) if version == Version::Http10 => {}
+            (Some(host), None) if valid_host_value(host) => {}
             _ => return Err(ParseError::BadHost),
         }
     }
@@ -489,16 +549,16 @@ fn request_head(
     if headers.contains("Transfer-Encoding") {
         return Err(if length.is_some() {
             ParseError::TransferEncodingWithContentLength
-        } else if headers.has_token("Transfer-Encoding", "chunked") {
+        } else if final_coding_is_chunked(&headers) {
             ParseError::ChunkedNotSupported
         } else {
-            ParseError::TransferEncodingNotSupported
+            ParseError::BadTransferEncoding
         });
     }
     let length = body_length(length.unwrap_or(0), limits)?;
     let request = Request {
-        method: Method::from_token(&ascii(method, ParseError::BadMethod)?),
-        target: ascii(target, ParseError::BadTarget)?,
+        method,
+        target,
         version,
         headers,
         body: Vec::new(),
@@ -530,7 +590,8 @@ impl ResponseParser {
     }
 
     /// Says whether the response being read answers a HEAD request, which has no body whatever its headers say.
-    /// Set it before each response that needs it.
+    /// It is one-shot: it applies to the next final response (a 1xx before it keeps it) and is cleared when that
+    /// one completes, so set it before each response that answers a HEAD request.
     pub fn set_response_to_head(&mut self, to_head: bool) {
         self.to_head = to_head;
     }
@@ -547,11 +608,15 @@ impl ResponseParser {
         }
     }
 
-    /// The bytes the parser holds for the message being read.
+    /// Every byte the parser holds for the message being read, as for [`RequestParser::buffered`].
     pub fn buffered(&self) -> usize {
         self.reader.buffered()
             + match &self.stage {
-                Stage::Body { message, .. } => message.body.len(),
+                Stage::Body {
+                    message,
+                    head_bytes,
+                    ..
+                } => head_bytes + message.body.len(),
                 _ => 0,
             }
     }
@@ -575,14 +640,18 @@ impl ResponseParser {
                 if !done {
                     return Ok((used, Progress::NeedMore));
                 }
-                let (start, headers) = self.reader.take();
+                let (start, headers, head_bytes) = self.reader.take();
                 let (response, length) =
                     response_head(&start, headers, self.to_head, &self.reader.limits)?;
                 if length == 0 {
+                    if response.status >= 200 {
+                        self.to_head = false;
+                    }
                     return Ok((used, Progress::Complete(response)));
                 }
                 self.stage = Stage::Body {
                     message: response,
+                    head_bytes,
                     expect_continue: false,
                     remaining: length,
                 };
@@ -601,8 +670,7 @@ impl ResponseParser {
                 if *remaining > 0 {
                     return Ok((used, Progress::NeedMore));
                 }
-                let Stage::Body { message, .. } = std::mem::replace(&mut self.stage, Stage::Head)
-                else {
+                let Stage::Body { message, .. } = replace(&mut self.stage, Stage::Head) else {
                     return Err(ParseError::BadStatusLine);
                 };
                 Ok((used, Progress::Complete(message)))

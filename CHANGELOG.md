@@ -9,9 +9,11 @@ semantics and the tests that pin it.
 
 **Why.** A server and a client built on `AsyncIo` need to read and write messages without a thread and without a buffer that grows with the peer's input. The parsers are separate from the I/O so that every rule can be tested on bytes alone, at every split.
 
+**Review changes.** Errors: `TransferEncodingNotSupported` no longer has a status (`status()` is an `Option`); a final coding other than `chunked`, or `chunked` not last, is `BadTransferEncoding` (400). Host: at most one on any version, validated as a host with an optional port. Targets are checked against the method (`TargetForm`). `buffered()` counts every byte of the current message held so far. `pending_head()` shows the head while the body is pending. The response-to-HEAD flag applies to one final response. `write_response` takes a `ConnectionMode`; `write_response_head` writes a head-only response; `write_request` checks Host and target. HTTP/1.2 stays 505 and a status line with no space before a missing reason stays refused.
+
 **Breaking:** none. A new crate in layer 4, with no dependency on another crate of the workspace yet.
 
-**How to use it.** `let (used, progress) = parser.feed(bytes)?; bytes = &bytes[used..];` and act on `Progress::{NeedMore, HeadComplete { expect_continue, content_length }, Complete(message)}`; `write_response(&response, close, &mut out)?`.
+**How to use it.** `let (used, progress) = parser.feed(bytes)?; bytes = &bytes[used..];` and act on `Progress::{NeedMore, HeadComplete { expect_continue, content_length }, Complete(message)}`; `write_response(&response, ConnectionMode::Close, &mut out)?`.
 
 **Semantics.**
 - `feed` consumes the bytes of the message being read and returns the count, stopping at a message's end: the caller keeps the rest (pipelining) and the parser never holds more than one message within its limits. Any split of the input, down to one byte per call, gives the same events and the same error. After an error the parser stays failed, returns the same error and holds nothing.

@@ -76,6 +76,12 @@ fn responses(limits: Limits, to_head: bool, input: &[u8], cuts: &[usize]) -> Out
 }
 
 /// Every split point natively; under Miri, every fifth (and byte by byte, always), to keep the shard short.
+const MODES: [ConnectionMode; 3] = [
+    ConnectionMode::Unspecified,
+    ConnectionMode::Close,
+    ConnectionMode::KeepAlive,
+];
+
 const SPLIT_STRIDE: usize = if cfg!(miri) { 5 } else { 1 };
 
 fn every_split_request(limits: Limits, input: &[u8]) -> Outcome<Request> {
@@ -729,14 +735,164 @@ fn bad_requests() -> Vec<(&'static str, Vec<u8>, ParseError, u16)> {
         (
             "another transfer coding",
             line("Transfer-Encoding: gzip"),
-            E::TransferEncodingNotSupported,
-            501,
+            E::BadTransferEncoding,
+            400,
         ),
         (
             "an empty Transfer-Encoding",
             line("Transfer-Encoding:"),
-            E::TransferEncodingNotSupported,
-            501,
+            E::BadTransferEncoding,
+            400,
+        ),
+        (
+            "two Host lines on HTTP/1.0",
+            b"GET / HTTP/1.0\r\nHost: a\r\nHost: b\r\n\r\n".to_vec(),
+            E::BadHost,
+            400,
+        ),
+        (
+            "two identical Host lines",
+            b"GET / HTTP/1.1\r\nHost: a\r\nHost: a\r\n\r\n".to_vec(),
+            E::BadHost,
+            400,
+        ),
+        (
+            "a bad Host on HTTP/1.0",
+            b"GET / HTTP/1.0\r\nHost: a/b\r\n\r\n".to_vec(),
+            E::BadHost,
+            400,
+        ),
+        (
+            "chunked before another coding",
+            line("Transfer-Encoding: chunked, gzip"),
+            E::BadTransferEncoding,
+            400,
+        ),
+        (
+            "chunked in an earlier line",
+            line("Transfer-Encoding: chunked\r\nTransfer-Encoding: gzip"),
+            E::BadTransferEncoding,
+            400,
+        ),
+        (
+            "chunked as the final coding of a later line",
+            line("Transfer-Encoding: gzip\r\nTransfer-Encoding: chunked"),
+            E::ChunkedNotSupported,
+            411,
+        ),
+        (
+            "a Host list",
+            b"GET / HTTP/1.1\r\nHost: a,b\r\n\r\n".to_vec(),
+            E::BadHost,
+            400,
+        ),
+        (
+            "a Host with a slash and an at sign",
+            b"GET / HTTP/1.1\r\nHost: a/b@c\r\n\r\n".to_vec(),
+            E::BadHost,
+            400,
+        ),
+        (
+            "a Host with two colons",
+            b"GET / HTTP/1.1\r\nHost: a:b:c\r\n\r\n".to_vec(),
+            E::BadHost,
+            400,
+        ),
+        (
+            "a Host with a letter in the port",
+            b"GET / HTTP/1.1\r\nHost: a:80x\r\n\r\n".to_vec(),
+            E::BadHost,
+            400,
+        ),
+        (
+            "an unclosed IPv6 literal",
+            b"GET / HTTP/1.1\r\nHost: [::1\r\n\r\n".to_vec(),
+            E::BadHost,
+            400,
+        ),
+        (
+            "an IPv6 literal that is not one",
+            b"GET / HTTP/1.1\r\nHost: [zz]\r\n\r\n".to_vec(),
+            E::BadHost,
+            400,
+        ),
+        (
+            "text after an IPv6 literal",
+            b"GET / HTTP/1.1\r\nHost: [::1]x\r\n\r\n".to_vec(),
+            E::BadHost,
+            400,
+        ),
+        (
+            "a bad percent escape",
+            b"GET / HTTP/1.1\r\nHost: a%zz\r\n\r\n".to_vec(),
+            E::BadHost,
+            400,
+        ),
+        (
+            "a Host with a semicolon",
+            b"GET / HTTP/1.1\r\nHost: a;b\r\n\r\n".to_vec(),
+            E::BadHost,
+            400,
+        ),
+        (
+            "an empty reg-name before a port",
+            b"GET / HTTP/1.1\r\nHost: :80\r\n\r\n".to_vec(),
+            E::BadHost,
+            400,
+        ),
+        (
+            "an asterisk target on GET",
+            b"GET * HTTP/1.1\r\nHost: h\r\n\r\n".to_vec(),
+            E::BadTarget,
+            400,
+        ),
+        (
+            "an authority target on GET",
+            b"GET h:80 HTTP/1.1\r\nHost: h\r\n\r\n".to_vec(),
+            E::BadTarget,
+            400,
+        ),
+        (
+            "an origin target on CONNECT",
+            b"CONNECT /x HTTP/1.1\r\nHost: h\r\n\r\n".to_vec(),
+            E::BadTarget,
+            400,
+        ),
+        (
+            "an authority without a port on CONNECT",
+            b"CONNECT h HTTP/1.1\r\nHost: h\r\n\r\n".to_vec(),
+            E::BadTarget,
+            400,
+        ),
+        (
+            "a bare word as target",
+            b"GET x HTTP/1.1\r\nHost: h\r\n\r\n".to_vec(),
+            E::BadTarget,
+            400,
+        ),
+        (
+            "a scheme without slashes",
+            b"GET http:/x HTTP/1.1\r\nHost: h\r\n\r\n".to_vec(),
+            E::BadTarget,
+            400,
+        ),
+        (
+            "an absolute target without an authority",
+            b"GET http:///x HTTP/1.1\r\nHost: h\r\n\r\n".to_vec(),
+            E::BadTarget,
+            400,
+        ),
+        (
+            "a scheme that begins with a digit",
+            b"GET 1http://h/x HTTP/1.1\r\nHost: h\r\n\r\n".to_vec(),
+            E::BadTarget,
+            400,
+        ),
+        (
+            "an asterisk with a path",
+            b"OPTIONS *x HTTP/1.1\r\nHost: h\r\n\r\n".to_vec(),
+            E::BadTarget,
+            400,
         ),
     ];
     t
@@ -747,7 +903,7 @@ fn bad_requests_fail_with_the_exact_error_and_status_at_every_split() {
     for (name, input, error, status) in bad_requests() {
         let (events, got) = every_split_request(Limits::default(), &input);
         assert_eq!(got, Some(error), "{name}");
-        assert_eq!(error.status(), status, "{name}");
+        assert_eq!(error.status(), Some(status), "{name}");
         assert!(
             events.iter().all(|e| !matches!(e, Event::Message(_))),
             "{name}: a request came out"
@@ -828,7 +984,7 @@ fn the_request_line_limit_passes_at_the_limit_and_fails_one_byte_over() {
     let over = make(limits.max_start_line + 1);
     let (_, error) = every_split_request(limits, &over);
     assert_eq!(error, Some(E::RequestLineTooLong));
-    assert_eq!(E::RequestLineTooLong.status(), 414);
+    assert_eq!(E::RequestLineTooLong.status(), Some(414));
     // The byte that fails is the one past the limit: nothing past it was buffered.
     assert_eq!(
         first_failure(limits, &over),
@@ -857,7 +1013,7 @@ fn the_header_bytes_limit_passes_at_the_limit_and_fails_one_byte_over() {
     let over = make(limits.max_header_bytes + 1);
     let (events, error) = every_split_request(limits, &over);
     assert_eq!((events.len(), error), (0, Some(E::HeadersTooLarge)));
-    assert_eq!(E::HeadersTooLarge.status(), 431);
+    assert_eq!(E::HeadersTooLarge.status(), Some(431));
     let start = "GET / HTTP/1.1\r\n".len();
     assert_eq!(
         first_failure(limits, &over),
@@ -887,7 +1043,7 @@ fn the_header_count_limit_passes_at_the_limit_and_fails_one_over() {
     assert_eq!((events.len(), error), (1, None));
     let (events, error) = every_split_request(limits, &make(limits.max_headers + 1));
     assert_eq!((events.len(), error), (0, Some(E::TooManyHeaders)));
-    assert_eq!(E::TooManyHeaders.status(), 431);
+    assert_eq!(E::TooManyHeaders.status(), Some(431));
 }
 
 #[test]
@@ -905,7 +1061,7 @@ fn the_body_limit_passes_at_the_limit_and_fails_one_over_before_a_byte_is_buffer
     let mut parser = RequestParser::new(limits);
     assert_eq!(parser.feed(&over), Err(E::BodyTooLarge));
     assert_eq!(parser.buffered(), 0);
-    assert_eq!(E::BodyTooLarge.status(), 413);
+    assert_eq!(E::BodyTooLarge.status(), Some(413));
     // The failure is at the end of the head: the body was never asked for.
     assert_eq!(
         first_failure(limits, &over),
@@ -1194,23 +1350,25 @@ fn a_written_response_parses_back_to_the_same_message() {
         Response::with_status(100),
     ];
     for original in cases {
-        for close in [false, true] {
+        for mode in MODES {
             let mut out = Vec::new();
-            write_response(&original, close, &mut out).unwrap();
+            write_response(&original, mode, &mut out).unwrap();
             let (events, error) = every_split_response(Limits::default(), false, &out);
             assert_eq!(error, None);
             let Some(Event::Message(parsed)) = events.into_iter().last() else {
                 panic!("a response")
             };
-            assert_eq!(parsed.keep_alive(), !close);
+            assert_eq!(parsed.keep_alive(), mode != ConnectionMode::Close);
             let mut expected = original.clone();
             if !status_has_no_body(original.status) {
                 expected
                     .headers
                     .append("Content-Length", original.body.len().to_string());
             }
-            if close {
-                expected.headers.append("Connection", "close");
+            match mode {
+                ConnectionMode::Close => expected.headers.append("Connection", "close"),
+                ConnectionMode::KeepAlive => expected.headers.append("Connection", "keep-alive"),
+                ConnectionMode::Unspecified => {}
             }
             assert_eq!(parsed, expected);
         }
@@ -1233,11 +1391,11 @@ fn a_written_request_parses_back_to_the_same_message() {
             .with_body(vec![0, 13, 10, 200]),
     ];
     for original in cases {
-        for close in [false, true] {
+        for mode in MODES {
             let mut out = Vec::new();
-            write_request(&original, close, &mut out).unwrap();
+            write_request(&original, mode, &mut out).unwrap();
             let parsed = one_request(&out);
-            assert_eq!(parsed.keep_alive(), !close);
+            assert_eq!(parsed.keep_alive(), mode != ConnectionMode::Close);
             let mut expected = original.clone();
             let has_length =
                 !original.body.is_empty() || matches!(original.method, Method::Post | Method::Put);
@@ -1246,8 +1404,10 @@ fn a_written_request_parses_back_to_the_same_message() {
                     .headers
                     .append("Content-Length", original.body.len().to_string());
             }
-            if close {
-                expected.headers.append("Connection", "close");
+            match mode {
+                ConnectionMode::Close => expected.headers.append("Connection", "close"),
+                ConnectionMode::KeepAlive => expected.headers.append("Connection", "keep-alive"),
+                ConnectionMode::Unspecified => {}
             }
             assert_eq!(parsed, expected);
         }
@@ -1347,7 +1507,7 @@ fn the_writer_refuses_what_could_split_a_message() {
     for (name, response, error) in bad_responses {
         let mut out = b"kept".to_vec();
         assert_eq!(
-            write_response(&response, false, &mut out),
+            write_response(&response, ConnectionMode::Unspecified, &mut out),
             Err(error),
             "{name}"
         );
@@ -1404,7 +1564,7 @@ fn the_writer_refuses_what_could_split_a_message() {
     for (name, request, error) in bad_requests {
         let mut out = b"kept".to_vec();
         assert_eq!(
-            write_request(&request, false, &mut out),
+            write_request(&request, ConnectionMode::Unspecified, &mut out),
             Err(error),
             "{name}"
         );
@@ -1417,7 +1577,7 @@ fn the_writer_output_is_exact() {
     let mut out = Vec::new();
     write_response(
         &Response::with_status(200).header("X", "y").with_body("ab"),
-        true,
+        ConnectionMode::Close,
         &mut out,
     )
     .unwrap();
@@ -1431,7 +1591,7 @@ fn the_writer_output_is_exact() {
     let mut out = Vec::new();
     write_request(
         &Request::new(Method::Post, "/p").header("Host", "h"),
-        false,
+        ConnectionMode::Unspecified,
         &mut out,
     )
     .unwrap();
@@ -1478,13 +1638,17 @@ fn methods_and_errors_report_their_names_and_statuses() {
         E::BodyTooLarge,
         E::RequestLineTooLong,
         E::HeadersTooLarge,
-        E::TransferEncodingNotSupported,
+        E::BadTransferEncoding,
         E::UnsupportedVersion,
     ]
     .iter()
-    .map(|e| e.status())
+    .map(|e| e.status().unwrap())
     .collect();
-    assert_eq!(statuses, [400, 411, 413, 414, 431, 501, 505]);
+    assert_eq!(statuses, [400, 411, 413, 414, 431, 400, 505]);
+    assert_eq!(E::MissingContentLength.status(), None);
+    assert_eq!(E::BadStatusLine.status(), None);
+    assert_eq!(E::StatusLineTooLong.status(), None);
+    assert_eq!(E::TransferEncodingNotSupported.status(), None);
     assert!(E::BodyTooLarge.to_string().contains("413"));
 }
 
@@ -1652,6 +1816,463 @@ fn bad_table_inputs_never_give_a_request_at_random_splits() {
                 .collect();
             cuts.sort_unstable();
             let (events, got) = requests(Limits::default(), &input, &cuts);
+            assert_eq!(got, Some(error), "{name}");
+            assert!(events.is_empty(), "{name}");
+        }
+    }
+}
+
+// ---- review additions -------------------------------------------------------------------------------------
+
+#[test]
+fn hosts_and_target_forms_that_are_valid_parse() {
+    let table: [(&str, Method, &str, Option<TargetForm>); 8] = [
+        (
+            "CONNECT h:443 HTTP/1.1\r\nHost: h:443\r\n\r\n",
+            Method::Connect,
+            "h:443",
+            Some(TargetForm::Authority),
+        ),
+        (
+            "GET /p HTTP/1.1\r\nHost:\r\n\r\n",
+            Method::Get,
+            "/p",
+            Some(TargetForm::Origin),
+        ),
+        (
+            "GET /p HTTP/1.1\r\nHost: [::1]:8080\r\n\r\n",
+            Method::Get,
+            "/p",
+            Some(TargetForm::Origin),
+        ),
+        (
+            "GET /p HTTP/1.1\r\nHost: 127.0.0.1:80\r\n\r\n",
+            Method::Get,
+            "/p",
+            Some(TargetForm::Origin),
+        ),
+        (
+            "GET /p HTTP/1.1\r\nHost: a-b.c_d~e%41:\r\n\r\n",
+            Method::Get,
+            "/p",
+            Some(TargetForm::Origin),
+        ),
+        (
+            "GET http://h:80/x?y HTTP/1.1\r\nHost: h\r\n\r\n",
+            Method::Get,
+            "http://h:80/x?y",
+            Some(TargetForm::Absolute),
+        ),
+        (
+            "OPTIONS * HTTP/1.1\r\nHost: h\r\n\r\n",
+            Method::Options,
+            "*",
+            Some(TargetForm::Asterisk),
+        ),
+        (
+            "GET /p HTTP/1.0\r\nHost: h\r\n\r\n",
+            Method::Get,
+            "/p",
+            Some(TargetForm::Origin),
+        ),
+    ];
+    for (input, method, target, form) in table {
+        let r = one_request(input.as_bytes());
+        assert_eq!(
+            (r.method.clone(), r.target.as_str(), r.target_form()),
+            (method, target, form)
+        );
+    }
+}
+
+#[test]
+fn an_empty_feed_does_nothing_in_every_state_but_failed() {
+    let limits = Limits::default();
+    let mut p = RequestParser::new(limits);
+    assert_eq!(p.feed(b""), Ok((0, Progress::NeedMore)));
+    p.feed(b"POST / HTTP/1.1\r\nHo").unwrap();
+    let held = p.buffered();
+    assert_eq!(p.feed(b""), Ok((0, Progress::NeedMore)));
+    assert_eq!((p.buffered(), p.state()), (held, State::Head));
+    p.feed(b"st: h\r\nContent-Length: 3\r\n\r\na").unwrap();
+    let (held, state) = (p.buffered(), p.state());
+    assert!(matches!(state, State::Body { .. }), "{state:?}");
+    assert_eq!(p.feed(b""), Ok((0, Progress::NeedMore)));
+    assert_eq!((p.buffered(), p.state()), (held, state));
+    let mut p = RequestParser::new(limits);
+    p.feed(b"G\n").unwrap_err();
+    assert_eq!(p.feed(b""), Err(E::BadLineEnding));
+
+    let mut r = ResponseParser::new(limits);
+    assert_eq!(r.feed(b""), Ok((0, Progress::NeedMore)));
+    r.feed(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\na")
+        .unwrap();
+    let (held, state) = (r.buffered(), r.state());
+    assert_eq!(r.feed(b""), Ok((0, Progress::NeedMore)));
+    assert_eq!((r.buffered(), r.state()), (held, state));
+}
+
+#[test]
+fn buffered_is_every_byte_held_until_the_message_completes() {
+    let input = b"POST /p HTTP/1.1\r\nHost: h\r\nContent-Length: 4\r\n\r\nabcd";
+    let mut p = RequestParser::new(Limits::default());
+    for (i, b) in input.iter().enumerate() {
+        let (_, progress) = p.feed(&[*b]).unwrap();
+        let done = i + 1 == input.len();
+        assert_eq!(p.buffered(), if done { 0 } else { i + 1 }, "after byte {i}");
+        assert_eq!(matches!(progress, Progress::Complete(_)), done);
+    }
+    let input = b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nabcd";
+    let mut p = ResponseParser::new(Limits::default());
+    for (i, b) in input.iter().enumerate() {
+        p.feed(&[*b]).unwrap();
+        assert_eq!(p.buffered(), if i + 1 == input.len() { 0 } else { i + 1 });
+    }
+}
+
+#[test]
+fn the_pending_head_is_visible_while_the_body_is_pending() {
+    let mut p = RequestParser::new(Limits::default());
+    assert!(p.pending_head().is_none());
+    let head = b"PUT /big HTTP/1.1\r\nHost: h\r\nExpect: 100-continue\r\nContent-Length: 3\r\n\r\n";
+    let (_, progress) = p.feed(head).unwrap();
+    assert!(matches!(
+        progress,
+        Progress::HeadComplete {
+            expect_continue: true,
+            ..
+        }
+    ));
+    let pending = p.pending_head().unwrap();
+    assert_eq!(
+        (pending.method, pending.target, pending.version),
+        (&Method::Put, "/big", Version::Http11)
+    );
+    assert_eq!(pending.headers.get("expect"), Some("100-continue"));
+    let (_, progress) = p.feed(b"abc").unwrap();
+    assert!(matches!(progress, Progress::Complete(_)));
+    assert!(p.pending_head().is_none());
+}
+
+#[test]
+fn the_head_flag_applies_to_one_final_response_only() {
+    let mut p = ResponseParser::new(Limits::default());
+    p.set_response_to_head(true);
+    let wire = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    let (events, error) = drive(|b| p.feed(b), &[wire]);
+    assert_eq!(error, None);
+    let bodies: Vec<(u16, Vec<u8>)> = events
+        .into_iter()
+        .filter_map(|e| match e {
+            Event::Message(m) => Some((m.status, m.body)),
+            Event::Head { .. } => None,
+        })
+        .collect();
+    assert_eq!(
+        bodies,
+        [(100, vec![]), (200, vec![]), (200, b"ok".to_vec())]
+    );
+}
+
+fn head_only(
+    response: &Response,
+    length: Option<u64>,
+    mode: ConnectionMode,
+) -> Result<Vec<u8>, WriteError> {
+    let mut out = Vec::new();
+    write_response_head(response, length, mode, &mut out).map(|()| out)
+}
+
+#[test]
+fn a_head_only_response_carries_the_explicit_length_and_no_body() {
+    let out = head_only(
+        &Response::with_status(200),
+        Some(1234),
+        ConnectionMode::KeepAlive,
+    )
+    .unwrap();
+    assert_eq!(
+        out,
+        b"HTTP/1.1 200 OK\r\nContent-Length: 1234\r\nConnection: keep-alive\r\n\r\n"
+    );
+    let (events, error) = every_split_response(Limits::default(), true, &out);
+    assert_eq!(error, None);
+    let Some(Event::Message(parsed)) = events.into_iter().next() else {
+        panic!("a response")
+    };
+    assert_eq!(parsed.headers.get("content-length"), Some("1234"));
+    assert!(parsed.body.is_empty());
+    // The status rules hold.
+    assert!(
+        head_only(
+            &Response::with_status(204),
+            Some(1),
+            ConnectionMode::Unspecified
+        )
+        .is_err()
+    );
+    assert!(
+        head_only(
+            &Response::with_status(100),
+            Some(0),
+            ConnectionMode::Unspecified
+        )
+        .is_err()
+    );
+    assert!(
+        head_only(
+            &Response::with_status(204),
+            None,
+            ConnectionMode::Unspecified
+        )
+        .is_ok()
+    );
+    assert!(
+        head_only(
+            &Response::with_status(304),
+            Some(9),
+            ConnectionMode::Unspecified
+        )
+        .is_ok()
+    );
+    assert_eq!(
+        head_only(
+            &Response::with_status(200).with_body("x"),
+            Some(1),
+            ConnectionMode::Unspecified
+        ),
+        Err(WriteError::BodyNotAllowed)
+    );
+    assert_eq!(
+        head_only(
+            &Response::with_status(200).header("Content-Length", "1"),
+            None,
+            ConnectionMode::Unspecified
+        ),
+        Err(WriteError::ReservedHeader)
+    );
+    let no_length = head_only(&Response::with_status(200), None, ConnectionMode::Close).unwrap();
+    assert_eq!(no_length, b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n");
+}
+
+#[test]
+fn the_request_writer_needs_exactly_one_valid_host_and_a_target_for_the_method() {
+    let cases: Vec<(&str, Request, WriteError)> = vec![
+        (
+            "no Host",
+            Request::new(Method::Get, "/"),
+            WriteError::BadHost,
+        ),
+        (
+            "two Host lines",
+            Request::new(Method::Get, "/")
+                .header("Host", "a")
+                .header("host", "b"),
+            WriteError::BadHost,
+        ),
+        (
+            "a Host with a space",
+            Request::new(Method::Get, "/").header("Host", "a b"),
+            WriteError::BadHost,
+        ),
+        (
+            "a Host list",
+            Request::new(Method::Get, "/").header("Host", "a,b"),
+            WriteError::BadHost,
+        ),
+        (
+            "an asterisk on GET",
+            Request::new(Method::Get, "*").header("Host", "h"),
+            WriteError::BadTarget,
+        ),
+        (
+            "CONNECT with a path",
+            Request::new(Method::Connect, "/x").header("Host", "h"),
+            WriteError::BadTarget,
+        ),
+        (
+            "a bare word",
+            Request::new(Method::Get, "x").header("Host", "h"),
+            WriteError::BadTarget,
+        ),
+    ];
+    for (name, request, error) in cases {
+        let mut out = b"kept".to_vec();
+        assert_eq!(
+            write_request(&request, ConnectionMode::Unspecified, &mut out),
+            Err(error),
+            "{name}"
+        );
+        assert_eq!(out, b"kept", "{name}");
+    }
+}
+
+fn pick<'a>(rng: &mut Rng, pool: &[&'a str]) -> &'a str {
+    pool[rng.below(pool.len())]
+}
+
+fn only_message<T>(outcome: Outcome<T>) -> T {
+    let (events, error) = outcome;
+    assert_eq!(error, None);
+    let mut messages: Vec<T> = events
+        .into_iter()
+        .filter_map(|e| match e {
+            Event::Message(m) => Some(m),
+            Event::Head { .. } => None,
+        })
+        .collect();
+    assert_eq!(messages.len(), 1);
+    messages.remove(0)
+}
+
+#[test]
+fn whatever_a_writer_accepts_this_parser_reads_back() {
+    let rounds = if cfg!(miri) { 30 } else { 20_000 };
+    let mut rng = Rng(0xC0FF_EE11);
+    let limits = Limits::default();
+    let methods = [
+        "GET", "POST", "PUT", "PURGE", "CONNECT", "OPTIONS", "G T", "", "HEAD",
+    ];
+    let targets = [
+        "/",
+        "/a?b=c",
+        "*",
+        "h:80",
+        "http://h/x",
+        "",
+        "/a b",
+        "/a\r\nx",
+        "x",
+        "#",
+        "h:",
+        "/%41",
+    ];
+    let names = [
+        "X",
+        "X-Y",
+        "",
+        "A B",
+        "Content-Length",
+        "connection",
+        "X\n",
+        "Host",
+        "host",
+        "Accept",
+    ];
+    let values = [
+        "h", "h:80", "a b", "", "a\r\nb", " x", "[::1]", "v", "\t", "[::1]:9", "a,b", "h:",
+    ];
+    let reasons = ["OK", "", "a\nb", "x y", "no \t tab"];
+    let statuses = [100, 101, 200, 204, 304, 404, 99, 600];
+    let modes = MODES;
+    let (mut requests_ok, mut responses_ok, mut heads_ok) = (0, 0, 0);
+    for _ in 0..rounds {
+        let mut request = Request::new(
+            Method::from_token(pick(&mut rng, &methods)),
+            pick(&mut rng, &targets),
+        );
+        if rng.below(4) != 0 {
+            request.headers.append("Host", pick(&mut rng, &values));
+        }
+        for _ in 0..rng.below(3) {
+            request
+                .headers
+                .append(pick(&mut rng, &names), pick(&mut rng, &values));
+        }
+        request.body = vec![b'b'; rng.below(3)];
+        let mode = modes[rng.below(3)];
+        let mut out = Vec::new();
+        if write_request(&request, mode, &mut out).is_ok() {
+            requests_ok += 1;
+            let parsed = only_message(every_split_request(limits, &out));
+            assert_eq!(
+                (&parsed.method, &parsed.target, &parsed.body),
+                (&request.method, &request.target, &request.body)
+            );
+        }
+
+        let mut response = Response::new(
+            statuses[rng.below(statuses.len())],
+            pick(&mut rng, &reasons),
+        );
+        for _ in 0..rng.below(3) {
+            response
+                .headers
+                .append(pick(&mut rng, &names), pick(&mut rng, &values));
+        }
+        response.body = vec![b'b'; rng.below(3)];
+        let mut out = Vec::new();
+        if write_response(&response, mode, &mut out).is_ok() {
+            responses_ok += 1;
+            let parsed = only_message(every_split_response(limits, false, &out));
+            assert_eq!(
+                (parsed.status, &parsed.reason, &parsed.body),
+                (response.status, &response.reason, &response.body)
+            );
+        }
+        let length = [None, Some(0), Some(7)][rng.below(3)];
+        if let Ok(out) = head_only(
+            &Response {
+                body: vec![],
+                ..response
+            },
+            length,
+            mode,
+        ) {
+            heads_ok += 1;
+            let parsed = only_message(every_split_response(limits, true, &out));
+            assert!(parsed.body.is_empty());
+        }
+    }
+    if !cfg!(miri) {
+        assert!(
+            requests_ok > 300 && responses_ok > 300 && heads_ok > 300,
+            "{requests_ok} {responses_ok} {heads_ok}"
+        );
+    }
+}
+
+#[test]
+fn pipelined_good_requests_are_all_yielded_at_random_splits() {
+    let rounds = if cfg!(miri) { 3 } else { 300 };
+    let mut rng = Rng(7);
+    let good: [&[u8]; 4] = [
+        b"GET /a HTTP/1.1\r\nHost: h\r\n\r\n",
+        b"POST /b HTTP/1.1\r\nHost: h\r\nContent-Length: 3\r\n\r\nxyz",
+        b"GET /c HTTP/1.0\r\n\r\n",
+        b"\r\nPUT /d HTTP/1.1\r\nHost: h:1\r\nContent-Length: 0\r\n\r\n",
+    ];
+    for _ in 0..rounds {
+        let n = 1 + rng.below(6);
+        let mut input = Vec::new();
+        for _ in 0..n {
+            input.extend_from_slice(good[rng.below(good.len())]);
+        }
+        let mut cuts: Vec<usize> = (0..rng.below(8))
+            .map(|_| rng.below(input.len() + 1))
+            .collect();
+        cuts.sort_unstable();
+        let (events, error) = requests(Limits::default(), &input, &cuts);
+        assert_eq!(error, None);
+        let count = events
+            .iter()
+            .filter(|e| matches!(e, Event::Message(_)))
+            .count();
+        assert_eq!(count, n);
+    }
+}
+
+#[test]
+fn a_bad_row_followed_by_anything_still_fails_the_same_way() {
+    let rounds = if cfg!(miri) { 2 } else { 40 };
+    let mut rng = Rng(99);
+    for (name, input, error, _) in bad_requests() {
+        for _ in 0..rounds {
+            let mut longer = input.clone();
+            longer.extend((0..rng.below(80)).map(|_| rng.next() as u8));
+            let (events, got) = requests(Limits::default(), &longer, &[]);
+            // A row that fails at the end of its head may fail earlier on the extra bytes only for the same
+            // reason: the first error is the row's.
             assert_eq!(got, Some(error), "{name}");
             assert!(events.is_empty(), "{name}");
         }
