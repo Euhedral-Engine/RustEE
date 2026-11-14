@@ -3,6 +3,26 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## A socket operation can have a time limit and can be cancelled (2026-11-14)
+
+**What.** `AsyncIo::send_with`, `recv_with`, `accept_with` and `connect_with` take an `OpOptions { limit: Option<Duration> }` and return `io::Result<OpId>`; `AsyncIo::cancel(id: OpId)` asks a pending operation to end. `Cancelled` is the payload of the error a cancel ends with (`Cancelled::is(&io::Error)`, `Cancelled::error()`). The `Engine` trait's `submit` takes the limit and returns the `OpId`, and gains `cancel`.
+
+**Why.** A caller could not bound a socket operation in time or give up on one: a receive on a silent peer, an accept with no client or a connect to an address that does not answer stayed pending for as long as the peer chose, and could not be undone short of closing the socket.
+
+**Breaking:** none for callers. `send`, `recv`, `accept`, `connect` and every other call keep their signatures and behaviour. **Migration:** an implementation of the `Engine` trait outside this repository takes the limit and returns the id (nothing here is affected).
+
+**How to use it.** `let id = io.recv_with(socket, buf, OpOptions { limit: Some(Duration::from_secs(1)) }, then)?;` and, from any worker, `io.cancel(id)`. In the continuation, `error.kind() == ErrorKind::TimedOut` is the limit and `Cancelled::is(&error)` is the cancel.
+
+**Semantics.**
+- The continuation runs exactly once, with the buffer (or owned value) back, however the operation ends; the socket is usable afterwards.
+- The limit counts from the call and bounds the whole operation, every piece of a send included.
+- `cancel` never blocks and may be called from any worker or from inside a continuation. One for an operation that already ended does nothing, also after its slot was reused (the id carries the slot's generation). A cancel that loses a race with the completion leaves the real result; the one that wins ends the operation with `Cancelled`. A second cancel does nothing.
+- A send or receive that ends early may have moved some bytes and reports none. A limited or cancelled accept closes the socket it had made.
+- Linux and Android: a linked timeout (absolute, monotonic clock) and an async cancel by the operation's user data; no timer thread, no scan; a kernel with linked timeouts and absolute timeouts (5.6) is needed for `*_with` with a limit. Operations without a limit are submitted as before.
+- Windows: `CancelIoEx` on the operation's `OVERLAPPED`; the crate has no timer, so a limit is a deadline in the engine's table, checked at the start of each poll, and the operation ends at the first poll after it expires. A poll with no limited operation in flight takes no extra lock. Not compiled or run on a real Windows in this change: the real `Sys` calls are untested, the simulated engine is tested.
+
+**Tests.** `tests/socket_limits.rs` (Linux, over loopback): `a_receive_with_a_limit_on_a_silent_peer_times_out_and_the_socket_receives_afterwards`, `a_limited_operation_that_finishes_in_time_ends_once_and_leaves_no_trace`, `a_cancelled_receive_ends_once_with_the_cancelled_error_and_the_socket_receives_afterwards`, `a_cancelled_send_to_a_peer_with_full_buffers_ends_once_and_a_limited_one_times_out`, `a_cancel_that_comes_after_the_completion_delivers_the_real_result_once`, `cancelling_an_operation_that_ended_does_nothing_even_after_its_slot_was_reused`, `a_limited_accept_with_no_peer_times_out_and_the_listener_accepts_afterwards`, `a_limited_connect_to_a_peer_that_does_not_answer_times_out`; and in `win/tests.rs` on the simulated engine: `a_receive_whose_limit_passed_times_out_at_the_next_poll_and_the_socket_receives_afterwards`, `limited_operations_that_finish_in_time_end_once_and_leave_no_limit_behind`, `a_cancelled_receive_ends_once_with_the_cancelled_error`, `a_cancelled_send_that_is_still_pending_ends_once_with_its_buffer`, `a_cancel_that_loses_the_race_with_the_completion_delivers_the_real_result_once`, `a_cancel_of_an_operation_that_ended_misses_the_one_that_took_its_slot`, `a_limit_or_cancel_that_comes_between_two_pieces_ends_the_operation_there`, `a_limited_accept_times_out_and_closes_its_socket_and_a_limited_connect_times_out`.
+
 ## A lane can copy a tile between pitched device buffers (2026-11-13)
 
 **What.** `LaneEnqueue::copy_pitched_on_device(dst, dst_pitch, src, src_pitch, row_bytes, rows)` (an `unsafe fn`, on every submitter: a stream's, a shared lane's, a recording's, on the CUDA and fake backends) copies `rows` rows of `row_bytes` bytes from `src` (rows `src_pitch` bytes apart) to `dst` (rows `dst_pitch` bytes apart), device to device, as one operation. `ShapeHasher::copy_pitched` records it in a shape.

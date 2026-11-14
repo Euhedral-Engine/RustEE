@@ -60,6 +60,39 @@ The memory comes back whether the read succeeded or failed, and `then` always ru
 is leaked (never dropped) and `result` is the ring's failure. The region is cut into pieces
 internally, each landing at its own offset. `read` stays as it was, for a `Vec`-backed `IoBuf`.
 
+**Time limits and cancel.** `send_with`, `recv_with`, `accept_with` and `connect_with` take an
+`OpOptions { limit: Option<Duration> }` and return an `OpId`; `cancel(id)` asks for that operation to end.
+Either way the continuation runs exactly once, the buffer comes back in it, and the socket stays usable. A
+limit ends the operation with `ErrorKind::TimedOut`; a cancel ends it with an `ErrorKind::Interrupted` error
+whose payload is `Cancelled` (`Cancelled::is(&error)` tells it from any other interruption). The limit
+counts from the call and covers all the pieces of a send. `cancel` is a request that never blocks and may
+come from any worker; one for an operation that already ended does nothing, even if its slot has been
+reused (an `OpId` carries the slot's generation), and one that loses a race with the completion leaves the
+real result. A send or receive that was cut short may have moved some bytes. A cancelled `accept` or
+`connect` closes nothing of the caller's.
+
+```no_run
+use std::time::Duration;
+use euhedral_io::{AsyncIo, IoBuf, OpOptions, RawSock};
+
+fn receive_for_a_second(io: &AsyncIo, socket: RawSock, then: euhedral_io::IoThen) {
+    let buf = IoBuf { bytes: vec![0; 4096], filled: 0 };
+    let options = OpOptions { limit: Some(Duration::from_secs(1)) };
+    let id = io.recv_with(socket, buf, options, then).unwrap();
+    // Later, from any worker: the continuation sees `Cancelled::is(&error)`.
+    io.cancel(id);
+}
+```
+
+- **Linux and Android:** a limit is a linked timeout (`IORING_OP_LINK_TIMEOUT`, absolute on the monotonic
+  clock, so the kernel's own timer: no timer thread, no scan) and a cancel is `IORING_OP_ASYNC_CANCEL` by
+  the operation's user data. Needs a kernel with linked timeouts (5.5 or later) and absolute timeouts
+  (5.6).
+- **Windows:** a cancel is `CancelIoEx` on the operation's own `OVERLAPPED`. The crate has no timer, so a
+  limit is a deadline kept in the engine's table and checked at each poll: it ends the operation at the
+  first poll after it expires (the poll takes no lock when no limited operation is in flight). Limits and
+  cancel apply to socket operations on the completion port.
+
 - **Linux and Android:** io_uring, with one ring per submitting thread. An operation belongs to the
   thread that submitted it, and lattice workers live as long as the lattice.
 - **Windows:** one I/O completion port per `AsyncIo`, polled with a zero timeout, for every
