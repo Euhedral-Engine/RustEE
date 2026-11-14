@@ -25,6 +25,22 @@ semantics and the tests that pin it.
 
 **Tests.** `tests/socket_limits.rs` (Linux, over loopback): `a_receive_with_a_limit_on_a_silent_peer_times_out_and_the_socket_receives_afterwards`, `a_limited_operation_that_finishes_in_time_ends_once_and_leaves_no_trace`, `a_cancelled_receive_ends_once_with_the_cancelled_error_and_the_socket_receives_afterwards`, `a_cancelled_send_to_a_peer_with_full_buffers_ends_once_and_a_limited_one_times_out`, `a_cancel_that_comes_after_the_completion_delivers_the_real_result_once`, `cancelling_an_operation_that_ended_does_nothing_even_after_its_slot_was_reused`, `a_limited_accept_with_no_peer_times_out_and_the_listener_accepts_afterwards`, `a_limited_connect_to_a_peer_that_does_not_answer_times_out`, `a_cancel_from_another_worker_ends_the_operation_once`, `cancelling_a_limited_operation_ends_it_with_the_cancel_and_no_timeout_follows`, `the_id_of_another_asyncio_cancels_nothing`; in `uring.rs`: `a_cancel_between_two_pieces_queues_behind_the_next_piece_and_ends_the_send`, `a_cancel_does_not_wait_for_room_in_a_full_completion_queue`, `no_piece_of_a_send_starts_after_its_limit`; and in `win/tests.rs` on the simulated engine: the receive, in-time, cancel, send, race, slot-reuse, between-pieces, accept and connect cases, `an_operation_the_os_aborted_is_none_of_cancel_and_limit`, `the_id_of_another_engine_cancels_nothing`, `a_cancelled_limited_operation_leaves_the_limit_set_and_ends_once` and `a_send_ended_between_pieces_says_how_many_bytes_went`. The README example is built as a doctest.
 
+## A completion source can be built without device lanes (2026-11-14)
+
+**What.** `Completions::without_lanes() -> Arc<Completions>`: a source with no lane pool.
+
+**Why.** A program with no device open, or between closing one and opening the next, still needs frames at deadlines and its own pending work polled; `Completions::new` required a pool.
+
+**How to use it.** `let completions = Completions::without_lanes();` then `at`, `after`, `register` and `after_retired` as usual, driven by the poll frame in a lattice or by `reap` and `pull` by hand.
+
+**Semantics.**
+- `at`, `after`, `register`, `after_retired`, `pending`, `reap`, the lateness figures and the poll frame's wake-ups (the deadline, the bell, the blind back-off) behave as on a source with lanes; nothing reads a lane.
+- `after_marker` has no lane to read and is refused as a registration after `complete` is: the frame is leaked and counted in `leaked_unreached` (the lane the marker names may still be using what it holds, so it is not finished), `pending` does not count it, and debug builds panic.
+- A timer is never emitted before its deadline and goes out in the first reap at or after it; timers due in one reap go out in registration order, not sorted by deadline (unchanged from a source with lanes).
+- A source built by `new` is unchanged, including holding its lanes for its life.
+
+**Tests.** In `completions.rs`: `due_timers_without_lanes_are_emitted_in_registration_order_and_none_before_its_deadline`, `a_pending_operation_registered_without_lanes_is_polled_and_completes`, `a_ready_token_registered_without_lanes_completes`, `a_marker_without_lanes_is_refused_and_its_frame_is_leaked_and_counted`, `a_retirement_cell_registered_without_lanes_completes_when_it_arrives`, `pending_and_reap_report_without_lanes` (none can compile on the old code).
+
 ## A lane can copy a tile between pitched device buffers (2026-11-13)
 
 **What.** `LaneEnqueue::copy_pitched_on_device(dst, dst_pitch, src, src_pitch, row_bytes, rows)` (an `unsafe fn`, on every submitter: a stream's, a shared lane's, a recording's, on the CUDA and fake backends) copies `rows` rows of `row_bytes` bytes from `src` (rows `src_pitch` bytes apart) to `dst` (rows `dst_pitch` bytes apart), device to device, as one operation. `ShapeHasher::copy_pitched` records it in a shape.
