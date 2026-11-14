@@ -409,8 +409,9 @@ impl Ring {
         let uring = IoUring::builder().setup_clamp().build(entries)?;
         let capacity = uring.params().cq_entries() as usize;
         // A linked pair must always fit between the operations' room and the reserve.
+        let reserve = (capacity / 8).max(1);
         debug_assert!(
-            capacity - (capacity / 8).max(1) >= 2,
+            capacity - reserve >= 2,
             "a ring too small for a linked pair"
         );
         let incoming: MpscQueue<Item> = MpscQueue::with_pool(INCOMING_CHUNK, 2);
@@ -433,7 +434,7 @@ impl Ring {
             ops: Mutex::new(Ops::default()),
             in_kernel: AtomicUsize::new(0),
             capacity,
-            reserve: (capacity / 8).max(1),
+            reserve,
         })
     }
 
@@ -463,7 +464,8 @@ impl Ring {
     }
 
     /// Ends the operations whose next piece waits in the backlog past their limit: no piece starts
-    /// after the limit. Reads the clock only when a limit may have passed.
+    /// after the limit. Reads the clock on each flush while a limited piece waits, and walks the
+    /// backlog only once the earliest of their limits may have passed.
     fn end_passed_limits(queue: &mut Queue) {
         if queue.limited == 0 {
             return;
@@ -651,9 +653,11 @@ impl Ring {
         let result = match arrival {
             Arrival::Completion(result) => result,
             Arrival::Unsubmitted(why) => {
+                // As in the kernel's path: a cancelled operation ends as cancelled, whatever
+                // else ended it too.
                 let error = match why {
-                    End::Cancelled => Cancelled::error(op.moved),
-                    End::LimitPassed => LimitPassed::error(op.moved),
+                    End::LimitPassed if !op.cancelled => LimitPassed::error(op.moved),
+                    _ => Cancelled::error(op.moved),
                 };
                 let op = ops.remove(user_data).expect("the operation just found");
                 return Reaped::Ended(op, Err(error));
@@ -966,12 +970,16 @@ impl Engine for Uring {
                 let Some(Ended { user_data, why }) = reaping.poll() else {
                     break;
                 };
-                if let Reaped::Ended(op, result) =
-                    ring.reap_one(user_data, Arrival::Unsubmitted(why), self.max_piece)
-                    && !offer(conclude(op, result))
-                {
-                    ring.flush_waiting(&*self.enter);
-                    return;
+                match ring.reap_one(user_data, Arrival::Unsubmitted(why), self.max_piece) {
+                    Reaped::Ended(op, result) => {
+                        if !offer(conclude(op, result)) {
+                            ring.flush_waiting(&*self.enter);
+                            return;
+                        }
+                    }
+                    Reaped::Again | Reaped::Stray => {
+                        debug_assert!(false, "an ended operation ({user_data:#x}) of no operation")
+                    }
                 }
             }
             loop {
@@ -2264,10 +2272,10 @@ mod tests {
     /// it ends with [`LimitPassed`], whatever else is (not) completing.
     #[test]
     fn a_limit_ends_an_operation_that_waits_in_the_backlog() {
-        let (io, ids, _pairs) = full_ring(1, Some(Duration::from_millis(50)));
         let started = Instant::now();
+        let (io, ids, _pairs) = full_ring(1, Some(Duration::from_millis(50)));
         let done = poll(&io, 1);
-        assert!(started.elapsed() >= Duration::from_millis(40));
+        assert!(started.elapsed() >= Duration::from_millis(50));
         assert_eq!(done[0].0, 7);
         let error = done[0]
             .1
@@ -2284,6 +2292,34 @@ mod tests {
         }
         assert_eq!(poll(&io, 7).len(), 7);
         assert_eq!(io.pending(), 0);
+    }
+
+    /// An operation cancelled and past its limit while it waits ends as cancelled, as one in the
+    /// kernel does.
+    #[test]
+    fn a_cancelled_operation_past_its_limit_in_the_backlog_ends_as_cancelled() {
+        let started = Instant::now();
+        let (io, ids, _pairs) = full_ring(1, Some(Duration::from_millis(50)));
+        // The limit passes before the cancel is flushed (the clock, not a poll, is waited for).
+        while started.elapsed() < Duration::from_millis(60) {
+            std::hint::spin_loop();
+        }
+        io.cancel(ids[7]);
+        let done = poll(&io, 1);
+        assert_eq!(done[0].0, 7);
+        let error = done[0]
+            .1
+            .done
+            .as_ref()
+            .unwrap()
+            .result
+            .as_ref()
+            .unwrap_err();
+        assert!(Cancelled::is(error));
+        for id in &ids[..7] {
+            io.cancel(*id);
+        }
+        assert_eq!(poll(&io, 7).len(), 7);
     }
 
     /// A limited send is bound as a whole: a piece that finishes after the limit is the last.
