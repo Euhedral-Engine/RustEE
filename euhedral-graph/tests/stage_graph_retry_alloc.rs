@@ -117,7 +117,7 @@ impl World {
             completed: AtomicU64::new(0),
         });
         let pool = Arc::new(LanePool::new(vec![hand.clone() as Arc<dyn DeviceQueue>]));
-        let completions = Completions::new(pool.clone());
+        let completions = Completions::new(&pool);
         let queue = MpscQueue::<Box<dyn Frame>>::bounded(1024);
         let frames = queue.consumer();
         let mut spec = StageGraphSpec::new();

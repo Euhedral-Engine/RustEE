@@ -137,7 +137,7 @@ fn a_quantum_with_no_lane_allocates_nothing_after_warm_up_and_runs_only_its_stag
         ],
         GraphRuntime {
             stages: Arc::new(Sink(queue.producer())),
-            completions: Completions::new(pool.clone()),
+            completions: Completions::new(&pool),
             lanes: pool,
             retries: Arc::default(),
             retry_backstop: DEFAULT_RETRY_BACKSTOP,

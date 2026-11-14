@@ -14,6 +14,8 @@ registration's own sweep) finishes its frame through `do_finally` without runnin
 the source if no poll comes. It does
 not panic: only the polling thread sees it, and it cannot tell a misuse from a poll that was late.
 
+**weakly held pool** ([`Completions::new`](src/completions.rs)): a `Completions` reads its markers from a lane pool it holds only weakly, so the pool's owner is the last to drop it and the lanes are destroyed there. Marker registrations pending when the pool is gone are leaked and counted, not finished.
+
 **leaked registration** ([`Completions::leaked_unreached`](src/completions.rs)): a registration that waits
 for a lane's marker the lane has still not reached, and is refused, late or abandoned. It is leaked
 (`mem::forget`) and counted, because the device may still use what its frame holds, and finishing the frame

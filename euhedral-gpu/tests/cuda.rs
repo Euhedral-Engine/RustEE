@@ -238,7 +238,7 @@ mod streams {
         let (pool, mut s) = gpu.open_lanes(&["a"], StreamOptions::default()).unwrap();
         let mem = device_memory(&gpu);
         let buf = mem.alloc(1 << 20).unwrap();
-        let completions = euhedral_graph::Completions::new(pool.clone());
+        let completions = euhedral_graph::Completions::new(&pool);
         let ran = Arc::new(std::sync::Mutex::new(Vec::new()));
         s[0].submit(|q| {
             // SAFETY: a live device allocation, used by nothing else.

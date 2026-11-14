@@ -66,7 +66,17 @@ A `Completions` holds frames to emit once something completes:
 - `register(pending)`: a `Pending` operation is polled until it yields its continuation frame, for
   a completion that carries a result.
 
-`Completions::new(lanes)` takes the device lanes its markers are read from; `Completions::without_lanes()` builds one with
+`Completions::new(&lanes)` takes the device lanes its markers are read from, and holds the pool **weakly**: the owner
+of the pool owns the lanes and decides where they are destroyed, and no source ever keeps them alive (the lattice lets
+go of a completed source on whichever worker releases it last, which must not be where a device is torn down). An owner
+tears down in this order: complete the source, drop the lane pool (the lanes are destroyed there, on that thread), then
+release the device. While the pool lives, markers are read as before. Once it is gone no marker can be observed, so a
+marker registration still pending is never finished as reached: the next poll, or the source's drop, leaks its frame
+and counts it in `leaked_unreached`, as for a refused marker not reached (the device may have used what it holds, and
+nothing says it stopped); a marker registered after that ends the same way at the next poll. `at`, `after`, `register`
+and `after_retired` do not name a lane and are unaffected. The owner therefore keeps the pool for as long as markers of
+it are registered. `Completions::without_lanes()` builds one with
+`Completions::without_lanes()` builds one with
 none, for a program with no device open (or between closing one and opening the next) that still runs frames at
 deadlines and registers its own pending work. On it `at`, `after`, `register` and `after_retired` work as on any other;
 `after_marker` has no lane to read and refuses its frame like a refused marker not reached: the frame is leaked and
@@ -105,7 +115,7 @@ use euhedral_graph::{Completions, Sequencer};
 
 // The pool's lanes are only polled for markers; a timer needs none.
 let (lanes, _devices) = FakeDevice::pool(&["compute"]);
-let completions = Completions::new(lanes);
+let completions = Completions::new(&lanes);
 
 let released = Arc::new(Mutex::new(Vec::new()));
 let sequencer = Sequencer::ordered({

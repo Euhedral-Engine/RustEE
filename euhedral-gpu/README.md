@@ -230,7 +230,7 @@ streams[1]
 
 // The copy's retirement continues as a frame, emitted by the lattice's own poll. The submitter travels with it,
 // and the frame hands it back to its source: dropping a submitter waits for the device, so a frame never drops one.
-let completions = Completions::new(lanes);
+let completions = Completions::new(&lanes);
 let returned = Arc::new(Mutex::new(None));
 let copy_lane = streams.remove(1);
 retire_into(copy_lane, &completions, {

@@ -3,6 +3,24 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## A `Completions` no longer keeps its lane pool alive (2026-11-14)
+
+**What.** `Completions` holds its lane pool weakly. `Completions::new(lanes: &Arc<LanePool>) -> Arc<Completions>` takes the pool by reference (it was `Arc<LanePool>` by value) and the source keeps only a `Weak`.
+
+**Why.** The owner of a device decides where its lanes, and then its context, are destroyed. The lattice lets go of a completed source on whichever worker releases the last claim on it, so a source that held the pool made the last reference to the lanes, and with it their driver-side teardown (a stream synchronise and destroy, event destroys, and the device's context release when it was the last holder), run there instead of at the owner's drop.
+
+**Breaking:** yes, for callers. `Completions::new` takes `&Arc<LanePool>`; a caller that handed its only `Arc` to the source (and relied on the source to keep the lanes) must now keep the pool itself, or every marker it registers is leaked.
+
+**How to use it.** `let completions = Completions::new(&lanes);` and keep `lanes` for as long as markers of it are registered. To tear down: `LatticeSource::complete(&*completions)`, drop `lanes`, then release the device.
+
+**Semantics.**
+- The owner's drop of the last strong reference to the pool destroys the lanes on that thread, whether a source on it is alive, attached, completed or not, and whatever else still holds the source.
+- A poll (`reap`) upgrades the pool once for all its markers (no lock). While the pool lives, markers are read exactly as before.
+- Once the pool is gone no marker can be observed, and none is treated as reached, whatever it was before: a pending marker registration is removed at the next poll (or at the source's drop), its frame is leaked (`mem::forget`) and counted in `leaked_unreached`, and it leaves `pending`. A marker registered afterwards ends the same way at the next poll. This is the refusal of a marker not reached, because the lane's work may still be using what the frame holds and nothing says it stopped. `at`, `register`, `after`, `after_wake` and `after_retired` do not name a lane and are unaffected.
+- Nothing else changed: the lattice's let-go, the downstream slot, deadline order, lateness accounting and reap pacing.
+
+**Tests.** In `euhedral-graph/src/completions.rs`: `the_owner_dropping_the_pool_destroys_the_lanes_there_while_a_source_is_alive`, `a_completed_source_still_held_elsewhere_does_not_keep_the_lanes`, `markers_pending_when_the_pool_goes_are_leaked_and_counted_never_emitted`, `markers_pending_at_the_source_drop_after_the_pool_went_are_leaked_and_counted`, `timers_and_pending_operations_keep_working_after_the_pool_is_gone`. They replace the test that pinned the source holding its lanes for its life.
+
 ## HTTP/1.1 messages, a strict incremental parser and a writer (`euhedral-net`) (2026-11-14)
 
 **What.** A new crate, `euhedral-net`, the message layer of an HTTP/1.1 server and client, with no I/O, no frame, no timer and no dependency. Types: `Request`, `Response`, `Headers` (ordered, repeats kept, names found without regard to case), `Method` (named variants and `Other`; a named token held in `Other` is still that method), `Version`, `TargetForm`, `ConnectionMode`. Parsers: `RequestParser` and `ResponseParser`, pure and incremental, with `Limits`, `Progress`, `State` and `PendingHead` (the head of a request whose body is still arriving, with `authority`, `keep_alive` and `expects_continue`). Writers: `write_response`, `write_response_head` (the head of a response to HEAD, with the length the body would have), `write_request` and `write_continue`. Errors: `ParseError` (`status()` is the status a server answers, or `None` for an error that has none) and `WriteError`. `reason_phrase` gives the usual phrase of a status.

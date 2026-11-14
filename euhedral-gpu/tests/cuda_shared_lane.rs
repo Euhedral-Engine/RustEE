@@ -228,7 +228,7 @@ fn stages_submit_on_their_lanes_and_the_boundary_covers_both() {
     let axpb = module.kernel("axpb").unwrap();
     let spin = module.kernel("spin").unwrap();
     let lanes = lanes(&gpu, 2);
-    let completions = Completions::new(lanes.queues.clone());
+    let completions = Completions::new(&lanes.queues);
     let queue = MpmcQueue::<Box<dyn Frame>>::bounded(1024);
     let frames: Consumer<Box<dyn Frame>, Multi> = queue.consumer();
     let mut spec = StageGraphSpec::new();
@@ -390,7 +390,7 @@ fn a_retirement_cell_is_settled_in_a_frame_after_the_work_before_it() {
     .unwrap();
     let cell = Arc::new(RetireCell::new());
     lane.notify_retired(&cell).unwrap();
-    let completions = Completions::new(lanes.queues.clone());
+    let completions = Completions::new(&lanes.queues);
     completions.after_retired(cell.clone(), Box::new(DummyFrame::INSTANCE));
     let mut frames = Vec::new();
     assert!(wait_until(Duration::from_secs(20), || {
@@ -414,7 +414,7 @@ fn what_stages_hold_is_released_by_their_hooks_once_per_quantum() {
     let Some(module) = module(&gpu) else { return };
     let spin = module.kernel("spin").unwrap();
     let lanes = lanes(&gpu, 2);
-    let completions = Completions::new(lanes.queues.clone());
+    let completions = Completions::new(&lanes.queues);
     let queue = MpmcQueue::<Box<dyn Frame>>::bounded(1024);
     let frames: Consumer<Box<dyn Frame>, Multi> = queue.consumer();
     let mut spec = StageGraphSpec::new();

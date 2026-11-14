@@ -205,7 +205,7 @@ fn overlapping_quanta(window: usize) {
         module.kernel("spin").unwrap(),
     );
     let lanes = lanes(&gpu, 2);
-    let completions = Completions::new(lanes.queues.clone());
+    let completions = Completions::new(&lanes.queues);
     let queue = MpmcQueue::<Box<dyn Frame>>::bounded(1024);
     let frames: Consumer<Box<dyn Frame>, Multi> = queue.consumer();
     let mut spec = StageGraphSpec::new();

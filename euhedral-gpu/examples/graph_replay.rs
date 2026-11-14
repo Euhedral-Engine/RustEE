@@ -346,7 +346,7 @@ fn run() -> Result<(), String> {
         streams.next().ok_or("no lane a")?,
         streams.next().ok_or("no lane b")?,
     );
-    let completions = Completions::new(pool);
+    let completions = Completions::new(&pool);
     lattice
         .add_upstream(completions.clone())
         .map_err(|e| format!("{e:?}"))?;

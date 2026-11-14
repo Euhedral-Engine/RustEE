@@ -167,7 +167,7 @@ fn warm_stages_submit_and_quanta_run_without_allocating() {
         ("b", StreamOptions::default()),
     ];
     let lanes = open_shared_lanes(&gpu, &specs).unwrap();
-    let completions = Completions::new(lanes.queues.clone());
+    let completions = Completions::new(&lanes.queues);
     let queue = MpscQueue::<Box<dyn Frame>>::bounded(1024);
     let mut frames: Consumer<Box<dyn Frame>, Single> = queue.consumer();
     let mut spec = StageGraphSpec::new();
