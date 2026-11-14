@@ -14,15 +14,15 @@ registration's own sweep) finishes its frame through `do_finally` without runnin
 the source if no poll comes. It does
 not panic: only the polling thread sees it, and it cannot tell a misuse from a poll that was late.
 
-**source without lanes** ([`Completions::without_lanes`](src/completions.rs)): a `Completions` built with no lane pool.
-Deadlines, `Ready` tokens, `Pending` operations and retirement cells work on it as on any other; a marker registration
-is refused (its frame is finished through `do_finally` without running, and debug builds panic) and, as no lane can be
-using what that frame holds, it is not leaked.
-
 **leaked registration** ([`Completions::leaked_unreached`](src/completions.rs)): a registration that waits
 for a lane's marker the lane has still not reached, and is refused, late or abandoned. It is leaked
 (`mem::forget`) and counted, because the device may still use what its frame holds, and finishing the frame
 would release it.
+
+**source without lanes** ([`Completions::without_lanes`](src/completions.rs)): a `Completions` built with no lane pool.
+Deadlines, `Ready` tokens, `Pending` operations and retirement cells work on it as on any other; a marker registration
+is refused and its frame is leaked and counted, as for any refused marker not reached (the lane it names may still
+use what the frame holds), and debug builds panic.
 
 **progress** ([`Progress`](src/sequencer.rs)): an entry's readiness word: pending, ready or abandoned. The
 finishing thread stores it with release ordering after it wrote whatever the entry carries, and the thread

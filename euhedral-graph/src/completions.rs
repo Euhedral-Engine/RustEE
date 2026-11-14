@@ -96,7 +96,7 @@ pub trait Pending: Send {
 pub struct Completions {
     /// The lanes polled for markers: fixed for the source's life and dropped with it. A marker
     /// counts as reached when its lane says so, also after the source has completed. `None` for a
-    /// source built [`without_lanes`](Self::without_lanes): it takes no markers.
+    /// source built [`without_lanes`](Self::without_lanes): it takes no markers, and none is ever reached.
     lanes: Option<Arc<LanePool>>,
     /// Registered since the last poll; any thread appends, lock-free. [`LatticeSource::complete`]
     /// appends one [`Slot::Closed`] marker: what is behind it was registered too late.
@@ -443,11 +443,7 @@ impl Completions {
     /// could be released while the device may still use them, they are not.
     fn cancel(&self, what: Waits) {
         let unreached = match &what {
-            // A source without lanes has no marker's work to protect: its frame is finished.
-            Waits::Marker(marker, _) => self
-                .lanes
-                .as_ref()
-                .is_some_and(|lanes| !lanes.reached(*marker)),
+            Waits::Marker(marker, _) => !self.reached(*marker),
             Waits::Retired(cell, _) => !cell.arrived(),
             _ => false,
         };
@@ -643,9 +639,10 @@ impl Completions {
     /// is not in this source's pool is never reached, so its frame is never emitted.
     ///
     /// A source built [`without_lanes`](Self::without_lanes) has no lane for any marker, and refuses the registration
-    /// the way one after [`complete`](LatticeSource::complete) is refused: the frame is finished through `do_finally`
-    /// without running (so whatever it holds ends; nothing is leaked, as no lane can be using it), it is not counted
-    /// by [`pending`](Self::pending), and debug builds panic.
+    /// the way one after [`complete`](LatticeSource::complete) is refused, except for what the frame holds: the marker
+    /// names a lane somewhere, whose work may still be in flight, so the frame is leaked and counted in
+    /// [`leaked_unreached`](Self::leaked_unreached) (as for any refused marker not reached), not finished. It is not
+    /// counted by [`pending`](Self::pending), and debug builds panic.
     pub fn after_marker(&self, marker: Marker, frame: Box<dyn Frame>) {
         if self.lanes.is_none() {
             self.cancel(Waits::Marker(marker, frame));
@@ -1360,15 +1357,15 @@ mod tests {
     }
 
     #[test]
-    fn timers_without_lanes_fire_in_deadline_order_and_not_before_their_deadline() {
+    fn due_timers_without_lanes_are_emitted_in_registration_order_and_none_before_its_deadline() {
         let completions = bare();
         let now = Instant::now();
         completions.at(now + Duration::from_secs(3600), tagged(4));
-        completions.at(now - Duration::from_millis(30), tagged(1));
-        completions.at(now - Duration::from_millis(20), tagged(2));
-        completions.at(now - Duration::from_millis(10), tagged(3));
+        completions.at(now - Duration::from_millis(10), tagged(1));
+        completions.at(now - Duration::from_millis(30), tagged(2));
+        completions.at(now - Duration::from_millis(20), tagged(3));
         assert_eq!(completions.pending(), 4);
-        assert_eq!(poll(&completions), [1, 2, 3]);
+        assert_eq!(poll(&completions), [1, 2, 3], "not sorted by deadline");
         assert_eq!(completions.pending(), 1);
         assert!(poll(&completions).is_empty());
         let (_, _, max) = completions.lateness_us();
@@ -1402,7 +1399,7 @@ mod tests {
     }
 
     #[test]
-    fn a_marker_without_lanes_is_refused_and_its_frame_is_finished_without_running() {
+    fn a_marker_without_lanes_is_refused_and_its_frame_is_leaked_and_counted() {
         let completions = bare();
         let (executed, finished) = (
             Arc::new(AtomicBool::new(false)),
@@ -1417,7 +1414,10 @@ mod tests {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             completions.after_marker(marker, Box::new(frame));
         }));
-        assert!(finished.load(Ordering::Acquire), "its do_finally ran");
+        assert!(
+            !finished.load(Ordering::Acquire),
+            "its do_finally did not run: the lane may still use what it holds"
+        );
         assert!(!executed.load(Ordering::Acquire), "it was not run");
         assert_eq!(
             result.is_err(),
@@ -1425,8 +1425,19 @@ mod tests {
             "debug builds panic"
         );
         assert_eq!(completions.pending(), 0);
-        assert_eq!(completions.leaked_unreached().load(Ordering::Acquire), 0);
+        assert_eq!(completions.leaked_unreached().load(Ordering::Acquire), 1);
         assert!(poll(&completions).is_empty());
+    }
+
+    #[test]
+    fn a_retirement_cell_registered_without_lanes_completes_when_it_arrives() {
+        let completions = bare();
+        let cell = Arc::new(RetireCell::new());
+        completions.after_retired(cell.clone(), tagged(6));
+        assert!(poll(&completions).is_empty());
+        cell.arrive(0);
+        assert_eq!(poll(&completions), [6]);
+        assert_eq!(completions.pending(), 0);
     }
 
     #[test]
