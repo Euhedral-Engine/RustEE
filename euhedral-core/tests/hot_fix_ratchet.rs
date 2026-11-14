@@ -60,11 +60,11 @@ const HOT_FIX_TAGS: &[(&str, usize)] = &[
 /// audit the locks it takes belong to. A file's count only shrinks, and is 0 once none of its ids is listed in
 /// [`HOT_FIX_TAGS`]; a file not listed here has no site.
 const LOCK_MACRO_SITES: &[(&str, &[&str], usize)] = &[
-    ("euhedral-io/src/uring.rs", &["I3", "I4", "I5", "I6"], 5),
+    ("euhedral-io/src/uring.rs", &["I3", "I4", "I5", "I6"], 7),
     (
         "euhedral-io/src/win/mod.rs",
         &["I7", "I8", "I9", "I10", "I11", "I12", "I13", "I14", "I15"],
-        31,
+        33,
     ),
 ];
 

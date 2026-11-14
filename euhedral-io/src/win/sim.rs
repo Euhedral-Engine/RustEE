@@ -14,8 +14,8 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use super::super::{Create, OpenSpec};
 use super::sys::{
-    BuildError, Cqe, Handle, HandleMode, Overlapped, Packet, RingProbe, STATUS_END_OF_FILE,
-    STATUS_PENDING, SockAddr, Sys,
+    BuildError, Cqe, Handle, HandleMode, Overlapped, Packet, RingProbe, STATUS_CANCELLED,
+    STATUS_END_OF_FILE, STATUS_PENDING, SockAddr, Sys,
 };
 
 /// The calls a script can make fail.
@@ -92,6 +92,8 @@ struct State {
     /// How many entries each ring submit handed over.
     submit_sizes: Vec<usize>,
     panic_next_open: bool,
+    /// The clock of [`Sys::now_ns`].
+    clock: u64,
 }
 
 type Hook = std::sync::Arc<dyn Fn() + Send + Sync>;
@@ -258,6 +260,12 @@ impl Sim {
     /// Completions wait until [`release`](Self::release).
     pub(super) fn hold(&self, hold: bool) {
         self.s().hold = hold;
+    }
+
+    /// Moves the clock on.
+    pub(super) fn advance(&self, by: std::time::Duration) {
+        let mut s = self.s();
+        s.clock += u64::try_from(by.as_nanos()).unwrap();
     }
 
     pub(super) fn release(&self) {
@@ -495,6 +503,28 @@ impl Sys for Sim {
             out.push(packet);
         }
         Ok(())
+    }
+
+    unsafe fn cancel_io(&self, handle: Handle, ov: *mut Overlapped) {
+        let mut s = self.s();
+        s.log.push(format!("cancel {handle:#x}"));
+        // A call that is held is still pending: it ends cancelled. One that ended already is not
+        // found.
+        if let Some(at) = s
+            .held_packets
+            .iter()
+            .position(|(packet, _)| packet.overlapped == ov as usize)
+        {
+            let (mut packet, _) = s.held_packets.remove(at);
+            packet.bytes = 0;
+            // SAFETY: the held operation's `OVERLAPPED` is valid until its packet is handled.
+            unsafe { Self::complete_overlapped(&packet, STATUS_CANCELLED) };
+            s.port.push_back(packet);
+        }
+    }
+
+    fn now_ns(&self) -> u64 {
+        self.s().clock
     }
 
     fn post(&self, _port: Handle, overlapped: usize) -> io::Result<()> {

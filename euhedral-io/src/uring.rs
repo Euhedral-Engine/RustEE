@@ -15,14 +15,15 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     reason = "HOT-FIX(I3), HOT-FIX(I4), HOT-FIX(I5), HOT-FIX(I6)"
 )]
 use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
 
 use euhedral_core::frames::Frame;
 use euhedral_data_structures::queues::{Consumer, MpscQueue, Multi, Producer, Single};
 use io_uring::{IoUring, Submitter, opcode, squeue, types};
 
 use super::{
-    AsyncIo, AsyncIoOptions, Buf, Create, Engine, MAX_PIECE, OpenSpec, READ_PIECE, Request, Then,
-    conclude as conclude_io,
+    AsyncIo, AsyncIoOptions, Buf, Cancelled, Create, Engine, LimitPassed, MAX_PIECE, OpId,
+    OpenSpec, READ_PIECE, Request, Then, conclude as conclude_io,
 };
 
 /// Entries of each ring's submission queue (its completion queue has twice as many).
@@ -43,10 +44,17 @@ pub(super) struct Uring {
     #[allow(clippy::disallowed_types, reason = "HOT-FIX(I3)")]
     rings: Mutex<Vec<Arc<Ring>>>,
     enter: Box<Enter>,
+    /// Entries of each ring's submission queue.
+    ring_entries: u32,
     /// The most bytes one read, write or send hands the kernel; a test's stand-in lowers it to
     /// force short ones.
     max_piece: usize,
 }
+
+/// The user data of entries whose completion means nothing to an operation: an async cancel, and a
+/// linked timeout (which ends with `ETIME` when it fired, or `ECANCELED` when its operation ended
+/// first; either way the operation's own completion says what happened).
+const IGNORED: u64 = u64::MAX;
 
 static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
 
@@ -58,6 +66,8 @@ thread_local! {
 /// One submitting thread's ring and the operations in flight on it.
 struct Ring {
     uring: IoUring,
+    /// Where this ring is in the engine's list: the lane of its operations' [`OpId`]s.
+    index: u32,
     /// Pushing entries and entering the kernel: the owning thread, and a poll that resubmits the
     /// rest of a short read or hands over entries the kernel refused or had no room for.
     #[allow(clippy::disallowed_types, reason = "HOT-FIX(I4)")]
@@ -66,29 +76,87 @@ struct Ring {
     /// inside its enter: a lane's small read waited 1.4 ms for the lock). Lock-free: any thread
     /// appends; the `sq` holder drains it (the consumer lives in [`Queue`]) before it lets go, and
     /// looks again after it does (see [`Ring::flush_waiting`]).
-    incoming: Producer<squeue::Entry, Multi>,
+    incoming: Producer<Item, Multi>,
     /// Set after a push to `incoming`, once the entry is published; the `sq` holder clears it
     /// before it drains, and looks again after it lets go.
     // HOT-FIX(S6a): the flag hands entries from a second submitter to the `sq` holder.
     waiting: AtomicBool,
     /// Reaping: one poll at a time (the lattice's guarantee; the lock makes it a fact).
     #[allow(clippy::disallowed_types, reason = "HOT-FIX(I5)")]
-    cq: Mutex<()>,
+    cq: Mutex<Consumer<Ended, Single>>,
     #[allow(clippy::disallowed_types, reason = "HOT-FIX(I6)")]
     ops: Mutex<Ops>,
     /// Entries handed to the submission queue and not yet reaped; at most the completion queue's
     /// size, so the completion queue never overflows.
     in_kernel: AtomicUsize,
     capacity: usize,
+    /// Completion-queue entries only async cancels may use: operations stop at `capacity -
+    /// reserve`, so a cancel always finds room once the cancels before it completed (they need no
+    /// peer to speak), and never waits for an operation. A cancel whose operation's piece still
+    /// waits in the backlog ends that operation there, and takes no room.
+    reserve: usize,
+}
+
+/// What goes to the submission queue as one: an entry, or an entry and the timeout linked to it (the
+/// kernel must get the two together, so they are never split between two flushes).
+enum Item {
+    One(squeue::Entry),
+    /// The entry, its linked timeout, and the limit's point on the monotonic clock (a piece that
+    /// still waits when that passes never goes in).
+    Linked(Box<[squeue::Entry; 2]>, u64),
+    /// An async cancel of the operation with this user data. It is built when it goes in, may use
+    /// the completion queue's reserve (see [`Ring::reserve`]), and never goes in before an item of
+    /// its operation that still waits (the kernel must already hold what it cancels).
+    Cancel(u64),
+}
+
+impl Item {
+    /// Submission-queue entries (and so completions) the item takes.
+    fn entries(&self) -> usize {
+        match self {
+            Self::One(_) | Self::Cancel(_) => 1,
+            Self::Linked(..) => 2,
+        }
+    }
+
+    /// The user data of the operation a piece belongs to.
+    fn operation(&self) -> Option<u64> {
+        match self {
+            Self::One(entry) => Some(entry.get_user_data()),
+            Self::Linked(pair, _) => Some(pair[0].get_user_data()),
+            Self::Cancel(_) => None,
+        }
+    }
 }
 
 struct Queue {
     /// The drain side of [`Ring::incoming`]: only the `sq` holder has it.
-    incoming: Consumer<squeue::Entry, Single>,
+    incoming: Consumer<Item, Single>,
     /// Entries waiting for room in the kernel's queues, the oldest first.
-    backlog: VecDeque<squeue::Entry>,
+    backlog: VecDeque<Item>,
     /// Entries are in the submission queue that the kernel has not taken (an enter was refused).
     unsubmitted: bool,
+    /// Operations that ended while their next piece waited in the backlog (a cancel, or their
+    /// limit): nothing of them is in the kernel. The poll concludes them.
+    ended: Producer<Ended, Multi>,
+    /// `Cancel` items in the backlog: the flush stops walking the backlog when none is left.
+    cancels: usize,
+    /// `Linked` items in the backlog, and the earliest limit among them or before it (a lower
+    /// bound: it is not raised when the earliest leaves).
+    limited: usize,
+    earliest_ns: u64,
+}
+
+/// An operation that ended before its next piece reached the kernel, and why.
+struct Ended {
+    user_data: u64,
+    why: End,
+}
+
+#[derive(Clone, Copy)]
+enum End {
+    Cancelled,
+    LimitPassed,
 }
 
 /// The operations in flight on a ring, by slot; `user_data` is the slot and its generation.
@@ -177,9 +245,70 @@ struct Op {
     /// Bytes moved so far (reads and writes resubmit the rest).
     moved: usize,
     then: Then,
+    /// The time limit, if the operation has one.
+    limit: Option<Box<Limit>>,
+    /// [`Engine::cancel`] asked for the operation to end early.
+    cancelled: bool,
+}
+
+/// An operation's time limit as an absolute point of the monotonic clock: the kernel's linked
+/// timeout reads `spec` (so it stays in its own block) at every submission of a piece, and the
+/// whole operation, not each piece, is bound by it.
+struct Limit {
+    spec: types::Timespec,
+    at_ns: u64,
+}
+
+/// The monotonic clock in nanoseconds, the clock a linked timeout counts on.
+fn monotonic_ns() -> u64 {
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `now` is a valid `timespec` for the call to write.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &raw mut now) };
+    (now.tv_sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(now.tv_nsec as u64)
+}
+
+impl Limit {
+    /// A limit that ends `limit` from now.
+    fn after(limit: Duration) -> Box<Self> {
+        let at_ns =
+            monotonic_ns().saturating_add(u64::try_from(limit.as_nanos()).unwrap_or(u64::MAX));
+        // Seconds beyond what a `Timespec` holds are far past any process's life.
+        let spec = types::Timespec::new()
+            .sec((at_ns / 1_000_000_000).min(i64::MAX as u64))
+            .nsec((at_ns % 1_000_000_000) as u32);
+        Box::new(Self { spec, at_ns })
+    }
+
+    fn passed(&self) -> bool {
+        monotonic_ns() >= self.at_ns
+    }
 }
 
 impl Op {
+    /// What goes to the submission queue for the operation's next piece: its entry, with the
+    /// linked timeout of its limit.
+    fn item(&mut self, user_data: u64, max_piece: usize) -> Item {
+        let entry = self.entry(user_data, max_piece);
+        match &self.limit {
+            None => Item::One(entry),
+            Some(limit) => {
+                let timeout = opcode::LinkTimeout::new(&raw const limit.spec)
+                    .flags(types::TimeoutFlags::ABS)
+                    .build()
+                    .user_data(IGNORED);
+                Item::Linked(
+                    Box::new([entry.flags(squeue::Flags::IO_LINK), timeout]),
+                    limit.at_ns,
+                )
+            }
+        }
+    }
+
     /// The submission entry for the operation's next piece.
     fn entry(&mut self, user_data: u64, max_piece: usize) -> squeue::Entry {
         let piece = |n: usize| u32::try_from(n.min(max_piece)).unwrap_or(u32::MAX);
@@ -253,12 +382,20 @@ impl Op {
     }
 }
 
+/// What reached an operation: a completion, or the end of an operation whose next piece never went
+/// in.
+enum Arrival {
+    Completion(i32),
+    Unsubmitted(End),
+}
+
 /// What a reaped completion means for its operation.
 enum Reaped {
     /// It ended: its continuation's frame goes out.
     Ended(Op, io::Result<usize>),
-    /// A short read or write: the rest goes in again.
-    Again(squeue::Entry),
+    /// A short read or write: the rest was offered to the ring's queue (under the `ops` lock, so
+    /// that a cancel made after it queues behind it); the caller flushes.
+    Again,
     /// A completion of no operation (never expected).
     Stray,
 }
@@ -268,39 +405,95 @@ impl Ring {
         clippy::disallowed_types,
         reason = "HOT-FIX(I4), HOT-FIX(I5), HOT-FIX(I6)"
     )]
-    fn new() -> io::Result<Self> {
-        let uring = IoUring::builder().setup_clamp().build(RING_ENTRIES)?;
+    fn new(index: u32, entries: u32) -> io::Result<Self> {
+        let uring = IoUring::builder().setup_clamp().build(entries)?;
         let capacity = uring.params().cq_entries() as usize;
-        let incoming: MpscQueue<squeue::Entry> = MpscQueue::with_pool(INCOMING_CHUNK, 2);
+        // A linked pair must always fit between the operations' room and the reserve.
+        let reserve = (capacity / 8).max(1);
+        debug_assert!(
+            capacity - reserve >= 2,
+            "a ring too small for a linked pair"
+        );
+        let incoming: MpscQueue<Item> = MpscQueue::with_pool(INCOMING_CHUNK, 2);
+        let ended: MpscQueue<Ended> = MpscQueue::with_pool(INCOMING_CHUNK, 2);
         Ok(Self {
             uring,
+            index,
             sq: Mutex::new(Queue {
                 incoming: incoming.consumer(),
                 backlog: VecDeque::new(),
                 unsubmitted: false,
+                ended: ended.producer(),
+                cancels: 0,
+                limited: 0,
+                earliest_ns: u64::MAX,
             }),
             incoming: incoming.producer(),
             waiting: AtomicBool::new(false),
-            cq: Mutex::new(()),
+            cq: Mutex::new(ended.consumer()),
             ops: Mutex::new(Ops::default()),
             in_kernel: AtomicUsize::new(0),
             capacity,
+            reserve,
         })
     }
 
-    /// Queues `entry` and hands what fits to the kernel: here, or, when another thread is
-    /// submitting on the ring right now, by that thread before it lets go (never waiting for it).
-    fn queue(&self, entry: squeue::Entry, enter: &Enter) {
+    /// Appends `item` to the entries that wait for `sq`, without handing anything to the kernel:
+    /// [`flush_waiting`](Self::flush_waiting) does that. Callers that must keep two items in order
+    /// (a piece and the cancel of its operation) offer both under the `ops` lock.
+    fn offer(&self, item: Item) {
         // Cannot fail: the queue is unbounded. Were it ever to, the entry would be lost with its
         // operation still in `ops`: say so loudly.
-        let queued = self.incoming.offer(entry);
+        let queued = self.incoming.offer(item);
         assert!(
             queued.is_ok(),
             "the unbounded incoming queue refused an entry"
         );
         // After the publish: a holder that reads this `true` finds the entry.
         self.waiting.store(true, Ordering::SeqCst);
-        self.flush_waiting(enter);
+    }
+
+    /// Records that the operation ended with its next piece never reaching the kernel.
+    fn end_unsubmitted(queue: &Queue, user_data: u64, why: End) {
+        // Cannot fail: the queue is unbounded.
+        let queued = queue.ended.offer(Ended { user_data, why });
+        assert!(
+            queued.is_ok(),
+            "the unbounded queue of ended operations refused an entry"
+        );
+    }
+
+    /// Ends the operations whose next piece waits in the backlog past their limit: no piece starts
+    /// after the limit. Reads the clock on each flush while a limited piece waits, and walks the
+    /// backlog only once the earliest of their limits may have passed.
+    fn end_passed_limits(queue: &mut Queue) {
+        if queue.limited == 0 {
+            return;
+        }
+        let now = monotonic_ns();
+        if now < queue.earliest_ns {
+            return;
+        }
+        let mut earliest = u64::MAX;
+        let mut left = 0;
+        let mut passed = Vec::new();
+        queue.backlog.retain(|item| match item {
+            Item::Linked(pair, at_ns) if *at_ns <= now => {
+                passed.push(pair[0].get_user_data());
+                false
+            }
+            Item::Linked(_, at_ns) => {
+                earliest = earliest.min(*at_ns);
+                left += 1;
+                true
+            }
+            _ => true,
+        });
+        queue.limited = left;
+        queue.earliest_ns = earliest;
+        for user_data in passed {
+            Self::end_unsubmitted(queue, user_data, End::LimitPassed);
+        }
     }
 
     /// Moves backlog entries into the submission queue while the completion queue has room for
@@ -308,21 +501,72 @@ impl Ring {
     fn flush(&self, queue: &mut Queue, enter: &Enter) {
         let mut pushed = false;
         if !queue.backlog.is_empty() {
+            Self::end_passed_limits(queue);
             // SAFETY: the `sq` lock is held, so this is the only `SubmissionQueue` of the ring.
             let mut sq = unsafe { self.uring.submission_shared() };
-            while self.in_kernel.load(Ordering::Acquire) < self.capacity {
-                let Some(entry) = queue.backlog.front() else {
+            // Operations go in order; once one waits for room, the ones after it wait too. A cancel
+            // may pass them (it takes the reserve); one whose operation waits ahead of it ends
+            // that operation right here instead, as nothing of it is in the kernel.
+            let mut operations_wait = false;
+            let mut at = 0;
+            while let Some(item) = queue.backlog.get(at) {
+                if operations_wait && queue.cancels == 0 {
+                    // Nothing past here can go in.
                     break;
-                };
+                }
+                let in_kernel = self.in_kernel.load(Ordering::Acquire);
+                let entries = item.entries();
+                if let Item::Cancel(target) = item {
+                    let target = *target;
+                    let waiting = queue
+                        .backlog
+                        .iter()
+                        .take(at)
+                        .position(|ahead| ahead.operation() == Some(target));
+                    if let Some(waiting) = waiting {
+                        queue.backlog.remove(at);
+                        if let Some(Item::Linked(..)) = queue.backlog.remove(waiting) {
+                            queue.limited -= 1;
+                        }
+                        queue.cancels -= 1;
+                        Self::end_unsubmitted(queue, target, End::Cancelled);
+                        at -= 1;
+                        continue;
+                    }
+                    if in_kernel + entries > self.capacity {
+                        break;
+                    }
+                } else if operations_wait || in_kernel + entries > self.capacity - self.reserve {
+                    // An item's entries go in together, and each has a completion: room for all.
+                    operations_wait = true;
+                    at += 1;
+                    continue;
+                }
                 // SAFETY: every pointer in the entry is into its operation's buffer (or its boxed
                 // address), which the ring's `ops` own and leave untouched until the operation is
                 // reaped; a ring dropped with operations in flight leaks them (`Drop for Ring`).
-                // Accept passes null address pointers.
-                if unsafe { sq.push(entry) }.is_err() {
+                // Accept passes null address pointers; a linked timeout points at its operation's
+                // `Limit`, and an async cancel at nothing.
+                let pushed_item = match item {
+                    // SAFETY: as above.
+                    Item::One(entry) => unsafe { sq.push(entry) },
+                    // SAFETY: as above.
+                    Item::Linked(pair, _) => unsafe { sq.push_multiple(&pair[..]) },
+                    Item::Cancel(target) => {
+                        let cancel = opcode::AsyncCancel::new(*target).build().user_data(IGNORED);
+                        // SAFETY: as above.
+                        unsafe { sq.push(&cancel) }
+                    }
+                };
+                if pushed_item.is_err() {
                     break;
                 }
-                queue.backlog.pop_front();
-                self.in_kernel.fetch_add(1, Ordering::AcqRel);
+                match queue.backlog.remove(at) {
+                    Some(Item::Cancel(_)) => queue.cancels -= 1,
+                    Some(Item::Linked(..)) => queue.limited -= 1,
+                    _ => {}
+                }
+                self.in_kernel.fetch_add(entries, Ordering::AcqRel);
                 pushed = true;
             }
             sq.sync();
@@ -371,9 +615,24 @@ impl Ring {
             // The swap reads the pusher's `true`, so its entry is published for the drain below.
             self.waiting.swap(false, Ordering::SeqCst);
             let Queue {
-                incoming, backlog, ..
+                incoming,
+                backlog,
+                cancels,
+                limited,
+                earliest_ns,
+                ..
             } = &mut *queue;
-            incoming.drain_all(|entry| backlog.push_back(entry));
+            incoming.drain_all(|item| {
+                match &item {
+                    Item::Cancel(_) => *cancels += 1,
+                    Item::Linked(_, at_ns) => {
+                        *limited += 1;
+                        *earliest_ns = (*earliest_ns).min(*at_ns);
+                    }
+                    Item::One(_) => {}
+                }
+                backlog.push_back(item);
+            });
             if queue.unsubmitted || !queue.backlog.is_empty() {
                 self.flush(&mut queue, enter);
             }
@@ -386,10 +645,23 @@ impl Ring {
         }
     }
 
-    fn reap_one(&self, user_data: u64, result: i32, max_piece: usize) -> Reaped {
+    fn reap_one(&self, user_data: u64, arrival: Arrival, max_piece: usize) -> Reaped {
         let mut ops = lock!(&self.ops);
         let Some(op) = ops.get(user_data) else {
             return Reaped::Stray;
+        };
+        let result = match arrival {
+            Arrival::Completion(result) => result,
+            Arrival::Unsubmitted(why) => {
+                // As in the kernel's path: a cancelled operation ends as cancelled, whatever
+                // else ended it too.
+                let error = match why {
+                    End::LimitPassed if !op.cancelled => LimitPassed::error(op.moved),
+                    _ => Cancelled::error(op.moved),
+                };
+                let op = ops.remove(user_data).expect("the operation just found");
+                return Reaped::Ended(op, Err(error));
+            }
         };
         let ended = match op.kind {
             Kind::Read { .. } | Kind::Write { .. } | Kind::Send { .. } if result > 0 => {
@@ -400,9 +672,21 @@ impl Ring {
                     op.buf.filled()
                 };
                 if op.moved < total {
-                    return Reaped::Again(op.entry(user_data, max_piece));
+                    if op.cancelled {
+                        // The cancel found the operation between two pieces: nothing in the
+                        // kernel was left to cancel, so this is where it ends.
+                        Err(Cancelled::error(op.moved))
+                    } else if op.limit.as_ref().is_some_and(|l| l.passed()) {
+                        // The whole operation is bound by the limit: no piece starts after it.
+                        Err(LimitPassed::error(op.moved))
+                    } else {
+                        let item = op.item(user_data, max_piece);
+                        self.offer(item);
+                        return Reaped::Again;
+                    }
+                } else {
+                    Ok(op.moved)
                 }
-                Ok(op.moved)
             }
             Kind::Read { .. } if result == 0 => {
                 if op.moved == 0 {
@@ -417,6 +701,16 @@ impl Ring {
             Kind::Write { .. } if result == 0 => Err(io::Error::from(io::ErrorKind::WriteZero)),
             Kind::Send { .. } if result == 0 && op.buf.filled() > 0 => {
                 Err(io::Error::from(io::ErrorKind::WriteZero))
+            }
+            // Ended by the cancel (`ECANCELED`), or interrupted while it was being cancelled.
+            _ if (result == -libc::ECANCELED || result == -libc::EINTR) && op.cancelled => {
+                Err(Cancelled::error(op.moved))
+            }
+            // The linked timeout cancelled it: the clock it counted on has reached the limit.
+            _ if (result == -libc::ECANCELED || result == -libc::EINTR)
+                && op.limit.as_ref().is_some_and(|l| l.passed()) =>
+            {
+                Err(LimitPassed::error(op.moved))
             }
             _ if result < 0 => Err(io::Error::from_raw_os_error(-result)),
             _ => Ok(result as usize),
@@ -501,14 +795,20 @@ fn socket_address(to: std::net::SocketAddr) -> (Box<libc::sockaddr_storage>, lib
 impl Uring {
     /// An engine with `enter` in place of `io_uring_enter` and pieces of at most `max_piece` bytes
     /// (tests: the stand-in backend).
-    #[allow(clippy::disallowed_types, reason = "HOT-FIX(I3)")]
     fn with(enter: Box<Enter>, max_piece: usize) -> io::Result<Self> {
+        Self::sized(enter, max_piece, RING_ENTRIES)
+    }
+
+    /// As [`with`](Self::with), with rings of `ring_entries` submission-queue entries.
+    #[allow(clippy::disallowed_types, reason = "HOT-FIX(I3)")]
+    fn sized(enter: Box<Enter>, max_piece: usize, ring_entries: u32) -> io::Result<Self> {
         // A ring proves the kernel allows io_uring before anything relies on it.
-        drop(Ring::new()?);
+        drop(Ring::new(0, ring_entries)?);
         Ok(Self {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             rings: Mutex::new(Vec::new()),
             enter,
+            ring_entries,
             max_piece: max_piece.clamp(1, MAX_PIECE),
         })
     }
@@ -528,7 +828,7 @@ impl Uring {
             if rings.len() >= MAX_RINGS {
                 return Err(io::Error::other("too many threads submit to this AsyncIo"));
             }
-            let ring = Arc::new(Ring::new()?);
+            let ring = Arc::new(Ring::new(rings.len() as u32, self.ring_entries)?);
             rings.push(ring.clone());
             mine.push((self.id, Arc::downgrade(&ring)));
             Ok(ring)
@@ -601,32 +901,87 @@ fn open_flags(spec: OpenSpec) -> i32 {
 }
 
 impl Engine for Uring {
-    fn submit(&self, request: Request, buf: Buf, then: Then) -> io::Result<()> {
+    fn submit(
+        &self,
+        request: Request,
+        buf: Buf,
+        then: Then,
+        limit: Option<Duration>,
+    ) -> io::Result<OpId> {
         let kind = Self::kind(request)?;
         let ring = self.ring()?;
-        let entry = {
+        let user_data = {
             let mut ops = lock!(&ring.ops);
             let user_data = ops.insert(Op {
                 kind,
                 buf,
                 moved: 0,
                 then,
+                limit: limit.map(Limit::after),
+                cancelled: false,
             });
-            ops.get(user_data)
+            let item = ops
+                .get(user_data)
                 .expect("just inserted")
-                .entry(user_data, self.max_piece)
+                .item(user_data, self.max_piece);
+            // Offered before the lock lets go: a cancel finds the operation only after its first
+            // piece is queued.
+            ring.offer(item);
+            user_data
         };
-        ring.queue(entry, &*self.enter);
-        Ok(())
+        ring.flush_waiting(&*self.enter);
+        Ok(OpId::new(self.id as u64, ring.index, user_data))
+    }
+
+    fn cancel(&self, id: OpId) {
+        if id.engine() != self.id as u64 {
+            return;
+        }
+        let Some(ring) = lock!(&self.rings).get(id.lane() as usize).cloned() else {
+            return;
+        };
+        {
+            let mut ops = lock!(&ring.ops);
+            // An operation that ended (or whose slot a later one took: the generation differs) is
+            // not there, and nothing is submitted. A second cancel adds nothing to the first.
+            let Some(op) = ops.get(id.token()) else {
+                return;
+            };
+            if op.cancelled {
+                return;
+            }
+            op.cancelled = true;
+            // Offered under the lock that `reap_one` holds when it queues the next piece: the
+            // cancel is behind that piece, whichever of the two came first.
+            ring.offer(Item::Cancel(id.token()));
+        }
+        ring.flush_waiting(&*self.enter);
     }
 
     fn poll(&self, room: &mut dyn FnMut() -> bool, offer: &mut dyn FnMut(Box<dyn Frame>) -> bool) {
         let rings: Vec<Arc<Ring>> = lock!(&self.rings).clone();
         for ring in &rings {
             ring.flush_waiting(&*self.enter);
-            let Ok(_reaping) = ring.cq.try_lock() else {
+            let Ok(mut reaping) = ring.cq.try_lock() else {
                 continue;
             };
+            // Operations that ended in the backlog, a cancel or a limit: no completion will say so.
+            while room() {
+                let Some(Ended { user_data, why }) = reaping.poll() else {
+                    break;
+                };
+                match ring.reap_one(user_data, Arrival::Unsubmitted(why), self.max_piece) {
+                    Reaped::Ended(op, result) => {
+                        if !offer(conclude(op, result)) {
+                            ring.flush_waiting(&*self.enter);
+                            return;
+                        }
+                    }
+                    Reaped::Again | Reaped::Stray => {
+                        debug_assert!(false, "an ended operation ({user_data:#x}) of no operation")
+                    }
+                }
+            }
             loop {
                 if !room() {
                     break;
@@ -641,14 +996,17 @@ impl Engine for Uring {
                     break;
                 };
                 ring.in_kernel.fetch_sub(1, Ordering::AcqRel);
-                match ring.reap_one(user_data, result, self.max_piece) {
+                if user_data == IGNORED {
+                    continue;
+                }
+                match ring.reap_one(user_data, Arrival::Completion(result), self.max_piece) {
                     Reaped::Ended(op, result) => {
                         if !offer(conclude(op, result)) {
                             ring.flush_waiting(&*self.enter);
                             return;
                         }
                     }
-                    Reaped::Again(entry) => ring.queue(entry, &*self.enter),
+                    Reaped::Again => ring.flush_waiting(&*self.enter),
                     Reaped::Stray => {
                         debug_assert!(false, "a completion ({user_data:#x}) of no operation")
                     }
@@ -678,6 +1036,17 @@ impl AsyncIo {
     /// `max_piece` bytes (tests: the stand-in backend).
     fn open_with(enter: Box<Enter>, max_piece: usize) -> io::Result<Arc<Self>> {
         Ok(Self::from_engine(Uring::with(enter, max_piece)?))
+    }
+
+    /// As [`open_with`](Self::open_with), with rings of `ring_entries` submission-queue entries
+    /// (tests: a ring small enough to fill).
+    #[cfg(test)]
+    fn open_sized(enter: Box<Enter>, max_piece: usize, ring_entries: u32) -> io::Result<Arc<Self>> {
+        Ok(Self::from_engine(Uring::sized(
+            enter,
+            max_piece,
+            ring_entries,
+        )?))
     }
 }
 
@@ -1635,7 +2004,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             for round in 0..ROUNDS {
-                let ring = Arc::new(Ring::new().unwrap());
+                let ring = Arc::new(Ring::new(0, RING_ENTRIES).unwrap());
                 let slow: Arc<Enter> = Arc::new(|submitter: &Submitter<'_>| {
                     // Long enough for the other threads to push meanwhile.
                     let until = Instant::now() + Duration::from_micros(30);
@@ -1653,7 +2022,8 @@ mod tests {
                             for i in 0..EACH {
                                 let entry =
                                     opcode::Nop::new().build().user_data((t * EACH + i) as u64);
-                                ring.queue(entry, &*slow);
+                                ring.offer(Item::One(entry));
+                                ring.flush_waiting(&*slow);
                             }
                         })
                     })
@@ -1678,5 +2048,318 @@ mod tests {
         });
         rx.recv_timeout(Duration::from_secs(120))
             .expect("the rounds did not finish in time");
+    }
+
+    /// What an engine's polls found, until `count` operations ended (10 s at most).
+    fn engine_polls(engine: &Uring, count: usize) -> Vec<Done> {
+        let mut out = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while out.len() < count {
+            assert!(Instant::now() < deadline, "the operations did not end");
+            engine.poll(&mut || true, &mut |frame| {
+                out.push(
+                    *(frame as Box<dyn std::any::Any>)
+                        .downcast::<Done>()
+                        .expect("a Done frame"),
+                );
+                true
+            });
+        }
+        out
+    }
+
+    /// A cancel made after a poll reaped a piece and before the next piece went in must not be
+    /// lost: both are offered in one order, under the lock the reaping holds, so the kernel gets
+    /// the piece first and the cancel finds it. Driven by hand, the interleaving being the point.
+    #[test]
+    fn a_cancel_between_two_pieces_queues_behind_the_next_piece_and_ends_the_send() {
+        let engine = Uring::with(
+            Box::new(|submitter: &Submitter<'_>| submitter.submit()),
+            4096,
+        )
+        .unwrap();
+        let (ours, _theirs) = socket_pair(4096);
+        let total = 8 * 4096;
+        let id = engine
+            .submit(
+                Request::Send {
+                    sock: crate::raw_sock(ours.as_raw_fd()),
+                },
+                IoBuf {
+                    bytes: vec![7; total],
+                    filled: total,
+                }
+                .into(),
+                Then::Io(then(1)),
+                None,
+            )
+            .unwrap();
+        let ring = engine.ring().unwrap();
+        // The first piece's completion, taken by hand: this is the poll that is about to reap it.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let (user_data, result) = loop {
+            let next = {
+                // SAFETY: the test is the only reader of the ring's completion queue.
+                let mut cq = unsafe { ring.uring.completion_shared() };
+                cq.next().map(|cqe| (cqe.user_data(), cqe.result()))
+            };
+            if let Some(found) = next {
+                break found;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the first piece did not complete"
+            );
+        };
+        ring.in_kernel.fetch_sub(1, Ordering::AcqRel);
+        let first = usize::try_from(result).expect("the first piece moved bytes");
+        assert!(first < total);
+        // No room is left in the socket: the next piece waits for the peer, which never reads.
+        let fill = [0_u8; 1];
+        loop {
+            // SAFETY: a non-blocking send of one byte from a live buffer on a socket we own.
+            let sent = unsafe {
+                libc::send(
+                    ours.as_raw_fd(),
+                    fill.as_ptr().cast(),
+                    1,
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            if sent < 0 {
+                break;
+            }
+        }
+        assert!(matches!(
+            ring.reap_one(user_data, Arrival::Completion(result), engine.max_piece),
+            Reaped::Again
+        ));
+        // The cancel arrives here: after the piece was queued, before the poll handed it over.
+        engine.cancel(id);
+        let done = engine_polls(&engine, 1).pop().unwrap().done.unwrap();
+        let error = done.result.unwrap_err();
+        assert_eq!(Cancelled::moved_of(&error), Some(first));
+        assert_eq!(done.buf.bytes.len(), total);
+        assert_eq!(ring.in_kernel.load(Ordering::Acquire), 0);
+    }
+
+    /// Cancels have a reserve in the completion queue: with every completion entry an operation may
+    /// use taken by operations that wait on silent peers, a cancel still goes in, and ends its
+    /// operation without any peer speaking.
+    #[test]
+    fn a_cancel_does_not_wait_for_room_in_a_full_completion_queue() {
+        let io = AsyncIo::open_sized(
+            Box::new(|submitter: &Submitter<'_>| submitter.submit()),
+            MAX_PIECE,
+            4,
+        )
+        .unwrap();
+        // The ring's completion queue has 8 entries: more silent receives than it holds.
+        let pairs: Vec<_> = (0..10)
+            .map(|_| std::os::unix::net::UnixStream::pair().unwrap())
+            .collect();
+        let ids: Vec<_> = pairs
+            .iter()
+            .enumerate()
+            .map(|(i, (ours, _))| {
+                io.recv_with(
+                    ours.as_raw_fd(),
+                    buf(16),
+                    crate::OpOptions::default(),
+                    then(i as u64),
+                )
+                .unwrap()
+            })
+            .collect();
+        for _ in 0..200 {
+            io.reap();
+        }
+        assert_eq!(io.pending(), 10);
+        // Seven operations are in the kernel (the eighth entry is the reserve): this one is among
+        // them, and its cancel goes in at once.
+        io.cancel(ids[0]);
+        let done = poll(&io, 1);
+        for (_, frame) in done {
+            let error = frame.done.unwrap().result.unwrap_err();
+            assert!(Cancelled::is(&error));
+        }
+        // The rest still waits for its peers, and the cancelled operation's room went to an
+        // operation that had waited for it: cancel them all and every one ends once.
+        for id in &ids[1..] {
+            io.cancel(*id);
+        }
+        let rest = poll(&io, 9);
+        assert!(rest.iter().all(|(_, frame)| {
+            frame
+                .done
+                .as_ref()
+                .unwrap()
+                .result
+                .as_ref()
+                .is_err_and(Cancelled::is)
+        }));
+        assert_eq!(io.pending(), 0);
+    }
+
+    /// A ring with every completion entry an operation may use taken by silent receives, and
+    /// `waiting` more behind them in the backlog (the small ring takes seven in the kernel).
+    fn full_ring(
+        waiting: usize,
+        last_limit: Option<Duration>,
+    ) -> (
+        std::sync::Arc<AsyncIo>,
+        Vec<OpId>,
+        Vec<(
+            std::os::unix::net::UnixStream,
+            std::os::unix::net::UnixStream,
+        )>,
+    ) {
+        let io = AsyncIo::open_sized(
+            Box::new(|submitter: &Submitter<'_>| submitter.submit()),
+            MAX_PIECE,
+            4,
+        )
+        .unwrap();
+        let total = 7 + waiting;
+        let pairs: Vec<_> = (0..total)
+            .map(|_| std::os::unix::net::UnixStream::pair().unwrap())
+            .collect();
+        let ids: Vec<_> = pairs
+            .iter()
+            .enumerate()
+            .map(|(i, (ours, _))| {
+                let options = crate::OpOptions {
+                    limit: if i + 1 == total { last_limit } else { None },
+                };
+                io.recv_with(ours.as_raw_fd(), buf(16), options, then(i as u64))
+                    .unwrap()
+            })
+            .collect();
+        for _ in 0..50 {
+            io.reap();
+        }
+        assert_eq!(io.pending(), total);
+        (io, ids, pairs)
+    }
+
+    /// An operation still waiting for room in the kernel's queues ends on its cancel, with no other
+    /// operation completing and no peer speaking.
+    #[test]
+    fn a_cancel_ends_an_operation_that_waits_in_the_backlog() {
+        let (io, ids, _pairs) = full_ring(3, None);
+        io.cancel(ids[9]);
+        let done = poll(&io, 1);
+        assert_eq!(done[0].0, 9);
+        let error = done[0]
+            .1
+            .done
+            .as_ref()
+            .unwrap()
+            .result
+            .as_ref()
+            .unwrap_err();
+        assert!(Cancelled::is(error));
+        assert_eq!(Cancelled::moved_of(error), Some(0));
+        assert_eq!(io.pending(), 9);
+        for id in &ids[..9] {
+            io.cancel(*id);
+        }
+        assert_eq!(poll(&io, 9).len(), 9);
+        assert_eq!(io.pending(), 0);
+    }
+
+    /// The limit of an operation that waits in the backlog runs from its submission: at the limit
+    /// it ends with [`LimitPassed`], whatever else is (not) completing.
+    #[test]
+    fn a_limit_ends_an_operation_that_waits_in_the_backlog() {
+        let started = Instant::now();
+        let (io, ids, _pairs) = full_ring(1, Some(Duration::from_millis(50)));
+        let done = poll(&io, 1);
+        assert!(started.elapsed() >= Duration::from_millis(50));
+        assert_eq!(done[0].0, 7);
+        let error = done[0]
+            .1
+            .done
+            .as_ref()
+            .unwrap()
+            .result
+            .as_ref()
+            .unwrap_err();
+        assert!(crate::LimitPassed::is(error));
+        assert_eq!(io.pending(), 7);
+        for id in &ids[..7] {
+            io.cancel(*id);
+        }
+        assert_eq!(poll(&io, 7).len(), 7);
+        assert_eq!(io.pending(), 0);
+    }
+
+    /// An operation cancelled and past its limit while it waits ends as cancelled, as one in the
+    /// kernel does.
+    #[test]
+    fn a_cancelled_operation_past_its_limit_in_the_backlog_ends_as_cancelled() {
+        let started = Instant::now();
+        let (io, ids, _pairs) = full_ring(1, Some(Duration::from_millis(50)));
+        // The limit passes before the cancel is flushed (the clock, not a poll, is waited for).
+        while started.elapsed() < Duration::from_millis(60) {
+            std::hint::spin_loop();
+        }
+        io.cancel(ids[7]);
+        let done = poll(&io, 1);
+        assert_eq!(done[0].0, 7);
+        let error = done[0]
+            .1
+            .done
+            .as_ref()
+            .unwrap()
+            .result
+            .as_ref()
+            .unwrap_err();
+        assert!(Cancelled::is(error));
+        for id in &ids[..7] {
+            io.cancel(*id);
+        }
+        assert_eq!(poll(&io, 7).len(), 7);
+    }
+
+    /// A limited send is bound as a whole: a piece that finishes after the limit is the last.
+    #[test]
+    fn no_piece_of_a_send_starts_after_its_limit() {
+        let io = short_pieces(1024);
+        let (ours, mut theirs) = socket_pair(1 << 20);
+        let total = 64 * 1024;
+        io.send_with(
+            ours.as_raw_fd(),
+            IoBuf {
+                bytes: vec![1; total],
+                filled: total,
+            },
+            crate::OpOptions {
+                limit: Some(Duration::ZERO),
+            },
+            then(1),
+        )
+        .unwrap();
+        let done = poll(&io, 1).pop().unwrap().1.done.unwrap();
+        let error = done.result.unwrap_err();
+        let moved = crate::LimitPassed::moved_of(&error).expect("the limit's error");
+        assert!(
+            moved < total,
+            "the send stopped at its limit, not at its end"
+        );
+        // Every byte that went out is in the peer's buffer already.
+        theirs.set_nonblocking(true).unwrap();
+        let mut sink = vec![0; total];
+        let mut got = 0;
+        while let Ok(n) = theirs.read(&mut sink[got..]) {
+            if n == 0 {
+                break;
+            }
+            got += n;
+        }
+        assert_eq!(
+            got, moved,
+            "the bytes that arrived are those the error counts"
+        );
     }
 }

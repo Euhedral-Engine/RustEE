@@ -76,6 +76,65 @@ internally, each landing at its own offset. `read` stays as it was, for a `Vec`-
   [CI](../.github/workflows/windows.yml) on every push to the `graph` branch.
 - **macOS:** no engine yet.
 
+### Time limits and cancel
+
+`send_with`, `recv_with`, `accept_with` and `connect_with` take an `OpOptions { limit: Option<Duration> }`
+and return an `OpId`; `cancel(id)` asks for that operation to end. Either way the continuation runs
+exactly once, the buffer comes back in it, and the socket stays usable.
+
+```no_run
+use std::time::Duration;
+use euhedral_io::{AsyncIo, Cancelled, IoBuf, IoThen, LimitPassed, OpOptions, RawSock};
+
+fn receive_for_a_second(io: &AsyncIo, socket: RawSock, then: IoThen) {
+    let buf = IoBuf { bytes: vec![0; 4096], filled: 0 };
+    let options = OpOptions { limit: Some(Duration::from_secs(1)) };
+    let id = io.recv_with(socket, buf, options, then).unwrap();
+    // Later, from any worker:
+    io.cancel(id);
+}
+
+/// What a continuation makes of a result.
+fn why(error: &std::io::Error) -> &'static str {
+    if Cancelled::is(error) {
+        "cancelled"
+    } else if LimitPassed::is(error) {
+        "limit passed"
+    } else {
+        "an error of the system"
+    }
+}
+```
+
+- **Three results, told apart.** A cancel ends with kind `Other` carrying `Cancelled` (not `Interrupted`,
+  which means "retry": a retry loop would reissue a cancelled operation). A passed limit ends with kind
+  `TimedOut` carrying `LimitPassed`, and no OS code: an `ETIMEDOUT` of the system has a code and no payload,
+  and so has an operation Windows aborted (`ERROR_OPERATION_ABORTED`, which `std` also calls `TimedOut`).
+  Test with `Cancelled::is`, `LimitPassed::is`, or `raw_os_error`. A kernel interruption (`EINTR`) of an
+  operation that was cancelled or whose limit passed is reported as that cancel or limit.
+- **The limit covers the whole operation**, every piece of a send included, counted from the call: no piece
+  starts after it passed.
+- **Bytes moved.** A send that ended early may have sent part of its bytes: `Cancelled::moved_of(&error)` and
+  `LimitPassed::moved_of(&error)` say how many (a receive, an accept and a connect move none that they report).
+  A stream on which a send ended early is no longer at a position the caller knows: close it, or resend from
+  the count with the peer's agreement. A connect that ended early leaves its socket in whatever state the
+  handshake had reached: close it.
+- **`cancel` never blocks** and may be called from any worker. An id names its operation, the slot's
+  generation and its `AsyncIo`: cancelling an operation that ended, even after its slot was reused, or
+  with the id of another `AsyncIo`, does nothing. A cancel that loses a race with the completion leaves the
+  real result.
+- **Linux and Android:** a limit is a linked timeout (`IORING_OP_LINK_TIMEOUT`, absolute on the monotonic
+  clock, so the kernel's own timer: no timer thread, no scan) and a cancel is `IORING_OP_ASYNC_CANCEL` by
+  the operation's user data. It needs a kernel with linked timeouts (5.5) and absolute timeouts (5.6). A
+  limited operation costs one boxed pair of entries per piece, and a ring keeps a part of its completion queue
+  for cancels, so that a cancel never waits for an operation in the kernel. An operation that still waits for
+  room in the queues (its piece is not in the kernel yet) ends on its cancel, or when its limit passes, without
+  going in, and without any other operation completing.
+- **Windows:** a cancel is `CancelIoEx` on the operation's own `OVERLAPPED`. The crate has no timer, so a
+  limit is a deadline kept in the engine's table and checked at the start of each poll: it ends the operation
+  at the first poll after it expires (a poll before the soonest deadline takes no lock). Limits and cancel
+  apply to socket operations on the completion port.
+
 ## Build and test
 
 ```sh

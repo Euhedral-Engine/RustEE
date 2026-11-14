@@ -36,6 +36,7 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::time::Duration;
 
 use euhedral_core::frames::{Frame, FrameError, FrameHeader};
 use euhedral_core::generics::{
@@ -109,6 +110,134 @@ pub struct IoDone {
 
 /// What continues an operation once it ended.
 pub type IoThen = Continuation<IoDone>;
+
+/// Names one operation in flight, for [`AsyncIo::cancel`]. Small, copyable, and valid only for the
+/// operation that returned it, on the [`AsyncIo`] that returned it: once that operation ended,
+/// cancelling the id does nothing, even after the engine reused the operation's slot for a later
+/// one, and the id of another `AsyncIo` is never found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct OpId {
+    engine: u64,
+    lane: u32,
+    token: u64,
+}
+
+impl OpId {
+    pub(crate) fn new(engine: u64, lane: u32, token: u64) -> Self {
+        Self {
+            engine,
+            lane,
+            token,
+        }
+    }
+
+    pub(crate) fn engine(self) -> u64 {
+        self.engine
+    }
+
+    #[cfg_attr(
+        windows,
+        allow(dead_code, reason = "the Windows engine has one table and no lanes")
+    )]
+    pub(crate) fn lane(self) -> u32 {
+        self.lane
+    }
+
+    pub(crate) fn token(self) -> u64 {
+        self.token
+    }
+}
+
+/// How a socket operation of [`AsyncIo`] is bounded: see [`AsyncIo::recv_with`], `send_with`,
+/// `accept_with` and `connect_with`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OpOptions {
+    /// The longest the operation may stay in flight, from the call that submitted it, the whole
+    /// operation (every piece of a send) included. An operation still in flight when it passes
+    /// ends with an error of kind [`io::ErrorKind::TimedOut`] carrying a [`LimitPassed`], and the
+    /// socket stays usable. This holds for an operation that still waits for room in the engine's
+    /// queues too: it ends at the limit without having started. `None` is no limit.
+    pub limit: Option<Duration>,
+}
+
+/// The error of an operation that [`AsyncIo::cancel`] ended before it finished: kind
+/// [`io::ErrorKind::Other`] (not `Interrupted`, which means "retry"), carrying this value. Test for
+/// it with [`Cancelled::is`]: it is none of the other ways an operation ends early, a passed limit
+/// ([`LimitPassed`]) or an error of the operating system (which has an OS code).
+///
+/// A send that ended this way may have sent part of its bytes ([`moved`](Self::moved)); a stream on
+/// which a send ended early is no longer at a position the caller knows, and is best closed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cancelled {
+    /// Bytes the operation moved before it ended.
+    pub moved: usize,
+}
+
+impl Cancelled {
+    /// Whether `error` is the error of a cancelled operation.
+    pub fn is(error: &io::Error) -> bool {
+        Self::moved_of(error).is_some()
+    }
+
+    /// The bytes a cancelled operation moved before it ended, or `None` if `error` is not the
+    /// error of a cancelled operation.
+    pub fn moved_of(error: &io::Error) -> Option<usize> {
+        error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<Self>())
+            .map(|cancelled| cancelled.moved)
+    }
+
+    pub(crate) fn error(moved: usize) -> io::Error {
+        io::Error::other(Self { moved })
+    }
+}
+
+impl fmt::Display for Cancelled {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("the operation was cancelled")
+    }
+}
+
+impl std::error::Error for Cancelled {}
+
+/// The error of an operation whose limit passed: kind [`io::ErrorKind::TimedOut`], carrying this
+/// value, so that it is told from an `ETIMEDOUT` of the operating system (which has an OS code and
+/// no payload) with [`LimitPassed::is`]. As for [`Cancelled`], a send that ended this way may have
+/// sent part of its bytes ([`moved`](Self::moved)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LimitPassed {
+    /// Bytes the operation moved before it ended.
+    pub moved: usize,
+}
+
+impl LimitPassed {
+    /// Whether `error` is the error of an operation whose limit passed.
+    pub fn is(error: &io::Error) -> bool {
+        Self::moved_of(error).is_some()
+    }
+
+    /// The bytes an operation moved before its limit passed, or `None` if `error` is not that
+    /// error.
+    pub fn moved_of(error: &io::Error) -> Option<usize> {
+        error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<Self>())
+            .map(|passed| passed.moved)
+    }
+
+    pub(crate) fn error(moved: usize) -> io::Error {
+        io::Error::new(io::ErrorKind::TimedOut, Self { moved })
+    }
+}
+
+impl fmt::Display for LimitPassed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("the operation did not finish within its limit")
+    }
+}
+
+impl std::error::Error for LimitPassed {}
 
 /// Memory the caller owns, that [`AsyncIo::read_into`] reads into: a pinned host arena, a mapped
 /// region, or any block the kernel may fill. The operation owns the value until it ends, and its
@@ -481,9 +610,20 @@ fn run_continuation(
 
 /// The platform's half of [`AsyncIo`]: it starts operations and finds their ends.
 pub(crate) trait Engine: Send + Sync {
-    /// Starts the operation and returns at once. On `Err`, nothing was started: `then` and the
-    /// buffer are dropped without running.
-    fn submit(&self, request: Request, buf: Buf, then: Then) -> io::Result<()>;
+    /// Starts the operation and returns at once, with the id that cancels it. On `Err`, nothing
+    /// was started: `then` and the buffer are dropped without running. With a `limit`, the
+    /// operation ends with a [`LimitPassed`] error if it is still in flight when the limit has passed.
+    fn submit(
+        &self,
+        request: Request,
+        buf: Buf,
+        then: Then,
+        limit: Option<Duration>,
+    ) -> io::Result<OpId>;
+
+    /// Asks for the operation to end early, with [`Cancelled`] (or its real result, if that came
+    /// first). Never waits. An id whose operation ended is ignored.
+    fn cancel(&self, id: OpId);
 
     /// Finds ended operations. Each is given to `offer` as its continuation's frame while `room`
     /// says the caller can take more; once `offer` returns `false` (it kept the frame), the engine
@@ -999,6 +1139,16 @@ impl AsyncIo {
     }
 
     fn submit(&self, request: Request, buf: Buf, then: Then) -> io::Result<()> {
+        self.submit_with(request, buf, then, None).map(|_| ())
+    }
+
+    fn submit_with(
+        &self,
+        request: Request,
+        buf: Buf,
+        then: Then,
+        limit: Option<Duration>,
+    ) -> io::Result<OpId> {
         let _hot = HotScope::enter();
         if self.front.is_complete() {
             return Err(io::Error::other("this AsyncIo is complete"));
@@ -1007,7 +1157,7 @@ impl AsyncIo {
         // not pending.
         self.front.pending.fetch_add(1, Ordering::AcqRel);
         self.unreaped.fetch_add(1, Ordering::AcqRel);
-        let started = self.engine.submit(request, buf, then);
+        let started = self.engine.submit(request, buf, then, limit);
         if started.is_err() {
             self.front.pending.fetch_sub(1, Ordering::AcqRel);
             self.unreaped.fetch_sub(1, Ordering::AcqRel);
@@ -1093,6 +1243,98 @@ impl AsyncIo {
     pub fn recv(&self, socket: RawSock, buf: IoBuf, then: IoThen) -> io::Result<()> {
         let sock = raw_sock(socket);
         self.submit(Request::Recv { sock }, buf.into(), Then::Io(then))
+    }
+
+    /// As [`send`](Self::send), bounded by `options`, and returning the [`OpId`] that
+    /// [`cancel`](Self::cancel) takes. The buffer comes back in the [`IoDone`] whatever ended the
+    /// operation. A send that ends early (limit or cancel) reports the bytes already sent in its
+    /// error ([`Cancelled::moved_of`], [`LimitPassed::moved_of`]); the stream is then at a position
+    /// only that count tells, and is best closed. The limit covers the whole send, every piece of
+    /// it.
+    pub fn send_with(
+        &self,
+        socket: RawSock,
+        buf: IoBuf,
+        options: OpOptions,
+        then: IoThen,
+    ) -> io::Result<OpId> {
+        if buf.filled > buf.bytes.len() {
+            return Err(invalid("filled is beyond the buffer"));
+        }
+        let sock = raw_sock(socket);
+        self.submit_with(
+            Request::Send { sock },
+            buf.into(),
+            Then::Io(then),
+            options.limit,
+        )
+    }
+
+    /// As [`recv`](Self::recv), bounded by `options`, and returning the [`OpId`] that
+    /// [`cancel`](Self::cancel) takes. A receive that ends early (limit or cancel) took no bytes
+    /// from the socket (`filled` is 0, and the error's byte count is 0), and the socket is usable
+    /// for the next one.
+    pub fn recv_with(
+        &self,
+        socket: RawSock,
+        buf: IoBuf,
+        options: OpOptions,
+        then: IoThen,
+    ) -> io::Result<OpId> {
+        let sock = raw_sock(socket);
+        self.submit_with(
+            Request::Recv { sock },
+            buf.into(),
+            Then::Io(then),
+            options.limit,
+        )
+    }
+
+    /// As [`accept`](Self::accept), bounded by `options`, and returning the [`OpId`] that
+    /// [`cancel`](Self::cancel) takes. The listener accepts again afterwards.
+    pub fn accept_with(
+        &self,
+        listener: RawSock,
+        options: OpOptions,
+        then: Continuation<io::Result<OwnedSock>>,
+    ) -> io::Result<OpId> {
+        let listener = raw_sock(listener);
+        let then = Then::Raw(Box::new(move |result| then(result.map(owned_sock))));
+        self.submit_with(
+            Request::Accept { listener },
+            IoBuf::default().into(),
+            then,
+            options.limit,
+        )
+    }
+
+    /// As [`connect`](Self::connect), bounded by `options`, and returning the [`OpId`] that
+    /// [`cancel`](Self::cancel) takes. A connect that ends early leaves the socket in whatever
+    /// state its handshake had reached: close it rather than reuse it.
+    pub fn connect_with(
+        &self,
+        socket: RawSock,
+        to: std::net::SocketAddr,
+        options: OpOptions,
+        then: Continuation<io::Result<()>>,
+    ) -> io::Result<OpId> {
+        let sock = raw_sock(socket);
+        let then = Then::Raw(Box::new(move |result| then(result.map(|_| ()))));
+        self.submit_with(
+            Request::Connect { sock, to },
+            IoBuf::default().into(),
+            then,
+            options.limit,
+        )
+    }
+
+    /// Asks for the operation `id` names to end early. A request: it returns at once, from any
+    /// thread, and never waits for the operation. The operation's continuation then runs exactly
+    /// once: with an error of kind `Other` for which [`Cancelled::is`] holds, or with its real result if it
+    /// finished first. Cancelling an operation that has already ended does nothing, and never
+    /// reaches a later operation that took its place. An id of another `AsyncIo` does nothing.
+    pub fn cancel(&self, id: OpId) {
+        self.engine.cancel(id);
     }
 
     /// Accepts one connection on a listening socket.
@@ -1238,3 +1480,8 @@ impl LatticeSource for AsyncIo {
         self.front.is_complete()
     }
 }
+
+/// Compiles the examples in the crate README as doctests.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;

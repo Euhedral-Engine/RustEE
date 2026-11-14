@@ -31,3 +31,11 @@ Windows' kernel ring for file reads and writes (Windows 11 22H2 and later), used
 is not emulated in user mode. `AsyncIoOptions { windows_ioring: false }` forces the port. Open and rename
 run on the OS thread pool and post to the port. A handle joins the engine's port and can serve one
 `AsyncIo`, ever.
+
+**limit, cancel, `OpId`** ([`lib.rs`](src/lib.rs)): `OpOptions { limit }` bounds a socket operation in time
+(the whole operation, every piece of a send); `cancel(OpId)` ends one on request. The `OpId` names an
+operation by its `AsyncIo`, slot and generation, so a cancel that arrives after the operation ended, after its
+slot was reused, or on another `AsyncIo`, finds nothing. A limit ends with `TimedOut` carrying `LimitPassed`, a
+cancel with `Other` carrying `Cancelled`; both carry the bytes moved. On Linux a limit is a linked timeout and
+a cancel an async cancel, which may use a reserve of the completion queue that operations may not; on Windows
+a cancel is `CancelIoEx` and a limit a deadline the poll checks.

@@ -15,6 +15,7 @@ use std::path::Path;
 use std::ptr::{null, null_mut};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI32, Ordering};
+use std::time::Instant;
 
 use windows_sys::Wdk::Storage::FileSystem::{
     FILE_MODE_INFORMATION, FILE_SYNCHRONOUS_IO_ALERT, FILE_SYNCHRONOUS_IO_NONALERT,
@@ -43,7 +44,7 @@ use windows_sys::Win32::Storage::FileSystem::{
     ReadFile, WriteFile,
 };
 use windows_sys::Win32::System::IO::{
-    CreateIoCompletionPort, GetQueuedCompletionStatusEx, IO_STATUS_BLOCK, OVERLAPPED,
+    CancelIoEx, CreateIoCompletionPort, GetQueuedCompletionStatusEx, IO_STATUS_BLOCK, OVERLAPPED,
     OVERLAPPED_ENTRY, PostQueuedCompletionStatus,
 };
 use windows_sys::Win32::System::LibraryLoader::{
@@ -403,6 +404,17 @@ impl Sys for RealSys {
             bytes: entry.dwNumberOfBytesTransferred,
         }));
         Ok(())
+    }
+
+    unsafe fn cancel_io(&self, handle: Handle, ov: *mut Overlapped) {
+        // SAFETY: cancels the call that was given `ov` on `handle`; if there is none (it ended) the
+        // call fails with `ERROR_NOT_FOUND`, which is the answer "nothing to cancel".
+        unsafe { CancelIoEx(handle as HANDLE, ov.cast::<OVERLAPPED>()) };
+    }
+
+    fn now_ns(&self) -> u64 {
+        static ORIGIN: OnceLock<Instant> = OnceLock::new();
+        u64::try_from(ORIGIN.get_or_init(Instant::now).elapsed().as_nanos()).unwrap_or(u64::MAX)
     }
 
     fn post(&self, port: Handle, overlapped: usize) -> io::Result<()> {
