@@ -23,6 +23,44 @@ semantics and the tests that pin it.
 
 **Tests.** In `euhedral-graph/src/completions.rs`: `the_owner_dropping_the_pool_destroys_the_lanes_there_while_a_source_is_alive`, `a_completed_source_still_held_elsewhere_does_not_keep_the_lanes`, `markers_pending_when_the_pool_goes_are_leaked_and_counted_never_emitted`, `markers_pending_at_the_source_drop_after_the_pool_went_are_leaked_and_counted`, `timers_and_pending_operations_keep_working_after_the_pool_is_gone`, `the_lanes_are_destroyed_on_the_owners_thread_not_the_one_that_drops_the_source`, `a_scan_with_no_marker_never_holds_the_pool_across_application_code`. They replace the test that pinned the source holding its lanes for its life.
 
+## An HTTP/1.1 client (`euhedral-net`) (2026-11-14)
+
+**What.** `euhedral-net` gains `request(io, sink, to, &request, config, then)`, `ClientConfig { limits, time_limit, read_chunk }`, `NetError`, `CallStage` and `MAX_INTERIM_RESPONSES`. Linux, Android and Windows. It uses `AsyncIo::socket_for` (see the entry for `euhedral-io` below).
+
+**Why.** A program needs to make one HTTP request to an address and get the response, or a precise error, with no thread parked and one time limit for the whole call.
+
+**Breaking:** none. New items only; the parser, the writer and the server are unchanged.
+
+**How to use it.** `request(&io, &sink, addr, &request, config, Box::new(|outcome| frame))`: `then` gets `Result<Response, NetError>` once and returns the frame that continues the work, which is offered to the sink. Keep the `AsyncIo` alive while calls are in flight.
+
+**Semantics.**
+- A call is a chain of step frames, not a source: its state is passed by ownership from the continuation of one operation to the frame it returns and on into the next operation, so only one place owns it at a time and nothing is shared (no cell, queue, lock or atomic). One operation is in flight at any moment, so there are no events to order that a source's inbox would be needed for.
+- One connection per call: connect, send the request with `Connection: close`, read one response, close. The socket is closed before `then` runs. `then` runs exactly once on every path: success, any error, an operation the engine refuses to start (or drops with the operation in flight, or a frame the lattice discards: `Abandoned`).
+- `time_limit` is one deadline from the call of `request`; each operation is issued with what is left of it, and a stage that has no time left is not started. `TimedOut(stage)` names where it passed. No timer of the crate's own.
+- Errors: `Connect(io::Error)`, `TimedOut(CallStage)`, `Io { stage, error }`, `PeerClosed(stage)`, `Malformed`, `Unsupported` (no `Content-Length` where a body needs one, or `Transfer-Encoding`: read-to-close and chunked bodies are refused as the parser refuses them), `OverLimit` (the `Limits`), `UnexpectedInterim(status)`, `Write(WriteError)` and `Abandoned(stage)`. The parser's and the writer's errors are kept, not turned into text.
+- HEAD reads no body. 1xx responses are skipped, up to 8; a `101` or a ninth is refused. Bytes after the final response are ignored.
+- A cancel of a call in flight is not offered: it would need the operation's id shared between the call and the canceller. The time limit ends a call.
+- Cost per call: one boxed state, one socket, the serialised request, a read buffer of `read_chunk` bytes (16 KiB by default), the response, and a continuation plus a step frame per operation. No source, no attach or detach of the lattice.
+
+**Tests.** `tests/client.rs`, on a real lattice and `AsyncIo` over loopback, against the crate's own server and raw sockets: a response with a body, an empty body, HEAD; the request as sent (method, body, `Connection: close`); a refused connection (the io error kind kept); a request the writer refuses (no connection made); a server that never answers and one that stalls in the body (the limit error naming the stage, not before the limit); a limit already passed; a peer closing in the head and in the body; a head and a body over the limits; malformed and unsupported responses; interim responses skipped, `101` and a ninth refused; a head read a byte at a time; eight calls in flight answered in reverse order, each getting its own response; a refused operation reported as `Abandoned`. Every test ends with `then` having run once per call and no operation pending. None can pass before this change (the API does not exist).
+
+## A new socket for `connect` (`euhedral-io`) (2026-11-14)
+
+**What.** `AsyncIo::socket_for(to: SocketAddr) -> io::Result<OwnedSock>`: a new unconnected stream socket of `to`'s family, to hand to `connect` or `connect_with`.
+
+**Why.** `connect` takes a socket the caller made, and neither the standard library (its connect blocks) nor safe code can make an unconnected one, so a client had to use `unsafe` and a platform crate.
+
+**Breaking:** none. A new method; the engines' behaviour is unchanged.
+
+**How to use it.** `let socket = io.socket_for(addr)?; io.connect_with(socket.as_raw_fd(), addr, options, then)?;` keep `socket` until the connection ends; dropping it closes it.
+
+**Semantics.**
+- IPv4 for an IPv4 address, IPv6 for an IPv6 one. The result owns the socket: dropped unconnected, nothing stays open.
+- Linux and Android: `socket(2)` with `SOCK_STREAM | SOCK_CLOEXEC`, blocking (the engine waits for the handshake either way). Windows: `WSASocketW` with `WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT`, through the engine's own system layer; the engine binds the socket and joins it to its port when it connects, as for any socket it is given.
+- No operation is started: `pending` is unchanged. An error is the operating system's.
+
+**Tests.** `tests/socket_for.rs` (Linux, real engine): IPv4 and IPv6 sockets connect to a loopback listener and carry data both ways; one dropped unconnected leaves no descriptor open. `win::tests` (the simulated Windows engine): the socket is made for the address's family, is the caller's (not closed by the engine) and connects. The helper in `tests/socket_limits.rs` that called `socket(2)` is replaced by it. The Windows call itself is compile-checked only (`x86_64-pc-windows-gnu` clippy); it has not been run.
+
 ## An HTTP/1.1 server on `AsyncIo` (`euhedral-net`) (2026-11-14)
 
 **What.** `euhedral-net` gains `serve(lattice, io, sink, listener, config, handler, timers) -> io::Result<ServerHandle>`, `ServerConfig`, the `Handler` trait (a closure works), `Responder` (with `cancelled` and `on_cancel`), `ServerHandle { counters, stop }`, `Counters` and `no_work`. Linux, Android and Windows. The crate now depends on `euhedral-core`, `euhedral-data-structures`, `euhedral-graph` and `euhedral-io` (layer 4 over layers 1 to 3).

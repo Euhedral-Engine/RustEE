@@ -467,6 +467,11 @@ enum Taken {
 }
 
 impl Engine {
+    /// A new unconnected stream socket of `to`'s family, ready for a connect.
+    pub(super) fn new_socket(&self, to: std::net::SocketAddr) -> io::Result<usize> {
+        self.sys.new_socket(to)
+    }
+
     /// An engine over `sys`. Fails if there is no completion port.
     #[allow(
         clippy::disallowed_types,

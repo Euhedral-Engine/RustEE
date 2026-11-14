@@ -684,6 +684,15 @@ impl Sys for Sim {
         Ok(sock)
     }
 
+    fn new_socket(&self, to: std::net::SocketAddr) -> io::Result<Handle> {
+        let mut s = self.s();
+        let sock = Self::new_handle(&mut s);
+        s.socks.insert(sock, SimSock::default());
+        s.log
+            .push(format!("new socket {sock:#x} v4 {}", to.is_ipv4()));
+        Ok(sock)
+    }
+
     fn close_socket(&self, sock: Handle) {
         let mut s = self.s();
         s.closed_sockets.push(sock);

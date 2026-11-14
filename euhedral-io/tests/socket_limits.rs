@@ -219,7 +219,7 @@ fn a_limited_operation_that_finishes_in_time_ends_once_and_leaves_no_trace() {
     assert!(accepted.take().remove(0).is_ok());
     let connected: Outcomes<io::Result<()>> = Outcomes::default();
     let sink = connected.clone();
-    let socket = socket_for(to);
+    let socket = io.socket_for(to).unwrap();
     io.connect_with(
         socket.as_raw_fd(),
         to,
@@ -243,21 +243,6 @@ fn a_limited_operation_that_finishes_in_time_ends_once_and_leaves_no_trace() {
     peer.write_all(b"z").unwrap();
     recv_ok(&io, &ours, b"z");
     drop(client);
-}
-
-/// A new unconnected stream socket of the address's family.
-fn socket_for(to: SocketAddr) -> OwnedFd {
-    use std::os::fd::FromRawFd;
-    let family = if to.is_ipv4() {
-        libc::AF_INET
-    } else {
-        libc::AF_INET6
-    };
-    // SAFETY: a plain `socket(2)` call; the descriptor is new and owned by the result.
-    let fd = unsafe { libc::socket(family, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
-    assert!(fd >= 0);
-    // SAFETY: `fd` was just opened and nothing else owns it.
-    unsafe { OwnedFd::from_raw_fd(fd) }
 }
 
 #[test]
@@ -473,7 +458,7 @@ fn a_limited_connect_to_a_peer_that_does_not_answer_times_out() {
     let _queued = TcpStream::connect(to).unwrap();
     let out: Outcomes<io::Result<()>> = Outcomes::default();
     let sink = out.clone();
-    let socket = socket_for(SocketAddr::V4(to));
+    let socket = io.socket_for(SocketAddr::V4(to)).unwrap();
     io.connect_with(
         socket.as_raw_fd(),
         SocketAddr::V4(to),

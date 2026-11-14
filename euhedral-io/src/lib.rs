@@ -1433,6 +1433,39 @@ impl AsyncIo {
         self.submit(Request::Connect { sock, to }, IoBuf::default().into(), then)
     }
 
+    /// A new, unconnected stream socket of `to`'s address family (IPv4 or IPv6), for
+    /// [`connect`](Self::connect) or [`connect_with`](Self::connect_with) to connect to `to`, owned by the
+    /// result: dropping it closes it. It is made as the engine needs it: close-on-exec on Linux and Android,
+    /// and overlapped and not inheritable on Windows. The engine binds and joins it to its completion port
+    /// when it connects, so the caller does nothing else. Nothing is in flight on it, and the call does not
+    /// count in [`pending`](Self::pending).
+    ///
+    /// # Errors
+    ///
+    /// The operating system's error (for example, no descriptors left).
+    pub fn socket_for(&self, to: std::net::SocketAddr) -> io::Result<OwnedSock> {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            use std::os::fd::FromRawFd;
+            let family = if to.is_ipv4() {
+                libc::AF_INET
+            } else {
+                libc::AF_INET6
+            };
+            // SAFETY: a plain `socket(2)` call; it reads no memory of ours.
+            let fd = unsafe { libc::socket(family, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: `fd` was just opened and nothing else owns it.
+            Ok(unsafe { OwnedSock::from_raw_fd(fd) })
+        }
+        #[cfg(windows)]
+        {
+            self.engine.new_socket(to).map(owned_sock)
+        }
+    }
+
     /// Operations in flight.
     pub fn pending(&self) -> usize {
         self.front.pending()
