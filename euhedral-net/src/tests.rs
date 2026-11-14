@@ -894,6 +894,144 @@ fn bad_requests() -> Vec<(&'static str, Vec<u8>, ParseError, u16)> {
             E::BadTarget,
             400,
         ),
+        (
+            "a percent escape that is a NUL",
+            b"GET / HTTP/1.1\r\nHost: a%00b\r\n\r\n".to_vec(),
+            E::BadHost,
+            400,
+        ),
+        (
+            "a percent escape that is a slash",
+            b"GET / HTTP/1.1\r\nHost: a%2Fb\r\n\r\n".to_vec(),
+            E::BadHost,
+            400,
+        ),
+        (
+            "a percent escape that is an at sign",
+            b"GET / HTTP/1.1\r\nHost: a%40b\r\n\r\n".to_vec(),
+            E::BadHost,
+            400,
+        ),
+        (
+            "a lone colon in brackets",
+            b"GET / HTTP/1.1\r\nHost: [:]\r\n\r\n".to_vec(),
+            E::BadHost,
+            400,
+        ),
+        (
+            "many colons in brackets",
+            b"GET / HTTP/1.1\r\nHost: [::::]\r\n\r\n".to_vec(),
+            E::BadHost,
+            400,
+        ),
+        (
+            "a future-format literal",
+            b"GET / HTTP/1.1\r\nHost: [v1.a,b]\r\n\r\n".to_vec(),
+            E::BadHost,
+            400,
+        ),
+        (
+            "a future-format literal of letters",
+            b"GET / HTTP/1.1\r\nHost: [v1.fe80]\r\n\r\n".to_vec(),
+            E::BadHost,
+            400,
+        ),
+        (
+            "an IPv6 literal with a bad group",
+            b"GET / HTTP/1.1\r\nHost: [1::2::3]\r\n\r\n".to_vec(),
+            E::BadHost,
+            400,
+        ),
+        (
+            "a port of six digits",
+            b"GET / HTTP/1.1\r\nHost: a:000080\r\n\r\n".to_vec(),
+            E::BadHost,
+            400,
+        ),
+        (
+            "a port above 65535",
+            b"GET / HTTP/1.1\r\nHost: a:65536\r\n\r\n".to_vec(),
+            E::BadHost,
+            400,
+        ),
+        (
+            "an IPv6 literal with a huge port",
+            b"GET / HTTP/1.1\r\nHost: [::1]:99999999999999999999\r\n\r\n".to_vec(),
+            E::BadHost,
+            400,
+        ),
+        (
+            "CONNECT with a port above 65535",
+            b"CONNECT h:65536 HTTP/1.1\r\nHost: h:1\r\n\r\n".to_vec(),
+            E::BadTarget,
+            400,
+        ),
+        (
+            "an absolute target with a six-digit port",
+            b"GET http://h:123456/ HTTP/1.1\r\nHost: h\r\n\r\n".to_vec(),
+            E::BadTarget,
+            400,
+        ),
+        (
+            "chunked then an empty element",
+            line("Transfer-Encoding: chunked,"),
+            E::ChunkedNotSupported,
+            411,
+        ),
+        (
+            "an empty element then chunked",
+            line("Transfer-Encoding: ,chunked"),
+            E::ChunkedNotSupported,
+            411,
+        ),
+        (
+            "chunked among empty elements",
+            line("Transfer-Encoding:  , chunked , ,"),
+            E::ChunkedNotSupported,
+            411,
+        ),
+        (
+            "an empty element after gzip",
+            line("Transfer-Encoding: gzip,"),
+            E::BadTransferEncoding,
+            400,
+        ),
+        (
+            "gzip then chunked then empty",
+            line("Transfer-Encoding: gzip, chunked,,"),
+            E::ChunkedNotSupported,
+            411,
+        ),
+        (
+            "only empty elements",
+            line("Transfer-Encoding:  , "),
+            E::BadTransferEncoding,
+            400,
+        ),
+        (
+            "an empty value",
+            line("Transfer-Encoding: "),
+            E::BadTransferEncoding,
+            400,
+        ),
+        (
+            "chunked then an empty later line",
+            line("Transfer-Encoding: gzip, chunked\r\nTransfer-Encoding:"),
+            E::ChunkedNotSupported,
+            411,
+        ),
+        (
+            "Transfer-Encoding on HTTP/1.0",
+            b"GET / HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec(),
+            E::BadTransferEncoding,
+            400,
+        ),
+        (
+            "Transfer-Encoding gzip on HTTP/1.0",
+            b"POST / HTTP/1.0\r\nTransfer-Encoding: gzip\r\n\r\n".to_vec(),
+            E::BadTransferEncoding,
+            400,
+        ),
     ];
     t
 }
@@ -1358,7 +1496,10 @@ fn a_written_response_parses_back_to_the_same_message() {
             let Some(Event::Message(parsed)) = events.into_iter().last() else {
                 panic!("a response")
             };
-            assert_eq!(parsed.keep_alive(), mode != ConnectionMode::Close);
+            assert_eq!(
+                parsed.keep_alive(),
+                mode != ConnectionMode::Close || original.status < 200
+            );
             let mut expected = original.clone();
             if !status_has_no_body(original.status) {
                 expected
@@ -1366,6 +1507,7 @@ fn a_written_response_parses_back_to_the_same_message() {
                     .append("Content-Length", original.body.len().to_string());
             }
             match mode {
+                _ if original.status < 200 => {}
                 ConnectionMode::Close => expected.headers.append("Connection", "close"),
                 ConnectionMode::KeepAlive => expected.headers.append("Connection", "keep-alive"),
                 ConnectionMode::Unspecified => {}
@@ -1852,7 +1994,7 @@ fn hosts_and_target_forms_that_are_valid_parse() {
             Some(TargetForm::Origin),
         ),
         (
-            "GET /p HTTP/1.1\r\nHost: a-b.c_d~e%41:\r\n\r\n",
+            "GET /p HTTP/1.1\r\nHost: a-b.c_d~e:\r\n\r\n",
             Method::Get,
             "/p",
             Some(TargetForm::Origin),
@@ -2276,5 +2418,164 @@ fn a_bad_row_followed_by_anything_still_fails_the_same_way() {
             assert_eq!(got, Some(error), "{name}");
             assert!(events.is_empty(), "{name}");
         }
+    }
+}
+
+#[test]
+fn a_named_method_written_as_other_behaves_as_the_named_method() {
+    for (token, target, ok) in [
+        ("CONNECT", "h:80", true),
+        ("CONNECT", "/x", false),
+        ("OPTIONS", "*", true),
+        ("GET", "*", false),
+    ] {
+        let request = Request {
+            method: Method::Other(token.to_owned()),
+            target: target.to_owned(),
+            version: Version::Http11,
+            headers: Headers::new(),
+            body: Vec::new(),
+        }
+        .header("Host", "h");
+        let named = Request {
+            method: Method::from_token(token),
+            ..request.clone()
+        };
+        assert_eq!(
+            request.target_form(),
+            named.target_form(),
+            "{token} {target}"
+        );
+        let mut out = Vec::new();
+        assert_eq!(
+            write_request(&request, ConnectionMode::Unspecified, &mut out).is_ok(),
+            ok
+        );
+        let mut named_out = Vec::new();
+        let _ = write_request(&named, ConnectionMode::Unspecified, &mut named_out);
+        assert_eq!(out, named_out);
+    }
+}
+
+#[test]
+fn the_authority_is_the_targets_when_it_has_one_and_the_host_otherwise() {
+    let table = [
+        ("GET /p HTTP/1.1\r\nHost: h:1\r\n\r\n", Some("h:1")),
+        (
+            "GET http://t:2/p HTTP/1.1\r\nHost: h:1\r\n\r\n",
+            Some("t:2"),
+        ),
+        ("GET http://t?q HTTP/1.1\r\nHost: h\r\n\r\n", Some("t")),
+        ("CONNECT c:443 HTTP/1.1\r\nHost: h\r\n\r\n", Some("c:443")),
+        ("OPTIONS * HTTP/1.1\r\nHost: h\r\n\r\n", Some("h")),
+        ("GET /p HTTP/1.1\r\nHost:\r\n\r\n", None),
+        ("GET /p HTTP/1.0\r\n\r\n", None),
+    ];
+    for (input, authority) in table {
+        assert_eq!(
+            one_request(input.as_bytes()).authority(),
+            authority,
+            "{input}"
+        );
+    }
+    let mut p = RequestParser::new(Limits::default());
+    p.feed(b"POST http://t:2/p HTTP/1.1\r\nHost: h\r\nContent-Length: 1\r\n\r\n")
+        .unwrap();
+    assert_eq!(p.pending_head().unwrap().authority(), Some("t:2"));
+}
+
+#[test]
+fn the_pending_head_answers_keep_alive_and_the_expectation() {
+    let table = [
+        (
+            "PUT / HTTP/1.1\r\nHost: h\r\nContent-Length: 1\r\nExpect: 100-continue\r\n\r\n",
+            true,
+            true,
+        ),
+        (
+            "PUT / HTTP/1.1\r\nHost: h\r\nContent-Length: 1\r\nConnection: close\r\n\r\n",
+            false,
+            false,
+        ),
+        (
+            "PUT / HTTP/1.0\r\nContent-Length: 1\r\nExpect: 100-continue\r\n\r\n",
+            false,
+            false,
+        ),
+        (
+            "PUT / HTTP/1.0\r\nContent-Length: 1\r\nConnection: keep-alive\r\n\r\n",
+            true,
+            false,
+        ),
+    ];
+    for (input, keep, expect) in table {
+        let mut p = RequestParser::new(Limits::default());
+        p.feed(input.as_bytes()).unwrap();
+        let pending = p.pending_head().unwrap();
+        assert_eq!(
+            (pending.keep_alive(), pending.expects_continue()),
+            (keep, expect),
+            "{input}"
+        );
+        p.feed(b"x").unwrap();
+    }
+}
+
+#[test]
+fn an_interim_response_never_carries_a_connection_line() {
+    for mode in MODES {
+        for status in [100, 101, 102] {
+            let mut out = Vec::new();
+            write_response(&Response::with_status(status), mode, &mut out).unwrap();
+            assert!(
+                !String::from_utf8(out).unwrap().contains("Connection"),
+                "{status}"
+            );
+            let head = head_only(&Response::with_status(status), None, mode).unwrap();
+            assert!(
+                !String::from_utf8(head).unwrap().contains("Connection"),
+                "{status}"
+            );
+        }
+        let mut out = Vec::new();
+        write_response(&Response::with_status(200), mode, &mut out).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap().contains("Connection"),
+            mode != ConnectionMode::Unspecified
+        );
+    }
+}
+
+#[test]
+fn the_reason_table_holds_the_common_statuses() {
+    let table = [
+        (101, "Switching Protocols"),
+        (206, "Partial Content"),
+        (301, "Moved Permanently"),
+        (302, "Found"),
+        (303, "See Other"),
+        (304, "Not Modified"),
+        (307, "Temporary Redirect"),
+        (308, "Permanent Redirect"),
+        (410, "Gone"),
+        (412, "Precondition Failed"),
+        (415, "Unsupported Media Type"),
+        (416, "Range Not Satisfiable"),
+        (422, "Unprocessable Content"),
+        (502, "Bad Gateway"),
+        (504, "Gateway Timeout"),
+    ];
+    for (status, reason) in table {
+        assert_eq!(reason_phrase(status), reason);
+        assert_eq!(Response::with_status(status).reason, reason);
+    }
+    // Every status from 200 to 599 that has a phrase has a non-empty, writable one.
+    for status in 100..600 {
+        let mut out = Vec::new();
+        let r = Response::with_status(status);
+        assert!(
+            write_response(&r, ConnectionMode::Unspecified, &mut out).is_ok()
+                || status_has_no_body(status)
+        );
     }
 }

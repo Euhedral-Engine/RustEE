@@ -1,6 +1,8 @@
 //! The HTTP/1.1 message types: `Request`, `Response`, `Headers`, `Method`, `Version` and the errors.
 
+use std::error::Error;
 use std::fmt;
+use std::net::Ipv6Addr;
 
 /// What a writer says about the connection: a `Connection: close`, a `Connection: keep-alive` (what an HTTP/1.0
 /// peer needs to keep the connection open), or no `Connection` line.
@@ -25,7 +27,8 @@ pub enum TargetForm {
 }
 
 /// The request method. A method the crate knows by name is one of the named variants; any other token is `Other`.
-/// The parser only builds `Other` for a token that is not one of the named methods.
+/// The parser only builds `Other` for a token that is not one of the named methods, but a hand-built
+/// `Other("CONNECT")` is still the CONNECT method to the writer and the target checks, which go by [`Method::as_str`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Method {
     Get,
@@ -200,6 +203,14 @@ impl Request {
         target_form(&self.method, &self.target)
     }
 
+    /// The authority this request is for (RFC 9112 section 3.2.2): the authority of an absolute-form or
+    /// authority-form target, which wins over the `Host` header, else the `Host` value. `None` when there is
+    /// neither (an HTTP/1.0 request with no `Host`, or an empty `Host`). A server must route on this, not on the
+    /// raw header, or a request can be sent to one place by its target and another by its `Host`.
+    pub fn authority(&self) -> Option<&str> {
+        authority_of(&self.method, &self.target, &self.headers)
+    }
+
     /// Whether the connection stays open after this request's response (RFC 9112 section 9.3): HTTP/1.1 keeps
     /// it open unless `Connection` holds `close`; HTTP/1.0 closes it unless `Connection` holds `keep-alive`
     /// (and not `close`).
@@ -278,28 +289,52 @@ pub fn status_has_no_body(status: u16) -> bool {
 pub fn reason_phrase(status: u16) -> &'static str {
     match status {
         100 => "Continue",
+        101 => "Switching Protocols",
         200 => "OK",
         201 => "Created",
         202 => "Accepted",
+        203 => "Non-Authoritative Information",
         204 => "No Content",
+        205 => "Reset Content",
+        206 => "Partial Content",
+        300 => "Multiple Choices",
+        301 => "Moved Permanently",
+        302 => "Found",
+        303 => "See Other",
         304 => "Not Modified",
+        307 => "Temporary Redirect",
+        308 => "Permanent Redirect",
         400 => "Bad Request",
         401 => "Unauthorized",
+        402 => "Payment Required",
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        406 => "Not Acceptable",
+        407 => "Proxy Authentication Required",
         408 => "Request Timeout",
         409 => "Conflict",
+        410 => "Gone",
         411 => "Length Required",
+        412 => "Precondition Failed",
         413 => "Content Too Large",
         414 => "URI Too Long",
+        415 => "Unsupported Media Type",
+        416 => "Range Not Satisfiable",
         417 => "Expectation Failed",
+        421 => "Misdirected Request",
+        422 => "Unprocessable Content",
+        426 => "Upgrade Required",
+        428 => "Precondition Required",
         429 => "Too Many Requests",
         431 => "Request Header Fields Too Large",
         500 => "Internal Server Error",
         501 => "Not Implemented",
+        502 => "Bad Gateway",
         503 => "Service Unavailable",
+        504 => "Gateway Timeout",
         505 => "HTTP Version Not Supported",
+        511 => "Network Authentication Required",
         _ => "",
     }
 }
@@ -411,7 +446,7 @@ impl fmt::Display for ParseError {
     }
 }
 
-impl std::error::Error for ParseError {}
+impl Error for ParseError {}
 
 /// Why a message cannot be written.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -443,7 +478,25 @@ impl fmt::Display for WriteError {
     }
 }
 
-impl std::error::Error for WriteError {}
+impl Error for WriteError {}
+
+/// See [`Request::authority`].
+pub(crate) fn authority_of<'a>(
+    method: &Method,
+    target: &'a str,
+    headers: &'a Headers,
+) -> Option<&'a str> {
+    let from_target = match target_form(method, target) {
+        Some(TargetForm::Authority) => Some(target),
+        Some(TargetForm::Absolute) => target
+            .split_once("://")
+            .and_then(|(_, rest)| rest.split(['/', '?']).next()),
+        _ => None,
+    };
+    from_target
+        .or_else(|| headers.get("Host"))
+        .filter(|a| !a.is_empty())
+}
 
 /// The form of `target` for `method`; see [`Request::target_form`].
 pub(crate) fn target_form(method: &Method, target: &str) -> Option<TargetForm> {
@@ -454,11 +507,11 @@ pub(crate) fn target_form(method: &Method, target: &str) -> Option<TargetForm> {
     {
         return None;
     }
-    if *method == Method::Connect {
+    if method.as_str() == "CONNECT" {
         return valid_authority(target, true).then_some(TargetForm::Authority);
     }
     if target == "*" {
-        return (*method == Method::Options).then_some(TargetForm::Asterisk);
+        return (method.as_str() == "OPTIONS").then_some(TargetForm::Asterisk);
     }
     if target.starts_with('/') {
         return Some(TargetForm::Origin);
@@ -498,50 +551,35 @@ fn valid_authority(value: &str, port_required: bool) -> bool {
         valid_reg_name(host)
     };
     let port_ok = match port {
-        Some(port) => {
-            port.bytes().all(|b| b.is_ascii_digit()) && !(port_required && port.is_empty())
-        }
+        Some(port) => valid_port(port, port_required),
         None => !port_required,
     };
     host_ok && port_ok
 }
 
-/// A registered name or IPv4 address: unreserved characters and percent-encodings only. This is stricter than
-/// RFC 3986, which also allows the sub-delimiters (`a,b`, `a;b`): none belongs in a host name.
+/// A registered name or IPv4 address: letters, digits and `-._~` only. This is stricter than RFC 3986, which also
+/// allows the sub-delimiters (`a,b`, `a;b`) and percent-encodings: a percent-encoding in a host is a way to hide a
+/// byte (`a%00b`, `a%2Fb`, `a%40b`) from one reader and show it to another, and none belongs in a host name.
 fn valid_reg_name(host: &str) -> bool {
-    let bytes = host.as_bytes();
-    let mut i = 0;
-    while let Some(&b) = bytes.get(i) {
-        if b == b'%' {
-            if !bytes
-                .get(i + 1..i + 3)
-                .is_some_and(|h| h.iter().all(u8::is_ascii_hexdigit))
-            {
-                return false;
-            }
-            i += 3;
-            continue;
-        }
-        if !(b.is_ascii_alphanumeric() || b"-._~".contains(&b)) {
-            return false;
-        }
-        i += 1;
-    }
-    !bytes.is_empty()
+    !host.is_empty()
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-._~".contains(&b))
 }
 
-/// The inside of `[...]`: an IPv6 address (hex digits, colons, a dotted tail) or an IPvFuture literal.
+/// The inside of `[...]`: an IPv6 address, checked as one. The IPvFuture form is refused.
 fn valid_ip_literal(literal: &str) -> bool {
-    if let Some(rest) = literal.strip_prefix(['v', 'V']) {
-        return rest.contains('.')
-            && rest
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=:".contains(&b));
+    literal.parse::<Ipv6Addr>().is_ok()
+}
+
+/// A port: at most five digits and at most 65535. Empty is allowed unless `required`.
+fn valid_port(port: &str, required: bool) -> bool {
+    if port.is_empty() {
+        return !required;
     }
-    literal.contains(':')
-        && literal
-            .bytes()
-            .all(|b| b.is_ascii_hexdigit() || b == b':' || b == b'.')
+    port.len() <= 5
+        && port.bytes().all(|b| b.is_ascii_digit())
+        && port.parse::<u32>().is_ok_and(|n| n <= 65535)
 }
 
 /// A `Host` field value: empty (an authority that is missing, RFC 9112 section 3.2) or `uri-host [":" port]`.

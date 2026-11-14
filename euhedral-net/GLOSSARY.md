@@ -24,3 +24,7 @@ line with one of these names is refused ([`write`](src/write.rs)).
 **Target form** ([`TargetForm`](src/message.rs)): origin, absolute, authority or asterisk, the four request-target shapes of RFC 9112 section 3.2. The parser checks the form against the method.
 
 **Pending head** ([`PendingHead`](src/parse.rs)): the request head a parser holds while its body is still arriving, readable through `pending_head`.
+
+**Authority** ([`Request::authority`](src/message.rs)): the host and optional port a request is for: the authority of an absolute-form or authority-form target when it has one, else the `Host` value. A server routes on it.
+
+**Interim response**: a 1xx response. The writer never puts a `Connection` line on one, whatever the mode.

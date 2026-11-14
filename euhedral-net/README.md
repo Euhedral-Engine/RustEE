@@ -53,13 +53,19 @@ assert_eq!(parser.buffered(), "GET / HT".len());
 The parser is strict where the RFCs let a recipient be lenient, because leniency about where a message ends is
 how a server and a proxy come to disagree about the next request. It refuses a bare LF, obsolete line folding,
 whitespace before a colon, a control character in a value, differing `Content-Length` values, `Transfer-Encoding`
-with `Content-Length`, more than one `Host` on any request (HTTP/1.1 needs exactly one), a `Host` that is not an RFC 3986 host with an optional port (stricter than the RFC: a registered name has no sub-delimiters), a target that does not fit its method (RFC 9112 section 3.2: CONNECT takes an authority, OPTIONS may take `*`, others an origin or absolute form), and every version but 1.0 and 1.1. HTTP/1.2 is answered 505, and a status line with no space before a missing reason is refused, both on purpose. Each
+with `Content-Length`, more than one `Host` on any request (HTTP/1.1 needs exactly one), a `Host` that is not a host with an optional port (stricter than RFC 3986: a registered name is letters, digits and `-._~`, with no sub-delimiters and no percent escapes, since an escape can hide a byte such as `a%00b` or `a%2Fb`; an IPv6 literal must be a real IPv6 address and the IPvFuture form is refused; a port has at most five digits and is at most 65535), a target that does not fit its method (RFC 9112 section 3.2: CONNECT takes an authority, OPTIONS may take `*`, others an origin or absolute form), and every version but 1.0 and 1.1. HTTP/1.2 is answered 505, and a status line with no space before a missing reason is refused, both on purpose. Each
 rule, its error and the RFC section it rests on are in the [`parse`](src/parse.rs) module notes and the
 [changelog](../CHANGELOG.md).
 
-**Limits of the crate.** A request with `Transfer-Encoding` is refused: 411 when its final coding is `chunked` (the
-crate cannot read chunked bodies yet), 400 when `chunked` is not the final coding (RFC 9112 section 6.3) and 400 for
-any other final coding. The client is minimal: a response must carry `Content-Length` unless it answers HEAD or has a status
+**Routing.** A server routes on `Request::authority()` (also on `PendingHead`), not on the raw `Host` header: for an
+absolute-form or authority-form target the authority of the target wins over `Host` (RFC 9112 section 3.2.2), else it
+is the `Host` value, and it is `None` when there is neither. `PendingHead` also has `keep_alive()` and
+`expects_continue()`, so a server can choose between `100 Continue` and an early final status before the body arrives.
+
+**Limits of the crate.** A request with `Transfer-Encoding` is refused: 411 when its last non-empty coding is `chunked`
+(the crate cannot read chunked bodies yet), and 400 when it is not (RFC 9112 section 6.3). Empty list elements are
+ignored (`chunked,` and `,chunked` are chunked, RFC 9110 section 5.6.1). Any `Transfer-Encoding` on an HTTP/1.0
+request is 400 (section 6.1). The client is minimal: a response must carry `Content-Length` unless it answers HEAD or has a status
 without a body (1xx, 204, 304); a response with `Transfer-Encoding`, or one that ends with the connection, is an
 error the client reports.
 
@@ -81,6 +87,6 @@ let bad = Response::with_status(200).header("X", "a\r\nSet-Cookie: b");
 assert!(write_response(&bad, ConnectionMode::Unspecified, &mut out).is_err());
 ```
 
-The writer sets `Content-Length` from the body, adds `Connection: close` or `keep-alive` as the `ConnectionMode` says, and refuses a method, target, reason phrase, header name or header value that could put a CR, LF
+The writer sets `Content-Length` from the body, adds `Connection: close` or `keep-alive` as the `ConnectionMode` says (never on a 1xx response: the mode is ignored there), and refuses a method, target, reason phrase, header name or header value that could put a CR, LF
 or other control character into the output. A header named `Content-Length`, `Transfer-Encoding` or `Connection` is
 the writer's: the caller cannot set it. `write_request` also needs exactly one valid `Host` and a target that fits the method, so what it writes parses back. `write_response_head` writes the head of a response to HEAD with the length the body would have. `write_continue` appends the interim `100 Continue`.

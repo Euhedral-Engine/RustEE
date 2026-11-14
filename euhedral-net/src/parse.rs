@@ -36,8 +36,9 @@
 //! - a request line with more than single spaces between its parts, or a lowercase or malformed version, and any
 //!   version but 1.0 and 1.1 (HTTP/1.2 is 505 too: this crate speaks the two it knows);
 //! - a request with more than one `Host` line, on any version, an HTTP/1.1 request without one (section 3.2), and
-//!   a `Host` that is not a host and an optional port (a registered name or IPv4 address, or a bracketed IP
-//!   literal; stricter than RFC 3986, which also lets a name hold `,` `;` and the like). An empty value is allowed;
+//!   a `Host` that is not a host and an optional port (a registered name of letters, digits and `-._~`, an IPv4
+//!   address, or a bracketed IPv6 address; stricter than RFC 3986, which also lets a name hold `,` `;` and percent
+//!   escapes; the port is at most five digits and at most 65535). An empty value is allowed;
 //! - a request target that is not one of the four forms (section 3.2): origin-form begins with `/`, asterisk-form
 //!   `*` only with OPTIONS, authority-form `host:port` only with CONNECT, absolute-form a scheme, `://` and an
 //!   authority;
@@ -46,18 +47,20 @@
 //!
 //! # Limits of the crate
 //!
-//! A request with `Transfer-Encoding` is refused. Where `chunked` is not the final coding (or is the only one
-//! missing) the length of the body cannot be told: 400 (section 6.3). Where `chunked` is the final coding the
-//! request is well formed but this crate does not decode a chunked request body: 411. A response must have a
+//! A request with `Transfer-Encoding` is refused. When the last non-empty coding is not `chunked`, the end of the
+//! body cannot be told, so the answer is 400 (section 6.3); so it is for any `Transfer-Encoding` on an HTTP/1.0
+//! request (section 6.1). When the last non-empty coding is `chunked` the request is well formed, but this crate
+//! does not decode a chunked request body: 411. A response must have a
 //! `Content-Length`, unless it answers a HEAD request or has a status without a body (1xx, 204, 304): a response
 //! with `Transfer-Encoding`, or one that ends with the connection, is an error. An `Expect` other than
 //! `100-continue` is ignored. The client side is minimal by design.
 
 use std::mem::{replace, take};
+use std::str::from_utf8;
 
 use crate::message::{
-    Headers, Method, ParseError, Request, Response, Version, status_has_no_body, target_form,
-    valid_host_value,
+    Headers, Method, ParseError, Request, Response, Version, authority_of, keep_alive,
+    status_has_no_body, target_form, valid_host_value,
 };
 
 /// How many empty lines before a request line are skipped before the input is refused.
@@ -147,9 +150,7 @@ fn trim_ows(mut s: &[u8]) -> &[u8] {
 }
 
 fn ascii(bytes: &[u8], error: ParseError) -> Result<String, ParseError> {
-    std::str::from_utf8(bytes)
-        .map(str::to_owned)
-        .map_err(|_| error)
+    from_utf8(bytes).map(str::to_owned).map_err(|_| error)
 }
 
 /// A version token: `Ok` for 1.0 and 1.1, 505 for another well-formed version, 400 for anything else.
@@ -378,6 +379,23 @@ pub struct PendingHead<'a> {
     pub headers: &'a Headers,
 }
 
+impl PendingHead<'_> {
+    /// The authority the request is for; see [`Request::authority`].
+    pub fn authority(&self) -> Option<&str> {
+        authority_of(self.method, self.target, self.headers)
+    }
+
+    /// Whether the connection stays open after the response; see [`Request::keep_alive`].
+    pub fn keep_alive(&self) -> bool {
+        keep_alive(self.version, self.headers)
+    }
+
+    /// Whether the client waits for `100 Continue`; see [`Request::expects_continue`].
+    pub fn expects_continue(&self) -> bool {
+        self.version == Version::Http11 && self.headers.has_token("Expect", "100-continue")
+    }
+}
+
 /// Reads requests, for a server.
 #[derive(Debug)]
 pub struct RequestParser {
@@ -498,13 +516,16 @@ impl RequestParser {
     }
 }
 
-/// Whether the last coding of the last `Transfer-Encoding` line is `chunked` (RFC 9112 section 6.3).
+/// Whether the last non-empty coding of all `Transfer-Encoding` lines is `chunked` (RFC 9112 section 6.3).
+/// Empty list elements (`chunked,` or `,chunked`, an empty line) are ignored (RFC 9110 section 5.6.1).
 fn final_coding_is_chunked(headers: &Headers) -> bool {
     headers
         .get_all("Transfer-Encoding")
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|coding| !coding.is_empty())
         .last()
-        .and_then(|value| value.split(',').next_back())
-        .is_some_and(|coding| coding.trim().eq_ignore_ascii_case("chunked"))
+        .is_some_and(|coding| coding.eq_ignore_ascii_case("chunked"))
 }
 
 /// The request a start line and headers make, and the length of its body.
@@ -547,7 +568,9 @@ fn request_head(
     }
     let length = content_length(&headers)?;
     if headers.contains("Transfer-Encoding") {
-        return Err(if length.is_some() {
+        return Err(if version == Version::Http10 {
+            ParseError::BadTransferEncoding
+        } else if length.is_some() {
             ParseError::TransferEncodingWithContentLength
         } else if final_coding_is_chunked(&headers) {
             ParseError::ChunkedNotSupported

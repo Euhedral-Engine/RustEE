@@ -89,13 +89,23 @@ fn check_response(response: &Response) -> Result<(), WriteError> {
     check_headers(&response.headers)
 }
 
+/// An interim (1xx) response never carries `Connection: close` or `keep-alive`: it does not end or keep anything,
+/// the final response does. The mode is ignored for it.
+fn interim_mode(response: &Response, connection: ConnectionMode) -> ConnectionMode {
+    if response.status < 200 {
+        ConnectionMode::Unspecified
+    } else {
+        connection
+    }
+}
+
 fn push_status_line(out: &mut Vec<u8>, response: &Response) {
     out.extend_from_slice(
         format!("HTTP/1.1 {} {}\r\n", response.status, response.reason).as_bytes(),
     );
 }
 
-/// Appends a response to `out`. `connection` adds `Connection: close` or `Connection: keep-alive`, or nothing. A
+/// Appends a response to `out`. `connection` (ignored for a 1xx) adds `Connection: close` or `Connection: keep-alive`, or nothing. A
 /// status without a body (1xx, 204, 304) is written without `Content-Length` and must have no body. On an error
 /// `out` is unchanged.
 pub fn write_response(
@@ -110,7 +120,12 @@ pub fn write_response(
     }
     push_status_line(out, response);
     let length = (!no_body).then_some(response.body.len() as u64);
-    push_headers(out, &response.headers, length, connection);
+    push_headers(
+        out,
+        &response.headers,
+        length,
+        interim_mode(response, connection),
+    );
     out.extend_from_slice(&response.body);
     Ok(())
 }
@@ -130,7 +145,12 @@ pub fn write_response_head(
         return Err(WriteError::BodyNotAllowed);
     }
     push_status_line(out, response);
-    push_headers(out, &response.headers, content_length, connection);
+    push_headers(
+        out,
+        &response.headers,
+        content_length,
+        interim_mode(response, connection),
+    );
     Ok(())
 }
 
