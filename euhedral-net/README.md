@@ -5,8 +5,8 @@ HTTP/1.1 for programs built on RustEE. The crate will be an HTTP/1.1 server and 
 keep-alive, `Expect: 100-continue`, size limits, time limits and a connection cap. Out of scope for the crate:
 TLS, HTTP/2, chunked request bodies (answered 411), compression, routing and JSON.
 
-**This part.** The messages, a parser and a writer, with no I/O: no socket, no frame, no timer, no thread, no
-dependency. The server and the client come in later changes and are built on exactly this. See the
+**This part.** The messages, a parser and a writer (pure: no I/O), and the server on `euhedral-io`. The client comes in
+a later change. See the
 [top-level glossary](../GLOSSARY.md) for the terms a user meets and [`GLOSSARY.md`](GLOSSARY.md) for this crate's.
 
 | Item | What it is |
@@ -15,6 +15,8 @@ dependency. The server and the client come in later changes and are built on exa
 | [`ParseError`, `WriteError`](src/message.rs) | Why input is refused. `ParseError::status()` is the status a server answers: 400, 411, 413, 414, 431 or 505, and `None` for an error that has no status to send (a response the client cannot read). |
 | [`RequestParser`, `ResponseParser`, `Limits`, `Progress`, `State`, `PendingHead`](src/parse.rs) | The strict, incremental parsers and their size limits. |
 | [`write_response`, `write_response_head`, `write_request`, `write_continue`, `ConnectionMode`](src/write.rs) | The writer. |
+| [`serve`, `ServerConfig`, `ServerHandle`, `Counters`, `Handler`, `no_work`](src/server.rs) | The server: accept loop, connection cap, counters, stop. Linux, Android and Windows. |
+| [`Responder`](src/connection.rs) | The one reply of one request, and its cancel flag. |
 
 ## The parser
 
@@ -90,3 +92,55 @@ assert!(write_response(&bad, ConnectionMode::Unspecified, &mut out).is_err());
 The writer sets `Content-Length` from the body, adds `Connection: close` or `keep-alive` as the `ConnectionMode` says (never on a 1xx response: the mode is ignored there), and refuses a method, target, reason phrase, header name or header value that could put a CR, LF
 or other control character into the output. A header named `Content-Length`, `Transfer-Encoding` or `Connection` is
 the writer's: the caller cannot set it. `write_request` also needs exactly one valid `Host` and a target that fits the method, so what it writes parses back. `write_response_head` writes the head of a response to HEAD with the length the body would have. `write_continue` appends the interim `100 Continue`.
+
+## The server
+
+`serve(io, sink, listener, config, handler)` takes a bound listener, an `AsyncIo` and a `QueueIngestSink`, both
+attached to a lattice, and a `Handler`. It starts accepting and returns a `ServerHandle`. The crate keeps no thread
+and no timer: every step is a frame, and every time limit is the limit of a socket operation.
+
+```no_run
+use std::net::TcpListener;
+use std::sync::Arc;
+use euhedral_core::frames::Frame;
+use euhedral_core::ingest::QueueIngestSink;
+use euhedral_io::AsyncIo;
+use euhedral_net::{Request, Response, Responder, ServerConfig, no_work, serve};
+
+fn start(io: Arc<AsyncIo>, sink: Arc<QueueIngestSink>) -> std::io::Result<()> {
+    // `io` and `sink.delegate()` are attached to a running lattice as upstreams.
+    let listener = TcpListener::bind("127.0.0.1:8080")?;
+    let handler = |request: Request, reply: Responder| -> Box<dyn Frame> {
+        // The reply may be sent here, or from the returned frame, or from any later frame on any worker.
+        reply.send(Response::with_status(200).with_body(request.target.into_bytes()));
+        no_work()
+    };
+    let server = serve(io, sink, listener, ServerConfig::default(), Arc::new(handler))?;
+    println!("{:?}", server.counters());
+    // Later, from anywhere: stop accepting, let requests in flight finish, and be told when it is done.
+    server.stop(no_work());
+    Ok(())
+}
+```
+
+- **One reply per request.** `Responder::send` is the reply; a `Responder` dropped without it answers 500. The server
+  chooses `Connection`; a HEAD request gets the head of the response only. `Responder::cancelled()` is a flag the
+  server sets when the peer ends its stream or breaks the connection while the request is being handled.
+- **Order.** All of a connection's work is frames ordered by the connection's id hash: its parser, buffers and
+  socket are plain state of that order. Requests on one connection are answered in the order they arrived, one at a
+  time; pipelined bytes wait in the buffer.
+- **`Expect: 100-continue`** is answered by the server with `100 Continue` once the head is accepted (not too large,
+  well formed); the handler is not consulted and cannot refuse it. A body over `max_body_bytes` is answered 413 at
+  the head, before it is read.
+- **Limits.** `read_limit` covers a request from its first byte, `idle_limit` the wait for the first byte of a
+  request, `write_limit` each reply. A passed read limit after the first byte is answered 408 and closes; any
+  other passed limit closes without a reply. `None` is no limit.
+- **Errors close.** A parse error answers its status with `Connection: close`, then the server shuts its writing
+  side and reads (and discards, up to the size limits, bounded by `write_limit`) until the peer closes, so that the
+  answer is not lost to a reset.
+- **Cap.** At `max_connections` no accept is pending; the kernel's backlog holds the rest.
+- **Stop.** Waiting connections close; a request in flight is answered, with `Connection: close`. The frame given
+  to `stop` is offered to the sink when the last connection is gone. The sink must outlive the stop.
+- **Allocated.** Per connection: the connection record (one `Arc`), a parser, a buffer for unparsed bytes and one
+  read buffer of `read_chunk` bytes, kept between reads. Per request: the `Request` the parser builds, the
+  `Responder`, the response and its serialised bytes, and the frames the events use.
