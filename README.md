@@ -20,6 +20,7 @@ arm64 (Linux, macOS and Windows back ends) and is untested on mobile.
 | [`euhedral-memory`](euhedral-memory/README.md) | A location-agnostic memory and residency planner: budgets, owners with lifetimes, claims with priorities, give-back as frames, admission, arenas and a leak check; CUDA allocation backends (feature `cuda`). |
 | [`euhedral-graph`](euhedral-graph/README.md) | No-wait dataflow on the lattice: completions, a sequencer, joins, device lanes and stage graphs. |
 | [`euhedral-io`](euhedral-io/README.md) | Asynchronous file and socket I/O whose completions are frames: `AsyncIo` (io_uring on Linux and Android; IoRing and completion ports on Windows). |
+| [`euhedral-net`](euhedral-net/README.md) | HTTP/1.1: the message types, a strict incremental request and response parser and a writer, with no I/O (the server and a minimal client are to follow, over `euhedral-io`). |
 | [`euhedral-gpu`](euhedral-gpu/README.md) | Asynchronous, backend-neutral GPU access: streams as device lanes, markers, retirement as frames, kernels loaded at run time, graph record and replay (CUDA backend, feature `cuda`). |
 | [`euhedral-benchmarks`](euhedral-benchmarks/README.md) | End-to-end benchmarks of the control plane: the high-contention throughput benchmark. |
 
@@ -30,7 +31,7 @@ not even through a dev-dependency or a feature (`euhedral-gpu/tests/layering.rs`
 1. `euhedral-hardware-utils`, on `euhedral-data-structures` (its lifecycle locks).
 2. `euhedral-core`, on the utilities.
 3. `euhedral-graph` and `euhedral-io`, on `euhedral-core` (and the utilities they use).
-4. `euhedral-memory`, on `euhedral-core`, `euhedral-graph` and the utilities.
+4. `euhedral-memory`, on `euhedral-core`, `euhedral-graph` and the utilities; and `euhedral-net`, which will sit on `euhedral-io` and has no dependency yet.
 5. `euhedral-gpu`, on `euhedral-core`, `euhedral-graph`, `euhedral-memory` and `euhedral-hashing`.
 6. `euhedral-benchmarks`, on `euhedral-core` and the utilities.
 

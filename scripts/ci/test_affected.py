@@ -9,7 +9,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import affected as A  # noqa: E402
 
-NAMES = ["ds", "hash", "hw", "core", "graph", "io", "mem", "gpu", "bench"]
+NAMES = ["ds", "hash", "hw", "core", "graph", "io", "mem", "net", "gpu", "bench"]
 DEPS = {
     "ds": set(),
     "hash": set(),
@@ -18,6 +18,7 @@ DEPS = {
     "graph": {"core", "ds", "hw", "hash"},
     "io": {"core", "ds"},
     "mem": {"core", "ds", "hash", "graph"},
+    "net": set(),
     "gpu": {"core", "graph", "mem", "ds", "hash", "hw"},
     "bench": {"core", "ds", "hw"},
 }  # as the real workspace: benchmarks does not depend on graph, io, memory or gpu
@@ -48,11 +49,13 @@ class Affected(unittest.TestCase):
 
     def test_leaf_and_layers_below_are_unrelated(self):
         self.assertEqual(run("euhedral-io/src/a.rs"), (["io"], False))
-        self.assertEqual(run("euhedral-hash/src/a.rs")[0], sorted(set(NAMES) - {"ds", "hw"}))
+        # The net crate has no dependency yet: nothing below it is affected by it, and it by nothing below.
+        self.assertEqual(run("euhedral-net/src/a.rs"), (["net"], False))
+        self.assertEqual(run("euhedral-hash/src/a.rs")[0], sorted(set(NAMES) - {"ds", "hw", "net"}))
 
     def test_lowest_layer_change_is_everything_above(self):
         crates, everything = run("euhedral-ds/src/a.rs")
-        self.assertEqual(sorted(crates), sorted(set(NAMES) - {"hash"}))
+        self.assertEqual(sorted(crates), sorted(set(NAMES) - {"hash", "net"}))
         self.assertFalse(everything)
 
     def test_root_build_files_are_everything(self):
@@ -85,7 +88,7 @@ class Affected(unittest.TestCase):
         self.assertTrue(run("tools/new.sh")[1])
 
     def test_crate_readme_counts_but_other_md_does_not(self):
-        self.assertEqual(run("euhedral-ds/README.md")[0], sorted(set(NAMES) - {"hash"}))
+        self.assertEqual(run("euhedral-ds/README.md")[0], sorted(set(NAMES) - {"hash", "net"}))
         self.assertEqual(run("euhedral-ds/GLOSSARY.md"), ([], False))
 
     def test_docs_plus_one_crate(self):
