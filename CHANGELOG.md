@@ -3,6 +3,22 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## A completion source can be built without device lanes (2026-11-14)
+
+**What.** `Completions::without_lanes() -> Arc<Completions>`: a source with no lane pool.
+
+**Why.** A program with no device open, or between closing one and opening the next, still needs frames at deadlines and its own pending work polled; `Completions::new` required a pool.
+
+**How to use it.** `let completions = Completions::without_lanes();` then `at`, `after`, `register` and `after_retired` as usual, driven by the poll frame in a lattice or by `reap` and `pull` by hand.
+
+**Semantics.**
+- `at`, `after`, `register`, `after_retired`, `pending`, `reap`, the lateness figures and the poll frame's wake-ups (the deadline, the bell, the blind back-off) behave as on a source with lanes; nothing reads a lane.
+- `after_marker` has no lane to read and is refused as a registration after `complete` is: the frame is leaked and counted in `leaked_unreached` (the lane the marker names may still be using what it holds, so it is not finished), `pending` does not count it, and debug builds panic.
+- A timer is never emitted before its deadline and goes out in the first reap at or after it; timers due in one reap go out in registration order, not sorted by deadline (unchanged from a source with lanes).
+- A source built by `new` is unchanged, including holding its lanes for its life.
+
+**Tests.** In `completions.rs`: `due_timers_without_lanes_are_emitted_in_registration_order_and_none_before_its_deadline`, `a_pending_operation_registered_without_lanes_is_polled_and_completes`, `a_ready_token_registered_without_lanes_completes`, `a_marker_without_lanes_is_refused_and_its_frame_is_leaked_and_counted`, `a_retirement_cell_registered_without_lanes_completes_when_it_arrives`, `pending_and_reap_report_without_lanes` (none can compile on the old code).
+
 ## A lane can copy a tile between pitched device buffers (2026-11-13)
 
 **What.** `LaneEnqueue::copy_pitched_on_device(dst, dst_pitch, src, src_pitch, row_bytes, rows)` (an `unsafe fn`, on every submitter: a stream's, a shared lane's, a recording's, on the CUDA and fake backends) copies `rows` rows of `row_bytes` bytes from `src` (rows `src_pitch` bytes apart) to `dst` (rows `dst_pitch` bytes apart), device to device, as one operation. `ShapeHasher::copy_pitched` records it in a shape.

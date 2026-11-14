@@ -66,6 +66,14 @@ A `Completions` holds frames to emit once something completes:
 - `register(pending)`: a `Pending` operation is polled until it yields its continuation frame, for
   a completion that carries a result.
 
+`Completions::new(lanes)` takes the device lanes its markers are read from; `Completions::without_lanes()` builds one with
+none, for a program with no device open (or between closing one and opening the next) that still runs frames at
+deadlines and registers its own pending work. On it `at`, `after`, `register` and `after_retired` work as on any other;
+`after_marker` has no lane to read and refuses its frame like a refused marker not reached: the frame is leaked and
+counted in `leaked_unreached` (the lane the marker names may still use what it holds), not counted by `pending`, and
+debug builds panic. A timer is never emitted before its deadline and goes out in the first reap at or after it; timers
+due in one reap go out in registration order, not sorted by deadline.
+
 Continuations are emitted in registration order, so frames on one ordered lane keep that order. A
 frame whose kill switch is set is still emitted: the executor skips it and runs its `do_finally`,
 which ends what it holds, so `pending()` drains to zero on its own. `lateness_us()` reports how
