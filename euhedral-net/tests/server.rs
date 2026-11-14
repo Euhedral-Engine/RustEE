@@ -725,8 +725,12 @@ fn at_the_cap_a_connection_waits_in_the_backlog_until_one_closes() {
     assert_eq!((counters.accepted, counters.open), (2, 2));
     assert_eq!(server.io.pending(), 2, "an accept is pending at the cap");
     // One ends, and the next accept follows: the third is taken in and answered.
-    let (target, reply) = replies.remove(0);
-    assert_eq!(target, "/1");
+    // The two handlers run in parallel and in no fixed order: the reply is picked by its target.
+    let at = replies
+        .iter()
+        .position(|(target, _)| target == "/1")
+        .unwrap();
+    let (_, reply) = replies.remove(at);
     reply.send(Response::with_status(200));
     assert_eq!(first.read_response(false).status, 200);
     first.expect_closed();
@@ -983,6 +987,34 @@ fn stop_after_the_100_continue_ends_the_connection_and_the_body_never_reaches_th
     assert_eq!(server.handle.counters().requests, 0);
     server.sink.complete_gracefully();
     server.lattice.close();
+}
+
+#[test]
+fn a_cancel_frame_asked_for_after_the_peer_broke_the_connection_still_runs_once() {
+    let (handler, parked) = parking();
+    let server = Fixture::start(config(), handler);
+    let mut peer = server.connect();
+    assert_eq!(text(&peer.get("/ok")), "ok");
+    peer.send(b"GET /ok HTTP/1.1\r\nHost: t\r\n\r\nGET /slow HTTP/1.1\r\nHost: t\r\n\r\n");
+    let (_, reply) = parked.recv_timeout(PATIENCE).unwrap();
+    // The first frame is the gate: when it ran, the server has seen the peer go, and its connection is closed and
+    // waits for the answer only. A frame asked for now must still run.
+    let (seen, gone) = signal();
+    reply.on_cancel(seen);
+    let mut probe = [0u8; 1];
+    peek_on(&mut peer.stream, &mut probe);
+    drop(peer);
+    gone.recv_timeout(PATIENCE)
+        .expect("the cancel was not seen");
+    let (spy, report) = Spy::pair();
+    reply.on_cancel(spy);
+    assert_eq!(report.recv_timeout(PATIENCE), Ok("ran"));
+    reply.send(Response::with_status(200));
+    server.finish();
+    assert!(
+        report.try_recv().is_err(),
+        "the frame was dropped or ran twice"
+    );
 }
 
 #[test]

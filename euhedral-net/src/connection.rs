@@ -39,6 +39,7 @@
 //!   connection's order (a discarded one); so a stop is complete only when no frame of the server is left.
 
 use std::fmt::{self, Debug, Formatter};
+use std::io::{Error, ErrorKind};
 use std::net::{Shutdown, TcpStream};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
@@ -114,6 +115,8 @@ struct ConnState {
     ctx: Option<Arc<Ctx>>,
     /// The frame to offer if the request being handled is cancelled.
     on_cancel: Option<Box<dyn Frame>>,
+    /// The number of the request whose cancel flag was set, whatever the phase became after.
+    cancelled_seq: Option<u64>,
     parser: RequestParser,
     /// Bytes received and not yet parsed.
     buf: Vec<u8>,
@@ -188,6 +191,7 @@ impl Conn {
                 stream: Some(stream),
                 ctx: Some(ctx),
                 on_cancel: None,
+                cancelled_seq: None,
                 parser,
                 buf: Vec::new(),
                 spare: None,
@@ -245,8 +249,8 @@ impl Conn {
 
     /// Cancels an operation of this connection.
     fn cancel_op(&self, st: &ConnState, id: OpId) {
-        if let Some(ctx) = &st.ctx {
-            ctx.io.cancel(id);
+        if let Some(io) = st.ctx.as_ref().and_then(|ctx| ctx.io.upgrade()) {
+            io.cancel(id);
         }
     }
 
@@ -261,15 +265,18 @@ impl Conn {
             .take()
             .unwrap_or_else(|| vec![0; self.shared.config.read_chunk.max(1)]);
         let conn = self.clone();
-        let started = ctx.io.recv_with(
-            raw_stream(stream),
-            IoBuf { bytes, filled: 0 },
-            OpOptions { limit },
-            Box::new(move |done| {
-                conn.post(Event::Recv(done));
-                no_work()
-            }),
-        );
+        let started = match ctx.io.upgrade() {
+            Some(io) => io.recv_with(
+                raw_stream(stream),
+                IoBuf { bytes, filled: 0 },
+                OpOptions { limit },
+                Box::new(move |done| {
+                    conn.post(Event::Recv(done));
+                    no_work()
+                }),
+            ),
+            None => Err(Error::from(ErrorKind::NotConnected)),
+        };
         match started {
             Ok(id) => st.recv = Some(id),
             Err(_) => self.close_now(st),
@@ -297,17 +304,19 @@ impl Conn {
         };
         let filled = bytes.len();
         let conn = self.clone();
-        let started = ctx.io.send_with(
-            raw_stream(stream),
-            IoBuf { bytes, filled },
-            OpOptions {
-                limit: self.shared.config.write_limit,
-            },
-            Box::new(move |done| {
-                conn.post(Event::Sent(done));
-                no_work()
-            }),
-        );
+        let limit = self.shared.config.write_limit;
+        let started = match ctx.io.upgrade() {
+            Some(io) => io.send_with(
+                raw_stream(stream),
+                IoBuf { bytes, filled },
+                OpOptions { limit },
+                Box::new(move |done| {
+                    conn.post(Event::Sent(done));
+                    no_work()
+                }),
+            ),
+            None => Err(Error::from(ErrorKind::NotConnected)),
+        };
         match started {
             Ok(id) => st.send = Some(id),
             Err(_) => self.close_now(st),
@@ -482,7 +491,8 @@ impl Conn {
     }
 
     fn raise_cancel(&self, st: &mut ConnState) {
-        if let Phase::Handling { cancel, .. } = &st.phase {
+        if let Phase::Handling { cancel, seq, .. } = &st.phase {
+            st.cancelled_seq = Some(*seq);
             cancel.store(true, Ordering::Release);
             self.shared
                 .counters
@@ -498,25 +508,20 @@ impl Conn {
         }
     }
 
-    /// The handler asked for a frame to be offered when the request is cancelled. A request that is already
-    /// cancelled offers it at once; one that is over drops it.
+    /// The handler asked for a frame to be offered when the request is cancelled. If the request was already
+    /// cancelled (and its reply is still owed, whatever the connection has done since) it is offered at once; while
+    /// the request is being handled it waits, a later one replacing it; otherwise (the reply went through) it is
+    /// dropped.
     fn on_cancel_asked(self: &Arc<Self>, st: &mut ConnState, seq: u64, frame: Box<dyn Frame>) {
-        let Phase::Handling {
-            seq: current,
-            cancel,
-            ..
-        } = &st.phase
-        else {
-            return;
-        };
-        if *current != seq {
-            return;
-        }
-        if cancel.load(Ordering::Acquire) {
+        if st.owed && seq == st.seq && st.cancelled_seq == Some(seq) {
             if let Some(ctx) = &st.ctx {
                 let _ = ctx.sink.offer(frame);
             }
-        } else {
+            return;
+        }
+        if let Phase::Handling { seq: current, .. } = &st.phase
+            && *current == seq
+        {
             st.on_cancel = Some(frame);
         }
     }
@@ -850,8 +855,10 @@ impl Responder {
     /// it while the request is handled): the way to be told without looking at the flag. It runs at most once, and
     /// never if the reply is sent before the cancel is seen: it is then dropped without running. The two race by
     /// nature (the reply and the peer's departure arrive in no fixed order), so the frame may also run after the
-    /// reply was sent, or when the reply is still sent because the peer only half-closed. A second call replaces
-    /// the frame of the first.
+    /// reply was sent, or when the reply is still sent because the peer only half-closed. Each
+    /// frame runs at most once: before a cancel is seen a later call replaces the earlier frame (which is dropped);
+    /// once it is seen, every frame asked for while the reply is still owed runs at once, so a call before the
+    /// cancel and one after it both run.
     pub fn on_cancel(&self, frame: Box<dyn Frame>) {
         self.conn.post(Event::OnCancel {
             seq: self.seq,

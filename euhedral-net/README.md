@@ -138,10 +138,13 @@ fn start(
   server sets when the peer ends its stream or breaks the connection while the request is being handled.
   `Responder::on_cancel(frame)` asks for a frame to be offered to the sink when that happens, so a handler need not
   look at the flag: it runs at most once, and is dropped without running if the reply is sent first (the two race, so
-  it may also run just after a reply that was still sent, after a half-close).
+  it may also run just after a reply that was still sent, after a half-close). Before a cancel a later call replaces
+  the earlier frame; after it, every frame asked for while the reply is still owed runs at once.
 - **One source per connection.** A connection's parser, buffers and socket are plain state that only its key frame
   touches (see the glossary: station). Requests on one connection are answered in the order they arrived, one at a
   time; pipelined bytes wait in the buffer. Different connections run in parallel.
+  While pipelined bytes are buffered when a request is handed to the handler, no read watches the peer, so a cancel
+  is seen only when the reply is sent (a reply to a peer that has gone is then discarded).
 - **`Expect: 100-continue`** is answered by the server with `100 Continue` once the head is accepted (not too large,
   well formed); the handler is not consulted and cannot refuse it. A body over `max_body_bytes` is answered 413 at
   the head, before it is read.
@@ -164,8 +167,10 @@ fn start(
   the server let go of the listener socket, the handler, the `AsyncIo`, the timers and the lattice. Only the sink is
   kept, to report a stop, until the last `ServerHandle` is dropped. The listener's source stays attached to the
   lattice until then too, so that a stop asked for at any time is heard.
-- **The lattice** is held weakly: keep it alive while the server runs. A lattice that is gone or closed when a
-  connection arrives refuses the connection and ends the server as a stop does.
+- **The lattice and the `AsyncIo`** are held weakly: keep them alive while the server runs, and stop the server
+  before dropping either (a server abandoned without a stop leaks through no cycle, but nothing runs its frames).
+  A lattice that is gone or closed when a connection arrives refuses the connection and ends the server as a stop
+  does.
 - **Cost of a source per connection.** Each connection is one allocation for its source and its state, plus the
   locks and atomics of attaching it to the lattice and detaching it. That matters only for very short-lived
   connections arriving at a very high rate; the server is designed for long-lived connections, where it is paid once

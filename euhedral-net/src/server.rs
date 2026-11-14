@@ -233,7 +233,9 @@ pub(crate) enum ListenerEvent {
 /// listener hold one `Arc` of it and let go of it when they end, so that when the stop is reported nothing of the
 /// caller's is held by the server any more (but the sink, which reports it; see [`ServerHandle::stop`]).
 pub(crate) struct Ctx {
-    pub io: Arc<AsyncIo>,
+    /// Weak: pending operations hold the connections, which hold this, so a strong reference would make a cycle
+    /// through the engine that a server dropped without a stop would leak. The caller keeps the engine alive.
+    pub io: Weak<AsyncIo>,
     pub sink: Arc<QueueIngestSink>,
     pub handler: Arc<dyn Handler>,
 }
@@ -252,8 +254,9 @@ struct ListenerState {
     lattice: Weak<ControlPlaneLattice>,
     /// The accept in flight.
     accepting: Option<OpId>,
-    /// The registry of open connections, by slot.
-    conns: Vec<Option<Arc<Conn>>>,
+    /// The registry of open connections, by slot. Weak: the lattice (while the connection is attached) and the
+    /// connection's own operations hold it, and a strong reference here would be a cycle with the server.
+    conns: Vec<Option<Weak<Conn>>>,
     free: Vec<usize>,
     open: usize,
     stopping: bool,
@@ -357,10 +360,13 @@ impl Shared {
             return;
         }
         ls.stopping = true;
-        if let (Some(id), Some(ctx)) = (ls.accepting, &ls.ctx) {
-            ctx.io.cancel(id);
+        if let (Some(id), Some(io)) = (
+            ls.accepting,
+            ls.ctx.as_ref().and_then(|ctx| ctx.io.upgrade()),
+        ) {
+            io.cancel(id);
         }
-        for conn in ls.conns.iter().flatten() {
+        for conn in ls.conns.iter().flatten().filter_map(Weak::upgrade) {
             conn.post(Event::Stop);
         }
     }
@@ -378,14 +384,17 @@ impl Shared {
             return;
         };
         let shared = self.clone();
-        let started = ctx.io.accept_with(
-            raw_listener(listener),
-            OpOptions::default(),
-            Box::new(move |result| {
-                shared.post_listener(ListenerEvent::Accepted(result));
-                no_work()
-            }),
-        );
+        let started = match ctx.io.upgrade() {
+            Some(io) => io.accept_with(
+                raw_listener(listener),
+                OpOptions::default(),
+                Box::new(move |result| {
+                    shared.post_listener(ListenerEvent::Accepted(result));
+                    no_work()
+                }),
+            ),
+            None => Err(io::Error::from(io::ErrorKind::NotConnected)),
+        };
         match started {
             Ok(id) => ls.accepting = Some(id),
             Err(_) => self.accept_failed(ls),
@@ -438,7 +447,7 @@ impl Shared {
             self.begin_stop(ls);
             return;
         }
-        ls.conns[slot] = Some(conn.clone());
+        ls.conns[slot] = Some(Arc::downgrade(&conn));
         ls.open += 1;
         self.counters
             .connection
@@ -540,7 +549,9 @@ impl ServerHandle {
 /// uses for the back-off after a failed accept (the lattice's own timer: the server keeps none).
 ///
 /// The listener, and each connection when it is accepted, becomes a source of `lattice`. The server holds the
-/// lattice weakly: the caller keeps it alive while the server runs. If the lattice is gone or closed when a
+/// lattice and `io` weakly: the caller keeps them alive while the server runs, and stops the server before it drops
+/// either (a server dropped without a stop does not leak through a reference cycle, but nothing then runs its
+/// frames, so its listening socket is closed only when the lattice lets go of the server). If the lattice is gone or closed when a
 /// connection is accepted, the connection is refused and the server ends as if stopped.
 ///
 /// Returns an error if the lattice refuses the listener's source (it is closed). The server then does nothing.
@@ -563,7 +574,7 @@ pub fn serve(
     let state = ListenerState {
         listener: Some(listener),
         ctx: Some(Arc::new(Ctx {
-            io,
+            io: Arc::downgrade(&io),
             sink: sink.clone(),
             handler,
         })),
