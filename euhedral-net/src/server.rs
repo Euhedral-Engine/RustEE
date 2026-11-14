@@ -2,33 +2,47 @@
 //! accepts exactly once.
 //!
 //! The server owns no thread and no timer, and nothing in it waits. Sockets go through `AsyncIo` (whose
-//! operations carry the time limits and can be cancelled); work runs as frames offered to a `QueueIngestSink`.
-//! The listener's own state (the pending accept, the registry of connections, the stop) is plain state that only
-//! frames ordered by the listener's hash touch; each connection's state is the same for the connection's hash (see
-//! the [`connection`](crate::connection) module notes).
+//! operations carry the time limits and can be cancelled); the handler's frames run as frames offered to a
+//! `QueueIngestSink`. The listener and every connection are each a source of the lattice with an inbox (see
+//! [`station`](crate::station)): the listener is attached by [`serve`], a connection when it is accepted, and a
+//! connection is detached when it ends. The listener's own state (the pending accept, the registry of
+//! connections, the stop) is plain state that only the listener's key frame touches, and a connection's state is
+//! the same for its key frame, so different connections are served at once and nothing waits on a cell.
+//!
+//! A failed accept is tried again after `accept_backoff`, through a timer of the lattice's own
+//! (`euhedral_graph::Completions`), so the server keeps no timer and no thread of its own.
 //!
 //! # Allocation
 //!
 //! Per connection: its `Conn` (an `Arc`), the parser (a buffer for one head within `max_header_bytes`, and a body
 //! within `max_body_bytes`), one receive buffer of `read_chunk` bytes, a slot of the registry and the socket. Per
 //! request: the `Request` the parser builds, one `Responder` with its cancel flag, the bytes of the reply, the
-//! handler's own frame, and one frame for each event of the connection (a `recv`, a `send`, a reply) plus the
-//! buffers and boxes `AsyncIo` keeps for each operation.
+//! handler's own frame, and, for each operation of the connection (a `recv`, a `send`), the frame that does nothing
+//! which its continuation returns, plus the buffers and boxes `AsyncIo` keeps for each operation.
 
 use std::io;
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+#[cfg(windows)]
+use std::os::windows::io::AsRawSocket;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
-use euhedral_core::frames::{Frame, FrameError, FrameHeader};
+use euhedral_core::control_plane::ControlPlaneLattice;
+use euhedral_core::frames::{Frame, FrameHeader};
+use euhedral_core::generics::{LatticeReceiver, LatticeSource, SourceCell};
 use euhedral_core::ingest::QueueIngestSink;
-use euhedral_data_structures::sync::ClaimCell;
+use euhedral_data_structures::atomics::CachePadded;
+use euhedral_data_structures::sync::{HotScope, LifecycleMutex};
+use euhedral_graph::Completions;
 use euhedral_io::{AsyncIo, Cancelled, OpId, OpOptions, OwnedSock, RawSock};
 
 use crate::connection::{Conn, Event, Responder};
 use crate::message::Request;
 use crate::parse::Limits;
+use crate::station::{Drive, Post, Station};
 
 /// The limits and sizes of a server. Every field is a setting: none is tied to a machine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,9 +61,18 @@ pub struct ServerConfig {
     /// How long a connection may wait for the first byte of a request (also the wait of a new connection). The
     /// connection is closed without an answer when it passes. `None` is no limit.
     pub idle_limit: Option<Duration>,
-    /// How long one reply (or the `100 Continue`) may take to go out, and how long a closing connection waits for
-    /// its peer to close. The connection is closed when it passes. `None` is no limit.
+    /// How long one reply (or the `100 Continue`) may take to go out. The connection is closed when it passes.
+    /// `None` is no limit.
     pub write_limit: Option<Duration>,
+    /// How long, from its start, the whole close of a connection after its last reply may take: the server shuts
+    /// its writing side and reads and drops what the peer still sends until the peer closes or this passes. It is
+    /// always a bound (a peer that sends a little at a time, or never closes, cannot hold the connection).
+    pub linger_limit: Duration,
+    /// The bound of that close when the server is stopping, if it is shorter than `linger_limit`; a close
+    /// already in progress is cut to it when the stop comes.
+    pub stop_linger_limit: Duration,
+    /// How long the server waits after a failed accept before it accepts again.
+    pub accept_backoff: Duration,
     /// The size of the buffer of each `recv`. It also bounds the bytes kept for a pipelined request while the
     /// one before it is handled.
     pub read_chunk: usize,
@@ -64,6 +87,9 @@ impl Default for ServerConfig {
             read_limit: Some(Duration::from_secs(30)),
             idle_limit: Some(Duration::from_secs(60)),
             write_limit: Some(Duration::from_secs(30)),
+            linger_limit: Duration::from_secs(5),
+            stop_linger_limit: Duration::from_secs(1),
+            accept_backoff: Duration::from_millis(100),
             read_chunk: 16 * 1024,
         }
     }
@@ -132,36 +158,56 @@ pub struct Counters {
     pub accept_errors: u64,
 }
 
-/// The cells behind [`Counters`], shared by every frame of the server.
+/// The counters of every connection's request, written by every frame that handles one.
 #[derive(Debug, Default)]
-pub(crate) struct CounterCells {
-    pub accepted: AtomicU64,
-    pub open: AtomicU64,
+pub(crate) struct RequestCells {
     pub requests: AtomicU64,
     pub replies: [AtomicU64; 4],
+}
+
+/// The counters of the connections themselves, written by the listener's order.
+#[derive(Debug, Default)]
+pub(crate) struct ConnectionCells {
+    pub accepted: AtomicU64,
+    pub open: AtomicU64,
+    pub accept_errors: AtomicU64,
+}
+
+/// The counters of what rarely happens.
+#[derive(Debug, Default)]
+pub(crate) struct RareCells {
     pub parse_errors: AtomicU64,
     pub limits_passed: AtomicU64,
     pub cancelled: AtomicU64,
     pub discarded: AtomicU64,
-    pub accept_errors: AtomicU64,
+}
+
+/// The cells behind [`Counters`], shared by every frame of the server and read from outside. They are grouped by how
+/// often they are written and each group has its own cache line, so the counters every request writes do not share
+/// a line with those of the listener or with those that rarely change.
+#[derive(Debug, Default)]
+pub(crate) struct CounterCells {
+    pub request: CachePadded<RequestCells>,
+    pub connection: CachePadded<ConnectionCells>,
+    pub rare: CachePadded<RareCells>,
 }
 
 impl CounterCells {
     fn snapshot(&self) -> Counters {
         let get = |cell: &AtomicU64| cell.load(Ordering::Relaxed);
         Counters {
-            accepted: get(&self.accepted),
-            open: get(&self.open),
-            requests: get(&self.requests),
-            replies_2xx: get(&self.replies[0]),
-            replies_3xx: get(&self.replies[1]),
-            replies_4xx: get(&self.replies[2]),
-            replies_5xx: get(&self.replies[3]),
-            parse_errors: get(&self.parse_errors),
-            limits_passed: get(&self.limits_passed),
-            cancelled: get(&self.cancelled),
-            discarded: get(&self.discarded),
-            accept_errors: get(&self.accept_errors),
+            accepted: get(&self.connection.accepted),
+            open: get(&self.connection.open),
+            requests: get(&self.request.requests),
+            replies_2xx: get(&self.request.replies[0]),
+            replies_3xx: get(&self.request.replies[1]),
+            replies_4xx: get(&self.request.replies[2]),
+            replies_5xx: get(&self.request.replies[3]),
+            parse_errors: get(&self.rare.parse_errors),
+            limits_passed: get(&self.rare.limits_passed),
+            cancelled: get(&self.rare.cancelled),
+            discarded: get(&self.rare.discarded),
+            accept_errors: get(&self.connection.accept_errors),
         }
     }
 }
@@ -174,8 +220,10 @@ pub(crate) enum ListenerEvent {
     Accepted(io::Result<OwnedSock>),
     /// The connection in registry slot `usize` ended.
     Closed(usize),
-    /// Stop; the frame is offered once the last connection is gone.
-    Stop(Box<dyn Frame>),
+    /// Stop (the frames to offer when it is done are in `Shared::stops`).
+    Stop,
+    /// The back-off after a failed accept is over.
+    Retry,
 }
 
 /// The plain state of the listener.
@@ -189,93 +237,62 @@ struct ListenerState {
     open: usize,
     stopping: bool,
     finished: bool,
-    /// The frames to offer when the server is stopped.
-    stopped: Vec<Box<dyn Frame>>,
+    /// A retry of the accept is waiting on the timer.
+    retrying: bool,
+}
+
+/// The frames to offer when the server is stopped, and whether it is.
+struct Stops {
+    done: bool,
+    frames: Vec<Box<dyn Frame>>,
 }
 
 /// What a server's frames share.
 pub(crate) struct Shared {
     pub io: Arc<AsyncIo>,
+    /// The lattice the connections attach their sources to.
+    lattice: Arc<ControlPlaneLattice>,
     pub sink: Arc<QueueIngestSink>,
     pub config: ServerConfig,
     pub limits: Limits,
     pub handler: Arc<dyn Handler>,
     pub counters: CounterCells,
-    listener_hash: u64,
-    salt: u64,
-    next_conn: AtomicU64,
-    listener: ClaimCell<ListenerState>,
-}
-
-/// A frame that carries an event to the listener's order.
-struct ListenerFrame {
-    header: FrameHeader,
-    shared: Arc<Shared>,
-    event: Option<ListenerEvent>,
-}
-
-impl Frame for ListenerFrame {
-    fn header(&self) -> &FrameHeader {
-        &self.header
-    }
-
-    fn header_mut(&mut self) -> &mut FrameHeader {
-        &mut self.header
-    }
-
-    fn execute(&mut self) -> Result<(), FrameError> {
-        if let Some(event) = self.event.take() {
-            self.shared.run(event);
-        }
-        Ok(())
-    }
-}
-
-/// A well-spread hash of `x` (the finaliser of SplitMix64), so that the ids of connections land on all cores.
-fn mix(mut x: u64) -> u64 {
-    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    x ^ (x >> 31)
+    timers: Arc<Completions>,
+    /// A stop was asked for; set by `ServerHandle::stop` before its event is posted, so a reply given after the
+    /// call returns already finds it.
+    pub stop_requested: AtomicBool,
+    /// The listener's state, entered by its key frame only.
+    listener: SourceCell<ListenerState>,
+    station: Station<Shared>,
+    /// Stop is lifecycle work: its frames wait in a list that the listener's finish and `ServerHandle::stop` share.
+    stops: LifecycleMutex<Stops>,
 }
 
 #[cfg(unix)]
 fn raw_listener(listener: &TcpListener) -> RawSock {
-    std::os::fd::AsRawFd::as_raw_fd(listener)
+    listener.as_raw_fd()
 }
 
 #[cfg(windows)]
 fn raw_listener(listener: &TcpListener) -> RawSock {
-    std::os::windows::io::AsRawSocket::as_raw_socket(listener)
+    listener.as_raw_socket()
 }
 
 impl Shared {
     /// Counts a final reply of `status`.
     pub(crate) fn count_reply(&self, status: u16) {
         let class = usize::from(status / 100).clamp(2, 5) - 2;
-        self.counters.replies[class].fetch_add(1, Ordering::Relaxed);
+        self.counters.request.replies[class].fetch_add(1, Ordering::Relaxed);
     }
 
-    /// The frame that carries `event` to the listener's order.
-    fn listener_frame(self: &Arc<Self>, event: ListenerEvent) -> Box<dyn Frame> {
-        Box::new(ListenerFrame {
-            header: FrameHeader::new(self.listener_hash),
-            shared: self.clone(),
-            event: Some(event),
-        })
+    /// Pushes `event` into the listener's inbox.
+    pub(crate) fn post_listener(&self, event: ListenerEvent) {
+        self.station.post(event);
     }
 
-    /// Offers `event` to the listener's order. Hands the event's frame back when the sink has completed.
-    pub(crate) fn post_listener(self: &Arc<Self>, event: ListenerEvent) {
-        let frame = self.listener_frame(event);
-        let _ = self.sink.offer_seeded(self.listener_hash, frame);
-    }
-
-    fn run(self: &Arc<Self>, event: ListenerEvent) {
-        let Some(mut guard) = self.listener.try_claim() else {
-            // Frames of one hash run one at a time: an ordering that was not kept. Try again, never wait.
-            self.post_listener(event);
-            return;
-        };
+    fn run_event(self: &Arc<Self>, event: ListenerEvent) {
+        // Only the listener's key frame runs events, one at a time: the entry cannot find the cell taken.
+        let mut guard = self.listener.enter();
         let ls: &mut ListenerState = &mut guard;
         match event {
             ListenerEvent::Start => self.arm_accept(ls),
@@ -285,12 +302,7 @@ impl Shared {
                     Ok(socket) => self.accepted(ls, socket),
                     Err(error) => {
                         if !Cancelled::is(&error) {
-                            self.counters.accept_errors.fetch_add(1, Ordering::Relaxed);
-                            // With connections open, one ending arms the accept again; with none, nothing
-                            // would, so it is armed now (an error that persists with none open repeats).
-                            if ls.open == 0 {
-                                self.arm_accept(ls);
-                            }
+                            self.accept_failed(ls);
                         }
                     }
                 }
@@ -302,18 +314,20 @@ impl Shared {
                 {
                     ls.free.push(slot);
                     ls.open -= 1;
-                    self.counters.open.store(ls.open as u64, Ordering::Relaxed);
+                    self.counters
+                        .connection
+                        .open
+                        .store(ls.open as u64, Ordering::Relaxed);
                 }
                 self.arm_accept(ls);
                 self.check_finished(ls);
             }
-            ListenerEvent::Stop(frame) => {
-                if ls.finished {
-                    // Already stopped: reported at once.
-                    let _ = self.sink.offer(frame);
-                    return;
-                }
-                ls.stopped.push(frame);
+            ListenerEvent::Retry => {
+                ls.retrying = false;
+                self.arm_accept(ls);
+                self.check_finished(ls);
+            }
+            ListenerEvent::Stop => {
                 if !ls.stopping {
                     ls.stopping = true;
                     if let Some(id) = ls.accepting {
@@ -330,7 +344,11 @@ impl Shared {
 
     /// Arms the accept unless one is pending, the server is stopping or the cap is reached.
     fn arm_accept(self: &Arc<Self>, ls: &mut ListenerState) {
-        if ls.stopping || ls.accepting.is_some() || ls.open >= self.config.max_connections {
+        if ls.stopping
+            || ls.accepting.is_some()
+            || ls.retrying
+            || ls.open >= self.config.max_connections
+        {
             return;
         }
         let Some(listener) = &ls.listener else {
@@ -340,14 +358,31 @@ impl Shared {
         let started = self.io.accept_with(
             raw_listener(listener),
             OpOptions::default(),
-            Box::new(move |result| shared.listener_frame(ListenerEvent::Accepted(result))),
+            Box::new(move |result| {
+                shared.post_listener(ListenerEvent::Accepted(result));
+                no_work()
+            }),
         );
         match started {
             Ok(id) => ls.accepting = Some(id),
-            Err(_) => {
-                self.counters.accept_errors.fetch_add(1, Ordering::Relaxed);
-            }
+            Err(_) => self.accept_failed(ls),
         }
+    }
+
+    /// An accept failed (it ended in an error, or could not start): counted, and tried again after the back-off, so
+    /// that neither a persistent error spins nor the server is left without an accept.
+    fn accept_failed(self: &Arc<Self>, ls: &mut ListenerState) {
+        self.counters
+            .connection
+            .accept_errors
+            .fetch_add(1, Ordering::Relaxed);
+        if ls.stopping || ls.retrying {
+            return;
+        }
+        ls.retrying = true;
+        let frame = Post::new(self.clone(), ListenerEvent::Retry);
+        self.timers
+            .at(Instant::now() + self.config.accept_backoff, frame);
     }
 
     /// Takes in an accepted socket: registers its connection and has it start reading.
@@ -356,8 +391,7 @@ impl Shared {
             // Dropped: the peer sees the connection close.
             return;
         }
-        let stream = std::net::TcpStream::from(socket);
-        let id = self.next_conn.fetch_add(1, Ordering::Relaxed);
+        let stream = TcpStream::from(socket);
         let slot = match ls.free.pop() {
             Some(slot) => slot,
             None => {
@@ -365,28 +399,42 @@ impl Shared {
                 ls.conns.len() - 1
             }
         };
-        let conn = Arc::new(Conn::new(
-            self.clone(),
-            mix(self.salt ^ id.wrapping_mul(0x9E37_79B9_7F4A_7C15)),
-            stream,
-            slot,
-        ));
+        let conn = Conn::new(self.clone(), stream, slot);
+        // Attaching a source is cold work, and the lattice says so itself; it refuses once it is closed.
+        if self.lattice.add_upstream(conn.clone()).is_err() {
+            ls.free.push(slot);
+            return;
+        }
         ls.conns[slot] = Some(conn.clone());
         ls.open += 1;
-        self.counters.accepted.fetch_add(1, Ordering::Relaxed);
-        self.counters.open.store(ls.open as u64, Ordering::Relaxed);
+        self.counters
+            .connection
+            .accepted
+            .fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .connection
+            .open
+            .store(ls.open as u64, Ordering::Relaxed);
         conn.post(Event::Start);
         self.arm_accept(ls);
     }
 
     /// When the server is stopping and nothing is left, closes the listener and offers the stop frames.
     fn check_finished(self: &Arc<Self>, ls: &mut ListenerState) {
-        if ls.stopping && !ls.finished && ls.open == 0 && ls.accepting.is_none() {
+        if ls.stopping && !ls.finished && ls.open == 0 && ls.accepting.is_none() && !ls.retrying {
             ls.finished = true;
             ls.listener = None;
-            for frame in ls.stopped.drain(..) {
+            let frames = {
+                let _cold = HotScope::leave();
+                let mut stops = self.stops.lock();
+                stops.done = true;
+                std::mem::take(&mut stops.frames)
+            };
+            for frame in frames {
                 let _ = self.sink.offer(frame);
             }
+            // The listener's source ends: the lattice lets go of it. Its key is running this, and goes home.
+            self.station.complete();
         }
     }
 }
@@ -420,47 +468,63 @@ impl ServerHandle {
     /// is offered to the sink, once. A second `stop` adds another frame, offered at the same time (or at
     /// once if the server is already stopped).
     ///
-    /// A `Responder` still alive after the server stopped is not special: its reply goes through the
-    /// connection's order as always, and is sent if its connection is still open and discarded otherwise. A
-    /// handler that never answers keeps the server from finishing, until its peer leaves. The sink must live
-    /// until the stop is done: a sink that completed refuses the events the server needs.
+    /// The notification means that no frame of the server will run after it: every connection is gone, no accept
+    /// or retry is pending, and every `Responder` handed to a handler has been used or dropped and its reply has
+    /// been through its connection's order (sent, or discarded and counted). So a handler that never answers (and
+    /// keeps its `Responder`) keeps the server from finishing, even when its peer is gone. A reply after the stop
+    /// started is sent if its connection is open (the request is answered with `Connection: close`) and
+    /// discarded otherwise. A lingering close is cut to `stop_linger_limit`. The sink must live until the stop is
+    /// done: a sink that completed refuses the events the server needs.
     pub fn stop(&self, stopped: Box<dyn Frame>) {
-        self.shared.post_listener(ListenerEvent::Stop(stopped));
+        let shared = &self.shared;
+        shared.stop_requested.store(true, Ordering::Release);
+        let _cold = HotScope::leave();
+        let mut stops = shared.stops.lock();
+        if stops.done {
+            // Already stopped, and the listener's source is gone: reported at once.
+            drop(stops);
+            let _ = shared.sink.offer(stopped);
+            return;
+        }
+        stops.frames.push(stopped);
+        drop(stops);
+        shared.post_listener(ListenerEvent::Stop);
     }
 }
 
 /// Starts serving: takes `listener` (a bound, listening socket), accepts connections on `io` and answers
 /// their requests with `handler`. Work runs as frames offered to `sink`, which a lattice drains; `io` must be
-/// attached to a lattice too (its continuations are frames).
+/// attached to a lattice too (its continuations are frames), and so must `timers`, a [`Completions`] the server
+/// uses for the back-off after a failed accept (the lattice's own timer: the server keeps none).
 ///
-/// Returns an error if the sink refuses the first frame (it has completed). The server then does nothing.
+/// Returns an error if the lattice refuses the listener's source (it is closed). The server then does nothing.
 ///
 /// A connection that the server refuses to read on (`max_connections`) waits in the kernel's backlog.
 pub fn serve(
+    lattice: Arc<ControlPlaneLattice>,
     io: Arc<AsyncIo>,
     sink: Arc<QueueIngestSink>,
     listener: TcpListener,
     config: ServerConfig,
     handler: Arc<dyn Handler>,
+    timers: Arc<Completions>,
 ) -> io::Result<ServerHandle> {
-    static SERVERS: AtomicU64 = AtomicU64::new(1);
-    let server = SERVERS.fetch_add(1, Ordering::Relaxed);
     let limits = Limits {
         max_header_bytes: config.max_header_bytes,
         max_body: config.max_body_bytes,
         ..Limits::default()
     };
-    let shared = Arc::new(Shared {
+    let shared = Arc::new_cyclic(|me| Shared {
         io,
+        lattice,
         sink,
         config,
         limits,
         handler,
         counters: CounterCells::default(),
-        listener_hash: mix(server),
-        salt: mix(server ^ 0xA5A5_A5A5_A5A5_A5A5),
-        next_conn: AtomicU64::new(0),
-        listener: ClaimCell::new(ListenerState {
+        timers,
+        stop_requested: AtomicBool::new(false),
+        listener: SourceCell::new(ListenerState {
             listener: Some(listener),
             accepting: None,
             conns: Vec::new(),
@@ -468,16 +532,59 @@ pub fn serve(
             open: 0,
             stopping: false,
             finished: false,
-            stopped: Vec::new(),
+            retrying: false,
+        }),
+        station: Station::new(me.clone()),
+        stops: LifecycleMutex::new(Stops {
+            done: false,
+            frames: Vec::new(),
         }),
     });
-    let start = shared.listener_frame(ListenerEvent::Start);
-    if shared
-        .sink
-        .offer_seeded(shared.listener_hash, start)
-        .is_err()
-    {
-        return Err(io::Error::other("the sink has completed"));
-    }
+    shared.post_listener(ListenerEvent::Start);
+    shared
+        .lattice
+        .add_upstream(shared.clone())
+        .map_err(|error| io::Error::other(error.to_string()))?;
     Ok(ServerHandle { shared })
+}
+
+impl Drive for Shared {
+    type Event = ListenerEvent;
+
+    fn station(&self) -> &Station<Shared> {
+        &self.station
+    }
+
+    fn run(self: &Arc<Self>, event: ListenerEvent) {
+        self.run_event(event);
+    }
+}
+
+impl LatticeSource for Shared {
+    fn add_downstream(self: Arc<Self>, downstream: Arc<dyn LatticeReceiver>) {
+        let me: Arc<dyn LatticeSource> = self.clone();
+        self.station.add_downstream(me, downstream);
+    }
+
+    /// Hands out nothing: the listener's work is its key frame, which only `request` pushes.
+    fn pull(
+        &self,
+        _consumer: &mut dyn FnMut(Box<dyn Frame>),
+        _stop: &mut dyn FnMut(&dyn Frame) -> bool,
+        _demand: u64,
+    ) -> u64 {
+        0
+    }
+
+    fn request(&self, demand: u64) {
+        self.station.request(demand);
+    }
+
+    fn complete(&self) {
+        self.station.complete();
+    }
+
+    fn is_complete(&self) -> bool {
+        self.station.is_complete()
+    }
 }

@@ -8,10 +8,12 @@ license = "Apache-2.0"
 
 [dependencies]
 euhedral-core = { path = "../euhedral-core" }
-# `ClaimCell`: the plain state of a connection, claimed by the frames that are ordered by its hash.
+# `CachePadded`, for the counters.
 euhedral-data-structures = { path = "../euhedral-data-structures" }
 # `AsyncIo`: the socket operations, with limits and cancel.
 euhedral-io = { path = "../euhedral-io" }
+# `Completions`: the lattice's timer, for the back-off after a failed accept.
+euhedral-graph = { path = "../euhedral-graph" }
 
 [dev-dependencies]
 # The loopback tests start a lattice on the CPUs this process may use.

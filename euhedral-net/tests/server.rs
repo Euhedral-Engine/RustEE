@@ -2,9 +2,12 @@
 //!
 //! Each test starts its own lattice, `AsyncIo` and sink, serves on a loopback listener and talks to it with plain
 //! blocking sockets. Order is driven by what the peer does (a blocking read returns when the server has answered)
-//! and by channels the handlers and the stop notification send on; nothing sleeps to synchronise. A time-limit test
-//! asserts a lower bound (the connection did not end before its limit) and the outcome, never an upper bound. The
-//! read timeouts on the peers are a failsafe against a hang, not a synchronisation.
+//! and by channels the handlers and the stop notification send on; nothing sleeps to synchronise. A handler that
+//! answers later parks its `Responder` in a channel, and the test releases it by offering a frame that sends. A
+//! time-limit test asserts a lower bound (the connection did not end before its limit) and the outcome, never an
+//! upper bound. The read timeouts on the peers are a failsafe against a hang, not a synchronisation. The one
+//! thing a test waits for by looking is a request's cancel flag (`until`): it is the server's only signal that the
+//! peer's departure was seen, and the tests that need it have no other event to wait on.
 //!
 //! Every test ends with `Fixture::finish`: the server is stopped, and when its notification arrives no operation is
 //! pending and no connection is counted.
@@ -16,10 +19,11 @@
 )]
 
 use std::io::{ErrorKind, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, OnceLock};
+use std::thread::{sleep, yield_now};
 use std::time::{Duration, Instant};
 
 use euhedral_core::config::{FragmentConfig, IdlePolicy, LatticeConfig};
@@ -27,6 +31,7 @@ use euhedral_core::control_plane::ControlPlaneLattice;
 use euhedral_core::frames::{Frame, FrameError, FrameHeader};
 use euhedral_core::impls::{BaseCloneableObject, DefaultExecutor};
 use euhedral_core::ingest::{IngestSink, QueueIngestSink};
+use euhedral_graph::Completions;
 use euhedral_hardware_utils::affinity;
 use euhedral_io::AsyncIo;
 use euhedral_net::{
@@ -34,6 +39,9 @@ use euhedral_net::{
     no_work, serve,
 };
 use euhedral_net::{Limits, Progress};
+
+/// What a parking handler holds: the request's target and the right to answer it.
+type Parked = (String, Responder);
 
 const PATIENCE: Duration = Duration::from_secs(20);
 
@@ -93,20 +101,28 @@ struct Fixture {
 
 impl Fixture {
     fn start(config: ServerConfig, handler: impl Handler) -> Fixture {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        Fixture::start_on(listener, config, handler)
+    }
+
+    fn start_on(listener: TcpListener, config: ServerConfig, handler: impl Handler) -> Fixture {
         let lattice = lattice();
         let io = AsyncIo::open().unwrap();
         let sink = Arc::new(QueueIngestSink::new());
+        let timers = Completions::without_lanes();
         lattice.add_upstream(io.clone()).unwrap();
         lattice.add_upstream(sink.delegate()).unwrap();
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        lattice.add_upstream(timers.clone()).unwrap();
         let addr = listener.local_addr().unwrap();
         assert_eq!(io.pending(), 0);
         let handle = serve(
+            lattice.clone(),
             io.clone(),
             sink.clone(),
             listener,
             config,
             Arc::new(handler),
+            timers,
         )
         .unwrap();
         let (notify, stopped) = channel();
@@ -130,12 +146,18 @@ impl Fixture {
         }
     }
 
-    /// Asks the server to stop and returns when it says it has.
-    fn stop(&self) {
+    /// Asks the server to stop and returns at once: when it returns, the request is recorded, so a reply sent
+    /// after it is sent after the stop.
+    fn begin_stop(&self) {
         self.handle.stop(Box::new(Notify {
             header: FrameHeader::new(7),
             tx: self.notify.clone(),
         }));
+    }
+
+    /// Asks the server to stop and returns when it says it has.
+    fn stop(&self) {
+        self.begin_stop();
         self.stopped
             .recv_timeout(PATIENCE)
             .expect("the server did not report that it stopped");
@@ -157,12 +179,27 @@ impl Fixture {
     }
 }
 
-/// A read that goes on after a signal interrupted it.
+/// A read that goes on after it was interrupted. The cause of the interruptions seen on the test threads of this
+/// machine was not found (nothing in this workspace installs a signal handler, and the server does no I/O on the
+/// test thread), so the one retry stays; `std` retries `Interrupted` for `read_exact` but not for `read`.
 fn read_on(stream: &mut TcpStream, buf: &mut [u8]) -> std::io::Result<usize> {
     loop {
         match stream.read(buf) {
             Err(e) if e.kind() == ErrorKind::Interrupted => {}
             other => return other,
+        }
+    }
+}
+
+/// A peek that goes on after it was interrupted (see `read_on`).
+fn peek_on(stream: &mut TcpStream, buf: &mut [u8]) {
+    loop {
+        match stream.peek(buf) {
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            other => {
+                other.expect("the data to peek at");
+                return;
+            }
         }
     }
 }
@@ -239,6 +276,32 @@ fn echo_target(request: Request, reply: Responder) -> Box<dyn Frame> {
 
 fn text(response: &Response) -> &str {
     std::str::from_utf8(&response.body).unwrap()
+}
+
+/// A handler that answers `/ok` at once and parks everything else: the test thread gets the `Responder` through
+/// the channel and answers (or drops it) when it chooses. `/boom` panics.
+fn parking() -> (impl Handler, Receiver<Parked>) {
+    let (tx, rx) = channel::<Parked>();
+    let handler = move |request: Request, reply: Responder| -> Box<dyn Frame> {
+        match request.target.as_str() {
+            "/ok" => reply.send(Response::with_status(200).with_body("ok")),
+            "/boom" => panic!("the handler failed"),
+            _ => {
+                let _ = tx.send((request.target, reply));
+            }
+        }
+        no_work()
+    };
+    (handler, rx)
+}
+
+/// Waits for a condition that the server alone makes true and that has no event to wait on.
+fn until(what: &str, mut condition: impl FnMut() -> bool) {
+    let limit = Instant::now() + PATIENCE;
+    while !condition() {
+        assert!(Instant::now() < limit, "{what}: not seen");
+        yield_now();
+    }
 }
 
 #[test]
@@ -694,152 +757,77 @@ fn a_peer_that_stops_reading_passes_the_write_limit_and_the_connection_closes() 
     assert_eq!(counters.limits_passed, 1);
 }
 
-/// Loops through the sink until the cancel flag is set, then answers (late, to nobody).
-struct WatchCancel {
-    header: FrameHeader,
-    sink: Arc<QueueIngestSink>,
-    reply: Option<Responder>,
-    seen: Sender<bool>,
-}
-
-impl Frame for WatchCancel {
-    fn header(&self) -> &FrameHeader {
-        &self.header
-    }
-
-    fn header_mut(&mut self) -> &mut FrameHeader {
-        &mut self.header
-    }
-
-    fn do_finally(mut self: Box<Self>) {
-        let cancelled = self
-            .reply
-            .as_ref()
-            .is_some_and(|r| r.cancelled().load(Ordering::Acquire));
-        if cancelled {
-            let reply = self.reply.take().unwrap();
-            reply.send(Response::with_status(200).with_body("too late"));
-            let _ = self.seen.send(true);
-            return;
-        }
-        let sink = self.sink.clone();
-        let _ = sink.offer(self);
-    }
-}
-
 #[test]
-fn a_peer_that_closes_mid_request_sets_the_cancel_flag_and_the_late_reply_is_discarded() {
-    let sink_slot: Arc<OnceLock<Arc<QueueIngestSink>>> = Arc::new(OnceLock::new());
-    let (called_tx, called) = channel::<()>();
-    let (seen_tx, seen) = channel::<bool>();
-    let slot = sink_slot.clone();
-    let handler = move |_request: Request, reply: Responder| -> Box<dyn Frame> {
-        let _ = called_tx.send(());
-        let mut header = FrameHeader::new(1);
-        header.randomize_hash(3);
-        Box::new(WatchCancel {
-            header,
-            sink: slot.get().unwrap().clone(),
-            reply: Some(reply),
-            seen: seen_tx.clone(),
-        })
-    };
+fn a_peer_that_breaks_mid_request_sets_the_cancel_flag_and_the_late_reply_is_discarded() {
+    let (handler, parked) = parking();
     let server = Fixture::start(config(), handler);
-    sink_slot.set(server.sink.clone()).ok().unwrap();
     let mut peer = server.connect();
-    peer.send(b"GET /slow HTTP/1.1\r\nHost: t\r\n\r\n");
-    called.recv_timeout(PATIENCE).unwrap();
+    assert_eq!(text(&peer.get("/ok")), "ok");
+    // The answer to the second request is never read, and the first answer is left unread too: closing a socket
+    // that holds unread data resets the connection.
+    peer.send(b"GET /ok HTTP/1.1\r\nHost: t\r\n\r\nGET /slow HTTP/1.1\r\nHost: t\r\n\r\n");
+    let (_, reply) = parked.recv_timeout(PATIENCE).unwrap();
+    let mut probe = [0u8; 1];
+    peek_on(&mut peer.stream, &mut probe);
     drop(peer);
-    assert!(seen.recv_timeout(PATIENCE).unwrap());
+    until("the cancel flag", || {
+        reply.cancelled().load(Ordering::Acquire)
+    });
+    reply.send(Response::with_status(200).with_body("too late"));
     let counters = server.finish();
-    assert_eq!(counters.cancelled, 1);
-    assert_eq!(counters.discarded, 1);
-    assert_eq!(
-        counters.replies_2xx + counters.replies_4xx + counters.replies_5xx,
-        0
-    );
+    assert_eq!((counters.cancelled, counters.discarded), (1, 1));
+    assert_eq!(counters.replies_2xx, 2, "the two answers that were sent");
+    assert_eq!(counters.replies_4xx + counters.replies_5xx, 0);
 }
 
 #[test]
-fn stop_closes_idle_connections_and_reports_once() {
-    let server = Fixture::start(config(), echo_target);
-    let mut peers = Vec::new();
-    for i in 0..3 {
+fn a_half_closed_peer_still_gets_its_reply_and_then_the_connection_closes() {
+    for (name, request) in [
+        ("1.0", &b"GET /h HTTP/1.0\r\n\r\n"[..]),
+        ("1.1", &b"GET /h HTTP/1.1\r\nHost: t\r\n\r\n"[..]),
+    ] {
+        let (handler, parked) = parking();
+        let server = Fixture::start(config(), handler);
         let mut peer = server.connect();
-        assert_eq!(text(&peer.get(&format!("/{i}"))), format!("/{i}"));
-        peers.push(peer);
-    }
-    // A connection that has sent half a request is closed too.
-    let mut partial = server.connect();
-    partial.send(b"GET /par");
-    server.stop();
-    for peer in &mut peers {
+        peer.send(request);
+        let (_, reply) = parked.recv_timeout(PATIENCE).unwrap();
+        peer.stream.shutdown(Shutdown::Write).unwrap();
+        // The flag is a hint that the peer's end of the stream was seen; the answer is still owed.
+        until("the cancel flag", || {
+            reply.cancelled().load(Ordering::Acquire)
+        });
+        reply.send(Response::with_status(200).with_body("still here"));
+        let response = peer.read_response(false);
+        assert_eq!(
+            (response.status, text(&response)),
+            (200, "still here"),
+            "{name}"
+        );
+        assert_eq!(response.headers.get("Connection"), Some("close"), "{name}");
         peer.expect_closed();
+        let counters = server.finish();
+        assert_eq!(
+            (counters.replies_2xx, counters.cancelled, counters.discarded),
+            (1, 1, 0),
+            "{name}"
+        );
     }
-    partial.expect_closed();
-    // A second stop on a stopped server reports again, at once, as its own frame.
-    server.stop();
-    let counters = server.handle.counters();
-    assert_eq!(counters.open, 0);
-    server.sink.complete_gracefully();
-    server.lattice.close();
 }
 
 #[test]
 fn stop_lets_a_request_in_flight_finish_and_then_closes_its_connection() {
-    let sink_slot: Arc<OnceLock<Arc<QueueIngestSink>>> = Arc::new(OnceLock::new());
-    let (called_tx, called) = channel::<()>();
-    let gate = Arc::new(AtomicBool::new(false));
-    struct Gated {
-        header: FrameHeader,
-        sink: Arc<QueueIngestSink>,
-        gate: Arc<AtomicBool>,
-        reply: Option<Responder>,
-    }
-    impl Frame for Gated {
-        fn header(&self) -> &FrameHeader {
-            &self.header
-        }
-        fn header_mut(&mut self) -> &mut FrameHeader {
-            &mut self.header
-        }
-        fn do_finally(mut self: Box<Self>) {
-            if self.gate.load(Ordering::Acquire) {
-                self.reply
-                    .take()
-                    .unwrap()
-                    .send(Response::with_status(200).with_body("finished"));
-                return;
-            }
-            let sink = self.sink.clone();
-            let _ = sink.offer(self);
-        }
-    }
-    let (slot, g) = (sink_slot.clone(), gate.clone());
-    let handler = move |_request: Request, reply: Responder| -> Box<dyn Frame> {
-        let _ = called_tx.send(());
-        let mut header = FrameHeader::new(1);
-        header.randomize_hash(4);
-        Box::new(Gated {
-            header,
-            sink: slot.get().unwrap().clone(),
-            gate: g.clone(),
-            reply: Some(reply),
-        })
-    };
+    let (handler, parked) = parking();
     let server = Fixture::start(config(), handler);
-    sink_slot.set(server.sink.clone()).ok().unwrap();
     let mut busy = server.connect();
     busy.send(b"GET /busy HTTP/1.1\r\nHost: t\r\n\r\n");
-    called.recv_timeout(PATIENCE).unwrap();
-    // The stop is asked for while the request is in the handler's hands; the reply is released afterwards.
-    server.handle.stop(Box::new(Notify {
-        header: FrameHeader::new(7),
-        tx: server.notify.clone(),
-    }));
-    gate.store(true, Ordering::Release);
+    let (_, reply) = parked.recv_timeout(PATIENCE).unwrap();
+    // The stop is recorded before the reply is sent, so the order is forced: the request began as a keep-alive
+    // one, and its answer ends the connection.
+    server.begin_stop();
+    reply.send(Response::with_status(200).with_body("finished"));
     let response = busy.read_response(false);
     assert_eq!((response.status, text(&response)), (200, "finished"));
+    assert_eq!(response.headers.get("Connection"), Some("close"));
     busy.expect_closed();
     // The server lingers until the peer closes too, as a client does on the end of the stream.
     drop(busy);
@@ -853,4 +841,228 @@ fn stop_lets_a_request_in_flight_finish_and_then_closes_its_connection() {
     assert!(server.stopped.try_recv().is_err());
     server.sink.complete_gracefully();
     server.lattice.close();
+}
+
+#[test]
+fn stop_is_not_reported_while_a_reply_is_still_owed_even_to_a_peer_that_left() {
+    let (handler, parked) = parking();
+    let server = Fixture::start(config(), handler);
+    let mut peer = server.connect();
+    assert_eq!(text(&peer.get("/ok")), "ok");
+    peer.send(b"GET /ok HTTP/1.1\r\nHost: t\r\n\r\nGET /slow HTTP/1.1\r\nHost: t\r\n\r\n");
+    let (_, reply) = parked.recv_timeout(PATIENCE).unwrap();
+    // Unread data makes the close a reset: the connection ends while the handler still owes its answer.
+    let mut probe = [0u8; 1];
+    peek_on(&mut peer.stream, &mut probe);
+    drop(peer);
+    until("the cancel flag", || {
+        reply.cancelled().load(Ordering::Acquire)
+    });
+    server.begin_stop();
+    assert!(
+        server
+            .stopped
+            .recv_timeout(Duration::from_millis(300))
+            .is_err(),
+        "the server reported that it stopped while a reply was owed"
+    );
+    reply.send(Response::with_status(200));
+    server
+        .stopped
+        .recv_timeout(PATIENCE)
+        .expect("the server did not report that it stopped");
+    // The late reply was counted before the notification: nothing runs after it.
+    assert_eq!(server.handle.counters().discarded, 1);
+    assert_eq!(server.handle.counters().open, 0);
+    server.sink.complete_gracefully();
+    server.lattice.close();
+}
+
+#[test]
+fn stop_while_a_request_waits_for_its_body_ends_the_connection_without_the_handler() {
+    // Best effort: the phase after the `100 Continue` cannot be held still from outside, so this covers the
+    // reachable orders of it (the stop before, during or after the interim answer is sent).
+    let (handler, _parked) = parking();
+    let server = Fixture::start(config(), handler);
+    let mut peer = server.connect();
+    peer.send(b"POST /up HTTP/1.1\r\nHost: t\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\n");
+    server.begin_stop();
+    let _ = peer.stream.write_all(b"hello");
+    let mut seen = Vec::new();
+    let mut chunk = [0u8; 256];
+    loop {
+        match read_on(&mut peer.stream, &mut chunk) {
+            Ok(0) => break,
+            Ok(n) => seen.extend_from_slice(&chunk[..n]),
+            Err(e) if e.kind() == ErrorKind::ConnectionReset => break,
+            Err(e) => panic!("{e}"),
+        }
+    }
+    assert!(
+        seen.is_empty() || seen.starts_with(b"HTTP/1.1 100"),
+        "only the interim answer may have been sent"
+    );
+    drop(peer);
+    server
+        .stopped
+        .recv_timeout(PATIENCE)
+        .expect("the server did not report that it stopped");
+    assert_eq!(server.handle.counters().requests, 0);
+    server.sink.complete_gracefully();
+    server.lattice.close();
+}
+
+#[test]
+fn a_peer_that_drips_after_the_reply_is_closed_at_the_linger_deadline() {
+    let limit = Duration::from_millis(400);
+    let server = Fixture::start(
+        ServerConfig {
+            linger_limit: limit,
+            // `write_limit` is `None` in `config()`: the linger is bounded by its own setting.
+            ..config()
+        },
+        echo_target,
+    );
+    let mut peer = server.connect();
+    let started = Instant::now();
+    peer.send(b"GET /a HTTP/1.0\r\n\r\n");
+    assert_eq!(text(&peer.read_response(false)), "/a");
+    // The server has closed its side and reads what the peer still sends. A byte every few milliseconds renews
+    // every single read, so only the overall deadline can end this. The sleep paces the peer, it synchronises
+    // nothing.
+    peer.stream
+        .set_read_timeout(Some(Duration::from_millis(5)))
+        .unwrap();
+    let mut chunk = [0u8; 16];
+    let ended = loop {
+        assert!(
+            started.elapsed() < PATIENCE,
+            "the connection was never closed"
+        );
+        // The end of the stream (the server shut its side down) is not the close: a write or read that fails is.
+        if peer.stream.write_all(b"x").is_err() {
+            break Instant::now();
+        }
+        match peer.stream.read(&mut chunk) {
+            Err(e) if e.kind() == ErrorKind::ConnectionReset => break Instant::now(),
+            // After the shutdown the read returns at once: pace the drip (a flood would spend the linger's byte
+            // budget, which is another way to end it).
+            Ok(0) => sleep(Duration::from_millis(5)),
+            _ => {}
+        }
+    };
+    assert!(
+        ended - started >= limit,
+        "closed before the deadline: {:?}",
+        ended - started
+    );
+    drop(peer);
+    server.finish();
+}
+
+#[test]
+fn a_stop_does_not_wait_for_a_peer_that_never_closes() {
+    let (handler, parked) = parking();
+    let server = Fixture::start(
+        ServerConfig {
+            // A stop must shorten these: the notification below would otherwise come after `PATIENCE`.
+            linger_limit: Duration::from_secs(600),
+            stop_linger_limit: Duration::from_millis(200),
+            ..config()
+        },
+        handler,
+    );
+    let mut busy = server.connect();
+    busy.send(b"GET /busy HTTP/1.1\r\nHost: t\r\n\r\n");
+    let (_, reply) = parked.recv_timeout(PATIENCE).unwrap();
+    server.begin_stop();
+    reply.send(Response::with_status(200));
+    assert_eq!(busy.read_response(false).status, 200);
+    // The peer keeps its end open and says nothing.
+    server
+        .stopped
+        .recv_timeout(PATIENCE)
+        .expect("the server did not report that it stopped");
+    assert_eq!(server.handle.counters().open, 0);
+    busy.expect_closed();
+    server.sink.complete_gracefully();
+    server.lattice.close();
+}
+
+#[test]
+fn a_request_dripped_in_slowly_passes_the_read_limit_as_a_whole() {
+    let limit = Duration::from_millis(300);
+    let server = Fixture::start(
+        ServerConfig {
+            read_limit: Some(limit),
+            ..config()
+        },
+        echo_target,
+    );
+    let mut peer = server.connect();
+    peer.stream
+        .set_read_timeout(Some(Duration::from_millis(10)))
+        .unwrap();
+    let started = Instant::now();
+    peer.send(b"GET / HTTP/1.1\r\nHost: t\r\nX-Slow: ");
+    let mut seen = Vec::new();
+    let mut chunk = [0u8; 256];
+    while !seen.ends_with(b"\r\n\r\n") && !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+        assert!(started.elapsed() < PATIENCE, "no answer");
+        // A byte now and then: every read of the server's gets data in time, the request as a whole is late.
+        let _ = peer.stream.write_all(b"a");
+        match peer.stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => seen.extend_from_slice(&chunk[..n]),
+            Err(_) => {}
+        }
+    }
+    assert!(seen.starts_with(b"HTTP/1.1 408"), "the answer is a 408");
+    assert!(started.elapsed() >= limit, "the limit did not pass");
+    drop(peer);
+    let counters = server.finish();
+    assert_eq!((counters.limits_passed, counters.requests), (1, 0));
+}
+
+#[test]
+fn a_handler_that_panics_answers_500_once_and_the_server_goes_on() {
+    let (handler, _parked) = parking();
+    let server = Fixture::start(config(), handler);
+    let mut peer = server.connect();
+    assert_eq!(peer.get("/boom").status, 500);
+    assert_eq!(peer.get("/ok").status, 200);
+    drop(peer);
+    let counters = server.finish();
+    assert_eq!((counters.replies_5xx, counters.replies_2xx), (1, 1));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failing_accept_is_counted_and_retried_after_the_back_off_and_stop_still_completes() {
+    use std::net::UdpSocket;
+    use std::os::fd::OwnedFd;
+    // A datagram socket is not listening: every accept on it fails.
+    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let listener = TcpListener::from(OwnedFd::from(socket));
+    let backoff = Duration::from_millis(60);
+    let started = Instant::now();
+    let server = Fixture::start_on(
+        listener,
+        ServerConfig {
+            accept_backoff: backoff,
+            ..config()
+        },
+        echo_target,
+    );
+    until("three failed accepts", || {
+        server.handle.counters().accept_errors >= 3
+    });
+    // Three failures with a back-off before each retry: at least two back-offs have passed.
+    assert!(
+        started.elapsed() >= 2 * backoff,
+        "no back-off between the accepts"
+    );
+    let counters = server.finish();
+    assert!(counters.accept_errors >= 3);
+    assert_eq!(counters.accepted, 0);
 }

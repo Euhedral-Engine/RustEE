@@ -29,21 +29,27 @@ line with one of these names is refused ([`write`](src/write.rs)).
 
 **Interim response**: a 1xx response. The writer never puts a `Connection` line on one, whatever the mode.
 
-**Connection order** ([`connection`](src/connection.rs)): the frames of one connection, all offered with the connection's
-id hash, so they run one at a time, in order. The connection's state (parser, buffers, socket, the pending `recv`) is
-plain data in a `ClaimCell`; an event that finds it claimed is offered again, never waited for.
+**Station** ([`station`](src/station.rs)): the part of a source that the listener and every connection share: an inbox
+(an MPSC queue), one key frame, and the downstream. Anything pushes an event into the inbox and returns; the source's
+`request` pushes the key when the inbox holds something; the key drains the inbox and runs the events one at a time,
+so the owner's state is plain.
+
+**Connection source** ([`connection`](src/connection.rs)): each connection is a source of its own, attached to the
+lattice when it is accepted and completed (detached) when it ends. Its state (parser, buffers, socket, the pending
+`recv`) is plain data that only its key frame touches; different connections run in parallel.
 
 **Event**: one thing that happened to a connection (started, bytes or an end arrived, a send ended, a reply was given,
-the server stopped), posted as a frame into the connection order. The `Responder` posts the reply the same way.
+the server stopped), pushed into its inbox. The `Responder` pushes the reply the same way.
 
 **Watch `recv`**: the one `recv` kept pending while a request is handled, so that the peer leaving is seen and sets
 the request's cancel flag. Bytes it reads are kept for the next request; no new one is issued until the reply is out.
 
 **Linger**: after a final reply that closes the connection, the server shuts its writing side and reads and discards
-what the peer sends (up to a budget of the size limits) until the peer closes, a limit passes or the budget is spent.
+what the peer sends (up to a budget of the size limits) until the peer closes, the one deadline of the linger passes
+(`linger_limit`, or `stop_linger_limit` if shorter while the server stops) or the budget is spent.
 Closing at once with unread input would reset the connection and could lose the reply.
 
 **Discarded reply**: a reply given for a request whose connection was gone or ended; counted, never an error to the
 handler.
 
-**Registry**: the listener state's slab of open connections, used to tell each one of a stop.
+**Registry**: the listener's slab of open connections, used to tell each one of a stop.

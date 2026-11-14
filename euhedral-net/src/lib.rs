@@ -9,6 +9,8 @@ pub mod message;
 pub mod parse;
 #[cfg(any(target_os = "linux", target_os = "android", windows))]
 pub mod server;
+#[cfg(any(target_os = "linux", target_os = "android", windows))]
+mod station;
 pub mod write;
 
 #[cfg(any(target_os = "linux", target_os = "android", windows))]

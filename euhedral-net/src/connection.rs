@@ -3,16 +3,22 @@
 //!
 //! # Who owns what
 //!
-//! A [`Conn`] is shared (by `Arc`) between the operations in flight, the registry of the server and the
-//! `Responder`, but everything that changes lives in one [`ConnState`] inside a `ClaimCell`, and **only frames
-//! ordered by the connection's id hash touch it**. Such frames run one at a time, so the claim never fails; a
-//! claim that does fail (an ordering that was not kept) re-offers the event rather than waiting. The state is plain:
-//! the parser, the bytes read and not yet parsed, the socket, the id of the `recv` in flight and the phase need
-//! no lock and no atomic of their own.
+//! A [`Conn`] is a source of the lattice of its own, attached when the connection is accepted and detached when it
+//! ends (see [`station`](crate::station)). Everything that changes lives in one [`ConnState`], which only the
+//! connection's *key frame* touches: producers (the continuation of a `recv` or a `send`, a `Responder`, the stop)
+//! push an [`Event`] into the connection's inbox and return; the key, which the lattice runs on some worker when
+//! the inbox holds something and which is never in two places, drains the inbox and runs the events one at a time.
+//! The state is plain: the parser, the bytes read and not yet parsed, the socket, the ids of the operations in
+//! flight and the phase need no lock and no atomic of their own. Two connections are two sources, so they run in
+//! parallel. The `SourceCell` that holds the state is *entered* by the key and by nothing else, and an entry that
+//! found it taken would break that and panic ([`SourceCell::enter`]).
 //!
-//! Everything reaches the state as an event: the continuation of a `recv` or `send` only wraps the result in a
-//! frame (it runs inside the reaping frame, on any worker), `Responder::send` offers a frame, and the server's
-//! stop offers one. The event frame carries the connection's hash, so it runs in the connection's order.
+//! Operations of one connection that end in an order the code did not expect are still handled: the continuation
+//! of an `AsyncIo` operation and a `Responder` push from different places, so each event is handled in whatever
+//! phase the connection is in.
+//!
+//! What the continuation of an operation does is push the event and return a frame that does nothing (the engine
+//! wants a frame back): that frame is the cost of one completion on top of the key's own run.
 //!
 //! # Phases
 //!
@@ -25,33 +31,44 @@
 //! - `Replying`: the reply is being sent; the `recv` of `Handling`, if still in flight, was cancelled.
 //! - `Closing`: the reply that ended the connection is out and the write side is shut down; what the peer still
 //!   sends is read and dropped (so that closing does not reset the connection and lose the reply) until it closes,
-//!   the budget of bytes is spent or `write_limit` passes.
-//! - `Closed`: the socket is dropped as soon as no operation is in flight on it (a cancelled `recv` ends first).
+//!   the budget of bytes is spent or the linger deadline passes (one deadline for the whole linger, from its start:
+//!   `linger_limit`, or `stop_linger_limit` if it is shorter and the server is stopping).
+//! - `Closed`: the socket is dropped as soon as no operation is in flight on it (a cancelled operation ends
+//!   first). The server is told the connection ended once the socket is dropped *and* the handler's `Responder`
+//!   for the request being handled, if any, has been used or dropped and its reply has been through the
+//!   connection's order (a discarded one); so a stop is complete only when no frame of the server is left.
 
+use std::fmt;
 use std::net::{Shutdown, TcpStream};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+#[cfg(windows)]
+use std::os::windows::io::AsRawSocket;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use euhedral_core::frames::{Frame, FrameError, FrameHeader};
-use euhedral_data_structures::sync::ClaimCell;
+use euhedral_core::frames::Frame;
+use euhedral_core::generics::{LatticeReceiver, LatticeSource, SourceCell};
 use euhedral_io::{Cancelled, IoBuf, IoDone, LimitPassed, OpId, OpOptions, RawSock};
 
 use crate::message::{ConnectionMode, Method, ParseError, Request, Response, Version, WriteError};
 use crate::parse::{Progress, RequestParser};
-use crate::server::{ListenerEvent, Shared};
+use crate::server::{ListenerEvent, Shared, no_work};
+use crate::station::{Drive, Station};
 use crate::write::{write_continue, write_response, write_response_head};
 
 /// The handle of a connected stream, as `AsyncIo` takes it.
 #[cfg(unix)]
 pub(crate) fn raw_stream(stream: &TcpStream) -> RawSock {
-    std::os::fd::AsRawFd::as_raw_fd(stream)
+    stream.as_raw_fd()
 }
 
 /// The handle of a connected stream, as `AsyncIo` takes it.
 #[cfg(windows)]
 pub(crate) fn raw_stream(stream: &TcpStream) -> RawSock {
-    std::os::windows::io::AsRawSocket::as_raw_socket(stream)
+    stream.as_raw_socket()
 }
 
 /// What a connection is doing.
@@ -99,70 +116,42 @@ struct ConnState {
     phase: Phase,
     /// The `recv` in flight.
     recv: Option<OpId>,
-    /// A `send` is in flight.
-    sending: bool,
+    /// The `send` in flight.
+    send: Option<OpId>,
     /// When the first byte of the request being read was seen.
     started: Option<Instant>,
     /// The number of the request being handled, or the last one.
     seq: u64,
     stopping: bool,
-    /// The peer ended or broke the stream while a reply was going out.
+    /// The peer broke the stream (or an operation of it hit its limit) while a reply was going out.
     peer_gone: bool,
+    /// The peer ended its stream (a half-close) while the request was handled: its reply is still sent, and the
+    /// connection ends after it.
+    half_closed: bool,
+    /// A `Responder` of this connection has not yet been through the connection's order.
+    owed: bool,
     /// Bytes the closing phase may still read and drop.
     linger_budget: usize,
+    /// When the closing phase ends whatever the peer does.
+    linger_deadline: Option<Instant>,
     /// Where the connection sits in the server's registry.
     slot: usize,
     /// The server has been told that this connection ended.
     reported: bool,
 }
 
-/// A connection: the immutable part and the claim on its state.
+/// A connection: the immutable part, the state that only its key frame enters, and its station.
 pub(crate) struct Conn {
     shared: Arc<Shared>,
     /// The id hash of every frame of this connection.
-    pub(crate) hash: u64,
-    state: ClaimCell<ConnState>,
+    state: SourceCell<ConnState>,
+    station: Station<Conn>,
 }
 
 impl std::fmt::Debug for Conn {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Conn")
-            .field("hash", &self.hash)
-            .finish_non_exhaustive()
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Conn").finish_non_exhaustive()
     }
-}
-
-/// The frame that carries an event to a connection's order.
-struct ConnFrame {
-    header: FrameHeader,
-    conn: Arc<Conn>,
-    event: Option<Event>,
-}
-
-impl Frame for ConnFrame {
-    fn header(&self) -> &FrameHeader {
-        &self.header
-    }
-
-    fn header_mut(&mut self) -> &mut FrameHeader {
-        &mut self.header
-    }
-
-    fn execute(&mut self) -> Result<(), FrameError> {
-        if let Some(event) = self.event.take() {
-            self.conn.run(event);
-        }
-        Ok(())
-    }
-}
-
-/// The frame that carries `event` to `conn`'s order.
-pub(crate) fn conn_frame(conn: Arc<Conn>, event: Event) -> Box<dyn Frame> {
-    Box::new(ConnFrame {
-        header: FrameHeader::new(conn.hash),
-        conn,
-        event: Some(event),
-    })
 }
 
 /// What a `recv` came to.
@@ -175,53 +164,57 @@ enum Got {
 }
 
 impl Conn {
-    pub(crate) fn new(shared: Arc<Shared>, hash: u64, stream: TcpStream, slot: usize) -> Conn {
+    pub(crate) fn new(shared: Arc<Shared>, stream: TcpStream, slot: usize) -> Arc<Conn> {
         let parser = RequestParser::new(shared.limits);
         let linger_budget = shared
             .config
             .max_header_bytes
             .saturating_add(shared.config.max_body_bytes);
-        Conn {
+        Arc::new_cyclic(|me| Conn {
             shared,
-            hash,
-            state: ClaimCell::new(ConnState {
+            station: Station::new(me.clone()),
+            state: SourceCell::new(ConnState {
                 stream: Some(stream),
                 parser,
                 buf: Vec::new(),
                 spare: None,
                 phase: Phase::Reading,
                 recv: None,
-                sending: false,
+                send: None,
                 started: None,
                 seq: 0,
                 stopping: false,
                 peer_gone: false,
+                half_closed: false,
+                owed: false,
                 linger_budget,
+                linger_deadline: None,
                 slot,
                 reported: false,
             }),
-        }
+        })
     }
 
-    /// Offers `event` to this connection's order.
-    pub(crate) fn post(self: &Arc<Self>, event: Event) {
-        let frame = conn_frame(self.clone(), event);
-        // A sink that has completed refuses; the event is dropped and the connection is left to its peer.
-        let _ = self.shared.sink.offer_seeded(self.hash, frame);
+    /// The server is stopping: this connection was told, or the stop was asked for and the news is on its way (it
+    /// is one atomic, read by the frames that decide whether a connection stays open).
+    fn is_stopping(&self, st: &ConnState) -> bool {
+        st.stopping || self.shared.stop_requested.load(Ordering::Acquire)
+    }
+
+    /// Pushes `event` into this connection's inbox; its key frame runs it.
+    pub(crate) fn post(&self, event: Event) {
+        self.station.post(event);
     }
 
     /// Runs one event: the only way into the state.
-    fn run(self: &Arc<Self>, event: Event) {
-        let Some(mut guard) = self.state.try_claim() else {
-            // Frames of one hash run one at a time, so this is an ordering that was not kept: try again
-            // through the sink rather than wait.
-            self.post(event);
-            return;
-        };
+    fn run_event(self: &Arc<Self>, event: Event) {
+        // Only the key frame runs events, one at a time (see the module notes): the entry cannot find the cell
+        // taken.
+        let mut guard = self.state.enter();
         let st: &mut ConnState = &mut guard;
         match event {
             Event::Start => {
-                if st.stopping {
+                if self.is_stopping(st) {
                     self.close_now(st);
                 } else {
                     self.begin_request(st);
@@ -230,12 +223,7 @@ impl Conn {
             Event::Recv(done) => self.on_recv(st, done),
             Event::Sent(done) => self.on_sent(st, done),
             Event::Reply { seq, response } => self.on_reply(st, seq, response),
-            Event::Stop => {
-                st.stopping = true;
-                if matches!(st.phase, Phase::Reading | Phase::Closing) {
-                    self.close_now(st);
-                }
-            }
+            Event::Stop => self.on_stop(st),
         }
     }
 
@@ -256,7 +244,10 @@ impl Conn {
             raw_stream(stream),
             IoBuf { bytes, filled: 0 },
             OpOptions { limit },
-            Box::new(move |done| conn_frame(conn, Event::Recv(done))),
+            Box::new(move |done| {
+                conn.post(Event::Recv(done));
+                no_work()
+            }),
         );
         match started {
             Ok(id) => st.recv = Some(id),
@@ -279,7 +270,7 @@ impl Conn {
 
     /// Starts the one `send` of the connection. The engine moves every byte or ends with an error.
     fn issue_send(self: &Arc<Self>, st: &mut ConnState, bytes: Vec<u8>) {
-        debug_assert!(!st.sending);
+        debug_assert!(st.send.is_none());
         let Some(stream) = &st.stream else {
             return;
         };
@@ -291,10 +282,13 @@ impl Conn {
             OpOptions {
                 limit: self.shared.config.write_limit,
             },
-            Box::new(move |done| conn_frame(conn, Event::Sent(done))),
+            Box::new(move |done| {
+                conn.post(Event::Sent(done));
+                no_work()
+            }),
         );
         match started {
-            Ok(_) => st.sending = true,
+            Ok(id) => st.send = Some(id),
             Err(_) => self.close_now(st),
         }
     }
@@ -303,6 +297,10 @@ impl Conn {
 
     /// Starts on the next request: from the bytes already held, or by waiting for the first one.
     fn begin_request(self: &Arc<Self>, st: &mut ConnState) {
+        if self.is_stopping(st) {
+            self.close_now(st);
+            return;
+        }
         st.phase = Phase::Reading;
         st.started = None;
         if st.buf.is_empty() {
@@ -357,6 +355,7 @@ impl Conn {
     fn parse_failed(self: &Arc<Self>, st: &mut ConnState, error: ParseError) {
         self.shared
             .counters
+            .rare
             .parse_errors
             .fetch_add(1, Ordering::Relaxed);
         self.final_status(st, error.status().unwrap_or(400));
@@ -378,7 +377,7 @@ impl Conn {
         let IoDone { buf, result } = done;
         let got = match result {
             Ok(0) => Got::Eof,
-            Ok(_) => Got::Data(buf.filled),
+            Ok(n) => Got::Data(n),
             Err(e) if LimitPassed::is(&e) => Got::Limit,
             Err(e) if Cancelled::is(&e) => Got::Cancelled,
             Err(_) => Got::Failed,
@@ -390,25 +389,32 @@ impl Conn {
             }
         }
         st.spare = Some(buf.bytes);
-        if matches!(got, Got::Limit) {
+        // The end of a lingering close is the server's own deadline, not a limit a peer passed.
+        if matches!(got, Got::Limit) && !matches!(st.phase, Phase::Closing | Phase::Closed) {
             self.shared
                 .counters
+                .rare
                 .limits_passed
                 .fetch_add(1, Ordering::Relaxed);
         }
         match st.phase {
             Phase::Closed => self.finalize(st),
-            Phase::Closing => match got {
-                Got::Data(n) => {
+            Phase::Closing => {
+                if let Got::Data(n) = got {
                     st.linger_budget = st.linger_budget.saturating_sub(n);
-                    if st.linger_budget == 0 {
-                        self.close_now(st);
-                    } else {
-                        self.issue_recv(st, self.shared.config.write_limit);
-                    }
                 }
-                _ => self.close_now(st),
-            },
+                // Data and a cancel (the stop shortening the deadline) go on, within the one deadline and the
+                // budget; anything else ends the linger.
+                let goes_on = matches!(got, Got::Data(_) | Got::Cancelled) && st.linger_budget > 0;
+                let left = st.linger_deadline.map_or(Duration::ZERO, |d| {
+                    d.saturating_duration_since(Instant::now())
+                });
+                if goes_on && !left.is_zero() {
+                    self.issue_recv(st, Some(left));
+                } else {
+                    self.close_now(st);
+                }
+            }
             Phase::Reading => match got {
                 Got::Data(_) => {
                     st.started.get_or_insert_with(Instant::now);
@@ -420,11 +426,15 @@ impl Conn {
             Phase::Handling { .. } => match got {
                 // Kept for the next request; no further `recv` until the reply is out.
                 Got::Data(_) | Got::Cancelled => {}
-                Got::Eof | Got::Limit | Got::Failed => self.peer_left(st),
+                // A half-close: the peer may still read. The flag is a hint; the reply is sent.
+                Got::Eof => self.peer_half_closed(st),
+                Got::Limit | Got::Failed => self.peer_left(st),
             },
             Phase::Replying { .. } => {
-                if matches!(got, Got::Eof | Got::Limit | Got::Failed) {
-                    st.peer_gone = true;
+                match got {
+                    Got::Eof => st.half_closed = true,
+                    Got::Limit | Got::Failed => st.peer_gone = true,
+                    Got::Data(_) | Got::Cancelled => {}
                 }
                 self.settle(st);
             }
@@ -432,16 +442,29 @@ impl Conn {
         }
     }
 
-    /// The peer ended its stream or broke it while the handler has its request: its cancel flag is set, and the
-    /// connection ends; the handler's reply, when it comes, is discarded.
-    fn peer_left(self: &Arc<Self>, st: &mut ConnState) {
+    /// The peer ended its stream while the handler has its request: the cancel flag is set as a hint that the
+    /// work may stop, but the peer may still be reading, so the reply is sent when it comes, and the connection
+    /// ends after it.
+    fn peer_half_closed(self: &Arc<Self>, st: &mut ConnState) {
+        st.half_closed = true;
+        self.raise_cancel(st);
+    }
+
+    fn raise_cancel(&self, st: &ConnState) {
         if let Phase::Handling { cancel, .. } = &st.phase {
             cancel.store(true, Ordering::Release);
             self.shared
                 .counters
+                .rare
                 .cancelled
                 .fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// The peer broke the connection while the handler has its request: its cancel flag is set, and the
+    /// connection ends; the handler's reply, when it comes, is discarded.
+    fn peer_left(self: &Arc<Self>, st: &mut ConnState) {
+        self.raise_cancel(st);
         self.close_now(st);
     }
 
@@ -455,12 +478,13 @@ impl Conn {
         st.phase = Phase::Handling {
             seq,
             head: request.method == Method::Head,
-            keep: request.keep_alive() && !st.stopping,
+            keep: request.keep_alive() && !self.is_stopping(st),
             version: request.version,
             cancel: cancel.clone(),
         };
         self.shared
             .counters
+            .request
             .requests
             .fetch_add(1, Ordering::Relaxed);
         // The `recv` that sees the peer go. Bytes of a pipelined request already held mean there is something
@@ -471,19 +495,30 @@ impl Conn {
                 return;
             }
         }
+        st.owed = true;
         let responder = Responder {
             conn: self.clone(),
             seq,
             cancel,
             sent: false,
         };
-        let frame = self.shared.handler.handle(request, responder);
+        // A handler that panics drops its `Responder` while it unwinds, which answers `500`; the panic ends there
+        // and does not take the connection's frame (or its worker) with it.
+        let handler = &self.shared.handler;
+        let Ok(frame) = catch_unwind(AssertUnwindSafe(|| handler.handle(request, responder)))
+        else {
+            return;
+        };
         // A sink that has completed refuses: the frame (and the `Responder` in it, which answers 500 to nobody)
         // is dropped.
         let _ = self.shared.sink.offer(frame);
     }
 
     fn on_reply(self: &Arc<Self>, st: &mut ConnState, seq: u64, response: Response) {
+        // The one `Responder` of this connection has been through its order, whatever becomes of its reply.
+        if seq == st.seq {
+            st.owed = false;
+        }
         let Phase::Handling {
             seq: current,
             head,
@@ -492,21 +527,15 @@ impl Conn {
             ..
         } = &st.phase
         else {
-            self.shared
-                .counters
-                .discarded
-                .fetch_add(1, Ordering::Relaxed);
+            self.discard(st);
             return;
         };
         if *current != seq {
-            self.shared
-                .counters
-                .discarded
-                .fetch_add(1, Ordering::Relaxed);
+            self.discard(st);
             return;
         }
         let (head, version) = (*head, *version);
-        let keep = *keep && !st.stopping && !st.peer_gone;
+        let keep = *keep && !self.is_stopping(st) && !st.peer_gone && !st.half_closed;
         let mode = match (keep, version) {
             (false, _) => ConnectionMode::Close,
             (true, Version::Http10) => ConnectionMode::KeepAlive,
@@ -528,12 +557,23 @@ impl Conn {
         self.issue_send(st, out);
     }
 
+    /// A reply nobody can be sent: counted, and the end of the connection may now be reported.
+    fn discard(self: &Arc<Self>, st: &mut ConnState) {
+        self.shared
+            .counters
+            .rare
+            .discarded
+            .fetch_add(1, Ordering::Relaxed);
+        self.finalize(st);
+    }
+
     fn on_sent(self: &Arc<Self>, st: &mut ConnState, done: IoDone) {
-        st.sending = false;
+        st.send = None;
         if let Err(error) = &done.result {
             if LimitPassed::is(error) {
                 self.shared
                     .counters
+                    .rare
                     .limits_passed
                     .fetch_add(1, Ordering::Relaxed);
             }
@@ -543,8 +583,12 @@ impl Conn {
         }
         match st.phase {
             Phase::Continuing => {
-                st.phase = Phase::Reading;
-                self.parse_loop(st);
+                if self.is_stopping(st) {
+                    self.close_now(st);
+                } else {
+                    st.phase = Phase::Reading;
+                    self.parse_loop(st);
+                }
             }
             Phase::Replying { .. } => self.settle(st),
             Phase::Closed => self.finalize(st),
@@ -557,12 +601,12 @@ impl Conn {
         let Phase::Replying { keep } = st.phase else {
             return;
         };
-        if st.sending || st.recv.is_some() {
+        if st.send.is_some() || st.recv.is_some() {
             return;
         }
         if st.peer_gone {
             self.close_now(st);
-        } else if keep && !st.stopping {
+        } else if keep && !self.is_stopping(st) && !st.half_closed {
             self.begin_request(st);
         } else {
             self.linger(st);
@@ -575,7 +619,34 @@ impl Conn {
             let _ = stream.shutdown(Shutdown::Write);
         }
         st.phase = Phase::Closing;
-        self.issue_recv(st, self.shared.config.write_limit);
+        let config = &self.shared.config;
+        let bound = if self.is_stopping(st) {
+            config.linger_limit.min(config.stop_linger_limit)
+        } else {
+            config.linger_limit
+        };
+        let deadline = Instant::now() + bound;
+        st.linger_deadline = Some(deadline);
+        self.issue_recv(st, Some(bound));
+    }
+
+    /// The server is stopping: what waits for a request ends, a request being handled is answered and ends, and a
+    /// linger is cut to the stop's bound.
+    fn on_stop(self: &Arc<Self>, st: &mut ConnState) {
+        st.stopping = true;
+        match st.phase {
+            Phase::Reading | Phase::Continuing => self.close_now(st),
+            Phase::Closing => {
+                let cut = Instant::now() + self.shared.config.stop_linger_limit;
+                st.linger_deadline = Some(st.linger_deadline.map_or(cut, |d| d.min(cut)));
+                // The pending `recv` carries the old deadline: it ends cancelled and is issued again with the
+                // new one.
+                if let Some(id) = st.recv {
+                    self.shared.io.cancel(id);
+                }
+            }
+            Phase::Handling { .. } | Phase::Replying { .. } | Phase::Closed => {}
+        }
     }
 
     // ---- ending --------------------------------------------------------------------------------------------
@@ -586,18 +657,70 @@ impl Conn {
         if let Some(id) = st.recv {
             self.shared.io.cancel(id);
         }
+        if let Some(id) = st.send {
+            self.shared.io.cancel(id);
+        }
         self.finalize(st);
     }
 
     fn finalize(self: &Arc<Self>, st: &mut ConnState) {
-        if !matches!(st.phase, Phase::Closed) || st.recv.is_some() || st.sending || st.reported {
+        if !matches!(st.phase, Phase::Closed) || st.recv.is_some() || st.send.is_some() {
             return;
         }
-        st.reported = true;
         st.stream = None;
         st.buf = Vec::new();
         st.spare = None;
+        // Not told to the server while a `Responder` is still to come through this order: the stop of the
+        // server is complete only when no frame of it is left to run.
+        if st.owed || st.reported {
+            return;
+        }
+        st.reported = true;
+        // The source ends with the connection: the lattice lets go of it. This runs inside the key, whose last act
+        // is to go home; nothing of the connection is touched after the listener hears of it but that.
+        self.station.complete();
         self.shared.post_listener(ListenerEvent::Closed(st.slot));
+    }
+}
+
+impl Drive for Conn {
+    type Event = Event;
+
+    fn station(&self) -> &Station<Conn> {
+        &self.station
+    }
+
+    fn run(self: &Arc<Self>, event: Event) {
+        self.run_event(event);
+    }
+}
+
+impl LatticeSource for Conn {
+    fn add_downstream(self: Arc<Self>, downstream: Arc<dyn LatticeReceiver>) {
+        let me: Arc<dyn LatticeSource> = self.clone();
+        self.station.add_downstream(me, downstream);
+    }
+
+    /// Hands out nothing: the connection's work is its key frame, which only `request` pushes.
+    fn pull(
+        &self,
+        _consumer: &mut dyn FnMut(Box<dyn Frame>),
+        _stop: &mut dyn FnMut(&dyn Frame) -> bool,
+        _demand: u64,
+    ) -> u64 {
+        0
+    }
+
+    fn request(&self, demand: u64) {
+        self.station.request(demand);
+    }
+
+    fn complete(&self) {
+        self.station.complete();
+    }
+
+    fn is_complete(&self) -> bool {
+        self.station.is_complete()
     }
 }
 
@@ -635,7 +758,7 @@ pub struct Responder {
 }
 
 impl std::fmt::Debug for Responder {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Responder")
             .field("seq", &self.seq)
             .field("cancelled", &self.cancel.load(Ordering::Relaxed))

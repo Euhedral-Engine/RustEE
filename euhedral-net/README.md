@@ -95,27 +95,37 @@ the writer's: the caller cannot set it. `write_request` also needs exactly one v
 
 ## The server
 
-`serve(io, sink, listener, config, handler)` takes a bound listener, an `AsyncIo` and a `QueueIngestSink`, both
-attached to a lattice, and a `Handler`. It starts accepting and returns a `ServerHandle`. The crate keeps no thread
-and no timer: every step is a frame, and every time limit is the limit of a socket operation.
+`serve(lattice, io, sink, listener, config, handler, timers)` takes the lattice, a bound listener, an `AsyncIo`, a
+`QueueIngestSink` and a `Completions` (the last three attached to the lattice by the caller), and a `Handler`. It
+attaches the listener as a source of the lattice and returns a `ServerHandle`; each accepted connection is a source of
+its own, attached on accept and detached on close. The crate keeps no thread and no timer of its own: every step is a
+frame, and every time limit is the limit of a socket operation (the back-off after a failed accept is one of
+`timers`).
 
 ```no_run
 use std::net::TcpListener;
 use std::sync::Arc;
+use euhedral_core::control_plane::ControlPlaneLattice;
 use euhedral_core::frames::Frame;
 use euhedral_core::ingest::QueueIngestSink;
+use euhedral_graph::Completions;
 use euhedral_io::AsyncIo;
 use euhedral_net::{Request, Response, Responder, ServerConfig, no_work, serve};
 
-fn start(io: Arc<AsyncIo>, sink: Arc<QueueIngestSink>) -> std::io::Result<()> {
-    // `io` and `sink.delegate()` are attached to a running lattice as upstreams.
+fn start(
+    lattice: Arc<ControlPlaneLattice>,
+    io: Arc<AsyncIo>,
+    sink: Arc<QueueIngestSink>,
+    timers: Arc<Completions>,
+) -> std::io::Result<()> {
+    // `io`, `sink.delegate()` and `timers` are attached to the lattice as upstreams.
     let listener = TcpListener::bind("127.0.0.1:8080")?;
     let handler = |request: Request, reply: Responder| -> Box<dyn Frame> {
         // The reply may be sent here, or from the returned frame, or from any later frame on any worker.
         reply.send(Response::with_status(200).with_body(request.target.into_bytes()));
         no_work()
     };
-    let server = serve(io, sink, listener, ServerConfig::default(), Arc::new(handler))?;
+    let server = serve(lattice, io, sink, listener, ServerConfig::default(), Arc::new(handler), timers)?;
     println!("{:?}", server.counters());
     // Later, from anywhere: stop accepting, let requests in flight finish, and be told when it is done.
     server.stop(no_work());
@@ -126,21 +136,27 @@ fn start(io: Arc<AsyncIo>, sink: Arc<QueueIngestSink>) -> std::io::Result<()> {
 - **One reply per request.** `Responder::send` is the reply; a `Responder` dropped without it answers 500. The server
   chooses `Connection`; a HEAD request gets the head of the response only. `Responder::cancelled()` is a flag the
   server sets when the peer ends its stream or breaks the connection while the request is being handled.
-- **Order.** All of a connection's work is frames ordered by the connection's id hash: its parser, buffers and
-  socket are plain state of that order. Requests on one connection are answered in the order they arrived, one at a
-  time; pipelined bytes wait in the buffer.
+- **One source per connection.** A connection's parser, buffers and socket are plain state that only its key frame
+  touches (see the glossary: station). Requests on one connection are answered in the order they arrived, one at a
+  time; pipelined bytes wait in the buffer. Different connections run in parallel.
 - **`Expect: 100-continue`** is answered by the server with `100 Continue` once the head is accepted (not too large,
   well formed); the handler is not consulted and cannot refuse it. A body over `max_body_bytes` is answered 413 at
   the head, before it is read.
 - **Limits.** `read_limit` covers a request from its first byte, `idle_limit` the wait for the first byte of a
   request, `write_limit` each reply. A passed read limit after the first byte is answered 408 and closes; any
   other passed limit closes without a reply. `None` is no limit.
+- **Half-close.** A peer that ends its stream while its request is handled sets the cancel flag as a hint, but the
+  reply is still sent (with `Connection: close`) and the connection then closes; a reply is discarded only if its
+  send fails or the read ended in an error or a reset.
 - **Errors close.** A parse error answers its status with `Connection: close`, then the server shuts its writing
-  side and reads (and discards, up to the size limits, bounded by `write_limit`) until the peer closes, so that the
-  answer is not lost to a reset.
+  side and reads (and discards, up to the size limits) until the peer closes, so that the answer is not lost to a
+  reset. The linger ends at one deadline from its start, `linger_limit` (`stop_linger_limit` if shorter while the
+  server stops), whatever the peer sends and whatever `write_limit` is.
+- **Accept errors** are counted (`accept_errors`) and the accept is tried again after `accept_backoff`.
 - **Cap.** At `max_connections` no accept is pending; the kernel's backlog holds the rest.
 - **Stop.** Waiting connections close; a request in flight is answered, with `Connection: close`. The frame given
-  to `stop` is offered to the sink when the last connection is gone. The sink must outlive the stop.
+  to `stop` is offered to the sink when every connection is gone and every `Responder` has been used or dropped; no
+  frame of the server that touches a handler or the sink runs after it. The sink must outlive the stop.
 - **Allocated.** Per connection: the connection record (one `Arc`), a parser, a buffer for unparsed bytes and one
   read buffer of `read_chunk` bytes, kept between reads. Per request: the `Request` the parser builds, the
-  `Responder`, the response and its serialised bytes, and the frames the events use.
+  `Responder`, the response and its serialised bytes, and the frame each I/O completion returns.
