@@ -2,7 +2,7 @@
 name = "euhedral-net"
 version = "0.1.0"
 edition = "2024"
-description = "HTTP/1.1 for programs built on RustEE: the message types, a strict incremental parser, a writer and the server"
+description = "HTTP/1.1 for programs built on RustEE: the message types, a strict incremental parser, a writer, the server and a client"
 readme = "README.md"
 license = "Apache-2.0"
 

@@ -1,12 +1,11 @@
 # euhedral-net
 
-HTTP/1.1 for programs built on RustEE. The crate will be an HTTP/1.1 server and a minimal client over
+HTTP/1.1 for programs built on RustEE. The crate is an HTTP/1.1 server and a minimal client over
 [`euhedral-io`](../euhedral-io/README.md)'s `AsyncIo`: a request line and headers, bodies with `Content-Length`,
 keep-alive, `Expect: 100-continue`, size limits, time limits and a connection cap. Out of scope for the crate:
 TLS, HTTP/2, chunked request bodies (answered 411), compression, routing and JSON.
 
-**This part.** The messages, a parser and a writer (pure: no I/O), and the server on `euhedral-io`. The client comes in
-a later change. See the
+**This part.** The messages, a parser and a writer (pure: no I/O), the server and the client on `euhedral-io`. See the
 [top-level glossary](../GLOSSARY.md) for the terms a user meets and [`GLOSSARY.md`](GLOSSARY.md) for this crate's.
 
 | Item | What it is |
@@ -16,6 +15,7 @@ a later change. See the
 | [`RequestParser`, `ResponseParser`, `Limits`, `Progress`, `State`, `PendingHead`](src/parse.rs) | The strict, incremental parsers and their size limits. |
 | [`write_response`, `write_response_head`, `write_request`, `write_continue`, `ConnectionMode`](src/write.rs) | The writer. |
 | [`serve`, `ServerConfig`, `ServerHandle`, `Counters`, `Handler`, `no_work`](src/server.rs) | The server: accept loop, connection cap, counters, stop. Linux, Android and Windows. |
+| [`request`, `ClientConfig`, `NetError`, `CallStage`](src/client.rs) | The client: one request to a socket address, answered through a continuation. Linux, Android and Windows. |
 | [`Responder`](src/connection.rs) | The one reply of one request, and its cancel flag. |
 
 ## The parser
@@ -178,3 +178,64 @@ fn start(
 - **Allocated.** Per connection: the connection record (one `Arc`), a parser, a buffer for unparsed bytes and one
   read buffer of `read_chunk` bytes, kept between reads. Per request: the `Request` the parser builds, the
   `Responder`, the response and its serialised bytes, and the frame each I/O completion returns.
+
+## The client
+
+`request(io, sink, to, &request, config, then)` makes one request to a socket address and calls `then` with the
+`Response` or a `NetError`, exactly once, on every path. It returns at once and waits for nothing: the call is a
+chain of frames. One connection per call: connect, write the request with `Connection: close`, read one response,
+close (the socket is closed before `then` runs). The frame `then` returns is offered to `sink`. `io` is held
+weakly: keep it alive while calls are in flight. Not offered: a pool, keep-alive, redirects, TLS, chunked bodies,
+DNS (the address is a socket address), retries, and a cancel of a call in flight (it would need the call's
+operation id shared with whoever cancels, which the plain state of a call does not have; the time limit is the
+way to end a call).
+
+```no_run
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
+use euhedral_core::frames::Frame;
+use euhedral_core::ingest::QueueIngestSink;
+use euhedral_io::AsyncIo;
+use euhedral_net::{ClientConfig, Method, Request, request, no_work};
+
+fn fetch(io: &Arc<AsyncIo>, sink: &Arc<QueueIngestSink>, to: SocketAddr) {
+    let get = Request::new(Method::Get, "/status").header("Host", "service");
+    let config = ClientConfig {
+        time_limit: Some(Duration::from_secs(5)), // the whole call: connect, send and receive
+        ..ClientConfig::default()
+    };
+    request(io, sink, to, &get, config, Box::new(|outcome| -> Box<dyn Frame> {
+        match outcome {
+            Ok(response) => println!("{} {} bytes", response.status, response.body.len()),
+            Err(error) => println!("failed: {error}"),
+        }
+        no_work() // or the frame that does the next work
+    }));
+}
+```
+
+- **One deadline.** `time_limit` runs from the call of `request`. Each operation is issued with what is left of it
+  (`recv_with`, `send_with`, `connect_with` limits); when none is left before an operation starts, the call ends
+  without issuing it. The error names the stage: `NetError::TimedOut(CallStage)`, with `Connect`, `Send`,
+  `ReceiveHead` or `ReceiveBody`. The crate has no timer of its own.
+- **Errors.** `Connect(io::Error)` (refused, unreachable, no socket), `TimedOut(stage)`, `Io { stage, error }` (a reset,
+  a broken pipe), `PeerClosed(stage)` (the peer closed before a whole response), `Malformed(ParseError)`,
+  `Unsupported(ParseError)` (a response that needs `Content-Length` and has none, or has `Transfer-Encoding`:
+  read-to-close and chunked bodies are refused, as the parser refuses them), `OverLimit(ParseError)` (status line,
+  header bytes, header count or body over the `Limits` in the config), `UnexpectedInterim(status)`,
+  `Write(WriteError)` (the request cannot be written; nothing was sent) and `Abandoned(stage)` (the engine refused to
+  start an operation, was dropped with one in flight, or the call's frame was discarded).
+- **HEAD** reads no body (`set_response_to_head`): the response has the headers, with the length the body would
+  have, and an empty body. A response to another method that has a status without a body (204, 304) has none.
+- **Interim responses.** A 1xx response is skipped, up to `MAX_INTERIM_RESPONSES` (8); a `101` is refused, since
+  the connection would change protocol, and so is a ninth interim: `UnexpectedInterim(status)`. Bytes after the final
+  response are ignored (the connection closes).
+- **State.** A call's state (the socket, the parser, the buffers, the deadline, `then`) is owned by one place at a
+  time: the operation in flight, or the step frame its continuation returned, which moves it into the next
+  operation. No lock, atomic, cell or source is involved.
+- **Cost per call.** One boxed state, one socket, the serialised request and a read buffer (`read_chunk`, 16 KiB
+  by default, kept between reads), the parsed response, and for each of the (connect, send, one or more receives)
+  operations a continuation and the step frame it returns. No source is attached to the lattice and no lock is
+  taken by the crate: the cost is what the engine's operations cost, and the few allocations above. A call is
+  one connection, so a program that makes many calls to one peer pays the handshake each time.

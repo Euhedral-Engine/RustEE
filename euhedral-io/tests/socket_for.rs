@@ -115,7 +115,9 @@ fn a_new_socket_connects_and_carries_data_and_is_closed_when_dropped() {
     let before = open_descriptors();
 
     // Dropped unconnected: nothing stays open, and nothing was in flight.
-    let socket = io.socket_for(SocketAddr::from(([127, 0, 0, 1], 9))).unwrap();
+    let socket = io
+        .socket_for(SocketAddr::from(([127, 0, 0, 1], 9)))
+        .unwrap();
     assert_eq!(open_descriptors(), before + 1);
     assert_eq!(io.pending(), 0);
     drop(socket);
