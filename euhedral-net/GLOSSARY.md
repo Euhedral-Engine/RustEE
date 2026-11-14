@@ -52,4 +52,6 @@ Closing at once with unread input would reset the connection and could lose the 
 **Discarded reply**: a reply given for a request whose connection was gone or ended; counted, never an error to the
 handler.
 
-**Registry**: the listener's slab of open connections, used to tell each one of a stop.
+**Registry**: the listener's slab of open connections, in the listener's plain state, used to tell each one of a stop. A connection enters it when the listener accepts it and leaves it by an event the connection sends when it ends.
+
+**Cancel frame**: the frame a handler gives `Responder::on_cancel`; the connection offers it to the sink once if the peer goes while the request is handled.

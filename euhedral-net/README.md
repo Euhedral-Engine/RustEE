@@ -136,6 +136,9 @@ fn start(
 - **One reply per request.** `Responder::send` is the reply; a `Responder` dropped without it answers 500. The server
   chooses `Connection`; a HEAD request gets the head of the response only. `Responder::cancelled()` is a flag the
   server sets when the peer ends its stream or breaks the connection while the request is being handled.
+  `Responder::on_cancel(frame)` asks for a frame to be offered to the sink when that happens, so a handler need not
+  look at the flag: it runs at most once, and is dropped without running if the reply is sent first (the two race, so
+  it may also run just after a reply that was still sent, after a half-close).
 - **One source per connection.** A connection's parser, buffers and socket are plain state that only its key frame
   touches (see the glossary: station). Requests on one connection are answered in the order they arrived, one at a
   time; pipelined bytes wait in the buffer. Different connections run in parallel.
@@ -154,9 +157,19 @@ fn start(
   server stops), whatever the peer sends and whatever `write_limit` is.
 - **Accept errors** are counted (`accept_errors`) and the accept is tried again after `accept_backoff`.
 - **Cap.** At `max_connections` no accept is pending; the kernel's backlog holds the rest.
-- **Stop.** Waiting connections close; a request in flight is answered, with `Connection: close`. The frame given
-  to `stop` is offered to the sink when every connection is gone and every `Responder` has been used or dropped; no
-  frame of the server that touches a handler or the sink runs after it. The sink must outlive the stop.
+- **Stop.** Waiting connections close (also one that waits for a body after `100 Continue`, and a request that
+  completes after the stop is not handed to the handler); a request in flight is answered, with `Connection:
+  close`. The frame given to `stop` is offered to the sink as the last thing the server does: when every connection
+  is gone and its source has ended, no accept is pending and every `Responder` has been used or dropped, and after
+  the server let go of the listener socket, the handler, the `AsyncIo`, the timers and the lattice. Only the sink is
+  kept, to report a stop, until the last `ServerHandle` is dropped. The listener's source stays attached to the
+  lattice until then too, so that a stop asked for at any time is heard.
+- **The lattice** is held weakly: keep it alive while the server runs. A lattice that is gone or closed when a
+  connection arrives refuses the connection and ends the server as a stop does.
+- **Cost of a source per connection.** Each connection is one allocation for its source and its state, plus the
+  locks and atomics of attaching it to the lattice and detaching it. That matters only for very short-lived
+  connections arriving at a very high rate; the server is designed for long-lived connections, where it is paid once
+  and amortised over many requests. It is not free.
 - **Allocated.** Per connection: the connection record (one `Arc`), a parser, a buffer for unparsed bytes and one
   read buffer of `read_chunk` bytes, kept between reads. Per request: the `Request` the parser builds, the
   `Responder`, the response and its serialised bytes, and the frame each I/O completion returns.

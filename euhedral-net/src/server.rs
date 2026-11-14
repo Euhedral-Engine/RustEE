@@ -20,14 +20,16 @@
 //! handler's own frame, and, for each operation of the connection (a `recv`, a `send`), the frame that does nothing
 //! which its continuation returns, plus the buffers and boxes `AsyncIo` keeps for each operation.
 
+use std::fmt;
 use std::io;
+use std::mem::take;
 use std::net::{TcpListener, TcpStream};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 #[cfg(windows)]
 use std::os::windows::io::AsRawSocket;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use euhedral_core::control_plane::ControlPlaneLattice;
@@ -35,7 +37,6 @@ use euhedral_core::frames::{Frame, FrameHeader};
 use euhedral_core::generics::{LatticeReceiver, LatticeSource, SourceCell};
 use euhedral_core::ingest::QueueIngestSink;
 use euhedral_data_structures::atomics::CachePadded;
-use euhedral_data_structures::sync::{HotScope, LifecycleMutex};
 use euhedral_graph::Completions;
 use euhedral_io::{AsyncIo, Cancelled, OpId, OpOptions, OwnedSock, RawSock};
 
@@ -220,15 +221,35 @@ pub(crate) enum ListenerEvent {
     Accepted(io::Result<OwnedSock>),
     /// The connection in registry slot `usize` ended.
     Closed(usize),
-    /// Stop (the frames to offer when it is done are in `Shared::stops`).
-    Stop,
+    /// Stop; the frame is offered when the server is stopped.
+    Stop(Box<dyn Frame>),
     /// The back-off after a failed accept is over.
     Retry,
+    /// The last [`ServerHandle`] is gone: nothing can ask for a stop any more.
+    Released,
 }
 
-/// The plain state of the listener.
+/// What the caller owns and the server uses: the sockets' engine, the sink and the handler. Each connection and the
+/// listener hold one `Arc` of it and let go of it when they end, so that when the stop is reported nothing of the
+/// caller's is held by the server any more (but the sink, which reports it; see [`ServerHandle::stop`]).
+pub(crate) struct Ctx {
+    pub io: Arc<AsyncIo>,
+    pub sink: Arc<QueueIngestSink>,
+    pub handler: Arc<dyn Handler>,
+}
+
+/// The plain state of the listener: only its key frame touches it.
 struct ListenerState {
     listener: Option<TcpListener>,
+    /// The caller's things, until the server is finished.
+    ctx: Option<Arc<Ctx>>,
+    /// The sink, kept to report a stop (also one asked for after the server finished) until the listener ends.
+    sink: Option<Arc<QueueIngestSink>>,
+    /// The lattice's own timers, for the back-off after a failed accept, until the server is finished.
+    timers: Option<Arc<Completions>>,
+    /// The lattice the connections attach to. Weak: the lattice holds this source, so a strong one would be a
+    /// cycle, and the server must not keep the caller's lattice alive.
+    lattice: Weak<ControlPlaneLattice>,
     /// The accept in flight.
     accepting: Option<OpId>,
     /// The registry of open connections, by slot.
@@ -239,33 +260,25 @@ struct ListenerState {
     finished: bool,
     /// A retry of the accept is waiting on the timer.
     retrying: bool,
+    /// The last handle is gone.
+    released: bool,
+    /// The listener's source has ended.
+    completed: bool,
+    /// The frames to offer when the server is stopped.
+    stops: Vec<Box<dyn Frame>>,
 }
 
-/// The frames to offer when the server is stopped, and whether it is.
-struct Stops {
-    done: bool,
-    frames: Vec<Box<dyn Frame>>,
-}
-
-/// What a server's frames share.
+/// What a server's frames share. Nothing in it belongs to the caller.
 pub(crate) struct Shared {
-    pub io: Arc<AsyncIo>,
-    /// The lattice the connections attach their sources to.
-    lattice: Arc<ControlPlaneLattice>,
-    pub sink: Arc<QueueIngestSink>,
     pub config: ServerConfig,
     pub limits: Limits,
-    pub handler: Arc<dyn Handler>,
     pub counters: CounterCells,
-    timers: Arc<Completions>,
     /// A stop was asked for; set by `ServerHandle::stop` before its event is posted, so a reply given after the
-    /// call returns already finds it.
+    /// call returns already finds it. Read by every connection's frames, which run in parallel with the listener.
     pub stop_requested: AtomicBool,
     /// The listener's state, entered by its key frame only.
     listener: SourceCell<ListenerState>,
     station: Station<Shared>,
-    /// Stop is lifecycle work: its frames wait in a list that the listener's finish and `ServerHandle::stop` share.
-    stops: LifecycleMutex<Stops>,
 }
 
 #[cfg(unix)]
@@ -306,7 +319,6 @@ impl Shared {
                         }
                     }
                 }
-                self.check_finished(ls);
             }
             ListenerEvent::Closed(slot) => {
                 if let Some(entry) = ls.conns.get_mut(slot)
@@ -320,25 +332,36 @@ impl Shared {
                         .store(ls.open as u64, Ordering::Relaxed);
                 }
                 self.arm_accept(ls);
-                self.check_finished(ls);
             }
             ListenerEvent::Retry => {
                 ls.retrying = false;
                 self.arm_accept(ls);
-                self.check_finished(ls);
             }
-            ListenerEvent::Stop => {
-                if !ls.stopping {
-                    ls.stopping = true;
-                    if let Some(id) = ls.accepting {
-                        self.io.cancel(id);
-                    }
-                    for conn in ls.conns.iter().flatten() {
-                        conn.post(Event::Stop);
-                    }
+            ListenerEvent::Stop(frame) => {
+                if let (true, Some(sink)) = (ls.finished, &ls.sink) {
+                    // Already stopped: reported at once.
+                    let _ = sink.offer(frame);
+                } else {
+                    ls.stops.push(frame);
+                    self.begin_stop(ls);
                 }
-                self.check_finished(ls);
             }
+            ListenerEvent::Released => ls.released = true,
+        }
+        self.check_finished(ls);
+    }
+
+    /// Stops accepting and tells every connection.
+    fn begin_stop(self: &Arc<Self>, ls: &mut ListenerState) {
+        if ls.stopping {
+            return;
+        }
+        ls.stopping = true;
+        if let (Some(id), Some(ctx)) = (ls.accepting, &ls.ctx) {
+            ctx.io.cancel(id);
+        }
+        for conn in ls.conns.iter().flatten() {
+            conn.post(Event::Stop);
         }
     }
 
@@ -351,11 +374,11 @@ impl Shared {
         {
             return;
         }
-        let Some(listener) = &ls.listener else {
+        let (Some(listener), Some(ctx)) = (&ls.listener, &ls.ctx) else {
             return;
         };
         let shared = self.clone();
-        let started = self.io.accept_with(
+        let started = ctx.io.accept_with(
             raw_listener(listener),
             OpOptions::default(),
             Box::new(move |result| {
@@ -379,18 +402,22 @@ impl Shared {
         if ls.stopping || ls.retrying {
             return;
         }
+        let Some(timers) = &ls.timers else {
+            return;
+        };
         ls.retrying = true;
         let frame = Post::new(self.clone(), ListenerEvent::Retry);
-        self.timers
-            .at(Instant::now() + self.config.accept_backoff, frame);
+        timers.at(Instant::now() + self.config.accept_backoff, frame);
     }
 
-    /// Takes in an accepted socket: registers its connection and has it start reading.
+    /// Takes in an accepted socket: registers its connection and has it start reading. A lattice that is gone or
+    /// closed refuses the connection (the socket is dropped) and ends the server as a stop does: nothing would
+    /// run its frames.
     fn accepted(self: &Arc<Self>, ls: &mut ListenerState, socket: OwnedSock) {
-        if ls.stopping {
+        let Some(ctx) = ls.ctx.clone().filter(|_| !ls.stopping) else {
             // Dropped: the peer sees the connection close.
             return;
-        }
+        };
         let stream = TcpStream::from(socket);
         let slot = match ls.free.pop() {
             Some(slot) => slot,
@@ -399,10 +426,16 @@ impl Shared {
                 ls.conns.len() - 1
             }
         };
-        let conn = Conn::new(self.clone(), stream, slot);
-        // Attaching a source is cold work, and the lattice says so itself; it refuses once it is closed.
-        if self.lattice.add_upstream(conn.clone()).is_err() {
+        let conn = Conn::new(self.clone(), ctx, stream, slot);
+        // Attaching a source is cold work, and the lattice says so itself. The strong reference lives for this call
+        // only.
+        let attached = ls
+            .lattice
+            .upgrade()
+            .is_some_and(|lattice| lattice.add_upstream(conn.clone()).is_ok());
+        if !attached {
             ls.free.push(slot);
+            self.begin_stop(ls);
             return;
         }
         ls.conns[slot] = Some(conn.clone());
@@ -419,35 +452,51 @@ impl Shared {
         self.arm_accept(ls);
     }
 
-    /// When the server is stopping and nothing is left, closes the listener and offers the stop frames.
+    /// When the server is stopping and nothing is left, lets go of everything of the caller's but the sink, and
+    /// then offers the stop frames: the last thing the server does. The listener's source ends when the last
+    /// handle is gone too.
     fn check_finished(self: &Arc<Self>, ls: &mut ListenerState) {
         if ls.stopping && !ls.finished && ls.open == 0 && ls.accepting.is_none() && !ls.retrying {
             ls.finished = true;
             ls.listener = None;
-            let frames = {
-                let _cold = HotScope::leave();
-                let mut stops = self.stops.lock();
-                stops.done = true;
-                std::mem::take(&mut stops.frames)
-            };
-            for frame in frames {
-                let _ = self.sink.offer(frame);
+            ls.timers = None;
+            ls.ctx = None;
+            if let Some(sink) = &ls.sink {
+                for frame in take(&mut ls.stops) {
+                    let _ = sink.offer(frame);
+                }
             }
+        }
+        if ls.finished && ls.released && !ls.completed {
+            ls.completed = true;
+            ls.sink = None;
             // The listener's source ends: the lattice lets go of it. Its key is running this, and goes home.
             self.station.complete();
         }
     }
 }
 
-/// A running server: reads its counters and stops it. Cloning gives another handle to the same server;
-/// dropping a handle does not stop the server.
-#[derive(Clone)]
-pub struct ServerHandle {
+/// What the handles of a server share: the last of them going away tells the listener.
+struct HandleCore {
     shared: Arc<Shared>,
 }
 
-impl std::fmt::Debug for ServerHandle {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Drop for HandleCore {
+    fn drop(&mut self) {
+        self.shared.post_listener(ListenerEvent::Released);
+    }
+}
+
+/// A running server: reads its counters and stops it. Cloning gives another handle to the same server;
+/// dropping a handle does not stop the server. The server's listener stays attached to the lattice until its last
+/// handle is dropped after a stop, so that a stop asked for at any time is heard.
+#[derive(Clone)]
+pub struct ServerHandle {
+    core: Arc<HandleCore>,
+}
+
+impl fmt::Debug for ServerHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ServerHandle")
             .field("counters", &self.counters())
             .finish_non_exhaustive()
@@ -458,7 +507,7 @@ impl ServerHandle {
     /// The counters now. Each is read on its own, so a snapshot taken while the server works need not be one
     /// instant.
     pub fn counters(&self) -> Counters {
-        self.shared.counters.snapshot()
+        self.core.shared.counters.snapshot()
     }
 
     /// Stops the server and returns at once. The accept in flight is cancelled and no more connections are
@@ -468,34 +517,31 @@ impl ServerHandle {
     /// is offered to the sink, once. A second `stop` adds another frame, offered at the same time (or at
     /// once if the server is already stopped).
     ///
-    /// The notification means that no frame of the server will run after it: every connection is gone, no accept
-    /// or retry is pending, and every `Responder` handed to a handler has been used or dropped and its reply has
-    /// been through its connection's order (sent, or discarded and counted). So a handler that never answers (and
-    /// keeps its `Responder`) keeps the server from finishing, even when its peer is gone. A reply after the stop
-    /// started is sent if its connection is open (the request is answered with `Connection: close`) and
-    /// discarded otherwise. A lingering close is cut to `stop_linger_limit`. The sink must live until the stop is
-    /// done: a sink that completed refuses the events the server needs.
+    /// The notification is the last thing the server does. Before it: every connection is gone and its source
+    /// has ended, no accept or retry is pending, every `Responder` handed to a handler has been used or dropped
+    /// and its reply has been through its connection's order (sent, or discarded and counted), and the server
+    /// has let go of the listener socket, the handler, the `AsyncIo`, the timers and the lattice. So a handler
+    /// that never answers (and keeps its `Responder`) keeps the server from finishing, even when its peer is
+    /// gone. What can still run afterwards is only the server's own bookkeeping, which touches nothing of the
+    /// caller's, and the frames the handler returned (which are the handler's). A reply after the stop started
+    /// is sent if its connection is open (the request is answered with `Connection: close`) and discarded
+    /// otherwise. A lingering close is cut to `stop_linger_limit`. The sink is the one thing the server keeps: it
+    /// reports the stop, and one asked for later, until the last handle is dropped; it must live that long.
     pub fn stop(&self, stopped: Box<dyn Frame>) {
-        let shared = &self.shared;
+        let shared = &self.core.shared;
         shared.stop_requested.store(true, Ordering::Release);
-        let _cold = HotScope::leave();
-        let mut stops = shared.stops.lock();
-        if stops.done {
-            // Already stopped, and the listener's source is gone: reported at once.
-            drop(stops);
-            let _ = shared.sink.offer(stopped);
-            return;
-        }
-        stops.frames.push(stopped);
-        drop(stops);
-        shared.post_listener(ListenerEvent::Stop);
+        shared.post_listener(ListenerEvent::Stop(stopped));
     }
 }
 
 /// Starts serving: takes `listener` (a bound, listening socket), accepts connections on `io` and answers
-/// their requests with `handler`. Work runs as frames offered to `sink`, which a lattice drains; `io` must be
-/// attached to a lattice too (its continuations are frames), and so must `timers`, a [`Completions`] the server
+/// their requests with `handler`. Work runs as frames offered to `sink`, which `lattice` drains; `io` must be
+/// attached to the lattice too (its continuations are frames), and so must `timers`, a [`Completions`] the server
 /// uses for the back-off after a failed accept (the lattice's own timer: the server keeps none).
+///
+/// The listener, and each connection when it is accepted, becomes a source of `lattice`. The server holds the
+/// lattice weakly: the caller keeps it alive while the server runs. If the lattice is gone or closed when a
+/// connection is accepted, the connection is refused and the server ends as if stopped.
 ///
 /// Returns an error if the lattice refuses the listener's source (it is closed). The server then does nothing.
 ///
@@ -514,38 +560,42 @@ pub fn serve(
         max_body: config.max_body_bytes,
         ..Limits::default()
     };
+    let state = ListenerState {
+        listener: Some(listener),
+        ctx: Some(Arc::new(Ctx {
+            io,
+            sink: sink.clone(),
+            handler,
+        })),
+        sink: Some(sink),
+        timers: Some(timers),
+        lattice: Arc::downgrade(&lattice),
+        accepting: None,
+        conns: Vec::new(),
+        free: Vec::new(),
+        open: 0,
+        stopping: false,
+        finished: false,
+        retrying: false,
+        released: false,
+        completed: false,
+        stops: Vec::new(),
+    };
     let shared = Arc::new_cyclic(|me| Shared {
-        io,
-        lattice,
-        sink,
         config,
         limits,
-        handler,
         counters: CounterCells::default(),
-        timers,
         stop_requested: AtomicBool::new(false),
-        listener: SourceCell::new(ListenerState {
-            listener: Some(listener),
-            accepting: None,
-            conns: Vec::new(),
-            free: Vec::new(),
-            open: 0,
-            stopping: false,
-            finished: false,
-            retrying: false,
-        }),
+        listener: SourceCell::new(state),
         station: Station::new(me.clone()),
-        stops: LifecycleMutex::new(Stops {
-            done: false,
-            frames: Vec::new(),
-        }),
     });
-    shared.post_listener(ListenerEvent::Start);
-    shared
-        .lattice
+    lattice
         .add_upstream(shared.clone())
         .map_err(|error| io::Error::other(error.to_string()))?;
-    Ok(ServerHandle { shared })
+    shared.post_listener(ListenerEvent::Start);
+    Ok(ServerHandle {
+        core: Arc::new(HandleCore { shared }),
+    })
 }
 
 impl Drive for Shared {

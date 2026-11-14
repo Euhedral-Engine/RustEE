@@ -6,8 +6,10 @@
 //! answers later parks its `Responder` in a channel, and the test releases it by offering a frame that sends. A
 //! time-limit test asserts a lower bound (the connection did not end before its limit) and the outcome, never an
 //! upper bound. The read timeouts on the peers are a failsafe against a hang, not a synchronisation. The one
-//! thing a test waits for by looking is a request's cancel flag (`until`): it is the server's only signal that the
-//! peer's departure was seen, and the tests that need it have no other event to wait on.
+//! thing a test waits for by looking is a counter of the failing-accept test (`until`), which has no event to wait on.
+//! A handler learns that its peer went by the frame it gave `Responder::on_cancel`, which tells the test thread. A
+//! thing that must not happen is shown by a state read at a gate that the server's own order puts after it, never by
+//! a timed wait.
 //!
 //! Every test ends with `Fixture::finish`: the server is stopped, and when its notification arrives no operation is
 //! pending and no connection is counted.
@@ -86,6 +88,59 @@ impl Frame for Notify {
     fn execute(&mut self) -> Result<(), FrameError> {
         let _ = self.tx.send(());
         Ok(())
+    }
+}
+
+/// A frame that tells the test thread it ran.
+fn signal() -> (Box<dyn Frame>, Receiver<()>) {
+    let (tx, rx) = channel();
+    let frame = Notify {
+        header: FrameHeader::new(9),
+        tx,
+    };
+    (Box::new(frame), rx)
+}
+
+/// A frame that says whether it ran or was dropped without running.
+struct Spy {
+    header: FrameHeader,
+    tx: Sender<&'static str>,
+    ran: bool,
+}
+
+impl Spy {
+    fn pair() -> (Box<dyn Frame>, Receiver<&'static str>) {
+        let (tx, rx) = channel();
+        let spy = Spy {
+            header: FrameHeader::new(11),
+            tx,
+            ran: false,
+        };
+        (Box::new(spy), rx)
+    }
+}
+
+impl Frame for Spy {
+    fn header(&self) -> &FrameHeader {
+        &self.header
+    }
+
+    fn header_mut(&mut self) -> &mut FrameHeader {
+        &mut self.header
+    }
+
+    fn execute(&mut self) -> Result<(), FrameError> {
+        self.ran = true;
+        let _ = self.tx.send("ran");
+        Ok(())
+    }
+}
+
+impl Drop for Spy {
+    fn drop(&mut self) {
+        if !self.ran {
+            let _ = self.tx.send("dropped");
+        }
     }
 }
 
@@ -181,7 +236,9 @@ impl Fixture {
 
 /// A read that goes on after it was interrupted. The cause of the interruptions seen on the test threads of this
 /// machine was not found (nothing in this workspace installs a signal handler, and the server does no I/O on the
-/// test thread), so the one retry stays; `std` retries `Interrupted` for `read_exact` but not for `read`.
+/// test thread), so the one retry stays; `std` retries `Interrupted` for `read_exact` but not for `read`. A likely
+/// cause, not confirmed: a read timeout set on the test socket (`SO_RCVTIMEO`) makes the kernel return `EINTR` from
+/// a read that a signal reaches, instead of restarting it.
 fn read_on(stream: &mut TcpStream, buf: &mut [u8]) -> std::io::Result<usize> {
     loop {
         match stream.read(buf) {
@@ -643,37 +700,42 @@ fn a_body_over_the_limit_is_refused_before_it_is_read() {
 
 #[test]
 fn at_the_cap_a_connection_waits_in_the_backlog_until_one_closes() {
+    let (handler, parked) = parking();
     let server = Fixture::start(
         ServerConfig {
             max_connections: 2,
             ..config()
         },
-        echo_target,
+        handler,
     );
+    // Two connections hold a request each: each has one `recv` in flight, and the server has no accept pending.
     let mut first = server.connect();
     let mut second = server.connect();
-    assert_eq!(text(&first.get("/1")), "/1");
-    assert_eq!(text(&second.get("/2")), "/2");
-    // The kernel completes the handshake of a third connection, but the server has no accept pending.
+    first.send(b"GET /1 HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+    second.send(b"GET /2 HTTP/1.1\r\nHost: t\r\n\r\n");
+    let mut replies = Vec::new();
+    for _ in 0..2 {
+        replies.push(parked.recv_timeout(PATIENCE).unwrap());
+    }
+    // The kernel completes the handshake of a third connection, but the cap holds: the state is read at a gate
+    // that both requests being handled provide (an accept would be one more operation in flight).
     let mut third = server.connect();
-    third.send(b"GET /3 HTTP/1.1\r\nHost: t\r\n\r\n");
-    third
-        .stream
-        .set_read_timeout(Some(Duration::from_millis(200)))
-        .unwrap();
-    let mut byte = [0u8; 1];
-    let err = read_on(&mut third.stream, &mut byte).unwrap_err();
-    assert!(matches!(
-        err.kind(),
-        ErrorKind::WouldBlock | ErrorKind::TimedOut
-    ));
+    third.send(b"GET /ok HTTP/1.1\r\nHost: t\r\n\r\n");
     let counters = server.handle.counters();
     assert_eq!((counters.accepted, counters.open), (2, 2));
-    // One ends, and the third is taken in and answered.
+    assert_eq!(server.io.pending(), 2, "an accept is pending at the cap");
+    // One ends, and the next accept follows: the third is taken in and answered.
+    let (target, reply) = replies.remove(0);
+    assert_eq!(target, "/1");
+    reply.send(Response::with_status(200));
+    assert_eq!(first.read_response(false).status, 200);
+    first.expect_closed();
     drop(first);
-    third.stream.set_read_timeout(Some(PATIENCE)).unwrap();
-    assert_eq!(text(&third.read_response(false)), "/3");
+    assert_eq!(text(&third.read_response(false)), "ok");
     assert_eq!(server.handle.counters().accepted, 3);
+    let (_, reply) = replies.remove(0);
+    reply.send(Response::with_status(200));
+    assert_eq!(second.read_response(false).status, 200);
     drop((second, third));
     server.finish();
 }
@@ -767,12 +829,15 @@ fn a_peer_that_breaks_mid_request_sets_the_cancel_flag_and_the_late_reply_is_dis
     // that holds unread data resets the connection.
     peer.send(b"GET /ok HTTP/1.1\r\nHost: t\r\n\r\nGET /slow HTTP/1.1\r\nHost: t\r\n\r\n");
     let (_, reply) = parked.recv_timeout(PATIENCE).unwrap();
+    let (woken, cancelled) = signal();
+    reply.on_cancel(woken);
     let mut probe = [0u8; 1];
     peek_on(&mut peer.stream, &mut probe);
     drop(peer);
-    until("the cancel flag", || {
-        reply.cancelled().load(Ordering::Acquire)
-    });
+    cancelled
+        .recv_timeout(PATIENCE)
+        .expect("the frame for the cancel did not run");
+    assert!(reply.cancelled().load(Ordering::Acquire));
     reply.send(Response::with_status(200).with_body("too late"));
     let counters = server.finish();
     assert_eq!((counters.cancelled, counters.discarded), (1, 1));
@@ -791,11 +856,20 @@ fn a_half_closed_peer_still_gets_its_reply_and_then_the_connection_closes() {
         let mut peer = server.connect();
         peer.send(request);
         let (_, reply) = parked.recv_timeout(PATIENCE).unwrap();
+        let (woken, cancelled) = signal();
+        reply.on_cancel(woken);
         peer.stream.shutdown(Shutdown::Write).unwrap();
         // The flag is a hint that the peer's end of the stream was seen; the answer is still owed.
-        until("the cancel flag", || {
-            reply.cancelled().load(Ordering::Acquire)
-        });
+        cancelled
+            .recv_timeout(PATIENCE)
+            .expect("the frame for the cancel did not run");
+        assert!(reply.cancelled().load(Ordering::Acquire));
+        // A frame asked for after the cancel was seen runs at once (the request is still being handled).
+        let (late, late_ran) = signal();
+        reply.on_cancel(late);
+        late_ran
+            .recv_timeout(PATIENCE)
+            .expect("the late frame for the cancel did not run");
         reply.send(Response::with_status(200).with_body("still here"));
         let response = peer.read_response(false);
         assert_eq!(
@@ -851,21 +925,22 @@ fn stop_is_not_reported_while_a_reply_is_still_owed_even_to_a_peer_that_left() {
     assert_eq!(text(&peer.get("/ok")), "ok");
     peer.send(b"GET /ok HTTP/1.1\r\nHost: t\r\n\r\nGET /slow HTTP/1.1\r\nHost: t\r\n\r\n");
     let (_, reply) = parked.recv_timeout(PATIENCE).unwrap();
+    let (woken, cancelled) = signal();
+    reply.on_cancel(woken);
     // Unread data makes the close a reset: the connection ends while the handler still owes its answer.
     let mut probe = [0u8; 1];
     peek_on(&mut peer.stream, &mut probe);
     drop(peer);
-    until("the cancel flag", || {
-        reply.cancelled().load(Ordering::Acquire)
-    });
+    // The gate: the server has seen the peer go, so its connection has closed its socket and holds only what the
+    // owed answer needs.
+    cancelled
+        .recv_timeout(PATIENCE)
+        .expect("the frame for the cancel did not run");
     server.begin_stop();
-    assert!(
-        server
-            .stopped
-            .recv_timeout(Duration::from_millis(300))
-            .is_err(),
-        "the server reported that it stopped while a reply was owed"
-    );
+    // State read at the gate: the connection is still counted, so the stop has nothing to report yet. (It is the
+    // reply, not a wait, that lets the server finish: the next lines send it.)
+    assert_eq!(server.handle.counters().open, 1);
+    assert!(server.stopped.try_recv().is_err());
     reply.send(Response::with_status(200));
     server
         .stopped
@@ -879,29 +954,27 @@ fn stop_is_not_reported_while_a_reply_is_still_owed_even_to_a_peer_that_left() {
 }
 
 #[test]
-fn stop_while_a_request_waits_for_its_body_ends_the_connection_without_the_handler() {
-    // Best effort: the phase after the `100 Continue` cannot be held still from outside, so this covers the
-    // reachable orders of it (the stop before, during or after the interim answer is sent).
+fn stop_after_the_100_continue_ends_the_connection_and_the_body_never_reaches_the_handler() {
     let (handler, _parked) = parking();
     let server = Fixture::start(config(), handler);
     let mut peer = server.connect();
     peer.send(b"POST /up HTTP/1.1\r\nHost: t\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\n");
-    server.begin_stop();
-    let _ = peer.stream.write_all(b"hello");
-    let mut seen = Vec::new();
-    let mut chunk = [0u8; 256];
-    loop {
-        match read_on(&mut peer.stream, &mut chunk) {
-            Ok(0) => break,
-            Ok(n) => seen.extend_from_slice(&chunk[..n]),
-            Err(e) if e.kind() == ErrorKind::ConnectionReset => break,
-            Err(e) => panic!("{e}"),
+    // The interim answer is out: the connection waits for the body.
+    let mut interim = [0u8; 25];
+    let mut got = 0;
+    while got < interim.len() {
+        let n = read_on(&mut peer.stream, &mut interim[got..]).expect("the interim answer");
+        assert!(n > 0, "closed before the interim answer");
+        got += n;
+        if interim[..got].ends_with(b"\r\n\r\n") {
+            break;
         }
     }
-    assert!(
-        seen.is_empty() || seen.starts_with(b"HTTP/1.1 100"),
-        "only the interim answer may have been sent"
-    );
+    assert!(interim[..got].starts_with(b"HTTP/1.1 100"));
+    // The stop is recorded before the body is sent, so the order is forced: the body arrives after the stop.
+    server.begin_stop();
+    let _ = peer.stream.write_all(b"hello");
+    peer.expect_closed();
     drop(peer);
     server
         .stopped
@@ -910,6 +983,24 @@ fn stop_while_a_request_waits_for_its_body_ends_the_connection_without_the_handl
     assert_eq!(server.handle.counters().requests, 0);
     server.sink.complete_gracefully();
     server.lattice.close();
+}
+
+#[test]
+fn a_cancel_frame_is_dropped_without_running_when_the_reply_comes_first() {
+    let (handler, parked) = parking();
+    let server = Fixture::start(config(), handler);
+    let mut peer = server.connect();
+    peer.send(b"GET /slow HTTP/1.1\r\nHost: t\r\n\r\n");
+    let (_, reply) = parked.recv_timeout(PATIENCE).unwrap();
+    let (spy, report) = Spy::pair();
+    reply.on_cancel(spy);
+    reply.send(Response::with_status(200));
+    assert_eq!(peer.read_response(false).status, 200);
+    // The registration was ahead of the reply in the connection's order, so the frame was dropped by it.
+    assert_eq!(report.recv_timeout(PATIENCE), Ok("dropped"));
+    drop(peer);
+    server.finish();
+    assert!(report.try_recv().is_err(), "the frame ran after all");
 }
 
 #[test]

@@ -38,7 +38,7 @@
 //!   for the request being handled, if any, has been used or dropped and its reply has been through the
 //!   connection's order (a discarded one); so a stop is complete only when no frame of the server is left.
 
-use std::fmt;
+use std::fmt::{self, Debug, Formatter};
 use std::net::{Shutdown, TcpStream};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
@@ -55,7 +55,7 @@ use euhedral_io::{Cancelled, IoBuf, IoDone, LimitPassed, OpId, OpOptions, RawSoc
 
 use crate::message::{ConnectionMode, Method, ParseError, Request, Response, Version, WriteError};
 use crate::parse::{Progress, RequestParser};
-use crate::server::{ListenerEvent, Shared, no_work};
+use crate::server::{Ctx, ListenerEvent, Shared, no_work};
 use crate::station::{Drive, Station};
 use crate::write::{write_continue, write_response, write_response_head};
 
@@ -102,12 +102,18 @@ pub(crate) enum Event {
     Reply { seq: u64, response: Response },
     /// The server is stopping.
     Stop,
+    /// The handler asked to be told if request `seq` is cancelled.
+    OnCancel { seq: u64, frame: Box<dyn Frame> },
 }
 
 /// The plain state of a connection.
 struct ConnState {
     /// The socket, until the connection is finished.
     stream: Option<TcpStream>,
+    /// What the caller owns (`AsyncIo`, sink, handler), until the server is told that the connection ended.
+    ctx: Option<Arc<Ctx>>,
+    /// The frame to offer if the request being handled is cancelled.
+    on_cancel: Option<Box<dyn Frame>>,
     parser: RequestParser,
     /// Bytes received and not yet parsed.
     buf: Vec<u8>,
@@ -148,8 +154,8 @@ pub(crate) struct Conn {
     station: Station<Conn>,
 }
 
-impl std::fmt::Debug for Conn {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Debug for Conn {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("Conn").finish_non_exhaustive()
     }
 }
@@ -164,7 +170,12 @@ enum Got {
 }
 
 impl Conn {
-    pub(crate) fn new(shared: Arc<Shared>, stream: TcpStream, slot: usize) -> Arc<Conn> {
+    pub(crate) fn new(
+        shared: Arc<Shared>,
+        ctx: Arc<Ctx>,
+        stream: TcpStream,
+        slot: usize,
+    ) -> Arc<Conn> {
         let parser = RequestParser::new(shared.limits);
         let linger_budget = shared
             .config
@@ -175,6 +186,8 @@ impl Conn {
             station: Station::new(me.clone()),
             state: SourceCell::new(ConnState {
                 stream: Some(stream),
+                ctx: Some(ctx),
+                on_cancel: None,
                 parser,
                 buf: Vec::new(),
                 spare: None,
@@ -224,15 +237,23 @@ impl Conn {
             Event::Sent(done) => self.on_sent(st, done),
             Event::Reply { seq, response } => self.on_reply(st, seq, response),
             Event::Stop => self.on_stop(st),
+            Event::OnCancel { seq, frame } => self.on_cancel_asked(st, seq, frame),
         }
     }
 
     // ---- operations ----------------------------------------------------------------------------------------
 
+    /// Cancels an operation of this connection.
+    fn cancel_op(&self, st: &ConnState, id: OpId) {
+        if let Some(ctx) = &st.ctx {
+            ctx.io.cancel(id);
+        }
+    }
+
     /// Starts the one `recv` of the connection, bounded by `limit`.
     fn issue_recv(self: &Arc<Self>, st: &mut ConnState, limit: Option<Duration>) {
         debug_assert!(st.recv.is_none());
-        let Some(stream) = &st.stream else {
+        let (Some(stream), Some(ctx)) = (&st.stream, &st.ctx) else {
             return;
         };
         let bytes = st
@@ -240,7 +261,7 @@ impl Conn {
             .take()
             .unwrap_or_else(|| vec![0; self.shared.config.read_chunk.max(1)]);
         let conn = self.clone();
-        let started = self.shared.io.recv_with(
+        let started = ctx.io.recv_with(
             raw_stream(stream),
             IoBuf { bytes, filled: 0 },
             OpOptions { limit },
@@ -271,12 +292,12 @@ impl Conn {
     /// Starts the one `send` of the connection. The engine moves every byte or ends with an error.
     fn issue_send(self: &Arc<Self>, st: &mut ConnState, bytes: Vec<u8>) {
         debug_assert!(st.send.is_none());
-        let Some(stream) = &st.stream else {
+        let (Some(stream), Some(ctx)) = (&st.stream, &st.ctx) else {
             return;
         };
         let filled = bytes.len();
         let conn = self.clone();
-        let started = self.shared.io.send_with(
+        let started = ctx.io.send_with(
             raw_stream(stream),
             IoBuf { bytes, filled },
             OpOptions {
@@ -334,6 +355,10 @@ impl Conn {
                     expect_continue, ..
                 } => {
                     if expect_continue {
+                        if self.is_stopping(st) {
+                            self.close_now(st);
+                            return;
+                        }
                         // The handler is not asked: the head passed the limits (a body over `max_body_bytes`
                         // was refused with 413 before this), so the body is invited.
                         st.phase = Phase::Continuing;
@@ -344,7 +369,13 @@ impl Conn {
                     }
                 }
                 Progress::Complete(request) => {
-                    self.dispatch(st, request);
+                    // A request that is complete when the stop is known is not handed to the handler: the
+                    // connection ends, as an idle one does.
+                    if self.is_stopping(st) {
+                        self.close_now(st);
+                    } else {
+                        self.dispatch(st, request);
+                    }
                     return;
                 }
             }
@@ -450,7 +481,7 @@ impl Conn {
         self.raise_cancel(st);
     }
 
-    fn raise_cancel(&self, st: &ConnState) {
+    fn raise_cancel(&self, st: &mut ConnState) {
         if let Phase::Handling { cancel, .. } = &st.phase {
             cancel.store(true, Ordering::Release);
             self.shared
@@ -458,6 +489,35 @@ impl Conn {
                 .rare
                 .cancelled
                 .fetch_add(1, Ordering::Relaxed);
+        } else {
+            return;
+        }
+        // Told once: the frame the handler asked to be woken by.
+        if let (Some(frame), Some(ctx)) = (st.on_cancel.take(), &st.ctx) {
+            let _ = ctx.sink.offer(frame);
+        }
+    }
+
+    /// The handler asked for a frame to be offered when the request is cancelled. A request that is already
+    /// cancelled offers it at once; one that is over drops it.
+    fn on_cancel_asked(self: &Arc<Self>, st: &mut ConnState, seq: u64, frame: Box<dyn Frame>) {
+        let Phase::Handling {
+            seq: current,
+            cancel,
+            ..
+        } = &st.phase
+        else {
+            return;
+        };
+        if *current != seq {
+            return;
+        }
+        if cancel.load(Ordering::Acquire) {
+            if let Some(ctx) = &st.ctx {
+                let _ = ctx.sink.offer(frame);
+            }
+        } else {
+            st.on_cancel = Some(frame);
         }
     }
 
@@ -504,18 +564,22 @@ impl Conn {
         };
         // A handler that panics drops its `Responder` while it unwinds, which answers `500`; the panic ends there
         // and does not take the connection's frame (or its worker) with it.
-        let handler = &self.shared.handler;
-        let Ok(frame) = catch_unwind(AssertUnwindSafe(|| handler.handle(request, responder)))
+        let Some(ctx) = st.ctx.clone() else {
+            return;
+        };
+        let Ok(frame) = catch_unwind(AssertUnwindSafe(|| ctx.handler.handle(request, responder)))
         else {
             return;
         };
         // A sink that has completed refuses: the frame (and the `Responder` in it, which answers 500 to nobody)
         // is dropped.
-        let _ = self.shared.sink.offer(frame);
+        let _ = ctx.sink.offer(frame);
     }
 
     fn on_reply(self: &Arc<Self>, st: &mut ConnState, seq: u64, response: Response) {
-        // The one `Responder` of this connection has been through its order, whatever becomes of its reply.
+        // The one `Responder` of this connection has been through its order, whatever becomes of its reply, and
+        // the frame that waited for a cancel will not run.
+        st.on_cancel = None;
         if seq == st.seq {
             st.owed = false;
         }
@@ -552,7 +616,7 @@ impl Conn {
         st.phase = Phase::Replying { keep };
         // The `recv` that watched the peer is no longer wanted: it ends cancelled, or with what it found.
         if let Some(id) = st.recv {
-            self.shared.io.cancel(id);
+            self.cancel_op(st, id);
         }
         self.issue_send(st, out);
     }
@@ -642,7 +706,7 @@ impl Conn {
                 // The pending `recv` carries the old deadline: it ends cancelled and is issued again with the
                 // new one.
                 if let Some(id) = st.recv {
-                    self.shared.io.cancel(id);
+                    self.cancel_op(st, id);
                 }
             }
             Phase::Handling { .. } | Phase::Replying { .. } | Phase::Closed => {}
@@ -655,10 +719,10 @@ impl Conn {
     fn close_now(self: &Arc<Self>, st: &mut ConnState) {
         st.phase = Phase::Closed;
         if let Some(id) = st.recv {
-            self.shared.io.cancel(id);
+            self.cancel_op(st, id);
         }
         if let Some(id) = st.send {
-            self.shared.io.cancel(id);
+            self.cancel_op(st, id);
         }
         self.finalize(st);
     }
@@ -668,6 +732,7 @@ impl Conn {
             return;
         }
         st.stream = None;
+        st.on_cancel = None;
         st.buf = Vec::new();
         st.spare = None;
         // Not told to the server while a `Responder` is still to come through this order: the stop of the
@@ -676,6 +741,9 @@ impl Conn {
             return;
         }
         st.reported = true;
+        // Everything of the caller's is let go of before the server is told: when the listener reports a stop, no
+        // connection holds it.
+        st.ctx = None;
         // The source ends with the connection: the lattice lets go of it. This runs inside the key, whose last act
         // is to go home; nothing of the connection is touched after the listener hears of it but that.
         self.station.complete();
@@ -757,8 +825,8 @@ pub struct Responder {
     sent: bool,
 }
 
-impl std::fmt::Debug for Responder {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Debug for Responder {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("Responder")
             .field("seq", &self.seq)
             .field("cancelled", &self.cancel.load(Ordering::Relaxed))
@@ -775,6 +843,19 @@ impl Responder {
         self.conn.post(Event::Reply {
             seq: self.seq,
             response,
+        });
+    }
+
+    /// Asks for `frame` to be offered to the sink if this request is cancelled (the peer ended its stream or broke
+    /// it while the request is handled): the way to be told without looking at the flag. It runs at most once, and
+    /// never if the reply is sent before the cancel is seen: it is then dropped without running. The two race by
+    /// nature (the reply and the peer's departure arrive in no fixed order), so the frame may also run after the
+    /// reply was sent, or when the reply is still sent because the peer only half-closed. A second call replaces
+    /// the frame of the first.
+    pub fn on_cancel(&self, frame: Box<dyn Frame>) {
+        self.conn.post(Event::OnCancel {
+            seq: self.seq,
+            frame,
         });
     }
 
