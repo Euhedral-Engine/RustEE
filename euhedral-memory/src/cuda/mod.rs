@@ -236,6 +236,7 @@ driver_fns! {
     device_get: "cuDeviceGet" => fn(*mut c_int, c_int);
     primary_ctx_retain: "cuDevicePrimaryCtxRetain" => fn(*mut CuContext, c_int);
     primary_ctx_release: "cuDevicePrimaryCtxRelease_v2" => fn(c_int);
+    primary_ctx_get_state: "cuDevicePrimaryCtxGetState" => fn(c_int, *mut c_uint, *mut c_int);
     ctx_push: "cuCtxPushCurrent_v2" => fn(CuContext);
     ctx_pop: "cuCtxPopCurrent_v2" => fn(*mut CuContext);
     ctx_synchronize: "cuCtxSynchronize" => fn();
@@ -359,6 +360,23 @@ impl Driver {
         // Under `LOADING` nobody else sets the cell, so the set succeeds.
         let _ = LOADED.set(driver.clone());
         Ok(driver)
+    }
+
+    /// Whether device `ordinal`'s primary context is active: retained by someone in this process (a [`Device`] or any
+    /// other holder) and not yet fully released. It reports; it does not create the context. After every holder of the
+    /// device has dropped it is `false`, and the driver has destroyed the context with everything made in it.
+    pub fn primary_context_active(&self, ordinal: c_int) -> Result<bool, CudaError> {
+        let mut dev = 0;
+        // SAFETY: out pointer.
+        self.check("cuDeviceGet", unsafe {
+            (self.fns.device_get)(&mut dev, ordinal)
+        })?;
+        let (mut flags, mut active) = (0, 0);
+        // SAFETY: out pointers.
+        self.check("cuDevicePrimaryCtxGetState", unsafe {
+            (self.fns.primary_ctx_get_state)(dev, &mut flags, &mut active)
+        })?;
+        Ok(active != 0)
     }
 
     /// An entry point beyond [`Fns`], looked up in the loaded library; null when the driver lacks it.
