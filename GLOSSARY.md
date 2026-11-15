@@ -599,6 +599,8 @@ context. The test that a release was complete.
 `FakeGpu` with memory of its own, the drop of that gpu and all it holds releases it, and the retains and releases are counted
 across opens. Not the same as the graph crate's `FakeDevice`, a fake lane.
 
+**FakeContextHold** ([`FakeContextHold`](euhedral-gpu/src/fake/mod.rs)): a retain of a `FakeContext` made by `hold()` that is not a gpu; it stands for a backend that holds the device itself, and keeps the context active until it drops.
+
 **marker** ([`Marker`](euhedral-graph/src/lanes.rs)): a queue ([`QueueId`](euhedral-graph/src/lanes.rs), an
 opaque identity unique in the process), a lane and a value on its timeline: the lane's work up to that
 value. A marker of another queue is never reached by a `LanePool` and is refused by a backend's await.

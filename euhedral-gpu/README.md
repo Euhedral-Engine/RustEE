@@ -381,8 +381,10 @@ and NVRTC (process-wide, no context).
 
 1. Emit every marker registration: poll the `Completions` until `pending() == 0`.
 2. Complete the source (`LatticeSource::complete`).
-3. Drop the lane pool and everything holding lanes: the streams and submitters, the lane sources and their intakes, the `Mover`
-   (dropping a stream waits for its device work).
+3. Drop the lane pool and everything holding lanes: the streams and submitters, the `Mover`, and the lane sources and
+   their intakes (complete each lane source that is attached to a lattice, then drop it: completing closes its intake
+   and downstream but does not drop its submitter, and the lattice lets go of the source afterwards). Dropping a stream
+   waits for its device work.
 4. Return the blocks: free device and pinned blocks to their backends, then drop the backends (`PinnedHost`'s drop frees
    what it cached, which waits for the device; `DeviceMemory`, `StreamPool`, `Vmm`, `StreamCopier`).
 5. Drop the kernels, modules, graphs and caches of graphs, and any deferral's queue: complete a `DeferredCalls` that is
@@ -401,14 +403,15 @@ and NVRTC (process-wide, no context).
   nothing outlives the context, but a block's address is a plain number: using it after its backend and device are gone is
   the caller's error, which the crate cannot detect.
 
-**When the context is never released.** Two cases keep it for the life of the process; `Driver::primary_context_active`
+**When the context is never released.** Two cases in these crates keep it for the life of the process; `Driver::primary_context_active`
 reports `true` and a re-open gets the same context.
 - A stream dropped after a sticky fault or a lost context, while retirements it armed are outstanding, deliberately leaks
   its shared side (a callback may still arrive), so its gpu and the device stay. The fault is sticky for the context, so
   the re-open meets the same fault; a program cannot recover in-process.
 - A `Completions` marker registration left when its pool went is leaked and forgotten (`leaked_unreached`). If its frame
-  owns a stream or the pool (`retire_into`), that holder is never dropped and keeps the context for ever. The order above
-  avoids it: emit before dropping the pool.
+  owns a holder of the device (a stream through `retire_into`, the typed pool of a `SharedLanes` whose `queues` view went,
+  a module, a backend), that holder is never dropped and keeps the context for ever. (A frame that owns the pool itself
+  keeps the pool alive, so its registration is not left this way.) The order above avoids it: emit before dropping the pool.
 
 **What the fake shows and does not.** `FakeContext` counts retains and releases across opens. Its streams, modules and
 pool hold the gpu, but the real backends of `euhedral-memory` hold the device directly, so the fake has no "gpu dropped, pinned
