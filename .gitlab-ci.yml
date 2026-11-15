@@ -1,0 +1,43 @@
+# GitLab twin of .github/workflows/ci.yml (Linux only): scripts/ci/affected.py picks the crates a change affects,
+# scripts/ci/gitlab_pipeline.py turns that into a child pipeline. Jobs run in the arbiter-gated runner; ARBITER_ARGS
+# sets the lease. The toolchain is the one pinned in mise.toml.
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+
+variables:
+  GIT_DEPTH: "0"
+
+stages: [plan, run]
+
+plan:
+  stage: plan
+  variables: { ARBITER_ARGS: "--cpu shared:2" }
+  script:
+    - mise install rust >/dev/null && eval "$(mise env -s bash)"
+    - python3 scripts/ci/test_affected.py
+    - |
+      if [ "$CI_PIPELINE_SOURCE" = "merge_request_event" ]; then
+        git fetch -q origin "$CI_MERGE_REQUEST_TARGET_BRANCH_NAME"
+        args="--base origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME --head HEAD --merge-base"
+      elif [ "$CI_COMMIT_BRANCH" = "$CI_DEFAULT_BRANCH" ] && [ "${CI_COMMIT_BEFORE_SHA#0000}" = "$CI_COMMIT_BEFORE_SHA" ]; then
+        args="--base $CI_COMMIT_BEFORE_SHA --head HEAD"
+      else
+        git fetch -q origin "$CI_DEFAULT_BRANCH"
+        args="--base origin/$CI_DEFAULT_BRANCH --head HEAD --merge-base"
+      fi
+      [ -n "$FORCE_ALL" ] && args="--all"
+      python3 scripts/ci/affected.py $args | tee affected.txt
+    - python3 scripts/ci/gitlab_pipeline.py < affected.txt > child.yml
+  artifacts:
+    paths: [child.yml]
+
+run:
+  stage: run
+  needs: [plan]
+  trigger:
+    include:
+      - artifact: child.yml
+        job: plan
+    strategy: depend
