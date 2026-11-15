@@ -3623,7 +3623,7 @@ mod tests {
             Self {
                 runtime: GraphRuntime {
                     stages: Arc::new(QueueStages(stages.clone())),
-                    completions: Completions::new(pool.clone()),
+                    completions: Completions::new(&pool),
                     lanes: pool,
                     retries: Arc::default(),
                     retry_backstop,
@@ -4965,7 +4965,9 @@ mod tests {
         }
         let hands: Vec<Arc<HandLane>> = (0..2).map(|_| Arc::new(HandLane::default())).collect();
         let pool = Arc::new(LanePool::typed(hands.clone()));
-        let completions = Completions::new(pool.as_queues());
+        // The source holds the pool weakly: this test holds it.
+        let queues = pool.as_queues();
+        let completions = Completions::new(&queues);
         let sink = Arc::new(QueueIngestSink::new());
         sink.delegate().add_downstream(Arc::new(Unattended));
         let mut spec = StageGraphSpec::new();

@@ -129,7 +129,7 @@ fn quanta_run_by_8_workers_allocate_nothing_after_warm_up() {
             .map(|h| h.clone() as Arc<dyn DeviceQueue>)
             .collect(),
     ));
-    let completions = Completions::new(pool.clone());
+    let completions = Completions::new(&pool);
     let queue = MpmcQueue::<Box<dyn Frame>>::bounded(4096);
     let frames: Consumer<Box<dyn Frame>, Multi> = queue.consumer();
     let sink = Arc::new(Sink(queue.producer()));

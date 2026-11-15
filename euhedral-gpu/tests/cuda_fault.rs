@@ -84,7 +84,7 @@ fn a_device_fault_surfaces_through_confirm_retired_and_poisons_the_device() {
     let after_poke = s[0].mark().unwrap();
     s[0].notify_retired(Box::new(Record(seen.clone()))).unwrap();
     s[1].await_marker(after_poke).unwrap();
-    let completions = Completions::new(pool.clone());
+    let completions = Completions::new(&pool);
     let confirmed = Arc::new(Mutex::new(Vec::new()));
     // Lane b's submitter travels with its continuation, which also tries to use the faulted device.
     let b = s.remove(1);

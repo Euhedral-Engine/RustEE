@@ -94,10 +94,11 @@ pub trait Pending: Send {
 /// cannot tell a misuse from a poll that was late. A `request` or `pull` of a completed source cancels
 /// nothing (it runs no application code of its own), and a completed source pushes no poll frame.
 pub struct Completions {
-    /// The lanes polled for markers: fixed for the source's life and dropped with it. A marker
-    /// counts as reached when its lane says so, also after the source has completed. `None` for a
+    /// The lanes polled for markers, held weakly: the pool's owner decides where the lanes are destroyed, and the
+    /// source never keeps them alive. A marker counts as reached when its lane says so, also after the source has
+    /// completed. Once the pool is gone no marker is reached any more (see [`Completions::new`]). `None` for a
     /// source built [`without_lanes`](Self::without_lanes): it takes no markers, and none is ever reached.
-    lanes: Option<Arc<LanePool>>,
+    lanes: Option<Weak<LanePool>>,
     /// Registered since the last poll; any thread appends, lock-free. [`LatticeSource::complete`]
     /// appends one [`Slot::Closed`] marker: what is behind it was registered too late.
     incoming: Producer<Slot, Multi>,
@@ -328,8 +329,31 @@ const INCOMING_CHUNK: usize = 256;
 
 impl Completions {
     /// Polls of `marker`s use `lanes`.
-    pub fn new(lanes: Arc<LanePool>) -> Arc<Self> {
-        Self::build(Some(lanes))
+    ///
+    /// The source holds the pool **weakly**. The owner's drop of the last strong reference destroys the lanes, on the
+    /// thread that drops it, wherever the lattice has let go of the source, **provided no marker registration is pending
+    /// and no poll is reading a marker at that moment**. A poll upgrades the pool once, at its first marker, and holds
+    /// it until the scan ends: a drop by the owner in that short window is a residual race inherent to a weak
+    /// reference, and the poll's worker then runs the teardown. So the order is required, not advisory: let the
+    /// marker registrations be emitted (`pending() == 0`) and only then complete the source (a completed source gets no poll
+    /// frame, so what is pending after `complete` is polled only by a `reap` and `pull` by hand), then drop the pool, then
+    /// release the device. Frames a
+    /// source holds may own the pool strongly themselves (a stage graph's continuation does): while such a frame
+    /// is registered the source keeps the pool alive through it, and the last drop happens where the frame ends.
+    ///
+    /// The pool handed in must live as long as the lanes it views: a pool that is a view of another (a typed pool's
+    /// query side, [`as_queues`](LanePool::as_queues)) must be held for as long as that other pool, or markers are
+    /// leaked while the lanes still live.
+    ///
+    /// A marker registration still pending when the pool is gone can no longer be observed, so it is not finished as
+    /// reached: the next poll (or the source's drop) leaks its frame and counts it in
+    /// [`leaked_unreached`](Self::leaked_unreached), as for a marker refused unreached. A marker registered after
+    /// that is leaked and counted the same way, at the next poll. A completed source is pushed no poll frame by the
+    /// lattice, so after the pool is gone [`pending`](Self::pending) can stay above zero until the source drops (which
+    /// leaks and counts what is left): assert `pending() == 0` before dropping the pool. Registrations that do not name a lane ([`at`](Self::at),
+    /// [`register`](Self::register), [`after`](Self::after), [`after_retired`](Self::after_retired)) are unaffected.
+    pub fn new(lanes: &Arc<LanePool>) -> Arc<Self> {
+        Self::build(Some(Arc::downgrade(lanes)))
     }
 
     /// A source with no device lanes: for a program with no device open (or between closing one and opening the
@@ -342,7 +366,7 @@ impl Completions {
         Self::build(None)
     }
 
-    fn build(lanes: Option<Arc<LanePool>>) -> Arc<Self> {
+    fn build(lanes: Option<Weak<LanePool>>) -> Arc<Self> {
         let queue: MpscQueue<Slot> = MpscQueue::with_pool(INCOMING_CHUNK, 2);
         let ready: SpscQueue<Box<dyn Frame>> = SpscQueue::with_pool(INCOMING_CHUNK, 2);
         Arc::new_cyclic(|me| Self {
@@ -377,11 +401,14 @@ impl Completions {
         })
     }
 
-    /// Whether `marker` is reached: never, with no lanes.
+    /// The pool, if it is still alive: one upgrade, for a caller that looks at several markers.
+    fn pool(&self) -> Option<Arc<LanePool>> {
+        self.lanes.as_ref().and_then(Weak::upgrade)
+    }
+
+    /// Whether `marker` is reached: never, with no lanes or once the pool is gone.
     fn reached(&self, marker: Marker) -> bool {
-        self.lanes
-            .as_ref()
-            .is_some_and(|lanes| lanes.reached(marker))
+        self.pool().is_some_and(|lanes| lanes.reached(marker))
     }
 
     /// Registers `what`. Exactly one end for its frame, whatever races `complete` (the argument is
@@ -677,8 +704,9 @@ impl Completions {
     }
 
     /// How many registrations the source leaked, instead of finishing them, because they were
-    /// refused, late or abandoned while their marker was still unreached (see `cancel`). The
-    /// counter outlives the source.
+    /// refused, late or abandoned while their marker was still unreached (see `cancel`), and, once the lane pool is
+    /// gone, every marker registration it ended for that reason, reached or not (a marker of a gone pool cannot be
+    /// observed). The counter outlives the source.
     pub fn leaked_unreached(&self) -> Arc<AtomicUsize> {
         self.leaked.clone()
     }
@@ -751,6 +779,9 @@ impl Completions {
             return 0;
         }
         let now = Instant::now();
+        // Upgraded at the first marker only, once for the whole scan, so a scan with no marker never holds the pool
+        // (application code runs in it). The inner `None` is a pool that is gone: no marker can be observed then.
+        let mut pool: Option<Option<Arc<LanePool>>> = None;
         let mut queued = 0;
         let mut index = 0;
         // What the entries left behind need next: the earliest deadline, and whether any can only be polled blind.
@@ -758,6 +789,18 @@ impl Completions {
         let mut blind = false;
         while index < waiting.len() {
             let entry = &mut waiting[index];
+            let pool_gone = matches!(entry.what, Waits::Marker(..))
+                && pool.get_or_insert_with(|| self.pool()).is_none();
+            if pool_gone {
+                // The pool is gone, so this marker will never be observed and is not known reached: the entry
+                // ends as a refused unreached marker does (leaked and counted by `cancel`), not as reached.
+                if let Some(Waiting { what, .. }) = waiting.remove(index) {
+                    self.cancel(what);
+                }
+                self.pending.fetch_sub(1, Ordering::AcqRel);
+                self.waiting.fetch_sub(1, Ordering::AcqRel);
+                continue;
+            }
             // Each operation is queried once, and a completed one leaves the list, so it is never
             // queried again (a query may have effects: a driver call that fetches the result).
             // A query is the application's code: one that panics loses its entry (finished without running, or
@@ -765,7 +808,12 @@ impl Completions {
             let queried = panic::catch_unwind(AssertUnwindSafe(|| match &mut entry.what {
                 Waits::Ready(ready, _) => (ready.is_ready(), None),
                 Waits::Wake(wake, _) => (wake.is_ready(), None),
-                Waits::Marker(marker, _) => (self.reached(*marker), None),
+                Waits::Marker(marker, _) => (
+                    pool.get_or_insert_with(|| self.pool())
+                        .as_ref()
+                        .is_some_and(|pool| pool.reached(*marker)),
+                    None,
+                ),
                 Waits::Retired(cell, _) => (cell.arrived(), None),
                 Waits::At(deadline, _) => (now >= *deadline, None),
                 Waits::Pending(pending) => {
@@ -966,8 +1014,9 @@ impl LatticeSource for Completions {
 // The tests' own threads register, complete and poll, as lattice workers would.
 #[allow(clippy::disallowed_methods, clippy::disallowed_types)]
 mod tests {
-    use std::sync::Mutex;
     use std::sync::atomic::AtomicU64;
+    use std::sync::{Mutex, OnceLock};
+    use std::thread::{self, ThreadId};
     use std::time::Duration;
 
     use euhedral_core::frames::FrameHeader;
@@ -1039,10 +1088,24 @@ mod tests {
         })
     }
 
-    fn setup() -> (Arc<Completions>, Arc<HandLane>) {
+    fn setup() -> (Arc<Completions>, Rig) {
         let lane = Arc::new(HandLane::default());
         let pool = Arc::new(LanePool::new(vec![lane.clone() as Arc<dyn DeviceQueue>]));
-        (Completions::new(pool), lane)
+        (Completions::new(&pool), Rig { lane, _pool: pool })
+    }
+
+    /// What a test keeps of a set-up: the lane (through `Deref`) and the pool the source only holds weakly.
+    struct Rig {
+        lane: Arc<HandLane>,
+        _pool: Arc<LanePool>,
+    }
+
+    impl std::ops::Deref for Rig {
+        type Target = HandLane;
+
+        fn deref(&self) -> &HandLane {
+            &self.lane
+        }
     }
 
     /// One poll by hand: what the poll frame does, then a pull of what it found.
@@ -1059,7 +1122,7 @@ mod tests {
 
     #[test]
     fn a_continuation_is_emitted_only_once_its_token_completed() {
-        let (completions, _) = setup();
+        let (completions, _rig) = setup();
         let token = Token::default();
         completions.after(Box::new(token.clone()), tagged(1));
         assert_eq!(completions.pending(), 1);
@@ -1086,7 +1149,7 @@ mod tests {
 
     #[test]
     fn a_kept_wake_is_emitted_when_it_holds_and_can_be_registered_again() {
-        let (completions, _) = setup();
+        let (completions, _rig) = setup();
         let flag = Arc::new(Flag::default());
         for round in 1..=3u64 {
             completions.after_wake(flag.clone(), tagged(round));
@@ -1110,7 +1173,7 @@ mod tests {
 
     #[test]
     fn each_poll_queries_each_pending_token_once() {
-        let (completions, _) = setup();
+        let (completions, _rig) = setup();
         let tokens: Vec<Token> = (0..5).map(|_| Token::default()).collect();
         for (i, token) in tokens.iter().enumerate() {
             completions.after(Box::new(token.clone()), tagged(i as u64));
@@ -1141,7 +1204,7 @@ mod tests {
 
     #[test]
     fn a_timer_fires_at_or_after_its_deadline_and_its_lateness_is_measured() {
-        let (completions, _) = setup();
+        let (completions, _rig) = setup();
         completions.at(Instant::now() + Duration::from_secs(3600), tagged(1));
         completions.at(Instant::now() - Duration::from_millis(5), tagged(2));
         assert_eq!(poll(&completions), [2]);
@@ -1165,7 +1228,7 @@ mod tests {
                 (self.0 == 0).then(|| tagged(7))
             }
         }
-        let (completions, _) = setup();
+        let (completions, _rig) = setup();
         completions.register(Box::new(CountDown(3)));
         assert!(poll(&completions).is_empty());
         assert!(poll(&completions).is_empty());
@@ -1175,7 +1238,7 @@ mod tests {
 
     #[test]
     fn a_poll_emits_no_more_than_its_demand() {
-        let (completions, _) = setup();
+        let (completions, _rig) = setup();
         for i in 0..5 {
             completions.at(Instant::now(), tagged(i));
         }
@@ -1193,7 +1256,7 @@ mod tests {
     /// place, and what was registered after it waits behind it.
     #[test]
     fn a_pull_stops_before_the_continuation_its_stop_matches_and_keeps_the_order() {
-        let (completions, _) = setup();
+        let (completions, _rig) = setup();
         let token = Token::default();
         token.done.store(true, Ordering::Release);
         completions.after(Box::new(token.clone()), tagged(1));
@@ -1225,7 +1288,7 @@ mod tests {
 
     #[test]
     fn a_dead_continuation_is_still_emitted_so_its_holdings_end() {
-        let (completions, _) = setup();
+        let (completions, _rig) = setup();
         let kill = Arc::new(AtomicBool::new(true));
         completions.at(
             Instant::now(),
@@ -1264,7 +1327,7 @@ mod tests {
 
     #[test]
     fn a_registration_after_complete_fails_visibly_and_still_finishes_its_frame() {
-        let (completions, _) = setup();
+        let (completions, _rig) = setup();
         completions.complete();
         let (executed, finished) = (
             Arc::new(AtomicBool::new(false)),
@@ -1320,7 +1383,7 @@ mod tests {
 
     #[test]
     fn requests_push_up_to_the_accumulated_demand_and_complete_tells_the_downstream() {
-        let (completions, _) = setup();
+        let (completions, _rig) = setup();
         let recorder = Arc::new(Recorder::default());
         completions.clone().add_downstream(recorder.clone());
         for i in 0..3 {
@@ -1454,31 +1517,233 @@ mod tests {
         assert_eq!(completions.pending(), 1);
     }
 
+    /// A lane that records where it was destroyed: the count of its drops and the thread of the first.
+    #[derive(Debug)]
+    struct ProbeLane {
+        id: QueueId,
+        completed: AtomicU64,
+        drops: Arc<AtomicUsize>,
+        dropped_on: Arc<OnceLock<ThreadId>>,
+    }
+
+    impl DeviceQueue for ProbeLane {
+        fn id(&self) -> QueueId {
+            self.id
+        }
+
+        fn completed(&self) -> u64 {
+            self.completed.load(Ordering::Acquire)
+        }
+
+        fn name(&self) -> &str {
+            "probe"
+        }
+    }
+
+    impl Drop for ProbeLane {
+        fn drop(&mut self) {
+            let _ = self.dropped_on.set(thread::current().id());
+            self.drops.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    /// A source on a pool of one probe lane. The pool is returned to the caller, its owner: the source holds it
+    /// weakly. The lane's id, its drop count and the thread it was dropped on come with it.
+    #[allow(clippy::type_complexity)]
+    fn probed() -> (
+        Arc<Completions>,
+        Arc<LanePool>,
+        QueueId,
+        Arc<AtomicUsize>,
+        Arc<OnceLock<ThreadId>>,
+    ) {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let dropped_on = Arc::new(OnceLock::new());
+        let id = QueueId::next();
+        let lane = Arc::new(ProbeLane {
+            id,
+            completed: AtomicU64::new(0),
+            drops: drops.clone(),
+            dropped_on: dropped_on.clone(),
+        });
+        let pool = Arc::new(LanePool::new(vec![lane as Arc<dyn DeviceQueue>]));
+        (Completions::new(&pool), pool, id, drops, dropped_on)
+    }
+
     #[test]
-    fn a_source_holds_its_lanes_for_its_life_and_drops_them_with_it() {
-        // The lane pool is a fixed field, as a final field is: the source lets go of it when the
-        // last owner of the source does.
-        let lane = Arc::new(HandLane::default());
-        let pool = Arc::new(LanePool::new(vec![lane.clone()]));
-        let completions = Completions::new(pool.clone());
+    fn the_owner_dropping_the_pool_destroys_the_lanes_there_while_a_source_is_alive() {
+        let (completions, pool, id, drops, dropped_on) = probed();
+        // Something pending on the lane: the source is in use when the owner lets go.
+        completions.after_marker(Marker::new(id, LaneId(0), 3), tagged(1));
+        assert_eq!(drops.load(Ordering::Acquire), 0);
         drop(pool);
         assert_eq!(
-            Arc::strong_count(&lane),
-            2,
-            "the source holds the lane while it runs"
+            drops.load(Ordering::Acquire),
+            1,
+            "the lane is destroyed at the owner's drop, not held by the source"
         );
-        LatticeSource::complete(&*completions);
-        assert_eq!(
-            Arc::strong_count(&lane),
-            2,
-            "completing touches no lane state"
-        );
+        assert!(dropped_on.get().is_some());
         drop(completions);
         assert_eq!(
-            Arc::strong_count(&lane),
+            drops.load(Ordering::Acquire),
             1,
-            "the last owner's drop lets the lane go"
+            "the source's drop touches no lane"
         );
+    }
+
+    #[test]
+    fn the_lanes_are_destroyed_on_the_owners_thread_not_the_one_that_drops_the_source() {
+        let (completions, pool, id, drops, dropped_on) = probed();
+        completions.after_marker(Marker::new(id, LaneId(0), 3), tagged(1));
+        let owner = thread::current().id();
+        // The owner drops the pool here; the source's last reference is dropped on another thread, as a worker's
+        // release is. The scope joins it, so the order is fixed.
+        drop(pool);
+        thread::scope(|scope| {
+            scope.spawn(move || drop(completions));
+        });
+        assert_eq!(drops.load(Ordering::Acquire), 1);
+        assert_eq!(
+            dropped_on.get(),
+            Some(&owner),
+            "destroyed where the owner dropped the pool"
+        );
+    }
+
+    #[test]
+    fn a_scan_with_no_marker_never_holds_the_pool_across_application_code() {
+        struct DropsPool {
+            pool: Option<Arc<LanePool>>,
+            drops: Arc<AtomicUsize>,
+            seen: Arc<AtomicUsize>,
+        }
+        impl Pending for DropsPool {
+            fn poll(&mut self) -> Option<Box<dyn Frame>> {
+                // The owner's last drop, made while the scan is inside this poll.
+                drop(self.pool.take());
+                self.seen
+                    .store(self.drops.load(Ordering::Acquire) + 100, Ordering::Release);
+                Some(tagged(1))
+            }
+        }
+        let (completions, pool, _, drops, _) = probed();
+        let seen = Arc::new(AtomicUsize::new(0));
+        completions.register(Box::new(DropsPool {
+            pool: Some(pool),
+            drops: drops.clone(),
+            seen: seen.clone(),
+        }));
+        completions.reap();
+        assert_eq!(
+            seen.load(Ordering::Acquire),
+            101,
+            "the owner's drop destroyed the lane inside the poll: the scan held no pool"
+        );
+        assert_eq!(drops.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn a_completed_source_still_held_elsewhere_does_not_keep_the_lanes() {
+        let (completions, pool, _, drops, _) = probed();
+        // The lattice's let-go is a later release of its own reference: model it with a clone.
+        let held_by_the_lattice = completions.clone();
+        LatticeSource::complete(&*completions);
+        drop(pool);
+        assert_eq!(
+            drops.load(Ordering::Acquire),
+            1,
+            "destroyed at the owner's drop"
+        );
+        drop(completions);
+        assert_eq!(drops.load(Ordering::Acquire), 1);
+        drop(held_by_the_lattice);
+        assert_eq!(
+            drops.load(Ordering::Acquire),
+            1,
+            "the last reference to the source destroys nothing of the device"
+        );
+    }
+
+    #[test]
+    fn markers_pending_when_the_pool_goes_are_leaked_and_counted_never_emitted() {
+        let (completions, pool, id, drops, _) = probed();
+        let leaks = completions.leaked_unreached();
+        let (unreached, unreached_ends) = counted(1);
+        let (reached, reached_ends) = counted(2);
+        let token = Token::default();
+        let (waits, waits_ends) = counted(3);
+        completions.after_marker(Marker::new(id, LaneId(0), 9), unreached);
+        // Not reached by a lane that is gone is not known reached, whatever the lane said before.
+        completions.after_marker(Marker::new(id, LaneId(0), 0), reached);
+        completions.after(Box::new(token.clone()), waits);
+        assert_eq!(completions.pending(), 3);
+        drop(pool);
+        assert_eq!(drops.load(Ordering::Acquire), 1);
+        assert!(poll(&completions).is_empty(), "no marker is emitted");
+        assert_eq!(
+            leaks.load(Ordering::Acquire),
+            2,
+            "both markers leaked and counted"
+        );
+        assert_eq!(completions.pending(), 1, "only the token still waits");
+        // A marker registered after the pool went ends the same way, at the next poll.
+        let (late, late_ends) = counted(4);
+        completions.after_marker(Marker::new(id, LaneId(0), 0), late);
+        assert!(poll(&completions).is_empty());
+        assert_eq!(leaks.load(Ordering::Acquire), 3);
+        // The token is not a marker: it completes as ever.
+        token.done.store(true, Ordering::Release);
+        assert_eq!(poll(&completions), [3]);
+        drop(completions);
+        for (name, ends) in [
+            ("unreached", unreached_ends),
+            ("reached", reached_ends),
+            ("late", late_ends),
+        ] {
+            assert_eq!(
+                ends.load(Ordering::Acquire),
+                0,
+                "the {name} frame never ran or finished"
+            );
+        }
+        assert_eq!(
+            waits_ends.load(Ordering::Acquire),
+            0,
+            "emitted, not finished by the source"
+        );
+        assert_eq!(leaks.load(Ordering::Acquire), 3);
+    }
+
+    #[test]
+    fn markers_pending_at_the_source_drop_after_the_pool_went_are_leaked_and_counted() {
+        let (completions, pool, id, _, _) = probed();
+        let leaks = completions.leaked_unreached();
+        let (frame, ends) = counted(1);
+        completions.after_marker(Marker::new(id, LaneId(0), 0), frame);
+        drop(pool);
+        drop(completions);
+        assert_eq!(ends.load(Ordering::Acquire), 0);
+        assert_eq!(leaks.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn timers_and_pending_operations_keep_working_after_the_pool_is_gone() {
+        struct CountDown(u32);
+        impl Pending for CountDown {
+            fn poll(&mut self) -> Option<Box<dyn Frame>> {
+                self.0 = self.0.saturating_sub(1);
+                (self.0 == 0).then(|| tagged(7))
+            }
+        }
+        let (completions, pool, _, _, _) = probed();
+        drop(pool);
+        let leaks = completions.leaked_unreached();
+        completions.at(Instant::now() - Duration::from_millis(1), tagged(1));
+        completions.register(Box::new(CountDown(2)));
+        assert_eq!(poll(&completions), [1]);
+        assert_eq!(poll(&completions), [7]);
+        assert_eq!(completions.pending(), 0);
+        assert_eq!(leaks.load(Ordering::Acquire), 0);
     }
 
     /// A frame whose lifecycle ends are counted (`do_finally`), and who got it: a test's `ends`
@@ -1550,7 +1815,7 @@ mod tests {
 
     #[test]
     fn a_registration_ahead_of_the_marker_is_emitted_and_one_behind_it_is_cancelled() {
-        let (completions, _) = setup();
+        let (completions, _rig) = setup();
         let (ahead, ahead_ends) = counted(1);
         completions.at(Instant::now(), ahead);
         completions.complete();
@@ -1585,7 +1850,7 @@ mod tests {
 
     #[test]
     fn a_reap_of_a_completed_source_cancels_what_landed_behind_the_marker_and_a_request_does_not() {
-        let (completions, _) = setup();
+        let (completions, _rig) = setup();
         let hands = Arc::new(Hands::default());
         completions.clone().add_downstream(hands.clone());
         completions.complete();
@@ -1602,7 +1867,7 @@ mod tests {
 
     #[test]
     fn with_no_poll_the_last_drop_cancels_what_landed_behind_the_marker() {
-        let (completions, _) = setup();
+        let (completions, _rig) = setup();
         completions.complete();
         let (behind, ends) = counted(4);
         queue_behind_the_marker(&completions, behind);
@@ -1626,7 +1891,7 @@ mod tests {
         within(Duration::from_secs(120), || {
             let mut refused_or_late = 0usize;
             for round in 0..ROUNDS {
-                let (completions, _) = setup();
+                let (completions, _rig) = setup();
                 let ends: Vec<Arc<AtomicUsize>> = (0..PER_ROUND).map(|_| Arc::default()).collect();
                 let go = Arc::new(std::sync::Barrier::new(3));
                 let registrar = {
@@ -1699,7 +1964,7 @@ mod tests {
         const THREADS: u64 = 8;
         const EACH: u64 = 10_000;
         within(Duration::from_secs(120), || {
-            let (completions, _) = setup();
+            let (completions, _rig) = setup();
             let registrars: Vec<_> = (0..THREADS)
                 .map(|t| {
                     let completions = completions.clone();
@@ -1833,7 +2098,7 @@ mod tests {
 
     #[test]
     fn a_request_while_another_thread_hands_out_returns_at_once() {
-        let (completions, _) = setup();
+        let (completions, _rig) = setup();
         let recorder = Arc::new(Recorder::default());
         completions.clone().add_downstream(recorder.clone());
         completions.at(Instant::now(), tagged(1));
@@ -1898,7 +2163,7 @@ mod tests {
 
     #[test]
     fn a_sweep_that_finds_the_poll_held_is_run_by_the_holder_when_it_lets_go() {
-        let (completions, _) = setup();
+        let (completions, _rig) = setup();
         let (inside, release) = (
             Arc::new(std::sync::Barrier::new(2)),
             Arc::new(std::sync::Barrier::new(2)),
@@ -1973,7 +2238,7 @@ mod tests {
 
     #[test]
     fn dropping_the_source_cancels_what_it_absorbed_and_never_emitted() {
-        let (completions, _) = setup();
+        let (completions, _rig) = setup();
         let token = Token::default();
         let (frame, ends) = counted(1);
         completions.after(Box::new(token), frame);
@@ -1989,7 +2254,7 @@ mod tests {
 
     #[test]
     fn a_consumer_that_panics_leaves_a_request_refused_meanwhile_to_the_next_request() {
-        let (completions, _) = setup();
+        let (completions, _rig) = setup();
         let recorder = Arc::new(Recorder::default());
         completions.clone().add_downstream(recorder.clone());
         completions.at(Instant::now(), tagged(1));
@@ -2030,7 +2295,7 @@ mod tests {
 
     #[test]
     fn a_panicking_consumer_leaves_pending_exact() {
-        let (completions, _) = setup();
+        let (completions, _rig) = setup();
         completions.at(Instant::now(), tagged(1));
         assert_eq!(completions.pending(), 1);
         completions.reap();
@@ -2074,7 +2339,7 @@ mod tests {
 
     #[test]
     fn a_panicking_push_keeps_demand_exact_and_serves_the_request_refused_meanwhile() {
-        let (completions, _) = setup();
+        let (completions, _rig) = setup();
         let receiver = Arc::new(PanicOncePush {
             inside: std::sync::Barrier::new(2),
             release: std::sync::Barrier::new(2),
@@ -2243,7 +2508,7 @@ mod tests {
 
     #[test]
     fn request_and_pull_query_nothing_and_the_poll_frame_does() {
-        let (completions, _) = setup();
+        let (completions, _rig) = setup();
         let hands = Arc::new(Hands::default());
         completions.clone().add_downstream(hands.clone());
         let token = Token::default();
@@ -2298,7 +2563,7 @@ mod tests {
 
     #[test]
     fn a_pull_hands_out_what_a_reap_found_without_querying_again() {
-        let (completions, _) = setup();
+        let (completions, _rig) = setup();
         let token = Token::default();
         token.done.store(true, Ordering::Release);
         completions.after(Box::new(token.clone()), tagged(1));
@@ -2337,7 +2602,7 @@ mod tests {
 
     #[test]
     fn a_poll_frame_that_was_dropped_unrun_is_replaced_so_the_polling_is_not_stranded() {
-        let (completions, _) = setup();
+        let (completions, _rig) = setup();
         let discard = Arc::new(Discard::default());
         completions.clone().add_downstream(discard.clone());
         completions.at(Instant::now() + Duration::from_secs(3600), tagged(1));
@@ -2350,7 +2615,7 @@ mod tests {
 
     #[test]
     fn a_poll_frame_whose_source_is_gone_does_nothing() {
-        let (completions, _) = setup();
+        let (completions, _rig) = setup();
         let hands = Arc::new(Hands::default());
         completions.clone().add_downstream(hands.clone());
         completions.at(Instant::now() + Duration::from_secs(3600), tagged(1));
@@ -2363,7 +2628,7 @@ mod tests {
 
     #[test]
     fn the_poll_frame_is_not_part_of_the_demand_and_a_pull_neither_pushes_nor_hands_it_out() {
-        let (completions, _) = setup();
+        let (completions, _rig) = setup();
         let hands = Arc::new(Hands::default());
         completions.clone().add_downstream(hands.clone());
         completions.at(Instant::now() + Duration::from_secs(3600), tagged(1));
@@ -2420,7 +2685,7 @@ mod tests {
         // A worker that finds nothing to do parks only if the handle it visits reads unproductive: a visit that
         // pushes a frame does not. So between polls, a visit must push nothing. The polls of a blind wait are
         // spaced by a window of time that doubles from 16 us to 100 us, whatever the visit rate.
-        let (completions, _) = setup();
+        let (completions, _rig) = setup();
         let hands = Arc::new(Hands::default());
         completions.clone().add_downstream(hands.clone());
         let polls = Arc::new(AtomicUsize::new(0));
@@ -2464,7 +2729,7 @@ mod tests {
 
     #[test]
     fn a_timer_needs_no_polling_before_its_deadline_and_is_polled_at_the_first_visit_after_it() {
-        let (completions, _) = setup();
+        let (completions, _rig) = setup();
         let hands = Arc::new(Hands::default());
         completions.clone().add_downstream(hands.clone());
         let deadline = Instant::now() + Duration::from_millis(3);
@@ -2505,7 +2770,7 @@ mod tests {
 
     #[test]
     fn a_timer_registered_earlier_than_the_one_waiting_is_polled_at_its_own_deadline() {
-        let (completions, _) = setup();
+        let (completions, _rig) = setup();
         let hands = Arc::new(Hands::default());
         completions.clone().add_downstream(hands.clone());
         completions.at(Instant::now() + Duration::from_secs(3600), tagged(1));
@@ -2528,7 +2793,7 @@ mod tests {
 
     #[test]
     fn a_wait_that_rings_a_bell_is_not_polled_until_it_rings() {
-        let (completions, _) = setup();
+        let (completions, _rig) = setup();
         let hands = Arc::new(Hands::default());
         completions.clone().add_downstream(hands.clone());
         let cell = Arc::new(RetireCell::new());
@@ -2556,7 +2821,7 @@ mod tests {
 
     #[test]
     fn a_callback_that_arrived_before_the_registration_is_found_by_the_look_it_asks_for() {
-        let (completions, _) = setup();
+        let (completions, _rig) = setup();
         let hands = Arc::new(Hands::default());
         completions.clone().add_downstream(hands.clone());
         let cell = Arc::new(RetireCell::new());
@@ -2572,8 +2837,8 @@ mod tests {
 
     #[test]
     fn a_cell_another_source_claimed_is_polled_blind() {
-        let (first, _) = setup();
-        let (second, _) = setup();
+        let (first, _rig_first) = setup();
+        let (second, _rig_second) = setup();
         let hands = Arc::new(Hands::default());
         second.clone().add_downstream(hands.clone());
         let cell = Arc::new(RetireCell::new());
@@ -2593,7 +2858,7 @@ mod tests {
 
     #[test]
     fn a_registration_that_races_a_poll_is_not_lost_to_its_back_off() {
-        let (completions, _) = setup();
+        let (completions, _rig) = setup();
         let hands = Arc::new(Hands::default());
         completions.clone().add_downstream(hands.clone());
         let polls = Arc::new(AtomicUsize::new(0));
@@ -2636,7 +2901,7 @@ mod tests {
 
     #[test]
     fn a_query_that_panics_loses_its_entry_and_not_the_others() {
-        let (completions, _) = setup();
+        let (completions, _rig) = setup();
         let (before, before_ends) = counted(1);
         let (panicking, panicking_ends) = counted(2);
         completions.at(Instant::now(), tagged(0));
@@ -2661,7 +2926,7 @@ mod tests {
 
     #[test]
     fn the_poll_frame_is_pushed_by_a_request_never_by_a_pull_and_a_key_out_is_never_out_twice() {
-        let (completions, _) = setup();
+        let (completions, _rig) = setup();
         let hands = Arc::new(Hands::default());
         completions.clone().add_downstream(hands.clone());
         let polls = Arc::new(AtomicUsize::new(0));
@@ -2704,7 +2969,7 @@ mod tests {
 
     #[test]
     fn a_poll_frame_that_runs_while_a_pull_holds_the_hand_out_leaves_the_pushing_to_a_request() {
-        let (completions, _) = setup();
+        let (completions, _rig) = setup();
         let hands = Arc::new(Hands::default());
         completions.clone().add_downstream(hands.clone());
         let done = |tag: u64| {

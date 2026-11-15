@@ -203,7 +203,7 @@ fn a_retirement_fills_the_cell_it_was_armed_with_and_a_frame_settles_it() {
     .unwrap();
     let cell = Arc::new(RetireCell::new());
     lane.notify_retired(&cell).unwrap();
-    let completions = Completions::new(lanes.queues.clone());
+    let completions = Completions::new(&lanes.queues);
     after_retired(&completions, &cell);
     assert_eq!(pull(&completions), 0, "the device has not run");
     assert_eq!(cell.status(), None);
@@ -416,7 +416,7 @@ fn fixture(
     let kernel = kernel_of(&gpu);
     let at = gpu.alloc(4);
     let lanes = open_with(&gpu, 2, markers);
-    let completions = Completions::new(lanes.queues.clone());
+    let completions = Completions::new(&lanes.queues);
     let queue = MpmcQueue::<Box<dyn Frame>>::bounded(256);
     let frames: Consumer<Box<dyn Frame>, Multi> = queue.consumer();
     let mut spec = StageGraphSpec::new();
