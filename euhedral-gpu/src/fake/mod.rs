@@ -262,7 +262,8 @@ struct ContextRecord {
 
 /// A fake device's context that can be opened, fully released and opened again, as a real device's primary context can: the
 /// record of retains and releases belongs to the context, not to one open, and each [`open`](Self::open) is a [`FakeGpu`] with its own memory,
-/// kernels and streams (a new context has none of the last one's).
+/// kernels and streams (a new context has none of the last one's). Two opens alive at once get separate memory, where a
+/// second retain of a live primary context shares the first's: the fake does not model that overlap.
 #[derive(Clone, Debug, Default)]
 pub struct FakeContext {
     record: Arc<ContextRecord>,
@@ -280,6 +281,16 @@ impl FakeContext {
         Arc::new(FakeGpu::over(self.clone()))
     }
 
+    /// A holder of the context that is not a gpu: it retains the context now and releases it when dropped, as a backend
+    /// that holds the device itself (the CUDA backend's `PinnedHost`, `DeviceMemory` and `StreamCopier` hold an
+    /// `Arc<Device>`, not the gpu) does. The context stays active until it and every opened gpu have gone.
+    pub fn hold(&self) -> FakeContextHold {
+        self.record.retained.fetch_add(1, Ordering::AcqRel);
+        FakeContextHold {
+            context: self.clone(),
+        }
+    }
+
     /// Contexts retained so far.
     pub fn retained(&self) -> u64 {
         self.record.retained.load(Ordering::Acquire)
@@ -293,6 +304,18 @@ impl FakeContext {
     /// Whether a context is held: retained more often than released.
     pub fn active(&self) -> bool {
         self.retained() > self.released()
+    }
+}
+
+/// A retain of a [`FakeContext`] made by [`FakeContext::hold`]; the drop releases it.
+#[derive(Debug)]
+pub struct FakeContextHold {
+    context: FakeContext,
+}
+
+impl Drop for FakeContextHold {
+    fn drop(&mut self) {
+        self.context.record.released.fetch_add(1, Ordering::AcqRel);
     }
 }
 

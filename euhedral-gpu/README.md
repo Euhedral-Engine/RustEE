@@ -360,35 +360,60 @@ does ten rounds on a real card; `tests/fake_reopen.rs` does the same on the fake
 and releases across opens.
 
 **What holds the context.** One `Arc<Device>` is the primary-context retain (`cuDevicePrimaryCtxRetain` in `Device::open`);
-its drop is the only release. The context is released when the last `Arc<Device>` goes. Strong holders: `CudaGpu`
-(and so everything that holds a `CudaGpu`: every stream and lane, every module and kernel, every graph and so a
-`GraphCache`'s entries, the retirement continuations), `DeviceMemory`, `StreamPool`, `Vmm`, `PinnedHost`, `StreamCopier`,
-texture objects, and a deferred call that is queued on the device's `DeferredCalls` (its closure holds the device until it
-runs). Not holders: `Completions` (its lane pool is weak), `LanePool` (it names queues, not the device), a `Block`
-(a plain address and size) and a marker.
+its drop is the only release, and the context is released when the last `Arc<Device>` goes. Strong holders, each directly or
+through another:
+- `CudaGpu` (it holds the device), and so everything that holds a `CudaGpu`: every `CudaStream` and shared `CudaQueue`
+  (a lane), every module and kernel (a kernel holds its module), every graph and so a `GraphCache`'s entries, the shared
+  lane handles, and the retirement continuations of `retire_into`.
+- `LanePool` and `SharedLanes` (the pool holds its lanes, the lanes hold the gpu): a pool kept alive keeps the context.
+- Lane sources and their intakes from `open_lane_sources` (they own the streams), and a stage graph's frames that own a
+  pool or a stream.
+- `DeviceMemory`, `StreamPool`, `Vmm`, `PinnedHost`, `StreamCopier` and texture objects hold an `Arc<Device>` directly,
+  not the gpu: they can outlive it, and then they alone keep the context.
+- A `Mover` (its copiers), and the completion tokens of work in flight: an `EventRetired` keeps its copier, a
+  `MarkerRetired` keeps a lane's queue, in a `Reaper` or a move task until the work retires.
+- A call queued on a device's `DeferredCalls` (its closure holds the device until it runs). A `DeferredCalls` attached to
+  a lattice is held by the lattice until it is completed.
+Not holders: `Completions` (its pool is weak), a `Block` (a plain address and size), a marker, and the loaded driver
+and NVRTC (process-wide, no context).
 
 **The order.** Drop outward in:
 
 1. Emit every marker registration: poll the `Completions` until `pending() == 0`.
 2. Complete the source (`LatticeSource::complete`).
-3. Drop the lane pool and the streams, lanes and submitters with it (dropping a stream waits for its device work).
+3. Drop the lane pool and everything holding lanes: the streams and submitters, the lane sources and their intakes, the `Mover`
+   (dropping a stream waits for its device work).
 4. Return the blocks: free device and pinned blocks to their backends, then drop the backends (`PinnedHost`'s drop frees
    what it cached, which waits for the device; `DeviceMemory`, `StreamPool`, `Vmm`, `StreamCopier`).
-5. Drop the kernels, modules, graphs and caches of graphs, and any deferral's queue (its owner dropping `DeferredCalls`
-   makes what is queued).
+5. Drop the kernels, modules, graphs and caches of graphs, and any deferral's queue: complete a `DeferredCalls` that is
+   attached to a lattice, then drop it (dropping it makes what is queued).
 6. Drop the `CudaGpu` and every other `Arc<Device>`. The last drop releases the context, on the thread that drops it, and
    waits for the driver to tear it down.
 
 **Out of order.** Nothing crashes; what is wrong is what stays.
-- A holder that outlives the rest keeps the context: the device stays active until that holder drops. A kernel or module kept
-  past the gpu keeps its gpu and so the device, and a context held by a forgotten holder is a context never released.
-  The last holder's drop releases it, wherever that is.
+- A holder that outlives the rest keeps the context: the device stays active until that holder drops (a kernel or
+  module kept past the gpu keeps its gpu; a `PinnedHost` kept past it keeps the device; a pool keeps its lanes). The
+  last holder's drop releases it, wherever that is, except in the two cases below.
 - A stream dropped after the pool still waits for its own work, and a marker of a dropped pool is never reached: pending
   `Completions` registrations are leaked and counted (`leaked_unreached`), not emitted (see the `euhedral-graph` README).
 - A pinned or device block not returned to its backend before the backend drops is not freed by the backend (a pinned
   backend frees only what it cached); the driver destroys what the context holds when the last `Arc<Device>` goes, so
   nothing outlives the context, but a block's address is a plain number: using it after its backend and device are gone is
   the caller's error, which the crate cannot detect.
+
+**When the context is never released.** Two cases keep it for the life of the process; `Driver::primary_context_active`
+reports `true` and a re-open gets the same context.
+- A stream dropped after a sticky fault or a lost context, while retirements it armed are outstanding, deliberately leaks
+  its shared side (a callback may still arrive), so its gpu and the device stay. The fault is sticky for the context, so
+  the re-open meets the same fault; a program cannot recover in-process.
+- A `Completions` marker registration left when its pool went is leaked and forgotten (`leaked_unreached`). If its frame
+  owns a stream or the pool (`retire_into`), that holder is never dropped and keeps the context for ever. The order above
+  avoids it: emit before dropping the pool.
+
+**What the fake shows and does not.** `FakeContext` counts retains and releases across opens. Its streams, modules and
+pool hold the gpu, but the real backends of `euhedral-memory` hold the device directly, so the fake has no "gpu dropped, pinned
+host alive" except through `FakeContext::hold`, which stands for such a holder. Two opens of a `FakeContext` alive at once
+get separate memory, where a second retain of a live primary context shares the first's.
 
 **Timings** on the development card (one round of the test: open the device, compile a module
 from source, 32 MiB of device buffers, a pinned loan pair, a copy and a kernel): `CudaGpu::open` about 50 ms (the context

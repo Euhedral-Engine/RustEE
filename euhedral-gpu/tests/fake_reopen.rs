@@ -1,5 +1,10 @@
 //! A device released completely and opened again in one process, on the fake backend: the context is released when the
 //! last holder goes, a later open works as the first did, and the sequence repeats. No GPU, no wall clock.
+//!
+//! What the fake cannot show: its streams, modules and pool hold the gpu, as the CUDA backend's do, but the backends of
+//! `euhedral-memory` (`PinnedHost`, `DeviceMemory`, `StreamCopier`) hold the device itself, so there is no fake of "gpu dropped,
+//! pinned host still alive": `FakeContext::hold` stands in for such a holder. And two opens alive at once get separate memory,
+//! where a second retain of a live primary context shares the first's.
 #![cfg(feature = "fake")]
 
 use std::sync::Arc;
@@ -7,9 +12,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use euhedral_core::frames::RunnableFrame;
 use euhedral_core::generics::LatticeSource;
-use euhedral_gpu::fake::{FakeContext, FakeGpu, FakeModule};
+use euhedral_gpu::fake::{FakeContext, FakeGpu, FakeModule, FakeStream};
 use euhedral_gpu::{Args, CompileOptions, Gpu, LaneEnqueue, Launch, Module, Stream, StreamOptions};
-use euhedral_graph::Completions;
+use euhedral_graph::{Completions, LanePool};
 
 const ROUNDS: u32 = 10;
 
@@ -30,8 +35,8 @@ fn open(device: &FakeContext) -> Arc<FakeGpu> {
 /// the copy writes, and a completions source with a marker registered.
 struct Round {
     gpu: Arc<FakeGpu>,
-    pool: Arc<euhedral_graph::LanePool>,
-    streams: Vec<euhedral_gpu::fake::FakeStream>,
+    pool: Arc<LanePool>,
+    streams: Vec<FakeStream>,
     module: FakeModule,
     word: u64,
     scratch: u64,
@@ -167,21 +172,49 @@ fn a_device_released_completely_opens_again_ten_times() {
 }
 
 #[test]
-fn a_reopened_device_starts_empty() {
+fn a_reopened_device_starts_empty_and_counts_on_its_own_open() {
     let device = FakeContext::new();
     let (held, _) = start(&device, 5);
-    let stale = held.word;
     release(held);
+    assert!(!device.active());
     let gpu = open(&device);
+    assert!(device.active());
+    assert_eq!((device.retained(), device.released()), (2, 1));
     assert_eq!(
         gpu.live_allocations(),
         0,
         "the old context's memory is gone"
     );
     assert!(gpu.log().is_empty());
-    let fresh = gpu.alloc(4);
-    assert_eq!(gpu.read(fresh, 4), [0; 4]);
-    assert_ne!(stale, 0);
+    drop(gpu);
+    assert!(!device.active());
+}
+
+#[test]
+fn a_lane_pool_kept_past_everything_else_keeps_the_context() {
+    let device = FakeContext::new();
+    let (held, _) = start(&device, 1);
+    let pool = held.pool.clone();
+    release(held);
+    assert!(device.active(), "the pool holds its lanes and so the gpu");
+    assert_eq!(device.released(), 0);
+    drop(pool);
+    assert!(!device.active(), "dropping the pool releases the context");
+}
+
+#[test]
+fn a_holder_of_the_context_that_is_not_the_gpu_keeps_it_too() {
+    let device = FakeContext::new();
+    let (held, _) = start(&device, 1);
+    let hold = device.hold();
+    release(held);
+    assert!(
+        device.active(),
+        "the gpu is gone and the holder keeps the context"
+    );
+    drop(hold);
+    assert!(!device.active());
+    assert_eq!(device.retained(), device.released());
 }
 
 #[test]

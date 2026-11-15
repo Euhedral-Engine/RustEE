@@ -1,6 +1,6 @@
 //! A device released completely and opened again in one process, on a real card: after everything that holds the device
 //! is dropped in the documented order the driver reports the primary context inactive, a later open computes the same
-//! result, and ten rounds in a row leave the card's free memory where it was. Skips, passing, with no driver, device or
+//! result, and ten rounds in a row. Skips, passing, with no driver, device or
 //! kernel compiler.
 #![cfg(feature = "cuda")]
 #![allow(
@@ -26,12 +26,8 @@ use euhedral_memory::{Backend, LocationId};
 const OPS: &str = include_str!("kernels/ops.cu");
 const OPS_PTX: &[u8] = include_bytes!("kernels/ops.ptx");
 const ROUNDS: usize = 10;
-/// Floats per buffer: 16 MiB each, so a round that leaked its device buffers would show within a few rounds.
+/// Floats per buffer: 16 MiB each.
 const N: usize = 4 << 20;
-/// How far the free memory read after an open may fall below the first open's. Other programs share the card; a leak of
-/// the round's two device buffers (32 MiB) per round passes this within four rounds.
-const TOLERANCE: u64 = 128 << 20;
-
 /// The test kernels, from source when the compiler is present, else from the prebuilt image.
 fn load_module(gpu: &Arc<CudaGpu>) -> Option<(CudaModule, &'static str)> {
     if Nvrtc::shared(None).is_ok() {
@@ -190,9 +186,10 @@ fn a_device_released_completely_opens_again_ten_times() {
         !driver.primary_context_active(0).unwrap_or(false),
         "nothing in this process has opened the device yet"
     );
-    let mut first_free = None;
     for n in 0..ROUNDS {
         let Some(Opened { gpu, free, open }) = open() else {
+            // Only a machine without a device skips; a device that opened once must open again.
+            assert_eq!(n, 0, "round {n}: the device opened before and now does not");
             return;
         };
         assert!(driver.primary_context_active(0).unwrap());
@@ -202,17 +199,38 @@ fn a_device_released_completely_opens_again_ten_times() {
         };
         let release = round(gpu, module, &driver);
         let inactive = !driver.primary_context_active(0).unwrap();
+        // The free memory is printed, not asserted: it is the whole card's and other programs share it, so a bound would fail
+        // or hide a leak by their doing. That the driver reports the context inactive is the proof of release: destroying a
+        // context frees everything made in it.
         eprintln!(
             "round {n}: module from {how}; open {open:?}; free after open {} MiB; release {release:?}; primary context inactive after release: {inactive}",
             free >> 20
         );
         assert!(inactive, "round {n}: the driver's context is gone");
-        let first = *first_free.get_or_insert(free);
-        assert!(
-            free + TOLERANCE >= first,
-            "round {n}: free memory after an open fell from {} to {} MiB: the process holds memory on the card",
-            first >> 20,
-            free >> 20
-        );
     }
+
+    // Out of order: a pinned backend, which holds the device itself, kept past the gpu keeps the context until it drops.
+    let Opened { gpu, .. } = open().expect("the device opened ten times");
+    let pinned = PinnedHost::new(gpu.device().clone(), LocationId(1), 64 << 20);
+    let block = pinned.alloc(1 << 20).unwrap();
+    // SAFETY: the block came from this backend and nothing uses it.
+    unsafe { pinned.free(block) };
+    drop(gpu);
+    assert!(
+        driver.primary_context_active(0).unwrap(),
+        "a pinned backend kept past the gpu holds the context"
+    );
+    drop(pinned);
+    assert!(
+        !driver.primary_context_active(0).unwrap(),
+        "its drop released the context"
+    );
+    eprintln!("out of order: held while the backend lived, released when it dropped");
+
+    // And the device opens once more and computes.
+    let Opened { gpu, .. } = open().expect("the device opened before");
+    let (module, _) = load_module(&gpu).unwrap();
+    round(gpu, module, &driver);
+    assert!(!driver.primary_context_active(0).unwrap());
+    eprintln!("open after the out-of-order release: kernel output correct, context released");
 }
