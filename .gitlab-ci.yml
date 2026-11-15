@@ -17,6 +17,7 @@ plan:
   script:
     - mise install rust >/dev/null && eval "$(mise env -s bash)"
     - python3 scripts/ci/test_affected.py
+    - python3 scripts/ci/test_miri_build.py
     - |
       if [ "$CI_PIPELINE_SOURCE" = "merge_request_event" ]; then
         git fetch -q origin "$CI_MERGE_REQUEST_TARGET_BRANCH_NAME"
