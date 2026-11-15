@@ -11,7 +11,8 @@ import sys
 
 out = dict(l.rstrip("\n").split("=", 1) for l in sys.stdin if "=" in l)
 yes = lambda k: out.get(k) == "true"
-HEAVY = {"ARBITER_ARGS": "--cpu shared:16 --mem 32G", "ARBITER_EST": "1800"}
+# io_uring (euhedral-io) is blocked by docker's default seccomp profile.
+HEAVY = {"ARBITER_ARGS": "--cpu shared:16 --mem 32G", "ARBITER_EST": "1800", "DOCKER_ARGS": "--security-opt seccomp=unconfined"}
 STABLE = ["mise install rust >/dev/null", 'eval "$(mise env -s bash)"', "rustc --version"]
 MIRI_SETUP = [
     'toolchain=$(cat scripts/ci/miri-toolchain)',
@@ -58,12 +59,14 @@ if yes("miri"):
     for i, shard in enumerate(matrix["include"]):
         jobs[f"miri {i}: {shard['name']}"] = {
             "stage": "test", "needs": ["miri-build"],
-            "variables": {**HEAVY, "MIRIFLAGS": f"-Zmiri-many-seeds=0..{shard['seeds']} -Zmiri-ignore-leaks"},
+            "variables": {**HEAVY, "MIRIFLAGS": f"-Zmiri-many-seeds=0..{shard['seeds']} -Zmiri-ignore-leaks",
+                          "COMMANDS": shard["commands"], "DOCKER_ARGS": HEAVY["DOCKER_ARGS"]},
             "script": MIRI_SETUP + [
                 "git ls-files -z | xargs -0 touch -d 2000-01-01",
                 'tar --use-compress-program="zstd -T0" -C / -xf miri-build.tar.zst',
                 'built=$(cat target/miri/built-from-commit); test "$built" = "$(git rev-parse HEAD)" || { echo "build is of $built"; exit 1; }',
-                f"bash -ex -c {json.dumps(shard['commands'])}",
+                # -e stops at the first failing command; -x logs each as it starts.
+                'bash -ex -c "$COMMANDS"',
             ],
         }
 
