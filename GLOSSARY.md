@@ -585,6 +585,20 @@ its submissions in order and whose progress is one cheap read (`completed`). A V
 semaphore, a CUDA stream with events, a copy engine, or a fake
 ([`FakeDevice`](euhedral-graph/src/testing.rs)).
 
+**release and re-open of a device** ([`euhedral-gpu` README](euhedral-gpu/README.md)): dropping every holder of a device in
+the documented order (marker registrations emitted, source completed, pool and streams, blocks and backends, modules and
+graphs, then the gpu), after which the driver's primary context is gone and the process holds no memory on the card, and
+a later open makes a new one that works as the first did. The context is released when the last `Arc<Device>` drops; a
+holder kept past the rest keeps it.
+
+**primary context active** ([`Driver::primary_context_active`](euhedral-memory/src/cuda/mod.rs)): the driver's own answer
+(`cuDevicePrimaryCtxGetState`) to whether a device's primary context is retained in this process. It does not create the
+context. The test that a release was complete.
+
+**FakeContext** ([`FakeContext`](euhedral-gpu/src/fake/mod.rs)): the fake backend's context: `open` retains it and returns a
+`FakeGpu` with memory of its own, the drop of that gpu and all it holds releases it, and the retains and releases are counted
+across opens. Not the same as the graph crate's `FakeDevice`, a fake lane.
+
 **marker** ([`Marker`](euhedral-graph/src/lanes.rs)): a queue ([`QueueId`](euhedral-graph/src/lanes.rs), an
 opaque identity unique in the process), a lane and a value on its timeline: the lane's work up to that
 value. A marker of another queue is never reached by a `LanePool` and is refused by a backend's await.

@@ -3,6 +3,23 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## A device can be released completely and opened again (2026-11-14)
+
+**What.** A tested promise, documented in the `euhedral-gpu` README: after every holder of a device is dropped in the documented order the driver's primary context is gone and a later open works as the first did, repeatably. New: `Driver::primary_context_active(ordinal)` in `euhedral-memory` (the driver's `cuDevicePrimaryCtxGetState`, added to the entry-point table), and in the fake backend `FakeContext` (`new`, `open`, `retained`, `released`, `active`), `FakeGpu::context`, `FakeGpu::free` and `FakeGpu::live_allocations`. `FakeGpu::new()` is unchanged: it opens a context of its own.
+
+**Why.** A program that unloads a device to give the card to another program, and loads it again later, needs to know that release is complete and repeatable. Nothing tested it.
+
+**Breaking:** none. New items only. The driver's entry-point table gains `cuDevicePrimaryCtxGetState` (present in every driver that has the primary-context calls the table already needs).
+
+**How to use it.** Tear down in the order of the README section "Releasing and re-opening a device"; `Driver::shared()?.primary_context_active(0)` says whether the context is gone. On the fake, `let ctx = FakeContext::new(); let gpu = ctx.open();` and `ctx.active()` after the drops.
+
+**Semantics.**
+- The context is released by the drop of the last `Arc<Device>`. Holders: `CudaGpu` and everything over it (streams, modules, kernels, graphs and their caches), `DeviceMemory`, `StreamPool`, `Vmm`, `PinnedHost`, `StreamCopier`, texture objects, queued deferred calls. `Completions`, `LanePool`, blocks and markers hold nothing.
+- Nothing is keyed by a context: the loaded driver and NVRTC are process-wide and hold no context; no thread-local state refers to one. A second open after a full release retains a new context.
+- A holder kept past the others keeps the context until it drops; nothing crashes. No change to the code that releases was needed.
+
+**Tests.** `euhedral-gpu/tests/fake_reopen.rs`: ten rounds of open, lanes, module, allocations, a completions source with a marker that is reached, release in the documented order, context counted released with nothing outstanding; a reopened device starts empty; a module kept past the drop holds the context until it goes. `euhedral-gpu/tests/cuda_reopen.rs` (a real card): the same ten rounds with a kernel checked bit for bit against the CPU, a pinned loan copied, and `primary_context_active` false after each release; the free memory after each open must not fall by more than a stated tolerance. They pass on the old code (the promise already held); the fake's accounting and the driver query are new, so the tests could not be written before.
+
 ## A `Completions` no longer keeps its lane pool alive (2026-11-14)
 
 **What.** `Completions` holds its lane pool weakly. `Completions::new(lanes: &Arc<LanePool>) -> Arc<Completions>` takes the pool by reference (it was `Arc<LanePool>` by value) and the source keeps only a `Weak`.

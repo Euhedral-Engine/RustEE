@@ -28,6 +28,7 @@ mod stream;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use euhedral_graph::{LaneId, QueueId, RetireCell};
@@ -249,13 +250,67 @@ pub(crate) struct State {
     next_stamp: u64,
 }
 
+/// The fake device's context accounting: how often the device's context was retained and released, kept by the
+/// [`FakeContext`] and so beyond one open. The CUDA backend's counterpart is the driver's primary context: retained by
+/// `Device::open`, released when the last holder of the device drops, and reported by
+/// `Driver::primary_context_active`.
+#[derive(Debug, Default)]
+struct ContextRecord {
+    retained: AtomicU64,
+    released: AtomicU64,
+}
+
+/// A fake device's context that can be opened, fully released and opened again, as a real device's primary context can: the
+/// record of retains and releases belongs to the context, not to one open, and each [`open`](Self::open) is a [`FakeGpu`] with its own memory,
+/// kernels and streams (a new context has none of the last one's).
+#[derive(Clone, Debug, Default)]
+pub struct FakeContext {
+    record: Arc<ContextRecord>,
+}
+
+impl FakeContext {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Retains the context and opens it: the device is active until the returned gpu and everything that holds it
+    /// (streams, modules, graphs) drop.
+    pub fn open(&self) -> Arc<FakeGpu> {
+        self.record.retained.fetch_add(1, Ordering::AcqRel);
+        Arc::new(FakeGpu::over(self.clone()))
+    }
+
+    /// Contexts retained so far.
+    pub fn retained(&self) -> u64 {
+        self.record.retained.load(Ordering::Acquire)
+    }
+
+    /// Contexts released so far.
+    pub fn released(&self) -> u64 {
+        self.record.released.load(Ordering::Acquire)
+    }
+
+    /// Whether a context is held: retained more often than released.
+    pub fn active(&self) -> bool {
+        self.retained() > self.released()
+    }
+}
+
 /// The fake device.
 pub struct FakeGpu {
+    /// The device this was opened on; released when this drops.
+    context: FakeContext,
     pub(crate) state: Mutex<State>,
     pub(crate) poison: Poison,
     kernels: Mutex<HashMap<String, FakeKernelFn>>,
     /// A test hook: how the next recording fails (0: it does not; 1: after its work ran; 2: before the body ran).
     fail_recording: std::sync::atomic::AtomicU8,
+}
+
+impl Drop for FakeGpu {
+    fn drop(&mut self) {
+        self.context.record.released.fetch_add(1, Ordering::AcqRel);
+    }
 }
 
 impl fmt::Debug for FakeGpu {
@@ -267,8 +322,14 @@ impl fmt::Debug for FakeGpu {
 }
 
 impl FakeGpu {
+    /// A gpu on a device of its own (see [`FakeContext::open`] to open one device again).
     pub fn new() -> Arc<Self> {
-        Arc::new(Self {
+        FakeContext::new().open()
+    }
+
+    fn over(context: FakeContext) -> Self {
+        Self {
+            context,
             state: Mutex::new(State {
                 next_addr: 0x1000_0000,
                 ..State::default()
@@ -276,7 +337,12 @@ impl FakeGpu {
             poison: Poison::new(),
             kernels: Mutex::new(HashMap::new()),
             fail_recording: std::sync::atomic::AtomicU8::new(0),
-        })
+        }
+    }
+
+    /// The context this gpu is an open of: it is held until this gpu and everything holding it drop.
+    pub fn context(&self) -> &FakeContext {
+        &self.context
     }
 
     /// A test hook: the next recording ends with `Err(Capture)`, as a capture the driver refused does; the work it ran
@@ -348,6 +414,23 @@ impl FakeGpu {
         st.next_addr += (bytes as u64).next_multiple_of(256).max(256) + 256;
         st.memory.allocations.insert(base, vec![0; bytes]);
         base
+    }
+
+    /// Frees the allocation at `addr`.
+    ///
+    /// # Panics
+    /// When `addr` is not the base of a live allocation.
+    pub fn free(&self, addr: u64) {
+        self.lock()
+            .memory
+            .allocations
+            .remove(&addr)
+            .expect("the base of a live allocation");
+    }
+
+    /// Allocations not yet freed.
+    pub fn live_allocations(&self) -> usize {
+        self.lock().memory.allocations.len()
     }
 
     /// Writes host bytes into device memory (for tests).

@@ -349,11 +349,57 @@ have `mark`, `id` and `await_marker`.
 `retire_into` is the same shape for a chain of frames: the stream travels inside the continuation instead of living in a
 source, and the last frame hands it back to the source that stops it.
 
+## Releasing and re-opening a device
+
+A program can release a device completely and open it again in the same process, any number of times. After every holder
+below is dropped, the driver's primary context is gone (`Driver::primary_context_active(ordinal)` reports `false`), the
+process holds no memory on the card, and the next `CudaGpu::open` (or `Device::open`) makes a new context that works as the
+first did. The driver library and NVRTC stay loaded for the process (`Driver::shared`, `Nvrtc::shared`): they hold no
+context, and nothing in this crate or `euhedral-memory` keeps a cache or a thread-local keyed by a context. `tests/cuda_reopen.rs`
+does ten rounds on a real card; `tests/fake_reopen.rs` does the same on the fake, where `FakeContext` keeps the retains
+and releases across opens.
+
+**What holds the context.** One `Arc<Device>` is the primary-context retain (`cuDevicePrimaryCtxRetain` in `Device::open`);
+its drop is the only release. The context is released when the last `Arc<Device>` goes. Strong holders: `CudaGpu`
+(and so everything that holds a `CudaGpu`: every stream and lane, every module and kernel, every graph and so a
+`GraphCache`'s entries, the retirement continuations), `DeviceMemory`, `StreamPool`, `Vmm`, `PinnedHost`, `StreamCopier`,
+texture objects, and a deferred call that is queued on the device's `DeferredCalls` (its closure holds the device until it
+runs). Not holders: `Completions` (its lane pool is weak), `LanePool` (it names queues, not the device), a `Block`
+(a plain address and size) and a marker.
+
+**The order.** Drop outward in:
+
+1. Emit every marker registration: poll the `Completions` until `pending() == 0`.
+2. Complete the source (`LatticeSource::complete`).
+3. Drop the lane pool and the streams, lanes and submitters with it (dropping a stream waits for its device work).
+4. Return the blocks: free device and pinned blocks to their backends, then drop the backends (`PinnedHost`'s drop frees
+   what it cached, which waits for the device; `DeviceMemory`, `StreamPool`, `Vmm`, `StreamCopier`).
+5. Drop the kernels, modules, graphs and caches of graphs, and any deferral's queue (its owner dropping `DeferredCalls`
+   makes what is queued).
+6. Drop the `CudaGpu` and every other `Arc<Device>`. The last drop releases the context, on the thread that drops it, and
+   waits for the driver to tear it down.
+
+**Out of order.** Nothing crashes; what is wrong is what stays.
+- A holder that outlives the rest keeps the context: the device stays active until that holder drops. A kernel or module kept
+  past the gpu keeps its gpu and so the device, and a context held by a forgotten holder is a context never released.
+  The last holder's drop releases it, wherever that is.
+- A stream dropped after the pool still waits for its own work, and a marker of a dropped pool is never reached: pending
+  `Completions` registrations are leaked and counted (`leaked_unreached`), not emitted (see the `euhedral-graph` README).
+- A pinned or device block not returned to its backend before the backend drops is not freed by the backend (a pinned
+  backend frees only what it cached); the driver destroys what the context holds when the last `Arc<Device>` goes, so
+  nothing outlives the context, but a block's address is a plain number: using it after its backend and device are gone is
+  the caller's error, which the crate cannot detect.
+
+**Timings** on the development card (one round of the test: open the device, compile a module
+from source, 32 MiB of device buffers, a pinned loan pair, a copy and a kernel): `CudaGpu::open` about 50 ms (the context
+create), the release (the drops above, the last of which destroys the context) about 45 ms; free memory read after each
+open was constant over ten rounds.
+
 ## Features
 
 | Feature | What it adds |
 |---|---|
-| `fake` | `FakeGpu`: a deterministic device for tests of code built on this crate. The crate's own tests enable it through a dev-dependency on itself. |
+| `fake` | `FakeGpu`: a deterministic device for tests of code built on this crate; `FakeContext` is its context, opened, fully released and opened again, with the retains and releases counted. The crate's own tests enable it through a dev-dependency on itself. |
 | `cuda` | The CUDA backend, on the driver and primary context `euhedral-memory` loads (`Driver::shared`): one library, one context. Linux and Windows. |
 
 The traits and the fake compile on every platform the workspace builds on.
@@ -369,4 +415,4 @@ mise exec -- cargo run -p euhedral-gpu --features cuda --example graph_replay   
 
 NVRTC is found through `EUHEDRAL_NVRTC` (a library file) or `CUDA_HOME` (a toolkit); without it, tests that compile from
 source skip and prebuilt images still load. The tests `tests/cuda_fault.rs` and `tests/cuda_lanes_fault.rs` are processes of their own, because a device
-fault is sticky. `tests/cuda_lanes.rs` is the lane-source suite on the device, and `tests/fake_lanes.rs` the same on the fake.
+fault is sticky. `tests/cuda_reopen.rs` and `tests/fake_reopen.rs` release a device and open it again ten times. `tests/cuda_lanes.rs` is the lane-source suite on the device, and `tests/fake_lanes.rs` the same on the fake.
