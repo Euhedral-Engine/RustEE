@@ -271,7 +271,7 @@ fn fixture() -> Fixture {
     let kernel = kernel(&gpu);
     let at = gpu.alloc(4);
     let lanes = lanes(&gpu, 2);
-    let completions = Completions::new(lanes.queues.clone());
+    let completions = Completions::new(&lanes.queues);
     let queue = MpmcQueue::<Box<dyn Frame>>::bounded(256);
     let frames: Consumer<Box<dyn Frame>, Multi> = queue.consumer();
     let mut spec = StageGraphSpec::new();

@@ -135,6 +135,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "euhedral-net"
+version = "0.1.0"
+dependencies = [
+ "euhedral-core",
+ "euhedral-data-structures",
+ "euhedral-graph",
+ "euhedral-hardware-utils",
+ "euhedral-io",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"

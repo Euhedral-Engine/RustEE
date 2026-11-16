@@ -325,7 +325,7 @@ fn a_poisoned_device_still_emits_retire_into_continuations() {
     let after_fault = s[0].mark().unwrap();
     // Lane b waits for lane a's marker, so its listener cannot run before the fault is the only thing that happens.
     s[1].await_marker(after_fault).unwrap();
-    let completions = euhedral_graph::Completions::new(pool);
+    let completions = euhedral_graph::Completions::new(&pool);
     let confirmed = Arc::new(Mutex::new(None));
     // Lane b's submitter travels with its continuation.
     let b = s.remove(1);
@@ -475,7 +475,7 @@ fn retire_into_refuses_a_stream_with_a_ticket_outstanding() {
     use euhedral_core::frames::RunnableFrame;
     let gpu = gpu_with_kernels();
     let (pool, mut s) = lanes(&gpu, &["a"]);
-    let completions = euhedral_graph::Completions::new(pool);
+    let completions = euhedral_graph::Completions::new(&pool);
     let mut stream = s.remove(0);
     // An earlier listener-free retirement is outstanding: its ticket would reach the continuation in place of the
     // one armed for it, possibly before the work that follows.

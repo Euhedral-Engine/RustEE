@@ -1,0 +1,28 @@
+[package]
+name = "euhedral-net"
+version = "0.1.0"
+edition = "2024"
+description = "HTTP/1.1 for programs built on RustEE: the message types, a strict incremental parser, a writer, the server and a client"
+readme = "README.md"
+license = "Apache-2.0"
+
+[dependencies]
+euhedral-core = { path = "../euhedral-core" }
+# `CachePadded`, for the counters.
+euhedral-data-structures = { path = "../euhedral-data-structures" }
+# `AsyncIo`: the socket operations, with limits and cancel.
+euhedral-io = { path = "../euhedral-io" }
+# `Completions`: the lattice's timer, for the back-off after a failed accept.
+euhedral-graph = { path = "../euhedral-graph" }
+
+[dev-dependencies]
+# The loopback tests start a lattice on the CPUs this process may use.
+euhedral-hardware-utils = { path = "../euhedral-hardware-utils" }
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+dbg_macro = "warn"
+todo = "warn"

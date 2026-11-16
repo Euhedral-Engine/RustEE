@@ -19,6 +19,7 @@ frames, sources and receivers, ingest sources, edges, the lattice, metrics.
 | 2 | [`euhedral-core`](euhedral-core/README.md) | Frames and their lifecycle, sources and receivers, the lattice that runs each frame on one pinned worker, ingest sources, executors, metrics. | [glossary](euhedral-core/GLOSSARY.md) |
 | 3 | [`euhedral-graph`](euhedral-graph/README.md) | No-wait dataflow on the lattice: completions, in-order conclusion, lakes, device lanes, stage graphs. | [glossary](euhedral-graph/GLOSSARY.md) |
 | 3 | [`euhedral-io`](euhedral-io/README.md) | File and socket I/O whose completions are frames. | [glossary](euhedral-io/GLOSSARY.md) |
+| 4 | [`euhedral-net`](euhedral-net/README.md) | HTTP/1.1 messages, a strict incremental request and response parser and a writer (the server and client are to follow). | [glossary](euhedral-net/GLOSSARY.md) |
 | 4 | [`euhedral-memory`](euhedral-memory/README.md) | Planned memory: budgets, owners, claims, admission, arenas, tiers, a leak check. | [glossary](euhedral-memory/GLOSSARY.md) |
 | 5 | [`euhedral-gpu`](euhedral-gpu/README.md) | GPU streams as lanes, markers, retirement as frames, kernels loaded at run time, recorded graphs. | [glossary](euhedral-gpu/GLOSSARY.md) |
 | 6 | [`euhedral-benchmarks`](euhedral-benchmarks/README.md) | End-to-end benchmarks of the control plane. | [glossary](euhedral-benchmarks/GLOSSARY.md) |
@@ -584,6 +585,22 @@ its submissions in order and whose progress is one cheap read (`completed`). A V
 semaphore, a CUDA stream with events, a copy engine, or a fake
 ([`FakeDevice`](euhedral-graph/src/testing.rs)).
 
+**release and re-open of a device** ([`euhedral-gpu` README](euhedral-gpu/README.md)): dropping every holder of a device in
+the documented order (marker registrations emitted, source completed, pool and streams, blocks and backends, modules and
+graphs, then the gpu), after which the driver's primary context is gone and the process holds no memory on the card, and
+a later open makes a new one that works as the first did. The context is released when the last `Arc<Device>` drops; a
+holder kept past the rest keeps it.
+
+**primary context active** ([`Driver::primary_context_active`](euhedral-memory/src/cuda/mod.rs)): the driver's own answer
+(`cuDevicePrimaryCtxGetState`) to whether a device's primary context is retained in this process. It does not create the
+context. The test that a release was complete.
+
+**FakeContext** ([`FakeContext`](euhedral-gpu/src/fake/mod.rs)): the fake backend's context: `open` retains it and returns a
+`FakeGpu` with memory of its own, the drop of that gpu and all it holds releases it, and the retains and releases are counted
+across opens. Not the same as the graph crate's `FakeDevice`, a fake lane.
+
+**FakeContextHold** ([`FakeContextHold`](euhedral-gpu/src/fake/mod.rs)): a retain of a `FakeContext` made by `hold()` that is not a gpu; it stands for a backend that holds the device itself, and keeps the context active until it drops.
+
 **marker** ([`Marker`](euhedral-graph/src/lanes.rs)): a queue ([`QueueId`](euhedral-graph/src/lanes.rs), an
 opaque identity unique in the process), a lane and a value on its timeline: the lane's work up to that
 value. A marker of another queue is never reached by a `LanePool` and is refused by a backend's await.
@@ -691,6 +708,22 @@ while it is not moving.
 asynchronous copy of a resident to another tier: the destination slot is claimed first, the source
 released once the copy retired. Spills (to make room or on a give-back order) and bring-backs are moves the
 mover plans itself. Completions are frames of the `Moves` source.
+
+### Layer 4: HTTP/1.1
+
+**message parser** ([`RequestParser`, `ResponseParser`](euhedral-net/src/parse.rs)): a pure state machine that is fed
+bytes in any split and yields one message at a time. It consumes only the current message and returns how many bytes
+it used, so a caller keeps pipelined bytes itself and the parser never holds more than its limits. It owns no thread
+and waits for nothing; one consumer owns it, so it needs no synchronisation.
+
+**strict framing** ([`parse`](euhedral-net/src/parse.rs)): the parser refuses what the RFCs let a recipient accept
+where a lenient reading could make two parsers disagree on where a message ends (a bare LF, obsolete line folding,
+whitespace before a colon, differing `Content-Length` values, `Transfer-Encoding` with `Content-Length`). The
+disagreement is request smuggling.
+
+**`HeadComplete`** ([`Progress`](euhedral-net/src/parse.rs)): the parser's report that the header lines of a message
+with a body are in and the body is pending. It carries the `Expect: 100-continue` flag, so a server can answer
+`100 Continue` before the body arrives.
 
 ### Layer 5: the GPU
 

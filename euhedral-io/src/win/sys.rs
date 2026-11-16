@@ -134,6 +134,8 @@ impl SockAddr {
 
 /// `STATUS_PENDING`: the value an `OVERLAPPED`'s `Internal` holds until its call completes.
 pub(crate) const STATUS_PENDING: i32 = 0x103;
+/// `STATUS_CANCELLED`: how a call that was cancelled ends.
+pub(crate) const STATUS_CANCELLED: i32 = 0xC000_0120_u32 as i32;
 /// `STATUS_END_OF_FILE`.
 pub(crate) const STATUS_END_OF_FILE: i32 = 0xC000_0011_u32 as i32;
 
@@ -288,10 +290,21 @@ pub(crate) trait Sys: Send + Sync + 'static {
         to: *const SockAddr,
         ov: *mut Overlapped,
     ) -> io::Result<()>;
+    /// Asks the kernel to cancel the call of `handle` that was given `ov` (`CancelIoEx`); never
+    /// waits. A call that has already ended is not found and nothing happens. A call that is
+    /// cancelled still queues its packet, with `STATUS_CANCELLED`.
+    ///
+    /// # Safety
+    /// `ov` is valid.
+    unsafe fn cancel_io(&self, handle: Handle, ov: *mut Overlapped);
+    /// The engine's clock: nanoseconds from some fixed point, never going back.
+    fn now_ns(&self) -> u64;
     // ---- sockets
     /// A new overlapped, non-inheritable stream socket of `listener`'s family.
     fn accept_socket(&self, listener: Handle) -> io::Result<Handle>;
     fn close_socket(&self, sock: Handle);
+    /// A new unconnected, overlapped, non-inheritable stream socket of `to`'s family, for the caller to own.
+    fn new_socket(&self, to: std::net::SocketAddr) -> io::Result<Handle>;
     /// Binds `sock` to the unspecified address of `to`'s family, if it is not bound.
     fn bind_any(&self, sock: Handle, to: &SockAddr) -> io::Result<()>;
     fn update_accept(&self, accepted: Handle, listener: Handle) -> io::Result<()>;

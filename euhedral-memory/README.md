@@ -25,7 +25,7 @@ time (no toolkit, no link-time dependency).
 | [`tiers`](src/tiers.rs) | `TierPool`, `Mover` and the `Moves` lattice source, `ResidentId`, `MoveDone`, the `Copier` trait (plain and `start_pitched` copies), `PitchedCopy`, `HostCopier`, `MarkerRetired`. |
 | [`backend`](src/backend.rs) | The `Backend` trait, `Block`, `Allocation`, `Reaper` and `Retired`. |
 | [`deferred`](src/deferred.rs) | `DeferredCalls` (a `LatticeSource` of key frames), `Deferral`/`WeakDeferral` (its producer handles), `Ticket`, `Place`, `Bounds`: blocking driver calls held for a moment with nothing in flight. |
-| [`cuda`](src/cuda/mod.rs) (feature `cuda`) | `Driver` (`Driver::shared()`: the process's one loaded driver; `Driver::symbol`: entry points beyond its table), `Device` (primary context, `import_fd` for memory another API exported as an fd or NT handle), `DeviceMemory`, `StreamPool`, `Vmm` (shareable-handle export: a POSIX fd on Linux, an NT handle on Windows), `loader::Library` (the one dynamic-loader wrapper), `PinnedHost`, `StreamCopier` (the tiers' device copies). |
+| [`cuda`](src/cuda/mod.rs) (feature `cuda`) | `Driver` (`Driver::shared()`: the process's one loaded driver; `Driver::symbol`: entry points beyond its table; `Driver::primary_context_active`: whether a device's context is held, false once every `Device` is released), `Device` (primary context, `import_fd` for memory another API exported as an fd or NT handle), `DeviceMemory`, `StreamPool`, `Vmm` (shareable-handle export: a POSIX fd on Linux, an NT handle on Windows), `loader::Library` (the one dynamic-loader wrapper), `PinnedHost`, `StreamCopier` (the tiers' device copies). |
 
 ## Key concepts
 

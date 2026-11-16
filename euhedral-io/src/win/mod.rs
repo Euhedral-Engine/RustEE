@@ -37,26 +37,28 @@
 #![cfg_attr(not(windows), allow(dead_code))]
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::io;
 use std::path::PathBuf;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 #[allow(
     clippy::disallowed_types,
     reason = "HOT-FIX(I9), HOT-FIX(I14), HOT-FIX(I15), HOT-FIX(I7), HOT-FIX(I8), HOT-FIX(I10), HOT-FIX(I11), HOT-FIX(I12), HOT-FIX(I13)"
 )]
 use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
 
 use euhedral_core::frames::Frame;
 
 use self::sys::{
-    ACCEPT_BUF, BuildError, Cqe, Handle, IORING_VERSION_3, Overlapped, Packet, STATUS_END_OF_FILE,
-    STATUS_PENDING, SockAddr, Sys, hresult_error, is_end_of_file, is_nt_warning,
+    ACCEPT_BUF, BuildError, Cqe, Handle, IORING_VERSION_3, Overlapped, Packet, STATUS_CANCELLED,
+    STATUS_END_OF_FILE, STATUS_PENDING, SockAddr, Sys, hresult_error, is_end_of_file,
+    is_nt_warning,
 };
 use super::{
-    AsyncIo, AsyncIoOptions, Buf, Engine as EngineTrait, MAX_PIECE, OpenSpec, READ_PIECE, Request,
-    Then, conclude as conclude_io, invalid,
+    AsyncIo, AsyncIoOptions, Buf, Cancelled, Engine as EngineTrait, LimitPassed, MAX_PIECE, OpId,
+    OpenSpec, READ_PIECE, Request, Then, conclude as conclude_io, invalid,
 };
 
 #[cfg(all(windows, test))]
@@ -88,6 +90,8 @@ const MAX_OPS: usize = (1 << SLOT_BITS) - 1;
 const GENERATION_MASK: usize = usize::MAX >> SLOT_BITS;
 
 static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
+/// `Engine::next_deadline` when no operation has a limit.
+const NO_DEADLINE: u64 = u64::MAX;
 
 thread_local! {
     /// This thread's ring of each engine it submitted to (by id).
@@ -148,6 +152,44 @@ struct Op {
     /// The destination of a datagram or a connect.
     addr: Option<Box<SockAddr>>,
     accepting: Option<Accepting>,
+    /// When the operation's time limit ends, on the engine's clock ([`Sys::now_ns`]).
+    deadline: Option<u64>,
+}
+
+impl Op {
+    /// The handle a cancel of this operation's call is made on: a socket operation's.
+    fn cancel_target(&self) -> Option<Handle> {
+        match (&self.route, &self.kind) {
+            (
+                Route::Port,
+                Kind::Send { sock: handle }
+                | Kind::Recv { sock: handle }
+                | Kind::SendTo { sock: handle }
+                | Kind::Accept { listener: handle }
+                | Kind::Connect { sock: handle },
+            ) => Some(*handle),
+            _ => None,
+        }
+    }
+}
+
+/// Why an operation ends before its call did.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum End {
+    Cancelled,
+    TimedOut,
+}
+
+impl End {
+    /// The error of an operation that ended for this reason after moving `moved` bytes. Neither
+    /// has an OS code, so both are told from an operation the OS aborted (`ERROR_OPERATION_ABORTED`,
+    /// which `std` reads as `TimedOut`, with its code).
+    fn error(self, moved: usize) -> io::Error {
+        match self {
+            Self::Cancelled => Cancelled::error(moved),
+            Self::TimedOut => LimitPassed::error(moved),
+        }
+    }
 }
 
 /// A slot's record. `ov` is first (it is what the kernel is given); the record is never freed
@@ -180,6 +222,16 @@ struct Slot {
     rec: RecPtr,
     generation: u32,
     state: State,
+    /// Names the operation in the slot, as its [`OpId`] does: it stays the same through the
+    /// operation's pieces (the generation changes at each), and is new for each operation.
+    serial: u64,
+    /// Set once the operation was asked to end early (cancel, or its limit passed): the first
+    /// reason stays. The call is cancelled at once if it is in flight, and an operation that a poll
+    /// holds, or whose call is being made, is cancelled when it goes in flight again.
+    end: Option<End>,
+    /// The operation's deadline, if it has a limit: it is in `Table::limits` until the slot is
+    /// released.
+    deadline: Option<u64>,
 }
 
 /// The slab of records.
@@ -187,6 +239,11 @@ struct Slot {
 struct Table {
     slots: Vec<Slot>,
     free: Vec<u32>,
+    /// The serial of the last operation begun.
+    last_serial: u64,
+    /// The limits of the operations that have one and have not ended: deadline and slot, the
+    /// soonest first, so that a poll looks at the head only.
+    limits: BTreeSet<(u64, u32)>,
     /// The slot of each record, by the address of its `OVERLAPPED`.
     by_addr: HashMap<usize, u32>,
 }
@@ -209,6 +266,7 @@ impl Drop for Table {
 struct Held {
     slot: u32,
     generation: u32,
+    serial: u64,
     rec: NonNull<Rec>,
 }
 
@@ -390,14 +448,18 @@ pub(super) struct Engine {
     #[allow(clippy::disallowed_types, reason = "HOT-FIX(I13)")]
     rings: Mutex<Vec<Arc<Ring>>>,
     max_piece: usize,
+    /// The soonest deadline in `Table::limits` (`NO_DEADLINE` when there is none), kept in step
+    /// under the table's lock, so that a poll takes no lock for limits until one has passed.
+    next_deadline: AtomicU64,
     /// Packets and completions of no operation (ignored), for tests.
     strays: AtomicUsize,
 }
 
 /// What a dequeued packet leads to.
 enum Taken {
-    /// The operation, now `Busy`, with the status and byte count of its call.
-    Op(Held, i32, u32),
+    /// The operation, now `Busy`, with the status and byte count of its call and why it was asked
+    /// to end, if it was (read in the lock that made it `Busy`).
+    Op(Held, i32, u32, Option<End>),
     /// Its call is still returning: look again at the next poll.
     Later,
     /// A packet of no operation in flight on the port.
@@ -405,6 +467,11 @@ enum Taken {
 }
 
 impl Engine {
+    /// A new unconnected stream socket of `to`'s family, ready for a connect.
+    pub(super) fn new_socket(&self, to: std::net::SocketAddr) -> io::Result<usize> {
+        self.sys.new_socket(to)
+    }
+
     /// An engine over `sys`. Fails if there is no completion port.
     #[allow(
         clippy::disallowed_types,
@@ -441,6 +508,7 @@ impl Engine {
             ringed: Mutex::new(HashSet::new()),
             rings: Mutex::new(Vec::new()),
             max_piece: max_piece.clamp(1, MAX_PIECE),
+            next_deadline: AtomicU64::new(NO_DEADLINE),
             strays: AtomicUsize::new(0),
         })
     }
@@ -482,17 +550,30 @@ impl Engine {
                     rec: RecPtr(rec),
                     generation: 0,
                     state: State::Idle,
+                    serial: 0,
+                    end: None,
+                    deadline: None,
                 });
                 slot
             }
         };
+        table.last_serial += 1;
+        let serial = table.last_serial;
+        if let Some(deadline) = op.deadline {
+            table.limits.insert((deadline, slot));
+            self.publish_deadline(&table);
+        }
         let entry = &mut table.slots[slot as usize];
         debug_assert_eq!(entry.state, State::Idle);
         entry.state = state;
         entry.generation = entry.generation.wrapping_add(1);
+        entry.serial = serial;
+        entry.end = None;
+        entry.deadline = op.deadline;
         let held = Held {
             slot,
             generation: entry.generation,
+            serial,
             rec: entry.rec.0,
         };
         drop(table);
@@ -502,28 +583,115 @@ impl Engine {
         Ok(held)
     }
 
-    /// A taken operation goes in again: a new issue of the same slot.
-    fn rebegin(&self, held: Held, state: State) -> Held {
+    /// A taken operation goes in again: a new issue of the same slot. Not if it was asked to end
+    /// meanwhile: that is the reason, and the slot stays as it was.
+    fn rebegin(&self, held: Held, state: State) -> Result<Held, End> {
         let mut table = lock!(&self.table);
         let entry = &mut table.slots[held.slot as usize];
         debug_assert_eq!(entry.state, State::Busy);
+        if let Some(why) = entry.end {
+            return Err(why);
+        }
         entry.state = state;
         entry.generation = entry.generation.wrapping_add(1);
-        Held {
+        Ok(Held {
             generation: entry.generation,
             ..held
-        }
+        })
     }
 
+    /// Moves the slot to `state`. A slot that goes in flight after being asked to end meanwhile
+    /// (a cancel or a limit while its call was being made) has its call cancelled now.
     fn set_state(&self, held: Held, state: State) {
-        lock!(&self.table).slots[held.slot as usize].state = state;
+        let mut table = lock!(&self.table);
+        let entry = &mut table.slots[held.slot as usize];
+        entry.state = state;
+        if state == State::InFlight && entry.end.is_some() {
+            self.cancel_call(entry);
+        }
     }
 
     /// The slot is free again.
     fn release(&self, held: Held) {
         let mut table = lock!(&self.table);
-        table.slots[held.slot as usize].state = State::Idle;
+        let entry = &mut table.slots[held.slot as usize];
+        entry.state = State::Idle;
+        // A limit that did not pass leaves the set with its operation.
+        if let Some(deadline) = entry.deadline.take() {
+            table.limits.remove(&(deadline, held.slot));
+            self.publish_deadline(&table);
+        }
         table.free.push(held.slot);
+    }
+
+    /// The call of an operation in flight is cancelled, on its handle: the kernel then ends it with
+    /// `STATUS_CANCELLED`, or with its own result if that came first. Only socket operations are
+    /// cancelled. Made under the table's lock, which is what keeps the record from being reused
+    /// meanwhile: a cancel of a reused `OVERLAPPED` would end another operation's call.
+    fn cancel_call(&self, entry: &Slot) {
+        let rec = entry.rec.0.as_ptr();
+        // SAFETY: a slab record, valid while the engine lives; `op` is read while the slot is
+        // `InFlight` and the table's lock is held, when nothing writes it.
+        let target = unsafe { (*rec).op.as_ref().and_then(Op::cancel_target) };
+        if let Some(handle) = target {
+            // SAFETY: `ov` is the record's `OVERLAPPED` that the call of `handle` was given; the
+            // call is cancelled by its address and the handle, and one that has ended is not found.
+            unsafe { self.sys.cancel_io(handle, &raw mut (*rec).ov) };
+        }
+    }
+
+    /// Asks the operation `serial` of `slot` to end early, for `why`; nothing if it has ended.
+    fn request_end(&self, slot: u32, serial: u64, why: End) {
+        let mut table = lock!(&self.table);
+        let Some(entry) = table.slots.get_mut(slot as usize) else {
+            return;
+        };
+        if entry.serial != serial || entry.state == State::Idle || entry.end.is_some() {
+            return;
+        }
+        entry.end = Some(why);
+        // A call being made is cancelled when it is armed, one a poll holds when it would go in
+        // again.
+        if entry.state == State::InFlight {
+            self.cancel_call(entry);
+        }
+    }
+
+    /// Makes `next_deadline` the soonest of the limits. Under the table's lock.
+    fn publish_deadline(&self, table: &Table) {
+        let soonest = table
+            .limits
+            .first()
+            .map_or(NO_DEADLINE, |&(deadline, _)| deadline);
+        self.next_deadline.store(soonest, Ordering::Release);
+    }
+
+    /// Asks every operation whose limit has passed to end, as `request_end` does. A poll's work, so
+    /// that no timer and no thread is needed: a limit ends at the first poll after it passed. A
+    /// poll before the soonest deadline takes no lock.
+    fn expire_limits(&self) {
+        if self.next_deadline.load(Ordering::Acquire) == NO_DEADLINE {
+            return;
+        }
+        let now = self.sys.now_ns();
+        if now < self.next_deadline.load(Ordering::Acquire) {
+            return;
+        }
+        let mut table = lock!(&self.table);
+        while let Some(&(deadline, slot)) = table.limits.first() {
+            if deadline > now {
+                break;
+            }
+            table.limits.pop_first();
+            let entry = &mut table.slots[slot as usize];
+            if entry.end.is_none() {
+                entry.end = Some(End::TimedOut);
+                if entry.state == State::InFlight {
+                    self.cancel_call(entry);
+                }
+            }
+        }
+        self.publish_deadline(&table);
     }
 
     /// The operation whose `OVERLAPPED` is at the packet's address, if it is in flight on the port
@@ -559,14 +727,17 @@ impl Engine {
             return Taken::Stray;
         }
         entry.state = State::Busy;
+        let end = entry.end;
         Taken::Op(
             Held {
                 slot,
                 generation: entry.generation,
+                serial: entry.serial,
                 rec: entry.rec.0,
             },
             status,
             packet.bytes,
+            end,
         )
     }
 
@@ -599,6 +770,7 @@ impl Engine {
         Some(Held {
             slot,
             generation: entry.generation,
+            serial: entry.serial,
             rec: entry.rec.0,
         })
     }
@@ -610,6 +782,7 @@ impl Engine {
         (entry.state == State::Busy && entry.generation == failed.generation).then_some(Held {
             slot: failed.slot,
             generation: failed.generation,
+            serial: entry.serial,
             rec: entry.rec.0,
         })
     }
@@ -894,16 +1067,18 @@ impl Engine {
             then,
             addr: None,
             accepting: None,
+            deadline: None,
         }
     }
 
     /// Starts the operation: its slot, then its call. The slot stays `Issuing` until the call is
     /// made (or, on a ring or the pool, until the entry or the job is handed over), so nothing
     /// that completes or fails operations touches the record while it is being filled.
-    fn start(&self, op: Op) -> io::Result<()> {
+    fn start(&self, op: Op) -> io::Result<OpId> {
         let held = self.begin(op, State::Issuing)?;
+        let id = OpId::new(self.id as u64, held.slot, held.serial);
         self.launch(held);
-        Ok(())
+        Ok(id)
     }
 
     /// Makes the call for the record's next piece. Nothing of the record is touched once the call
@@ -1147,11 +1322,17 @@ impl Engine {
             (_, Ok(n)) if piecewise && n > 0 => {
                 op.moved += n;
                 if op.moved < total {
-                    let held = self.rebegin(held, State::Issuing);
-                    self.launch(held);
-                    return None;
+                    match self.rebegin(held, State::Issuing) {
+                        Ok(held) => {
+                            self.launch(held);
+                            return None;
+                        }
+                        // Asked to end between two pieces: the rest does not go in.
+                        Err(why) => Err(why.error(op.moved)),
+                    }
+                } else {
+                    Ok(op.moved)
                 }
-                Ok(op.moved)
             }
             (Kind::Read { .. }, Ok(0)) => {
                 if op.moved == 0 {
@@ -1243,13 +1424,20 @@ impl Engine {
                     self.stray();
                 }
                 Taken::Later => later.push_back(packet),
-                Taken::Op(held, status, bytes) => {
+                Taken::Op(held, status, bytes, end) => {
                     progress = true;
                     let (result, partial) = {
                         // SAFETY: the slot is `Busy`: this thread has the record.
                         let rec = unsafe { &*held.rec.as_ptr() };
-                        let kind = &rec.op.as_ref().expect("an operation in flight").kind;
-                        self.packet_result(kind, status, bytes)
+                        let op = rec.op.as_ref().expect("an operation in flight");
+                        let (result, partial) = self.packet_result(&op.kind, status, bytes);
+                        // A call that was cancelled for a reason ends with it.
+                        match end {
+                            Some(why) if status == STATUS_CANCELLED => {
+                                (Err(why.error(op.moved)), partial)
+                            }
+                            _ => (result, partial),
+                        }
                     };
                     if let Some(frame) = self.advance(held, result, partial)
                         && !offer(frame)
@@ -1355,8 +1543,14 @@ fn conclude(op: Op, result: io::Result<usize>) -> Box<dyn Frame> {
 }
 
 impl EngineTrait for Engine {
-    fn submit(&self, request: Request, buf: Buf, then: Then) -> io::Result<()> {
-        let op = match request {
+    fn submit(
+        &self,
+        request: Request,
+        buf: Buf,
+        then: Then,
+        limit: Option<Duration>,
+    ) -> io::Result<OpId> {
+        let mut op = match request {
             Request::Read { file, offset } => {
                 self.check_handle(file, false)?;
                 let route = self.file_route(file)?;
@@ -1413,6 +1607,11 @@ impl EngineTrait for Engine {
             #[cfg(any(target_os = "linux", target_os = "android"))]
             Request::OpenAt { .. } => return Err(invalid("open_file is not available here")),
         };
+        op.deadline = limit.map(|limit| {
+            self.sys
+                .now_ns()
+                .saturating_add(u64::try_from(limit.as_nanos()).unwrap_or(u64::MAX))
+        });
         // An accept's socket made above is closed if no slot can be had.
         let accepted = op.accepting.as_ref().map(|accepting| accepting.socket);
         let started = self.start(op);
@@ -1424,7 +1623,14 @@ impl EngineTrait for Engine {
         started
     }
 
+    fn cancel(&self, id: OpId) {
+        if id.engine() == self.id as u64 {
+            self.request_end(id.lane(), id.token(), End::Cancelled);
+        }
+    }
+
     fn poll(&self, room: &mut dyn FnMut() -> bool, offer: &mut dyn FnMut(Box<dyn Frame>) -> bool) {
+        self.expire_limits();
         if !self.poll_failed(room, offer) {
             return;
         }

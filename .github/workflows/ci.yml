@@ -24,7 +24,7 @@ name: ci
 
 # A manual run takes optional inputs, which a caller that is not GitHub (a pipeline elsewhere that runs the parts GitHub
 # is needed for) uses to select what runs: `only_os` limits the workspace job to one runner and skips Miri,
-# `miri_only` runs Miri alone, `base_ref` selects the affected crates against that branch as a pull request does (empty:
+# `base_ref` selects the affected crates against that branch as a pull request does (empty:
 # everything), and `proxy_id` is an identifier shown in the name of the run, so the caller can find the run it started.
 on:
   pull_request:
@@ -35,10 +35,6 @@ on:
         type: choice
         options: [all, ubuntu-latest, windows-2025]
         default: all
-      miri_only:
-        description: Run Miri alone
-        type: boolean
-        default: false
       base_ref:
         description: Branch to compare with, to run what a pull request against it would run (empty runs everything)
         type: string
@@ -79,6 +75,7 @@ jobs:
       euhedral_graph: ${{ steps.affected.outputs.euhedral_graph }}
       euhedral_io: ${{ steps.affected.outputs.euhedral_io }}
       euhedral_memory: ${{ steps.affected.outputs.euhedral_memory }}
+      euhedral_net: ${{ steps.affected.outputs.euhedral_net }}
       euhedral_gpu: ${{ steps.affected.outputs.euhedral_gpu }}
       euhedral_benchmarks: ${{ steps.affected.outputs.euhedral_benchmarks }}
     steps:
@@ -112,7 +109,7 @@ jobs:
 
   workspace:
     needs: changes
-    if: needs.changes.outputs.any == 'true' && !inputs.miri_only
+    if: needs.changes.outputs.any == 'true'
     strategy:
       fail-fast: false
       matrix:

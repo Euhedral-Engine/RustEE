@@ -404,7 +404,7 @@ impl Ctx {
         let ctx = Arc::new_cyclic(|me| Ctx {
             stages: Lake::new(lattice, STAGE_SINKS, Duration::ZERO),
             control: QueueIngestSink::new(),
-            completions: Completions::new(lanes),
+            completions: Completions::new(&lanes),
             device: Arc::new(Device { lanes: devices }),
             graph: OnceLock::new(),
             sequencer: OnceLock::new(),

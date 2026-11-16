@@ -195,7 +195,7 @@ fn timer_latency() {
     let lattice = ControlPlaneLattice::new(config).unwrap();
     lattice.start().unwrap();
     let (pool, _devices) = euhedral_graph::testing::FakeDevice::pool(&["a"]);
-    let completions = Completions::new(pool);
+    let completions = Completions::new(&pool);
     lattice.add_upstream(completions.clone()).unwrap();
     let dummies: Vec<Arc<Visits>> = (0..3)
         .map(|_| {
