@@ -17,6 +17,8 @@ linux:
     GIT_DEPTH: "0"
     ARBITER_ARGS: "--cpu shared:16 --mem 16G"
     ARBITER_EST: "900"
+    # euhedral-io's tests open io_uring, which Docker's default seccomp profile refuses: the runner's narrow profile allows it.
+    CI_SECCOMP: io-uring
     CARGO_TARGET_DIR: /cache/rustee-target
     CARGO_NET_GIT_FETCH_WITH_CLI: "true"
   before_script:

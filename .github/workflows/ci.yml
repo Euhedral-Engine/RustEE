@@ -29,7 +29,7 @@ on:
   workflow_dispatch:
     inputs:
       only_os:
-        description: Run the workspace job on this runner only, and nothing else (empty: everything)
+        description: "Run the workspace job on this runner only, and nothing else; empty runs everything"
         type: string
         default: ""
       proxy_id:
