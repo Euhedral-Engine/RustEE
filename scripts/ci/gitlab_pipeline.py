@@ -72,4 +72,7 @@ if yes("miri"):
 
 if not jobs:  # a change that affects nothing: the pipeline still passes
     jobs["nothing-affected"] = {"stage": "test", "script": [f"echo {json.dumps(out.get('reason', 'no crate affected'))}"]}
-json.dump({"stages": ["build", "test"], "variables": {"GIT_DEPTH": "0"}, **jobs}, sys.stdout, indent=1)
+# A child of a merge request pipeline is not created unless its own `workflow` lets it run: the parent's rules do not
+# reach it (a merge request pipeline has no branch for the parent's `$CI_COMMIT_BRANCH` rule to match).
+WORKFLOW = {"rules": [{"when": "always"}]}
+json.dump({"workflow": WORKFLOW, "stages": ["build", "test"], "variables": {"GIT_DEPTH": "0"}, **jobs}, sys.stdout, indent=1)

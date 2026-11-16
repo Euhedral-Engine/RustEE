@@ -88,6 +88,7 @@ jobs:
         run: |
           python3 scripts/ci/test_affected.py
           python3 scripts/ci/test_miri_build.py
+          python3 scripts/ci/test_gitlab_pipeline.py
 
       - name: Compute the affected crates
         id: affected
