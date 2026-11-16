@@ -1,0 +1,36 @@
+# Merge request pipelines. The Linux checks run on this project's runner; the Windows run of ci.yml cannot, so the
+# `windows` job runs it on GitHub Actions and reports its result (see the template's README).
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+include:
+  - project: euhedral/ci
+    ref: main
+    file: github-actions-proxy.yml
+
+# The `workspace` job of .github/workflows/ci.yml on Ubuntu (scripts/ci/linux.sh). Miri is not run yet.
+linux:
+  interruptible: true
+  timeout: 1h
+  variables:
+    GIT_DEPTH: "0"
+    ARBITER_ARGS: "--cpu shared:16 --mem 16G"
+    ARBITER_EST: "900"
+    CARGO_TARGET_DIR: /cache/rustee-target
+    CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  before_script:
+    - git fetch --quiet origin "+refs/heads/${CI_MERGE_REQUEST_TARGET_BRANCH_NAME}:refs/remotes/origin/${CI_MERGE_REQUEST_TARGET_BRANCH_NAME}"
+    - mise install
+  script:
+    - scripts/ci/linux.sh "origin/${CI_MERGE_REQUEST_TARGET_BRANCH_NAME}"
+
+# The `workspace` job of .github/workflows/ci.yml on Windows, run by GitHub Actions.
+windows:
+  extends: .github-actions-proxy
+  variables:
+    PROXY_REPO: Euhedral-Engine/RustEE
+    PROXY_WORKFLOW: ci.yml
+    PROXY_INPUT_NAME: only_os
+    PROXY_INPUT_VALUE: windows-2025
+    PROXY_ID_INPUT: proxy_id

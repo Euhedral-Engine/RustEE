@@ -22,9 +22,22 @@
 # completion port).
 name: ci
 
+# A manual run takes two optional inputs: `only_os` limits the workspace job to one runner (for example windows-2025)
+# and skips Miri, and `proxy_id` is an identifier a caller puts in the run's name to find the run it started.
 on:
   pull_request:
   workflow_dispatch:
+    inputs:
+      only_os:
+        description: Run the workspace job on this runner only, and nothing else (empty: everything)
+        type: string
+        default: ""
+      proxy_id:
+        description: An identifier shown in the name of the run, so the caller can find it
+        type: string
+        default: ""
+
+run-name: ${{ inputs.proxy_id && format('ci [{0}]', inputs.proxy_id) || github.event.pull_request.title || github.ref_name }}
 
 # One run per branch or pull request: a push aborts the run it supersedes (its `ci-ok` is then red for the old commit
 # only; the check of the new head commit is the new run's).
@@ -86,7 +99,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-2025]
+        os: ${{ fromJSON(inputs.only_os && format('["{0}"]', inputs.only_os) || '["ubuntu-latest","windows-2025"]') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     # Bash everywhere: it stops at the first failing command of a multi-line step, which PowerShell does not.
@@ -197,7 +210,7 @@ jobs:
   # shard only installs the toolchain and runs tests.
   miri-build:
     needs: changes
-    if: needs.changes.outputs.miri == 'true'
+    if: needs.changes.outputs.miri == 'true' && !inputs.only_os
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -245,7 +258,7 @@ jobs:
   miri:
     name: miri (${{ matrix.name }})
     needs: [changes, miri-build]
-    if: needs.changes.outputs.miri == 'true'
+    if: needs.changes.outputs.miri == 'true' && !inputs.only_os
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.changes.outputs.miri_matrix) }}
