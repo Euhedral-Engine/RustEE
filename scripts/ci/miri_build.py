@@ -61,6 +61,9 @@ def list_command(command):
 def listed_tests(command):
     """The names of the tests `command`'s selection lists (every test binary of the selection)."""
     env = {k: v for k, v in os.environ.items() if k != "MIRIFLAGS"}
+    # The pinned toolchain, whatever a hook of the job's shell has set (a stable one has no Miri).
+    with open(os.path.join(HERE, "miri-toolchain")) as f:
+        env["RUSTUP_TOOLCHAIN"] = f.read().strip()
     done = subprocess.run(list_command(command), env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if done.returncode:
         raise SystemExit(f"listing the tests of `{shlex.join(list_command(command))}` failed "
