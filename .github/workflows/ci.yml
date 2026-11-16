@@ -22,14 +22,25 @@
 # completion port).
 name: ci
 
-# A manual run takes two optional inputs: `only_os` limits the workspace job to one runner (for example windows-2025)
-# and skips Miri, and `proxy_id` is an identifier a caller puts in the run's name to find the run it started.
+# A manual run takes optional inputs, which a caller that is not GitHub (a pipeline elsewhere that runs the parts GitHub
+# is needed for) uses to select what runs: `only_os` limits the workspace job to one runner and skips Miri,
+# `miri_only` runs Miri alone, `base_ref` selects the affected crates against that branch as a pull request does (empty:
+# everything), and `proxy_id` is an identifier shown in the name of the run, so the caller can find the run it started.
 on:
   pull_request:
   workflow_dispatch:
     inputs:
       only_os:
-        description: "Run the workspace job on this runner only, and nothing else; empty runs everything"
+        description: Run the workspace job on this runner only, and nothing else
+        type: choice
+        options: [all, ubuntu-latest, windows-2025]
+        default: all
+      miri_only:
+        description: Run Miri alone
+        type: boolean
+        default: false
+      base_ref:
+        description: Branch to compare with, to run what a pull request against it would run (empty runs everything)
         type: string
         default: ""
       proxy_id:
@@ -86,20 +97,26 @@ jobs:
         env:
           EVENT: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}
+          BASE_INPUT: ${{ inputs.base_ref }}
         run: |
           case "$EVENT" in
             # Against the merge base with the PR's base branch, which is not always main (stacked PRs).
             pull_request) python3 scripts/ci/affected.py --base "origin/$BASE_REF" --head HEAD --merge-base --github-output "$GITHUB_OUTPUT" ;;
-            *) python3 scripts/ci/affected.py --all --github-output "$GITHUB_OUTPUT" ;;
+            *)
+              if [ -n "$BASE_INPUT" ]; then
+                python3 scripts/ci/affected.py --base "origin/$BASE_INPUT" --head HEAD --merge-base --github-output "$GITHUB_OUTPUT"
+              else
+                python3 scripts/ci/affected.py --all --github-output "$GITHUB_OUTPUT"
+              fi ;;
           esac
 
   workspace:
     needs: changes
-    if: needs.changes.outputs.any == 'true'
+    if: needs.changes.outputs.any == 'true' && !inputs.miri_only
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ fromJSON(inputs.only_os && format('["{0}"]', inputs.only_os) || '["ubuntu-latest","windows-2025"]') }}
+        os: ${{ fromJSON(inputs.only_os && inputs.only_os != 'all' && format('["{0}"]', inputs.only_os) || '["ubuntu-latest","windows-2025"]') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     # Bash everywhere: it stops at the first failing command of a multi-line step, which PowerShell does not.
@@ -210,7 +227,7 @@ jobs:
   # shard only installs the toolchain and runs tests.
   miri-build:
     needs: changes
-    if: needs.changes.outputs.miri == 'true' && !inputs.only_os
+    if: needs.changes.outputs.miri == 'true' && (!inputs.only_os || inputs.only_os == 'all')
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -258,7 +275,7 @@ jobs:
   miri:
     name: miri (${{ matrix.name }})
     needs: [changes, miri-build]
-    if: needs.changes.outputs.miri == 'true' && !inputs.only_os
+    if: needs.changes.outputs.miri == 'true' && (!inputs.only_os || inputs.only_os == 'all')
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.changes.outputs.miri_matrix) }}

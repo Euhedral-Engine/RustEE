@@ -1,5 +1,6 @@
-# Merge request pipelines. The Linux checks run on this project's runner; the Windows run of ci.yml cannot, so the
-# `windows` job runs it on GitHub Actions and reports its result (see the template's README).
+# Merge request pipelines. The Linux checks run on this project's runner; what needs GitHub's runners (Windows, and
+# Miri, which is not worth this machine's cores) runs there through the template's job, which waits for the run and
+# reports its result. A merge request needs this pipeline to succeed: it replaces the `ci-ok` check of ci.yml.
 workflow:
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
@@ -8,8 +9,24 @@ include:
   - project: euhedral/ci
     ref: main
     file: github-actions-proxy.yml
+    inputs:
+      ref: main
 
-# The `workspace` job of .github/workflows/ci.yml on Ubuntu (scripts/ci/linux.sh). Miri is not run yet.
+variables:
+  # Compare with the merge request's target as a pull request is compared; the same for the jobs below.
+  BASE: origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME
+
+# The workflows and the pipeline file: syntax, expressions, shell steps.
+workflows:
+  interruptible: true
+  timeout: 10m
+  variables:
+    ARBITER_ARGS: "--cpu shared:2 --mem 2G"
+    ARBITER_EST: "120"
+  script:
+    - mise exec actionlint@1.7.12 -- actionlint .github/workflows/*.yml
+
+# The `workspace` job of .github/workflows/ci.yml on Ubuntu (scripts/ci/linux.sh).
 linux:
   interruptible: true
   timeout: 1h
@@ -22,17 +39,39 @@ linux:
     CARGO_TARGET_DIR: /cache/rustee-target
     CARGO_NET_GIT_FETCH_WITH_CLI: "true"
   before_script:
+    # This job runs the merge request's own code: the GitHub App's key must not be in its environment.
+    - |
+      for name in GITHUB_APP_ID GITHUB_APP_INSTALLATION_ID GITHUB_APP_PRIVATE_KEY; do
+        if printenv "$name" > /dev/null; then echo "$name is set in this job"; exit 1; fi
+      done
     - git fetch --quiet origin "+refs/heads/${CI_MERGE_REQUEST_TARGET_BRANCH_NAME}:refs/remotes/origin/${CI_MERGE_REQUEST_TARGET_BRANCH_NAME}"
     - mise install
   script:
-    - scripts/ci/linux.sh "origin/${CI_MERGE_REQUEST_TARGET_BRANCH_NAME}"
+    - scripts/ci/linux.sh "$BASE"
 
-# The `workspace` job of .github/workflows/ci.yml on Windows, run by GitHub Actions.
+# The `workspace` job of ci.yml on Windows, run by GitHub Actions on the crates the change affects.
 windows:
   extends: .github-actions-proxy
   variables:
     PROXY_REPO: Euhedral-Engine/RustEE
     PROXY_WORKFLOW: ci.yml
-    PROXY_INPUT_NAME: only_os
-    PROXY_INPUT_VALUE: windows-2025
-    PROXY_ID_INPUT: proxy_id
+    PROXY_INPUTS: |
+      only_os=windows-2025
+      base_ref=$CI_MERGE_REQUEST_TARGET_BRANCH_NAME
+    # A change to documentation alone affects no crate, and ci.yml then skips every job: nothing to run.
+    PROXY_SKIP_IF: >-
+      git fetch --quiet origin "+refs/heads/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME:refs/remotes/$BASE" &&
+      mise exec -- python3 scripts/ci/affected.py --base "$BASE" --head HEAD --merge-base | grep -qx 'any=false'
+
+# Miri, on GitHub: the shards of the affected crates, and the canary.
+miri:
+  extends: .github-actions-proxy
+  variables:
+    PROXY_REPO: Euhedral-Engine/RustEE
+    PROXY_WORKFLOW: ci.yml
+    PROXY_INPUTS: |
+      miri_only=true
+      base_ref=$CI_MERGE_REQUEST_TARGET_BRANCH_NAME
+    PROXY_SKIP_IF: >-
+      git fetch --quiet origin "+refs/heads/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME:refs/remotes/$BASE" &&
+      mise exec -- python3 scripts/ci/affected.py --base "$BASE" --head HEAD --merge-base | grep -qx 'miri=false'
