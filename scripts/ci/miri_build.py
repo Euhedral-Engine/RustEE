@@ -61,7 +61,7 @@ def list_command(command):
 def listed_tests(command):
     """The names of the tests `command`'s selection lists (every test binary of the selection)."""
     env = {k: v for k, v in os.environ.items() if k != "MIRIFLAGS"}
-    out = subprocess.run(list_command(command), env=env, check=True, capture_output=True, text=True).stdout
+    out = subprocess.run(list_command(command), env=env, check=True, stdout=subprocess.PIPE, text=True).stdout
     return {line[: -len(": test")] for line in out.splitlines() if line.endswith(": test")}
 
 
