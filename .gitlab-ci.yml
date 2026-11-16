@@ -55,6 +55,8 @@ windows:
   variables:
     PROXY_REPO: Euhedral-Engine/RustEE
     PROXY_WORKFLOW: ci.yml
+    # The branch carries the merge request's changes to workflow files, which a push is only allowed to make with this.
+    PROXY_PERMISSIONS: contents:write,actions:write,workflows:write
     PROXY_INPUTS: |
       only_os=windows-2025
       base_ref=$CI_MERGE_REQUEST_TARGET_BRANCH_NAME
@@ -69,6 +71,8 @@ miri:
   variables:
     PROXY_REPO: Euhedral-Engine/RustEE
     PROXY_WORKFLOW: ci.yml
+    # The branch carries the merge request's changes to workflow files, which a push is only allowed to make with this.
+    PROXY_PERMISSIONS: contents:write,actions:write,workflows:write
     PROXY_INPUTS: |
       miri_only=true
       base_ref=$CI_MERGE_REQUEST_TARGET_BRANCH_NAME
