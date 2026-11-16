@@ -4,11 +4,10 @@
 # `windows` job has GitHub's runner do it and waits for the result (the template of the project euhedral/ci).
 workflow:
   rules:
+    # A merge request has one pipeline, its own. A branch pipeline only on the default branch: `$CI_OPEN_MERGE_REQUESTS`
+    # is evaluated when the push arrives, before a first push's merge request exists, so it cannot tell the two apart.
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    # A branch with an open merge request already has a merge request pipeline: no second one for a push.
-    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
-      when: never
-    - if: $CI_COMMIT_BRANCH
+    - if: $CI_COMMIT_BRANCH && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
 include:
   - project: euhedral/ci

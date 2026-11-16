@@ -222,9 +222,8 @@ jobs:
   # The rule is unchanged: the seeds are what finds a race, and the time went elsewhere (below), so none is dropped.
   #
   # Miri runs each seed on its own thread, so a job's seeds are the cores it uses: a shard of more than 8 seeds is
-  # split into jobs of at most 8 (scripts/ci/affected.py), each asking the runner for those cores and a small memory.
-  # The tests of a job run one at a time (RUST_TEST_THREADS=1 inside Miri): interleaving them on top of the seeds only
-  # multiplies Miri's cost. The pools and queues the tests create are small under `cfg(miri)`, because filling a
+  # split into jobs of at most 8 (scripts/ci/affected.py). On the project's runner each job asks the arbiter for those
+  # cores; a GitHub runner has fewer cores, and the seeds then share them. The pools and queues the tests create are small under `cfg(miri)`, because filling a
   # 4096-frame pool dominated a test's time under Miri and says nothing more about undefined behaviour.
   #
   # Nothing is built twice: `miri-build` builds Miri's sysroot and, once, every selection of tests the shards run, and
@@ -261,6 +260,8 @@ jobs:
           cargo miri setup
           python3 scripts/ci/miri_build.py --matrix "$MATRIX" > miri-build.sh
           bash -ex miri-build.sh
+          # A name in a shard that no test has (a renamed test) would silently drop it from the run.
+          python3 scripts/ci/miri_build.py --check-names --matrix "$MATRIX"
 
       # The commit the build is of: a shard refuses a build that is not of its own checkout.
       - name: Pack the target directory and the sysroot

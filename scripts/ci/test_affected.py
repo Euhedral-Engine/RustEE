@@ -225,7 +225,7 @@ class Miri(unittest.TestCase):
                          [("a (seeds 0..8)", 8, 8, "0..8"), ("a (seeds 8..16)", 8, 8, "8..16")])
         self.assertEqual({e["commands"] for e in jobs}, {"c1\nc2"})
         self.assertIn("-Zmiri-many-seeds=8..16 ", jobs[1]["miriflags"])
-        self.assertIn("RUST_TEST_THREADS=1", jobs[1]["miriflags"])
+        self.assertIn("-Zmiri-ignore-leaks", jobs[1]["miriflags"])
         self.assertEqual(jobs[0]["mem"], A.MIRI_MEM)
 
     def test_a_shard_can_name_its_memory(self):

@@ -20,7 +20,7 @@ DOCKER = {"DOCKER_ARGS": "--security-opt seccomp=unconfined"}
 # 4 cores on average over 80 s; miri-build 1.3 GB and about 1 core over 15 s.
 WORKSPACE = {"ARBITER_ARGS": "--cpu shared:8 --mem 6G", "ARBITER_EST": "240", **DOCKER}
 MIRI_BUILD = {"ARBITER_ARGS": "--cpu shared:2 --mem 2G", "ARBITER_EST": "60", **DOCKER}
-MIRI_TEST_EST = "120"
+MIRI_TEST_EST = "240"
 STABLE = ["mise install rust >/dev/null", 'eval "$(mise env -s bash)"', "rustc --version"]
 MIRI_SETUP = [
     'toolchain=$(cat scripts/ci/miri-toolchain)',
@@ -59,6 +59,7 @@ if yes("miri"):
             "cargo miri setup",
             f"python3 scripts/ci/miri_build.py --matrix {shlex.quote(json.dumps(matrix, separators=(',', ':')))} > miri-build.sh",
             "bash -ex miri-build.sh",
+            f"python3 scripts/ci/miri_build.py --check-names --matrix {shlex.quote(json.dumps(matrix, separators=(',', ':')))}",
             "git rev-parse HEAD > target/miri/built-from-commit",
             'tar --use-compress-program="zstd -T0 -3" -C / -cf miri-build.tar.zst "${CI_PROJECT_DIR#/}/target/miri" "${HOME#/}/.cache/miri"',
         ],

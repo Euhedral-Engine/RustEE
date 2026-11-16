@@ -235,9 +235,9 @@ SEEDS_PER_JOB = 8
 # The memory a Miri job asks for when its shard does not say (`"mem"`): the peak of a job measured at 0.5 GB and of
 # eight seeds at 1 GB, with a margin.
 MIRI_MEM = "2G"
-# The tests of one process run one at a time: interleaved they cost 1.3 to 12 times more in Miri's scheduler, and no
-# test is written to race against another.
-MIRIFLAGS = "-Zmiri-ignore-leaks -Zmiri-env-set=RUST_TEST_THREADS=1"
+# Leaks are ignored: the lock-free sources park frames on purpose. (Running the tests one at a time made no difference
+# to the time: Miri interleaves a process's threads on one core either way.)
+MIRIFLAGS = "-Zmiri-ignore-leaks"
 
 
 def seed_ranges(seeds):

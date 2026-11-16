@@ -56,7 +56,7 @@ class ChildPipeline(unittest.TestCase):
         self.assertEqual(jobs["miri 0: a (seeds 0..8)"]["variables"]["MIRIFLAGS"], "-Zmiri-many-seeds=0..8")
         for name, job in jobs.items():
             if "ARBITER_EST" in job.get("variables", {}):
-                self.assertLessEqual(int(job["variables"]["ARBITER_EST"]), 1800, name)
+                self.assertLessEqual(int(job["variables"]["ARBITER_EST"]), 600, name)
         for name in ("miri 0: a (seeds 0..8)", "miri 1: b"):
             self.assertLessEqual(int(jobs[name]["variables"]["ARBITER_EST"]), 600, "a test job fits the runner's cap")
 
