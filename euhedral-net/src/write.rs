@@ -1,5 +1,5 @@
 //! The writer: [`write_response`] and [`write_response_head`] for a server, [`write_request`] for a client, and
-//! [`write_continue`].
+//! [`write_continue`]; for a body sent in pieces, [`write_chunked_head`], [`write_chunk`] and [`write_last_chunk`].
 //!
 //! Every message is written as HTTP/1.1. The writer owns the framing: it sets `Content-Length` from the body,
 //! sets `Connection` from the [`ConnectionMode`] the caller passes, and refuses a message whose headers already
@@ -11,6 +11,10 @@
 //!
 //! A response to a HEAD request has no body but the length the body would have: [`write_response_head`] writes
 //! the head with that length given explicitly and no body.
+//!
+//! A body whose length is not known when the head is written is sent in the chunked coding: the head from
+//! [`write_chunked_head`] says `Transfer-Encoding: chunked` and carries no `Content-Length`; each piece of the body
+//! is framed by [`write_chunk`] and the body is ended by [`write_last_chunk`].
 
 use crate::message::{
     ConnectionMode, Headers, Request, Response, WriteError, status_has_no_body, target_form,
@@ -56,6 +60,7 @@ fn push_headers(
     out: &mut Vec<u8>,
     headers: &Headers,
     length: Option<u64>,
+    chunked: bool,
     connection: ConnectionMode,
 ) {
     for (name, value) in headers.iter() {
@@ -66,6 +71,9 @@ fn push_headers(
     }
     if let Some(length) = length {
         out.extend_from_slice(format!("Content-Length: {length}\r\n").as_bytes());
+    }
+    if chunked {
+        out.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
     }
     match connection {
         ConnectionMode::Close => out.extend_from_slice(b"Connection: close\r\n"),
@@ -124,6 +132,7 @@ pub fn write_response(
         out,
         &response.headers,
         length,
+        false,
         interim_mode(response, connection),
     );
     out.extend_from_slice(&response.body);
@@ -149,9 +158,54 @@ pub fn write_response_head(
         out,
         &response.headers,
         content_length,
+        false,
         interim_mode(response, connection),
     );
     Ok(())
+}
+
+/// Appends the head of a response whose body follows in the chunked coding: the status line, the headers,
+/// `Transfer-Encoding: chunked` and no `Content-Length`, then the `Connection` line `connection` asks for. The
+/// response's own body is not written (the caller frames it with [`write_chunk`]). A status without a body (1xx,
+/// 204, 304) is refused with [`WriteError::BodyNotAllowed`]. On an error `out` is unchanged.
+pub fn write_chunked_head(
+    response: &Response,
+    connection: ConnectionMode,
+    out: &mut Vec<u8>,
+) -> Result<(), WriteError> {
+    check_response(response)?;
+    if status_has_no_body(response.status) {
+        return Err(WriteError::BodyNotAllowed);
+    }
+    push_status_line(out, response);
+    push_headers(out, &response.headers, None, true, connection);
+    Ok(())
+}
+
+/// Appends `piece` as one chunk: its length in lowercase hexadecimal, CRLF, the bytes, CRLF. An empty piece appends
+/// nothing, since a chunk of length zero is the last chunk and would end the body ([`write_last_chunk`]).
+pub fn write_chunk(piece: &[u8], out: &mut Vec<u8>) {
+    if piece.is_empty() {
+        return;
+    }
+    let mut digits = [0u8; 16];
+    let mut at = digits.len();
+    let mut left = piece.len();
+    while left > 0 {
+        at -= 1;
+        digits[at] = b"0123456789abcdef"[left & 0xf];
+        left >>= 4;
+    }
+    out.reserve(digits.len() - at + piece.len() + 4);
+    out.extend_from_slice(&digits[at..]);
+    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(piece);
+    out.extend_from_slice(b"\r\n");
+}
+
+/// Appends the last chunk, `0` CRLF CRLF, which ends a chunked body (there are no trailers).
+pub fn write_last_chunk(out: &mut Vec<u8>) {
+    out.extend_from_slice(b"0\r\n\r\n");
 }
 
 /// Appends a request to `out`. `Content-Length` is written when there is a body, and for POST, PUT and PATCH
@@ -182,6 +236,7 @@ pub fn write_request(
         out,
         &request.headers,
         needs_length.then_some(request.body.len() as u64),
+        false,
         connection,
     );
     out.extend_from_slice(&request.body);
