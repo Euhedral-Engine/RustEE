@@ -3,6 +3,7 @@
 
 import json
 import os
+import shlex
 import subprocess
 import sys
 import unittest
@@ -32,6 +33,14 @@ class ChildPipeline(unittest.TestCase):
         self.assertIn("workspace", jobs)
         self.assertNotIn("nothing-affected", jobs)
         self.assertIn("cargo test -p euhedral-hashing", jobs["workspace"]["script"])
+
+    def test_a_matrix_with_an_apostrophe_reaches_the_build_script_whole(self):
+        # A shard's name carries the reason it runs, which can quote ("Miri's wiring"): the matrix is one shell word.
+        matrix = {"include": [{"name": "canary: Miri's wiring (changed)", "seeds": 1, "commands": "cargo miri test -p x"}]}
+        jobs = pipeline("any=false\nmiri=true\nmiri_matrix=" + json.dumps(matrix) + "\n")
+        line = next(l for l in jobs["miri-build"]["script"] if "miri_build.py" in l)
+        words = shlex.split(line)
+        self.assertEqual(json.loads(words[words.index("--matrix") + 1]), matrix)
 
 
 if __name__ == "__main__":

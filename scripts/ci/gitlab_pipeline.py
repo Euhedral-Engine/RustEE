@@ -7,6 +7,7 @@ of tests, handed to the shards as an artifact) and one `miri` job per affected s
 Keep the steps in step with ci.yml.
 """
 import json
+import shlex
 import sys
 
 out = dict(l.rstrip("\n").split("=", 1) for l in sys.stdin if "=" in l)
@@ -49,7 +50,7 @@ if yes("miri"):
         "stage": "build", "variables": HEAVY,
         "script": MIRI_SETUP + [
             "cargo miri setup",
-            f"python3 scripts/ci/miri_build.py --matrix '{json.dumps(matrix, separators=(',', ':'))}' > miri-build.sh",
+            f"python3 scripts/ci/miri_build.py --matrix {shlex.quote(json.dumps(matrix, separators=(',', ':')))} > miri-build.sh",
             "bash -ex miri-build.sh",
             "git rev-parse HEAD > target/miri/built-from-commit",
             'tar --use-compress-program="zstd -T0 -3" -C / -cf miri-build.tar.zst "${CI_PROJECT_DIR#/}/target/miri" "${HOME#/}/.cache/miri"',
