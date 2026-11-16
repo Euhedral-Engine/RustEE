@@ -7,10 +7,10 @@ workflow:
 
 include:
   - project: euhedral/ci
-    ref: v1
+    ref: v2
     file: github-actions-proxy.yml
     inputs:
-      ref: v1
+      ref: v2
 
 variables:
   # Compare with the merge request's target as a pull request is compared; the same for the jobs below.
