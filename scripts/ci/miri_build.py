@@ -61,7 +61,11 @@ def list_command(command):
 def listed_tests(command):
     """The names of the tests `command`'s selection lists (every test binary of the selection)."""
     env = {k: v for k, v in os.environ.items() if k != "MIRIFLAGS"}
-    out = subprocess.run(list_command(command), env=env, check=True, stdout=subprocess.PIPE, text=True).stdout
+    done = subprocess.run(list_command(command), env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if done.returncode:
+        raise SystemExit(f"listing the tests of `{shlex.join(list_command(command))}` failed "
+                         f"(RUSTUP_TOOLCHAIN={env.get('RUSTUP_TOOLCHAIN')}):\n{done.stderr[-2000:]}")
+    out = done.stdout
     return {line[: -len(": test")] for line in out.splitlines() if line.endswith(": test")}
 
 
