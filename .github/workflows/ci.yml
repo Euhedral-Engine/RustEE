@@ -219,6 +219,13 @@ jobs:
   # compare-exchanges fail spuriously, so seeds matter where threads race and little in a test with one thread: 1 for
   # such a test. A test with threads gets 4 only if a loom model runs the same code and asserts the same property (Miri
   # then looks for undefined behaviour and aliasing; loom does not check SeqCst store-to-load orderings); otherwise 16.
+  # The rule is unchanged: the seeds are what finds a race, and the time went elsewhere (below), so none is dropped.
+  #
+  # Miri runs each seed on its own thread, so a job's seeds are the cores it uses: a shard of more than 8 seeds is
+  # split into jobs of at most 8 (scripts/ci/affected.py), each asking the runner for those cores and a small memory.
+  # The tests of a job run one at a time (RUST_TEST_THREADS=1 inside Miri): interleaving them on top of the seeds only
+  # multiplies Miri's cost. The pools and queues the tests create are small under `cfg(miri)`, because filling a
+  # 4096-frame pool dominated a test's time under Miri and says nothing more about undefined behaviour.
   #
   # Nothing is built twice: `miri-build` builds Miri's sysroot and, once, every selection of tests the shards run, and
   # hands its target directory and sysroot to the shards as an artifact (a tarball, which keeps file times), so a
@@ -280,7 +287,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      MIRIFLAGS: -Zmiri-many-seeds=0..${{ matrix.seeds }} -Zmiri-ignore-leaks
+      MIRIFLAGS: ${{ matrix.miriflags }}
       COMMANDS: ${{ matrix.commands }}
     steps:
       - uses: actions/checkout@v4

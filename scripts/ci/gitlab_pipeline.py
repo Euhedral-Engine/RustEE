@@ -13,7 +13,14 @@ import sys
 out = dict(l.rstrip("\n").split("=", 1) for l in sys.stdin if "=" in l)
 yes = lambda k: out.get(k) == "true"
 # io_uring (euhedral-io) is blocked by docker's default seccomp profile.
-HEAVY = {"ARBITER_ARGS": "--cpu shared:16 --mem 32G", "ARBITER_EST": "1800", "DOCKER_ARGS": "--security-opt seccomp=unconfined"}
+DOCKER = {"DOCKER_ARGS": "--security-opt seccomp=unconfined"}
+# What each kind of job asks the arbiter for: the cores and memory it uses, and an estimate of its run time in seconds
+# (at most the runner's 600 s cap). A Miri test job asks for its own seeds' cores and its shard's memory (the matrix).
+# Measured peaks: the workspace job (fmt, Clippy, every test, release stress, loom) about 4.5 GB and, with a warm build,
+# 4 cores on average over 80 s; miri-build 1.3 GB and about 1 core over 15 s.
+WORKSPACE = {"ARBITER_ARGS": "--cpu shared:8 --mem 6G", "ARBITER_EST": "240", **DOCKER}
+MIRI_BUILD = {"ARBITER_ARGS": "--cpu shared:2 --mem 2G", "ARBITER_EST": "60", **DOCKER}
+MIRI_TEST_EST = "120"
 STABLE = ["mise install rust >/dev/null", 'eval "$(mise env -s bash)"', "rustc --version"]
 MIRI_SETUP = [
     'toolchain=$(cat scripts/ci/miri-toolchain)',
@@ -42,12 +49,12 @@ if yes("any"):
                  "cargo test -p euhedral-memory --features cuda"]
     if yes("euhedral_gpu"):
         cmds += ["cargo clippy -p euhedral-gpu --all-targets --features cuda -- -D warnings", "cargo test -p euhedral-gpu --features cuda"]
-    jobs["workspace"] = {"stage": "test", "variables": HEAVY, "script": STABLE + cmds}
+    jobs["workspace"] = {"stage": "test", "variables": WORKSPACE, "script": STABLE + cmds}
 
 if yes("miri"):
     matrix = json.loads(out["miri_matrix"])
     jobs["miri-build"] = {
-        "stage": "build", "variables": HEAVY,
+        "stage": "build", "variables": MIRI_BUILD,
         "script": MIRI_SETUP + [
             "cargo miri setup",
             f"python3 scripts/ci/miri_build.py --matrix {shlex.quote(json.dumps(matrix, separators=(',', ':')))} > miri-build.sh",
@@ -60,8 +67,8 @@ if yes("miri"):
     for i, shard in enumerate(matrix["include"]):
         jobs[f"miri {i}: {shard['name']}"] = {
             "stage": "test", "needs": ["miri-build"],
-            "variables": {**HEAVY, "MIRIFLAGS": f"-Zmiri-many-seeds=0..{shard['seeds']} -Zmiri-ignore-leaks",
-                          "COMMANDS": shard["commands"], "DOCKER_ARGS": HEAVY["DOCKER_ARGS"]},
+            "variables": {"ARBITER_ARGS": f"--cpu shared:{shard['cpu']} --mem {shard['mem']}", "ARBITER_EST": MIRI_TEST_EST,
+                          "MIRIFLAGS": shard["miriflags"], "COMMANDS": shard["commands"], **DOCKER},
             "script": MIRI_SETUP + [
                 "git ls-files -z | xargs -0 touch -d 2000-01-01",
                 'tar --use-compress-program="zstd -T0" -C / -xf miri-build.tar.zst',
