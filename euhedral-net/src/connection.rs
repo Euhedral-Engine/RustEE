@@ -1102,7 +1102,9 @@ impl Conn {
 
     /// Ends the connection: cancels the `recv` in flight, and drops the socket once nothing is in flight on it.
     fn close_now(self: &Arc<Self>, st: &mut ConnState) {
-        if matches!(st.phase, Phase::Streaming { .. }) {
+        // A stream is cut when it is closed while going, or while its last chunk is not yet out.
+        let finishing = take(&mut st.finishing);
+        if finishing || matches!(st.phase, Phase::Streaming { .. }) {
             self.count_cut();
         }
         st.phase = Phase::Closed;
@@ -1423,11 +1425,20 @@ impl StdError for StreamError {
     }
 }
 
-/// What a failed send of a stream means to its handler.
+/// What a failed send of a stream means to its handler: a peer that reset or closed the connection is `Closed`,
+/// whether the connection saw it first or the send did.
 fn stream_error(error: Error) -> StreamError {
     if LimitPassed::is(&error) {
         StreamError::TimedOut
-    } else if Cancelled::is(&error) {
+    } else if Cancelled::is(&error)
+        || matches!(
+            error.kind(),
+            ErrorKind::BrokenPipe
+                | ErrorKind::ConnectionReset
+                | ErrorKind::ConnectionAborted
+                | ErrorKind::NotConnected
+        )
+    {
         StreamError::Closed
     } else {
         StreamError::Io(error)
