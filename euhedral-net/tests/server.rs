@@ -26,7 +26,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, OnceLock};
 use std::thread::sleep;
-#[cfg(unix)]
 use std::thread::yield_now;
 use std::time::{Duration, Instant};
 
@@ -396,7 +395,6 @@ fn parking() -> (impl Handler, Receiver<Parked>) {
 }
 
 /// Waits for a condition that the server alone makes true and that has no event to wait on.
-#[cfg(unix)]
 fn until(what: &str, mut condition: impl FnMut() -> bool) {
     let limit = Instant::now() + PATIENCE;
     while !condition() {
