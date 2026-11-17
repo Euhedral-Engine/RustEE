@@ -28,6 +28,12 @@
 //! - `Handling`: the handler has the request. One `recv` is in flight (without a limit) to see the peer go; bytes
 //!   it brings are kept for the next request and no further `recv` is issued. At most one `recv` and at most one
 //!   `send` are ever in flight.
+//! - `Streaming`: the handler answered with [`Responder::stream`]: the head (and any first piece) is sent, and the
+//!   body follows piece by piece, one send in flight at a time, each started by an event the handler's
+//!   [`ReplyStream`] posts. The watch `recv` of `Handling` stays pending and means what it did there (the cancel flag,
+//!   a half-close that lets the stream finish, a broken peer that ends it). The stream ends by its `end` (the last
+//!   chunk is sent, then the phase is `Replying`) or is cut (dropped without `end`, a failed or late send, a peer that
+//!   left): the connection then closes, with no last chunk.
 //! - `Replying`: the reply is being sent; the `recv` of `Handling`, if still in flight, was cancelled.
 //! - `Closing`: the reply that ended the connection is out and the write side is shut down; what the peer still
 //!   sends is read and dropped (so that closing does not reset the connection and lose the reply) until it closes,
@@ -38,8 +44,10 @@
 //!   for the request being handled, if any, has been used or dropped and its reply has been through the
 //!   connection's order (a discarded one); so a stop is complete only when no frame of the server is left.
 
-use std::fmt::{self, Debug, Formatter};
+use std::error::Error as StdError;
+use std::fmt::{self, Debug, Display, Formatter};
 use std::io::{Error, ErrorKind};
+use std::mem::take;
 use std::net::{Shutdown, TcpStream};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
@@ -52,13 +60,19 @@ use std::time::{Duration, Instant};
 
 use euhedral_core::frames::Frame;
 use euhedral_core::generics::{LatticeReceiver, LatticeSource, SourceCell};
-use euhedral_io::{Cancelled, IoBuf, IoDone, LimitPassed, OpId, OpOptions, RawSock};
+use euhedral_core::ingest::QueueIngestSink;
+use euhedral_io::{Cancelled, Continuation, IoBuf, IoDone, LimitPassed, OpId, OpOptions, RawSock};
 
-use crate::message::{ConnectionMode, Method, ParseError, Request, Response, Version, WriteError};
+use crate::message::{
+    ConnectionMode, Method, ParseError, Request, Response, Version, WriteError, status_has_no_body,
+};
 use crate::parse::{Progress, RequestParser};
 use crate::server::{Ctx, ListenerEvent, Shared, no_work};
 use crate::station::{Drive, Station};
-use crate::write::{write_continue, write_response, write_response_head};
+use crate::write::{
+    write_chunk, write_chunked_head, write_continue, write_last_chunk, write_response,
+    write_response_head,
+};
 
 /// The handle of a connected stream, as `AsyncIo` takes it.
 #[cfg(unix)]
@@ -84,11 +98,89 @@ enum Phase {
         version: Version,
         cancel: Arc<AtomicBool>,
     },
+    /// A streamed reply is going out: `framing` says how its body is delimited, `keep` whether the connection may
+    /// stay open after it.
+    Streaming {
+        seq: u64,
+        keep: bool,
+        framing: Framing,
+        cancel: Arc<AtomicBool>,
+    },
     Replying {
         keep: bool,
     },
     Closing,
     Closed,
+}
+
+/// How the body of a streamed reply is delimited.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Framing {
+    /// HTTP/1.1: the chunked coding, ended by the last chunk.
+    Chunked,
+    /// HTTP/1.0: no length; the body ends when the connection does.
+    Close,
+    /// The answer to HEAD: the head only; pieces are dropped.
+    None,
+}
+
+type HeadThen = Continuation<Result<ReplyStream, StreamError>>;
+type PieceThen = Continuation<Result<PieceSent, StreamError>>;
+
+/// The continuation waiting for the send in flight to end.
+enum Awaited {
+    Head(HeadThen),
+    Piece(PieceThen, Vec<u8>),
+}
+
+impl Awaited {
+    /// Runs the continuation with `error`.
+    fn fail(self, sink: &QueueIngestSink, error: StreamError) {
+        match self {
+            Awaited::Head(then) => run_then(sink, then, Err(error)),
+            Awaited::Piece(then, _) => run_then(sink, then, Err(error)),
+        }
+    }
+}
+
+/// An [`Awaited`] that is never lost: dropped without having been taken, it runs with `StreamError::Closed`.
+struct Waiting {
+    sink: Arc<QueueIngestSink>,
+    awaited: Option<Awaited>,
+}
+
+impl Waiting {
+    fn new(sink: Arc<QueueIngestSink>, awaited: Awaited) -> Waiting {
+        Waiting {
+            sink,
+            awaited: Some(awaited),
+        }
+    }
+
+    /// Takes the continuation out; the guard then has nothing left to deliver.
+    fn take(mut self) -> (Arc<QueueIngestSink>, Awaited) {
+        let awaited = self
+            .awaited
+            .take()
+            .expect("a waiting continuation is taken once");
+        (self.sink.clone(), awaited)
+    }
+}
+
+impl Drop for Waiting {
+    fn drop(&mut self) {
+        if let Some(awaited) = self.awaited.take() {
+            awaited.fail(&self.sink, StreamError::Closed);
+        }
+    }
+}
+
+/// Runs `then` with `value` and offers the frame it returns to `sink`. A `then` that panics is dropped with what it
+/// held (a `ReplyStream` posts its abort); the panic ends here.
+fn run_then<T>(sink: &QueueIngestSink, then: Continuation<T>, value: T) {
+    if let Ok(frame) = catch_unwind(AssertUnwindSafe(|| then(value))) {
+        let _ = sink.offer(frame);
+    }
 }
 
 /// What reaches a connection's state.
@@ -105,6 +197,20 @@ pub(crate) enum Event {
     Stop,
     /// The handler asked to be told if request `seq` is cancelled.
     OnCancel { seq: u64, frame: Box<dyn Frame> },
+    /// The handler answers request `seq` with a streamed reply: `head` (and its body, if any, as the first piece).
+    StreamHead {
+        seq: u64,
+        head: Response,
+        then: HeadThen,
+    },
+    /// The next piece of the stream of request `seq`.
+    Piece {
+        seq: u64,
+        bytes: Vec<u8>,
+        then: PieceThen,
+    },
+    /// The stream of request `seq` ends: cleanly (`end`), or because its `ReplyStream` was dropped.
+    StreamEnd { seq: u64, clean: bool },
 }
 
 /// The plain state of a connection.
@@ -137,8 +243,15 @@ struct ConnState {
     /// The peer ended its stream (a half-close) while the request was handled: its reply is still sent, and the
     /// connection ends after it.
     half_closed: bool,
-    /// A `Responder` of this connection has not yet been through the connection's order.
+    /// A `Responder` of this connection has not yet been through the connection's order, or a `ReplyStream` of it
+    /// is held or a piece of it is in flight.
     owed: bool,
+    /// The continuation to run when the send of a stream's head or piece ends.
+    waiting: Option<Waiting>,
+    /// The send buffer of a stream, kept between its pieces and dropped when the stream ends.
+    out_spare: Option<Vec<u8>>,
+    /// The last chunk of a stream is in flight.
+    finishing: bool,
     /// Bytes the closing phase may still read and drop.
     linger_budget: usize,
     /// When the closing phase ends whatever the peer does.
@@ -204,6 +317,9 @@ impl Conn {
                 peer_gone: false,
                 half_closed: false,
                 owed: false,
+                waiting: None,
+                out_spare: None,
+                finishing: false,
                 linger_budget,
                 linger_deadline: None,
                 slot,
@@ -242,6 +358,9 @@ impl Conn {
             Event::Reply { seq, response } => self.on_reply(st, seq, response),
             Event::Stop => self.on_stop(st),
             Event::OnCancel { seq, frame } => self.on_cancel_asked(st, seq, frame),
+            Event::StreamHead { seq, head, then } => self.on_stream_head(st, seq, head, then),
+            Event::Piece { seq, bytes, then } => self.on_piece(st, seq, bytes, then),
+            Event::StreamEnd { seq, clean } => self.on_stream_end(st, seq, clean),
         }
     }
 
@@ -296,15 +415,26 @@ impl Conn {
         }
     }
 
-    /// Starts the one `send` of the connection. The engine moves every byte or ends with an error.
+    /// Starts the one `send` of the connection, bounded by `write_limit`. The engine moves every byte or ends with
+    /// an error.
     fn issue_send(self: &Arc<Self>, st: &mut ConnState, bytes: Vec<u8>) {
+        let limit = self.shared.config.write_limit;
+        self.issue_send_limited(st, bytes, limit);
+    }
+
+    /// Starts the one `send` of the connection, bounded by `limit`.
+    fn issue_send_limited(
+        self: &Arc<Self>,
+        st: &mut ConnState,
+        bytes: Vec<u8>,
+        limit: Option<Duration>,
+    ) {
         debug_assert!(st.send.is_none());
         let (Some(stream), Some(ctx)) = (&st.stream, &st.ctx) else {
             return;
         };
         let filled = bytes.len();
         let conn = self.clone();
-        let limit = self.shared.config.write_limit;
         let started = match ctx.io.upgrade() {
             Some(io) => io.send_with(
                 raw_stream(stream),
@@ -463,7 +593,7 @@ impl Conn {
                 Got::Limit if st.started.is_some() => self.final_status(st, 408),
                 _ => self.close_now(st),
             },
-            Phase::Handling { .. } => match got {
+            Phase::Handling { .. } | Phase::Streaming { .. } => match got {
                 // Kept for the next request; no further `recv` until the reply is out.
                 Got::Data(_) | Got::Cancelled => {}
                 // A half-close: the peer may still read. The flag is a hint; the reply is sent.
@@ -491,7 +621,9 @@ impl Conn {
     }
 
     fn raise_cancel(&self, st: &mut ConnState) {
-        if let Phase::Handling { cancel, seq, .. } = &st.phase {
+        if let Phase::Handling { cancel, seq, .. } | Phase::Streaming { cancel, seq, .. } =
+            &st.phase
+        {
             st.cancelled_seq = Some(*seq);
             cancel.store(true, Ordering::Release);
             self.shared
@@ -519,7 +651,8 @@ impl Conn {
             }
             return;
         }
-        if let Phase::Handling { seq: current, .. } = &st.phase
+        if let Phase::Handling { seq: current, .. } | Phase::Streaming { seq: current, .. } =
+            &st.phase
             && *current == seq
         {
             st.on_cancel = Some(frame);
@@ -638,16 +771,32 @@ impl Conn {
 
     fn on_sent(self: &Arc<Self>, st: &mut ConnState, done: IoDone) {
         st.send = None;
-        if let Err(error) = &done.result {
-            if LimitPassed::is(error) {
+        let IoDone { buf, result } = done;
+        if matches!(st.phase, Phase::Streaming { .. }) {
+            st.out_spare = Some(buf.bytes);
+        }
+        let finishing = take(&mut st.finishing);
+        if let Err(error) = result {
+            if LimitPassed::is(&error) {
                 self.shared
                     .counters
                     .rare
                     .limits_passed
                     .fetch_add(1, Ordering::Relaxed);
             }
+            if let Some(waiting) = st.waiting.take() {
+                let (sink, awaited) = waiting.take();
+                awaited.fail(&sink, stream_error(error));
+                st.owed = false;
+            } else if finishing {
+                self.count_cut();
+            }
             // A stream a send ended early on is at a position only the count tells: it is closed.
             self.close_now(st);
+            return;
+        }
+        if let Some(waiting) = st.waiting.take() {
+            self.stream_sent(st, waiting);
             return;
         }
         match st.phase {
@@ -662,6 +811,234 @@ impl Conn {
             Phase::Replying { .. } => self.settle(st),
             Phase::Closed => self.finalize(st),
             _ => {}
+        }
+    }
+
+    // ---- streaming -----------------------------------------------------------------------------------------
+
+    /// A stream is cut: counted once.
+    fn count_cut(&self) {
+        self.shared
+            .counters
+            .rare
+            .streams_cut
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The right to send the rest of the stream of the phase the connection is in, if it is streaming.
+    fn new_stream(self: &Arc<Self>, st: &ConnState) -> Option<ReplyStream> {
+        match &st.phase {
+            Phase::Streaming { seq, cancel, .. } => Some(ReplyStream {
+                conn: self.clone(),
+                seq: *seq,
+                cancel: cancel.clone(),
+                live: true,
+            }),
+            _ => None,
+        }
+    }
+
+    /// The send of a stream's head or piece is out: the stream goes back to the handler, or, if the connection was
+    /// closed meanwhile, the handler is told so.
+    fn stream_sent(self: &Arc<Self>, st: &mut ConnState, waiting: Waiting) {
+        let (sink, awaited) = waiting.take();
+        let Some(stream) = self.new_stream(st) else {
+            awaited.fail(&sink, StreamError::Closed);
+            st.owed = false;
+            self.finalize(st);
+            return;
+        };
+        match awaited {
+            Awaited::Head(then) => run_then(&sink, then, Ok(stream)),
+            Awaited::Piece(then, mut piece) => {
+                piece.clear();
+                run_then(&sink, then, Ok(PieceSent { stream, piece }));
+            }
+        }
+    }
+
+    /// The handler answers with a streamed reply: the head (and its body, as the first piece) is written, and the
+    /// handler gets the stream when it is out.
+    fn on_stream_head(
+        self: &Arc<Self>,
+        st: &mut ConnState,
+        seq: u64,
+        mut head: Response,
+        then: HeadThen,
+    ) {
+        let Some(sink) = st.ctx.as_ref().map(|ctx| ctx.sink.clone()) else {
+            return;
+        };
+        let stream_phase = match &st.phase {
+            Phase::Handling {
+                seq: current,
+                head,
+                keep,
+                version,
+                cancel,
+            } if *current == seq => Some((*head, *keep, *version, cancel.clone())),
+            _ => None,
+        };
+        let Some((is_head, keep, version, cancel)) = stream_phase else {
+            st.on_cancel = None;
+            if seq == st.seq {
+                st.owed = false;
+            }
+            run_then(&sink, then, Err(StreamError::Closed));
+            self.discard(st);
+            return;
+        };
+        let framing = match (is_head, version) {
+            (true, _) => Framing::None,
+            (false, Version::Http11) => Framing::Chunked,
+            (false, Version::Http10) => Framing::Close,
+        };
+        // A body that ends with the connection leaves nothing to keep.
+        let keep = keep
+            && framing != Framing::Close
+            && !self.is_stopping(st)
+            && !st.peer_gone
+            && !st.half_closed;
+        let mode = match (keep, version) {
+            (false, _) => ConnectionMode::Close,
+            (true, Version::Http10) => ConnectionMode::KeepAlive,
+            (true, Version::Http11) => ConnectionMode::Unspecified,
+        };
+        let status = head.status;
+        let first = take(&mut head.body);
+        let mut out = st.out_spare.take().unwrap_or_default();
+        out.clear();
+        let written = if status_has_no_body(status) {
+            Err(WriteError::BodyNotAllowed)
+        } else if framing == Framing::Chunked {
+            write_chunked_head(&head, mode, &mut out)
+        } else {
+            write_response_head(&head, None, mode, &mut out)
+        };
+        if let Err(error) = written {
+            // The head cannot be written: the request is answered 500, and the handler is told why.
+            run_then(&sink, then, Err(StreamError::Head(error)));
+            self.on_reply(st, seq, Response::with_status(500));
+            return;
+        }
+        match framing {
+            Framing::Chunked => write_chunk(&first, &mut out),
+            Framing::Close => out.extend_from_slice(&first),
+            Framing::None => {}
+        }
+        self.shared.count_reply(status);
+        self.shared
+            .counters
+            .request
+            .streams
+            .fetch_add(1, Ordering::Relaxed);
+        st.phase = Phase::Streaming {
+            seq,
+            keep,
+            framing,
+            cancel,
+        };
+        // The watch `recv` stays: the stream is answered to a peer that may leave.
+        st.waiting = Some(Waiting::new(sink, Awaited::Head(then)));
+        let limit = self.shared.config.piece_limit;
+        self.issue_send_limited(st, out, limit);
+    }
+
+    /// The handler sends the next piece of its stream.
+    fn on_piece(self: &Arc<Self>, st: &mut ConnState, seq: u64, bytes: Vec<u8>, then: PieceThen) {
+        let Some(sink) = st.ctx.as_ref().map(|ctx| ctx.sink.clone()) else {
+            return;
+        };
+        let framing = match &st.phase {
+            Phase::Streaming {
+                seq: current,
+                framing,
+                ..
+            } if *current == seq && st.waiting.is_none() && st.send.is_none() => Some(*framing),
+            _ => None,
+        };
+        let Some(framing) = framing else {
+            // The connection ended (or the stream was cut) while the handler held the stream.
+            run_then(&sink, then, Err(StreamError::Closed));
+            if seq == st.seq {
+                st.owed = false;
+            }
+            self.finalize(st);
+            return;
+        };
+        if bytes.is_empty() || framing == Framing::None {
+            self.piece_done(st, &sink, then, bytes);
+            return;
+        }
+        let mut out = st.out_spare.take().unwrap_or_default();
+        out.clear();
+        match framing {
+            Framing::Chunked => write_chunk(&bytes, &mut out),
+            Framing::Close | Framing::None => out.extend_from_slice(&bytes),
+        }
+        st.waiting = Some(Waiting::new(sink, Awaited::Piece(then, bytes)));
+        let limit = self.shared.config.piece_limit;
+        self.issue_send_limited(st, out, limit);
+    }
+
+    /// A piece that needs no write is done: the stream goes back with the emptied buffer.
+    fn piece_done(
+        self: &Arc<Self>,
+        st: &mut ConnState,
+        sink: &QueueIngestSink,
+        then: PieceThen,
+        mut piece: Vec<u8>,
+    ) {
+        piece.clear();
+        if let Some(stream) = self.new_stream(st) {
+            run_then(sink, then, Ok(PieceSent { stream, piece }));
+        }
+    }
+
+    /// The handler ends its stream, or drops it.
+    fn on_stream_end(self: &Arc<Self>, st: &mut ConnState, seq: u64, clean: bool) {
+        let framing = match &st.phase {
+            Phase::Streaming {
+                seq: current,
+                framing,
+                ..
+            } if *current == seq => Some(*framing),
+            _ => None,
+        };
+        if seq == st.seq {
+            st.owed = false;
+        }
+        let Some(framing) = framing else {
+            // Already closed: what is left is to report the end of the connection.
+            self.finalize(st);
+            return;
+        };
+        if !clean {
+            // A stream that is dropped is cut: the body stays unfinished, and the connection closes.
+            st.on_cancel = None;
+            self.close_now(st);
+            return;
+        }
+        let Phase::Streaming { keep, .. } = st.phase else {
+            return;
+        };
+        st.on_cancel = None;
+        let keep = keep && !self.is_stopping(st) && !st.half_closed && !st.peer_gone;
+        st.phase = Phase::Replying { keep };
+        // The `recv` that watched the peer is no longer wanted.
+        if let Some(id) = st.recv {
+            self.cancel_op(st, id);
+        }
+        if framing == Framing::Chunked {
+            let mut out = st.out_spare.take().unwrap_or_default();
+            out.clear();
+            write_last_chunk(&mut out);
+            st.finishing = true;
+            let limit = self.shared.config.piece_limit;
+            self.issue_send_limited(st, out, limit);
+        } else {
+            st.out_spare = None;
+            self.settle(st);
         }
     }
 
@@ -714,7 +1091,10 @@ impl Conn {
                     self.cancel_op(st, id);
                 }
             }
-            Phase::Handling { .. } | Phase::Replying { .. } | Phase::Closed => {}
+            Phase::Handling { .. }
+            | Phase::Streaming { .. }
+            | Phase::Replying { .. }
+            | Phase::Closed => {}
         }
     }
 
@@ -722,12 +1102,20 @@ impl Conn {
 
     /// Ends the connection: cancels the `recv` in flight, and drops the socket once nothing is in flight on it.
     fn close_now(self: &Arc<Self>, st: &mut ConnState) {
+        if matches!(st.phase, Phase::Streaming { .. }) {
+            self.count_cut();
+        }
         st.phase = Phase::Closed;
         if let Some(id) = st.recv {
             self.cancel_op(st, id);
         }
         if let Some(id) = st.send {
             self.cancel_op(st, id);
+        } else if let Some(waiting) = st.waiting.take() {
+            // The send that would have delivered it never started.
+            let (sink, awaited) = waiting.take();
+            awaited.fail(&sink, StreamError::Closed);
+            st.owed = false;
         }
         self.finalize(st);
     }
@@ -740,6 +1128,7 @@ impl Conn {
         st.on_cancel = None;
         st.buf = Vec::new();
         st.spare = None;
+        st.out_spare = None;
         // Not told to the server while a `Responder` is still to come through this order: the stop of the
         // server is complete only when no frame of it is left to run.
         if st.owed || st.reported {
@@ -851,6 +1240,27 @@ impl Responder {
         });
     }
 
+    /// Answers with a reply whose body is sent piece by piece, and returns at once. `head` carries the status and the
+    /// headers, and its body, if it has one, goes out as the first piece in the same write as the head; the writer
+    /// owns the framing (`Transfer-Encoding: chunked` for an HTTP/1.1 peer; for HTTP/1.0 no length, `Connection:
+    /// close` and the end of the body is the close; for HEAD the head alone, with no `Content-Length` and no
+    /// `Transfer-Encoding`, and the pieces are dropped), so `head` must not set `Content-Length`,
+    /// `Transfer-Encoding` or `Connection`.
+    ///
+    /// `then` runs once the head is written, with the [`ReplyStream`] to send the rest through, or with the reason
+    /// the stream did not start: a head the writer refuses (and a 1xx, 204 or 304, which have no body) is answered
+    /// `500` and `then` gets `Err(StreamError::Head(_))`; a connection that ended gets `Err(StreamError::Closed)`;
+    /// the write that passed [`piece_limit`](crate::server::ServerConfig::piece_limit) gets `TimedOut`. `then` runs
+    /// inside the connection's own frame and must return quickly; the frame it returns is offered to the sink.
+    pub fn stream(mut self, head: Response, then: Continuation<Result<ReplyStream, StreamError>>) {
+        self.sent = true;
+        self.conn.post(Event::StreamHead {
+            seq: self.seq,
+            head,
+            then,
+        });
+    }
+
     /// Asks for `frame` to be offered to the sink if this request is cancelled (the peer ended its stream or broke
     /// it while the request is handled): the way to be told without looking at the flag. It runs at most once, and
     /// never if the reply is sent before the cancel is seen: it is then dropped without running. The two race by
@@ -881,5 +1291,145 @@ impl Drop for Responder {
                 response: Response::with_status(500),
             });
         }
+    }
+}
+
+/// The right to send the rest of one streamed reply, from [`Responder::stream`]: whoever holds it owns it, and a
+/// piece in flight takes it away, so there is never more than one piece in flight (a second [`send`](Self::send)
+/// before the first one is out does not compile: `send` consumes the stream, and it comes back only in
+/// [`PieceSent`]).
+///
+/// ```compile_fail
+/// # use euhedral_io::Continuation;
+/// # use euhedral_net::{PieceSent, ReplyStream, StreamError};
+/// # type Then = Continuation<Result<PieceSent, StreamError>>;
+/// # fn two(stream: ReplyStream, then: Then, again: Then) {
+/// stream.send(b"a".to_vec(), then);
+/// stream.send(b"b".to_vec(), again); // the stream was moved by the first send
+/// # }
+/// ```
+///
+/// A `ReplyStream` dropped without [`end`](Self::end) cuts the stream: the connection closes and the body has no
+/// last chunk, so the peer sees it was cut (an HTTP/1.0 peer cannot: the close is the end of its body). A stream
+/// held keeps the server from reporting its stop, as a `Responder` does.
+pub struct ReplyStream {
+    conn: Arc<Conn>,
+    seq: u64,
+    cancel: Arc<AtomicBool>,
+    /// The stream has not ended or been given to a piece: its drop cuts the stream.
+    live: bool,
+}
+
+impl Debug for ReplyStream {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ReplyStream")
+            .field("seq", &self.seq)
+            .field("cancelled", &self.cancel.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
+}
+
+impl ReplyStream {
+    /// Sends `piece` as the next part of the body and returns at once. `then` runs once it is written, with the
+    /// stream back and the piece's buffer emptied (its capacity kept, for the next piece), or with the error that
+    /// ended the stream (the stream is then gone). An empty piece writes nothing and does not end the body. `then`
+    /// runs inside the connection's own frame and must return quickly; the frame it returns is offered to the sink.
+    pub fn send(mut self, piece: Vec<u8>, then: Continuation<Result<PieceSent, StreamError>>) {
+        self.live = false;
+        self.conn.post(Event::Piece {
+            seq: self.seq,
+            bytes: piece,
+            then,
+        });
+    }
+
+    /// Ends the body cleanly: the last chunk is written (on HTTP/1.1) and the connection then serves its next
+    /// request, or closes if it was to.
+    pub fn end(mut self) {
+        self.live = false;
+        self.conn.post(Event::StreamEnd {
+            seq: self.seq,
+            clean: true,
+        });
+    }
+
+    /// Asks for `frame` to be offered to the sink if the request is cancelled while the stream is going (the peer
+    /// ended its stream or broke it); the rules are those of [`Responder::on_cancel`], for the whole stream.
+    pub fn on_cancel(&self, frame: Box<dyn Frame>) {
+        self.conn.post(Event::OnCancel {
+            seq: self.seq,
+            frame,
+        });
+    }
+
+    /// Set when the peer ended its stream or broke it while the stream is going; only ever set, never cleared. A
+    /// peer that only half-closed may still read what is sent.
+    pub fn cancelled(&self) -> &Arc<AtomicBool> {
+        &self.cancel
+    }
+}
+
+impl Drop for ReplyStream {
+    fn drop(&mut self) {
+        if self.live {
+            self.conn.post(Event::StreamEnd {
+                seq: self.seq,
+                clean: false,
+            });
+        }
+    }
+}
+
+/// A piece is written: the stream back, and the piece's buffer, emptied, with its capacity kept.
+#[derive(Debug)]
+pub struct PieceSent {
+    pub stream: ReplyStream,
+    pub piece: Vec<u8>,
+}
+
+/// Why a stream did not start or went no further. The stream is gone with it.
+#[derive(Debug)]
+pub enum StreamError {
+    /// The head cannot be written (see [`WriteError`]); the request is answered `500`.
+    Head(WriteError),
+    /// The connection ended (the peer left, a stop cut the connection, or an earlier failure closed it).
+    Closed,
+    /// A write passed `piece_limit`: the peer does not read.
+    TimedOut,
+    /// A write failed.
+    Io(Error),
+}
+
+impl Display for StreamError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            StreamError::Head(error) => {
+                write!(f, "the head of the stream cannot be written: {error}")
+            }
+            StreamError::Closed => f.write_str("the connection ended"),
+            StreamError::TimedOut => f.write_str("a write of the stream passed its time limit"),
+            StreamError::Io(error) => write!(f, "a write of the stream failed: {error}"),
+        }
+    }
+}
+
+impl StdError for StreamError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            StreamError::Head(error) => Some(error),
+            StreamError::Io(error) => Some(error),
+            StreamError::Closed | StreamError::TimedOut => None,
+        }
+    }
+}
+
+/// What a failed send of a stream means to its handler.
+fn stream_error(error: Error) -> StreamError {
+    if LimitPassed::is(&error) {
+        StreamError::TimedOut
+    } else if Cancelled::is(&error) {
+        StreamError::Closed
+    } else {
+        StreamError::Io(error)
     }
 }

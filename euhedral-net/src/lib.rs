@@ -18,7 +18,7 @@ pub mod write;
 #[cfg(any(target_os = "linux", target_os = "android", windows))]
 pub use client::{CallStage, ClientConfig, MAX_INTERIM_RESPONSES, NetError, request};
 #[cfg(any(target_os = "linux", target_os = "android", windows))]
-pub use connection::Responder;
+pub use connection::{PieceSent, ReplyStream, Responder, StreamError};
 pub use message::{
     ConnectionMode, Headers, Method, ParseError, Request, Response, TargetForm, Version,
     WriteError, reason_phrase, status_has_no_body,
