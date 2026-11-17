@@ -19,7 +19,7 @@ frames, sources and receivers, ingest sources, edges, the lattice, metrics.
 | 2 | [`euhedral-core`](euhedral-core/README.md) | Frames and their lifecycle, sources and receivers, the lattice that runs each frame on one pinned worker, ingest sources, executors, metrics. | [glossary](euhedral-core/GLOSSARY.md) |
 | 3 | [`euhedral-graph`](euhedral-graph/README.md) | No-wait dataflow on the lattice: completions, in-order conclusion, lakes, device lanes, stage graphs. | [glossary](euhedral-graph/GLOSSARY.md) |
 | 3 | [`euhedral-io`](euhedral-io/README.md) | File and socket I/O whose completions are frames. | [glossary](euhedral-io/GLOSSARY.md) |
-| 4 | [`euhedral-net`](euhedral-net/README.md) | HTTP/1.1 messages, a strict incremental request and response parser and a writer (the server and client are to follow). | [glossary](euhedral-net/GLOSSARY.md) |
+| 4 | [`euhedral-net`](euhedral-net/README.md) | HTTP/1.1 messages, a strict incremental request and response parser and a writer, a server and a client. A reply can be streamed piece by piece. | [glossary](euhedral-net/GLOSSARY.md) |
 | 4 | [`euhedral-memory`](euhedral-memory/README.md) | Planned memory: budgets, owners, claims, admission, arenas, tiers, a leak check. | [glossary](euhedral-memory/GLOSSARY.md) |
 | 5 | [`euhedral-gpu`](euhedral-gpu/README.md) | GPU streams as lanes, markers, retirement as frames, kernels loaded at run time, recorded graphs. | [glossary](euhedral-gpu/GLOSSARY.md) |
 | 6 | [`euhedral-benchmarks`](euhedral-benchmarks/README.md) | End-to-end benchmarks of the control plane. | [glossary](euhedral-benchmarks/GLOSSARY.md) |
@@ -724,6 +724,13 @@ disagreement is request smuggling.
 **`HeadComplete`** ([`Progress`](euhedral-net/src/parse.rs)): the parser's report that the header lines of a message
 with a body are in and the body is pending. It carries the `Expect: 100-continue` flag, so a server can answer
 `100 Continue` before the body arrives.
+
+**streamed reply** ([`Responder::stream`, `ReplyStream`](euhedral-net/src/connection.rs)): an answer whose body is sent
+piece by piece, for a producer that has the body a part at a time. The handler gets the right to send the rest
+(`ReplyStream`) once the head is written; each piece moves the right into the write and gives it back when the piece is
+out, so one piece is in flight at most and the producer sets the pace; the server holds no queue of pieces. The body is
+chunked on HTTP/1.1, ended by the close on HTTP/1.0 and absent for HEAD. A stream dropped before its end is cut, and the
+connection closes. A held stream keeps the server from reporting its stop, as an unanswered request does.
 
 ### Layer 5: the GPU
 

@@ -14,9 +14,11 @@ TLS, HTTP/2, chunked request bodies (answered 411), compression, routing and JSO
 | [`ParseError`, `WriteError`](src/message.rs) | Why input is refused. `ParseError::status()` is the status a server answers: 400, 411, 413, 414, 431 or 505, and `None` for an error that has no status to send (a response the client cannot read). |
 | [`RequestParser`, `ResponseParser`, `Limits`, `Progress`, `State`, `PendingHead`](src/parse.rs) | The strict, incremental parsers and their size limits. |
 | [`write_response`, `write_response_head`, `write_request`, `write_continue`, `ConnectionMode`](src/write.rs) | The writer. |
-| [`serve`, `ServerConfig`, `ServerHandle`, `Counters`, `Handler`, `no_work`](src/server.rs) | The server: accept loop, connection cap, counters, stop. Linux, Android and Windows. |
+| [`write_chunked_head`, `write_chunk`, `write_last_chunk`](src/write.rs) | The writer for a body sent in pieces: the head with `Transfer-Encoding: chunked`, one chunk, the last chunk. |
+| [`serve`, `ServerConfig`, `ServerHandle`, `Counters`, `Handler`, `no_work`](src/server.rs) | The server: accept loop, connection cap, counters (including `streams` and `streams_cut`), stop. Linux, Android and Windows. |
 | [`request`, `ClientConfig`, `NetError`, `CallStage`](src/client.rs) | The client: one request to a socket address, answered through a continuation. Linux, Android and Windows. |
-| [`Responder`](src/connection.rs) | The one reply of one request, and its cancel flag. |
+| [`Responder`](src/connection.rs) | The one reply of one request, and its cancel flag. `Responder::stream` answers with a reply whose body is sent piece by piece. |
+| [`ReplyStream`, `PieceSent`, `StreamError`](src/connection.rs) | The right to send the rest of a streamed reply, one piece at a time; a piece written; why a stream did not start or went no further. |
 
 ## The parser
 
@@ -68,8 +70,8 @@ is the `Host` value, and it is `None` when there is neither. `PendingHead` also 
 (the crate cannot read chunked bodies yet), and 400 when it is not (RFC 9112 section 6.3). Empty list elements are
 ignored (`chunked,` and `,chunked` are chunked, RFC 9110 section 5.6.1). Any `Transfer-Encoding` on an HTTP/1.0
 request is 400 (section 6.1). The client is minimal: a response must carry `Content-Length` unless it answers HEAD or has a status
-without a body (1xx, 204, 304); a response with `Transfer-Encoding`, or one that ends with the connection, is an
-error the client reports.
+without a body (1xx, 204, 304); a response with `Transfer-Encoding` (so a streamed reply of this crate's server), or one that ends with the
+connection, is an error the client reports.
 
 ## The writer
 
@@ -92,6 +94,22 @@ assert!(write_response(&bad, ConnectionMode::Unspecified, &mut out).is_err());
 The writer sets `Content-Length` from the body, adds `Connection: close` or `keep-alive` as the `ConnectionMode` says (never on a 1xx response: the mode is ignored there), and refuses a method, target, reason phrase, header name or header value that could put a CR, LF
 or other control character into the output. A header named `Content-Length`, `Transfer-Encoding` or `Connection` is
 the writer's: the caller cannot set it. `write_request` also needs exactly one valid `Host` and a target that fits the method, so what it writes parses back. `write_response_head` writes the head of a response to HEAD with the length the body would have. `write_continue` appends the interim `100 Continue`.
+
+A body whose length is not known when the head goes out is sent in the chunked coding: `write_chunked_head` writes the
+head with `Transfer-Encoding: chunked` and no `Content-Length` (and refuses a 1xx, 204 or 304, which have no body),
+`write_chunk` frames one piece (its length in lowercase hexadecimal, CRLF, the bytes, CRLF; an empty piece appends
+nothing, since a zero-length chunk would end the body) and `write_last_chunk` writes `0`, CRLF, CRLF. There are no
+trailers.
+
+```rust
+use euhedral_net::{ConnectionMode, Response, write_chunk, write_chunked_head, write_last_chunk};
+
+let mut out = Vec::new();
+write_chunked_head(&Response::with_status(200), ConnectionMode::Unspecified, &mut out).expect("a valid head");
+write_chunk(b"hello", &mut out);
+write_last_chunk(&mut out);
+assert_eq!(out, b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n");
+```
 
 ## The server
 
@@ -140,6 +158,39 @@ fn start(
   look at the flag: it runs at most once, and is dropped without running if the reply is sent first (the two race, so
   it may also run just after a reply that was still sent, after a half-close). Before a cancel a later call replaces
   the earlier frame; after it, every frame asked for while the reply is still owed runs at once.
+- **Streamed replies.** `Responder::stream(head, then)` answers with a reply whose body is sent piece by piece, for a
+  producer that has the body a part at a time (generated text, a long export). `head` has the status, the headers and
+  a body that, if non-empty, goes out as the first piece in the same write as the head. `then` runs once the head is
+  written, with a `ReplyStream` (or a `StreamError` if the stream did not start); `ReplyStream::send(piece, then)`
+  writes a piece and runs `then` with a `PieceSent`: the stream back, and the piece's `Vec`, emptied, with its capacity
+  kept, to fill again; `ReplyStream::end()` ends the body. The framing is the server's, by the peer's version: HTTP/1.1
+  gets the chunked coding (`Transfer-Encoding: chunked`, a last chunk at the end); HTTP/1.0 gets no length and
+  `Connection: close`, and the close ends the body (so a 1.0 peer cannot tell a cut stream from a finished one); the
+  answer to HEAD is the head alone, with neither `Content-Length` nor `Transfer-Encoding`, and its pieces are dropped
+  (reported written at once). A head the writer refuses, or a 1xx, 204 or 304, is answered `500` and `then` gets
+  `StreamError::Head`.
+  - *One piece at a time.* `send` consumes the stream and it comes back only in `PieceSent`, so a second piece cannot
+    be sent while one is in flight: this is checked by the compiler (a doctest of `ReplyStream` shows it). The pace
+    is the producer's: the server holds no queue of pieces. An empty piece writes nothing and does not end the body.
+    A producer that wants fewer, larger writes joins its pieces before sending.
+  - *Time.* `piece_limit` (default 30 s) bounds each write of the head, a piece and the end; a write that passes it
+    ends the stream with `StreamError::TimedOut` and closes the connection. There is no limit on the gap between two
+    pieces.
+  - *Cancel.* The watch `recv` stays pending during the stream, and `ReplyStream::cancelled()` and `on_cancel(frame)`
+    behave as the `Responder`'s do, for the whole stream: a half-close sets the flag and the stream goes on (the
+    connection closes after it); a broken peer sets the flag, closes the connection and ends the piece in flight (and
+    every later piece) with `StreamError::Closed`. Once pipelined bytes are held no `recv` watches the peer, and a
+    departure shows on a send.
+  - *The end.* `end()` writes the last chunk and the connection then serves its next request (or closes, if the
+    request said `Connection: close`, the peer half-closed or the server is stopping). A `ReplyStream` dropped
+    without `end` cuts the stream: the connection closes with no last chunk, so an HTTP/1.1 peer sees a truncated
+    body; it is counted in `streams_cut`, as is a write that failed or passed `piece_limit` and a peer that left. A
+    pipelined request behind a stream is answered after its end.
+  - *Stop.* A stream runs to its end, and the connection closes after it; the stop is not reported while a
+    `ReplyStream` is held or a piece is in flight, so the program ends its streams when it stops (as it answers its
+    requests). The stop does not set the cancel flag.
+  - *Where `then` runs.* Inside the connection's own frame, under `catch_unwind`: it must return quickly. The frame
+    it returns is offered to the sink; a `then` that panics drops the stream it was given, which cuts it.
 - **One source per connection.** A connection's parser, buffers and socket are plain state that only its key frame
   touches (see the glossary: station). Requests on one connection are answered in the order they arrived, one at a
   time; pipelined bytes wait in the buffer. Different connections run in parallel.
@@ -149,7 +200,7 @@ fn start(
   well formed); the handler is not consulted and cannot refuse it. A body over `max_body_bytes` is answered 413 at
   the head, before it is read.
 - **Limits.** `read_limit` covers a request from its first byte, `idle_limit` the wait for the first byte of a
-  request, `write_limit` each reply. A passed read limit after the first byte is answered 408 and closes; any
+  request, `write_limit` each reply, `piece_limit` each write of a streamed reply (head, piece, end). A passed read limit after the first byte is answered 408 and closes; any
   other passed limit closes without a reply. `None` is no limit.
 - **Half-close.** A peer that ends its stream while its request is handled sets the cancel flag as a hint, but the
   reply is still sent (with `Connection: close`) and the connection then closes; a reply is discarded only if its
@@ -177,7 +228,10 @@ fn start(
   and amortised over many requests. It is not free.
 - **Allocated.** Per connection: the connection record (one `Arc`), a parser, a buffer for unparsed bytes and one
   read buffer of `read_chunk` bytes, kept between reads. Per request: the `Request` the parser builds, the
-  `Responder`, the response and its serialised bytes, and the frame each I/O completion returns.
+  `Responder`, the response and its serialised bytes, and the frame each I/O completion returns. A streamed reply
+  adds, per piece, the continuation's box and the frame it returns, and the continuation and frame of the send; the
+  piece's bytes are copied once into the stream's send buffer (kept for the whole stream, since `AsyncIo` has no
+  vectored send), and the caller's `Vec` comes back for reuse.
 
 ## The client
 
