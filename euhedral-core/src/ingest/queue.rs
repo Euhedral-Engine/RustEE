@@ -16,8 +16,9 @@ use std::sync::{Arc, OnceLock, Weak};
 
 type Consumer = PartitionedConsumer<Box<dyn Frame>, Single>;
 
-/// The chunk size of the default queue.
-pub(super) const DEFAULT_CHUNK: usize = 8192;
+/// The chunk size of the default queue. Under Miri it is small: initialising a chunk of the full size is most of what a
+/// test that builds a queue costs there, and a small chunk also makes the tests cross chunk boundaries.
+pub(super) const DEFAULT_CHUNK: usize = if cfg!(miri) { 64 } else { 8192 };
 
 /// When a source that was told to finish completes.
 #[derive(Clone, Copy, PartialEq, Eq)]

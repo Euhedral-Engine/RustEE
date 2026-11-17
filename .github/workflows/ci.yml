@@ -22,9 +22,29 @@
 # completion port).
 name: ci
 
+# A manual run takes optional inputs, which a caller that is not GitHub (a pipeline elsewhere that runs the parts GitHub
+# is needed for) uses to select what runs: `only_os` limits the workspace job to one runner and skips Miri,
+# `base_ref` selects the affected crates against that branch as a pull request does (empty:
+# everything), and `proxy_id` is an identifier shown in the name of the run, so the caller can find the run it started.
 on:
   pull_request:
   workflow_dispatch:
+    inputs:
+      only_os:
+        description: Run the workspace job on this runner only, and nothing else
+        type: choice
+        options: [all, ubuntu-latest, windows-2025]
+        default: all
+      base_ref:
+        description: Branch to compare with, to run what a pull request against it would run (empty runs everything)
+        type: string
+        default: ""
+      proxy_id:
+        description: An identifier shown in the name of the run, so the caller can find it
+        type: string
+        default: ""
+
+run-name: ${{ inputs.proxy_id && format('ci [{0}]', inputs.proxy_id) || github.event.pull_request.title || github.ref_name }}
 
 # One run per branch or pull request: a push aborts the run it supersedes (its `ci-ok` is then red for the old commit
 # only; the check of the new head commit is the new run's).
@@ -68,17 +88,24 @@ jobs:
         run: |
           python3 scripts/ci/test_affected.py
           python3 scripts/ci/test_miri_build.py
+          python3 scripts/ci/test_gitlab_pipeline.py
 
       - name: Compute the affected crates
         id: affected
         env:
           EVENT: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}
+          BASE_INPUT: ${{ inputs.base_ref }}
         run: |
           case "$EVENT" in
             # Against the merge base with the PR's base branch, which is not always main (stacked PRs).
             pull_request) python3 scripts/ci/affected.py --base "origin/$BASE_REF" --head HEAD --merge-base --github-output "$GITHUB_OUTPUT" ;;
-            *) python3 scripts/ci/affected.py --all --github-output "$GITHUB_OUTPUT" ;;
+            *)
+              if [ -n "$BASE_INPUT" ]; then
+                python3 scripts/ci/affected.py --base "origin/$BASE_INPUT" --head HEAD --merge-base --github-output "$GITHUB_OUTPUT"
+              else
+                python3 scripts/ci/affected.py --all --github-output "$GITHUB_OUTPUT"
+              fi ;;
           esac
 
   workspace:
@@ -87,7 +114,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-2025]
+        os: ${{ fromJSON(inputs.only_os && inputs.only_os != 'all' && format('["{0}"]', inputs.only_os) || '["ubuntu-latest","windows-2025"]') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     # Bash everywhere: it stops at the first failing command of a multi-line step, which PowerShell does not.
@@ -192,13 +219,19 @@ jobs:
   # compare-exchanges fail spuriously, so seeds matter where threads race and little in a test with one thread: 1 for
   # such a test. A test with threads gets 4 only if a loom model runs the same code and asserts the same property (Miri
   # then looks for undefined behaviour and aliasing; loom does not check SeqCst store-to-load orderings); otherwise 16.
+  # The rule is unchanged: the seeds are what finds a race, and the time went elsewhere (below), so none is dropped.
+  #
+  # Miri runs each seed on its own thread, so a job's seeds are the cores it uses: a shard of more than 8 seeds is
+  # split into jobs of at most 8 (scripts/ci/affected.py). On the project's runner each job asks the arbiter for those
+  # cores; a GitHub runner has fewer cores, and the seeds then share them. The pools and queues the tests create are small under `cfg(miri)`, because filling a
+  # 4096-frame pool dominated a test's time under Miri and says nothing more about undefined behaviour.
   #
   # Nothing is built twice: `miri-build` builds Miri's sysroot and, once, every selection of tests the shards run, and
   # hands its target directory and sysroot to the shards as an artifact (a tarball, which keeps file times), so a
   # shard only installs the toolchain and runs tests.
   miri-build:
     needs: changes
-    if: needs.changes.outputs.miri == 'true'
+    if: needs.changes.outputs.miri == 'true' && (!inputs.only_os || inputs.only_os == 'all')
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -227,6 +260,8 @@ jobs:
           cargo miri setup
           python3 scripts/ci/miri_build.py --matrix "$MATRIX" > miri-build.sh
           bash -ex miri-build.sh
+          # A name in a shard that no test has (a renamed test) would silently drop it from the run.
+          python3 scripts/ci/miri_build.py --check-names --matrix "$MATRIX"
 
       # The commit the build is of: a shard refuses a build that is not of its own checkout.
       - name: Pack the target directory and the sysroot
@@ -246,14 +281,14 @@ jobs:
   miri:
     name: miri (${{ matrix.name }})
     needs: [changes, miri-build]
-    if: needs.changes.outputs.miri == 'true'
+    if: needs.changes.outputs.miri == 'true' && (!inputs.only_os || inputs.only_os == 'all')
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.changes.outputs.miri_matrix) }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      MIRIFLAGS: -Zmiri-many-seeds=0..${{ matrix.seeds }} -Zmiri-ignore-leaks
+      MIRIFLAGS: ${{ matrix.miriflags }}
       COMMANDS: ${{ matrix.commands }}
     steps:
       - uses: actions/checkout@v4

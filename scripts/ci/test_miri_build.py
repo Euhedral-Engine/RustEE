@@ -54,5 +54,39 @@ class BuildCommands(unittest.TestCase):
         self.assertTrue(all(b.startswith("cargo miri test --no-run -p ") and " -- " not in b for b in built), built)
 
 
+class StaleNames(unittest.TestCase):
+    TESTS = {"a::tests::one", "a::tests::two_threads", "b::tests::three"}
+
+    def test_names_that_exist_pass(self):
+        self.assertEqual(M.name_problems("cargo miri test -p x --lib -- a::tests --skip a::tests::two", self.TESTS), [])
+        self.assertEqual(M.name_problems("cargo miri test -p x --lib -- --exact a::tests::one b::tests::three", self.TESTS), [])
+
+    def test_a_renamed_exact_name_is_a_problem(self):
+        problems = M.name_problems("cargo miri test -p x --lib -- --exact a::tests::one a::tests::two", self.TESTS)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("a::tests::two'", problems[0])
+
+    def test_a_stale_skip_or_filter_is_a_problem(self):
+        self.assertEqual(len(M.name_problems("cargo miri test -p x --lib -- a --skip a::tests::gone", self.TESTS)), 1)
+        self.assertEqual(len(M.name_problems("cargo miri test -p x --lib -- c::tests", self.TESTS)), 1)
+
+    def test_a_selection_is_listed_once_and_a_stale_name_fails_the_check(self):
+        calls = []
+
+        def lister(command):
+            calls.append(command)
+            return self.TESTS
+
+        commands = ["cargo miri test -p x --lib -- a", "cargo miri test -p x --lib -- --exact a::tests::old"]
+        self.assertEqual(len(M.check_names(commands, lister)), 1)
+        self.assertEqual(len(calls), 1)
+
+    def test_the_list_command_keeps_the_selection(self):
+        self.assertEqual(
+            M.list_command("cargo miri test -p x --features fake --lib -- a --skip b"),
+            ["cargo", "miri", "test", "-p", "x", "--features", "fake", "--lib", "--", "--list", "--format", "terse"],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

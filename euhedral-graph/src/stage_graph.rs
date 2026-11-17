@@ -1014,10 +1014,11 @@ fn give_back<T>(to: &Weak<Producer<T, Multi>>, item: T) {
 
 /// The polls a take makes while the pool holds something it could not take yet.
 const TAKE_TRIES: usize = 1 << 16;
-/// Quanta kept for reuse.
-const POOLED_RUNS: usize = 256;
+/// Quanta kept for reuse. Under Miri the pools are small: allocating and initialising a queue of the full size is most
+/// of what a test costs there, and a small pool is the one that fills, so the full-pool path runs too.
+const POOLED_RUNS: usize = if cfg!(miri) { 16 } else { 256 };
 /// Frames kept for reuse.
-const POOLED_FRAMES: usize = 4096;
+const POOLED_FRAMES: usize = if cfg!(miri) { 64 } else { 4096 };
 
 impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> StageGraph<Q, L> {
     /// `stages[i]` implements `spec.stages()[i]`. `retire` runs once per quantum, in a frame, after its boundary: the

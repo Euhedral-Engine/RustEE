@@ -36,7 +36,9 @@ Outputs (stdout as `key=value`, and to --github-output):
   <crate>      `true` or `false` per workspace crate, the name with `-` as `_` (euhedral_core)
   miri         `true` if any Miri shard runs
   miri_matrix  a `{"include": [...]}` matrix of the Miri shards (scripts/ci/miri-shards.json) that run; each entry has
-               the shard's name, its commands (newline-joined), its seeds (how many seeds Miri runs) and why it runs
+               the job's name, its commands (newline-joined), its seeds (how many), its seed range, the MIRIFLAGS it runs
+               with, the cores (`cpu`) and memory (`mem`) it asks for, and why it runs. A shard with more seeds than
+               SEEDS_PER_JOB becomes several jobs, each with a part of the range.
   miri_reasons the same reasons on one line (`name: why | name: why`)
   reason       one line saying why the workspace jobs run
 """
@@ -187,6 +189,8 @@ def shard_problems(shards):
         seeds = s.get("seeds")
         if type(seeds) is not int or seeds < 1:
             problems.append(f"{name}: seeds must be a positive whole number, not {seeds!r}")
+        if "mem" in s and not (isinstance(s["mem"], str) and s["mem"][:-1].isdigit() and s["mem"][-1] in "MG"):
+            problems.append(f"{name}: mem is a size such as 2G, not {s['mem']!r}")
         if "canary" in s and s["canary"] is not True:
             problems.append(f"{name}: canary is true or absent")
         commands = s.get("commands")
@@ -225,14 +229,41 @@ def miri_everything(shards, reason):
     return [(s, reason) for s in shards]
 
 
+# Miri runs the seeds of one job on one thread each (RAYON_NUM_THREADS does not limit it), so a job's seeds are the
+# cores it uses: a shard with more seeds than this is split into jobs that each take a part of the range.
+SEEDS_PER_JOB = 8
+# The memory a Miri job asks for when its shard does not say (`"mem"`): the peak of a job measured at 0.5 GB and of
+# eight seeds at 1 GB, with a margin.
+MIRI_MEM = "2G"
+# Leaks are ignored: the lock-free sources park frames on purpose. (Running the tests one at a time made no difference
+# to the time: Miri interleaves a process's threads on one core either way.)
+MIRIFLAGS = "-Zmiri-ignore-leaks"
+
+
+def seed_ranges(seeds):
+    """`[(from, to)]`: `seeds` seeds in as few jobs of at most SEEDS_PER_JOB as are needed, of equal size."""
+    jobs = -(-seeds // SEEDS_PER_JOB)
+    size = -(-seeds // jobs)
+    return [(lo, min(lo + size, seeds)) for lo in range(0, seeds, size)]
+
+
 def miri_matrix(selection):
-    """The matrix for the Miri jobs: one entry per selected (shard, why)."""
-    return {
-        "include": [
-            {"name": s["name"], "seeds": s["seeds"], "commands": "\n".join(s["commands"]), "reason": why}
-            for s, why in selection
-        ]
-    }
+    """The matrix for the Miri jobs: one entry per selected (shard, why) and seed range."""
+    include = []
+    for s, why in selection:
+        ranges = seed_ranges(s["seeds"])
+        for lo, hi in ranges:
+            include.append({
+                "name": s["name"] if len(ranges) == 1 else f"{s['name']} (seeds {lo}..{hi})",
+                "seeds": hi - lo,
+                "seed_range": f"{lo}..{hi}",
+                "miriflags": f"-Zmiri-many-seeds={lo}..{hi} {MIRIFLAGS}",
+                "cpu": hi - lo,
+                "mem": s.get("mem", MIRI_MEM),
+                "commands": "\n".join(s["commands"]),
+                "reason": why,
+            })
+    return {"include": include}
 
 
 def outputs(graph, crates, everything, reason, selection=()):

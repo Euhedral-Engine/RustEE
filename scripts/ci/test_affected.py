@@ -207,6 +207,34 @@ class Miri(unittest.TestCase):
         self.assertEqual(A.shard_problems(shards), [])
         self.assertEqual([s["name"] for s in shards if s.get("canary")], ["hardware-utils: CPU sets"])
 
+    def test_seeds_are_split_into_jobs_that_cover_the_range_once(self):
+        self.assertEqual(A.seed_ranges(1), [(0, 1)])
+        self.assertEqual(A.seed_ranges(4), [(0, 4)])
+        self.assertEqual(A.seed_ranges(8), [(0, 8)])
+        self.assertEqual(A.seed_ranges(16), [(0, 8), (8, 16)])
+        self.assertEqual(A.seed_ranges(20), [(0, 7), (7, 14), (14, 20)])
+        for n in range(1, 70):
+            ranges = A.seed_ranges(n)
+            self.assertEqual([i for lo, hi in ranges for i in range(lo, hi)], list(range(n)), n)
+            self.assertTrue(all(0 < hi - lo <= A.SEEDS_PER_JOB for lo, hi in ranges), n)
+
+    def test_a_shard_with_many_seeds_is_several_jobs_that_ask_for_their_own_cores(self):
+        include = json.loads(self.matrix("euhedral-core/src/a.rs")["miri_matrix"])["include"]
+        jobs = [e for e in include if e["name"].startswith("a")]
+        self.assertEqual([(e["name"], e["seeds"], e["cpu"], e["seed_range"]) for e in jobs],
+                         [("a (seeds 0..8)", 8, 8, "0..8"), ("a (seeds 8..16)", 8, 8, "8..16")])
+        self.assertEqual({e["commands"] for e in jobs}, {"c1\nc2"})
+        self.assertIn("-Zmiri-many-seeds=8..16 ", jobs[1]["miriflags"])
+        self.assertIn("-Zmiri-ignore-leaks", jobs[1]["miriflags"])
+        self.assertEqual(jobs[0]["mem"], A.MIRI_MEM)
+
+    def test_a_shard_can_name_its_memory(self):
+        shards = [{**self.SHARDS[1], "mem": "3G", "commands": ["cargo miri test -p graph --lib"]}]
+        [entry] = A.miri_matrix([(shards[0], "why")])["include"]
+        self.assertEqual((entry["mem"], entry["cpu"], entry["seed_range"]), ("3G", 4, "0..4"))
+        self.assertTrue(A.shard_problems([{**shards[0], "mem": "lots"}]))
+        self.assertEqual(A.shard_problems(shards), [])
+
     def test_a_shard_needs_its_seeds_a_name_and_miri_commands(self):
         good = {"name": "a", "crate": "core", "seeds": 4, "commands": ["cargo miri test -p core --lib"]}
         self.assertEqual(A.shard_problems([good]), [])
