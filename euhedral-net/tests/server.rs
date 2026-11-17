@@ -26,7 +26,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, OnceLock};
 use std::thread::sleep;
-#[cfg(unix)]
 use std::thread::yield_now;
 use std::time::{Duration, Instant};
 
@@ -39,8 +38,8 @@ use euhedral_graph::Completions;
 use euhedral_hardware_utils::affinity;
 use euhedral_io::AsyncIo;
 use euhedral_net::{
-    Counters, Handler, Request, Responder, Response, ResponseParser, ServerConfig, ServerHandle,
-    no_work, serve,
+    Counters, Handler, PieceSent, ReplyStream, Request, Responder, Response, ResponseParser,
+    ServerConfig, ServerHandle, StreamError, no_work, serve,
 };
 use euhedral_net::{Limits, Progress};
 
@@ -303,6 +302,47 @@ impl Peer {
         self.read_response(false)
     }
 
+    /// The next bytes on the connection are exactly `expected`. A byte that differs fails at once, without waiting
+    /// for the rest.
+    fn expect_wire(&mut self, expected: &[u8]) {
+        let mut chunk = vec![0u8; 64 * 1024];
+        while self.buf.len() < expected.len() {
+            let seen = self.buf.len().min(expected.len());
+            assert_eq!(
+                String::from_utf8_lossy(&self.buf[..seen]),
+                String::from_utf8_lossy(&expected[..seen]),
+                "the wire differs from what was expected"
+            );
+            let n = read_on(&mut self.stream, &mut chunk).expect("the server's bytes");
+            assert!(
+                n > 0,
+                "the server closed the connection after {:?}",
+                String::from_utf8_lossy(&self.buf)
+            );
+            self.buf.extend_from_slice(&chunk[..n]);
+        }
+        assert_eq!(
+            String::from_utf8_lossy(&self.buf[..expected.len()]),
+            String::from_utf8_lossy(expected),
+            "the wire differs from what was expected"
+        );
+        self.buf.drain(..expected.len());
+    }
+
+    /// Everything up to the end of the stream (or a reset).
+    fn read_to_end(&mut self) -> Vec<u8> {
+        let mut all = std::mem::take(&mut self.buf);
+        let mut chunk = vec![0u8; 64 * 1024];
+        loop {
+            match read_on(&mut self.stream, &mut chunk) {
+                Ok(0) => return all,
+                Ok(n) => all.extend_from_slice(&chunk[..n]),
+                Err(e) if e.kind() == ErrorKind::ConnectionReset => return all,
+                Err(e) => panic!("no end of stream: {e}"),
+            }
+        }
+    }
+
     /// The server closed the connection and sent nothing more.
     fn expect_closed(&mut self) {
         assert!(self.buf.is_empty(), "bytes the test did not expect");
@@ -355,7 +395,6 @@ fn parking() -> (impl Handler, Receiver<Parked>) {
 }
 
 /// Waits for a condition that the server alone makes true and that has no event to wait on.
-#[cfg(unix)]
 fn until(what: &str, mut condition: impl FnMut() -> bool) {
     let limit = Instant::now() + PATIENCE;
     while !condition() {
@@ -1191,4 +1230,653 @@ fn a_failing_accept_is_counted_and_retried_after_the_back_off_and_stop_still_com
     let counters = server.finish();
     assert!(counters.accept_errors >= 3);
     assert_eq!(counters.accepted, 0);
+}
+
+// ---- streamed replies ---------------------------------------------------------------------------------------
+
+type Started = Result<ReplyStream, StreamError>;
+type Sent = Result<PieceSent, StreamError>;
+
+/// A handler that answers `/ok` at once and answers everything else with a streamed reply whose head `head` makes
+/// from the request: the test thread gets what `then` was given through the channel.
+fn streaming(
+    head: impl Fn(&Request) -> Response + Send + Sync + 'static,
+) -> (impl Handler, Receiver<Started>) {
+    let (tx, rx) = channel::<Started>();
+    let handler = move |request: Request, reply: Responder| -> Box<dyn Frame> {
+        if request.target == "/ok" {
+            reply.send(Response::with_status(200).with_body("ok"));
+            return no_work();
+        }
+        let response = head(&request);
+        let tx = tx.clone();
+        reply.stream(
+            response,
+            Box::new(move |started| {
+                let _ = tx.send(started);
+                no_work()
+            }),
+        );
+        no_work()
+    };
+    (handler, rx)
+}
+
+fn ok_head(_request: &Request) -> Response {
+    Response::with_status(200).header("X-Kind", "s")
+}
+
+fn started(rx: &Receiver<Started>) -> ReplyStream {
+    rx.recv_timeout(PATIENCE)
+        .expect("the head was not reported")
+        .expect("the stream did not start")
+}
+
+/// Sends a piece and returns what the continuation was given.
+fn try_piece(stream: ReplyStream, bytes: &[u8]) -> Sent {
+    let (tx, rx) = channel::<Sent>();
+    stream.send(
+        bytes.to_vec(),
+        Box::new(move |sent| {
+            let _ = tx.send(sent);
+            no_work()
+        }),
+    );
+    rx.recv_timeout(PATIENCE)
+        .expect("the piece was not reported")
+}
+
+/// Sends a piece that must be written and returns the stream.
+fn piece(stream: ReplyStream, bytes: &[u8]) -> ReplyStream {
+    let sent = try_piece(stream, bytes).expect("the piece was not written");
+    assert!(sent.piece.is_empty(), "the buffer came back with bytes");
+    assert!(
+        sent.piece.capacity() >= bytes.len(),
+        "the buffer's capacity was lost"
+    );
+    sent.stream
+}
+
+const STREAM_GET: &[u8] = b"GET /s HTTP/1.1\r\nHost: t\r\n\r\n";
+const STREAM_HEAD: &[u8] = b"HTTP/1.1 200 OK\r\nX-Kind: s\r\nTransfer-Encoding: chunked\r\n\r\n";
+
+#[test]
+fn a_streamed_reply_goes_out_piece_by_piece_and_the_connection_is_kept() {
+    let (handler, rx) = streaming(ok_head);
+    let server = Fixture::start(config(), handler);
+    let mut peer = server.connect();
+    peer.send(STREAM_GET);
+    let stream = started(&rx);
+    // The head is out before any piece was given.
+    peer.expect_wire(STREAM_HEAD);
+    let stream = piece(stream, b"hello");
+    peer.expect_wire(b"5\r\nhello\r\n");
+    let stream = piece(stream, &[b'a'; 255]);
+    let mut expected = b"ff\r\n".to_vec();
+    expected.extend_from_slice(&[b'a'; 255]);
+    expected.extend_from_slice(b"\r\n");
+    peer.expect_wire(&expected);
+    stream.end();
+    peer.expect_wire(b"0\r\n\r\n");
+    // The connection serves its next request.
+    assert_eq!(text(&peer.get("/ok")), "ok");
+    drop(peer);
+    let counters = server.finish();
+    assert_eq!(
+        (
+            counters.requests,
+            counters.streams,
+            counters.streams_cut,
+            counters.replies_2xx
+        ),
+        (2, 1, 0, 2)
+    );
+}
+
+#[test]
+fn an_empty_piece_writes_nothing_and_does_not_end_the_stream() {
+    let (handler, rx) = streaming(ok_head);
+    let server = Fixture::start(config(), handler);
+    let mut peer = server.connect();
+    peer.send(STREAM_GET);
+    let stream = started(&rx);
+    peer.expect_wire(STREAM_HEAD);
+    // The empty piece is reported as written, and the next bytes on the wire are those of the piece after it.
+    let stream = piece(stream, b"");
+    let stream = piece(stream, b"a");
+    peer.expect_wire(b"1\r\na\r\n");
+    stream.end();
+    peer.expect_wire(b"0\r\n\r\n");
+    assert_eq!(text(&peer.get("/ok")), "ok");
+    drop(peer);
+    server.finish();
+}
+
+#[test]
+fn a_head_with_a_body_sends_it_as_the_first_piece() {
+    let (handler, rx) = streaming(|_| Response::with_status(200).with_body("first"));
+    let server = Fixture::start(config(), handler);
+    let mut peer = server.connect();
+    peer.send(STREAM_GET);
+    let stream = started(&rx);
+    peer.expect_wire(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nfirst\r\n");
+    let stream = piece(stream, b"second");
+    peer.expect_wire(b"6\r\nsecond\r\n");
+    stream.end();
+    peer.expect_wire(b"0\r\n\r\n");
+    drop(peer);
+    server.finish();
+}
+
+#[test]
+fn a_dropped_stream_closes_the_connection_without_the_last_chunk() {
+    let (handler, rx) = streaming(ok_head);
+    let server = Fixture::start(config(), handler);
+    let mut peer = server.connect();
+    peer.send(STREAM_GET);
+    let stream = started(&rx);
+    peer.expect_wire(STREAM_HEAD);
+    let stream = piece(stream, b"x");
+    peer.expect_wire(b"1\r\nx\r\n");
+    drop(stream);
+    // The body ends here with no last chunk: what follows is the end of the connection.
+    peer.expect_closed();
+    drop(peer);
+    let counters = server.finish();
+    assert_eq!((counters.streams, counters.streams_cut), (1, 1));
+}
+
+#[test]
+fn a_stream_to_http_1_0_is_ended_by_the_close() {
+    let (handler, rx) = streaming(ok_head);
+    let server = Fixture::start(config(), handler);
+    let mut peer = server.connect();
+    peer.send(b"GET /s HTTP/1.0\r\nConnection: keep-alive\r\n\r\n");
+    let stream = started(&rx);
+    // No chunked coding and no length: the close ends the body, so `keep-alive` is not honoured.
+    peer.expect_wire(b"HTTP/1.1 200 OK\r\nX-Kind: s\r\nConnection: close\r\n\r\n");
+    let stream = piece(stream, b"ab");
+    peer.expect_wire(b"ab");
+    stream.end();
+    assert_eq!(peer.read_to_end(), b"");
+    drop(peer);
+    let counters = server.finish();
+    assert_eq!((counters.streams, counters.streams_cut), (1, 0));
+}
+
+#[test]
+fn a_stream_to_head_sends_the_head_only_and_keeps_the_connection() {
+    let (handler, rx) = streaming(|_| {
+        Response::with_status(200)
+            .header("X-Kind", "s")
+            .with_body("dropped")
+    });
+    let server = Fixture::start(config(), handler);
+    let mut peer = server.connect();
+    peer.send(b"HEAD /s HTTP/1.1\r\nHost: t\r\n\r\n");
+    let stream = started(&rx);
+    peer.expect_wire(b"HTTP/1.1 200 OK\r\nX-Kind: s\r\n\r\n");
+    // The pieces are reported written and nothing goes out.
+    let stream = piece(stream, b"abc");
+    stream.end();
+    // The next thing on the wire is the answer to the next request.
+    assert_eq!(text(&peer.get("/ok")), "ok");
+    drop(peer);
+    let counters = server.finish();
+    assert_eq!((counters.streams, counters.streams_cut), (1, 0));
+}
+
+#[test]
+fn a_connection_close_request_gets_its_stream_and_then_closes() {
+    let (handler, rx) = streaming(ok_head);
+    let server = Fixture::start(config(), handler);
+    let mut peer = server.connect();
+    peer.send(b"GET /s HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+    let stream = started(&rx);
+    peer.expect_wire(
+        b"HTTP/1.1 200 OK\r\nX-Kind: s\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+    );
+    let stream = piece(stream, b"abc");
+    peer.expect_wire(b"3\r\nabc\r\n");
+    stream.end();
+    peer.expect_wire(b"0\r\n\r\n");
+    peer.expect_closed();
+    drop(peer);
+    server.finish();
+}
+
+#[test]
+fn a_stream_head_that_cannot_be_written_answers_500_and_reports_it() {
+    let (handler, rx) = streaming(|request| match request.target.as_str() {
+        "/204" => Response::with_status(204),
+        "/line" => Response::with_status(200).header("X", "a\r\nSet-Cookie: b"),
+        _ => Response::with_status(200).header("Content-Length", "3"),
+    });
+    let server = Fixture::start(config(), handler);
+    let mut peer = server.connect();
+    for (target, expected) in [
+        ("/204", "BodyNotAllowed"),
+        ("/line", "BadHeaderValue"),
+        ("/length", "ReservedHeader"),
+    ] {
+        let mut request = Vec::new();
+        request.extend_from_slice(format!("GET {target} HTTP/1.1\r\nHost: t\r\n\r\n").as_bytes());
+        peer.send(&request);
+        match rx
+            .recv_timeout(PATIENCE)
+            .expect("the head was not reported")
+        {
+            Err(StreamError::Head(error)) => assert_eq!(format!("{error:?}"), expected),
+            other => panic!("{target}: {other:?}"),
+        }
+        assert_eq!(peer.read_response(false).status, 500, "{target}");
+    }
+    // The connection is still open.
+    assert_eq!(text(&peer.get("/ok")), "ok");
+    drop(peer);
+    let counters = server.finish();
+    assert_eq!(
+        (counters.streams, counters.replies_5xx, counters.replies_2xx),
+        (0, 3, 1)
+    );
+}
+
+#[test]
+fn a_peer_that_stops_reading_passes_the_piece_limit_and_the_piece_reports_it() {
+    let limit = Duration::from_millis(150);
+    let size = 64 * 1024 * 1024;
+    let (handler, rx) = streaming(ok_head);
+    let server = Fixture::start(
+        ServerConfig {
+            piece_limit: Some(limit),
+            ..config()
+        },
+        handler,
+    );
+    let mut peer = server.connect();
+    peer.send(STREAM_GET);
+    let stream = started(&rx);
+    // The peer reads nothing of the piece, which is larger than the connection can hold.
+    let began = Instant::now();
+    let result = try_piece(stream, &vec![b'x'; size]);
+    assert!(began.elapsed() >= limit, "the limit did not pass");
+    assert!(
+        matches!(result, Err(StreamError::TimedOut)),
+        "the piece ended with {result:?}"
+    );
+    let got = peer.read_to_end().len();
+    assert!(got < size, "the whole piece went out");
+    drop(peer);
+    let counters = server.finish();
+    assert_eq!(
+        (counters.limits_passed, counters.streams_cut),
+        (1, 1),
+        "the cut is counted once"
+    );
+}
+
+#[test]
+fn a_peer_that_leaves_mid_stream_runs_the_cancel_frame_and_the_next_piece_reports_closed() {
+    let (handler, rx) = streaming(ok_head);
+    let server = Fixture::start(config(), handler);
+    let mut peer = server.connect();
+    peer.send(STREAM_GET);
+    let stream = started(&rx);
+    let (woken, cancelled) = signal();
+    stream.on_cancel(woken);
+    // The head is left unread: closing a socket that holds unread data resets the connection.
+    let mut probe = [0u8; 1];
+    peek_on(&mut peer.stream, &mut probe);
+    drop(peer);
+    cancelled
+        .recv_timeout(PATIENCE)
+        .expect("the frame for the cancel did not run");
+    assert!(stream.cancelled().load(Ordering::Acquire));
+    let result = try_piece(stream, b"late");
+    assert!(
+        matches!(result, Err(StreamError::Closed)),
+        "the piece ended with {result:?}"
+    );
+    let counters = server.finish();
+    assert_eq!(
+        (counters.cancelled, counters.streams_cut, counters.discarded),
+        (1, 1, 0)
+    );
+}
+
+#[test]
+fn a_half_closed_peer_gets_the_whole_stream_and_then_the_connection_closes() {
+    let (handler, rx) = streaming(ok_head);
+    let server = Fixture::start(config(), handler);
+    let mut peer = server.connect();
+    peer.send(STREAM_GET);
+    let stream = started(&rx);
+    let (woken, cancelled) = signal();
+    stream.on_cancel(woken);
+    peer.stream.shutdown(Shutdown::Write).unwrap();
+    // The flag is a hint that the peer's end of the stream was seen; the stream goes on.
+    cancelled
+        .recv_timeout(PATIENCE)
+        .expect("the frame for the cancel did not run");
+    assert!(stream.cancelled().load(Ordering::Acquire));
+    peer.expect_wire(STREAM_HEAD);
+    let stream = piece(stream, b"abc");
+    peer.expect_wire(b"3\r\nabc\r\n");
+    stream.end();
+    peer.expect_wire(b"0\r\n\r\n");
+    peer.expect_closed();
+    drop(peer);
+    let counters = server.finish();
+    assert_eq!(
+        (counters.cancelled, counters.streams, counters.streams_cut),
+        (1, 1, 0)
+    );
+}
+
+#[test]
+fn stop_lets_a_stream_end_and_is_not_reported_while_the_stream_is_held() {
+    let (handler, rx) = streaming(ok_head);
+    let server = Fixture::start(config(), handler);
+    let mut peer = server.connect();
+    peer.send(STREAM_GET);
+    let stream = started(&rx);
+    peer.expect_wire(STREAM_HEAD);
+    server.begin_stop();
+    // A piece goes out and comes back after the stop was recorded: the stream is still ours, and the server has not
+    // reported. (It is the end of the stream, not a wait, that lets the server finish: the next lines end it.)
+    let stream = piece(stream, b"abc");
+    peer.expect_wire(b"3\r\nabc\r\n");
+    assert!(server.stopped.try_recv().is_err());
+    assert_eq!(server.handle.counters().open, 1);
+    stream.end();
+    peer.expect_wire(b"0\r\n\r\n");
+    // The stop closes the connection after the stream, which the peer sees.
+    peer.expect_closed();
+    drop(peer);
+    server
+        .stopped
+        .recv_timeout(PATIENCE)
+        .expect("the server did not report that it stopped");
+    assert_eq!(server.handle.counters().streams_cut, 0);
+    server.finish();
+}
+
+#[test]
+fn a_pipelined_request_behind_a_stream_is_answered_after_its_end() {
+    let (handler, rx) = streaming(ok_head);
+    let server = Fixture::start(config(), handler);
+    let mut peer = server.connect();
+    peer.send(b"GET /s HTTP/1.1\r\nHost: t\r\n\r\nGET /ok HTTP/1.1\r\nHost: t\r\n\r\n");
+    let stream = started(&rx);
+    peer.expect_wire(STREAM_HEAD);
+    let stream = piece(stream, b"abc");
+    peer.expect_wire(b"3\r\nabc\r\n");
+    // The second request is held back while the stream goes on.
+    assert_eq!(server.handle.counters().requests, 1);
+    stream.end();
+    peer.expect_wire(b"0\r\n\r\n");
+    let response = peer.read_response(false);
+    assert_eq!((response.status, text(&response)), (200, "ok"));
+    drop(peer);
+    let counters = server.finish();
+    assert_eq!((counters.requests, counters.streams_cut), (2, 0));
+}
+
+#[test]
+fn a_stream_head_given_after_the_peer_left_reports_closed_and_is_discarded() {
+    let (handler, parked) = parking();
+    let server = Fixture::start(config(), handler);
+    let mut peer = server.connect();
+    assert_eq!(text(&peer.get("/ok")), "ok");
+    peer.send(b"GET /ok HTTP/1.1\r\nHost: t\r\n\r\nGET /slow HTTP/1.1\r\nHost: t\r\n\r\n");
+    let (_, reply) = parked.recv_timeout(PATIENCE).unwrap();
+    let (woken, cancelled) = signal();
+    reply.on_cancel(woken);
+    let mut probe = [0u8; 1];
+    peek_on(&mut peer.stream, &mut probe);
+    drop(peer);
+    cancelled
+        .recv_timeout(PATIENCE)
+        .expect("the frame for the cancel did not run");
+    let (tx, rx) = channel::<Started>();
+    reply.stream(
+        Response::with_status(200),
+        Box::new(move |started| {
+            let _ = tx.send(started);
+            no_work()
+        }),
+    );
+    let result = rx
+        .recv_timeout(PATIENCE)
+        .expect("the head was not reported");
+    assert!(
+        matches!(result, Err(StreamError::Closed)),
+        "the head ended with {result:?}"
+    );
+    let counters = server.finish();
+    assert_eq!((counters.discarded, counters.streams), (1, 0));
+}
+
+#[test]
+fn a_continuation_that_panics_drops_the_stream_and_closes_the_connection() {
+    let handler = |request: Request, reply: Responder| -> Box<dyn Frame> {
+        if request.target == "/ok" {
+            reply.send(Response::with_status(200).with_body("ok"));
+        } else {
+            reply.stream(
+                Response::with_status(200).header("X-Kind", "s"),
+                Box::new(|started| {
+                    let _stream = started;
+                    panic!("the continuation failed");
+                }),
+            );
+        }
+        no_work()
+    };
+    let server = Fixture::start(config(), handler);
+    let mut peer = server.connect();
+    peer.send(STREAM_GET);
+    // The head is out, the stream was dropped with the continuation that held it, and the connection closed with
+    // no last chunk. The server goes on.
+    peer.expect_wire(STREAM_HEAD);
+    peer.expect_closed();
+    let mut other = server.connect();
+    assert_eq!(text(&other.get("/ok")), "ok");
+    drop((peer, other));
+    let counters = server.finish();
+    assert_eq!((counters.streams, counters.streams_cut), (1, 1));
+}
+
+// ---- streamed replies: the ends ------------------------------------------------------------------------------
+
+/// A body larger than the connection can hold when the peer reads nothing, so a write of it stays in flight.
+const BIG: usize = 64 * 1024 * 1024;
+
+/// Reads and drops `count` bytes of the wire.
+fn discard(peer: &mut Peer, count: usize) {
+    let mut left = count;
+    let held = peer.buf.len().min(left);
+    peer.buf.drain(..held);
+    left -= held;
+    let mut chunk = vec![0u8; 256 * 1024];
+    while left > 0 {
+        let want = left.min(chunk.len());
+        let n = read_on(&mut peer.stream, &mut chunk[..want]).expect("the server's bytes");
+        assert!(
+            n > 0,
+            "the server closed the connection with {left} bytes to go"
+        );
+        left -= n;
+    }
+}
+
+fn big_head(_request: &Request) -> Response {
+    Response::with_status(200)
+        .header("X-Kind", "s")
+        .with_body(vec![b'x'; BIG])
+}
+
+#[test]
+fn a_peer_that_leaves_while_the_head_is_being_written_ends_the_head_with_closed_once() {
+    let (handler, rx) = streaming(big_head);
+    let server = Fixture::start(config(), handler);
+    let mut peer = server.connect();
+    peer.send(STREAM_GET);
+    // The peer reads nothing, so the head and its body stay in flight; it leaves with the bytes unread, which
+    // resets the connection.
+    let mut probe = [0u8; 1];
+    peek_on(&mut peer.stream, &mut probe);
+    drop(peer);
+    let result = rx
+        .recv_timeout(PATIENCE)
+        .expect("the head was not reported");
+    assert!(
+        matches!(result, Err(StreamError::Closed)),
+        "the head ended with {result:?}"
+    );
+    // The stop is not held by the stream that never came.
+    let counters = server.finish();
+    assert_eq!((counters.streams, counters.streams_cut), (1, 1));
+}
+
+#[test]
+fn a_peer_that_leaves_while_a_piece_is_being_written_ends_the_piece_with_closed_once() {
+    let (handler, rx) = streaming(ok_head);
+    let server = Fixture::start(config(), handler);
+    let mut peer = server.connect();
+    peer.send(STREAM_GET);
+    let stream = started(&rx);
+    let (tx, done) = channel::<Sent>();
+    stream.send(
+        vec![b'x'; BIG],
+        Box::new(move |sent| {
+            let _ = tx.send(sent);
+            no_work()
+        }),
+    );
+    let mut probe = [0u8; 1];
+    peek_on(&mut peer.stream, &mut probe);
+    drop(peer);
+    let result = done
+        .recv_timeout(PATIENCE)
+        .expect("the piece was not reported");
+    assert!(
+        matches!(result, Err(StreamError::Closed)),
+        "the piece ended with {result:?}"
+    );
+    let counters = server.finish();
+    assert_eq!((counters.streams, counters.streams_cut), (1, 1));
+    assert!(done.try_recv().is_err(), "the piece was reported twice");
+}
+
+#[test]
+fn a_stop_that_comes_while_the_head_is_being_written_waits_for_the_stream_and_its_end() {
+    let (handler, rx) = streaming(big_head);
+    let server = Fixture::start(config(), handler);
+    let mut peer = server.connect();
+    peer.send(STREAM_GET);
+    // The head is counted when its write starts: a stop asked before would find the connection waiting for a
+    // request and close it.
+    until("the head was taken", || {
+        server.handle.counters().streams == 1
+    });
+    server.begin_stop();
+    // The peer has read nothing, so the head cannot be out, and the server cannot have reported.
+    assert!(rx.try_recv().is_err());
+    assert!(server.stopped.try_recv().is_err());
+    // The head, then the body as one chunk: `4000000` and its CRLF, the bytes and a CRLF.
+    discard(&mut peer, STREAM_HEAD.len() + 9 + BIG + 2);
+    let stream = started(&rx);
+    assert!(server.stopped.try_recv().is_err());
+    stream.end();
+    assert_eq!(peer.read_to_end(), b"0\r\n\r\n");
+    drop(peer);
+    server
+        .stopped
+        .recv_timeout(PATIENCE)
+        .expect("the server did not report that it stopped");
+    assert_eq!(server.handle.counters().streams_cut, 0);
+    server.finish();
+}
+
+#[test]
+fn a_stream_to_http_1_0_that_is_dropped_is_cut_and_counted() {
+    let (handler, rx) = streaming(ok_head);
+    let server = Fixture::start(config(), handler);
+    let mut peer = server.connect();
+    peer.send(b"GET /s HTTP/1.0\r\n\r\n");
+    let stream = started(&rx);
+    peer.expect_wire(b"HTTP/1.1 200 OK\r\nX-Kind: s\r\nConnection: close\r\n\r\n");
+    let stream = piece(stream, b"ab");
+    peer.expect_wire(b"ab");
+    drop(stream);
+    peer.expect_closed();
+    drop(peer);
+    let counters = server.finish();
+    assert_eq!((counters.streams, counters.streams_cut), (1, 1));
+}
+
+#[test]
+fn a_stream_to_head_that_is_dropped_is_cut_and_counted() {
+    let (handler, rx) = streaming(ok_head);
+    let server = Fixture::start(config(), handler);
+    let mut peer = server.connect();
+    peer.send(b"HEAD /s HTTP/1.1\r\nHost: t\r\n\r\n");
+    let stream = started(&rx);
+    peer.expect_wire(b"HTTP/1.1 200 OK\r\nX-Kind: s\r\n\r\n");
+    drop(stream);
+    peer.expect_closed();
+    drop(peer);
+    let counters = server.finish();
+    assert_eq!((counters.streams, counters.streams_cut), (1, 1));
+}
+
+#[test]
+fn a_cancel_frame_asked_for_on_a_stream_after_the_peer_left_still_runs_once() {
+    let (handler, rx) = streaming(ok_head);
+    let server = Fixture::start(config(), handler);
+    let mut peer = server.connect();
+    peer.send(STREAM_GET);
+    let stream = started(&rx);
+    // The first frame is the gate: when it ran, the server has seen the peer go and closed the connection.
+    let (seen, gone) = signal();
+    stream.on_cancel(seen);
+    let mut probe = [0u8; 1];
+    peek_on(&mut peer.stream, &mut probe);
+    drop(peer);
+    gone.recv_timeout(PATIENCE)
+        .expect("the cancel was not seen");
+    let (spy, report) = Spy::pair();
+    stream.on_cancel(spy);
+    assert_eq!(report.recv_timeout(PATIENCE), Ok("ran"));
+    drop(stream);
+    server.finish();
+    assert!(
+        report.try_recv().is_err(),
+        "the frame was dropped or ran twice"
+    );
+}
+
+#[test]
+fn a_stream_head_with_a_status_that_has_no_body_answers_500_and_reports_it() {
+    let (handler, rx) = streaming(|request| match request.target.as_str() {
+        "/304" => Response::with_status(304),
+        _ => Response::with_status(100),
+    });
+    let server = Fixture::start(config(), handler);
+    let mut peer = server.connect();
+    for target in ["/304", "/100"] {
+        peer.send(format!("GET {target} HTTP/1.1\r\nHost: t\r\n\r\n").as_bytes());
+        match rx
+            .recv_timeout(PATIENCE)
+            .expect("the head was not reported")
+        {
+            Err(StreamError::Head(error)) => assert_eq!(format!("{error:?}"), "BodyNotAllowed"),
+            other => panic!("{target}: {other:?}"),
+        }
+        assert_eq!(peer.read_response(false).status, 500, "{target}");
+    }
+    drop(peer);
+    let counters = server.finish();
+    assert_eq!((counters.streams, counters.replies_5xx), (0, 2));
 }

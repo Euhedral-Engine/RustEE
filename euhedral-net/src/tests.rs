@@ -1747,6 +1747,124 @@ fn the_writer_output_is_exact() {
     assert_eq!((events.len(), error), (1, None));
 }
 
+#[test]
+fn a_chunked_head_carries_transfer_encoding_and_no_length() {
+    let response = Response::with_status(200).header("X", "y");
+    for (mode, expected) in [
+        (
+            ConnectionMode::Unspecified,
+            &b"HTTP/1.1 200 OK\r\nX: y\r\nTransfer-Encoding: chunked\r\n\r\n"[..],
+        ),
+        (
+            ConnectionMode::Close,
+            b"HTTP/1.1 200 OK\r\nX: y\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+        ),
+        (
+            ConnectionMode::KeepAlive,
+            b"HTTP/1.1 200 OK\r\nX: y\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n",
+        ),
+    ] {
+        let mut out = Vec::new();
+        write_chunked_head(&response, mode, &mut out).unwrap();
+        assert_eq!(out, expected, "{mode:?}");
+    }
+    // The response's own body is not part of the head.
+    let mut out = Vec::new();
+    write_chunked_head(
+        &Response::with_status(200).with_body("abc"),
+        ConnectionMode::Unspecified,
+        &mut out,
+    )
+    .unwrap();
+    assert_eq!(
+        out,
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+    );
+    let refused = [
+        (
+            "a 100",
+            Response::with_status(100),
+            WriteError::BodyNotAllowed,
+        ),
+        (
+            "a 204",
+            Response::with_status(204),
+            WriteError::BodyNotAllowed,
+        ),
+        (
+            "a 304",
+            Response::with_status(304),
+            WriteError::BodyNotAllowed,
+        ),
+        (
+            "a Content-Length line",
+            Response::with_status(200).header("Content-Length", "1"),
+            WriteError::ReservedHeader,
+        ),
+        (
+            "a Transfer-Encoding line",
+            Response::with_status(200).header("transfer-encoding", "chunked"),
+            WriteError::ReservedHeader,
+        ),
+        (
+            "a Connection line",
+            Response::with_status(200).header("Connection", "close"),
+            WriteError::ReservedHeader,
+        ),
+        (
+            "a line break in a value",
+            Response::with_status(200).header("X", "a\r\nb"),
+            WriteError::BadHeaderValue,
+        ),
+        (
+            "a status of 600",
+            Response::with_status(600),
+            WriteError::BadStatus,
+        ),
+    ];
+    for (name, response, error) in refused {
+        let mut out = b"kept".to_vec();
+        assert_eq!(
+            write_chunked_head(&response, ConnectionMode::Unspecified, &mut out),
+            Err(error),
+            "{name}"
+        );
+        assert_eq!(out, b"kept", "{name}: the output changed");
+    }
+}
+
+#[test]
+fn a_chunk_is_its_hex_length_bytes_and_crlf_and_an_empty_piece_writes_nothing() {
+    for (length, hex) in [
+        (1usize, "1"),
+        (15, "f"),
+        (16, "10"),
+        (255, "ff"),
+        (256, "100"),
+        (4096, "1000"),
+    ] {
+        let piece = vec![b'a'; length];
+        let mut out = b"kept".to_vec();
+        write_chunk(&piece, &mut out);
+        let mut expected = b"kept".to_vec();
+        expected.extend_from_slice(hex.as_bytes());
+        expected.extend_from_slice(b"\r\n");
+        expected.extend_from_slice(&piece);
+        expected.extend_from_slice(b"\r\n");
+        assert_eq!(out, expected, "{length} bytes");
+    }
+    let mut out = b"kept".to_vec();
+    write_chunk(b"", &mut out);
+    assert_eq!(out, b"kept", "an empty piece wrote bytes");
+    let mut out = Vec::new();
+    write_last_chunk(&mut out);
+    assert_eq!(out, b"0\r\n\r\n");
+    // Binary bytes are framed as they are.
+    let mut out = Vec::new();
+    write_chunk(&[0, 13, 10, 255], &mut out);
+    assert_eq!(out, b"4\r\n\x00\r\n\xff\r\n");
+}
+
 // ---- the message types ------------------------------------------------------------------------------------
 
 #[test]

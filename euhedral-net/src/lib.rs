@@ -18,7 +18,7 @@ pub mod write;
 #[cfg(any(target_os = "linux", target_os = "android", windows))]
 pub use client::{CallStage, ClientConfig, MAX_INTERIM_RESPONSES, NetError, request};
 #[cfg(any(target_os = "linux", target_os = "android", windows))]
-pub use connection::Responder;
+pub use connection::{PieceSent, ReplyStream, Responder, StreamError};
 pub use message::{
     ConnectionMode, Headers, Method, ParseError, Request, Response, TargetForm, Version,
     WriteError, reason_phrase, status_has_no_body,
@@ -26,7 +26,10 @@ pub use message::{
 pub use parse::{Limits, PendingHead, Progress, RequestParser, ResponseParser, State};
 #[cfg(any(target_os = "linux", target_os = "android", windows))]
 pub use server::{Counters, Handler, ServerConfig, ServerHandle, no_work, serve};
-pub use write::{write_continue, write_request, write_response, write_response_head};
+pub use write::{
+    write_chunk, write_chunked_head, write_continue, write_last_chunk, write_request,
+    write_response, write_response_head,
+};
 
 /// Compiles and runs the examples in the crate README as doctests.
 #[cfg(doctest)]

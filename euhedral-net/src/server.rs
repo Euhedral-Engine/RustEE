@@ -65,6 +65,10 @@ pub struct ServerConfig {
     /// How long one reply (or the `100 Continue`) may take to go out. The connection is closed when it passes.
     /// `None` is no limit.
     pub write_limit: Option<Duration>,
+    /// How long each write of a streamed reply may take: its head, each piece and its end (a piece the peer does
+    /// not read in that time ends the stream with `StreamError::TimedOut` and closes the connection). There is no
+    /// limit on the gap between two pieces: the producer sets that pace. `None` is no limit.
+    pub piece_limit: Option<Duration>,
     /// How long, from its start, the whole close of a connection after its last reply may take: the server shuts
     /// its writing side and reads and drops what the peer still sends until the peer closes or this passes. It is
     /// always a bound (a peer that sends a little at a time, or never closes, cannot hold the connection).
@@ -88,6 +92,7 @@ impl Default for ServerConfig {
             read_limit: Some(Duration::from_secs(30)),
             idle_limit: Some(Duration::from_secs(60)),
             write_limit: Some(Duration::from_secs(30)),
+            piece_limit: Some(Duration::from_secs(30)),
             linger_limit: Duration::from_secs(5),
             stop_linger_limit: Duration::from_secs(1),
             accept_backoff: Duration::from_millis(100),
@@ -147,13 +152,20 @@ pub struct Counters {
     pub replies_3xx: u64,
     pub replies_4xx: u64,
     pub replies_5xx: u64,
+    /// Replies started as a stream (`Responder::stream` with a head that was written; each is also counted in the
+    /// class of its head's status).
+    pub streams: u64,
     /// Requests refused by the parser (each answered with its status, including `413`).
     pub parse_errors: u64,
     /// Operations that ended at their limit.
     pub limits_passed: u64,
     /// Requests whose peer went while they were handled (their cancel flag was set).
     pub cancelled: u64,
-    /// Replies discarded because their request's connection had ended.
+    /// Streams that ended without their last chunk or before their end: the handler dropped the `ReplyStream`, or a
+    /// write failed or passed `piece_limit`, or the peer left.
+    pub streams_cut: u64,
+    /// Replies discarded because their request's connection had ended (a reply, or the head of a stream, given
+    /// after the connection ended).
     pub discarded: u64,
     /// Accepts that failed (other than the server's own cancel on stop).
     pub accept_errors: u64,
@@ -163,6 +175,7 @@ pub struct Counters {
 #[derive(Debug, Default)]
 pub(crate) struct RequestCells {
     pub requests: AtomicU64,
+    pub streams: AtomicU64,
     pub replies: [AtomicU64; 4],
 }
 
@@ -180,6 +193,7 @@ pub(crate) struct RareCells {
     pub parse_errors: AtomicU64,
     pub limits_passed: AtomicU64,
     pub cancelled: AtomicU64,
+    pub streams_cut: AtomicU64,
     pub discarded: AtomicU64,
 }
 
@@ -200,6 +214,7 @@ impl CounterCells {
             accepted: get(&self.connection.accepted),
             open: get(&self.connection.open),
             requests: get(&self.request.requests),
+            streams: get(&self.request.streams),
             replies_2xx: get(&self.request.replies[0]),
             replies_3xx: get(&self.request.replies[1]),
             replies_4xx: get(&self.request.replies[2]),
@@ -207,6 +222,7 @@ impl CounterCells {
             parse_errors: get(&self.rare.parse_errors),
             limits_passed: get(&self.rare.limits_passed),
             cancelled: get(&self.rare.cancelled),
+            streams_cut: get(&self.rare.streams_cut),
             discarded: get(&self.rare.discarded),
             accept_errors: get(&self.connection.accept_errors),
         }

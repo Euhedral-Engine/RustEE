@@ -13,7 +13,8 @@ the first byte past a limit and never buffers it.
 **Stage**: where a parser is: reading the head, reading a body (with the bytes still pending) or failed. A failed
 parser returns its error for every later call and holds nothing.
 
-**Framing**: where a message ends: by `Content-Length` here. Everything strict in the parser is about framing,
+**Framing**: where a message ends: by `Content-Length`, or, for a streamed reply, by the chunked coding, or by the close
+of the connection (see Framing of a stream). Everything strict in the parser is about framing,
 because two parsers that frame differently can be made to read one request as two (request smuggling).
 
 **Reserved header**: `Content-Length`, `Transfer-Encoding` and `Connection`, which the writer sets itself; a caller's
@@ -41,8 +42,9 @@ lattice when it is accepted and completed (detached) when it ends. Its state (pa
 **Event**: one thing that happened to a connection (started, bytes or an end arrived, a send ended, a reply was given,
 the server stopped), pushed into its inbox. The `Responder` pushes the reply the same way.
 
-**Watch `recv`**: the one `recv` kept pending while a request is handled, so that the peer leaving is seen and sets
-the request's cancel flag. Bytes it reads are kept for the next request; no new one is issued until the reply is out.
+**Watch `recv`**: the one `recv` kept pending while a request is handled (and while its reply is streamed), so that the
+peer leaving is seen and sets the request's cancel flag. Bytes it reads are kept for the next request; no new one is
+issued until the reply is out. It is cancelled when the reply is sent, or when the stream ends cleanly.
 
 **Linger**: after a final reply that closes the connection, the server shuts its writing side and reads and discards
 what the peer sends (up to a budget of the size limits) until the peer closes, the one deadline of the linger passes
@@ -68,3 +70,21 @@ or reading the body. Errors that depend on where they happened carry it.
 
 **Overall limit** ([`ClientConfig::time_limit`](src/client.rs)): the one deadline of a call, from the call of `request`;
 each operation is issued with what is left of it.
+
+**Reply stream** ([`ReplyStream`](src/connection.rs)): the right to send the rest of one streamed reply, handed to the
+handler when the head is written. It is owned by whoever holds it; sending a piece moves it into the piece in flight
+and `PieceSent` gives it back, so one piece is in flight at most. The connection's phase `Streaming` is the other side.
+Dropped without `end`, it posts an abort event: the stream is cut.
+
+**Piece**: one part of a streamed body, in a caller's `Vec`. It is copied into the stream's send buffer (framed as one
+chunk on HTTP/1.1), and the `Vec` comes back emptied with its capacity.
+
+**Framing of a stream** (`Framing`, in [`connection`](src/connection.rs)): how the body of a streamed reply is
+delimited: `Chunked` (HTTP/1.1: chunks and a last chunk), `Close` (HTTP/1.0: no length, the end of the body is the
+close) or `None` (HEAD: the head only; pieces are dropped).
+
+**Awaited continuation** (`Waiting`, in [`connection`](src/connection.rs)): the `then` of the head or piece whose send is
+in flight, with the piece's buffer. It is run when the send ends; a guard delivers `StreamError::Closed` to it if it is
+dropped unrun.
+
+**Last chunk**: `0`, CRLF, CRLF, which ends a chunked body. A stream cut before it leaves the peer a truncated body.
