@@ -8,7 +8,7 @@
 
 use std::thread;
 
-use euhedral_gpu::fake::{FakeGpu, FakeMemoryEvent, FakeModule};
+use euhedral_gpu::fake::{FakeContext, FakeGpu, FakeMemoryEvent, FakeModule};
 use euhedral_gpu::{CompileOptions, Gpu, GpuError, LaneEnqueue, Module, Stream, StreamOptions};
 
 #[test]
@@ -142,4 +142,63 @@ fn a_label_ends_with_its_guard() {
         })
         .collect();
     assert_eq!(labels, [Some("scoped".to_owned()), None]);
+}
+
+fn label_now(gpu: &FakeGpu) -> Option<String> {
+    gpu.alloc(1);
+    match gpu.memory_log().pop().unwrap() {
+        FakeMemoryEvent::Alloc { caller, .. } => caller.label,
+        FakeMemoryEvent::Free { .. } => unreachable!("the last event is the allocation"),
+    }
+}
+
+#[test]
+fn dropping_an_inner_label_shows_the_outer_one_again() {
+    let gpu = FakeGpu::new();
+    let _outer = FakeGpu::label_caller("outer");
+    let inner = FakeGpu::label_caller("inner");
+    assert_eq!(label_now(&gpu).as_deref(), Some("inner"));
+    drop(inner);
+    assert_eq!(label_now(&gpu).as_deref(), Some("outer"));
+}
+
+#[test]
+fn labels_dropped_out_of_order_leave_no_stale_label() {
+    let gpu = FakeGpu::new();
+    let a = FakeGpu::label_caller("a");
+    let b = FakeGpu::label_caller("b");
+    drop(a);
+    assert_eq!(label_now(&gpu).as_deref(), Some("b"));
+    drop(b);
+    assert_eq!(label_now(&gpu), None);
+}
+
+#[test]
+fn the_capacity_belongs_to_the_device_and_a_re_open_keeps_it() {
+    let device = FakeContext::new();
+    let first = device.open();
+    first.set_capacity(Some(100));
+    assert!(first.try_alloc(90).is_ok());
+    drop(first);
+    let second = device.open();
+    assert_eq!(second.free_bytes(), Some(100), "a new open holds nothing");
+    assert!(
+        second.try_alloc(101).is_err(),
+        "the size is still the device's"
+    );
+    assert!(second.try_alloc(100).is_ok());
+}
+
+#[test]
+fn a_refusal_for_the_capacity_does_not_use_up_a_skip() {
+    let gpu = FakeGpu::new();
+    gpu.set_capacity(Some(10));
+    gpu.fail_allocs(1, 1);
+    assert!(gpu.try_alloc(11).is_err(), "too big: refused for size");
+    assert!(
+        gpu.try_alloc(1).is_ok(),
+        "the one skipped call, still to come"
+    );
+    assert!(gpu.try_alloc(1).is_err(), "the injected failure");
+    assert!(gpu.try_alloc(1).is_ok());
 }

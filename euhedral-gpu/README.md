@@ -442,14 +442,17 @@ records, beside `FakeGpu::alloc` and `free`:
 
 - **Bytes.** `bytes_held()` and `peak_bytes()` count what was allocated and not freed, and the most held at once.
   `set_capacity(Some(n))` gives the device a size: `try_alloc` then fails with `Err(Call)` named `OUT_OF_MEMORY` when the
-  allocation would hold more, and holds nothing. `free_bytes()` answers as a free-memory query would. `alloc` is
+  allocation would hold more, and holds nothing. `free_bytes()` is the capacity less the bytes held. It is not `euhedral_memory`'s `Device::mem_info`: that reports the
+  whole device, every process included, and falls by the bytes the driver granted (rounded to 512); the fake counts the bytes
+  asked for. The capacity belongs to the `FakeContext`, so a re-open keeps it; the bytes held and the injections belong to
+  one open. The out-of-memory error is named `OUT_OF_MEMORY` with code 2, not the driver's name: match on the code. `alloc` is
   `try_alloc` that panics.
 - **Injected failures.** `fail_allocs(skip, count)` lets `skip` allocations through, then fails the next `count`;
   `fail_module_loads(skip, count)` does the same for `Module::from_source` and `from_image`, which then return
   `Err(Load)`. A call that fails changes nothing on the device.
 - **Who called.** `calls()` is `log()` with a `FakeCaller` for each operation: the thread, its name, the CPU the
   submission ran on (where the platform tells) and a label. A frame that wants to be named wraps its work in
-  `let _label = FakeGpu::label_caller("name")`; the label is thread-local, nests, and ends with the guard. `memory_log()`
+  `let _label = FakeGpu::label_caller("name")`; the labels are a per-thread stack, the last one shows, and each guard removes its own entry whatever order they drop in. `memory_log()`
   lists each allocation and free in order with its caller. `log()` is unchanged.
 
 The caller is the one who put the operation on its lane, not the thread that stepped the device.

@@ -175,8 +175,12 @@ impl Injection {
     }
 }
 
+/// The number of the next [`CallerLabel`].
+static NEXT_LABEL: AtomicU64 = AtomicU64::new(0);
+
 thread_local! {
-    static LABEL: RefCell<Option<String>> = const { RefCell::new(None) };
+    /// The live labels of the thread, oldest first, each with its guard's number; the last is the one in force.
+    static LABELS: RefCell<Vec<(u64, String)>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Who submitted an operation to the fake device: the thread and the CPU it ran on at the call, and the label a frame
@@ -201,7 +205,7 @@ impl FakeCaller {
             thread: current.id(),
             name: current.name().map(str::to_owned),
             cpu: affinity::current_cpu(),
-            label: LABEL.with(|label| label.borrow().clone()),
+            label: LABELS.with(|labels| labels.borrow().last().map(|(_, label)| label.clone())),
         }
     }
 }
@@ -209,15 +213,16 @@ impl FakeCaller {
 /// A label on the calling thread's submissions to any fake device, until dropped; see [`FakeGpu::label_caller`].
 #[derive(Debug)]
 pub struct CallerLabel {
-    previous: Option<String>,
+    /// This guard's entry in the thread's labels.
+    id: u64,
     /// The label belongs to the thread that made it.
     _thread: PhantomData<*const ()>,
 }
 
 impl Drop for CallerLabel {
     fn drop(&mut self) {
-        let previous = self.previous.take();
-        LABEL.with(|label| *label.borrow_mut() = previous);
+        // Each guard removes its own entry, so guards may drop in any order.
+        LABELS.with(|labels| labels.borrow_mut().retain(|(id, _)| *id != self.id));
     }
 }
 
@@ -344,7 +349,6 @@ pub(crate) struct State {
     held: usize,
     peak: usize,
     /// The device's size, if the test gave it one.
-    capacity: Option<usize>,
     alloc_failures: Injection,
     load_failures: Injection,
     memory_log: Vec<FakeMemoryEvent>,
@@ -375,6 +379,8 @@ impl State {
 struct ContextRecord {
     retained: AtomicU64,
     released: AtomicU64,
+    /// The device's size: it stands for the card's memory, so it outlives one open.
+    capacity: Mutex<Option<usize>>,
 }
 
 /// A fake device's context that can be opened, fully released and opened again, as a real device's primary context can: the
@@ -406,6 +412,25 @@ impl FakeContext {
         FakeContextHold {
             context: self.clone(),
         }
+    }
+
+    /// Gives the device a size: an allocation on any open of it that would hold more than `bytes` fails. `None` removes
+    /// the limit (the default). The size belongs to the device, so a re-open keeps it.
+    pub fn set_capacity(&self, bytes: Option<usize>) {
+        *self
+            .record
+            .capacity
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = bytes;
+    }
+
+    /// The device's size, if it has one.
+    pub fn capacity(&self) -> Option<usize> {
+        *self
+            .record
+            .capacity
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Contexts retained so far.
@@ -566,21 +591,23 @@ impl FakeGpu {
     /// Zeroed device memory of `bytes`, 256-aligned, never at 0.
     ///
     /// # Panics
-    /// When the allocation fails (see [`try_alloc`](Self::try_alloc)).
+    /// When the allocation fails (see [`try_alloc`](Self::try_alloc)): with a capacity set or a failure injected this
+    /// can happen, so a test that does either allocates through `try_alloc`.
     pub fn alloc(&self, bytes: usize) -> u64 {
         self.try_alloc(bytes).expect("the allocation to succeed")
     }
 
     /// As [`alloc`](Self::alloc), failing as a device does: `Err(Call)` named `OUT_OF_MEMORY` when the bytes held plus
     /// `bytes` pass the [capacity](Self::set_capacity), or when an [injected failure](Self::fail_allocs) is due. A failed
-    /// allocation holds nothing.
+    /// allocation holds nothing. The error's name is `OUT_OF_MEMORY` and its code 2, where the driver's is
+    /// `CUDA_ERROR_OUT_OF_MEMORY`: match on the code.
     pub fn try_alloc(&self, bytes: usize) -> Result<u64, GpuError> {
+        let caller = FakeCaller::here();
+        let capacity = self.context.capacity();
         let mut st = self.lock();
-        let injected = st.alloc_failures.hit();
-        let over = st
-            .capacity
-            .is_some_and(|capacity| st.held.saturating_add(bytes) > capacity);
-        if injected || over {
+        let over = capacity.is_some_and(|capacity| st.held.saturating_add(bytes) > capacity);
+        // A refusal for size is not a call the injection counts: `skip` counts allocations that would succeed.
+        if over || st.alloc_failures.hit() {
             return Err(GpuError::Call {
                 call: "fake alloc",
                 code: 2,
@@ -595,7 +622,7 @@ impl FakeGpu {
         st.memory_log.push(FakeMemoryEvent::Alloc {
             addr: base,
             bytes,
-            caller: FakeCaller::here(),
+            caller,
         });
         Ok(base)
     }
@@ -605,6 +632,7 @@ impl FakeGpu {
     /// # Panics
     /// When `addr` is not the base of a live allocation.
     pub fn free(&self, addr: u64) {
+        let caller = FakeCaller::here();
         let mut st = self.lock();
         let bytes = st
             .memory
@@ -616,7 +644,7 @@ impl FakeGpu {
         st.memory_log.push(FakeMemoryEvent::Free {
             addr,
             bytes,
-            caller: FakeCaller::here(),
+            caller,
         });
     }
 
@@ -631,26 +659,29 @@ impl FakeGpu {
     }
 
     /// Gives the device a size: an allocation that would hold more than `bytes` fails. Bytes already held stay; `None`
-    /// removes the limit (the default).
+    /// removes the limit (the default). The size is the [context's](FakeContext::set_capacity), so a re-open keeps it.
     pub fn set_capacity(&self, bytes: Option<usize>) {
-        self.lock().capacity = bytes;
+        self.context.set_capacity(bytes);
     }
 
     /// The bytes an allocation can still take (the capacity less the bytes held), as a free-memory query answers; `None`
     /// without a capacity.
     pub fn free_bytes(&self) -> Option<usize> {
-        let st = self.lock();
-        st.capacity.map(|capacity| capacity.saturating_sub(st.held))
+        let capacity = self.context.capacity();
+        let held = self.lock().held;
+        capacity.map(|capacity| capacity.saturating_sub(held))
     }
 
-    /// A test hook: after `skip` more allocations succeed, the next `count` fail with `OUT_OF_MEMORY`. Replaces an
-    /// injection not yet used up.
+    /// A test hook: after `skip` more allocations succeed, the next `count` fail with `OUT_OF_MEMORY`. An allocation
+    /// refused for the [capacity](Self::set_capacity) does not count toward `skip`. Replaces an injection not yet used up.
+    /// The injection belongs to this open: a re-open of the context starts with none.
     pub fn fail_allocs(&self, skip: usize, count: usize) {
         self.lock().alloc_failures = Injection { skip, count };
     }
 
     /// A test hook: after `skip` more module loads succeed ([`FakeModule::from_source`](crate::Module::from_source) or
-    /// `from_image`), the next `count` fail with `Err(Load)`. Replaces an injection not yet used up.
+    /// `from_image`), the next `count` fail with `Err(Load)`. Replaces an injection not yet used up. The injection belongs to
+    /// this open: a re-open of the context starts with none.
     pub fn fail_module_loads(&self, skip: usize, count: usize) {
         self.lock().load_failures = Injection { skip, count };
     }
@@ -665,9 +696,10 @@ impl FakeGpu {
     /// Labels the calling thread's submissions and allocations until the returned guard drops, as a frame names its
     /// work: the label is in the [`FakeCaller`] of each. Labels nest; the innermost shows.
     pub fn label_caller(label: &str) -> CallerLabel {
-        let previous = LABEL.with(|slot| slot.borrow_mut().replace(label.to_owned()));
+        let id = NEXT_LABEL.fetch_add(1, Ordering::Relaxed);
+        LABELS.with(|labels| labels.borrow_mut().push((id, label.to_owned())));
         CallerLabel {
-            previous,
+            id,
             _thread: PhantomData,
         }
     }
@@ -925,6 +957,7 @@ impl FakeGpu {
 
     /// Enqueues the marker reserved with [`reserve_mark`](Self::reserve_mark), behind the work enqueued so far.
     pub(crate) fn push_reserved_mark(&self, index: usize, lane: u16) -> u64 {
+        let caller = FakeCaller::here();
         let mut st = self.lock();
         st.seq += 1;
         let seq = st.seq;
@@ -934,7 +967,7 @@ impl FakeGpu {
         entry.marks_enqueued = value;
         entry.queue.push_back(Queued {
             seq,
-            caller: FakeCaller::here(),
+            caller,
             lane,
             op: QOp::Mark { value },
         });
@@ -954,6 +987,7 @@ impl FakeGpu {
     }
 
     pub(crate) fn push(&self, index: usize, lane: u16, op: QOp) {
+        let caller = FakeCaller::here();
         let mut st = self.lock();
         st.seq += 1;
         let seq = st.seq;
@@ -962,7 +996,7 @@ impl FakeGpu {
         }
         st.lanes[index].queue.push_back(Queued {
             seq,
-            caller: FakeCaller::here(),
+            caller,
             lane,
             op,
         });
