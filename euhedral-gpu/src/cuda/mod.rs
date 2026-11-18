@@ -33,9 +33,14 @@ use euhedral_graph::LaneId;
 
 use enqueue::Mode;
 
-use crate::{Fingerprint, Gpu, GpuError, GraphHold, Poison, Rerecorded, StreamOptions};
+use crate::{
+    DeviceAttributes, Fingerprint, Gpu, GpuError, GraphHold, Poison, Rerecorded, StreamOptions,
+};
 
-use fns::{ATTR_CC_MAJOR, ATTR_CC_MINOR, GpuFns};
+use fns::{
+    ATTR_CC_MAJOR, ATTR_CC_MINOR, ATTR_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
+    ATTR_MULTIPROCESSOR_COUNT, GpuFns,
+};
 
 /// Device faults: the context is lost and the device is poisoned. These are the codes for which the driver says
 /// further work returns the same error or the process must be relaunched:
@@ -102,6 +107,7 @@ pub struct CudaGpu {
     pub(crate) fns: GpuFns,
     pub(crate) poison: Poison,
     arch: (i32, i32),
+    attributes: DeviceAttributes,
     driver_version: i32,
 }
 
@@ -127,6 +133,25 @@ impl CudaGpu {
             Ok(value)
         };
         let arch = (attribute(ATTR_CC_MAJOR)?, attribute(ATTR_CC_MINOR)?);
+        // A count or a limit that is not positive is a driver that does not know the attribute (or a broken one): a planner
+        // would divide by it, so the open fails.
+        let positive = |name: &str, attr| -> Result<u32, GpuError> {
+            u32::try_from(attribute(attr)?)
+                .ok()
+                .filter(|&v| v > 0)
+                .ok_or_else(|| {
+                    GpuError::Invalid(format!(
+                        "the driver reports no positive {name} for the device"
+                    ))
+                })
+        };
+        let attributes = DeviceAttributes {
+            multiprocessors: positive("multiprocessor count", ATTR_MULTIPROCESSOR_COUNT)?,
+            max_shared_memory_per_block_optin: positive(
+                "per-block shared-memory opt-in limit",
+                ATTR_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
+            )?,
+        };
         let mut driver_version = 0;
         // SAFETY: an out pointer.
         let code = unsafe { (fns.driver_get_version)(&mut driver_version) };
@@ -139,6 +164,7 @@ impl CudaGpu {
             fns,
             poison: Poison::new(),
             arch,
+            attributes,
             driver_version,
         }))
     }
@@ -206,6 +232,10 @@ impl Gpu for CudaGpu {
         options: &[StreamOptions],
     ) -> Result<Vec<CudaStream>, GpuError> {
         CudaStream::open(self, first, names, options)
+    }
+
+    fn attributes(&self) -> DeviceAttributes {
+        self.attributes
     }
 
     fn poisoned(&self) -> Option<GpuError> {

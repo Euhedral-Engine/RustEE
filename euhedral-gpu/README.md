@@ -19,7 +19,7 @@ Asynchronous, backend-neutral GPU access for the RustEE control plane. A lattice
 
 | Module | Main types |
 |---|---|
-| [`api`](src/api.rs) | The traits: `Gpu`, `Stream`, `Lane`, `LaneEnqueue`, `Enqueue`, `Module`, `Kernel`, `Sequence`, `Graph`, `RetireListener`; `RetireTicket`, `StreamOptions`, `StreamPriority`, `CompileOptions`, `KernelOptions`, `Rerecorded`, `Span` (timed spans, `Stream::span_*`). |
+| [`api`](src/api.rs) | The traits: `Gpu`, `Stream`, `Lane`, `LaneEnqueue`, `Enqueue`, `Module`, `Kernel`, `Sequence`, `Graph`, `RetireListener`; `RetireTicket`, `DeviceAttributes` (`Gpu::attributes`), `StreamOptions`, `StreamPriority`, `CompileOptions`, `KernelOptions`, `Rerecorded`, `Span` (timed spans, `Stream::span_*`). |
 | [`lanes`](src/lanes.rs) | `LaneSubmit` for the backends' streams, and `open_lane_sources`: a device's lanes as a pool, its intakes and a `LaneSource` per lane (`LaneSpec`, `OpenedLanes`); `open_shared_lanes`: a device's lanes as a typed pool that any worker submits to (`SharedLanes`). |
 | [`ring`](src/ring.rs) | The lock-free marker ring behind a lane's markers: numbers claimed by compare-and-set, completion found by an in-order scan, the awaiters' pins. No driver; loom-checked. |
 | [`cuda::texture`](src/cuda/texture.rs) | `TexObject`, `View`: texture objects over pitched device memory (filter, address and coordinate modes). |
@@ -348,6 +348,16 @@ have `mark`, `id` and `await_marker`.
 
 `retire_into` is the same shape for a chain of frames: the stream travels inside the continuation instead of living in a
 source, and the last frame hands it back to the source that stops it.
+
+## Device attributes
+
+`Gpu::attributes()` returns a `DeviceAttributes`: the multiprocessor count and the per-block shared-memory opt-in limit in
+bytes (`CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT` and `CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN`), what a launch
+planner needs to size a grid and a dynamic shared-memory request. It is a small typed struct, as `CudaGpu::arch` and
+`driver_version` are typed accessors, and not a general attribute call: the CUDA backend reads both once when the device
+opens, so the query is a copy that makes no driver call and cannot fail (a failed read, or a value that is not positive, fails the open with `Invalid` naming the attribute; opening needs a driver that knows attribute 97, CUDA 9 or later). The fake reports
+`fake::DEFAULT_ATTRIBUTES` until `FakeGpu::set_attributes` sets others; the fake module refuses a kernel opt-in above its opt-in limit. `tests/cuda_device_attributes.rs` reads them from a
+real card; `tests/fake_device_attributes.rs` covers the fake.
 
 ## Releasing and re-opening a device
 
