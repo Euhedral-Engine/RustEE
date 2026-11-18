@@ -204,7 +204,12 @@ impl FakeCaller {
         Self {
             thread: current.id(),
             name: current.name().map(str::to_owned),
-            cpu: affinity::current_cpu(),
+            // Miri runs with isolation, and finding the CPU reads the system's topology from the file system.
+            cpu: if cfg!(miri) {
+                None
+            } else {
+                affinity::current_cpu()
+            },
             label: LABELS.with(|labels| labels.borrow().last().map(|(_, label)| label.clone())),
         }
     }
