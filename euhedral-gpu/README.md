@@ -355,8 +355,8 @@ source, and the last frame hands it back to the source that stops it.
 bytes (`CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT` and `CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN`), what a launch
 planner needs to size a grid and a dynamic shared-memory request. It is a small typed struct, as `CudaGpu::arch` and
 `driver_version` are typed accessors, and not a general attribute call: the CUDA backend reads both once when the device
-opens, so the query is a copy that makes no driver call and cannot fail (a failed read fails the open). The fake reports
-`fake::DEFAULT_ATTRIBUTES` until `FakeGpu::set_attributes` sets others. `tests/cuda_device_attributes.rs` reads them from a
+opens, so the query is a copy that makes no driver call and cannot fail (a failed read, or a value that is not positive, fails the open with `Invalid` naming the attribute; opening needs a driver that knows attribute 97, CUDA 9 or later). The fake reports
+`fake::DEFAULT_ATTRIBUTES` until `FakeGpu::set_attributes` sets others; the fake module refuses a kernel opt-in above its opt-in limit. `tests/cuda_device_attributes.rs` reads them from a
 real card; `tests/fake_device_attributes.rs` covers the fake.
 
 ## Releasing and re-opening a device

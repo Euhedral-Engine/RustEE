@@ -319,10 +319,10 @@ impl Drop for FakeContextHold {
     }
 }
 
-/// What a new [`FakeGpu`] reports as its limits: values for tests, not any card's.
+/// What a new [`FakeGpu`] reports as its limits: values for tests, not any card's. The opt-in limit is what `FakeModule::kernel_with` refuses above.
 pub const DEFAULT_ATTRIBUTES: DeviceAttributes = DeviceAttributes {
     multiprocessors: 8,
-    max_shared_memory_per_block_optin: 48 * 1024,
+    max_shared_memory_per_block_optin: MAX_DYNAMIC_SHARED_BYTES,
 };
 
 /// The fake device.
