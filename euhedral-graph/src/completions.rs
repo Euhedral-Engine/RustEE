@@ -1,6 +1,7 @@
 //! Completions found by polls (the upstream Java `GpuCompletions`).
 
 use std::cell::Cell;
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::panic::{self, AssertUnwindSafe};
@@ -218,40 +219,39 @@ impl Lists {
             self.waiting.push_back(entry);
             return;
         };
-        if !self.chains.contains_key(&chain) {
-            self.chains.insert(
-                chain,
-                Tails {
+        match self.chains.entry(chain) {
+            Entry::Vacant(vacant) => {
+                vacant.insert(Tails {
                     first: NIL,
                     last: NIL,
-                },
-            );
-            self.waiting.push_back(entry);
-            return;
-        }
-        let node = self.node(entry);
-        if let Some(tails) = self.chains.get_mut(&chain) {
-            if tails.last == NIL {
-                tails.first = node;
-            } else {
-                self.nodes[tails.last].next = node;
+                });
+                self.waiting.push_back(entry);
             }
-            tails.last = node;
+            Entry::Occupied(mut occupied) => {
+                let node = Self::take_node(&mut self.nodes, &mut self.free, entry);
+                let tails = occupied.get_mut();
+                if tails.last == NIL {
+                    tails.first = node;
+                } else {
+                    self.nodes[tails.last].next = node;
+                }
+                tails.last = node;
+            }
         }
     }
 
     /// A node for `entry`, from the free list if it has one.
-    fn node(&mut self, entry: Waiting) -> usize {
-        if self.free == NIL {
-            self.nodes.push(Node {
+    fn take_node(nodes: &mut Vec<Node>, free: &mut usize, entry: Waiting) -> usize {
+        if *free == NIL {
+            nodes.push(Node {
                 next: NIL,
                 entry: Some(entry),
             });
-            return self.nodes.len() - 1;
+            return nodes.len() - 1;
         }
-        let index = self.free;
-        let node = &mut self.nodes[index];
-        self.free = node.next;
+        let index = *free;
+        let node = &mut nodes[index];
+        *free = node.next;
         node.next = NIL;
         node.entry = Some(entry);
         index
