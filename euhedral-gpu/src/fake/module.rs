@@ -16,7 +16,9 @@ use super::{FakeGpu, FakeKernelFn};
 /// models, not a fact about any real one.
 pub const DEFAULT_DYNAMIC_SHARED_BYTES: u32 = 48 * 1024;
 
-/// The most dynamic shared memory, in bytes, a fake kernel can be opted in to: what the fake device models.
+/// The most dynamic shared memory, in bytes, a new fake device lets a kernel be opted in to (its
+/// [`DEFAULT_ATTRIBUTES`](super::DEFAULT_ATTRIBUTES) opt-in limit; [`FakeGpu::set_attributes`] changes it): what the fake
+/// device models.
 pub const MAX_DYNAMIC_SHARED_BYTES: u32 = 227 * 1024;
 
 /// A fake module: its kernels resolve by name in the device's registry.
@@ -114,9 +116,10 @@ impl Module for FakeModule {
         name: &str,
         options: KernelOptions,
     ) -> Result<<FakeGpu as Gpu>::Kernel, GpuError> {
-        if options.max_dynamic_shared_bytes > MAX_DYNAMIC_SHARED_BYTES {
+        let most = self.gpu.attributes().max_shared_memory_per_block_optin;
+        if options.max_dynamic_shared_bytes > most {
             return Err(GpuError::Invalid(format!(
-                "{name}: the device refused {} bytes of dynamic shared memory (at most {MAX_DYNAMIC_SHARED_BYTES})",
+                "{name}: the device refused {} bytes of dynamic shared memory (at most {most})",
                 options.max_dynamic_shared_bytes
             )));
         }
