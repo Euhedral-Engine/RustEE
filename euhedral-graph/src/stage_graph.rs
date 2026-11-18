@@ -2246,7 +2246,10 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Run<Q, L> {
     /// holds no chain back (a killed chain head still ends at once and promotes the next, whose device work the lane
     /// orders behind this marker anyway). It waits for the retirement armed for the stage's completion edge, if one
     /// was (so its callback has arrived before the run can be reused and its cell armed again), or else for the
-    /// marker. Returns whether it waits: false when the work is reached already. With `take`, it takes a live count of
+    /// marker. The wait is on the marker (or on the retirement, which itself follows it), so the quantum retires only
+    /// once the queue's `completed()` has advanced past it: a backend must advance `completed()` past the markers of a
+    /// faulted device too (CUDA's poison does, by reporting them claimed), or a killed quantum never retires.
+    /// Returns whether it waits: false when the work is reached already. With `take`, it takes a live count of
     /// its own; otherwise the caller's count passes to it.
     fn hold_device_work(self: &Arc<Self>, stage: StageId, marker: Marker, take: bool) -> bool {
         let state = &self.stages[usize::from(stage.0)];

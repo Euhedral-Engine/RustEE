@@ -72,6 +72,10 @@ pub trait DeviceQueue: Send + Sync + fmt::Debug {
 
     /// The highest value whose work has completed. One cheap query (`vkGetSemaphoreCounterValue`,
     /// `cuEventQuery`); never blocks.
+    ///
+    /// A killed quantum's hold waits on its markers, so this must advance past the markers of a faulted device as well
+    /// (CUDA's poison does, by reporting them claimed): a value that stays behind a marker for good leaves the quantum
+    /// live and it never retires.
     fn completed(&self) -> u64;
 
     /// The highest value of a marker issued on this queue: the lane's work up to it has been submitted. When
