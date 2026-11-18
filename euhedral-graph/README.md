@@ -296,7 +296,12 @@ runs again when a lane of the pool made progress, or after `GraphRuntime::retry_
 `DEFAULT_RETRY_BACKSTOP`, 20 ms: set it longer than any one pass on your devices). A stage can be
 **ordered** (`StageSpec::ordered`): its frames then run in the order they were published, on one
 lane of the lattice. The graph's **kill switch** goes on every stage frame of a quantum; a killed
-quantum's unrun stages are `abandoned`.
+quantum's unrun stages are `abandoned`. A stage's completion (a host completion, or the marker a completion edge waits
+for) holds the quantum live until the stage's device work is reached, also on a kill: an ordered stage's completion is a
+chain entry, which the kill ends at once so its chain goes on, and the quantum's count then passes to one pooled wait for
+the stage's marker (or its completion edge's retirement) that has no kill switch and no chain. So no `abandoned` hook
+runs, and nothing the quantum holds is let go, under that work. A host completion with no marker, on an ordered stage,
+holds nothing once the kill ended it.
 
 A quantum **retires** when none of its frames can run again and every lane it used has reached its
 last marker (its retirement boundary). When the lanes can be controlled (`DeviceQueue::control`, which a backend's

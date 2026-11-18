@@ -3,6 +3,23 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## A killed quantum quiesces only behind its ordered stages' device work (`euhedral-graph`) (2026-11-18)
+
+**What.** A `StageGraph` quantum that is killed while an ordered stage's device work is not reached no longer quiesces at once: no `abandoned` hook runs and nothing it holds is let go until that work is reached. Then both happen, once.
+
+**Why.** An ordered stage's completion is an ordered frame with the quantum's kill switch, so it is a `Completions` chain entry, and a kill ends a chain head at once (the chain contract). Its end dropped the quantum's last live count, and the quantum quiesced and ran its `abandoned` hooks while the device could still write what the quantum held. That broke the stage graph's own rule that a host completion holds the quantum live while its work may still use what the quantum holds. Unordered stages were not affected, because their killed completion waited for its condition.
+
+**Migration.** None. A consumer that waits for a killed quantum's `retire` sees it at the same time as before: the retirement was already behind the boundary. The `abandoned` hooks of a killed quantum, and the release of later quanta's external edges into its unsubmitted stages, now come after its ordered stages' device work instead of before it.
+
+**Semantics.**
+- A completion that ends dead (its kill switch set) while its stage's marker is not reached hands its live count to one pooled frame with no kill switch and no order, registered on that marker (`Completions::after_marker`), or on the completion edge's retirement cell when one was armed (`after_retired`, so the lane's callback has arrived before the run is reused and the cell armed again). Its end drops the count. A marker reached already holds nothing.
+- A stage that submits into a quantum the kill already halted, with a completion edge and no host completion (nothing is registered for the edge), holds the quantum the same way until its marker.
+- `Completions` is unchanged: a killed chain head still ends at the next visit and promotes the next entry of its chain. The hold is no chain entry, so it holds no chain back, and the next entry's device work is ordered behind the marker on the device.
+- Not covered: a stage that submitted a marker and has no completion (no completion edge, no host completion) holds no quantum live, killed or not, as before; its work is ordered on the device ahead of what the `abandoned` hooks submit to the home lane, and the retirement covers both. An ordered stage's host completion with no marker holds nothing once a kill ended it: its `Ready` is dropped with the chain entry, and there is no marker to wait for.
+- After warm-up nothing allocates: the frame comes from the graph's frame pool.
+
+**Tests.** `stage_graph.rs`: `a_killed_quantum_waits_for_its_ordered_stages_device_work_before_it_quiesces` (query-only and controlled lanes, with and without a host completion), `a_killed_head_lets_its_chain_go_on_and_its_quantum_waits_for_its_own_work`, `a_quantum_killed_once_its_completion_heads_the_chain_waits_for_its_device_work`, `a_quantum_killed_with_two_ordered_stages_queued_waits_for_the_work_of_both`, `an_ordered_stage_that_submits_into_its_killed_quantum_holds_it_until_its_marker`.
+
 ## The fake device can stand in for a card in residency and failure tests (`euhedral-gpu`) (2026-11-17)
 
 **What.** On `FakeGpu` (feature `fake`): `bytes_held()`, `peak_bytes()`, `set_capacity(Option<usize>)` (also on `FakeContext`, with `capacity()`), `free_bytes()`, `try_alloc(bytes) -> Result<u64, GpuError>`, `fail_allocs(skip, count)`, `fail_module_loads(skip, count)`, `calls() -> Vec<FakeCall>`, `memory_log() -> Vec<FakeMemoryEvent>` and `label_caller(label) -> CallerLabel`. New types `FakeCaller { thread, name, cpu, label }`, `FakeCall { op, caller }`, `FakeMemoryEvent` and `CallerLabel`. The `fake` feature now depends on `euhedral-hardware-utils` (a lower layer) for the CPU number.
