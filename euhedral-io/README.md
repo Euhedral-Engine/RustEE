@@ -31,13 +31,20 @@ channels, `Condvar`, blocking `std::fs` or `std::net` calls.
 ## `AsyncIo`
 
 `AsyncIo` does file and socket I/O that holds no worker: `read`, `write`, `send`, `recv`, `accept`,
-`open_path` (and `open_file` with raw flags on Linux), `rename`, `send_to` and `connect` each
+`open_path` (and `open_file` with raw flags on Linux), `rename`, `file_len`, `send_to` and `connect` each
 return at once, and the operation's `IoDone` (its buffer back, and the bytes moved or the error)
 reaches the `IoThen` continuation, which builds the frame the source emits. Handles are the
 platform's: descriptors on Linux and Android, `HANDLE`s and `SOCKET`s on Windows (the aliases
 `RawFile`, `RawSock`, `OwnedFile` and `OwnedSock`). A read is cut into pieces so that no single
 completion holds a worker for long. The `AsyncIo` type is the same everywhere; an engine under it
 starts operations and finds their ends, and `src/lib.rs` does the rest.
+
+`file_len(file, then)` finds the length of an open file without blocking the caller, so a reader can size its
+buffers or plan its reads from it: `statx(2)` of the descriptor through the ring on Linux and Android
+(`STATX_SIZE`, empty path with `AT_EMPTY_PATH`), `GetFileSizeEx` on the OS thread pool on Windows (any handle works, as the
+call does not wait on the file). `then` gets `io::Result<u64>`: the size at the moment the kernel looked, or the
+system's error (a bad descriptor ends with `EBADF` on Linux and Android, `ERROR_INVALID_HANDLE` (6) on Windows). The file must stay open until `then` runs. Where the length
+does not fit a `usize` (a 32-bit target) it ends with an overflow error.
 
 `socket_for(addr)` makes the socket a client's `connect` needs: a new, unconnected stream socket of the address's
 family (IPv4 or IPv6), owned by the result, so that dropping it closes it. The standard library cannot make one
@@ -74,8 +81,8 @@ internally, each landing at its own offset. `read` stays as it was, for a `Vec`-
   kernel ring for both (Windows 11 22H2 and later; not one emulated in user mode). The ring
   functions are looked up at run time, so the library still loads where they are missing. A file
   keeps its route: IoRing refuses a handle that belongs to a completion port. `AsyncIoOptions { windows_ioring: false }` forces the port.
-  Windows has no asynchronous open or rename, so those run on the OS thread pool and post their
-  result to the port: the one place the crate uses threads it did not create. Handles must be
+  Windows has no asynchronous open, rename or file length, so those run on the OS thread pool and leave their
+  result in a queue the poll drains: the one place the crate uses threads it did not create. Handles must be
   opened for overlapped I/O (`open_path` does, and so do Rust's sockets) and must not skip the port
   on success; a handle that would block or never complete is refused. A handle joins the engine's
   port and can serve one `AsyncIo`, ever. Writes go in pieces of at most 256 KiB, since a write

@@ -82,8 +82,8 @@ Each is kept by the code. What it gives you follows it.
 7. **No completion thread, no timer thread, no channel.** `Completions`, `AsyncIo` and the lane sources are
    `LatticeSource`s that the lattice's own polls drive, and a poll does not block. A long call runs on the
    worker that needs it, and the other workers keep serving other sources and steal unordered work. Calls
-   that block are named: module loading and dropping a stream or a graph in `euhedral-gpu`, and open and
-   rename on Windows, which run on the OS thread pool.
+   that block are named: module loading and dropping a stream or a graph in `euhedral-gpu`, and open,
+   rename and file length on Windows, which run on the OS thread pool.
 8. **A frame is finished by exactly one finalizer, except in the cases the frame lifecycle lists as
    dropped.** See [the frame lifecycle](#frame).
 
@@ -561,6 +561,10 @@ source of frames.
 socket operations. A submission returns at once; the lattice's polls reap the completions. io_uring on
 Linux and Android; IoRing and completion ports on Windows. Engines:
 [`euhedral-io` glossary](euhedral-io/GLOSSARY.md).
+
+**file length** ([`AsyncIo::file_len`](euhedral-io/src/lib.rs)): the size of an open file, found without blocking
+the caller and delivered to a continuation as a `u64`: `statx` of the descriptor through the ring on Linux and
+Android, `GetFileSizeEx` on the OS thread pool on Windows.
 
 #### Ordering and joining
 

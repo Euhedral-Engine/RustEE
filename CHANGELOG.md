@@ -20,6 +20,16 @@ semantics and the tests that pin it.
 
 **Tests.** `tests/fake_residency.rs`: `bytes_held_follow_allocations_and_frees_and_the_peak_stays`, `an_allocation_past_the_capacity_fails_and_holds_nothing`, `the_capacity_belongs_to_the_device_and_a_re_open_keeps_it`, `injected_allocation_failures_skip_then_fail_then_stop`, `a_refusal_for_the_capacity_does_not_use_up_a_skip`, `injected_module_load_failures_fail_both_routes`, `each_operation_names_its_submitter_and_each_allocation_its_caller`, `a_label_ends_with_its_guard`, `dropping_an_inner_label_shows_the_outer_one_again`, `labels_dropped_out_of_order_leave_no_stale_label`.
 
+## An open file's length without a blocking call (`euhedral-io`) (2026-11-17)
+
+**What.** `AsyncIo::file_len(file, then)` gives the continuation the length of an open file as `io::Result<u64>`.
+
+**Why.** A reader that sizes its buffers or plans its reads from a file's length had to make a blocking `fstat` on the descriptor. Now the call returns at once and the length arrives as a frame, like every other file operation.
+
+**How.** Linux and Android: a `statx` of the descriptor on the ring (`STATX_SIZE`, `AT_EMPTY_PATH`). Windows: `GetFileSizeEx` on the OS thread pool, as open and rename. A bad handle ends with the system's error; a length that does not fit a `usize` ends with an overflow error. The file must stay open until the continuation runs.
+
+**Tests.** `file_len_gives_the_size_of_an_open_file_and_the_kernels_error_for_a_bad_descriptor` (io_uring), `file_len_runs_on_the_pool_and_comes_out_of_the_poll` (simulated Windows engine), `file_len_gives_the_size_of_an_open_file` (live Windows).
+
 ## A device reports its multiprocessor count and shared-memory opt-in limit (`euhedral-gpu`) (2026-11-17)
 
 **What.** `Gpu::attributes()` returns a `DeviceAttributes { multiprocessors, max_shared_memory_per_block_optin }` (bytes). `FakeGpu::set_attributes` sets what the fake reports; a new fake reports `fake::DEFAULT_ATTRIBUTES`.
