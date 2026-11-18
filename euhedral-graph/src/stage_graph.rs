@@ -7203,58 +7203,69 @@ mod tests {
         }
     }
 
-    /// The kill is set inside the ordered stage's run, so it submits to a halted quantum: its completion edge is never
-    /// registered (no host completion) or its host completion is cancelled at once. Either way the quantum waits for
-    /// the marker before it quiesces.
+    /// The kill is set inside the stage's run, so it submits to a halted quantum: its completion edge is never
+    /// registered (no host completion), or its host completion is cancelled at once (ordered) or ends dead once it is
+    /// ready (unordered). Either way the quantum waits for the marker before it quiesces.
     #[test]
-    fn an_ordered_stage_that_submits_into_its_killed_quantum_holds_it_until_its_marker() {
-        for host in [false, true] {
-            let h = Harness::new(1);
-            let kill = alive();
-            let mut spec = StageGraphSpec::new();
-            spec.stage(StageSpec {
-                name: "kills",
-                ordered: Some(ORDERED),
-                lanes: vec![LaneId(0)],
-            });
-            spec.stage(StageSpec {
-                name: "probe",
-                ordered: None,
-                lanes: vec![LaneId(0)],
-            });
-            spec.edge(StageId(0), StageId(1), EdgeKind::Completion);
-            let log = h.log.clone();
-            let stages: Vec<Arc<dyn Stage<u64>>> = vec![
-                Arc::new(KillsThenSubmits {
-                    kill: kill.clone(),
-                    host: host.then(Token::default),
-                    hands: h.hands.clone(),
-                    log: h.log.clone(),
-                }),
-                Arc::new(Named(
-                    1,
-                    Probe {
-                        act: Act::Submit,
-                        gate: GateAct::Pass,
-                        log: h.log.clone(),
+    fn a_stage_that_submits_into_its_killed_quantum_holds_it_until_its_marker() {
+        for ordered in [Some(ORDERED), None] {
+            for host in [false, true] {
+                let case = format!("ordered {}, host {host}", ordered.is_some());
+                let h = Harness::new(1);
+                let kill = alive();
+                let token = Token::default();
+                let mut spec = StageGraphSpec::new();
+                spec.stage(StageSpec {
+                    name: "kills",
+                    ordered,
+                    lanes: vec![LaneId(0)],
+                });
+                spec.stage(StageSpec {
+                    name: "probe",
+                    ordered: None,
+                    lanes: vec![LaneId(0)],
+                });
+                spec.edge(StageId(0), StageId(1), EdgeKind::Completion);
+                let log = h.log.clone();
+                let stages: Vec<Arc<dyn Stage<u64>>> = vec![
+                    Arc::new(KillsThenSubmits {
+                        kill: kill.clone(),
+                        host: host.then(|| token.clone()),
                         hands: h.hands.clone(),
-                    },
-                )),
-            ];
-            let graph = StageGraph::new(spec, stages, h.runtime.clone(), move |q, outcome| {
-                lock(&log).push(Event::Retired { q, outcome });
-            })
-            .unwrap();
-            let _ = graph.start(1, kill, Vec::new());
-            h.pump();
-            assert_eq!(h.ran(1), [0], "host {host}");
-            assert_eq!(h.abandoned(1), [], "host {host}: the marker is not reached");
-            assert!(h.retired(1).is_empty(), "host {host}");
-            h.finish_lanes();
-            h.pump();
-            assert_eq!(h.abandoned(1), [1], "host {host}");
-            assert_eq!(h.retired(1), [QuantumOutcome::Killed], "host {host}");
-            assert_eq!(graph.live(), 0, "host {host}");
+                        log: h.log.clone(),
+                    }),
+                    Arc::new(Named(
+                        1,
+                        Probe {
+                            act: Act::Submit,
+                            gate: GateAct::Pass,
+                            log: h.log.clone(),
+                            hands: h.hands.clone(),
+                        },
+                    )),
+                ];
+                let graph = StageGraph::new(spec, stages, h.runtime.clone(), move |q, outcome| {
+                    lock(&log).push(Event::Retired { q, outcome });
+                })
+                .unwrap();
+                let _ = graph.start(1, kill, Vec::new());
+                h.pump();
+                assert_eq!(h.ran(1), [0], "{case}");
+                assert_eq!(h.abandoned(1), [], "{case}: the marker is not reached");
+                token.0.store(true, Ordering::Release);
+                h.pump();
+                assert_eq!(
+                    h.abandoned(1),
+                    [],
+                    "{case}: the host completion is ready, the marker is still not reached"
+                );
+                assert!(h.retired(1).is_empty(), "{case}");
+                h.finish_lanes();
+                h.pump();
+                assert_eq!(h.abandoned(1), [1], "{case}");
+                assert_eq!(h.retired(1), [QuantumOutcome::Killed], "{case}");
+                assert_eq!(graph.live(), 0, "{case}");
+            }
         }
     }
 

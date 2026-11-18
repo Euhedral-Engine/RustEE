@@ -18,7 +18,7 @@ semantics and the tests that pin it.
 - Not covered: a stage that submitted a marker and has no completion (no completion edge, no host completion) holds no quantum live, killed or not, as before; its work is ordered on the device ahead of what the `abandoned` hooks submit to the home lane, and the retirement covers both. An ordered stage's host completion with no marker holds nothing once a kill ended it: its `Ready` is dropped with the chain entry, and there is no marker to wait for.
 - After warm-up nothing allocates: the frame comes from the graph's frame pool.
 
-**Tests.** `stage_graph.rs`: `a_killed_quantum_waits_for_its_ordered_stages_device_work_before_it_quiesces` (query-only and controlled lanes, with and without a host completion), `a_killed_head_lets_its_chain_go_on_and_its_quantum_waits_for_its_own_work`, `a_quantum_killed_once_its_completion_heads_the_chain_waits_for_its_device_work`, `a_quantum_killed_with_two_ordered_stages_queued_waits_for_the_work_of_both`, `an_ordered_stage_that_submits_into_its_killed_quantum_holds_it_until_its_marker`.
+**Tests.** `stage_graph.rs`: `a_killed_quantum_waits_for_its_ordered_stages_device_work_before_it_quiesces` (query-only and controlled lanes, with and without a host completion), `a_killed_head_lets_its_chain_go_on_and_its_quantum_waits_for_its_own_work`, `a_quantum_killed_once_its_completion_heads_the_chain_waits_for_its_device_work`, `a_quantum_killed_with_two_ordered_stages_queued_waits_for_the_work_of_both`, `a_stage_that_submits_into_its_killed_quantum_holds_it_until_its_marker`.
 
 ## The fake device can stand in for a card in residency and failure tests (`euhedral-gpu`) (2026-11-17)
 
