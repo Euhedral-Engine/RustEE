@@ -195,6 +195,9 @@ impl Ops {
     }
 }
 
+/// The empty path of a `statx` of a descriptor.
+static EMPTY_PATH: &std::ffi::CStr = c"";
+
 enum Kind {
     Read {
         fd: RawFd,
@@ -222,6 +225,12 @@ enum Kind {
     RenameAt {
         from: CString,
         to: CString,
+    },
+    /// `statx(2)` of the descriptor itself (an empty path with `AT_EMPTY_PATH`). The result block
+    /// is boxed so that it stays where the kernel writes it.
+    Statx {
+        fd: RawFd,
+        out: Box<libc::statx>,
     },
     /// The address is boxed so that it stays where the kernel reads it.
     SendTo {
@@ -312,7 +321,7 @@ impl Op {
     /// The submission entry for the operation's next piece.
     fn entry(&mut self, user_data: u64, max_piece: usize) -> squeue::Entry {
         let piece = |n: usize| u32::try_from(n.min(max_piece)).unwrap_or(u32::MAX);
-        let entry = match &self.kind {
+        let entry = match &mut self.kind {
             Kind::Read { fd, offset } => {
                 let rest = &mut self.buf.bytes_mut()[self.moved..];
                 // A read the page cache can serve is copied inside `io_uring_enter`, on the
@@ -322,13 +331,13 @@ impl Op {
                 // made the submitting worker create an io worker thread now and then: worse).
                 let len = piece(rest.len().min(READ_PIECE));
                 opcode::Read::new(types::Fd(*fd), rest.as_mut_ptr(), len)
-                    .offset(offset + self.moved as u64)
+                    .offset(*offset + self.moved as u64)
                     .build()
             }
             Kind::Write { fd, offset } => {
                 let rest = &self.buf.bytes()[self.moved..self.buf.filled()];
                 opcode::Write::new(types::Fd(*fd), rest.as_ptr(), piece(rest.len()))
-                    .offset(offset + self.moved as u64)
+                    .offset(*offset + self.moved as u64)
                     .build()
             }
             Kind::Send { fd } => {
@@ -364,6 +373,15 @@ impl Op {
                 types::Fd(libc::AT_FDCWD),
                 to.as_ptr(),
             )
+            .build(),
+            Kind::Statx { fd, out } => opcode::Statx::new(
+                types::Fd(*fd),
+                EMPTY_PATH.as_ptr(),
+                // The kernel writes through this pointer: it comes from a mutable borrow.
+                (&raw mut **out).cast(),
+            )
+            .flags(libc::AT_EMPTY_PATH)
+            .mask(libc::STATX_SIZE)
             .build(),
             Kind::SendTo { fd, addr, len } => {
                 let bytes = &self.buf.bytes()[..self.buf.filled()];
@@ -713,6 +731,14 @@ impl Ring {
                 Err(LimitPassed::error(op.moved))
             }
             _ if result < 0 => Err(io::Error::from_raw_os_error(-result)),
+            Kind::Statx { ref out, .. } => {
+                if out.stx_mask & libc::STATX_SIZE == 0 {
+                    Err(io::Error::other("the file system gave no size"))
+                } else {
+                    usize::try_from(out.stx_size)
+                        .map_err(|_| io::Error::from_raw_os_error(libc::EOVERFLOW))
+                }
+            }
             _ => Ok(result as usize),
         };
         let op = ops.remove(user_data).expect("the operation just found");
@@ -863,6 +889,11 @@ impl Uring {
             Request::Rename { from, to } => Kind::RenameAt {
                 from: c_path(&from)?,
                 to: c_path(&to)?,
+            },
+            Request::FileLen { file } => Kind::Statx {
+                fd: file as RawFd,
+                // SAFETY: `statx` is plain integers: all zeros is a valid value.
+                out: Box::new(unsafe { std::mem::zeroed() }),
             },
             Request::SendTo { sock, to } => {
                 let (addr, len) = socket_address(to);
@@ -1891,6 +1922,40 @@ mod tests {
             std::fs::metadata(&target.0).unwrap().permissions().mode() & 0o777,
             0o644 & !umask()
         );
+    }
+
+    /// What `file_len` of `fd` ended with, polled to the end.
+    fn file_len_of(io: &AsyncIo, fd: RawFd) -> io::Result<u64> {
+        let slot = Arc::new(Mutex::new(None));
+        let put = slot.clone();
+        io.file_len(
+            fd,
+            Box::new(move |result| {
+                *lock!(&put) = Some(result);
+                Box::new(Done {
+                    header: FrameHeader::new(1),
+                    done: None,
+                    accepted: None,
+                })
+            }),
+        )
+        .unwrap();
+        poll(io, 1);
+        lock!(&slot).take().unwrap()
+    }
+
+    #[test]
+    fn file_len_gives_the_size_of_an_open_file_and_the_kernels_error_for_a_bad_descriptor() {
+        let io = AsyncIo::open().unwrap();
+        let (_path, file) = temp_file("sized", &[7u8; 12345]);
+        assert_eq!(file_len_of(&io, file.as_raw_fd()).unwrap(), 12345);
+        // It follows the file as it grows.
+        file.set_len(70_000).unwrap();
+        assert_eq!(file_len_of(&io, file.as_raw_fd()).unwrap(), 70_000);
+        let (_empty_path, empty) = temp_file("empty", b"");
+        assert_eq!(file_len_of(&io, empty.as_raw_fd()).unwrap(), 0);
+        let error = file_len_of(&io, -1).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EBADF));
     }
 
     fn umask() -> u32 {

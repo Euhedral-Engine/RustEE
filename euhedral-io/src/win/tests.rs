@@ -552,6 +552,33 @@ fn open_and_rename_run_on_the_pool_and_come_out_of_the_poll() {
 }
 
 #[test]
+fn file_len_runs_on_the_pool_and_comes_out_of_the_poll() {
+    let h = Harness::new();
+    let file = h.sim.file(&content(5000));
+    h.submit(Request::FileLen { file }, IoBuf::default(), raw_then(1))
+        .unwrap();
+    assert_eq!(h.pending(), 1);
+    assert_eq!(h.one().raw.unwrap().unwrap(), 5000);
+    let empty = h.sim.file(b"");
+    h.submit(
+        Request::FileLen { file: empty },
+        IoBuf::default(),
+        raw_then(2),
+    )
+    .unwrap();
+    assert_eq!(h.one().raw.unwrap().unwrap(), 0);
+    // A handle that is not a file ends with the system's error, not a hang.
+    h.submit(
+        Request::FileLen { file: 0xdead },
+        IoBuf::default(),
+        raw_then(3),
+    )
+    .unwrap();
+    assert_eq!(h.one().raw.unwrap().unwrap_err().raw_os_error(), Some(6));
+    assert_eq!(h.pending(), 0);
+}
+
+#[test]
 fn a_pool_that_refuses_the_job_ends_the_operation_with_an_error() {
     let h = Harness::new();
     h.sim.fail_pool();
