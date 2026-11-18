@@ -93,10 +93,13 @@ counted in `leaked_unreached` (the lane the marker names may still use what it h
 debug builds panic. A timer is never emitted before its deadline and goes out in the first reap at or after it; timers
 due in one reap go out in registration order, not sorted by deadline.
 
-Continuations are emitted in registration order, so frames on one ordered lane keep that order, whatever each waits on: a reap
-queries an operation only once every earlier operation of its chain (ordered frames with one routing hash) was found done, so a
-lane that advances between two queries cannot let a later registration out first. Operations of different chains, and unordered
-ones, are emitted as they are found. A
+Continuations are emitted in registration order, so frames on one ordered lane keep that order, whatever each waits on
+(a marker, a retirement, a `Ready` or a `Wake`): the entries of one chain (ordered frames with one routing hash) wait in
+registration order and a reap queries only the head of a chain, then the next once the head was found done, up to the first
+not done. A lane that advances between two queries cannot let a later registration out first, and the entries held behind a
+head cost nothing. Timers are not part of a chain (a scan reads the clock once, so timers cannot be found done out of order,
+and each goes out at its own deadline), and a `Pending` has no frame until it yields one, so its frame goes out when it is
+yielded. Operations of different chains, and unordered ones, are emitted as they are found. A
 frame whose kill switch is set is still emitted: the executor skips it and runs its `do_finally`,
 which ends what it holds, so `pending()` drains to zero on its own. `lateness_us()` reports how
 late emissions were: the cost of finding completions by polls.
