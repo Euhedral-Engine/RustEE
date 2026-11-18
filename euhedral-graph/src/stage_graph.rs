@@ -15,7 +15,10 @@
 //! - **The retirement boundary** is the latest marker per used lane (Java `usedLanes`). With lanes that can be controlled
 //!   it is Java's `quiesce`: the other lanes join the home lane on the device and one retirement armed there ends the
 //!   quantum (`RetireCell`, `Completions::after_retired`); over a query-only lane it is one completion per lane. A
-//!   host completion that no edge consumes holds a live count until it is done (Java `deferral`).
+//!   host completion that no edge consumes holds a live count until it is done (Java `deferral`). A completion that a
+//!   kill ends before its stage's device work is reached (an ordered stage's completion is a `Completions` chain entry,
+//!   which a kill ends at once) hands its count to one pooled wait for that work, with no kill switch and no chain: the
+//!   quantum quiesces only once the stage's marker is reached (or its completion edge's retirement arrived).
 //! - **The conclude rule.** A quantum *touches a lane* when one of its stages submitted a marker, a marker was recorded
 //!   for it (an external edge brought one, or a later quantum's stage that used it submitted one), or the
 //!   [`Stage::abandoned`] hook of a stage that names a lane ran on a home lane that can arm a retirement. A quantum that
@@ -687,7 +690,10 @@ impl std::error::Error for GraphError {}
 ///   elsewhere (a dropped [`QuantumRef`], a later quantum's release), one pooled frame does.
 /// - A killed quantum's frames are skipped by RustEE and their `do_finally` drops their counts; its
 ///   stages get [`Stage::abandoned`]. Device work already submitted runs to its end and is covered
-///   by the boundary.
+///   by the boundary. A stage's completion (a host completion, or the marker a completion edge waits for) still holds
+///   the quantum until the stage's marker is reached, even when the kill ended the completion first (an ordered
+///   stage's, which its chain lets go at once) or kept it from being registered (the stage submitted into the killed
+///   quantum): no `abandoned` hook runs and nothing the quantum holds is let go under that work.
 /// - **A quantum is pooled.** `start` takes a retired quantum's state from the graph's pool (a
 ///   bounded queue) and `retire` gives it back, as frames go back to theirs; the stage, arrival,
 ///   boundary and retirement frames are pooled the same way. After warm-up, a quantum allocates
@@ -709,7 +715,9 @@ impl std::error::Error for GraphError {}
 /// - **The boundary** is the latest marker per lane of everything the quantum submitted (plus the
 ///   markers of later quanta's stages that used it through external edges, and those of external
 ///   edges, whatever became of their stages). Every lane used is covered. A host
-///   completion holds the quantum live until it is ready, so the quantum retires after it.
+///   completion holds the quantum live until it is ready, so the quantum retires after it; if a kill ends it first,
+///   the stage's marker holds the quantum until it is reached. A host completion whose work has no marker, on an
+///   ordered stage, holds nothing once a kill ended it (its `Ready` is dropped with it).
 /// - **The outcome** is the first of: a stage's failure (an `Err`, or a panic as
 ///   [`StageError::Fatal`]), or the kill switch found set before a stage or edge ran. Otherwise it
 ///   is [`QuantumOutcome::Completed`].
@@ -1956,7 +1964,8 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Run<Q, L> {
         self.release_pins(stage, None);
         if let Some(host) = submitted.completion {
             self.live.fetch_add(1, Ordering::AcqRel);
-            self.completes(stage, None, Some(host));
+            // A foreign marker is never reached: it cannot hold the quantum.
+            self.completes(stage, None, Some(host), None);
         }
     }
 
@@ -2120,20 +2129,29 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Run<Q, L> {
                 self.note(QuantumOutcome::Killed);
             }
             // A host completion still holds the quantum live, whether or not an edge would consume it (Java's
-            // deferral): its work may still use what the quantum holds.
+            // deferral): its work may still use what the quantum holds. If a kill cancels it before the stage's marker
+            // is reached, the marker holds the quantum from there (`hold_device_work`).
             if let Some(host) = completion {
                 self.live.fetch_add(1, Ordering::AcqRel);
-                self.completes(stage, None, Some(host));
+                self.completes(stage, None, Some(host), marker);
+            } else if let Some(marker) = marker
+                && completion_edge
+                && self.kill_set()
+            {
+                // The completion its edge would have waited for is not registered: the killed quantum still waits for
+                // the marker before it quiesces, as for a completion the kill cancelled.
+                self.hold_device_work(stage, marker, true);
             }
             return;
         }
         if completion_edge {
             self.live.fetch_add(1, Ordering::AcqRel);
-            self.completes(stage, marker, completion);
+            self.completes(stage, marker, completion, marker);
         } else if let Some(host) = completion {
-            // The boundary has the marker; the host completion holds a live count until it is ready.
+            // The boundary has the marker; the host completion holds a live count until it is ready (and the marker
+            // until it is reached, if a kill cancels the host completion first).
             self.live.fetch_add(1, Ordering::AcqRel);
-            self.completes(stage, None, Some(host));
+            self.completes(stage, None, Some(host), marker);
         }
         for &(successor, kind) in &self.core.topology.successors[index] {
             if kind == EdgeKind::Submission {
@@ -2147,16 +2165,22 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Run<Q, L> {
     ///
     /// On the predecessor's ordered lane, if it has one: its completions (emitted in registration order) then publish
     /// their successors in that order, so an ordered successor keeps the predecessor's order.
+    ///
+    /// `holds` is the marker of the stage's own work. The frame carries it: if a kill cancels the completion before
+    /// that work is reached (an ordered stage's completion is a chain entry, which a kill ends at once), the quantum
+    /// stays live until it is ([`hold_device_work`](Self::hold_device_work)).
     fn completes(
         self: &Arc<Self>,
         stage: StageId,
         marker: Option<Marker>,
         host: Option<Box<dyn Ready>>,
+        holds: Option<Marker>,
     ) {
         let ordered = self.core.spec.stages[usize::from(stage.0)].ordered;
-        let frame = self
+        let mut frame = self
             .core
             .frame(self, Kind::Completions(stage), self.header(ordered, true));
+        frame.holds = holds;
         let completions = &self.core.runtime.completions;
         // Java `RetiredEdge`: the retirement is armed on the producer's lane, and its status settled when it arrives.
         if let Some(marker) = marker
@@ -2211,6 +2235,47 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Run<Q, L> {
         }
         // SAFETY: this thread owns the stage's frame until its arrival is registered.
         unsafe { state.edge_armed.set(true) };
+        true
+    }
+
+    /// A kill ended `stage`'s completion (or kept its completion edge from being registered) while the device may not
+    /// have reached the stage's work, `marker`: the quantum stays live until it has. What the stage's work uses is the
+    /// quantum's, and quiescing would run the `abandoned` hooks and let go of it under the device.
+    ///
+    /// The wait is one pooled frame with no kill switch and no order, so it is no chain entry: nothing cancels it and it
+    /// holds no chain back (a killed chain head still ends at once and promotes the next, whose device work the lane
+    /// orders behind this marker anyway). It waits for the retirement armed for the stage's completion edge, if one
+    /// was (so its callback has arrived before the run can be reused and its cell armed again), or else for the
+    /// marker. The wait is on the marker (or on the retirement, which itself follows it), so the quantum retires only
+    /// once the queue's `completed()` has advanced past it: a backend must advance `completed()` past the markers of a
+    /// faulted device too (CUDA's poison does, by reporting them claimed), or a killed quantum never retires.
+    /// Returns whether it waits: false when the work is reached already. With `take`, it takes a live count of
+    /// its own; otherwise the caller's count passes to it.
+    fn hold_device_work(self: &Arc<Self>, stage: StageId, marker: Marker, take: bool) -> bool {
+        let state = &self.stages[usize::from(stage.0)];
+        // SAFETY: written by `arm_edge` before the completion was registered, and read after its frame was handed out
+        // (or by the thread that owns the stage's frame, before any registration).
+        let armed = unsafe { state.edge_armed.get() };
+        let reached = if armed {
+            state.edge_cell.arrived()
+        } else {
+            self.core.runtime.lanes.reached(marker)
+        };
+        if reached {
+            return false;
+        }
+        if take {
+            self.live.fetch_add(1, Ordering::AcqRel);
+        }
+        let frame = self
+            .core
+            .frame(self, Kind::DeviceWork, self.header(None, false));
+        let completions = &self.core.runtime.completions;
+        if armed {
+            completions.after_retired(state.edge_cell.clone(), frame);
+        } else {
+            completions.after_marker(marker, frame);
+        }
         true
     }
 
@@ -2845,8 +2910,11 @@ enum Kind {
     /// Runs the stage in `execute`, hands on to its successors in `do_finally`.
     Stage(StageId),
     /// The completion of this stage's work: its completion-edge successors arrive (a stage with none only holds the
-    /// quantum live until its host completion is ready).
+    /// quantum live until its host completion is ready). One a kill ended hands its count to a `DeviceWork` frame
+    /// while the stage's marker is not reached.
     Completions(StageId),
+    /// The device work of a stage whose completion a kill ended was reached: drops the live count it held.
+    DeviceWork,
     /// One marker of an external completion edge (the slot's index) was reached; the last arrives at the stage.
     External(usize),
     /// A retried stage runs again (its live count is the arrival's).
@@ -2873,6 +2941,9 @@ struct GraphFrame<Q, L: DeviceQueue + ?Sized> {
     /// frame.
     inputs: Vec<Marker>,
     waits: Vec<Marker>,
+    /// A completion's: the marker of its stage's work, which holds the quantum live if a kill ends the completion
+    /// before it is reached.
+    holds: Option<Marker>,
     pool: Weak<Producer<Box<GraphFrame<Q, L>>, Multi>>,
 }
 
@@ -2886,6 +2957,7 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> GraphFrame<Q, 
             held: AtomicBool::new(false),
             inputs: Vec::new(),
             waits: Vec::new(),
+            holds: None,
             pool,
         }
     }
@@ -2913,6 +2985,8 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Frame for Grap
             self.recycle();
             return;
         };
+        // A completion a kill ended, and the marker of its stage's work: the quantum is held until it is reached.
+        let mut device_work = None;
         let finish = match self.kind {
             Kind::Stage(stage) => {
                 let held = self.held.load(Ordering::Relaxed);
@@ -2920,8 +2994,12 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Frame for Grap
             }
             Kind::Completions(stage) => {
                 run.completed(stage, alive);
+                if !alive {
+                    device_work = self.holds.map(|marker| (stage, marker));
+                }
                 true
             }
+            Kind::DeviceWork => true,
             Kind::External(index) => run.external_reached(index, alive),
             Kind::Retry(stage) => run.retry_woke(stage, alive),
             Kind::Boundary => {
@@ -2945,7 +3023,13 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Frame for Grap
             }
             Kind::Idle => false,
         };
+        // Recycled first, so the wait below can take this frame from the pool.
         self.recycle();
+        if let Some((stage, marker)) = device_work
+            && run.hold_device_work(stage, marker, false)
+        {
+            return;
+        }
         if finish {
             run.finish_one(Ends::OwnFrame);
         }
@@ -2971,6 +3055,7 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Frame for Grap
         self.run = None;
         self.kind = Kind::Idle;
         self.result = None;
+        self.holds = None;
         self.held.store(false, Ordering::Relaxed);
         self.header = FrameHeader::new(0);
         if let Some(pool) = self.pool.upgrade() {
@@ -3327,6 +3412,11 @@ mod tests {
 
         fn armed(&self) -> u32 {
             self.armed.load(Ordering::Acquire)
+        }
+
+        /// Completes the work up to marker `value` only (no retirement is told: for a query-only lane).
+        fn reach(&self, value: u64) {
+            self.completed.store(value, Ordering::Release);
         }
     }
 
@@ -6909,6 +6999,277 @@ mod tests {
         assert_eq!(h.ran(1), [0], "nothing runs past a killed quantum");
         assert_eq!(h.retired(1), [QuantumOutcome::Killed]);
         assert_eq!(h.abandoned(1), [1]);
+    }
+
+    /// The ordered lane the tests of a killed ordered stage put their completions on: one chain.
+    const ORDERED: u64 = 0x0d3e;
+
+    /// An ordered stage's completion is a chain entry, which a kill ends at once (its chain moves on), but the stage's
+    /// device work may still use what the quantum holds: the quantum does not quiesce (no `abandoned` hook, no
+    /// retirement) until that work is reached. Over a query-only lane (the marker) and a lane with control (the
+    /// completion edge's retirement), with and without a host completion that never gets ready.
+    #[test]
+    fn a_killed_quantum_waits_for_its_ordered_stages_device_work_before_it_quiesces() {
+        for controlled in [false, true] {
+            for host in [false, true] {
+                let case = format!("controlled {controlled}, host {host}");
+                let h = if controlled {
+                    Harness::controlled(1, |_| 0)
+                } else {
+                    Harness::new(1)
+                };
+                let act = if host {
+                    Act::Host(Token::default())
+                } else {
+                    Act::Submit
+                };
+                let graph = h.graph(
+                    &[(Some(ORDERED), &[0], act), (None, &[0], Act::Submit)],
+                    &[(0, 1, Completion)],
+                );
+                let kill = alive();
+                let _ = graph.start(1, kill.clone(), Vec::new());
+                h.pump();
+                assert_eq!(h.ran(1), [0], "{case}");
+                kill.store(true, Ordering::Release);
+                h.pump();
+                assert_eq!(
+                    h.abandoned(1),
+                    [],
+                    "{case}: the device has not reached the ordered stage's work"
+                );
+                assert!(h.retired(1).is_empty(), "{case}");
+                h.finish_lanes();
+                h.pump();
+                assert_eq!(h.abandoned(1), [1], "{case}: once the work is reached");
+                // With control, the home lane's retirement is armed at the quiesce.
+                h.finish_lanes();
+                h.pump();
+                assert_eq!(h.ran(1), [0], "{case}: nothing runs past the kill");
+                assert_eq!(h.abandoned(1), [1], "{case}: abandoned once");
+                assert_eq!(h.retired(1), [QuantumOutcome::Killed], "{case}");
+                assert_eq!(graph.live(), 0, "{case}");
+            }
+        }
+    }
+
+    /// A kill of the chain's head still lets the next of its chain go at once (another quantum's completion on the same
+    /// ordered lane, its work on another device lane): the killed quantum alone waits for its own work.
+    #[test]
+    fn a_killed_head_lets_its_chain_go_on_and_its_quantum_waits_for_its_own_work() {
+        let h = Harness::fixed(2, |_| 0);
+        let (first, second) = (Token::default(), Token::default());
+        let a = h.graph(
+            &[
+                (Some(ORDERED), &[0], Act::Host(first.clone())),
+                (None, &[0], Act::Submit),
+            ],
+            &[(0, 1, Completion)],
+        );
+        let b = h.graph(
+            &[
+                (Some(ORDERED), &[1], Act::Host(second.clone())),
+                (None, &[1], Act::Submit),
+            ],
+            &[(0, 1, Completion)],
+        );
+        let kill = alive();
+        let _ = a.start(1, kill.clone(), Vec::new());
+        let _ = b.start(2, alive(), Vec::new());
+        h.pump();
+        assert_eq!((h.ran(1), h.ran(2)), (vec![0], vec![0]));
+        kill.store(true, Ordering::Release);
+        second.0.store(true, Ordering::Release);
+        h.hands[1].reach(1);
+        h.pump();
+        assert_eq!(h.ran(2), [0, 1], "the next of the chain went out");
+        assert_eq!(
+            h.abandoned(1),
+            [],
+            "lane 0 has not reached the killed stage's work"
+        );
+        assert!(h.retired(1).is_empty());
+        h.hands[0].reach(1);
+        h.pump();
+        assert_eq!(h.abandoned(1), [1]);
+        assert_eq!(h.retired(1), [QuantumOutcome::Killed]);
+        h.finish_lanes();
+        h.pump();
+        assert_eq!(h.retired(2), [QuantumOutcome::Completed]);
+        assert_eq!(h.ran(1), [0]);
+        assert_eq!(a.live() + b.live(), 0);
+    }
+
+    /// The kill comes after the quantum's completion became the head of its chain (the one before it went out).
+    #[test]
+    fn a_quantum_killed_once_its_completion_heads_the_chain_waits_for_its_device_work() {
+        let h = Harness::new(1);
+        let (first, second) = (Token::default(), Token::default());
+        let graph = |token: &Token| {
+            h.graph(
+                &[
+                    (Some(ORDERED), &[0], Act::Host(token.clone())),
+                    (None, &[0], Act::Submit),
+                ],
+                &[(0, 1, Completion)],
+            )
+        };
+        let (a, b) = (graph(&first), graph(&second));
+        let kill = alive();
+        let _ = a.start(1, alive(), Vec::new());
+        let _ = b.start(2, kill.clone(), Vec::new());
+        h.pump();
+        assert_eq!((h.ran(1), h.ran(2)), (vec![0], vec![0]));
+        // The first quantum's work (marker 1) is reached and its host completion ready: it goes out, and the second's
+        // completion (marker 2) heads the chain.
+        first.0.store(true, Ordering::Release);
+        h.hands[0].reach(1);
+        h.pump();
+        assert_eq!(h.ran(1), [0, 1]);
+        kill.store(true, Ordering::Release);
+        h.pump();
+        assert_eq!(h.abandoned(2), [], "marker 2 is not reached");
+        assert!(h.retired(2).is_empty());
+        h.hands[0].reach(2);
+        h.pump();
+        assert_eq!(h.abandoned(2), [1]);
+        assert_eq!(h.retired(2), [QuantumOutcome::Killed]);
+        h.finish_lanes();
+        h.pump();
+        assert_eq!(h.retired(1), [QuantumOutcome::Completed]);
+        assert_eq!(h.ran(2), [0]);
+        assert_eq!(a.live() + b.live(), 0);
+    }
+
+    /// Two ordered stages of one quantum queued in one chain: the kill ends both completions, and the quantum waits for
+    /// the work of both.
+    #[test]
+    fn a_quantum_killed_with_two_ordered_stages_queued_waits_for_the_work_of_both() {
+        let h = Harness::new(1);
+        let graph = h.graph(
+            &[
+                (Some(ORDERED), &[0], Act::Host(Token::default())),
+                (Some(ORDERED), &[0], Act::Host(Token::default())),
+                (None, &[0], Act::Submit),
+            ],
+            &[(0, 1, Submission), (1, 2, Completion)],
+        );
+        let kill = alive();
+        let _ = graph.start(1, kill.clone(), Vec::new());
+        h.pump();
+        assert_eq!(h.ran(1), [0, 1]);
+        kill.store(true, Ordering::Release);
+        h.pump();
+        assert_eq!(h.abandoned(1), [], "neither marker is reached");
+        h.hands[0].reach(1);
+        h.pump();
+        assert_eq!(
+            h.abandoned(1),
+            [],
+            "the second stage's marker is not reached"
+        );
+        assert!(h.retired(1).is_empty());
+        h.hands[0].reach(2);
+        h.pump();
+        assert_eq!(h.abandoned(1), [2]);
+        assert_eq!(h.retired(1), [QuantumOutcome::Killed]);
+        assert_eq!(graph.live(), 0);
+    }
+
+    /// A stage that sets its own quantum's kill switch while it runs, then submits a marker on its lane (and a host
+    /// completion that never gets ready, if it has one).
+    struct KillsThenSubmits {
+        kill: Arc<AtomicBool>,
+        host: Option<Token>,
+        hands: Vec<Arc<HandLane>>,
+        log: Log,
+    }
+
+    impl Stage<u64> for KillsThenSubmits {
+        fn run(&self, q: &u64, cx: &StageCx<'_>) -> Result<Submitted, StageError> {
+            lock(&self.log).push(Event::Ran {
+                q: *q,
+                stage: cx.stage.0,
+                lane: cx.lane.map(|l| l.0),
+                waits: Vec::new(),
+            });
+            self.kill.store(true, Ordering::Release);
+            let lane = cx.lane.expect("the stage names a lane");
+            let hand = &self.hands[usize::from(lane.0)];
+            Ok(Submitted {
+                marker: Some(Marker::new(hand.id, lane, hand.submit())),
+                completion: self
+                    .host
+                    .as_ref()
+                    .map(|token| Box::new(token.clone()) as Box<dyn Ready>),
+            })
+        }
+    }
+
+    /// The kill is set inside the stage's run, so it submits to a halted quantum: its completion edge is never
+    /// registered (no host completion), or its host completion is cancelled at once (ordered) or ends dead once it is
+    /// ready (unordered). Either way the quantum waits for the marker before it quiesces.
+    #[test]
+    fn a_stage_that_submits_into_its_killed_quantum_holds_it_until_its_marker() {
+        for ordered in [Some(ORDERED), None] {
+            for host in [false, true] {
+                let case = format!("ordered {}, host {host}", ordered.is_some());
+                let h = Harness::new(1);
+                let kill = alive();
+                let token = Token::default();
+                let mut spec = StageGraphSpec::new();
+                spec.stage(StageSpec {
+                    name: "kills",
+                    ordered,
+                    lanes: vec![LaneId(0)],
+                });
+                spec.stage(StageSpec {
+                    name: "probe",
+                    ordered: None,
+                    lanes: vec![LaneId(0)],
+                });
+                spec.edge(StageId(0), StageId(1), EdgeKind::Completion);
+                let log = h.log.clone();
+                let stages: Vec<Arc<dyn Stage<u64>>> = vec![
+                    Arc::new(KillsThenSubmits {
+                        kill: kill.clone(),
+                        host: host.then(|| token.clone()),
+                        hands: h.hands.clone(),
+                        log: h.log.clone(),
+                    }),
+                    Arc::new(Named(
+                        1,
+                        Probe {
+                            act: Act::Submit,
+                            gate: GateAct::Pass,
+                            log: h.log.clone(),
+                            hands: h.hands.clone(),
+                        },
+                    )),
+                ];
+                let graph = StageGraph::new(spec, stages, h.runtime.clone(), move |q, outcome| {
+                    lock(&log).push(Event::Retired { q, outcome });
+                })
+                .unwrap();
+                let _ = graph.start(1, kill, Vec::new());
+                h.pump();
+                assert_eq!(h.ran(1), [0], "{case}");
+                assert_eq!(h.abandoned(1), [], "{case}: the marker is not reached");
+                token.0.store(true, Ordering::Release);
+                h.pump();
+                assert_eq!(
+                    h.abandoned(1),
+                    [],
+                    "{case}: the host completion is ready, the marker is still not reached"
+                );
+                assert!(h.retired(1).is_empty(), "{case}");
+                h.finish_lanes();
+                h.pump();
+                assert_eq!(h.abandoned(1), [1], "{case}");
+                assert_eq!(h.retired(1), [QuantumOutcome::Killed], "{case}");
+                assert_eq!(graph.live(), 0, "{case}");
+            }
+        }
     }
 
     /// A stage that returns a marker of a queue that is no lane of the pool, with a host completion.

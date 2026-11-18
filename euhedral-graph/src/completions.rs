@@ -86,6 +86,10 @@ pub trait Pending: Send {
 /// releases it. Cancelling is setting the kill switch of the head's frame; the next visit to the head finds it, ends
 /// it as a dead continuation (handed out, skipped by the executor, its `do_finally` ending what it holds) and
 /// promotes the next entry. A head that panics in its query, or whose marker's pool is gone, ends the same way.
+/// A cancelled head is not queried: its `do_finally` may run before its marker is reached, its retirement arrived or
+/// its `Ready` got ready (the `Ready` is dropped). A consumer whose frame stands for device work that may still use
+/// what it holds keeps that hold itself, past the cancellation: [`StageGraph`](crate::StageGraph) hands it to a wait
+/// for the marker whose frame has no kill switch and no order, so no chain holds it and no cancellation ends it.
 ///
 /// A continuation is handed out even if its frame has died (its kill switch is set): the executor then
 /// skips it and runs its `do_finally`, which ends what it holds. So at shutdown
