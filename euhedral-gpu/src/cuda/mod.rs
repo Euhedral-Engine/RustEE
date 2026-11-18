@@ -33,9 +33,14 @@ use euhedral_graph::LaneId;
 
 use enqueue::Mode;
 
-use crate::{Fingerprint, Gpu, GpuError, GraphHold, Poison, Rerecorded, StreamOptions};
+use crate::{
+    DeviceAttributes, Fingerprint, Gpu, GpuError, GraphHold, Poison, Rerecorded, StreamOptions,
+};
 
-use fns::{ATTR_CC_MAJOR, ATTR_CC_MINOR, GpuFns};
+use fns::{
+    ATTR_CC_MAJOR, ATTR_CC_MINOR, ATTR_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
+    ATTR_MULTIPROCESSOR_COUNT, GpuFns,
+};
 
 /// Device faults: the context is lost and the device is poisoned. These are the codes for which the driver says
 /// further work returns the same error or the process must be relaunched:
@@ -102,6 +107,7 @@ pub struct CudaGpu {
     pub(crate) fns: GpuFns,
     pub(crate) poison: Poison,
     arch: (i32, i32),
+    attributes: DeviceAttributes,
     driver_version: i32,
 }
 
@@ -127,6 +133,13 @@ impl CudaGpu {
             Ok(value)
         };
         let arch = (attribute(ATTR_CC_MAJOR)?, attribute(ATTR_CC_MINOR)?);
+        let attributes = DeviceAttributes {
+            multiprocessors: u32::try_from(attribute(ATTR_MULTIPROCESSOR_COUNT)?).unwrap_or(0),
+            max_shared_memory_per_block_optin: u32::try_from(attribute(
+                ATTR_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
+            )?)
+            .unwrap_or(0),
+        };
         let mut driver_version = 0;
         // SAFETY: an out pointer.
         let code = unsafe { (fns.driver_get_version)(&mut driver_version) };
@@ -139,6 +152,7 @@ impl CudaGpu {
             fns,
             poison: Poison::new(),
             arch,
+            attributes,
             driver_version,
         }))
     }
@@ -206,6 +220,10 @@ impl Gpu for CudaGpu {
         options: &[StreamOptions],
     ) -> Result<Vec<CudaStream>, GpuError> {
         CudaStream::open(self, first, names, options)
+    }
+
+    fn attributes(&self) -> DeviceAttributes {
+        self.attributes
     }
 
     fn poisoned(&self) -> Option<GpuError> {
