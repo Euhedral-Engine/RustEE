@@ -87,7 +87,10 @@ everything a quantum submitted (and of later quanta's stages that used it throug
 external edges into stages that never ran). A quantum retires, handing itself and its outcome to the graph's
 `retire` callback, once none of its frames can run again and the boundary is reached. The boundary is armed
 as one `Completions` edge per lane used; a host completion no completion edge consumed holds the quantum live
-until it is ready, so the quantum retires after it.
+until it is ready, so the quantum retires after it. A device failure of a retirement (the quantum's boundary, or a
+completion edge's) ends it as `QuantumOutcome::DeviceFailed`, which names no stage; a stage's own failure is `Failed`.
+A start on a sink that refuses frames fails the quantum with the refusal, abandons its stages and retires it; with the
+A closed `Completions` source refuses the retirement's registration and leaks its frame (the quantum never retires); the consumer avoids it by completing `Completions` only after `live() == 0`.
 
 **typed lane pool, lane handle** ([`LanePool`](src/lanes.rs), [`StageCx::lane_handle`](src/stage_graph.rs)): a pool is typed
 over its lane, as Java's `LanePool` holds `GpuStream`s. The default, `dyn DeviceQueue`, is the query side only; with a

@@ -294,15 +294,32 @@ shared lane gives, as Java's `GpuStream` does), the boundary is Java's `quiesce`
 lane on the device (the home lane awaits its latest marker), one retirement is armed on the home lane and fills the
 quantum's own `RetireCell`, and a retirement frame settles it, runs each attempted stage's `retired` hook and the
 quantum's terminal work, and recycles the quantum. A completion edge arms a retirement on the producing stage's lane the
-same way (Java `RetiredEdge`). For lanes that are only a query side (`dyn DeviceQueue` without control) the boundary
+same way (Java `RetiredEdge`); a device failure of that retirement ends the quantum as `QuantumOutcome::DeviceFailed`, not as a stage's failure, and releases no successor. For lanes that are only a query side (`dyn DeviceQueue` without control) the boundary
 stays one `Completions` marker edge per lane. A quantum that **touched no lane** (none of its stages submitted a
 marker, none was recorded for it, and no `abandoned` hook of a stage that names a lane ran on a home lane that can arm
 a retirement) has no device work to retire and arms no retirement: it concludes in its own last frame (the frame that
 ends its last stage, its last host completion or the frame that abandons its stages), or, when its last hold goes
 anywhere else (a dropped `QuantumRef`, a later quantum's stage releasing its pin, a gate failed from outside), in one
 pooled frame; `retire` never runs inside the call that drops a hold (a sink that refuses the frame has it end in place on that thread, where a panic of `retire` is contained). `retire` then receives the
-quantum and its `QuantumOutcome`: `Completed`, `Failed` or `Killed`. `live()` counts quanta not
+quantum and its `QuantumOutcome`: `Completed`, `Failed`, `DeviceFailed` or `Killed`. `live()` counts quanta not
 retired yet.
+
+**A start on a sink that refuses frames.** The stage frames are refused, the first of them fails the quantum, every stage
+is abandoned and the quantum retires with that failure as its cause, so `live()` returns to 0 and the reply of whoever
+waits on `retire` resolves. Where the home lane takes retirements, the hooks' work of stages that name a lane is
+covered by a retirement as for any quantum, so the quantum retires when the device reaches it (not before). `retire`
+cannot tell covered work from uncovered: a retirement that could not be armed notes `DeviceFailed`, but when a hook ran
+the cause is claimed already.
+
+**A closed `Completions` source.** A quantum that waits for a retirement or a marker registers a frame with the
+`Completions` source. A source that is closed refuses the registration and leaks the frame, as it documents (device work
+may still read what the frame holds, so it is never freed under it): the quantum never retires and `live()` keeps counting
+it, and debug builds panic at the registration (`debug_assert!` in `Completions`), which unwinds into the frame's
+contained end or into the consumer's drop of a `QuantumRef`. This holds for a quantum started after the close as for one
+in flight, and it is the safety rule that stays. Whether quanta retire at shutdown is the consumer's policy, not
+RustEE's: to have every quantum retire, stop starting quanta and complete `Completions` only after `live() == 0`.
+(Retiring such a quantum in place instead would end its retirement frame on a refusing sink, which recurses down a chain
+of quanta that hold each other.)
 
 Quanta are **pooled**. `start` takes a retired quantum's state from a bounded pool and `retire` gives it back,
 as the graph's frames go back to theirs, so after warm-up a quantum allocates nothing and takes no lock of its own. (A stage
