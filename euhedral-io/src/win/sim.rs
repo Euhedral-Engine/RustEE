@@ -767,6 +767,15 @@ impl Sys for Sim {
         }
     }
 
+    fn file_len(&self, file: Handle) -> io::Result<u64> {
+        let mut s = self.s();
+        s.log.push(format!("file_len {file}"));
+        match s.files.get(&file) {
+            Some(file) => Ok(file.data.len() as u64),
+            None => Err(io::Error::from_raw_os_error(6)),
+        }
+    }
+
     fn run_on_pool(&self, job: Box<dyn FnOnce() + Send + 'static>) -> io::Result<()> {
         if self.s().pool_fail {
             return Err(io::Error::from_raw_os_error(8));

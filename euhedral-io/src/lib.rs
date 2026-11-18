@@ -403,6 +403,10 @@ pub(crate) enum Request {
         from: PathBuf,
         to: PathBuf,
     },
+    /// The size in bytes of an open file.
+    FileLen {
+        file: usize,
+    },
     /// `open(2)` with raw flags (Linux and Android).
     #[cfg(any(target_os = "linux", target_os = "android"))]
     OpenAt {
@@ -1402,6 +1406,16 @@ impl AsyncIo {
         };
         let then = Then::Raw(Box::new(move |result| then(result.map(|_| ()))));
         self.submit(request, IoBuf::default().into(), then)
+    }
+
+    /// Finds the length in bytes of an open file, without blocking the caller (`statx(2)` on the
+    /// descriptor on Linux and Android; `GetFileSizeEx` on the OS thread pool on Windows). The
+    /// continuation gets the length or the error. `file` must stay open until the continuation
+    /// runs, as for a read.
+    pub fn file_len(&self, file: RawFile, then: Continuation<io::Result<u64>>) -> io::Result<()> {
+        let file = raw_file(file);
+        let then = Then::Raw(Box::new(move |result| then(result.map(|len| len as u64))));
+        self.submit(Request::FileLen { file }, IoBuf::default().into(), then)
     }
 
     /// Sends one datagram to `to`.
