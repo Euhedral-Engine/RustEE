@@ -52,9 +52,9 @@ mod sync;
 mod tensor_map;
 
 pub use api::{
-    CompileOptions, Enqueue, Gpu, Graph, Kernel, KernelOptions, Lane, LaneEnqueue, LaneStream,
-    Lanes, Module, POISONED_STATUS, RawStream, Rerecorded, RetireListener, RetireTicket, Sequence,
-    Stream, StreamOptions, StreamPriority,
+    CompileOptions, DeviceAttributes, Enqueue, Gpu, Graph, Kernel, KernelOptions, Lane,
+    LaneEnqueue, LaneStream, Lanes, Module, POISONED_STATUS, RawStream, Rerecorded, RetireListener,
+    RetireTicket, Sequence, Stream, StreamOptions, StreamPriority,
 };
 pub use args::{ArgMismatch, Args, Dim3, KernelArg, Launch, MAX_ALIGN, MAX_ARGS};
 pub use error::GpuError;

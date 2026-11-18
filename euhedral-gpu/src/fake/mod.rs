@@ -40,8 +40,8 @@ use euhedral_hardware_utils::affinity;
 use crate::retire::RetireSink;
 
 use crate::{
-    Args, Fingerprint, Gpu, GpuError, GraphHold, Kernel, Launch, POISONED_STATUS, Poison,
-    Rerecorded, StreamOptions, StreamPriority,
+    Args, DeviceAttributes, Fingerprint, Gpu, GpuError, GraphHold, Kernel, Launch, POISONED_STATUS,
+    Poison, Rerecorded, StreamOptions, StreamPriority,
 };
 
 pub use enqueue::FakeEnqueue;
@@ -436,6 +436,12 @@ impl Drop for FakeContextHold {
     }
 }
 
+/// What a new [`FakeGpu`] reports as its limits: values for tests, not any card's. The opt-in limit is what `FakeModule::kernel_with` refuses above.
+pub const DEFAULT_ATTRIBUTES: DeviceAttributes = DeviceAttributes {
+    multiprocessors: 8,
+    max_shared_memory_per_block_optin: MAX_DYNAMIC_SHARED_BYTES,
+};
+
 /// The fake device.
 pub struct FakeGpu {
     /// The device this was opened on; released when this drops.
@@ -443,6 +449,7 @@ pub struct FakeGpu {
     pub(crate) state: Mutex<State>,
     pub(crate) poison: Poison,
     kernels: Mutex<HashMap<String, FakeKernelFn>>,
+    attributes: Mutex<DeviceAttributes>,
     /// A test hook: how the next recording fails (0: it does not; 1: after its work ran; 2: before the body ran).
     fail_recording: std::sync::atomic::AtomicU8,
 }
@@ -476,8 +483,17 @@ impl FakeGpu {
             }),
             poison: Poison::new(),
             kernels: Mutex::new(HashMap::new()),
+            attributes: Mutex::new(DEFAULT_ATTRIBUTES),
             fail_recording: std::sync::atomic::AtomicU8::new(0),
         }
+    }
+
+    /// Sets the limits [`Gpu::attributes`] reports (a new fake reports [`DEFAULT_ATTRIBUTES`]).
+    pub fn set_attributes(&self, attributes: DeviceAttributes) {
+        *self
+            .attributes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = attributes;
     }
 
     /// The context this gpu is an open of: it is held until this gpu and everything holding it drop.
@@ -1016,6 +1032,13 @@ impl Gpu for FakeGpu {
                 )
             })
             .collect())
+    }
+
+    fn attributes(&self) -> DeviceAttributes {
+        *self
+            .attributes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     fn poisoned(&self) -> Option<GpuError> {

@@ -82,6 +82,9 @@ pub trait Gpu: Send + Sync + fmt::Debug + Sized + 'static {
         options: &[StreamOptions],
     ) -> Result<Vec<Self::Stream>, GpuError>;
 
+    /// The device's limits that a launch planner sizes work by. Fixed for an open device.
+    fn attributes(&self) -> DeviceAttributes;
+
     /// The device's first fault, once it has one.
     fn poisoned(&self) -> Option<GpuError>;
 
@@ -756,6 +759,18 @@ pub enum StreamPriority {
     Normal,
     /// The greatest priority the device offers: its waiting blocks are scheduled ahead of a normal stream's.
     High,
+}
+
+/// The limits of a device that a launch planner sizes work by: how many blocks run at once, and how much shared memory
+/// one block may ask for. A small typed struct rather than a general attribute call: a planner needs these and the
+/// crate reads them once, when the device opens, so the query makes no driver call and cannot fail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeviceAttributes {
+    /// The number of multiprocessors (`CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT`).
+    pub multiprocessors: u32,
+    /// The most dynamic shared memory one block may use once it opts in, in bytes
+    /// (`CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN`).
+    pub max_shared_memory_per_block_optin: u32,
 }
 
 /// How a stream is set up.

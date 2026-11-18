@@ -3,6 +3,22 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## A device reports its multiprocessor count and shared-memory opt-in limit (`euhedral-gpu`) (2026-11-17)
+
+**What.** `Gpu::attributes()` returns a `DeviceAttributes { multiprocessors, max_shared_memory_per_block_optin }` (bytes). `FakeGpu::set_attributes` sets what the fake reports; a new fake reports `fake::DEFAULT_ATTRIBUTES`.
+
+**Why.** A launch planner sizes a grid by the multiprocessor count and a dynamic shared-memory request by the per-block opt-in limit, and the crate had no way to ask the device for either.
+
+**Breaking:** `Gpu::attributes` is a required trait method (a default would invent numbers). An implementor of `Gpu` outside this repository must add it. `CudaGpu` and `FakeGpu` do.
+
+**Migration.** Implement `fn attributes(&self) -> DeviceAttributes` on a `Gpu`; a call site needs nothing.
+
+**Semantics.**
+- On CUDA both values are read once when the device opens (`CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT`, `CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN`, attribute 97: a driver of CUDA 9 or later), so the query makes no driver call and cannot fail. A failed read, or a value that is not positive, fails the open with `GpuError::Invalid` naming the attribute.
+- The fake's `FakeModule::kernel_with` refuses an opt-in above the device's current opt-in limit as `Invalid`, and accepts one at it. The default limit is `fake::MAX_DYNAMIC_SHARED_BYTES` (227 KiB), so a fake kernel opts in as before until a test sets a lower limit.
+
+**Tests.** `tests/fake_device_attributes.rs` (the defaults; set values are reported; a kernel opt-in above a set limit is refused and one at it succeeds); device: `tests/cuda_device_attributes.rs`. The refusal of a non-positive value on CUDA is reachable only through a mock driver, which the crate has none of, so it is not tested.
+
 ## A reply can be streamed piece by piece (`euhedral-net`) (2026-11-16)
 
 **What.** `Responder::stream(head, then)` answers a request with a reply whose body is sent piece by piece. `then` gets a `ReplyStream` once the head is written; `ReplyStream::send(piece, then)` writes a piece and gives back a `PieceSent { stream, piece }` (the stream, and the piece's `Vec` emptied with its capacity kept); `ReplyStream::end()` ends the body; `on_cancel` and `cancelled` are the `Responder`'s, for the whole stream. `StreamError` is `Head(WriteError)`, `Closed`, `TimedOut` or `Io(io::Error)`. `ServerConfig::piece_limit` (default 30 s) and `Counters::streams` and `streams_cut` are new. The writer gains `write_chunked_head`, `write_chunk` and `write_last_chunk`.

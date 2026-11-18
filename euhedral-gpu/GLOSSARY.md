@@ -5,6 +5,10 @@ and the rings and caches under a stream. The terms a user submits work with (str
 modules, sequences, graphs) and the lifecycle are in the [top-level glossary](../GLOSSARY.md). Paths are
 relative to this crate. Entries run from the lowest layer up: streams, recording, caches.
 
+**device attributes** ([`DeviceAttributes`](src/api.rs), `Gpu::attributes`): the limits of an open device that a launch planner
+sizes work by: its multiprocessor count and its per-block shared-memory opt-in limit in bytes. Read once when a CUDA device
+opens; settable on the fake (`FakeGpu::set_attributes`).
+
 **marker ring** ([`StreamOptions::markers`](src/api.rs), [`ring`](src/ring.rs)): each CUDA stream has a ring of events for its
 markers (256 by default), made by any number of threads. A number is claimed by compare-and-set once the slot's previous
 marker completed (`mark()` returns `Err(Busy)` rather than reuse a slot whose marker has not completed), the claimant records
