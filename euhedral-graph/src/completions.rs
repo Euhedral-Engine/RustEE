@@ -1060,7 +1060,7 @@ impl LatticeSource for Completions {
 #[allow(clippy::disallowed_methods, clippy::disallowed_types)]
 mod tests {
     use std::sync::atomic::AtomicU64;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::{Mutex, OnceLock, PoisonError};
     use std::thread::{self, ThreadId};
     use std::time::Duration;
 
@@ -1265,7 +1265,10 @@ mod tests {
         }
 
         fn do_finally(self: Box<Self>) {
-            self.ran.lock().unwrap().push(self.tag);
+            self.ran
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(self.tag);
         }
     }
 
