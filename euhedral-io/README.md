@@ -43,7 +43,7 @@ starts operations and finds their ends, and `src/lib.rs` does the rest.
 buffers or plan its reads from it: `statx(2)` of the descriptor through the ring on Linux and Android
 (`STATX_SIZE`, empty path with `AT_EMPTY_PATH`), `GetFileSizeEx` on the OS thread pool on Windows (any handle works, as the
 call does not wait on the file). `then` gets `io::Result<u64>`: the size at the moment the kernel looked, or the
-system's error (a bad descriptor ends with `EBADF`). The file must stay open until `then` runs. Where the length
+system's error (a bad descriptor ends with `EBADF` on Linux and Android, `ERROR_INVALID_HANDLE` (6) on Windows). The file must stay open until `then` runs. Where the length
 does not fit a `usize` (a 32-bit target) it ends with an overflow error.
 
 `socket_for(addr)` makes the socket a client's `connect` needs: a new, unconnected stream socket of the address's
@@ -81,8 +81,8 @@ internally, each landing at its own offset. `read` stays as it was, for a `Vec`-
   kernel ring for both (Windows 11 22H2 and later; not one emulated in user mode). The ring
   functions are looked up at run time, so the library still loads where they are missing. A file
   keeps its route: IoRing refuses a handle that belongs to a completion port. `AsyncIoOptions { windows_ioring: false }` forces the port.
-  Windows has no asynchronous open, rename or file length, so those run on the OS thread pool and post their
-  result to the port: the one place the crate uses threads it did not create. Handles must be
+  Windows has no asynchronous open, rename or file length, so those run on the OS thread pool and leave their
+  result in a queue the poll drains: the one place the crate uses threads it did not create. Handles must be
   opened for overlapped I/O (`open_path` does, and so do Rust's sockets) and must not skip the port
   on success; a handle that would block or never complete is refused. A handle joins the engine's
   port and can serve one `AsyncIo`, ever. Writes go in pieces of at most 256 KiB, since a write

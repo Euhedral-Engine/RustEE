@@ -321,7 +321,7 @@ impl Op {
     /// The submission entry for the operation's next piece.
     fn entry(&mut self, user_data: u64, max_piece: usize) -> squeue::Entry {
         let piece = |n: usize| u32::try_from(n.min(max_piece)).unwrap_or(u32::MAX);
-        let entry = match &self.kind {
+        let entry = match &mut self.kind {
             Kind::Read { fd, offset } => {
                 let rest = &mut self.buf.bytes_mut()[self.moved..];
                 // A read the page cache can serve is copied inside `io_uring_enter`, on the
@@ -377,7 +377,8 @@ impl Op {
             Kind::Statx { fd, out } => opcode::Statx::new(
                 types::Fd(*fd),
                 EMPTY_PATH.as_ptr(),
-                std::ptr::from_ref(&**out).cast_mut().cast(),
+                // The kernel writes through this pointer: it comes from a mutable borrow.
+                (&raw mut **out).cast(),
             )
             .flags(libc::AT_EMPTY_PATH)
             .mask(libc::STATX_SIZE)

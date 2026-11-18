@@ -10,9 +10,9 @@
 //!   supported: Windows 11 22H2 and later). A full
 //!   submission queue goes to the ring's backlog and is handed over by a later submission or poll.
 //!   A file keeps its route: IoRing refuses a handle that belongs to a completion port.
-//! - **Open, rename and file length** have no asynchronous call. They run on the OS thread pool and leave their
-//!   result in a queue the poll drains, so a job that panics or is dropped still ends its
-//!   operation, with an error. It is the one place the crate uses threads it did not create.
+//! - **Open, rename and file length** have no asynchronous call. They run on the OS thread pool and
+//!   leave their result in a queue the poll drains, so a job that panics or is dropped still ends
+//!   its operation, with an error. It is the one place the crate uses threads it did not create.
 //!
 //! # Records and identity
 //!
@@ -287,7 +287,7 @@ struct Failed {
     error: io::Error,
 }
 
-/// What the pool left for an open or rename.
+/// What the pool left for an open, a rename or a file length.
 struct PoolDone {
     slot: u32,
     generation: u32,
@@ -429,7 +429,7 @@ pub(super) struct Engine {
     /// Operations whose call failed at once, to end with that error at the next poll.
     #[allow(clippy::disallowed_types, reason = "HOT-FIX(I8)")]
     ready: Mutex<VecDeque<Failed>>,
-    /// What open and rename jobs left.
+    /// What open, rename and file length jobs left.
     #[allow(clippy::disallowed_types, reason = "HOT-FIX(I9)")]
     pool_done: Arc<Mutex<VecDeque<PoolDone>>>,
     /// Packets taken from the port and not yet handled (a poll stops when the caller has room for
@@ -1646,7 +1646,7 @@ impl EngineTrait for Engine {
         if !self.poll_failed(room, offer) {
             return;
         }
-        // What open and rename jobs left.
+        // What open, rename and file length jobs left.
         while room() {
             let Some(done) = lock!(&self.pool_done).pop_front() else {
                 break;

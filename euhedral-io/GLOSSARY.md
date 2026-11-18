@@ -29,7 +29,7 @@ belongs to the ring of the thread that submitted it.
 completion port collects the packets of overlapped calls and is polled with a zero timeout; IoRing is
 Windows' kernel ring for file reads and writes (Windows 11 22H2 and later), used where the OS has one that
 is not emulated in user mode. `AsyncIoOptions { windows_ioring: false }` forces the port. Open, rename and file length
-run on the OS thread pool and post to the port. A handle joins the engine's port and can serve one
+run on the OS thread pool and leave their result in a queue the poll drains. A handle joins the engine's port and can serve one
 `AsyncIo`, ever.
 
 **limit, cancel, `OpId`** ([`lib.rs`](src/lib.rs)): `OpOptions { limit }` bounds a socket operation in time
