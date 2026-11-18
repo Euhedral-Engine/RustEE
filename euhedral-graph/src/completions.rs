@@ -74,6 +74,12 @@ pub trait Pending: Send {
 /// then go out through `request`'s pushes and the lattice's routing, so continuations on one ordered lane
 /// keep their registration order. A completed operation is never queried again.
 ///
+/// **In-order delivery within a chain.** Continuations whose frames are ordered and share a routing hash (one
+/// chain) are emitted in registration order whatever they wait on: an operation is queried only once every earlier
+/// operation of its chain was found done (a lane may advance between two queries of one scan, and a later
+/// registration would otherwise be found done while an earlier one was not). Operations of different chains, and
+/// unordered ones, are emitted as they are found.
+///
 /// A continuation is handed out even if its frame has died (its kill switch is set): the executor then
 /// skips it and runs its `do_finally`, which ends what it holds. So at shutdown
 /// [`pending`](Self::pending) drains to zero on its own.
@@ -189,6 +195,23 @@ enum Waits {
     Retired(Arc<RetireCell>, Box<dyn Frame>),
     At(Instant, Box<dyn Frame>),
     Pending(Box<dyn Pending>),
+}
+
+impl Waits {
+    /// The routing hash of the continuation's chain: `Some` when the frame is ordered, so that frames with the same
+    /// hash run in the order they leave the source. A `Pending` has no frame until it yields one: no chain.
+    fn chain(&self) -> Option<u64> {
+        let frame = match self {
+            Waits::Ready(_, frame)
+            | Waits::Wake(_, frame)
+            | Waits::Marker(_, frame)
+            | Waits::Retired(_, frame)
+            | Waits::At(_, frame) => frame,
+            Waits::Pending(_) => return None,
+        };
+        let header = frame.header();
+        header.is_ordered().then(|| header.routing_hash())
+    }
 }
 
 /// The id hash of the poll frame. The routing hash of each push is this mixed with the push's own seed, which
@@ -805,6 +828,28 @@ impl Completions {
             // queried again (a query may have effects: a driver call that fetches the result).
             // A query is the application's code: one that panics loses its entry (finished without running, or
             // dropped), is counted, and does not stop the entries behind it.
+            // An ordered continuation never leaves before an earlier one of its chain: the operations are queried one
+            // after the other, and a lane that advanced between two queries would otherwise show the later
+            // registration done and the earlier one not. What stays in `waiting` ahead of this entry is exactly what
+            // was found not done in this scan or before it.
+            let held_back = entry.what.chain().is_some_and(|chain| {
+                waiting
+                    .iter()
+                    .take(index)
+                    .any(|earlier| earlier.what.chain() == Some(chain))
+            });
+            if held_back {
+                // Not queried (nothing is lost: an operation is only queried until it is found done), and not seen in
+                // flight, so its lateness counts from its last look.
+                match &waiting[index].what {
+                    Waits::At(deadline, _) => earliest = earliest.min(self.nanos(*deadline)),
+                    Waits::Retired(cell, _) if cell.rings(&self.events) => {}
+                    _ => blind = true,
+                }
+                index += 1;
+                continue;
+            }
+            let entry = &mut waiting[index];
             let queried = panic::catch_unwind(AssertUnwindSafe(|| match &mut entry.what {
                 Waits::Ready(ready, _) => (ready.is_ready(), None),
                 Waits::Wake(wake, _) => (wake.is_ready(), None),
@@ -1200,6 +1245,110 @@ mod tests {
         lane.completed.store(2, Ordering::Release);
         late.done.store(true, Ordering::Release);
         assert_eq!(poll(&completions), [10, 11, 12]);
+    }
+
+    /// A continuation of one ordered chain (the routing hash `chain`), told apart by its `tag`: it adds the tag to
+    /// `ran` when it ends, which is how the order it was handed out in shows.
+    struct Linked {
+        header: FrameHeader,
+        tag: u64,
+        ran: Arc<Mutex<Vec<u64>>>,
+    }
+
+    impl Frame for Linked {
+        fn header(&self) -> &FrameHeader {
+            &self.header
+        }
+
+        fn header_mut(&mut self) -> &mut FrameHeader {
+            &mut self.header
+        }
+
+        fn do_finally(self: Box<Self>) {
+            self.ran.lock().unwrap().push(self.tag);
+        }
+    }
+
+    fn linked(chain: u64, tag: u64, ran: &Arc<Mutex<Vec<u64>>>) -> Box<dyn Frame> {
+        Box::new(Linked {
+            header: FrameHeader::new(chain),
+            tag,
+            ran: ran.clone(),
+        })
+    }
+
+    /// One poll by hand, ending each continuation that comes out.
+    fn poll_ending(completions: &Completions) {
+        completions.reap();
+        completions.pull(&mut |frame| frame.do_finally(), &mut |_| false, u64::MAX);
+    }
+
+    /// A lane that moves on between two reads of it: the first read says nothing is done, every later one says
+    /// all is (a device that finished work while the poller was away).
+    #[derive(Debug)]
+    struct AdvancingLane {
+        id: QueueId,
+        reads: AtomicUsize,
+    }
+
+    impl DeviceQueue for AdvancingLane {
+        fn id(&self) -> QueueId {
+            self.id
+        }
+
+        fn completed(&self) -> u64 {
+            if self.reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                0
+            } else {
+                u64::MAX
+            }
+        }
+
+        fn name(&self) -> &str {
+            "advancing"
+        }
+    }
+
+    #[test]
+    fn two_markers_of_one_ordered_chain_never_swap_when_the_lane_advances_between_their_queries() {
+        let lane = Arc::new(AdvancingLane {
+            id: QueueId::next(),
+            reads: AtomicUsize::new(0),
+        });
+        let pool = Arc::new(LanePool::new(vec![lane.clone() as Arc<dyn DeviceQueue>]));
+        let completions = Completions::new(&pool);
+        let ran = Arc::new(Mutex::new(Vec::new()));
+        completions.after_marker(Marker::new(lane.id, LaneId(0), 1), linked(7, 1, &ran));
+        completions.after_marker(Marker::new(lane.id, LaneId(0), 2), linked(7, 2, &ran));
+        // The first query found marker 1 not done; marker 2, behind it in its chain, waits for it.
+        poll_ending(&completions);
+        assert!(ran.lock().unwrap().is_empty(), "nothing leaves ahead of marker 1");
+        poll_ending(&completions);
+        assert_eq!(*ran.lock().unwrap(), [1, 2], "registration order");
+    }
+
+    #[test]
+    fn a_completed_operation_waits_for_an_earlier_one_of_its_chain_whatever_kind_it_waits_on() {
+        let (completions, _rig) = setup();
+        let ran = Arc::new(Mutex::new(Vec::new()));
+        let (first, second, other) = (Token::default(), Token::default(), Token::default());
+        second.done.store(true, Ordering::Release);
+        other.done.store(true, Ordering::Release);
+        completions.after(Box::new(first.clone()), linked(7, 1, &ran));
+        completions.after(Box::new(second.clone()), linked(7, 2, &ran));
+        // Another chain is not held back by it.
+        completions.after(Box::new(other.clone()), linked(8, 3, &ran));
+        poll_ending(&completions);
+        assert_eq!(*ran.lock().unwrap(), [3]);
+        assert_eq!(
+            second.queries.load(Ordering::Relaxed),
+            0,
+            "an operation held back behind its chain is not queried"
+        );
+        first.done.store(true, Ordering::Release);
+        poll_ending(&completions);
+        assert_eq!(*ran.lock().unwrap(), [3, 1, 2], "registration order within the chain");
+        assert_eq!(completions.pending(), 0);
     }
 
     #[test]
