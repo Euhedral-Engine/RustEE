@@ -1680,6 +1680,13 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Run<Q, L> {
         self.stopped.store(true, Ordering::Release);
     }
 
+    /// The device work failed where no stage is to blame (a completion edge's retirement): the quantum ends as
+    /// [`QuantumOutcome::DeviceFailed`], and nothing more is published.
+    fn fail_device(&self, cause: String) {
+        self.note(QuantumOutcome::DeviceFailed { cause });
+        self.stopped.store(true, Ordering::Release);
+    }
+
     fn header(&self, ordered: Option<u64>, kill: bool) -> FrameHeader {
         let kill = kill.then(|| {
             // SAFETY: as `kill_set`.
@@ -2240,7 +2247,7 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Run<Q, L> {
         };
         match control.confirm_retired(status) {
             Some(error) => {
-                self.fail(stage, StageError::Fatal(error.to_string()));
+                self.fail_device(error.to_string());
                 true
             }
             None => false,
@@ -2418,8 +2425,9 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Run<Q, L> {
             return;
         }
         if used == 0 {
-            // A hook of a stage that names a lane ran and the home lane refused the retirement: the hooks' work is
-            // uncovered, which the quantum reports.
+            // A hook of a stage that names a lane ran and the home lane refused the retirement: the hooks' work is uncovered, which the quantum reports
+            // (as `DeviceFailed` when no earlier cause was claimed; a hook ran, so `retire` usually cannot tell covered
+            // work from uncovered).
             self.note(QuantumOutcome::DeviceFailed {
                 cause: "the retirement covering the abandoned hooks' work could not be armed on the home lane".into(),
             });
@@ -4600,6 +4608,79 @@ mod tests {
         assert_eq!(graph.live(), 0);
     }
 
+    /// A quantum started on a sink that already refuses frames concludes, whatever the graph's shape: every stage is
+    /// abandoned, it retires once as failed (the refusal is the cause), and `live` returns to 0.
+    #[test]
+    fn a_quantum_started_on_a_refusing_sink_retires_whatever_the_graphs_shape() {
+        type Shape = (
+            &'static str,
+            Vec<(Option<u64>, Vec<u16>)>,
+            Vec<(u16, u16, EdgeKind)>,
+        );
+        let shapes: Vec<Shape> = vec![
+            ("lane root", vec![(None, vec![0])], vec![]),
+            (
+                "two lane stages",
+                vec![(None, vec![0]), (None, vec![0])],
+                vec![(0, 1, Submission)],
+            ),
+            (
+                "completion edge",
+                vec![(None, vec![0]), (None, vec![0])],
+                vec![(0, 1, Completion)],
+            ),
+            ("ordered root", vec![(Some(7), vec![0])], vec![]),
+            ("two roots", vec![(None, vec![0]), (None, vec![])], vec![]),
+        ];
+        for (name, stages, edges) in shapes {
+            let h = Harness::new(1);
+            let stages: Vec<(Option<u64>, &[u16], Act)> = stages
+                .iter()
+                .map(|(o, l)| (*o, l.as_slice(), Act::Submit))
+                .collect();
+            let graph = h.graph(&stages, &edges);
+            h.sink.complete();
+            let _ = graph.start(1, alive(), Vec::new());
+            h.pump();
+            assert_eq!(graph.live(), 0, "{name}");
+            assert!(
+                matches!(
+                    &h.retired(1)[..],
+                    [QuantumOutcome::Failed {
+                        stage: StageId(0),
+                        error: StageError::Fatal(_)
+                    }]
+                ),
+                "{name}: {:?}",
+                h.retired(1)
+            );
+            assert_eq!(h.abandoned(1).len(), stages.len(), "{name}");
+        }
+    }
+
+    /// On a lane that takes retirements, the abandoned hooks' work is covered by a retirement, so the quantum retires
+    /// when the device reaches it (not before), even though the sink refused every stage.
+    #[test]
+    fn a_quantum_started_on_a_refusing_sink_retires_when_its_hooks_retirement_arrives() {
+        let h = Harness::controlled(1, |_| 0);
+        let graph = h.graph(&[(None, &[0], Act::Submit)], &[]);
+        h.sink.complete();
+        let _ = graph.start(1, alive(), Vec::new());
+        h.pump();
+        assert_eq!(h.hands[0].armed(), 1);
+        assert_eq!(graph.live(), 1, "the retirement has not arrived");
+        h.finish_lanes();
+        h.pump();
+        assert_eq!(graph.live(), 0);
+        assert!(matches!(
+            &h.retired(1)[..],
+            [QuantumOutcome::Failed {
+                error: StageError::Fatal(_),
+                ..
+            }]
+        ));
+    }
+
     #[test]
     fn ordered_stages_run_on_their_lane_and_the_others_are_unordered() {
         let h = Harness::new(1);
@@ -5474,13 +5555,12 @@ mod tests {
         h.finish_lanes();
         h.pump();
         assert_eq!(h.ran(1), [0], "the successor never ran");
-        assert!(matches!(
-            &h.retired(1)[..],
-            [QuantumOutcome::Failed {
-                stage: StageId(0),
-                ..
-            }]
-        ));
+        assert!(
+            matches!(&h.retired(1)[..], [QuantumOutcome::DeviceFailed { cause }] if !cause.is_empty()),
+            "{:?}",
+            h.retired(1)
+        );
+        assert_eq!(graph.live(), 0);
     }
 
     /// The gates a test took, in the order the stages asked.
@@ -6266,6 +6346,86 @@ mod tests {
         assert_eq!(h.abandoned(1), [0, 1]);
         assert_eq!(h.retired(1), [QuantumOutcome::Killed]);
         assert_eq!(graph.live(), 0);
+    }
+
+    /// A stage that enqueued work and failed leaves no marker (`used` is 0), but the device may still read what the
+    /// quantum holds: with the completions source closed the quantum is not retired early (its retirement frame can
+    /// never be emitted, which the source documents as a leak), so nothing is released under the device's work.
+    #[test]
+    fn a_quantum_whose_stage_enqueued_and_failed_is_not_retired_early_when_the_source_closes() {
+        let h = Harness::controlled(1, |_| 0);
+        let graph = h.graph(&[(None, &[0], Act::Fail)], &[]);
+        h.runtime.completions.complete();
+        // Debug builds panic where the closed source refuses the registration (and the frame's end contains it).
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            let _ = graph.start(1, alive(), Vec::new());
+            h.pump();
+        }));
+        assert_eq!(
+            h.hands[0].submitted.load(Ordering::Acquire),
+            1,
+            "the stage enqueued"
+        );
+        assert!(h.retired(1).is_empty(), "{:?}", h.retired(1));
+        assert_eq!(graph.live(), 1);
+    }
+
+    /// Quanta started after the sink closed (the completions source still takes registrations), each held by the next
+    /// one's state, retire one retirement frame at a time when the last reference is dropped: the stack stays flat.
+    #[test]
+    fn a_long_chain_of_lane_quanta_started_on_a_closed_sink_retires_in_a_flat_stack() {
+        struct Chain(Option<QuantumRef>);
+
+        struct Never;
+
+        impl Stage<Chain> for Never {
+            fn run(&self, _: &Chain, _: &StageCx<'_>) -> Result<Submitted, StageError> {
+                Ok(Submitted::done())
+            }
+        }
+
+        let length: usize = if cfg!(miri) { 40 } else { 100_000 };
+        let worker = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                let h = Harness::controlled(1, |_| 0);
+                let mut spec = StageGraphSpec::new();
+                spec.stage(StageSpec {
+                    name: "never",
+                    ordered: None,
+                    lanes: vec![LaneId(0)],
+                });
+                let retired = Arc::new(AtomicU64::new(0));
+                let counted = retired.clone();
+                let graph = StageGraph::new(
+                    spec,
+                    vec![Arc::new(Never) as Arc<dyn Stage<Chain>>],
+                    h.runtime.clone(),
+                    move |link: Chain, _| {
+                        counted.fetch_add(1, Ordering::AcqRel);
+                        drop(link.0);
+                    },
+                )
+                .unwrap();
+                h.sink.complete();
+                let mut previous = None;
+                for _ in 0..length {
+                    previous = Some(graph.start(Chain(previous.take()), alive(), Vec::new()));
+                }
+                assert_eq!(
+                    retired.load(Ordering::Acquire),
+                    0,
+                    "each is held by the next"
+                );
+                drop(previous);
+                while graph.live() > 0 {
+                    h.finish_lanes();
+                    assert!(h.pump() > 0, "a retirement frame is due");
+                }
+                assert_eq!(retired.load(Ordering::Acquire), length as u64);
+            })
+            .unwrap();
+        worker.join().expect("the chain ended in a flat stack");
     }
 
     /// A later quantum's stage that submitted on a lane after this one ran covers its marker with this quantum's
