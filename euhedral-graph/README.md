@@ -93,7 +93,10 @@ counted in `leaked_unreached` (the lane the marker names may still use what it h
 debug builds panic. A timer is never emitted before its deadline and goes out in the first reap at or after it; timers
 due in one reap go out in registration order, not sorted by deadline.
 
-Continuations are emitted in registration order, so frames on one ordered lane keep that order. A
+Continuations are emitted in registration order, so frames on one ordered lane keep that order, whatever each waits on: a reap
+queries an operation only once every earlier operation of its chain (ordered frames with one routing hash) was found done, so a
+lane that advances between two queries cannot let a later registration out first. Operations of different chains, and unordered
+ones, are emitted as they are found. A
 frame whose kill switch is set is still emitted: the executor skips it and runs its `do_finally`,
 which ends what it holds, so `pending()` drains to zero on its own. `lateness_us()` reports how
 late emissions were: the cost of finding completions by polls.
@@ -144,7 +147,9 @@ for (seq, after_ms) in [(0u32, 6), (1, 0), (2, 3)] {
             slot.complete(seq); // the sequencer concludes it once every earlier entry did
         }
     });
-    let continuation = Box::new(RunnableFrame::new(7, task));
+    // One chain for each item (the id): frames of one chain come out in registration order, so items that may
+    // finish in any order are not one chain.
+    let continuation = Box::new(RunnableFrame::new(7 + u64::from(seq), task));
     completions.at(now + Duration::from_millis(after_ms), continuation);
 }
 

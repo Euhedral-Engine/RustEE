@@ -1325,7 +1325,10 @@ mod tests {
         completions.after_marker(Marker::new(lane.id, LaneId(0), 2), linked(7, 2, &ran));
         // The first query found marker 1 not done; marker 2, behind it in its chain, waits for it.
         poll_ending(&completions);
-        assert!(ran.lock().unwrap().is_empty(), "nothing leaves ahead of marker 1");
+        assert!(
+            ran.lock().unwrap().is_empty(),
+            "nothing leaves ahead of marker 1"
+        );
         poll_ending(&completions);
         assert_eq!(*ran.lock().unwrap(), [1, 2], "registration order");
     }
@@ -1350,7 +1353,11 @@ mod tests {
         );
         first.done.store(true, Ordering::Release);
         poll_ending(&completions);
-        assert_eq!(*ran.lock().unwrap(), [3, 1, 2], "registration order within the chain");
+        assert_eq!(
+            *ran.lock().unwrap(),
+            [3, 1, 2],
+            "registration order within the chain"
+        );
         assert_eq!(completions.pending(), 0);
     }
 

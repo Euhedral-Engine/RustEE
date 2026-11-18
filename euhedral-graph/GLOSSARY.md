@@ -14,6 +14,8 @@ registration's own sweep) finishes its frame through `do_finally` without runnin
 the source if no poll comes. It does
 not panic: only the polling thread sees it, and it cannot tell a misuse from a poll that was late.
 
+**chain hold-back** ([`Completions::reap`](src/completions.rs)): a reap queries a pending operation only if no earlier operation still waiting has an ordered frame with the same routing hash (its chain). A lane that advanced between two queries of one scan would otherwise show a later registration done and an earlier one not, and the later continuation would leave first. A held-back operation is not queried and counts as not done for the next visit's timing.
+
 **weakly held pool** ([`Completions::new`](src/completions.rs)): a `Completions` reads its markers from a lane pool it holds only weakly, so the pool's owner is the last to drop it and the lanes are destroyed there. Marker registrations pending when the pool is gone are leaked and counted, not finished.
 
 **leaked registration** ([`Completions::leaked_unreached`](src/completions.rs)): a registration that waits
