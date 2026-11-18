@@ -140,7 +140,9 @@ impl CudaGpu {
                 .ok()
                 .filter(|&v| v > 0)
                 .ok_or_else(|| {
-                    GpuError::Invalid(format!("the driver reports no positive {name} for the device"))
+                    GpuError::Invalid(format!(
+                        "the driver reports no positive {name} for the device"
+                    ))
                 })
         };
         let attributes = DeviceAttributes {
