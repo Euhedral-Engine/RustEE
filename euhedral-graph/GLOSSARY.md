@@ -14,7 +14,7 @@ registration's own sweep) finishes its frame through `do_finally` without runnin
 the source if no poll comes. It does
 not panic: only the polling thread sees it, and it cannot tell a misuse from a poll that was late.
 
-**chain** ([`Completions`](src/completions.rs)): the registrations whose frames are ordered and share a routing hash, kept in registration order, as a commit handler keeps the offsets of one partition. A reap queries the head of a chain and, once it is found done, the next, up to the first not done; the rest wait in a reused slab, unqueried, and ask for no polling. A head that panics in its query or whose pool is gone ends and the next takes its place. Timers and `Pending` operations have no chain.
+**chain** ([`Completions`](src/completions.rs)): the registrations whose frames are ordered and share a routing hash, kept in registration order, as a commit handler keeps the offsets of one partition. A reap queries the head of a chain and, once it is found done, the next, up to the first not done; the rest wait in a reused slab, unqueried, and ask for no polling. A head holds its chain until it completes, fails or is cancelled (its frame's kill switch is set, found at the next visit); a head that can never complete holds it until the consumer cancels it, and nothing times it out. A head that panics in its query or whose pool is gone ends and the next takes its place. Timers and `Pending` operations have no chain.
 
 **weakly held pool** ([`Completions::new`](src/completions.rs)): a `Completions` reads its markers from a lane pool it holds only weakly, so the pool's owner is the last to drop it and the lanes are destroyed there. Marker registrations pending when the pool is gone are leaked and counted, not finished.
 

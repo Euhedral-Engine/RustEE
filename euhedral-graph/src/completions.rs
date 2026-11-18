@@ -76,10 +76,16 @@ pub trait Pending: Send {
 /// keep their registration order. A completed operation is never queried again.
 ///
 /// **In-order delivery within a chain.** Continuations whose frames are ordered and share a routing hash (one
-/// chain) are emitted in registration order whatever they wait on: an operation is queried only once every earlier
-/// operation of its chain was found done (a lane may advance between two queries of one scan, and a later
-/// registration would otherwise be found done while an earlier one was not). Operations of different chains, and
-/// unordered ones, are emitted as they are found.
+/// chain) are emitted in registration order whatever they wait on (a marker, a retirement, a `Ready`, a `Wake`): a
+/// chain's head holds the rest until it completes, fails or is cancelled, and only heads are queried (the next entry
+/// takes its place, and is queried in the same scan, once the head is found done). Timers have no chain (one clock
+/// reading serves a scan, and a timer goes out at its own deadline), and a `Pending` has no frame to order until it
+/// yields one. Operations of different chains, and unordered ones, are emitted as they are found.
+///
+/// A head that can never complete holds its chain until the consumer cancels it: nothing here times it out or
+/// releases it. Cancelling is setting the kill switch of the head's frame; the next visit to the head finds it, ends
+/// it as a dead continuation (handed out, skipped by the executor, its `do_finally` ending what it holds) and
+/// promotes the next entry. A head that panics in its query, or whose marker's pool is gone, ends the same way.
 ///
 /// A continuation is handed out even if its frame has died (its kill switch is set): the executor then
 /// skips it and runs its `do_finally`, which ends what it holds. So at shutdown
@@ -331,15 +337,30 @@ impl Waits {
     /// registration order. A timer has none: one clock reading serves a whole scan, so timers cannot be found done
     /// out of order, and each goes out at its own deadline. A `Pending` has no frame until it yields one: no chain.
     fn chain(&self) -> Option<u64> {
-        let frame = match self {
+        if matches!(self, Waits::At(..)) {
+            return None;
+        }
+        let header = self.frame()?.header();
+        header.is_ordered().then(|| header.routing_hash())
+    }
+
+    /// The continuation, once there is one (a `Pending` has none until it yields).
+    fn frame(&self) -> Option<&dyn Frame> {
+        match self {
             Waits::Ready(_, frame)
             | Waits::Wake(_, frame)
             | Waits::Marker(_, frame)
-            | Waits::Retired(_, frame) => frame,
-            Waits::At(..) | Waits::Pending(_) => return None,
-        };
-        let header = frame.header();
-        header.is_ordered().then(|| header.routing_hash())
+            | Waits::Retired(_, frame)
+            | Waits::At(_, frame) => Some(&**frame),
+            Waits::Pending(_) => None,
+        }
+    }
+
+    /// Whether the operation is in a chain and its frame was cancelled (its kill switch is set): the consumer's way to
+    /// release a chain whose head can never complete. It ends as found done, so its frame is handed out, skipped by
+    /// the executor, and its `do_finally` ends what it holds; the next of its chain takes its place.
+    fn cancelled_in_chain(&self) -> bool {
+        self.chain().is_some() && self.frame().is_some_and(|frame| !frame.header().is_alive())
     }
 }
 
@@ -939,7 +960,9 @@ impl Completions {
         let mut blind = false;
         while index < lists.waiting.len() {
             let entry = &mut lists.waiting[index];
-            let pool_gone = matches!(entry.what, Waits::Marker(..))
+            let cancelled = entry.what.cancelled_in_chain();
+            let pool_gone = !cancelled
+                && matches!(entry.what, Waits::Marker(..))
                 && pool.get_or_insert_with(|| self.pool()).is_none();
             if pool_gone {
                 // The pool is gone, so this marker will never be observed and is not known reached: the entry
@@ -958,6 +981,7 @@ impl Completions {
             // A query is the application's code: one that panics loses its entry (finished without running, or
             // dropped), is counted, and does not stop the entries behind it.
             let queried = panic::catch_unwind(AssertUnwindSafe(|| match &mut entry.what {
+                _ if cancelled => (true, None),
                 Waits::Ready(ready, _) => (ready.is_ready(), None),
                 Waits::Wake(wake, _) => (wake.is_ready(), None),
                 Waits::Marker(marker, _) => (
@@ -1387,6 +1411,19 @@ mod tests {
         })
     }
 
+    fn linked_killable(
+        chain: u64,
+        tag: u64,
+        ran: &Arc<Mutex<Vec<u64>>>,
+        kill: &Arc<AtomicBool>,
+    ) -> Box<dyn Frame> {
+        Box::new(Linked {
+            header: FrameHeader::with_kill_switch(chain, Some(kill.clone())),
+            tag,
+            ran: ran.clone(),
+        })
+    }
+
     /// One poll by hand, ending each continuation that comes out.
     fn poll_ending(completions: &Completions) {
         completions.reap();
@@ -1572,6 +1609,34 @@ mod tests {
             [1, 1, 1, 0],
             "up to the first one not done, and no further"
         );
+    }
+
+    #[test]
+    fn a_cancelled_head_that_can_never_complete_ends_and_the_next_of_its_chain_goes_out() {
+        let (completions, rig) = setup();
+        let ran = Arc::new(Mutex::new(Vec::new()));
+        let kill = Arc::new(AtomicBool::new(false));
+        let done = Token::default();
+        done.done.store(true, Ordering::Release);
+        // A marker no lane will reach, and an operation behind it that is done.
+        completions.after_marker(
+            Marker::new(rig.id, LaneId(0), 99),
+            linked_killable(7, 1, &ran, &kill),
+        );
+        completions.after(Box::new(done), linked(7, 2, &ran));
+        poll_ending(&completions);
+        assert!(
+            ran.lock().unwrap().is_empty(),
+            "a head that never completes holds its chain: nothing times it out"
+        );
+        kill.store(true, Ordering::Release);
+        poll_ending(&completions);
+        assert_eq!(
+            *ran.lock().unwrap(),
+            [1, 2],
+            "the cancelled head ends (its frame is handed out dead) and the next goes out in the same scan"
+        );
+        assert_eq!(completions.pending(), 0);
     }
 
     #[test]
