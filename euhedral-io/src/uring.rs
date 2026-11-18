@@ -331,13 +331,13 @@ impl Op {
                 // made the submitting worker create an io worker thread now and then: worse).
                 let len = piece(rest.len().min(READ_PIECE));
                 opcode::Read::new(types::Fd(*fd), rest.as_mut_ptr(), len)
-                    .offset(offset + self.moved as u64)
+                    .offset(*offset + self.moved as u64)
                     .build()
             }
             Kind::Write { fd, offset } => {
                 let rest = &self.buf.bytes()[self.moved..self.buf.filled()];
                 opcode::Write::new(types::Fd(*fd), rest.as_ptr(), piece(rest.len()))
-                    .offset(offset + self.moved as u64)
+                    .offset(*offset + self.moved as u64)
                     .build()
             }
             Kind::Send { fd } => {
