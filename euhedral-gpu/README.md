@@ -423,11 +423,32 @@ from source, 32 MiB of device buffers, a pinned loan pair, a copy and a kernel):
 create), the release (the drops above, the last of which destroys the context) about 45 ms; free memory read after each
 open was constant over ten rounds.
 
+## The fake device in residency and failure tests
+
+`FakeGpu` can stand in for a card in tests of code that loads, holds and gives up device memory. Nothing was added to the
+`Gpu` trait: device memory, a free-memory query and the context belong to `euhedral-memory` and the driver on the real
+backend, and `FakeContext` (open, release, open again) already stands for the context. These are fake-only controls and
+records, beside `FakeGpu::alloc` and `free`:
+
+- **Bytes.** `bytes_held()` and `peak_bytes()` count what was allocated and not freed, and the most held at once.
+  `set_capacity(Some(n))` gives the device a size: `try_alloc` then fails with `Err(Call)` named `OUT_OF_MEMORY` when the
+  allocation would hold more, and holds nothing. `free_bytes()` answers as a free-memory query would. `alloc` is
+  `try_alloc` that panics.
+- **Injected failures.** `fail_allocs(skip, count)` lets `skip` allocations through, then fails the next `count`;
+  `fail_module_loads(skip, count)` does the same for `Module::from_source` and `from_image`, which then return
+  `Err(Load)`. A call that fails changes nothing on the device.
+- **Who called.** `calls()` is `log()` with a `FakeCaller` for each operation: the thread, its name, the CPU the
+  submission ran on (where the platform tells) and a label. A frame that wants to be named wraps its work in
+  `let _label = FakeGpu::label_caller("name")`; the label is thread-local, nests, and ends with the guard. `memory_log()`
+  lists each allocation and free in order with its caller. `log()` is unchanged.
+
+The caller is the one who put the operation on its lane, not the thread that stepped the device.
+
 ## Features
 
 | Feature | What it adds |
 |---|---|
-| `fake` | `FakeGpu`: a deterministic device for tests of code built on this crate; `FakeContext` is its context, opened, fully released and opened again, with the retains and releases counted. The crate's own tests enable it through a dev-dependency on itself. |
+| `fake` | `FakeGpu`: a deterministic device for tests of code built on this crate; `FakeContext` is its context, opened, fully released and opened again, with the retains and releases counted, and with bytes held, a capacity, injected allocation and module-load failures and the caller of each operation (see "The fake device in residency and failure tests"). The crate's own tests enable it through a dev-dependency on itself. |
 | `cuda` | The CUDA backend, on the driver and primary context `euhedral-memory` loads (`Driver::shared`): one library, one context. Linux and Windows. |
 
 The traits and the fake compile on every platform the workspace builds on.

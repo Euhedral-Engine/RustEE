@@ -9,7 +9,7 @@ license = "Apache-2.0"
 [features]
 default = []
 # `fake`: a stepped, wall-clock-free fake device for tests of code built on this crate.
-fake = []
+fake = ["dep:euhedral-hardware-utils"]
 # `test-hooks`: switches that tests use to reach paths a healthy driver does not take (a failed capture, a poisoned device, counters
 # of deliberate leaks). Not for production use.
 test-hooks = []
@@ -25,6 +25,8 @@ euhedral-graph = { path = "../euhedral-graph", default-features = false }
 euhedral-memory = { path = "../euhedral-memory", default-features = false }
 # `PlainQueue`: a submitter's single-owner list of kept values.
 euhedral-data-structures = { path = "../euhedral-data-structures" }
+# The fake device names the CPU a submission came from.
+euhedral-hardware-utils = { path = "../euhedral-hardware-utils", optional = true }
 # The module cache key and the shape fingerprint.
 euhedral-hashing = { path = "../euhedral-hashing" }
 
