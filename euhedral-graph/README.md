@@ -93,7 +93,15 @@ counted in `leaked_unreached` (the lane the marker names may still use what it h
 debug builds panic. A timer is never emitted before its deadline and goes out in the first reap at or after it; timers
 due in one reap go out in registration order, not sorted by deadline.
 
-Continuations are emitted in registration order, so frames on one ordered lane keep that order. A
+Continuations are emitted in registration order, so frames on one ordered lane keep that order, whatever each waits on
+(a marker, a retirement, a `Ready` or a `Wake`): the entries of one chain (ordered frames with one routing hash) wait in
+registration order and a reap queries only the head of a chain, then the next once the head was found done, up to the first
+not done. A chain's head holds the rest until it completes, fails or is cancelled (its frame's kill switch is set: the head ends as a
+dead continuation and the next takes its place); a head that can never complete holds its chain until the consumer cancels
+it, and nothing times it out. A lane that advances between two queries cannot let a later registration out first, and the
+entries held behind a head cost nothing. Timers are not part of a chain (a scan reads the clock once, so timers cannot be found done out of order,
+and each goes out at its own deadline), and a `Pending` has no frame until it yields one, so its frame goes out when it is
+yielded. Operations of different chains, and unordered ones, are emitted as they are found. A
 frame whose kill switch is set is still emitted: the executor skips it and runs its `do_finally`,
 which ends what it holds, so `pending()` drains to zero on its own. `lateness_us()` reports how
 late emissions were: the cost of finding completions by polls.
@@ -144,7 +152,9 @@ for (seq, after_ms) in [(0u32, 6), (1, 0), (2, 3)] {
             slot.complete(seq); // the sequencer concludes it once every earlier entry did
         }
     });
-    let continuation = Box::new(RunnableFrame::new(7, task));
+    // One chain for each item (the id): frames of one chain come out in registration order, so items that may
+    // finish in any order are not one chain.
+    let continuation = Box::new(RunnableFrame::new(7 + u64::from(seq), task));
     completions.at(now + Duration::from_millis(after_ms), continuation);
 }
 

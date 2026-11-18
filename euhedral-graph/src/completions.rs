@@ -1,7 +1,8 @@
 //! Completions found by polls (the upstream Java `GpuCompletions`).
 
 use std::cell::Cell;
-use std::collections::VecDeque;
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering, fence};
@@ -73,6 +74,18 @@ pub trait Pending: Send {
 /// registered after it) for a later hand-out; the lattice's direct pulls stop before ordered frames, which
 /// then go out through `request`'s pushes and the lattice's routing, so continuations on one ordered lane
 /// keep their registration order. A completed operation is never queried again.
+///
+/// **In-order delivery within a chain.** Continuations whose frames are ordered and share a routing hash (one
+/// chain) are emitted in registration order whatever they wait on (a marker, a retirement, a `Ready`, a `Wake`): a
+/// chain's head holds the rest until it completes, fails or is cancelled, and only heads are queried (the next entry
+/// takes its place, and is queried in the same scan, once the head is found done). Timers have no chain (one clock
+/// reading serves a scan, and a timer goes out at its own deadline), and a `Pending` has no frame to order until it
+/// yields one. Operations of different chains, and unordered ones, are emitted as they are found.
+///
+/// A head that can never complete holds its chain until the consumer cancels it: nothing here times it out or
+/// releases it. Cancelling is setting the kill switch of the head's frame; the next visit to the head finds it, ends
+/// it as a dead continuation (handed out, skipped by the executor, its `do_finally` ending what it holds) and
+/// promotes the next entry. A head that panics in its query, or whose marker's pool is gone, ends the same way.
 ///
 /// A continuation is handed out even if its frame has died (its kill switch is set): the executor then
 /// skips it and runs its `do_finally`, which ends what it holds. So at shutdown
@@ -157,12 +170,139 @@ enum Slot {
 /// What only the polling side touches.
 struct Poll {
     consumer: Consumer<Slot, Single>,
-    /// Drained from the queue, oldest first, and not yet found completed.
-    waiting: VecDeque<Waiting>,
+    /// Drained from the queue, oldest first, and not yet found completed: the heads of the chains and the
+    /// operations that have no chain.
+    lists: Lists,
     /// The `Closed` marker was drained: whatever is drained from now on is late.
     closed: bool,
     /// Where the continuations found completed go, in the order they were found.
     ready: Producer<Box<dyn Frame>, Single>,
+}
+
+/// The operations waiting, kept as a commit handler keeps its partitions: the entries of one chain (ordered frames
+/// with one routing hash) wait in registration order and only the head of a chain is queried. When the head is found
+/// done the next one takes its place and is queried in the same scan, so a chain is looked at up to its first
+/// operation not done and no further. Everything is O(1) for each entry, and a reused slab holds the tails, so a
+/// reap allocates nothing once the slab and the map have grown to what is registered.
+struct Lists {
+    /// The heads of the chains and the operations without a chain, in registration order.
+    waiting: VecDeque<Waiting>,
+    /// For each chain with a head in `waiting`: the entries behind that head.
+    chains: HashMap<u64, Tails>,
+    /// The nodes of the tails, linked by index; freed nodes are linked through `free`.
+    nodes: Vec<Node>,
+    free: usize,
+}
+
+/// No node.
+const NIL: usize = usize::MAX;
+
+/// The first and last node of the entries behind one head, `NIL` when there are none.
+#[derive(Clone, Copy)]
+struct Tails {
+    first: usize,
+    last: usize,
+}
+
+struct Node {
+    next: usize,
+    entry: Option<Waiting>,
+}
+
+impl Lists {
+    fn new() -> Self {
+        Self {
+            waiting: VecDeque::new(),
+            chains: HashMap::new(),
+            nodes: Vec::new(),
+            free: NIL,
+        }
+    }
+
+    /// Puts a registration behind its chain's last entry, or makes it a head (or an entry without a chain).
+    fn enqueue(&mut self, entry: Waiting) {
+        let Some(chain) = entry.what.chain() else {
+            self.waiting.push_back(entry);
+            return;
+        };
+        match self.chains.entry(chain) {
+            Entry::Vacant(vacant) => {
+                vacant.insert(Tails {
+                    first: NIL,
+                    last: NIL,
+                });
+                self.waiting.push_back(entry);
+            }
+            Entry::Occupied(mut occupied) => {
+                let node = Self::take_node(&mut self.nodes, &mut self.free, entry);
+                let tails = occupied.get_mut();
+                if tails.last == NIL {
+                    tails.first = node;
+                } else {
+                    self.nodes[tails.last].next = node;
+                }
+                tails.last = node;
+            }
+        }
+    }
+
+    /// A node for `entry`, from the free list if it has one.
+    fn take_node(nodes: &mut Vec<Node>, free: &mut usize, entry: Waiting) -> usize {
+        if *free == NIL {
+            nodes.push(Node {
+                next: NIL,
+                entry: Some(entry),
+            });
+            return nodes.len() - 1;
+        }
+        let index = *free;
+        let node = &mut nodes[index];
+        *free = node.next;
+        node.next = NIL;
+        node.entry = Some(entry);
+        index
+    }
+
+    /// The entry behind the head of `chain`, if any; with none, the chain ends.
+    fn promote(&mut self, chain: u64) -> Option<Waiting> {
+        let tails = self.chains.get_mut(&chain)?;
+        if tails.first == NIL {
+            self.chains.remove(&chain);
+            return None;
+        }
+        let index = tails.first;
+        let node = &mut self.nodes[index];
+        let entry = node.entry.take();
+        tails.first = node.next;
+        if tails.first == NIL {
+            tails.last = NIL;
+        }
+        node.next = self.free;
+        self.free = index;
+        entry
+    }
+
+    /// Takes the head at `index` out of `waiting` (done, panicked or gone with its pool): the next entry of its chain
+    /// takes its place and is looked at next, as the entry that followed the head would be.
+    fn take_head(&mut self, index: usize) -> Option<Waiting> {
+        let chain = self.waiting.get(index)?.what.chain();
+        match chain.and_then(|chain| self.promote(chain)) {
+            Some(next) => Some(std::mem::replace(&mut self.waiting[index], next)),
+            None => self.waiting.remove(index),
+        }
+    }
+
+    /// Everything still waiting, heads and tails, for the last drop.
+    fn take_all(&mut self, out: &mut Vec<Waits>) {
+        out.extend(self.waiting.drain(..).map(|entry| entry.what));
+        out.extend(
+            self.nodes
+                .iter_mut()
+                .filter_map(|node| node.entry.take())
+                .map(|entry| entry.what),
+        );
+        self.chains.clear();
+    }
 }
 
 /// What only the hand-out side touches.
@@ -189,6 +329,39 @@ enum Waits {
     Retired(Arc<RetireCell>, Box<dyn Frame>),
     At(Instant, Box<dyn Frame>),
     Pending(Box<dyn Pending>),
+}
+
+impl Waits {
+    /// The routing hash of the continuation's chain: `Some` when the frame is ordered and the operation is one a lane
+    /// or an owner moves on (a marker, a retirement, a `Ready`, a `Wake`), so that frames with the same hash leave in
+    /// registration order. A timer has none: one clock reading serves a whole scan, so timers cannot be found done
+    /// out of order, and each goes out at its own deadline. A `Pending` has no frame until it yields one: no chain.
+    fn chain(&self) -> Option<u64> {
+        if matches!(self, Waits::At(..)) {
+            return None;
+        }
+        let header = self.frame()?.header();
+        header.is_ordered().then(|| header.routing_hash())
+    }
+
+    /// The continuation, once there is one (a `Pending` has none until it yields).
+    fn frame(&self) -> Option<&dyn Frame> {
+        match self {
+            Waits::Ready(_, frame)
+            | Waits::Wake(_, frame)
+            | Waits::Marker(_, frame)
+            | Waits::Retired(_, frame)
+            | Waits::At(_, frame) => Some(&**frame),
+            Waits::Pending(_) => None,
+        }
+    }
+
+    /// Whether the operation is in a chain and its frame was cancelled (its kill switch is set): the consumer's way to
+    /// release a chain whose head can never complete. It ends as found done, so its frame is handed out, skipped by
+    /// the executor, and its `do_finally` ends what it holds; the next of its chain takes its place.
+    fn cancelled_in_chain(&self) -> bool {
+        self.chain().is_some() && self.frame().is_some_and(|frame| !frame.header().is_alive())
+    }
 }
 
 /// The id hash of the poll frame. The routing hash of each push is this mixed with the push's own seed, which
@@ -272,11 +445,7 @@ impl Drop for Completions {
     fn drop(&mut self) {
         let poll = self.poll.get_mut();
         let mut ends = Self::absorb(poll);
-        ends.extend(
-            std::mem::take(&mut poll.waiting)
-                .into_iter()
-                .map(|entry| entry.what),
-        );
+        poll.lists.take_all(&mut ends);
         for what in ends {
             self.cancel(what);
         }
@@ -374,7 +543,7 @@ impl Completions {
             incoming: queue.producer(),
             poll: SourceCell::new(Poll {
                 consumer: queue.consumer(),
-                waiting: VecDeque::new(),
+                lists: Lists::new(),
                 closed: false,
                 ready: ready.producer(),
             }),
@@ -489,13 +658,13 @@ impl Completions {
         }
     }
 
-    /// Moves what landed in the queue into `poll.waiting`, and takes out what landed behind the
+    /// Moves what landed in the queue into `poll.lists`, and takes out what landed behind the
     /// `Closed` marker. Returns the late ones to cancel (the caller does it after letting go of the
     /// lock: `do_finally` is the application's).
     fn absorb(poll: &mut Poll) -> Vec<Waits> {
         let Poll {
             consumer,
-            waiting,
+            lists,
             closed,
             ..
         } = poll;
@@ -503,7 +672,7 @@ impl Completions {
         consumer.drain_all(|slot| match slot {
             Slot::Closed => *closed = true,
             Slot::Waiting(entry) if *closed => late.push(entry.what),
-            Slot::Waiting(entry) => waiting.push_back(entry),
+            Slot::Waiting(entry) => lists.enqueue(entry),
         });
         late
     }
@@ -739,7 +908,9 @@ impl Completions {
         )
     }
 
-    /// Polls once: every operation is queried once, and the continuations of those that completed are
+    /// Polls once: each operation that can be found done is queried once (the entries of one chain, ordered frames
+    /// with one routing hash, are queried in registration order up to the first not done; the ones behind it wait
+    /// unqueried), and the continuations of those that completed are
     /// queued, in the order they were registered, for the hand-out ([`pull`](LatticeSource::pull) and
     /// `request`). Returns how many it queued. Returns 0 at once if another poll is inside.
     ///
@@ -772,8 +943,8 @@ impl Completions {
     fn reap_entered(&self, poll: &mut SourceGuard<'_, Poll>) -> usize {
         let late = Self::absorb(poll);
         self.cancel_late(late);
-        let Poll { waiting, ready, .. } = &mut **poll;
-        if waiting.is_empty() {
+        let Poll { lists, ready, .. } = &mut **poll;
+        if lists.waiting.is_empty() {
             self.next_at.store(u64::MAX, Ordering::Relaxed);
             self.blind.store(false, Ordering::Relaxed);
             return 0;
@@ -787,25 +958,30 @@ impl Completions {
         // What the entries left behind need next: the earliest deadline, and whether any can only be polled blind.
         let mut earliest = u64::MAX;
         let mut blind = false;
-        while index < waiting.len() {
-            let entry = &mut waiting[index];
-            let pool_gone = matches!(entry.what, Waits::Marker(..))
+        while index < lists.waiting.len() {
+            let entry = &mut lists.waiting[index];
+            let cancelled = entry.what.cancelled_in_chain();
+            let pool_gone = !cancelled
+                && matches!(entry.what, Waits::Marker(..))
                 && pool.get_or_insert_with(|| self.pool()).is_none();
             if pool_gone {
                 // The pool is gone, so this marker will never be observed and is not known reached: the entry
                 // ends as a refused unreached marker does (leaked and counted by `cancel`), not as reached.
-                if let Some(Waiting { what, .. }) = waiting.remove(index) {
+                if let Some(Waiting { what, .. }) = lists.take_head(index) {
                     self.cancel(what);
                 }
                 self.pending.fetch_sub(1, Ordering::AcqRel);
                 self.waiting.fetch_sub(1, Ordering::AcqRel);
                 continue;
             }
-            // Each operation is queried once, and a completed one leaves the list, so it is never
-            // queried again (a query may have effects: a driver call that fetches the result).
+            // Each operation is queried until it is found done, and a completed one leaves the list, so it is never
+            // queried again (a query may have effects: a driver call that fetches the result). Only heads and
+            // operations without a chain are here: the entries behind a head are not queried until the head is found
+            // done, when the next takes its place and is queried in this same scan.
             // A query is the application's code: one that panics loses its entry (finished without running, or
             // dropped), is counted, and does not stop the entries behind it.
             let queried = panic::catch_unwind(AssertUnwindSafe(|| match &mut entry.what {
+                _ if cancelled => (true, None),
                 Waits::Ready(ready, _) => (ready.is_ready(), None),
                 Waits::Wake(wake, _) => (wake.is_ready(), None),
                 Waits::Marker(marker, _) => (
@@ -824,7 +1000,7 @@ impl Completions {
             let Ok((done, mut yielded)) = queried else {
                 self.panicked.fetch_add(1, Ordering::Relaxed);
                 log::error!("an operation's query panicked; its entry is dropped");
-                if let Some(Waiting { what, .. }) = waiting.remove(index) {
+                if let Some(Waiting { what, .. }) = lists.take_head(index) {
                     // Ending it runs the application's `do_finally`, which may panic too.
                     let _ = panic::catch_unwind(AssertUnwindSafe(|| self.cancel(what)));
                 }
@@ -842,7 +1018,7 @@ impl Completions {
                 index += 1;
                 continue;
             }
-            let Some(Waiting { what, last_seen }) = waiting.remove(index) else {
+            let Some(Waiting { what, last_seen }) = lists.take_head(index) else {
                 unreachable!("a done entry at index")
             };
             let (frame, since) = match what {
@@ -1015,7 +1191,7 @@ impl LatticeSource for Completions {
 #[allow(clippy::disallowed_methods, clippy::disallowed_types)]
 mod tests {
     use std::sync::atomic::AtomicU64;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::{Mutex, OnceLock, PoisonError};
     use std::thread::{self, ThreadId};
     use std::time::Duration;
 
@@ -1200,6 +1376,267 @@ mod tests {
         lane.completed.store(2, Ordering::Release);
         late.done.store(true, Ordering::Release);
         assert_eq!(poll(&completions), [10, 11, 12]);
+    }
+
+    /// A continuation of one ordered chain (the routing hash `chain`), told apart by its `tag`: it adds the tag to
+    /// `ran` when it ends, which is how the order it was handed out in shows.
+    struct Linked {
+        header: FrameHeader,
+        tag: u64,
+        ran: Arc<Mutex<Vec<u64>>>,
+    }
+
+    impl Frame for Linked {
+        fn header(&self) -> &FrameHeader {
+            &self.header
+        }
+
+        fn header_mut(&mut self) -> &mut FrameHeader {
+            &mut self.header
+        }
+
+        fn do_finally(self: Box<Self>) {
+            self.ran
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(self.tag);
+        }
+    }
+
+    fn linked(chain: u64, tag: u64, ran: &Arc<Mutex<Vec<u64>>>) -> Box<dyn Frame> {
+        Box::new(Linked {
+            header: FrameHeader::new(chain),
+            tag,
+            ran: ran.clone(),
+        })
+    }
+
+    fn linked_killable(
+        chain: u64,
+        tag: u64,
+        ran: &Arc<Mutex<Vec<u64>>>,
+        kill: &Arc<AtomicBool>,
+    ) -> Box<dyn Frame> {
+        Box::new(Linked {
+            header: FrameHeader::with_kill_switch(chain, Some(kill.clone())),
+            tag,
+            ran: ran.clone(),
+        })
+    }
+
+    /// One poll by hand, ending each continuation that comes out.
+    fn poll_ending(completions: &Completions) {
+        completions.reap();
+        completions.pull(&mut |frame| frame.do_finally(), &mut |_| false, u64::MAX);
+    }
+
+    /// A lane that moves on between two reads of it: the first read says nothing is done, every later one says
+    /// all is (a device that finished work while the poller was away).
+    #[derive(Debug)]
+    struct AdvancingLane {
+        id: QueueId,
+        reads: AtomicUsize,
+    }
+
+    impl DeviceQueue for AdvancingLane {
+        fn id(&self) -> QueueId {
+            self.id
+        }
+
+        fn completed(&self) -> u64 {
+            if self.reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                0
+            } else {
+                u64::MAX
+            }
+        }
+
+        fn name(&self) -> &str {
+            "advancing"
+        }
+    }
+
+    #[test]
+    fn two_markers_of_one_ordered_chain_never_swap_when_the_lane_advances_between_their_queries() {
+        let lane = Arc::new(AdvancingLane {
+            id: QueueId::next(),
+            reads: AtomicUsize::new(0),
+        });
+        let pool = Arc::new(LanePool::new(vec![lane.clone() as Arc<dyn DeviceQueue>]));
+        let completions = Completions::new(&pool);
+        let ran = Arc::new(Mutex::new(Vec::new()));
+        completions.after_marker(Marker::new(lane.id, LaneId(0), 1), linked(7, 1, &ran));
+        completions.after_marker(Marker::new(lane.id, LaneId(0), 2), linked(7, 2, &ran));
+        // The first query found marker 1 not done; marker 2, behind it in its chain, waits for it.
+        poll_ending(&completions);
+        assert!(
+            ran.lock().unwrap().is_empty(),
+            "nothing leaves ahead of marker 1"
+        );
+        poll_ending(&completions);
+        assert_eq!(*ran.lock().unwrap(), [1, 2], "registration order");
+    }
+
+    #[test]
+    fn a_completed_operation_waits_for_an_earlier_one_of_its_chain_whatever_kind_it_waits_on() {
+        let (completions, _rig) = setup();
+        let ran = Arc::new(Mutex::new(Vec::new()));
+        let (first, second, other) = (Token::default(), Token::default(), Token::default());
+        second.done.store(true, Ordering::Release);
+        other.done.store(true, Ordering::Release);
+        completions.after(Box::new(first.clone()), linked(7, 1, &ran));
+        completions.after(Box::new(second.clone()), linked(7, 2, &ran));
+        // Another chain is not held back by it.
+        completions.after(Box::new(other.clone()), linked(8, 3, &ran));
+        poll_ending(&completions);
+        assert_eq!(*ran.lock().unwrap(), [3]);
+        assert_eq!(
+            second.queries.load(Ordering::Relaxed),
+            0,
+            "an operation held back behind its chain is not queried"
+        );
+        first.done.store(true, Ordering::Release);
+        poll_ending(&completions);
+        assert_eq!(
+            *ran.lock().unwrap(),
+            [3, 1, 2],
+            "registration order within the chain"
+        );
+        assert_eq!(completions.pending(), 0);
+    }
+
+    #[test]
+    fn a_timer_is_not_part_of_a_chain_and_goes_out_at_its_own_deadline() {
+        let (completions, _rig) = setup();
+        let ran = Arc::new(Mutex::new(Vec::new()));
+        let now = Instant::now();
+        completions.at(now + Duration::from_secs(3600), linked(7, 1, &ran));
+        completions.at(now, linked(7, 2, &ran));
+        poll_ending(&completions);
+        assert_eq!(
+            *ran.lock().unwrap(),
+            [2],
+            "a due timer is not held behind a long one"
+        );
+        assert_eq!(completions.pending(), 1);
+    }
+
+    #[test]
+    fn an_entry_held_behind_its_chains_head_costs_no_polling() {
+        let (completions, _rig) = setup();
+        let hands = Arc::new(Hands::default());
+        completions.clone().add_downstream(hands.clone());
+        let ran = Arc::new(Mutex::new(Vec::new()));
+        let cell = Arc::new(RetireCell::new());
+        // The head waits for a bell; the entry behind it could only be polled blind, and is not looked at.
+        completions.after_retired(cell.clone(), linked(7, 1, &ran));
+        completions.after(Box::new(Token::default()), linked(7, 2, &ran));
+        completions.request(8);
+        assert_eq!(hands.run(), 1, "one look, from the registration");
+        for visit in 0..20_000 {
+            if visit % 2 == 0 {
+                completions.pull(&mut |_| panic!("nothing is ready"), &mut |_| false, 8);
+            } else {
+                completions.request(8);
+            }
+            assert_eq!(hands.kept(), 0, "a held entry asks for no polls");
+        }
+    }
+
+    #[test]
+    fn an_operation_that_has_no_frame_yet_is_outside_the_chains() {
+        struct Yields(Arc<Mutex<Vec<u64>>>, bool);
+        impl Pending for Yields {
+            fn poll(&mut self) -> Option<Box<dyn Frame>> {
+                std::mem::replace(&mut self.1, true).then(|| linked(7, 9, &self.0))
+            }
+        }
+        let (completions, _rig) = setup();
+        let ran = Arc::new(Mutex::new(Vec::new()));
+        completions.after(Box::new(Token::default()), linked(7, 1, &ran));
+        completions.register(Box::new(Yields(ran.clone(), false)));
+        poll_ending(&completions);
+        assert!(ran.lock().unwrap().is_empty());
+        poll_ending(&completions);
+        assert_eq!(
+            *ran.lock().unwrap(),
+            [9],
+            "the frame of a pending operation goes out when it is yielded, ahead of an earlier chain entry still waiting"
+        );
+    }
+
+    #[test]
+    fn a_head_that_panics_in_its_query_promotes_the_next_of_its_chain_in_the_same_scan() {
+        struct Panics;
+        impl Ready for Panics {
+            fn is_ready(&mut self) -> bool {
+                panic!("a query that panics")
+            }
+        }
+        let (completions, _rig) = setup();
+        let ran = Arc::new(Mutex::new(Vec::new()));
+        let done = Token::default();
+        done.done.store(true, Ordering::Release);
+        completions.after(Box::new(Panics), linked(7, 1, &ran));
+        completions.after(Box::new(done), linked(7, 2, &ran));
+        poll_ending(&completions);
+        assert_eq!(
+            *ran.lock().unwrap(),
+            [1, 2],
+            "the panicked entry ends, then the next goes out"
+        );
+        assert_eq!(completions.pending(), 0);
+    }
+
+    #[test]
+    fn a_chain_is_looked_at_up_to_its_first_operation_not_done() {
+        let (completions, _rig) = setup();
+        let ran = Arc::new(Mutex::new(Vec::new()));
+        let tokens: Vec<Token> = (0..4).map(|_| Token::default()).collect();
+        for (tag, token) in tokens.iter().enumerate() {
+            completions.after(Box::new(token.clone()), linked(7, tag as u64, &ran));
+        }
+        tokens[0].done.store(true, Ordering::Release);
+        tokens[1].done.store(true, Ordering::Release);
+        poll_ending(&completions);
+        assert_eq!(*ran.lock().unwrap(), [0, 1]);
+        let queries: Vec<usize> = tokens
+            .iter()
+            .map(|t| t.queries.load(Ordering::Relaxed))
+            .collect();
+        assert_eq!(
+            queries,
+            [1, 1, 1, 0],
+            "up to the first one not done, and no further"
+        );
+    }
+
+    #[test]
+    fn a_cancelled_head_that_can_never_complete_ends_and_the_next_of_its_chain_goes_out() {
+        let (completions, rig) = setup();
+        let ran = Arc::new(Mutex::new(Vec::new()));
+        let kill = Arc::new(AtomicBool::new(false));
+        let done = Token::default();
+        done.done.store(true, Ordering::Release);
+        // A marker no lane will reach, and an operation behind it that is done.
+        completions.after_marker(
+            Marker::new(rig.id, LaneId(0), 99),
+            linked_killable(7, 1, &ran, &kill),
+        );
+        completions.after(Box::new(done), linked(7, 2, &ran));
+        poll_ending(&completions);
+        assert!(
+            ran.lock().unwrap().is_empty(),
+            "a head that never completes holds its chain: nothing times it out"
+        );
+        kill.store(true, Ordering::Release);
+        poll_ending(&completions);
+        assert_eq!(
+            *ran.lock().unwrap(),
+            [1, 2],
+            "the cancelled head ends (its frame is handed out dead) and the next goes out in the same scan"
+        );
+        assert_eq!(completions.pending(), 0);
     }
 
     #[test]
