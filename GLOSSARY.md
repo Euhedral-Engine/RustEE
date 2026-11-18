@@ -605,6 +605,12 @@ across opens. Not the same as the graph crate's `FakeDevice`, a fake lane.
 
 **FakeContextHold** ([`FakeContextHold`](euhedral-gpu/src/fake/mod.rs)): a retain of a `FakeContext` made by `hold()` that is not a gpu; it stands for a backend that holds the device itself, and keeps the context active until it drops.
 
+**FakeCaller** ([`FakeCaller`](euhedral-gpu/src/fake/mod.rs)): who submitted an operation to the fake device: the thread, its name, the CPU of the call and the label in force (see **caller label**). `FakeGpu::calls` pairs each logged operation with one; `memory_log` gives one to each allocation and free.
+
+**caller label** ([`FakeGpu::label_caller`](euhedral-gpu/src/fake/mod.rs)): a name a worker puts on its thread's calls to the fake device for the life of a guard, so a test can tell which frame's work an operation was. Thread-local; labels nest.
+
+**injected failure** ([`fail_allocs`, `fail_module_loads`](euhedral-gpu/src/fake/mod.rs)): a fake-only control: after `skip` calls succeed, the next `count` allocations (`OUT_OF_MEMORY`) or module loads (`Load`) fail, and the failed call changes nothing. With `set_capacity`, `bytes_held` and `peak_bytes`, it lets the fake stand in for a card whose memory runs out.
+
 **marker** ([`Marker`](euhedral-graph/src/lanes.rs)): a queue ([`QueueId`](euhedral-graph/src/lanes.rs), an
 opaque identity unique in the process), a lane and a value on its timeline: the lane's work up to that
 value. A marker of another queue is never reached by a `LanePool` and is refused by a backend's await.

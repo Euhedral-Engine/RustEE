@@ -3,6 +3,23 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## The fake device can stand in for a card in residency and failure tests (`euhedral-gpu`) (2026-11-17)
+
+**What.** On `FakeGpu` (feature `fake`): `bytes_held()`, `peak_bytes()`, `set_capacity(Option<usize>)` (also on `FakeContext`, with `capacity()`), `free_bytes()`, `try_alloc(bytes) -> Result<u64, GpuError>`, `fail_allocs(skip, count)`, `fail_module_loads(skip, count)`, `calls() -> Vec<FakeCall>`, `memory_log() -> Vec<FakeMemoryEvent>` and `label_caller(label) -> CallerLabel`. New types `FakeCaller { thread, name, cpu, label }`, `FakeCall { op, caller }`, `FakeMemoryEvent` and `CallerLabel`. The `fake` feature now depends on `euhedral-hardware-utils` (a lower layer) for the CPU number.
+
+**Why.** Code that loads, holds and gives up device memory could not be tested against the fake: it kept no count of bytes, could not run out of memory, could not have a module load fail, and did not say which worker made a call.
+
+**Migration.** None for callers. `FakeGpu::alloc` is `try_alloc` that panics, so it now panics when a capacity is set and the allocation does not fit, or when a failure is injected; a test that does either allocates through `try_alloc`. `log()` is unchanged, and allocations are in `memory_log()`, not in it.
+
+**Semantics.**
+- `try_alloc` fails with `Err(Call)` named `OUT_OF_MEMORY` (code 2; the name and code differ from the driver's, so match on the code) when the bytes held plus the request pass the capacity, or when an injected failure is due; a failed call holds and records nothing.
+- The capacity belongs to the `FakeContext`, as the card's memory does, so a re-open keeps it. Bytes held and peak, and the injections, belong to one open: a re-open starts with none.
+- `fail_allocs(skip, count)` lets `skip` allocations that would succeed through (a refusal for the capacity does not count), then fails `count`. `fail_module_loads` does the same for `from_source` and `from_image`, which return `Err(Load)`.
+- `free_bytes()` is the capacity less the bytes held, counting the bytes asked for; the real `Device::mem_info` reports the whole device, every process included, and falls by the bytes the driver granted, rounded.
+- `FakeCaller` is taken when an operation is queued (or an allocation or free is made): the thread, its name, the CPU and the innermost live `CallerLabel` of the thread. Labels are a per-thread stack; a guard removes its own entry, so guards may drop in any order.
+
+**Tests.** `tests/fake_residency.rs`: `bytes_held_follow_allocations_and_frees_and_the_peak_stays`, `an_allocation_past_the_capacity_fails_and_holds_nothing`, `the_capacity_belongs_to_the_device_and_a_re_open_keeps_it`, `injected_allocation_failures_skip_then_fail_then_stop`, `a_refusal_for_the_capacity_does_not_use_up_a_skip`, `injected_module_load_failures_fail_both_routes`, `each_operation_names_its_submitter_and_each_allocation_its_caller`, `a_label_ends_with_its_guard`, `dropping_an_inner_label_shows_the_outer_one_again`, `labels_dropped_out_of_order_leave_no_stale_label`.
+
 ## An open file's length without a blocking call (`euhedral-io`) (2026-11-17)
 
 **What.** `AsyncIo::file_len(file, then)` gives the continuation the length of an open file as `io::Result<u64>`.

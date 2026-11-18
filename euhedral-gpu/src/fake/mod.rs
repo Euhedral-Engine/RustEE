@@ -26,12 +26,16 @@ mod lane;
 mod module;
 mod stream;
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
+use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::thread::{self, ThreadId};
 
 use euhedral_graph::{LaneId, QueueId, RetireCell};
+use euhedral_hardware_utils::affinity;
 
 use crate::retire::RetireSink;
 
@@ -149,6 +153,106 @@ pub enum FakeOp {
     },
 }
 
+/// A failure injection: let `skip` calls through, then fail `count` calls.
+#[derive(Clone, Copy, Debug, Default)]
+struct Injection {
+    skip: usize,
+    count: usize,
+}
+
+impl Injection {
+    /// Whether this call fails.
+    fn hit(&mut self) -> bool {
+        if self.skip > 0 {
+            self.skip -= 1;
+            false
+        } else if self.count > 0 {
+            self.count -= 1;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// The number of the next [`CallerLabel`].
+static NEXT_LABEL: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    /// The live labels of the thread, oldest first, each with its guard's number; the last is the one in force.
+    static LABELS: RefCell<Vec<(u64, String)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Who submitted an operation to the fake device: the thread and the CPU it ran on at the call, and the label a frame
+/// gave its thread with [`FakeGpu::label_caller`]. The log lists the operations as they ran; this says who put each on
+/// its lane, so a test can tell which worker, and so which frame, made the call.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FakeCaller {
+    pub thread: ThreadId,
+    /// The thread's name, if it has one.
+    pub name: Option<String>,
+    /// The CPU the call ran on, where the platform tells.
+    pub cpu: Option<usize>,
+    /// The innermost live [`CallerLabel`] of the thread.
+    pub label: Option<String>,
+}
+
+impl FakeCaller {
+    /// The calling thread.
+    fn here() -> Self {
+        let current = thread::current();
+        Self {
+            thread: current.id(),
+            name: current.name().map(str::to_owned),
+            // Miri runs with isolation, and finding the CPU reads the system's topology from the file system.
+            cpu: if cfg!(miri) {
+                None
+            } else {
+                affinity::current_cpu()
+            },
+            label: LABELS.with(|labels| labels.borrow().last().map(|(_, label)| label.clone())),
+        }
+    }
+}
+
+/// A label on the calling thread's submissions to any fake device, until dropped; see [`FakeGpu::label_caller`].
+#[derive(Debug)]
+pub struct CallerLabel {
+    /// This guard's entry in the thread's labels.
+    id: u64,
+    /// The label belongs to the thread that made it.
+    _thread: PhantomData<*const ()>,
+}
+
+impl Drop for CallerLabel {
+    fn drop(&mut self) {
+        // Each guard removes its own entry, so guards may drop in any order.
+        LABELS.with(|labels| labels.borrow_mut().retain(|(id, _)| *id != self.id));
+    }
+}
+
+/// An operation that ran, and who submitted it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FakeCall {
+    pub op: FakeOp,
+    pub caller: FakeCaller,
+}
+
+/// An allocation or a free on the fake device.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FakeMemoryEvent {
+    Alloc {
+        addr: u64,
+        bytes: usize,
+        caller: FakeCaller,
+    },
+    Free {
+        addr: u64,
+        bytes: usize,
+        caller: FakeCaller,
+    },
+}
+
 /// A queued operation.
 pub(crate) enum QOp {
     Launch {
@@ -209,6 +313,8 @@ pub(crate) enum QOp {
 
 pub(crate) struct Queued {
     seq: u64,
+    /// Who submitted the operation.
+    caller: FakeCaller,
     /// The lane's id in its pool, for the log and for tickets.
     lane: u16,
     op: QOp,
@@ -240,6 +346,17 @@ pub(crate) struct State {
     seq: u64,
     pub(crate) lanes: Vec<Lane>,
     log: Vec<FakeOp>,
+    /// The submitter of each entry of `log`, one for one.
+    callers: Vec<FakeCaller>,
+    /// The submitter of the operation that is running.
+    running: Option<FakeCaller>,
+    /// Device bytes allocated and not freed, and the most that was held at once.
+    held: usize,
+    peak: usize,
+    /// The device's size, if the test gave it one.
+    alloc_failures: Injection,
+    load_failures: Injection,
+    memory_log: Vec<FakeMemoryEvent>,
     /// The device's fault, as the hardware has it: work behind it never runs and its markers never complete. The
     /// host does not know until something observes it (see [`FakeGpu::observe_fault`]), as with a driver.
     pub(crate) faulted: Option<GpuError>,
@@ -250,6 +367,15 @@ pub(crate) struct State {
     next_stamp: u64,
 }
 
+impl State {
+    /// Appends to the log what ran, with the submitter of the operation that is running.
+    fn record(&mut self, op: FakeOp) {
+        let caller = self.running.clone().unwrap_or_else(FakeCaller::here);
+        self.log.push(op);
+        self.callers.push(caller);
+    }
+}
+
 /// The fake device's context accounting: how often the device's context was retained and released, kept by the
 /// [`FakeContext`] and so beyond one open. The CUDA backend's counterpart is the driver's primary context: retained by
 /// `Device::open`, released when the last holder of the device drops, and reported by
@@ -258,6 +384,8 @@ pub(crate) struct State {
 struct ContextRecord {
     retained: AtomicU64,
     released: AtomicU64,
+    /// The device's size: it stands for the card's memory, so it outlives one open.
+    capacity: Mutex<Option<usize>>,
 }
 
 /// A fake device's context that can be opened, fully released and opened again, as a real device's primary context can: the
@@ -289,6 +417,25 @@ impl FakeContext {
         FakeContextHold {
             context: self.clone(),
         }
+    }
+
+    /// Gives the device a size: an allocation on any open of it that would hold more than `bytes` fails. `None` removes
+    /// the limit (the default). The size belongs to the device, so a re-open keeps it.
+    pub fn set_capacity(&self, bytes: Option<usize>) {
+        *self
+            .record
+            .capacity
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = bytes;
+    }
+
+    /// The device's size, if it has one.
+    pub fn capacity(&self) -> Option<usize> {
+        *self
+            .record
+            .capacity
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Contexts retained so far.
@@ -447,12 +594,42 @@ impl FakeGpu {
     }
 
     /// Zeroed device memory of `bytes`, 256-aligned, never at 0.
+    ///
+    /// # Panics
+    /// When the allocation fails (see [`try_alloc`](Self::try_alloc)): with a capacity set or a failure injected this
+    /// can happen, so a test that does either allocates through `try_alloc`.
     pub fn alloc(&self, bytes: usize) -> u64 {
+        self.try_alloc(bytes).expect("the allocation to succeed")
+    }
+
+    /// As [`alloc`](Self::alloc), failing as a device does: `Err(Call)` named `OUT_OF_MEMORY` when the bytes held plus
+    /// `bytes` pass the [capacity](Self::set_capacity), or when an [injected failure](Self::fail_allocs) is due. A failed
+    /// allocation holds nothing. The error's name is `OUT_OF_MEMORY` and its code 2, where the driver's is
+    /// `CUDA_ERROR_OUT_OF_MEMORY`: match on the code.
+    pub fn try_alloc(&self, bytes: usize) -> Result<u64, GpuError> {
+        let caller = FakeCaller::here();
+        let capacity = self.context.capacity();
         let mut st = self.lock();
+        let over = capacity.is_some_and(|capacity| st.held.saturating_add(bytes) > capacity);
+        // A refusal for size is not a call the injection counts: `skip` counts allocations that would succeed.
+        if over || st.alloc_failures.hit() {
+            return Err(GpuError::Call {
+                call: "fake alloc",
+                code: 2,
+                name: "OUT_OF_MEMORY".into(),
+            });
+        }
         let base = st.next_addr;
         st.next_addr += (bytes as u64).next_multiple_of(256).max(256) + 256;
         st.memory.allocations.insert(base, vec![0; bytes]);
-        base
+        st.held += bytes;
+        st.peak = st.peak.max(st.held);
+        st.memory_log.push(FakeMemoryEvent::Alloc {
+            addr: base,
+            bytes,
+            caller,
+        });
+        Ok(base)
     }
 
     /// Frees the allocation at `addr`.
@@ -460,11 +637,93 @@ impl FakeGpu {
     /// # Panics
     /// When `addr` is not the base of a live allocation.
     pub fn free(&self, addr: u64) {
-        self.lock()
+        let caller = FakeCaller::here();
+        let mut st = self.lock();
+        let bytes = st
             .memory
             .allocations
             .remove(&addr)
-            .expect("the base of a live allocation");
+            .expect("the base of a live allocation")
+            .len();
+        st.held -= bytes;
+        st.memory_log.push(FakeMemoryEvent::Free {
+            addr,
+            bytes,
+            caller,
+        });
+    }
+
+    /// Device bytes allocated and not freed.
+    pub fn bytes_held(&self) -> usize {
+        self.lock().held
+    }
+
+    /// The most bytes held at once since the device opened.
+    pub fn peak_bytes(&self) -> usize {
+        self.lock().peak
+    }
+
+    /// Gives the device a size: an allocation that would hold more than `bytes` fails. Bytes already held stay; `None`
+    /// removes the limit (the default). The size is the [context's](FakeContext::set_capacity), so a re-open keeps it.
+    pub fn set_capacity(&self, bytes: Option<usize>) {
+        self.context.set_capacity(bytes);
+    }
+
+    /// The bytes an allocation can still take (the capacity less the bytes held), as a free-memory query answers; `None`
+    /// without a capacity.
+    pub fn free_bytes(&self) -> Option<usize> {
+        let capacity = self.context.capacity();
+        let held = self.lock().held;
+        capacity.map(|capacity| capacity.saturating_sub(held))
+    }
+
+    /// A test hook: after `skip` more allocations succeed, the next `count` fail with `OUT_OF_MEMORY`. An allocation
+    /// refused for the [capacity](Self::set_capacity) does not count toward `skip`. Replaces an injection not yet used up.
+    /// The injection belongs to this open: a re-open of the context starts with none.
+    pub fn fail_allocs(&self, skip: usize, count: usize) {
+        self.lock().alloc_failures = Injection { skip, count };
+    }
+
+    /// A test hook: after `skip` more module loads succeed ([`FakeModule::from_source`](crate::Module::from_source) or
+    /// `from_image`), the next `count` fail with `Err(Load)`. Replaces an injection not yet used up. The injection belongs to
+    /// this open: a re-open of the context starts with none.
+    pub fn fail_module_loads(&self, skip: usize, count: usize) {
+        self.lock().load_failures = Injection { skip, count };
+    }
+
+    pub(crate) fn check_module_load(&self) -> Result<(), GpuError> {
+        if self.lock().load_failures.hit() {
+            return Err(GpuError::Load("injected module load failure".into()));
+        }
+        Ok(())
+    }
+
+    /// Labels the calling thread's submissions and allocations until the returned guard drops, as a frame names its
+    /// work: the label is in the [`FakeCaller`] of each. Labels nest; the innermost shows.
+    pub fn label_caller(label: &str) -> CallerLabel {
+        let id = NEXT_LABEL.fetch_add(1, Ordering::Relaxed);
+        LABELS.with(|labels| labels.borrow_mut().push((id, label.to_owned())));
+        CallerLabel {
+            id,
+            _thread: PhantomData,
+        }
+    }
+
+    /// The allocations and frees so far, in order, each with its caller.
+    pub fn memory_log(&self) -> Vec<FakeMemoryEvent> {
+        self.lock().memory_log.clone()
+    }
+
+    /// The operations that ran, in order, each with the thread, CPU and label of whoever submitted it. The same
+    /// operations as [`log`](Self::log).
+    pub fn calls(&self) -> Vec<FakeCall> {
+        let st = self.lock();
+        st.log
+            .iter()
+            .cloned()
+            .zip(st.callers.iter().cloned())
+            .map(|(op, caller)| FakeCall { op, caller })
+            .collect()
     }
 
     /// Allocations not yet freed.
@@ -539,7 +798,10 @@ impl FakeGpu {
             let Some((_, index)) = best else {
                 return false;
             };
-            let Queued { lane, op, .. } = st.lanes[index].queue.pop_front().expect("a head");
+            let Queued {
+                lane, op, caller, ..
+            } = st.lanes[index].queue.pop_front().expect("a head");
+            st.running = Some(caller);
             self.run(&mut st, index, lane, op, fault.as_ref())
         };
         // The device only queues the outcome, as a driver's callback would; the stream's owner dispatches it.
@@ -571,7 +833,7 @@ impl FakeGpu {
             // callbacks of the stream that faulted are still told, with the fault's code.
             return match op {
                 QOp::Retire { seq, sink } => {
-                    st.log.push(FakeOp::Retire { lane, seq });
+                    st.record(FakeOp::Retire { lane, seq });
                     Some((Told::Sink(sink), status))
                 }
                 QOp::Notify { cell } => Some((Told::Cell(cell), status)),
@@ -590,7 +852,7 @@ impl FakeGpu {
                 launch,
                 args,
             } => {
-                st.log.push(FakeOp::Launch {
+                st.record(FakeOp::Launch {
                     lane,
                     kernel: kernel.name().to_owned(),
                     programmatic: launch.programmatic,
@@ -598,7 +860,7 @@ impl FakeGpu {
                 (kernel.f)(&mut st.memory, &launch, &args)
             }
             QOp::ToDevice { dst, src, bytes } => {
-                st.log.push(FakeOp::Copy { lane });
+                st.record(FakeOp::Copy { lane });
                 st.memory.bytes_mut(dst, bytes).map(|to| {
                     // SAFETY: the `Enqueue` contract keeps the `bytes` at `src` valid and unaliased until retired.
                     unsafe {
@@ -607,14 +869,14 @@ impl FakeGpu {
                 })
             }
             QOp::ToHost { dst, src, bytes } => {
-                st.log.push(FakeOp::Copy { lane });
+                st.record(FakeOp::Copy { lane });
                 st.memory.bytes(src, bytes).map(|from| {
                     // SAFETY: as above, for the host range at `dst`.
                     unsafe { std::ptr::copy_nonoverlapping(from.as_ptr(), dst as *mut u8, bytes) };
                 })
             }
             QOp::OnDevice { dst, src, bytes } => {
-                st.log.push(FakeOp::Copy { lane });
+                st.record(FakeOp::Copy { lane });
                 st.memory
                     .bytes(src, bytes)
                     .map(<[u8]>::to_vec)
@@ -636,7 +898,7 @@ impl FakeGpu {
                 if rows == 0 || row_bytes == 0 {
                     return None;
                 }
-                st.log.push(FakeOp::Copy { lane });
+                st.record(FakeOp::Copy { lane });
                 // The spans were checked at enqueue.
                 let span = |pitch: usize| (rows - 1) * pitch + row_bytes;
                 st.memory
@@ -652,20 +914,20 @@ impl FakeGpu {
                     })
             }
             QOp::Memset { dst, value, bytes } => {
-                st.log.push(FakeOp::Memset { lane });
+                st.record(FakeOp::Memset { lane });
                 st.memory.bytes_mut(dst, bytes).map(|to| to.fill(value))
             }
             QOp::Mark { value } => {
-                st.log.push(FakeOp::Mark { lane, value });
+                st.record(FakeOp::Mark { lane, value });
                 st.lanes[index].marks_run = value;
                 Ok(())
             }
             QOp::Await { value, .. } => {
-                st.log.push(FakeOp::Await { lane, value });
+                st.record(FakeOp::Await { lane, value });
                 Ok(())
             }
             QOp::Retire { seq, sink } => {
-                st.log.push(FakeOp::Retire { lane, seq });
+                st.record(FakeOp::Retire { lane, seq });
                 return Some((Told::Sink(sink), 0));
             }
             QOp::Notify { cell } => return Some((Told::Cell(cell), 0)),
@@ -700,6 +962,7 @@ impl FakeGpu {
 
     /// Enqueues the marker reserved with [`reserve_mark`](Self::reserve_mark), behind the work enqueued so far.
     pub(crate) fn push_reserved_mark(&self, index: usize, lane: u16) -> u64 {
+        let caller = FakeCaller::here();
         let mut st = self.lock();
         st.seq += 1;
         let seq = st.seq;
@@ -709,6 +972,7 @@ impl FakeGpu {
         entry.marks_enqueued = value;
         entry.queue.push_back(Queued {
             seq,
+            caller,
             lane,
             op: QOp::Mark { value },
         });
@@ -728,13 +992,19 @@ impl FakeGpu {
     }
 
     pub(crate) fn push(&self, index: usize, lane: u16, op: QOp) {
+        let caller = FakeCaller::here();
         let mut st = self.lock();
         st.seq += 1;
         let seq = st.seq;
         if matches!(op, QOp::Mark { .. }) {
             st.lanes[index].marks_enqueued += 1;
         }
-        st.lanes[index].queue.push_back(Queued { seq, lane, op });
+        st.lanes[index].queue.push_back(Queued {
+            seq,
+            caller,
+            lane,
+            op,
+        });
     }
 }
 

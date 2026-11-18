@@ -90,6 +90,7 @@ impl Module for FakeModule {
         source: &str,
         options: &CompileOptions,
     ) -> Result<Self, GpuError> {
+        gpu.check_module_load()?;
         Ok(Self {
             gpu: gpu.clone(),
             id: hash_bytes(source.as_bytes()),
@@ -99,6 +100,7 @@ impl Module for FakeModule {
     }
 
     fn from_image(gpu: &Arc<FakeGpu>, image: &[u8]) -> Result<Self, GpuError> {
+        gpu.check_module_load()?;
         Ok(Self {
             gpu: gpu.clone(),
             id: hash_bytes(image),
