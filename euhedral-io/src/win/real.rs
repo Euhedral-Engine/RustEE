@@ -35,13 +35,13 @@ use windows_sys::Win32::Networking::WinSock::{
 use windows_sys::Win32::Storage::FileSystem::{
     CREATE_ALWAYS, CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OVERLAPPED,
     FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_FLAGS, FILE_WRITE_FLAGS_NONE,
-    HIORING, IORING_BUFFER_REF, IORING_BUFFER_REF_0, IORING_CAPABILITIES, IORING_CQE,
-    IORING_CREATE_ADVISORY_FLAGS_NONE, IORING_CREATE_FLAGS, IORING_CREATE_REQUIRED_FLAGS_NONE,
-    IORING_FEATURE_UM_EMULATION, IORING_HANDLE_REF, IORING_HANDLE_REF_0, IORING_OP_CODE,
-    IORING_OP_READ, IORING_OP_WRITE, IORING_REF_RAW, IORING_SQE_FLAGS, IORING_VERSION,
-    IORING_VERSION_1, IORING_VERSION_3 as WIN_IORING_VERSION_3, IOSQE_FLAGS_NONE,
-    MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_ALWAYS, OPEN_EXISTING,
-    ReadFile, WriteFile,
+    GetFileSizeEx, HIORING, IORING_BUFFER_REF, IORING_BUFFER_REF_0, IORING_CAPABILITIES,
+    IORING_CQE, IORING_CREATE_ADVISORY_FLAGS_NONE, IORING_CREATE_FLAGS,
+    IORING_CREATE_REQUIRED_FLAGS_NONE, IORING_FEATURE_UM_EMULATION, IORING_HANDLE_REF,
+    IORING_HANDLE_REF_0, IORING_OP_CODE, IORING_OP_READ, IORING_OP_WRITE, IORING_REF_RAW,
+    IORING_SQE_FLAGS, IORING_VERSION, IORING_VERSION_1, IORING_VERSION_3 as WIN_IORING_VERSION_3,
+    IOSQE_FLAGS_NONE, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_ALWAYS,
+    OPEN_EXISTING, ReadFile, WriteFile,
 };
 use windows_sys::Win32::System::IO::{
     CancelIoEx, CreateIoCompletionPort, GetQueuedCompletionStatusEx, IO_STATUS_BLOCK, OVERLAPPED,
@@ -760,6 +760,17 @@ impl Sys for RealSys {
             )
         };
         if ok == 0 { Err(last_error()) } else { Ok(()) }
+    }
+
+    fn file_len(&self, file: Handle) -> io::Result<u64> {
+        let mut len = 0i64;
+        // SAFETY: `len` is a live `i64`; the handle is the caller's open file.
+        let ok = unsafe { GetFileSizeEx(file as HANDLE, &raw mut len) };
+        if ok == 0 {
+            Err(last_error())
+        } else {
+            Ok(len as u64)
+        }
     }
 
     fn run_on_pool(&self, job: Box<dyn FnOnce() + Send + 'static>) -> io::Result<()> {

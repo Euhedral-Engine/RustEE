@@ -315,6 +315,8 @@ pub(crate) trait Sys: Send + Sync + 'static {
     fn open_file(&self, path: &Path, spec: OpenSpec) -> io::Result<Handle>;
     /// `MoveFileExW`, replacing. Blocks: the engine calls it on the pool.
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
+    /// `GetFileSizeEx`. Blocks: the engine calls it on the pool.
+    fn file_len(&self, file: Handle) -> io::Result<u64>;
     /// Runs `job` once on the OS thread pool.
     fn run_on_pool(&self, job: Box<dyn FnOnce() + Send + 'static>) -> io::Result<()>;
 

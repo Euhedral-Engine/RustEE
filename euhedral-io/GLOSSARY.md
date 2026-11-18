@@ -28,7 +28,7 @@ belongs to the ring of the thread that submitted it.
 **completion port, IoRing** ([`win`](src/win/mod.rs)): the two engines of `AsyncIo` on Windows. A
 completion port collects the packets of overlapped calls and is polled with a zero timeout; IoRing is
 Windows' kernel ring for file reads and writes (Windows 11 22H2 and later), used where the OS has one that
-is not emulated in user mode. `AsyncIoOptions { windows_ioring: false }` forces the port. Open and rename
+is not emulated in user mode. `AsyncIoOptions { windows_ioring: false }` forces the port. Open, rename and file length
 run on the OS thread pool and post to the port. A handle joins the engine's port and can serve one
 `AsyncIo`, ever.
 
@@ -39,3 +39,5 @@ slot was reused, or on another `AsyncIo`, finds nothing. A limit ends with `Time
 cancel with `Other` carrying `Cancelled`; both carry the bytes moved. On Linux a limit is a linked timeout and
 a cancel an async cancel, which may use a reserve of the completion queue that operations may not; on Windows
 a cancel is `CancelIoEx` and a limit a deadline the poll checks.
+
+**file length** ([`lib.rs`](src/lib.rs), [`uring.rs`](src/uring.rs), [`win`](src/win/mod.rs)): `file_len` is a `Request::FileLen`. On Linux it is a `statx` of the descriptor (empty path, `AT_EMPTY_PATH`, `STATX_SIZE`) into a boxed result block that stays where the kernel writes it; the engine reads `stx_size` when the completion arrives and refuses a reply whose mask lacks the size. On Windows it is a `Kind::FileLen` on the OS thread pool, behind `Sys::file_len` (`GetFileSizeEx`); the simulated `Sys` answers from its files.

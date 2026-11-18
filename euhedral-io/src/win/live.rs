@@ -289,6 +289,31 @@ fn a_handle_opened_without_overlapped_io_is_refused() {
 }
 
 #[test]
+fn file_len_gives_the_size_of_an_open_file() {
+    both(|io| {
+        let (path, file) = overlapped_file("sized", &content(12345, 7));
+        let slot: Arc<Mutex<Option<std::io::Result<u64>>>> = Arc::default();
+        let put = slot.clone();
+        io.file_len(
+            file.as_raw_handle(),
+            Box::new(move |result| {
+                *put.lock().unwrap() = Some(result);
+                Box::new(Done {
+                    header: FrameHeader::new(1),
+                    done: None,
+                    raw: Some(Ok(())),
+                })
+            }),
+        )
+        .unwrap();
+        assert!(one(io).raw.unwrap().is_ok());
+        assert_eq!(slot.lock().unwrap().take().unwrap().unwrap(), 12345);
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+    });
+}
+
+#[test]
 fn open_write_and_rename_make_an_atomic_save() {
     both(|io| {
         let target = scratch("saved");

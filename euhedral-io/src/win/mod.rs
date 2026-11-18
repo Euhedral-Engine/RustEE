@@ -10,7 +10,7 @@
 //!   supported: Windows 11 22H2 and later). A full
 //!   submission queue goes to the ring's backlog and is handed over by a later submission or poll.
 //!   A file keeps its route: IoRing refuses a handle that belongs to a completion port.
-//! - **Open and rename** have no asynchronous call. They run on the OS thread pool and leave their
+//! - **Open, rename and file length** have no asynchronous call. They run on the OS thread pool and leave their
 //!   result in a queue the poll drains, so a job that panics or is dropped still ends its
 //!   operation, with an error. It is the one place the crate uses threads it did not create.
 //!
@@ -121,6 +121,7 @@ enum Kind {
     Connect { sock: Handle },
     Open { path: PathBuf, spec: OpenSpec },
     Rename { from: PathBuf, to: PathBuf },
+    FileLen { file: Handle },
 }
 
 /// How the operation reaches the kernel.
@@ -1272,6 +1273,16 @@ impl Engine {
                     delivery.deliver(sys.open_file(&path, spec));
                 }))
             }
+            Kind::FileLen { file } => {
+                let file = *file;
+                let sys = self.sys.clone();
+                let delivery = self.delivery(held);
+                Call::Pool(Box::new(move || {
+                    delivery.deliver(sys.file_len(file).and_then(|len| {
+                        usize::try_from(len).map_err(|_| io::Error::from_raw_os_error(534))
+                    }));
+                }))
+            }
             Kind::Rename { from, to } => {
                 let (from, to) = (from.clone(), to.clone());
                 let sys = self.sys.clone();
@@ -1604,6 +1615,7 @@ impl EngineTrait for Engine {
             Request::Rename { from, to } => {
                 Self::op(Kind::Rename { from, to }, Route::Pool, buf, then)
             }
+            Request::FileLen { file } => Self::op(Kind::FileLen { file }, Route::Pool, buf, then),
             #[cfg(any(target_os = "linux", target_os = "android"))]
             Request::OpenAt { .. } => return Err(invalid("open_file is not available here")),
         };
