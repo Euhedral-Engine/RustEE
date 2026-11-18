@@ -11,10 +11,10 @@ workflow:
 
 include:
   - project: euhedral/ci
-    ref: key-b64
+    ref: v3
     file: github-actions-proxy.yml
     inputs:
-      ref: key-b64
+      ref: v3
 
 variables:
   GIT_DEPTH: "0"
