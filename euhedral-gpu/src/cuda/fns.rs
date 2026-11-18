@@ -50,6 +50,8 @@ pub const CAPTURE_MODE_RELAXED: c_int = 2;
 pub const CAPTURE_STATUS_ACTIVE: c_int = 1;
 pub const ATTR_CC_MAJOR: c_int = 75;
 pub const ATTR_CC_MINOR: c_int = 76;
+pub const ATTR_MULTIPROCESSOR_COUNT: c_int = 16;
+pub const ATTR_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN: c_int = 97;
 
 /// `cuStreamGetCaptureInfo`, in the newest form the driver has.
 #[derive(Clone, Copy)]
