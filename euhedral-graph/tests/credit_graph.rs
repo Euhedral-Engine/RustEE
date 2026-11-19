@@ -29,7 +29,11 @@
 //! = sent + dropped, in flight <= pool, the stream finishing within its time. A pack slower than the consumer
 //! must make items late. With `EUHEDRAL_TEST_TIMING` set (a quiet machine), also no callback over 200 µs and
 //! shutdown under 100 ms; otherwise those two are printed, not asserted (run with `-- --nocapture` to see the
-//! line; libtest hides a passing test's output). The only real-time bound left is a 120 s guard against a hang.
+//! line; libtest hides a passing test's output).
+//!
+//! Real time still decides when the harness takes the lattice for quiet: a window (`QUIET_FOR`) with no
+//! activity of the graph's code, a 20 ms wait for the frame a due completion releases, and a 120 s guard
+//! against a hang. No assertion is on a real-time bound; the window only chooses when scenario time moves.
 //!
 //! `EUHEDRAL_TEST_CPUS` (default 0,1,2,3) picks the lattice's CPUs. As in `euhedral-core`'s tests
 //! that need particular hardware, the test passes without checking anything when this process may
@@ -338,7 +342,9 @@ struct Compute(Arc<Device>);
 
 impl Stage<Item> for Compute {
     fn run(&self, item: &Item, cx: &StageCx<'_>) -> Result<Submitted, StageError> {
-        let lane = cx.lane.expect("a compute lane").0;
+        // The lane is the item's, not the pool's pick (which is random per thread): the same items go to the
+        // same lanes on every run.
+        let lane = COMPUTE_A + (item.seq % 2) as u16;
         let marker = self.0.submit(lane, COMPUTE, cx.waits);
         if let Some(slot) = lock(&item.slot).take() {
             let Item {
@@ -741,12 +747,14 @@ impl Frame for ControlFrame {
 // ---------------------------------------------------------------------------------------------
 // The stepped clock and the fake consumer (the harness).
 
-/// How long the lattice must show no frame starting or running before the harness takes it for quiet. The
-/// graph needs no real time to be right: this only lets a frame that is already queued reach a worker, so
-/// the harness steps time when the lattice has nothing left to do at the current time.
+/// A real-time window, not a proof of quiet: the harness takes the lattice for quiet at the current scenario
+/// time once the graph's own code (a stage run, a hop, a control message taken, a lease end, an item's
+/// drop, a retirement; not the lattice's idle polling) has not counted an activity for this long. A frame
+/// that is queued but has not reached a worker within the window is missed, so on a machine stalled for
+/// longer the harness can step time early. An exact test needs a count of the frames the lattice holds.
 const QUIET_FOR: Duration = Duration::from_micros(500);
-/// After a step that made a device submission complete, how long the harness waits for the frame that
-/// completion releases to start, before it starts counting a quiet window.
+/// After a step that made a device submission complete, the longest real time the harness waits for the
+/// graph's code to show an activity (the frame the completion releases) before it starts the quiet window.
 const RELEASE_WITHIN: Duration = Duration::from_millis(20);
 /// A real-time guard that only catches a hang; no assertion depends on it.
 const HANG_GUARD: Duration = Duration::from_secs(120);
@@ -1154,6 +1162,10 @@ fn run(pack_cost: Duration) -> Option<Outcome> {
 /// What holds whatever the pack costs: order, credit, accounting, drain.
 fn assert_graph_correct(o: &Outcome) {
     assert!(!o.report.timed_out, "the stream did not finish");
+    assert!(
+        o.report.start_latency.is_some(),
+        "the first stream delivered nothing before the seek"
+    );
     assert_eq!(o.report.out_of_order, 0, "out of order");
     assert!(
         o.inversions.iter().all(|(_, n)| *n == 0),

@@ -1,6 +1,6 @@
 //! Fakes for tests of code that submits to device lanes (feature `testing`): [`FakeDevice`], an in-order fake
-//! device queue on a timeline (the wall clock, or a [`StepClock`] the test sets), [`FakeLanes`], a stepped fake lane submitter, and [`StageHarness`], which calls a
-//! [`Stage`](crate::Stage)'s hooks without a graph.
+//! device queue on a timeline (the wall clock, or a [`StepClock`] the test sets), [`FakeLanes`], a stepped fake
+//! lane submitter, and [`StageHarness`], which calls a [`Stage`](crate::Stage)'s hooks without a graph.
 
 #![allow(
     clippy::disallowed_types,
@@ -67,7 +67,8 @@ struct Timelines {
     time: TimeSource,
     /// Each lane's queue identity: a marker of another queue is no lane of this pool.
     ids: Vec<QueueId>,
-    /// Per lane: when each submitted value completes (value k at index k − 1), in ns from `start`.
+    /// Per lane: when each submitted value completes (value k at index k − 1), in ns on the pool's clock
+    /// (from the pool's start on the wall clock).
     done_at: Mutex<Vec<Vec<u64>>>,
 }
 
@@ -181,7 +182,7 @@ impl FakeDevice {
         )
     }
 
-    /// When `marker` completes, in ns from the pool's start (for tests).
+    /// When `marker` completes, in ns on the pool's clock (for tests).
     pub fn done_at_ns(&self, marker: Marker) -> Option<u64> {
         if self.timelines.ids.get(usize::from(marker.lane.0)) != Some(&marker.queue) {
             return None;
@@ -250,5 +251,51 @@ mod tests {
         let (pool, devices) = FakeDevice::pool(&["copy"]);
         let marker = devices[0].submit(Duration::ZERO, &[]);
         assert!(pool.reached(marker));
+    }
+
+    #[test]
+    fn a_stepped_pool_completes_work_only_when_its_clock_reaches_it() {
+        let clock = StepClock::new();
+        let (pool, devices) = FakeDevice::pool_stepped(&["a", "b"], &clock);
+        let first = devices[0].submit(Duration::from_millis(5), &[]);
+        let behind = devices[0].submit(Duration::from_millis(5), &[]);
+        let other = devices[1].submit(Duration::from_millis(2), &[first]);
+        assert_eq!(devices[0].done_at_ns(first), Some(5_000_000));
+        assert_eq!(devices[0].done_at_ns(behind), Some(10_000_000));
+        assert_eq!(devices[1].done_at_ns(other), Some(7_000_000));
+        assert!(!pool.reached(first), "real time does not complete it");
+        assert_eq!(devices[0].until_done(first), Duration::from_millis(5));
+        clock.advance_to(5_000_000);
+        assert!(pool.reached(first) && !pool.reached(behind) && !pool.reached(other));
+        assert_eq!(devices[0].until_done(first), Duration::ZERO);
+        clock.advance_to(10_000_000);
+        assert!(pool.reached(behind) && pool.reached(other));
+        // A submission now starts at the clock's time.
+        let late = devices[1].submit(Duration::from_millis(1), &[]);
+        assert_eq!(devices[1].done_at_ns(late), Some(11_000_000));
+    }
+
+    #[test]
+    fn a_step_clock_never_goes_back() {
+        let clock = StepClock::new();
+        clock.advance_to(9);
+        clock.advance_to(4);
+        assert_eq!(clock.now_ns(), 9);
+    }
+
+    #[test]
+    fn the_next_completion_is_the_earliest_one_after_a_time_on_any_lane() {
+        let clock = StepClock::new();
+        let (_pool, devices) = FakeDevice::pool_stepped(&["a", "b"], &clock);
+        assert_eq!(devices[0].next_done_after_ns(0), None);
+        devices[0].submit(Duration::from_nanos(30), &[]);
+        devices[0].submit(Duration::from_nanos(30), &[]);
+        devices[1].submit(Duration::from_nanos(45), &[]);
+        let next = |after| devices[1].next_done_after_ns(after);
+        assert_eq!(next(0), Some(30));
+        assert_eq!(next(29), Some(30));
+        assert_eq!(next(30), Some(45), "completing at the time is not after it");
+        assert_eq!(next(45), Some(60));
+        assert_eq!(next(60), None);
     }
 }
