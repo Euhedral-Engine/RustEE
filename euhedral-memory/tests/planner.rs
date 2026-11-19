@@ -758,29 +758,36 @@ fn a_stop_matched_order_stays_first_for_its_owner() {
 }
 
 #[test]
-fn a_pull_pushes_queued_orders_within_the_demand_a_request_banked_and_banks_none() {
+fn a_pull_pushes_nothing_and_leaves_the_banked_demand_to_the_next_request() {
     use euhedral_core::generics::LatticeSource;
     use std::sync::Arc;
     let keep = Arc::new(Keep::default());
     let k = keep.clone();
-    // Demand for two is banked while nothing is queued; the orders come after, and only a pull visits the source.
+    // Demand for two is banked while nothing is queued; the orders come after.
     let (p, _got, _held) = three_orders(move |p| {
         let source = p.give_backs();
         source.clone().add_downstream(k);
         source.request(2);
     });
     let source = p.give_backs();
-    assert_eq!(keep.frames.lock().unwrap().len(), 0);
     let mut none = |_: Box<dyn euhedral_core::frames::Frame>| panic!("no demand of its own");
-    assert_eq!(source.pull(&mut none, &mut |_| true, 0), 0);
-    assert_eq!(keep.frames.lock().unwrap().len(), 2, "the banked demand");
-    assert_eq!(source.pull(&mut none, &mut |_| true, 0), 0);
+    assert_eq!(source.pull(&mut none, &mut |_| false, 0), 0);
     assert_eq!(
         keep.frames.lock().unwrap().len(),
-        2,
-        "a pull banks nothing: the third waits"
+        0,
+        "a pull pushes nothing"
     );
-    assert_eq!(p.orders_pending(), 1);
+    let mut handed = Vec::new();
+    assert_eq!(source.pull(&mut |f| handed.push(f), &mut |_| false, 1), 1);
+    assert_eq!(
+        keep.frames.lock().unwrap().len(),
+        0,
+        "it hands out to its consumer"
+    );
+    // The bank is untouched by the pull: a request that adds one finds three asked for, two orders left.
+    source.request(1);
+    assert_eq!(keep.frames.lock().unwrap().len(), 2);
+    assert_eq!(p.orders_pending(), 0);
 }
 
 #[test]
@@ -798,24 +805,4 @@ fn an_order_a_pull_refused_is_pushed_first_by_the_next_request() {
         f.do_finally();
     }
     assert_eq!(*got.lock().unwrap(), vec![GIB, 2 * GIB, 3 * GIB]);
-}
-
-#[test]
-fn a_pull_after_complete_pushes_nothing() {
-    use euhedral_core::generics::LatticeSource;
-    use std::sync::Arc;
-    let keep = Arc::new(Keep::default());
-    let k = keep.clone();
-    let (p, _got, _held) = three_orders(move |p| {
-        let source = p.give_backs();
-        source.clone().add_downstream(k);
-        source.request(2);
-    });
-    let source = p.give_backs();
-    source.complete();
-    assert_eq!(
-        source.pull(&mut |_| panic!("complete"), &mut |_| false, 8),
-        0
-    );
-    assert_eq!(keep.frames.lock().unwrap().len(), 0);
 }

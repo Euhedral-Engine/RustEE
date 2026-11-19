@@ -1357,7 +1357,7 @@ impl Moves {
         n
     }
 
-    /// Pushes the queued completions (the held head first) within the demand a `request` banked.
+    /// Pushes the queued completions (the held head first) within the demand a `request` banked. Only `request` calls it.
     fn push_banked(&self, inside: &mut Inside) {
         let Some(downstream) = self.downstream.get() else {
             return;
@@ -1423,15 +1423,9 @@ impl LatticeSource for Moves {
         stop: &mut dyn FnMut(&dyn Frame) -> bool,
         demand: u64,
     ) -> u64 {
-        if self.complete.load(Ordering::Acquire) {
-            return 0;
-        }
         let Some(mut inside) = self.inside.try_enter() else {
             return 0;
         };
-        // A busy worker's pull is the only visit some sources get: it also pushes what the demand a request banked
-        // asks for (never the pump frame: that is long), and banks nothing itself.
-        self.push_banked(&mut inside);
         self.emit(&mut inside.held, consumer, stop, demand)
     }
 

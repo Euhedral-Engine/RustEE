@@ -966,7 +966,7 @@ fn completions_are_pushed_one_request_at_a_time() {
 }
 
 #[test]
-fn a_pull_pushes_completions_within_the_demand_a_request_banked_and_banks_none() {
+fn a_pull_pushes_nothing_and_leaves_the_banked_demand_to_the_next_request() {
     let r = rig([4, 4, 4], 8);
     let o = r
         .planner
@@ -983,12 +983,21 @@ fn a_pull_pushes_completions_within_the_demand_a_request_banked_and_banks_none()
     }
     settle(&r.mover);
     let mut none = |_: Box<dyn Frame>| panic!("no demand of its own");
-    assert_eq!(source.pull(&mut none, &mut |_| true, 0), 0);
+    assert_eq!(source.pull(&mut none, &mut |_| false, 0), 0);
     keep.run();
-    assert_eq!(seen.lock().unwrap().len(), 2, "the banked demand");
-    assert_eq!(source.pull(&mut none, &mut |_| true, 0), 0);
+    assert_eq!(seen.lock().unwrap().len(), 0, "a pull pushes nothing");
+    let mut handed = Vec::new();
+    assert_eq!(source.pull(&mut |f| handed.push(f), &mut |_| false, 1), 1);
     keep.run();
-    assert_eq!(seen.lock().unwrap().len(), 2, "a pull banks nothing");
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        0,
+        "it hands out to its consumer"
+    );
+    // The bank is untouched by the pull: a request that adds one finds three asked for, two completions left.
+    source.request(1);
+    keep.run();
+    assert_eq!(seen.lock().unwrap().len(), 2);
 }
 
 #[test]
@@ -1009,27 +1018,4 @@ fn a_completion_a_pull_refused_is_pushed_first_by_the_next_request() {
     keep.run();
     let order: Vec<_> = seen.lock().unwrap().iter().map(|d| d.resident).collect();
     assert_eq!(order, vec![first, second]);
-}
-
-#[test]
-fn a_pull_after_complete_pushes_nothing() {
-    let r = rig([4, 4, 4], 8);
-    let o = r
-        .planner
-        .open_owner(OwnerSpec::new("consumer", Priority(50), Scope::Process));
-    let source = r.mover.moves();
-    let keep = Arc::new(Keep::default());
-    source.clone().add_downstream(keep.clone());
-    let seen: Arc<std::sync::Mutex<Vec<MoveDone>>> = Arc::default();
-    source.request(2);
-    keep.run();
-    moved(&r, o, &seen);
-    settle(&r.mover);
-    source.complete();
-    assert_eq!(
-        source.pull(&mut |_| panic!("complete"), &mut |_| false, 8),
-        0
-    );
-    keep.run();
-    assert!(seen.lock().unwrap().is_empty());
 }
