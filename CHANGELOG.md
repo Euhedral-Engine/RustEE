@@ -9,7 +9,7 @@ semantics and the tests that pin it.
 
 **Why.** On a busy machine the slow-pack test failed with one callback over 200 µs although every count was right: the delay came with no involuntary context switch (CPU quota, hypervisor steal, a hardware sibling), which the preemption count cannot tell apart from a slow frame.
 
-**How to use.** `EUHEDRAL_TEST_TIMING=1 cargo test -p euhedral-graph --test credit_graph` on a quiet machine asserts the timing. Without it the line `timing (reported, not asserted ...)` is printed. This replaces the earlier rule that asserted unless `CI` was set.
+**How to use.** `EUHEDRAL_TEST_TIMING=1 cargo test -p euhedral-graph --test credit_graph` on a quiet machine asserts the timing. Without it, with `-- --nocapture` (libtest hides a passing test's output), the line `timing (reported, not asserted ...)` is printed. This replaces the earlier rule that asserted unless `CI` was set.
 
 **Semantics.** Asserted always: no late item, no order break at any hop, nothing beyond credit, nothing left over, made = sent + dropped, every quantum retired once, in flight <= pool. Asserted only with the variable: zero non-preempted callbacks over 200 µs, shutdown under 100 ms.
 

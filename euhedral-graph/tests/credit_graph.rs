@@ -23,7 +23,8 @@
 //!
 //! Pass: 0 late, 0 out of order, 0 beyond credit, 0 left (items, slots, completions, quanta), made
 //! = sent + dropped, in flight <= pool. With `EUHEDRAL_TEST_TIMING` set (a quiet machine), also no
-//! callback over 200 µs and shutdown under 100 ms; otherwise those two are printed, not asserted.
+//! callback over 200 µs and shutdown under 100 ms; otherwise those two are printed, not asserted
+//! (run with `-- --nocapture` to see the line; libtest hides a passing test's output).
 //!
 //! `EUHEDRAL_TEST_CPUS` (default 0,1,2,3) picks the lattice's CPUs. As in `euhedral-core`'s tests
 //! that need particular hardware, the test passes without checking anything when this process may
