@@ -163,7 +163,8 @@ handle's value to the next handle made. Sockets and files the engine makes itsel
 `open_path`) need nothing. For a socket or file you made, call `io.forget_socket(raw)` or `io.forget_file(raw)` before
 you close it, with nothing in flight on it (both do nothing elsewhere). A handle forgotten while it is still open is
 refused by the system at its next join and no longer taken for ours: every later operation on it fails with
-`InvalidInput` ("belongs to another completion port"); none hangs.
+`InvalidInput` ("belongs to another completion port"); none hangs. A handle one `AsyncIo` made and a different
+`AsyncIo` uses counts as caller-made for that other one: forget it there before closing it.
 
 ### Time limits and cancel
 

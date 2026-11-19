@@ -1498,7 +1498,7 @@ impl AsyncIo {
     /// Windows the engine remembers which handle values it joined to its completion port, and the system gives a
     /// closed handle's value to the next one made: call this before the close, so that a new handle of the same
     /// value is not taken for the old one. Sockets and files the engine made itself ([`socket_for`](Self::socket_for),
-    /// accepted sockets, [`open_path`](Self::open_path)) need no call. A handle forgotten while it is still open
+    /// accepted sockets, [`open_path`](Self::open_path)) need no call (on the engine that made them: used with a different `AsyncIo` they count as the caller's there, and the caller forgets them on it). A handle forgotten while it is still open
     /// is not harmed beyond this: its next join is refused by the system, the engine no longer takes that for its
     /// own, and every later operation on it fails with `InvalidInput` ("belongs to another completion port"); none
     /// hangs. Does nothing off Windows.
@@ -1509,7 +1509,8 @@ impl AsyncIo {
         let _ = socket;
     }
 
-    /// As [`forget_socket`](Self::forget_socket), for a file or handle the caller opened and is about to close.
+    /// As [`forget_socket`](Self::forget_socket), for a file or handle the caller opened (or that another `AsyncIo`
+    /// opened) and is about to close.
     pub fn forget_file(&self, file: RawFile) {
         #[cfg(windows)]
         self.engine.forget(raw_file(file));
