@@ -19,6 +19,18 @@ semantics and the tests that pin it.
 
 **Tests.** `stage_graph.rs`: `a_long_chain_of_held_quanta_retires_in_a_flat_stack_when_the_sink_refuses_the_retirements` (100,000 links on a 256 KiB stack), `a_stage_that_releases_itself_on_a_refusing_sink_runs_again_in_a_flat_stack` (20,000 runs on a 256 KiB stack) and `a_stage_that_panics_in_an_in_place_run_on_a_refusing_sink_still_retires_its_quantum` (counter 1, quantum retired, panic does not reach the releaser). With the trampoline off the first two overflow the stack and the third fails.
 
+## The credit-graph timing checks are opt-in (`euhedral-graph` tests) (2026-11-19)
+
+**What.** `euhedral-graph/tests/credit_graph.rs` prints the number of frame callbacks over 200 µs and the shutdown time, and asserts them only when `EUHEDRAL_TEST_TIMING` is set. Every functional check stays asserted.
+
+**Why.** On a busy machine the slow-pack test failed with one callback over 200 µs although every count was right: the delay came with no involuntary context switch (CPU quota, hypervisor steal, a hardware sibling), which the preemption count cannot tell apart from a slow frame.
+
+**How to use.** `EUHEDRAL_TEST_TIMING=1 cargo test -p euhedral-graph --test credit_graph` on a quiet machine asserts the timing. Without it, with `-- --nocapture` (libtest hides a passing test's output), the line `timing (reported, not asserted ...)` is printed. This replaces the earlier rule that asserted unless `CI` was set.
+
+**Semantics.** Asserted always: no late item, no order break at any hop, nothing beyond credit, nothing left over, made = sent + dropped, every quantum retired once, in flight <= pool. Asserted only with the variable: zero non-preempted callbacks over 200 µs, shutdown under 100 ms.
+
+**Tests.** `the_credit_graph_with_a_fast_pack`, `the_credit_graph_with_a_slow_pack`.
+
 ## `AsyncIo` runs where the system refuses io_uring (`euhedral-io`) (2026-11-19)
 
 **What.** On Linux and Android `AsyncIo::open` no longer fails when io_uring is refused. A positional engine (`pread`, `pwrite`, `open`, `rename`, `fstat` and non-blocking socket calls, made by the source's reap frame) takes over, with the same contract. `AsyncIo::backend()` returns `IoBackend::IoUring` or `IoBackend::Positional`, and `AsyncIoOptions::positional_io` forces the fallback.

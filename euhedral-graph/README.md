@@ -452,7 +452,8 @@ Windows.
 The tests are unit tests in each module (the stage graph's drives its sources by hand), the fake
 device's, and `tests/credit_graph.rs`: one lattice of 4 workers, with a per-item
 stage graph, a `Sequencer`, a two-end count as the pool lease, credit-bounded admission, a jump to a new generation and a
-pause, and a timing executor that fails the test if any frame callback runs over 200 µs without
-the OS preempting it. It takes a few seconds and runs on the CPUs in `EUHEDRAL_TEST_CPUS` (default
+pause, and a timing executor that reports every frame callback over 200 µs that the OS did not preempt,
+and fails the test on one only when `EUHEDRAL_TEST_TIMING` is set (run with `-- --nocapture` to
+see the report). It takes a few seconds and runs on the CPUs in `EUHEDRAL_TEST_CPUS` (default
 `0,1,2,3`); as with `euhedral-core`'s tests that need particular hardware, it passes without
 checking anything when the process may not run on all of them. It needs Linux.
