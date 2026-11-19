@@ -309,8 +309,8 @@ fn reaper_frees_only_what_retired() {
     let done = Arc::new(AtomicBool::new(false));
     let r = Reaper::new();
     let d = done.clone();
-    r.push(move || d.load(Ordering::SeqCst), Freed(freed.clone()));
     r.push(|| true, Freed(freed.clone()));
+    r.push(move || d.load(Ordering::SeqCst), Freed(freed.clone()));
     assert_eq!(r.reap(), 1);
     assert_eq!(freed.load(Ordering::SeqCst), 1);
     done.store(true, Ordering::SeqCst);
