@@ -2854,6 +2854,130 @@ mod tests {
         assert!(Cancelled::is(&error), "{error}");
     }
 
+    fn attempts_of(engine: &crate::positional::Positional) -> usize {
+        engine.attempts.load(Ordering::Relaxed)
+    }
+
+    /// A write open of a FIFO with no reader is not attempted at every visit, and still opens once a reader is
+    /// there.
+    #[test]
+    fn a_fifo_open_with_no_reader_backs_off() {
+        let (guard, _path) = fifo_path("fifo-backoff");
+        let engine = crate::positional::Positional::new();
+        engine
+            .submit(
+                open_request(&guard.0, true),
+                IoBuf::default().into(),
+                open_then(1),
+                None,
+                &Cell::new(false),
+            )
+            .unwrap();
+        for _ in 0..100 {
+            assert!(engine_found(&engine).is_empty());
+        }
+        let tried = attempts_of(&engine);
+        assert!(
+            (1..=10).contains(&tried),
+            "{tried} attempts in 100 visits of an open that has no reader"
+        );
+        let reader = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&guard.0)
+                .unwrap()
+        };
+        // The wait is bounded: the open is attempted again within the longest gap.
+        let mut found = Vec::new();
+        for _ in 0..=64 {
+            found = engine_found(&engine);
+            if !found.is_empty() {
+                break;
+            }
+        }
+        let write_end = found.pop().expect("the open ended").done.unwrap().result;
+        // SAFETY: the engine opened this descriptor for us.
+        unsafe { libc::close(write_end.unwrap() as RawFd) };
+        drop(reader);
+    }
+
+    /// A file leased to another process: the open the engine makes non-blocking is refused with EWOULDBLOCK, and
+    /// the caller, who asked for a blocking open, gets the file once the lease is gone.
+    #[test]
+    fn an_open_of_a_leased_file_waits_for_the_lease_like_a_blocking_open() {
+        let (guard, file) = temp_file("leased", b"x");
+        drop(file);
+        // The lease holder is told of a break with SIGIO, which ends a process that does not handle it.
+        // SAFETY: setting a signal's disposition to ignore; nothing else here uses SIGIO.
+        unsafe { libc::signal(libc::SIGIO, libc::SIG_IGN) };
+        let holder = std::fs::File::open(&guard.0).unwrap();
+        // SAFETY: a plain `fcntl` of a descriptor the test owns.
+        let leased = unsafe { libc::fcntl(holder.as_raw_fd(), libc::F_SETLEASE, libc::F_RDLCK) };
+        if leased != 0 {
+            let error = io::Error::last_os_error();
+            // Only a file system without leases is a reason to skip; anything else (a stray writer, say) is a
+            // test that is broken.
+            assert_eq!(error.raw_os_error(), Some(libc::EINVAL), "{error}");
+            eprintln!("no lease on this file system: the test is skipped");
+            return;
+        }
+        let engine = crate::positional::Positional::new();
+        engine
+            .submit(
+                open_request(&guard.0, true),
+                IoBuf::default().into(),
+                open_then(1),
+                None,
+                &Cell::new(false),
+            )
+            .unwrap();
+        for _ in 0..20 {
+            assert!(
+                engine_found(&engine).is_empty(),
+                "the open waits while the lease is held"
+            );
+        }
+        assert!(attempts_of(&engine) >= 1);
+        // SAFETY: as above.
+        let released = unsafe { libc::fcntl(holder.as_raw_fd(), libc::F_SETLEASE, libc::F_UNLCK) };
+        assert_eq!(released, 0);
+        let mut found = Vec::new();
+        for _ in 0..=64 {
+            found = engine_found(&engine);
+            if !found.is_empty() {
+                break;
+            }
+        }
+        let opened = found.pop().expect("the open ended").done.unwrap().result;
+        // SAFETY: the engine opened this descriptor for us.
+        unsafe { libc::close(opened.unwrap() as RawFd) };
+    }
+
+    /// A read that is the only operation due takes the visit's whole budget; two share it a few pieces at a time.
+    #[test]
+    fn a_lone_long_read_moves_more_than_a_turn_in_one_reap_and_two_share() {
+        let pieces = 12;
+        let data = content(pieces * crate::READ_PIECE, 5);
+        let (_guard, file) = temp_file("long-read", &data);
+        let io = positional();
+        io.read(file.as_raw_fd(), 0, buf(data.len()), then(1))
+            .unwrap();
+        assert_eq!(io.reap(), 1, "one visit moved all the pieces");
+        assert_eq!(counts(&io).1, pieces);
+
+        let io = positional();
+        io.read(file.as_raw_fd(), 0, buf(data.len()), then(1))
+            .unwrap();
+        io.read(file.as_raw_fd(), 0, buf(data.len()), then(2))
+            .unwrap();
+        assert_eq!(io.reap(), 0, "neither ran away with the visit");
+        assert_eq!(counts(&io).1, 8, "four pieces each");
+        assert_eq!(io.reap(), 0);
+        assert_eq!(io.reap(), 2);
+    }
+
     /// An accept on a blocking listener cannot block the reap, and leaves the listener as it was.
     #[test]
     fn a_positional_accept_leaves_a_blocking_listener_blocking() {

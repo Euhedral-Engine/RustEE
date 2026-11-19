@@ -1126,6 +1126,11 @@ impl Conn {
         if !matches!(st.phase, Phase::Closed) || st.recv.is_some() || st.send.is_some() {
             return;
         }
+        if let (Some(stream), Some(io)) =
+            (&st.stream, st.ctx.as_ref().and_then(|ctx| ctx.io.upgrade()))
+        {
+            io.forget_socket(raw_stream(stream));
+        }
         st.stream = None;
         st.on_cancel = None;
         st.buf = Vec::new();

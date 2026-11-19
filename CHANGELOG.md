@@ -3,6 +3,20 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## Handle reuse on Windows, and the positional fallback's long reads, FIFO opens and leased files (`euhedral-io`) (2026-11-19)
+
+**What.** The engine forgets the value of every socket, accepted socket and file it makes itself; `AsyncIo::forget_socket(socket)` and `forget_file(file)` tell it that a handle the caller made is about to close, and `euhedral-net` calls the former before its client, connection and listener sockets close. In the positional engine, an operation that is the only one due in a visit takes the whole attempt budget, and an open that cannot proceed backs off between attempts.
+
+**Why.** On Windows the engine remembered every handle it joined to its port and never forgot one. The system reuses a closed handle's value, so a new socket of that value on another port was taken for the engine's own (the system's refusal was read as "already joined"), and a new file of a value that had joined the port was kept off IoRing. In the positional engine one operation moved at most 4 pieces (1 MiB) a visit even when it was alone and 60 of the 64 attempts went unused; an open of a FIFO that has no reader was attempted, with a `stat`, at every visit; and a file leased to another process made the non-blocking open fail with `EWOULDBLOCK`, where a blocking open waits for the lease to break.
+
+**How to use.** Call `io.forget_socket(raw)` or `forget_file(raw)` before closing a handle you made and used with the engine, with nothing in flight on it (it does nothing off Windows). Nothing else changes for callers.
+
+**Semantics.**
+- The engine cannot see a close: handles are the caller's and arrive per operation. A generation key would need an identity to read at join time, and a handle has none that the system does not reuse; so the engine clears the value whenever it makes a handle, and the owner says when a handle of its own closes. A handle forgotten while still open fails its later operations with `InvalidInput` (the system refuses its next join); none hangs.
+- Positional: when exactly one operation is due in a visit (the others wait for a descriptor that is not ready, back off or were cancelled) it goes on until the visit's 64 attempts are used; with two or more due, each moves at most 4 pieces in a row, as before.
+- Positional: a write open of a FIFO with no reader, and an open of a regular file refused with `EWOULDBLOCK` (a lease held elsewhere) when the caller did not ask for `O_NONBLOCK`, are retried with growing gaps of 1, 2, 4 ... 64 visits, until they open, are cancelled or pass their limit (both end them at the next visit). There is no signal for "a reader appeared" or "the lease broke", so the wait is the longest gap at most. A lease breaks after `/proc/sys/fs/lease-break-time` seconds (45 by default); a caller with a limit shorter than that gets `LimitPassed`, as a blocking open would not.
+
+**Tests.** `win::tests`: a socket from `socket_for`, an accepted socket and an opened file that reuse a closed value (one that had joined the port) behave as fresh without any call, and so do caller-made ones after `forget` (all fail without it). `uring::tests`: a lone long read moves 12 pieces in one reap and two share 4 each; a FIFO open with no reader makes at most 10 attempts in 100 visits and opens once a reader is there; an open of a file leased with `F_SETLEASE` waits and succeeds after `F_UNLCK` (these three fail on the old code).
 ## A panic in `AsyncIo`'s completion and refusal paths neither stalls a ring nor skews the counts (`euhedral-io`) (2026-11-19)
 
 **What.** The io_uring engine takes a completion-queue or submission-queue lock a panic poisoned instead of skipping it, and a completion of no operation is raised by `AsyncIo::reap` after its counts are done. The reap drops the frame of an operation whose continuation panicked (it is counted by `panicked()` and by `pending`, and no consumer sees a frame for it). `submit` takes its `pending` and `unreaped` counts back through a guard, so they are right when dropping a refused continuation panics; the engine sets a flag the guard owns (`Engine::submit`'s `taken`) once it holds the operation, so a later panic does not undo the counts and a submission made while the refused continuation drops does not hide the refusal. An enter that unwinds leaves the ring's entries marked unsubmitted, so a later poll hands them over. A reap run inside a continuation keeps the enclosing reap's stray check. The Windows engine takes its poisoned ring lock the same way.
@@ -56,7 +70,6 @@ semantics and the tests that pin it.
 **Semantics.** Asserted always: no late item, no order break at any hop, nothing beyond credit, nothing left over, made = sent + dropped, every quantum retired once, in flight <= pool. Asserted only with the variable: zero non-preempted callbacks over 200 µs, shutdown under 100 ms.
 
 **Tests.** `the_credit_graph_with_a_fast_pack`, `the_credit_graph_with_a_slow_pack`.
-
 ## `AsyncIo` runs where the system refuses io_uring (`euhedral-io`) (2026-11-19)
 
 **What.** On Linux and Android `AsyncIo::open` no longer fails when io_uring is refused. A positional engine (`pread`, `pwrite`, `open`, `rename`, `fstat` and non-blocking socket calls, made by the source's reap frame) takes over, with the same contract. `AsyncIo::backend()` returns `IoBackend::IoUring` or `IoBackend::Positional`, and `AsyncIoOptions::positional_io` forces the fallback.
