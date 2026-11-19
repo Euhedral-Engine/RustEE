@@ -80,7 +80,11 @@ fn expected_ring_use(windows_ioring: bool) -> (bool, bool) {
 /// Runs a test body with IoRing (where the OS has it) and then forced onto the port.
 fn both(body: impl Fn(&Arc<AsyncIo>)) {
     for windows_ioring in [true, false] {
-        let io = AsyncIo::open_with_options(AsyncIoOptions { windows_ioring }).unwrap();
+        let io = AsyncIo::open_with_options(AsyncIoOptions {
+            windows_ioring,
+            positional_io: false,
+        })
+        .unwrap();
         assert_eq!(io.engine.ring_use(), expected_ring_use(windows_ioring));
         body(&io);
         assert_eq!(io.pending(), 0, "windows_ioring = {windows_ioring}");

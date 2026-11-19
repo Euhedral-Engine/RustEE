@@ -113,6 +113,7 @@ impl Harness {
             sim.clone(),
             AsyncIoOptions {
                 windows_ioring: ioring,
+                positional_io: false,
             },
             max_piece,
         )

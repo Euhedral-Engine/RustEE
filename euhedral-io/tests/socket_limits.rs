@@ -13,6 +13,8 @@
 // Fixtures open sockets and run a peer thread outside any lattice.
 #![allow(clippy::disallowed_methods)]
 
+mod common;
+
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -141,9 +143,10 @@ fn recv_ok(io: &AsyncIo, socket: &TcpStream, expect: &[u8]) {
     assert_eq!(filled, expect.len());
 }
 
-#[test]
-fn a_receive_with_a_limit_on_a_silent_peer_times_out_and_the_socket_receives_afterwards() {
-    let io = AsyncIo::open().unwrap();
+fn a_receive_with_a_limit_on_a_silent_peer_times_out_and_the_socket_receives_afterwards_on(
+    open: fn() -> Arc<AsyncIo>,
+) {
+    let io = open();
     let (mut peer, ours) = pair();
     let out = Outcomes::default();
     io.recv_with(ours.as_raw_fd(), buf(64), limit(50), io_then(&out))
@@ -164,8 +167,18 @@ fn a_receive_with_a_limit_on_a_silent_peer_times_out_and_the_socket_receives_aft
 }
 
 #[test]
-fn a_limited_operation_that_finishes_in_time_ends_once_and_leaves_no_trace() {
-    let io = AsyncIo::open().unwrap();
+fn a_receive_with_a_limit_on_a_silent_peer_times_out_and_the_socket_receives_afterwards() {
+    for open in common::engines() {
+        a_receive_with_a_limit_on_a_silent_peer_times_out_and_the_socket_receives_afterwards_on(
+            open,
+        );
+    }
+}
+
+fn a_limited_operation_that_finishes_in_time_ends_once_and_leaves_no_trace_on(
+    open: fn() -> Arc<AsyncIo>,
+) {
+    let io = open();
     let (mut peer, ours) = pair();
     // A receive with data waiting.
     peer.write_all(b"abc").unwrap();
@@ -246,8 +259,16 @@ fn a_limited_operation_that_finishes_in_time_ends_once_and_leaves_no_trace() {
 }
 
 #[test]
-fn a_cancelled_receive_ends_once_with_the_cancelled_error_and_the_socket_receives_afterwards() {
-    let io = AsyncIo::open().unwrap();
+fn a_limited_operation_that_finishes_in_time_ends_once_and_leaves_no_trace() {
+    for open in common::engines() {
+        a_limited_operation_that_finishes_in_time_ends_once_and_leaves_no_trace_on(open);
+    }
+}
+
+fn a_cancelled_receive_ends_once_with_the_cancelled_error_and_the_socket_receives_afterwards_on(
+    open: fn() -> Arc<AsyncIo>,
+) {
+    let io = open();
     let (mut peer, ours) = pair();
     let out = Outcomes::default();
     let id = io
@@ -279,6 +300,13 @@ fn a_cancelled_receive_ends_once_with_the_cancelled_error_and_the_socket_receive
     recv_ok(&io, &ours, b"after");
 }
 
+#[test]
+fn a_cancelled_receive_ends_once_with_the_cancelled_error_and_the_socket_receives_afterwards() {
+    for open in common::engines() {
+        a_cancelled_receive_ends_once_with_the_cancelled_error_and_the_socket_receives_afterwards_on(open);
+    }
+}
+
 /// Sets a socket option of integer type.
 fn set_int(socket: &impl AsRawFd, level: i32, name: i32, value: i32) {
     // SAFETY: `setsockopt(2)` on a socket we own, with a pointer to an int that outlives the call.
@@ -306,9 +334,10 @@ fn small_pair() -> (TcpStream, TcpStream) {
     (client, server)
 }
 
-#[test]
-fn a_cancelled_send_to_a_peer_with_full_buffers_ends_once_and_a_limited_one_times_out() {
-    let io = AsyncIo::open().unwrap();
+fn a_cancelled_send_to_a_peer_with_full_buffers_ends_once_and_a_limited_one_times_out_on(
+    open: fn() -> Arc<AsyncIo>,
+) {
+    let io = open();
     // The peer never reads: the socket's buffers fill and the send waits.
     let (_peer, ours) = small_pair();
     let total = 4 * 1024 * 1024;
@@ -346,8 +375,16 @@ fn a_cancelled_send_to_a_peer_with_full_buffers_ends_once_and_a_limited_one_time
 }
 
 #[test]
-fn a_cancel_that_comes_after_the_completion_delivers_the_real_result_once() {
-    let io = AsyncIo::open().unwrap();
+fn a_cancelled_send_to_a_peer_with_full_buffers_ends_once_and_a_limited_one_times_out() {
+    for open in common::engines() {
+        a_cancelled_send_to_a_peer_with_full_buffers_ends_once_and_a_limited_one_times_out_on(open);
+    }
+}
+
+fn a_cancel_that_comes_after_the_completion_delivers_the_real_result_once_on(
+    open: fn() -> Arc<AsyncIo>,
+) {
+    let io = open();
     let (mut peer, ours) = pair();
     peer.write_all(b"data").unwrap();
     let out = Outcomes::default();
@@ -361,6 +398,12 @@ fn a_cancel_that_comes_after_the_completion_delivers_the_real_result_once() {
             io_then(&out),
         )
         .unwrap();
+    // On io_uring the kernel completed the receive during the submission, so this cancel comes after it. The
+    // fallback ends the receive at its first visit: reap first, then cancel.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if io.backend() == euhedral_io::IoBackend::Positional {
+        drive(&io, || out.len() == 1);
+    }
     io.cancel(id);
     drive(&io, || out.len() == 1);
     assert_eq!(only(&out).0.unwrap(), 4);
@@ -372,8 +415,16 @@ fn a_cancel_that_comes_after_the_completion_delivers_the_real_result_once() {
 }
 
 #[test]
-fn cancelling_an_operation_that_ended_does_nothing_even_after_its_slot_was_reused() {
-    let io = AsyncIo::open().unwrap();
+fn a_cancel_that_comes_after_the_completion_delivers_the_real_result_once() {
+    for open in common::engines() {
+        a_cancel_that_comes_after_the_completion_delivers_the_real_result_once_on(open);
+    }
+}
+
+fn cancelling_an_operation_that_ended_does_nothing_even_after_its_slot_was_reused_on(
+    open: fn() -> Arc<AsyncIo>,
+) {
+    let io = open();
     let (mut peer, ours) = pair();
     peer.write_all(b"first").unwrap();
     let first = Outcomes::default();
@@ -407,8 +458,16 @@ fn cancelling_an_operation_that_ended_does_nothing_even_after_its_slot_was_reuse
 }
 
 #[test]
-fn a_limited_accept_with_no_peer_times_out_and_the_listener_accepts_afterwards() {
-    let io = AsyncIo::open().unwrap();
+fn cancelling_an_operation_that_ended_does_nothing_even_after_its_slot_was_reused() {
+    for open in common::engines() {
+        cancelling_an_operation_that_ended_does_nothing_even_after_its_slot_was_reused_on(open);
+    }
+}
+
+fn a_limited_accept_with_no_peer_times_out_and_the_listener_accepts_afterwards_on(
+    open: fn() -> Arc<AsyncIo>,
+) {
+    let io = open();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let to = listener.local_addr().unwrap();
     let out: Outcomes<io::Result<OwnedFd>> = Outcomes::default();
@@ -441,13 +500,19 @@ fn a_limited_accept_with_no_peer_times_out_and_the_listener_accepts_afterwards()
     assert!(out.take().remove(0).is_ok());
 }
 
+#[test]
+fn a_limited_accept_with_no_peer_times_out_and_the_listener_accepts_afterwards() {
+    for open in common::engines() {
+        a_limited_accept_with_no_peer_times_out_and_the_listener_accepts_afterwards_on(open);
+    }
+}
+
 /// No address that never answers exists on every machine, so the test makes one on loopback: a
 /// listener whose accept queue is full has the kernel drop the SYNs that come after it, and answer
 /// none (whatever `tcp_abort_on_overflow` says: that setting only governs the final ACK of a
 /// handshake that already began).
-#[test]
-fn a_limited_connect_to_a_peer_that_does_not_answer_times_out() {
-    let io = AsyncIo::open().unwrap();
+fn a_limited_connect_to_a_peer_that_does_not_answer_times_out_on(open: fn() -> Arc<AsyncIo>) {
+    let io = open();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let SocketAddr::V4(to) = listener.local_addr().unwrap() else {
         unreachable!("bound to an IPv4 address")
@@ -481,8 +546,14 @@ fn a_limited_connect_to_a_peer_that_does_not_answer_times_out() {
 }
 
 #[test]
-fn a_cancel_from_another_worker_ends_the_operation_once() {
-    let io = AsyncIo::open().unwrap();
+fn a_limited_connect_to_a_peer_that_does_not_answer_times_out() {
+    for open in common::engines() {
+        a_limited_connect_to_a_peer_that_does_not_answer_times_out_on(open);
+    }
+}
+
+fn a_cancel_from_another_worker_ends_the_operation_once_on(open: fn() -> Arc<AsyncIo>) {
+    let io = open();
     let (_peer, ours) = pair();
     let out = Outcomes::default();
     let id = io
@@ -506,8 +577,16 @@ fn a_cancel_from_another_worker_ends_the_operation_once() {
 }
 
 #[test]
-fn cancelling_a_limited_operation_ends_it_with_the_cancel_and_no_timeout_follows() {
-    let io = AsyncIo::open().unwrap();
+fn a_cancel_from_another_worker_ends_the_operation_once() {
+    for open in common::engines() {
+        a_cancel_from_another_worker_ends_the_operation_once_on(open);
+    }
+}
+
+fn cancelling_a_limited_operation_ends_it_with_the_cancel_and_no_timeout_follows_on(
+    open: fn() -> Arc<AsyncIo>,
+) {
+    let io = open();
     let (mut peer, ours) = pair();
     let out = Outcomes::default();
     let id = io
@@ -531,9 +610,15 @@ fn cancelling_a_limited_operation_ends_it_with_the_cancel_and_no_timeout_follows
 }
 
 #[test]
-fn the_id_of_another_asyncio_cancels_nothing() {
-    let first = AsyncIo::open().unwrap();
-    let second = AsyncIo::open().unwrap();
+fn cancelling_a_limited_operation_ends_it_with_the_cancel_and_no_timeout_follows() {
+    for open in common::engines() {
+        cancelling_a_limited_operation_ends_it_with_the_cancel_and_no_timeout_follows_on(open);
+    }
+}
+
+fn the_id_of_another_asyncio_cancels_nothing_on(open: fn() -> Arc<AsyncIo>) {
+    let first = open();
+    let second = open();
     let (mut peer, ours) = pair();
     let out = Outcomes::default();
     let id = first
@@ -557,4 +642,11 @@ fn the_id_of_another_asyncio_cancels_nothing() {
     second.cancel(id2);
     drive(&second, || out2.len() == 1);
     assert!(Cancelled::is(&only(&out2).0.unwrap_err()));
+}
+
+#[test]
+fn the_id_of_another_asyncio_cancels_nothing() {
+    for open in common::engines() {
+        the_id_of_another_asyncio_cancels_nothing_on(open);
+    }
 }

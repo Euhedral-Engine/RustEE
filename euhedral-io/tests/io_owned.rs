@@ -14,6 +14,8 @@
 // Fixtures write files synchronously, outside any lattice.
 #![allow(clippy::disallowed_methods)]
 
+mod common;
+
 use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -135,9 +137,8 @@ fn read_into(io: &AsyncIo, file: &OwnedFile, offset: u64, memory: Vec<u8>) -> Io
     slot.lock().unwrap().take().expect("the read ended")
 }
 
-#[test]
-fn read_into_fills_owned_region() {
-    let io = AsyncIo::open().unwrap();
+fn read_into_fills_owned_region_on(open: fn() -> Arc<AsyncIo>) {
+    let io = open();
     let data = content(64 * 1024);
     let (_scratch, file) = open_file(&io, "fills", &data);
     let memory = vec![SENTINEL; data.len()];
@@ -155,8 +156,14 @@ fn read_into_fills_owned_region() {
 }
 
 #[test]
-fn read_into_split_pieces_preserve_offsets() {
-    let io = AsyncIo::open().unwrap();
+fn read_into_fills_owned_region() {
+    for open in common::engines() {
+        read_into_fills_owned_region_on(open);
+    }
+}
+
+fn read_into_split_pieces_preserve_offsets_on(open: fn() -> Arc<AsyncIo>) {
+    let io = open();
     let data = content(3 * PIECE + 777);
     let (_scratch, file) = open_file(&io, "pieces", &data);
     // Larger than a piece, from the start and from an offset that is not aligned to one.
@@ -176,8 +183,14 @@ fn read_into_split_pieces_preserve_offsets() {
 }
 
 #[test]
-fn read_into_short_read_reports_count() {
-    let io = AsyncIo::open().unwrap();
+fn read_into_split_pieces_preserve_offsets() {
+    for open in common::engines() {
+        read_into_split_pieces_preserve_offsets_on(open);
+    }
+}
+
+fn read_into_short_read_reports_count_on(open: fn() -> Arc<AsyncIo>) {
+    let io = open();
     let data = content(1000);
     let (_scratch, file) = open_file(&io, "short", &data);
     let done = read_into(&io, &file, 400, vec![SENTINEL; 4096]);
@@ -193,8 +206,14 @@ fn read_into_short_read_reports_count() {
 }
 
 #[test]
-fn owned_buffer_returned_on_error() {
-    let io = AsyncIo::open().unwrap();
+fn read_into_short_read_reports_count() {
+    for open in common::engines() {
+        read_into_short_read_reports_count_on(open);
+    }
+}
+
+fn owned_buffer_returned_on_error_on(open: fn() -> Arc<AsyncIo>) {
+    let io = open();
     let data = content(100);
     let (_scratch, file) = open_file(&io, "error", &data);
     // A read at the end of the file fails, and the region comes back unchanged.
@@ -214,6 +233,13 @@ fn owned_buffer_returned_on_error() {
     );
     assert_eq!(refused.unwrap_err().kind(), io::ErrorKind::InvalidInput);
     assert_eq!(io.pending(), 0);
+}
+
+#[test]
+fn owned_buffer_returned_on_error() {
+    for open in common::engines() {
+        owned_buffer_returned_on_error_on(open);
+    }
 }
 
 /// Takes each frame its upstream pushes and records its tag.
@@ -261,11 +287,10 @@ impl SharedFile {
     }
 }
 
-#[test]
-fn a_request_only_lattice_delivers_every_completion() {
+fn a_request_only_lattice_delivers_every_completion_on(open: fn() -> Arc<AsyncIo>) {
     const THREADS: u64 = 4;
     const EACH: u64 = 125;
-    let io = AsyncIo::open().unwrap();
+    let io = open();
     let data = content(4096);
     let (_scratch, file) = open_file(&io, "request-only", &data);
     let collector = Arc::new(Collector::default());
@@ -309,8 +334,16 @@ fn a_request_only_lattice_delivers_every_completion() {
 }
 
 #[test]
-fn a_request_while_a_pull_holds_the_front_returns_at_once_and_is_served_after() {
-    let io = AsyncIo::open().unwrap();
+fn a_request_only_lattice_delivers_every_completion() {
+    for open in common::engines() {
+        a_request_only_lattice_delivers_every_completion_on(open);
+    }
+}
+
+fn a_request_while_a_pull_holds_the_front_returns_at_once_and_is_served_after_on(
+    open: fn() -> Arc<AsyncIo>,
+) {
+    let io = open();
     let data = content(4096);
     let (_scratch, file) = open_file(&io, "refused-request", &data);
     let collector = Arc::new(Collector::default());
@@ -371,4 +404,11 @@ fn a_request_while_a_pull_holds_the_front_returns_at_once_and_is_served_after() 
     tags.sort_unstable();
     assert_eq!(tags, [0, 1], "each completion went to exactly one of them");
     assert_eq!(io.pending(), 0);
+}
+
+#[test]
+fn a_request_while_a_pull_holds_the_front_returns_at_once_and_is_served_after() {
+    for open in common::engines() {
+        a_request_while_a_pull_holds_the_front_returns_at_once_and_is_served_after_on(open);
+    }
 }
