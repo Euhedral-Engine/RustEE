@@ -568,7 +568,7 @@ mod tests {
     }
 
     #[test]
-    fn a_remove_racing_the_close_tail_leaves_nothing_behind() {
+    fn a_listener_destructor_that_eats_the_park_token_does_not_stall_the_thread() {
         struct Gated {
             entered: Mutex<mpsc::Sender<()>>,
             release: Mutex<mpsc::Receiver<()>>,
@@ -627,5 +627,53 @@ mod tests {
         assert!(dispatcher.remove_listener(b));
         wait_for_release(&first);
         wait_for_release(&second);
+    }
+
+    #[test]
+    fn a_remove_racing_the_close_tail_leaves_nothing_behind() {
+        struct Gated {
+            entered: Mutex<mpsc::Sender<()>>,
+            release: Mutex<mpsc::Receiver<()>>,
+        }
+        impl Drop for Gated {
+            fn drop(&mut self) {
+                self.entered.lock().unwrap().send(()).unwrap();
+                let _ = self
+                    .release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5));
+            }
+        }
+        let dispatcher = LatestValueDispatcher::<u32>::new("test-dispatcher").unwrap();
+        let (seen, entered_rx, release_recorder) = gated_recorder(&dispatcher);
+        let (dropping, dropping_rx) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
+        let gated = Gated {
+            entered: Mutex::new(dropping),
+            release: Mutex::new(release_rx),
+        };
+        let a = dispatcher.add_listener(move |_: &u32| {
+            let _ = &gated;
+        });
+        let b = dispatcher.add_listener(|_: &u32| {});
+        let token = Arc::new(());
+        let held = Arc::clone(&token);
+        dispatcher.add_listener(move |_: &u32| {
+            let _ = &held;
+        });
+        dispatcher.offer(1);
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        // The thread's own list keeps A alive until the close tail drops it.
+        assert!(dispatcher.remove_listener(a));
+        dispatcher.begin_close(None);
+        release_recorder.send(()).unwrap();
+        dropping_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        // The tail is dropping A: this removal publishes after the thread has begun to close.
+        assert!(dispatcher.remove_listener(b));
+        release.send(()).unwrap();
+        wait_until(|| dispatcher.is_closed());
+        assert_eq!(*seen.lock().unwrap(), [1]);
+        assert_eq!(live(&token), 1, "the close released every listener");
     }
 }
