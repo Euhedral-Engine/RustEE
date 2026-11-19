@@ -33,6 +33,14 @@
   "canary": true
  },
  {
+  "name": "hardware-utils: monitor dispatcher",
+  "crate": "euhedral-hardware-utils",
+  "seeds": 4,
+  "commands": [
+   "cargo miri test -p euhedral-hardware-utils --lib -- monitor::dispatcher"
+  ]
+ },
+ {
   "name": "core: single-threaded (1)",
   "crate": "euhedral-core",
   "seeds": 1,

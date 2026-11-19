@@ -3,6 +3,21 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## The resource monitor's dispatcher takes no lock and waits for nothing on the offer path (`euhedral-hardware-utils`) (2026-11-19)
+
+**What.** The monitor's dispatcher no longer uses a mutex and condvar. The pending value is one pointer cell: `offer` swaps its box in, drops the value it replaced and unparks the dispatch thread; the dispatch thread swaps the cell empty and owns what it took. The listener list is the dispatch thread's own: `add_listener` and `remove_listener` edit a master list under a lifecycle lock (cold) and hand the new list over through a second pointer cell, which the dispatch thread takes before each delivery. `closing` and `closed` are atomics, and the close hook sits in the cold lock. An idle dispatch thread parks.
+
+**Why.** The poller offered a value every tick through a lock the dispatch thread also took, and the thread slept on a condvar.
+
+**How to use.** Nothing changes: the API and the documented behaviour (latest value only, one listener's panic isolated, a delivery in progress may still reach a removed listener once, the hook runs after the last delivery) are as before.
+
+**Semantics.**
+- A listener added or removed during a delivery takes effect from the next value.
+- An offer racing a close is delivered or dropped, never both; values left in the cell at close are dropped by the dispatch thread or when the monitor is dropped.
+- Registered listeners are released on the dispatch thread at close, as before.
+
+**Tests.** `offers_racing_close_deliver_the_latest_or_nothing_after_close`, `a_burst_of_offers_delivers_the_last` (each replaced value dropped once), `listeners_added_during_dispatch_see_the_next_value`, `a_removed_listener_is_gone_for_the_next_value_and_the_list_is_freed`, `an_offer_takes_no_lock`; the H5 row of the ratchet is gone. The module runs under Miri in its own shard.
+
 ## `Completions::lateness_us` measures from when a wait could first have been seen done (`euhedral-graph`) (2026-11-19)
 
 **What.** A wait claimed by a lane's retirement (`after_retired`) is measured from the instant the callback arrived (`RetireCell::arrive` stamps it), not from the registration or the last look. A timer was already measured from its deadline. A marker, a `Ready`, a `Wake` and a `Pending` keep the last look.
