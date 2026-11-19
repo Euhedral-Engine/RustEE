@@ -3,6 +3,21 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## Handle reuse on Windows, and the positional fallback's long reads, FIFO opens and leased files (`euhedral-io`) (2026-11-19)
+
+**What.** `AsyncIo::forget_socket(socket)` tells the engine a socket is about to close; `euhedral-net` calls it before its client and server connections close their sockets. In the positional engine, an operation that is the only one due in a visit takes the whole attempt budget, and an open that cannot proceed backs off between attempts.
+
+**Why.** On Windows the engine remembered every handle it joined to its port and never forgot one. The system reuses a closed handle's value, so a new socket of that value on another port was taken for the engine's own (the system's refusal was read as "already joined"), and a new file of a value that had joined the port was kept off IoRing. In the positional engine one operation moved at most 4 pieces (1 MiB) a visit even when it was alone and 60 of the 64 attempts went unused; an open of a FIFO that has no reader was attempted, with a `stat`, at every visit; and a file leased to another process made the non-blocking open fail with `EWOULDBLOCK`, where a blocking open waits for the lease to break.
+
+**How to use.** Call `io.forget_socket(raw)` before closing a socket you used with the engine, with nothing in flight on it (it does nothing off Windows). Nothing else changes for callers.
+
+**Semantics.**
+- The engine cannot see a close: handles are the caller's and arrive per operation. A generation key would need an identity to read at join time, and a handle has none that the system does not reuse; so the owner says when it closes. A handle that is never forgotten behaves as before.
+- Positional: when exactly one operation is due in a visit (the others wait for a descriptor that is not ready, or back off) it goes on until the visit's 64 attempts are used; with two or more due, each moves at most 4 pieces in a row, as before.
+- Positional: a write open of a FIFO with no reader, and an open of a regular file refused with `EWOULDBLOCK` (a lease held elsewhere) when the caller did not ask for `O_NONBLOCK`, are retried with growing gaps of 1, 2, 4 ... 64 visits, until they open, are cancelled or pass their limit (both end them at the next visit). There is no signal for "a reader appeared" or "the lease broke", so the wait is the longest gap at most. A lease breaks after `/proc/sys/fs/lease-break-time` seconds (45 by default); a caller with a limit shorter than that gets `LimitPassed`, as a blocking open would not.
+
+**Tests.** `win::tests`: a closed socket's value given to a new one is joined afresh; a new socket of that value on another port is refused; a new file of that value is offered a ring (the last two fail without `forget`). `uring::tests`: a lone long read moves 12 pieces in one reap and two share 4 each; a FIFO open with no reader makes at most 10 attempts in 100 visits and opens once a reader is there; an open of a file leased with `F_SETLEASE` waits and succeeds after `F_UNLCK` (these three fail on the old code).
+
 ## `AsyncIo` runs where the system refuses io_uring (`euhedral-io`) (2026-11-19)
 
 **What.** On Linux and Android `AsyncIo::open` no longer fails when io_uring is refused. A positional engine (`pread`, `pwrite`, `open`, `rename`, `fstat` and non-blocking socket calls, made by the source's reap frame) takes over, with the same contract. `AsyncIo::backend()` returns `IoBackend::IoUring` or `IoBackend::Positional`, and `AsyncIoOptions::positional_io` forces the fallback.

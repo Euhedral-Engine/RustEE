@@ -174,6 +174,16 @@ impl Sim {
         self.s().elsewhere.insert(handle);
     }
 
+    /// The handle is closed and its value given to a new one, which belongs to no port, or (with `elsewhere`) to
+    /// another completion port.
+    pub(super) fn reuse(&self, handle: Handle, elsewhere: bool) {
+        let mut s = self.s();
+        s.associated.remove(&handle);
+        if elsewhere {
+            s.elsewhere.insert(handle);
+        }
+    }
+
     /// An OS error code whose status is a warning.
     pub(super) fn mark_warning(&self, code: i32) {
         self.s().warnings.insert(code);

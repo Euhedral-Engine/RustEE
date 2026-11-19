@@ -1494,6 +1494,17 @@ impl AsyncIo {
         }
     }
 
+    /// Tells the engine that `socket` is about to be closed, with nothing in flight on it. On Windows the engine
+    /// remembers which handle values it joined to its completion port, and the system hands a closed handle's value
+    /// to the next one made: call this before the close, so that a new socket of the same value is not taken for
+    /// the old one. Nowhere else does it do anything.
+    pub fn forget_socket(&self, socket: RawSock) {
+        #[cfg(windows)]
+        self.engine.forget(raw_sock(socket));
+        #[cfg(not(windows))]
+        let _ = socket;
+    }
+
     /// Operations in flight.
     pub fn pending(&self) -> usize {
         self.front.pending()

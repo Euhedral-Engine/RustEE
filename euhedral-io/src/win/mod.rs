@@ -1018,6 +1018,16 @@ impl Engine {
         Ok(())
     }
 
+    /// Forgets a handle that is about to close: the OS may give its value to a new handle, which is not the one
+    /// this engine joined. Only the owner knows when it closes, so it says so, before it closes the handle and with
+    /// nothing in flight on it. Without this, a new handle of the same value that sits on another port would
+    /// pass for ours (the OS's refusal would be taken for "already joined"), and a new file would be kept off a
+    /// ring.
+    pub(super) fn forget(&self, handle: Handle) {
+        lock!(&self.associated).remove(&handle);
+        lock!(&self.ringed).remove(&handle);
+    }
+
     /// Joins the handle to the engine's port. A handle already on a port is refused by the OS
     /// with `ERROR_INVALID_PARAMETER`: that is fine only for a handle this engine joined.
     fn join_port(&self, handle: Handle) -> io::Result<()> {

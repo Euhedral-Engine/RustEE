@@ -962,6 +962,49 @@ fn a_pool_job_that_panics_or_is_dropped_still_ends_its_operation() {
 }
 
 #[test]
+fn a_closed_sockets_value_given_to_a_new_socket_is_joined_afresh() {
+    let h = Harness::new();
+    let sock = h.sim.sock();
+    h.engine.join_port(sock).unwrap();
+    h.engine.join_port(sock).unwrap();
+    assert_eq!(associations(&h, sock), 1, "joined once while it lives");
+    // The socket closes and its value goes to a new socket.
+    h.engine.forget(sock);
+    h.sim.reuse(sock, false);
+    h.engine.join_port(sock).unwrap();
+    assert_eq!(associations(&h, sock), 2, "the new socket is joined");
+}
+
+#[test]
+fn a_new_socket_of_a_closed_ones_value_that_sits_on_another_port_is_refused() {
+    let h = Harness::new();
+    let sock = h.sim.sock();
+    h.engine.join_port(sock).unwrap();
+    h.engine.forget(sock);
+    h.sim.reuse(sock, true);
+    let error = h.engine.join_port(sock).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+}
+
+#[test]
+fn a_new_file_of_a_closed_ones_value_is_offered_a_ring() {
+    let h = Harness::with(Some(full_probe()), true, MAX_PIECE);
+    let file = h.sim.file(&content(100));
+    // The old file joined the port, and closed.
+    h.engine.join_port(file).unwrap();
+    h.engine.forget(file);
+    h.sim.reuse(file, false);
+    h.read(file, 0, 10, 1).unwrap();
+    assert_eq!(ended(h.one()).result.unwrap(), 10);
+    assert_eq!(h.sim.rings_made(), 1, "a new file is not kept off a ring");
+}
+
+fn associations(h: &Harness, handle: usize) -> usize {
+    let line = format!("associate {handle:#x}");
+    h.sim.log().iter().filter(|l| **l == line).count()
+}
+
+#[test]
 fn a_handle_that_belongs_to_another_port_is_refused() {
     let h = Harness::new();
     let file = h.sim.file(&content(100));
