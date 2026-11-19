@@ -25,9 +25,9 @@ semantics and the tests that pin it.
 
 **Semantics.** One extra test binary on pipelines that do not affect `euhedral-core`; the GitLab child pipeline and `ci.yml` do the same.
 
-**Ratchet.** The listed `lock!` count of a file in `LOCK_MACRO_SITES` is now a ceiling (more sites fail, fewer pass); the entry of `euhedral-io/src/win/mod.rs` is set far above its sites (1_000_000) until its locks go in the lock removal campaign. `HOT_FIX_TAGS` stays exact.
+**Ratchet.** A file's `lock!` count in `LOCK_MACRO_SITES` still only shrinks (exact), except for a file on the new `LOCK_MACRO_CEILINGS` list, whose count is a ceiling (more sites fail, fewer pass). Only `euhedral-io/src/win/mod.rs` is on it, set far above its sites (1_000_000) until its locks go in the lock removal campaign, which removes the list. `HOT_FIX_TAGS` stays exact.
 
-**Tests.** `scripts/ci/test_gitlab_pipeline.py`: the ratchet step is present when only another crate is affected and absent when `euhedral-core` is. Fails on the old script.
+**Tests.** `scripts/ci/test_gitlab_pipeline.py`: the ratchet step is present when only another crate is affected and absent when `euhedral-core` is (fails on the old script). `hot_fix_ratchet.rs`: an exact row fails with fewer or more sites, a ceiling row passes with fewer and fails with more.
 
 ## A killed quantum holds for everything it started, and killed waiting entries end at the next visit (`euhedral-graph`) (2026-11-19)
 
