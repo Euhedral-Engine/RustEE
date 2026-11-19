@@ -128,8 +128,8 @@ pub(crate) type Bell = crate::sync::AtomicU64;
 
 /// Where a lane's retirement callback leaves its status: the sink an arm names (Java's `notifyRetired(listener)`).
 ///
-/// The callback only fills the cell with one atomic exchange (and rings a bell with one add, if a source claimed the
-/// cell): it makes no driver call, takes no lock and allocates nothing. Whoever armed the retirement finds the cell
+/// The callback only reads the clock and stores the arrival stamp, fills the cell with one atomic exchange (and rings a
+/// bell with one add, if a source claimed the cell): it makes no driver call, takes no lock and allocates nothing. Whoever armed the retirement finds the cell
 /// filled by polling it ([`Completions::after_retired`](crate::Completions) does) and settles the status in a frame,
 /// so a retirement is never anonymous: two parties arming on one lane each read their own cell.
 #[derive(Debug)]
@@ -142,7 +142,7 @@ pub struct RetireCell {
     bell: AtomicPtr<Bell>,
     /// When the callback arrived: 1 + nanoseconds since the process's first stamp, or 0 before. Written before the
     /// status exchange, so whoever sees the status sees the stamp.
-    arrived_at: AtomicU64,
+    arrived_at: crate::sync::AtomicU64,
 }
 
 /// The origin of [`RetireCell`] stamps.
@@ -156,10 +156,12 @@ const PENDING: i64 = i64::MIN;
 impl RetireCell {
     /// A cell no callback has filled.
     pub fn new() -> Self {
+        // The origin is set here, so the callback never initialises it.
+        stamp_origin();
         Self {
             state: AtomicI64::new(PENDING),
             bell: AtomicPtr::new(std::ptr::null_mut()),
-            arrived_at: AtomicU64::new(0),
+            arrived_at: crate::sync::AtomicU64::new(0),
         }
     }
 

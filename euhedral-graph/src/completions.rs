@@ -930,7 +930,8 @@ impl Completions {
     ///   is polled blind. The wait itself is not counted.
     /// - a marker, a [`Ready`], a `Wake`, a [`Pending`]: from the last look that found it in flight
     ///   (its registration if there was none). An upper bound: the completion happened somewhere
-    ///   after that look, and these are polled blind (every 16 to 100 us), so it is at most a window.
+    ///   after that look, and these are polled blind, so while a worker visits the source it is at most the blind-poll window
+    ///   (16 to 100 us); with no visit it is the time since the last one.
     pub fn lateness_us(&self) -> (u64, u64, u64) {
         let h = self.lateness.snapshot();
         let up = |us: f64| us.ceil() as u64;
@@ -1787,14 +1788,16 @@ mod tests {
     #[test]
     fn lateness_of_a_timer_counts_from_its_deadline_not_its_registration() {
         let completions = bare();
-        let deadline = Instant::now() + Duration::from_millis(5);
+        let before = Instant::now();
+        let deadline = before + Duration::from_millis(5);
         register_aged(&completions, Waits::At(deadline, tagged(1)), LONG_WAIT);
         std::thread::sleep(Duration::from_millis(25));
         assert_eq!(poll(&completions), [1]);
+        let after = Instant::now();
         let (_, _, max) = completions.lateness_us();
         assert!(max >= 20_000, "found 20 ms after its deadline: {max}");
         assert!(
-            max < LONG_WAIT.as_micros() as u64 / 2,
+            max <= (after - before).as_micros() as u64 + 1,
             "not the wait: {max}"
         );
     }
@@ -1809,13 +1812,15 @@ mod tests {
             Waits::Retired(cell.clone(), tagged(2)),
             LONG_WAIT,
         );
+        let before = Instant::now();
         cell.arrive(0);
         std::thread::sleep(Duration::from_millis(20));
         assert_eq!(poll(&completions), [2]);
+        let after = Instant::now();
         let (_, _, max) = completions.lateness_us();
         assert!(max >= 20_000, "found 20 ms after the ring: {max}");
         assert!(
-            max < LONG_WAIT.as_micros() as u64 / 2,
+            max <= (after - before).as_micros() as u64 + 1,
             "not the wait: {max}"
         );
     }
@@ -1829,13 +1834,16 @@ mod tests {
             Waits::Retired(cell.clone(), tagged(3)),
             LONG_WAIT,
         );
+        let before = Instant::now();
         cell.arrive(0);
         std::thread::sleep(Duration::from_millis(20));
         assert_eq!(poll(&completions), [3]);
+        let after = Instant::now();
         let (_, _, max) = completions.lateness_us();
+        assert!(max >= 20_000, "found 20 ms after the arrival: {max}");
         assert!(
-            max >= 20_000 && max < LONG_WAIT.as_micros() as u64 / 2,
-            "{max}"
+            max <= (after - before).as_micros() as u64 + 1,
+            "not the wait: {max}"
         );
     }
 
