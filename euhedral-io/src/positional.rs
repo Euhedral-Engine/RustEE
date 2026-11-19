@@ -55,6 +55,9 @@ pub(super) struct Positional {
     /// How many `poll(2)` readiness calls the visits made (tests).
     #[cfg(test)]
     pub(super) readiness_calls: std::sync::atomic::AtomicUsize,
+    /// The descriptors the last readiness call was given.
+    #[cfg(test)]
+    pub(super) entries: std::sync::atomic::AtomicUsize,
     /// How many attempts (steps) the visits made (tests).
     #[cfg(test)]
     pub(super) attempts: std::sync::atomic::AtomicUsize,
@@ -67,8 +70,9 @@ struct State {
     active: VecDeque<Op>,
     /// The descriptors the waiting operations ask about, reused by every visit.
     fds: Vec<libc::pollfd>,
-    /// The index in `active` of the operation each of `fds` is for.
-    slots: Vec<usize>,
+    /// Each waiting operation as (descriptor, events, index in `active`), sorted by descriptor so that `fds` holds
+    /// one entry per distinct descriptor.
+    slots: Vec<(RawFd, i16, usize)>,
 }
 
 enum Message {
@@ -167,9 +171,6 @@ struct Op {
     /// A read or write that found its descriptor is not seekable (a pipe, a terminal): it goes on as a stream,
     /// waiting for readiness and calling `read` and `write`.
     stream: bool,
-    /// The descriptor's flags as the operation first saw them, for the calls that make it non-blocking around
-    /// themselves.
-    flags: Option<i32>,
     /// This visit: the operation asked `poll(2)` about its descriptor, and what it answered.
     waiting: bool,
     ready: bool,
@@ -206,33 +207,38 @@ fn counted(n: isize) -> Result<usize, io::Error> {
     }
 }
 
-/// Runs `call` with `fd` non-blocking, and puts the descriptor's flags back right after, on every path. `cached`
-/// holds the flags as first seen. The flags belong to the open file description, so another holder of it (a
-/// listener shared with a blocking accepter) may see `EAGAIN` during the call.
-fn nonblocking<T>(fd: RawFd, cached: &mut Option<i32>, call: impl FnOnce() -> T) -> io::Result<T> {
-    let flags = match *cached {
-        Some(flags) => flags,
-        None => {
-            // SAFETY: a plain `fcntl` of the caller's descriptor.
-            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-            if flags < 0 {
-                return Err(last_error());
-            }
-            *cached = Some(flags);
-            flags
-        }
-    };
-    if flags & libc::O_NONBLOCK != 0 {
-        return Ok(call());
+/// The most a write to a blocking stream moves in one call: `poll(2)` promises that much room on a pipe.
+const PIPE_BUF: usize = libc::PIPE_BUF;
+
+/// The descriptor's flags, read fresh: they belong to the open file description, so another holder may change them
+/// at any time and nothing is cached.
+fn flags_of(fd: RawFd) -> io::Result<i32> {
+    // SAFETY: a plain `fcntl` of the caller's descriptor.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        Err(last_error())
+    } else {
+        Ok(flags)
     }
-    // SAFETY: as above.
+}
+
+/// Runs `call` (a system call that returns a count or a negative number) with `fd` non-blocking, and puts the
+/// flags back right after, on every path. The flags are read just before the call. The error number is taken
+/// before the flags are put back. The flags belong to the open file description, so another holder of it (a
+/// listener shared with a blocking accepter) may see `EAGAIN` during the call.
+fn nonblocking(fd: RawFd, call: impl FnOnce() -> isize) -> io::Result<usize> {
+    let flags = flags_of(fd)?;
+    if flags & libc::O_NONBLOCK != 0 {
+        return counted(call());
+    }
+    // SAFETY: as in `flags_of`.
     if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
         return Err(last_error());
     }
-    let result = call();
+    let result = counted(call());
     // SAFETY: as above.
     unsafe { libc::fcntl(fd, libc::F_SETFL, flags) };
-    Ok(result)
+    result
 }
 
 impl Op {
@@ -273,18 +279,13 @@ impl Op {
                 let n = if self.stream {
                     // SAFETY: `rest` is a live, writable region of at least `len` bytes, and nothing else
                     // touches it while the operation is here.
-                    match nonblocking(*fd, &mut self.flags, || unsafe {
-                        libc::read(*fd, ptr, len)
-                    }) {
-                        Ok(n) => n,
-                        Err(error) => return Step::Done(Err(error)),
-                    }
+                    nonblocking(*fd, || unsafe { libc::read(*fd, ptr, len) })
                 } else {
                     let at = offset.wrapping_add(self.moved as u64) as libc::off_t;
                     // SAFETY: as above.
-                    unsafe { libc::pread(*fd, ptr, len, at) }
+                    counted(unsafe { libc::pread(*fd, ptr, len, at) })
                 };
-                match counted(n) {
+                match n {
                     Err(error) if error.raw_os_error() == Some(libc::ESPIPE) => {
                         self.stream = true;
                         Step::Idle
@@ -310,22 +311,27 @@ impl Op {
             }
             Kind::Write { fd, offset } => {
                 let rest = &self.buf.bytes()[self.moved..self.buf.filled()];
-                let len = rest.len().min(piece);
+                let mut len = rest.len().min(piece);
                 let ptr = rest.as_ptr().cast();
                 let n = if self.stream {
-                    // SAFETY: `rest` is a live, readable region of at least `len` bytes.
-                    match nonblocking(*fd, &mut self.flags, || unsafe {
-                        libc::write(*fd, ptr, len)
-                    }) {
-                        Ok(n) => n,
-                        Err(error) => return Step::Done(Err(error)),
+                    // The flag is never toggled for a write (the descriptor may be a shared stdout): a blocking
+                    // descriptor gets at most what `poll(2)` promised room for, a non-blocking one the whole piece.
+                    match flags_of(*fd) {
+                        Ok(flags) => {
+                            if flags & libc::O_NONBLOCK == 0 {
+                                len = len.min(PIPE_BUF);
+                            }
+                            // SAFETY: `rest` is a live, readable region of at least `len` bytes.
+                            counted(unsafe { libc::write(*fd, ptr, len) })
+                        }
+                        Err(error) => Err(error),
                     }
                 } else {
                     let at = offset.wrapping_add(self.moved as u64) as libc::off_t;
-                    // SAFETY: as above.
-                    unsafe { libc::pwrite(*fd, ptr, len, at) }
+                    // SAFETY: `rest` is a live, readable region of at least `len` bytes.
+                    counted(unsafe { libc::pwrite(*fd, ptr, len, at) })
                 };
-                match counted(n) {
+                match n {
                     Err(error) if error.raw_os_error() == Some(libc::ESPIPE) => {
                         self.stream = true;
                         Step::Idle
@@ -388,18 +394,15 @@ impl Op {
             }
             Kind::Accept { fd } => {
                 // SAFETY: null address buffers are allowed; the call reads no memory of ours.
-                let accepted = match nonblocking(*fd, &mut self.flags, || unsafe {
+                let accepted = nonblocking(*fd, || unsafe {
                     libc::accept4(
                         *fd,
                         std::ptr::null_mut(),
                         std::ptr::null_mut(),
                         libc::SOCK_CLOEXEC,
-                    )
-                }) {
-                    Ok(accepted) => accepted,
-                    Err(error) => return Step::Done(Err(error)),
-                };
-                match counted(accepted as isize) {
+                    ) as isize
+                });
+                match accepted {
                     Err(error) if would_block(&error) || interrupted(&error) => Step::Idle,
                     Err(error) => Step::Done(Err(error)),
                     Ok(fd) => Step::Done(Ok(fd)),
@@ -647,6 +650,8 @@ impl Positional {
             #[cfg(test)]
             readiness_calls: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
+            entries: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
             attempts: std::sync::atomic::AtomicUsize::new(0),
         }
     }
@@ -677,7 +682,6 @@ impl Engine for Positional {
             limit: limit.and_then(|limit| Instant::now().checked_add(limit)),
             cancelled: false,
             stream: false,
-            flags: None,
             waiting: false,
             ready: false,
         })));
@@ -717,26 +721,42 @@ impl Engine for Positional {
             op.waiting = false;
             if let Some((fd, events)) = op.waits_for(now) {
                 op.waiting = true;
-                fds.push(libc::pollfd {
+                slots.push((fd, events, at));
+            }
+        }
+        // One entry per distinct descriptor, with the events of every operation on it merged: the count can never
+        // pass the descriptor limit, which `poll(2)` refuses.
+        slots.sort_unstable_by_key(|&(fd, _, _)| fd);
+        for &(fd, events, _) in slots.iter() {
+            match fds.last_mut() {
+                Some(last) if last.fd == fd => last.events |= events,
+                _ => fds.push(libc::pollfd {
                     fd,
                     events,
                     revents: 0,
-                });
-                slots.push(at);
+                }),
             }
         }
         if !fds.is_empty() {
             #[cfg(test)]
-            self.readiness_calls.fetch_add(1, Ordering::Relaxed);
+            {
+                self.readiness_calls.fetch_add(1, Ordering::Relaxed);
+                self.entries.store(fds.len(), Ordering::Relaxed);
+            }
             // SAFETY: `fds` is a valid array of `fds.len()` `pollfd`s; a zero timeout never waits.
             let found = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 0) };
             if found > 0 {
-                for (pollfd, &at) in fds.iter().zip(slots.iter()) {
-                    active[at].ready = pollfd.revents != 0;
+                let mut entry = 0;
+                for &(fd, events, at) in slots.iter() {
+                    while fds[entry].fd != fd {
+                        entry += 1;
+                    }
+                    let wanted = events | libc::POLLERR | libc::POLLHUP | libc::POLLNVAL;
+                    active[at].ready = fds[entry].revents & wanted != 0;
                 }
             } else if found < 0 && !interrupted(&last_error()) {
                 // The call itself failed: let each operation's own call say what is wrong.
-                for &at in slots.iter() {
+                for &(_, _, at) in slots.iter() {
                     active[at].ready = true;
                 }
             }

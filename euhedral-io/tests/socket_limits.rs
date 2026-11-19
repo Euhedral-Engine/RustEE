@@ -398,21 +398,15 @@ fn a_cancel_that_comes_after_the_completion_delivers_the_real_result_once_on(
             io_then(&out),
         )
         .unwrap();
-    io.cancel(id);
-    drive(&io, || out.len() == 1);
-    let result = only(&out).0;
+    // On io_uring the kernel completed the receive during the submission, so this cancel comes after it. The
+    // fallback ends the receive at its first visit: reap first, then cancel.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     if io.backend() == euhedral_io::IoBackend::Positional {
-        // Nothing has run before the first visit, so the cancel may come first: then it is the result.
-        match result {
-            Ok(n) => assert_eq!(n, 4),
-            Err(error) => assert!(Cancelled::is(&error), "{error}"),
-        }
-    } else {
-        assert_eq!(result.unwrap(), 4);
+        drive(&io, || out.len() == 1);
     }
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    assert_eq!(result.unwrap(), 4);
+    io.cancel(id);
+    drive(&io, || out.len() == 1);
+    assert_eq!(only(&out).0.unwrap(), 4);
     for _ in 0..100 {
         step(&io);
     }

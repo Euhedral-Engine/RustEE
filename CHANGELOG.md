@@ -15,11 +15,24 @@ semantics and the tests that pin it.
 - The fallback is chosen when the first ring's setup, or a probe of it (a no-op entered without waiting), fails with `EPERM`, `EACCES` or `ENOSYS`. Any other error fails the open as before; so does `ENOMEM` from the memlock limit on kernels before 5.12.
 - It owns no thread and waits for nothing. A submission queues the operation; the reap frame walks the line once per visit, makes one `poll(2)` call with a zero timeout over the descriptors operations wait for, and attempts only the ready ones plus the operations that wait for no descriptor (files, open, rename, length), at most 64 attempts a visit, every attempt counted. A reap with 500 idle receives costs one readiness call and no receive attempt (before: 64 `recvfrom` per reap, 64,000 in two reaps). It hands the ended ones on in the order they ended. One reap runs at a time, so its file calls run one after another on the reaping worker.
 - A read or write on a pipe, tty or character device (`ESPIPE`) goes on as a stream (readiness, then `read` or `write`). A path open uses `O_NONBLOCK` and clears it on the result, so a FIFO open never holds the worker; `ENXIO` on a write open is retried at later visits, so a limit or cancel reaches it. An accept on a blocking listener sets `O_NONBLOCK` only around `accept4` and restores it on every path (a listener shared with another blocking accepter may see `EAGAIN` in that window).
+- The descriptor's flags are read before every call and never cached. A stream write never toggles `O_NONBLOCK`: on a blocking descriptor it moves at most `PIPE_BUF` after `POLLOUT`, on a non-blocking one the whole piece. The readiness call gets one entry per distinct descriptor with the events of its operations merged, so its size never passes the descriptor limit.
 - Every operation of the io_uring engine is offered: reads (into a `Vec` or caller memory), writes, sends, receives, accept, connect, datagrams, `open_path`, `open_file`, `rename`, `file_len`, time limits and `cancel`. Short reads and writes go on with the rest; a read that finds no bytes is `UnexpectedEof`; a write that moves nothing is `WriteZero`; a limit or cancel is looked at before each step. A connect makes a blocking socket non-blocking for its handshake and restores its flags when it ends or when the `AsyncIo` is dropped.
 - Dropping an `AsyncIo` with operations in flight frees their buffers and runs no continuation (the io_uring engine leaks them, as the kernel may still write them).
 - The io_uring engine and the Windows engines are unchanged.
 
 **Tests.** The file and socket tests of the engine module run once on io_uring and once on the positional engine (`on_io_uring`, `on_positional`); the short read, write and send tests and the send that a closed peer stops run on both. `linux.rs`: a setup refused with `EPERM`, `EACCES` or `ENOSYS` selects the fallback and `backend()` reports it, any other error fails the open, the option forces it without trying io_uring (these fail on the old code, which has neither the fallback nor the accessor). Fallback only: a refused read, a cancel and a limit of an idle receive, drop with operations in flight, and a connect that restores a blocking socket's flags.
+
+## A lake dropped by a frame takes its lifecycle lock off the hot scope (`euhedral-graph`) (2026-11-19)
+
+**What.** `Drop for Lake` suspends the hot scopes of its thread before it takes the attached-set lock, as `complete` and `detach` do.
+
+**Why.** The last `Arc<Lake>` can be held by a frame or by its `UnitGuard` and dropped on a lattice worker inside the hot scope. In a debug build that tripped the lifecycle-lock check and aborted the process, now and then at the end of a run. Release builds were not affected.
+
+**How to use.** Nothing to change: a frame may own the last reference to a lake.
+
+**Semantics.** Only the debug check changes; the drop still takes the set, clears the registry cell and lets the set finish.
+
+**Tests.** `tests/lake_drop_cold.rs`: `the_last_reference_to_a_lake_dropped_by_a_frame_takes_no_lock_inside_the_hot_scope` (reports a violation at the drop's lock on the old code; own binary because the hook is process-wide).
 
 ## A replay on a lane that fails after its launch keeps the recording's values in the caller's hold (`euhedral-gpu`) (2026-11-19)
 

@@ -142,7 +142,7 @@ assert_eq!(io.backend(), IoBackend::Positional);
   blocking listener sets `O_NONBLOCK` only around the `accept4` call and restores the flags on every path; a
   listener that another blocking accepter shares may see `EAGAIN` in that window.
 - **The probe.** At open the engine also enters a ring with a no-op, without waiting. A system that allows
-  `io_uring_setup` but refuses `io_uring_enter` (or a needed register call) with `EPERM`, `EACCES` or `ENOSYS`
+  `io_uring_setup` but refuses `io_uring_enter` with `EPERM`, `EACCES` or `ENOSYS`
   gets the fallback too. On kernels before 5.12 a ring is charged to the memlock limit, and a refusal with `ENOMEM`
   there still fails the open: it is not a permission refusal.
 - **Dropping** an `AsyncIo` with operations in flight frees their buffers and runs no continuation: nothing

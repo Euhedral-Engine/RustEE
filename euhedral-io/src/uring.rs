@@ -2634,6 +2634,76 @@ mod tests {
         assert_eq!(counts(&io).1, 64);
     }
 
+    /// Two operations on one descriptor are one entry of the readiness call, and both are told.
+    #[test]
+    fn a_receive_and_a_send_on_one_descriptor_share_one_readiness_entry() {
+        let io = positional();
+        let (ours, mut theirs) = socket_pair(4096);
+        io.recv(ours.as_raw_fd(), buf(8), then(1)).unwrap();
+        io.send(
+            ours.as_raw_fd(),
+            IoBuf {
+                filled: 3,
+                bytes: vec![7; 3],
+            },
+            then(2),
+        )
+        .unwrap();
+        theirs.write_all(b"hi").unwrap();
+        let engine = positional_of(&io);
+        let done = poll(&io, 2);
+        assert_eq!(done.len(), 2);
+        assert!(
+            done.iter()
+                .all(|(_, d)| d.done.as_ref().unwrap().result.is_ok())
+        );
+        assert_eq!(
+            engine.entries.load(Ordering::Relaxed),
+            1,
+            "one pollfd for the two operations"
+        );
+    }
+
+    /// A write to a blocking pipe moves at most `PIPE_BUF` per attempt, never toggles the flag, and the reap
+    /// returns however full the pipe is.
+    #[test]
+    fn a_stream_write_to_a_blocking_pipe_moves_at_most_pipe_buf_an_attempt() {
+        let io = positional();
+        let mut ends = [0; 2];
+        // SAFETY: `pipe2` fills the two descriptors of the array.
+        let made = unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) };
+        assert_eq!(made, 0);
+        // SAFETY: both descriptors were just made and nothing else owns them.
+        let (read_end, write_end) =
+            unsafe { (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) };
+        let flags = fd_flags(write_end.as_raw_fd());
+        assert_eq!(flags & libc::O_NONBLOCK, 0);
+        let total = 1 << 20;
+        io.write(
+            write_end.as_raw_fd(),
+            0,
+            IoBuf {
+                filled: total,
+                bytes: vec![5; total],
+            },
+            then(1),
+        )
+        .unwrap();
+        for _ in 0..200 {
+            io.reap();
+        }
+        let mut queued: libc::c_int = 0;
+        // SAFETY: FIONREAD writes one int.
+        let asked = unsafe { libc::ioctl(read_end.as_raw_fd(), libc::FIONREAD, &raw mut queued) };
+        assert_eq!(asked, 0);
+        let (_, attempts) = counts(&io);
+        assert!(queued > 0 && (queued as usize) < total);
+        // The first attempt is the positional write that finds the pipe is a stream; each later one wrote one piece.
+        assert_eq!(attempts, 1 + queued as usize / libc::PIPE_BUF);
+        assert_eq!(fd_flags(write_end.as_raw_fd()), flags);
+        assert_eq!(io.pending(), 1);
+    }
+
     /// A pipe is not seekable: a read and a write on it go on as a stream, on either engine.
     fn a_pipe_carries_a_write_and_a_read(io: Arc<AsyncIo>) {
         let mut ends = [0; 2];
