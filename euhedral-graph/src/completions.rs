@@ -112,8 +112,8 @@ pub trait Pending: Send {
 /// nothing (it runs no application code of its own), and a completed source pushes no poll frame.
 pub struct Completions {
     /// The lanes polled for markers, held weakly: the pool's owner decides where the lanes are destroyed, and the
-    /// source never keeps them alive (a scan holds an upgrade only while it queries one marker entry, and releases it before it
-    /// emits a frame). A marker counts as reached when its lane says so, also after the source has
+    /// source never keeps them alive for a frame it has emitted (a scan holds an upgrade only for one marker entry's
+    /// query, and releases it before it emits a frame). A marker counts as reached when its lane says so, also after the source has
     /// completed. Once the pool is gone no marker is reached any more (see [`Completions::new`]). `None` for a
     /// source built [`without_lanes`](Self::without_lanes): it takes no markers, and none is ever reached.
     lanes: Option<Weak<LanePool>>,
@@ -963,7 +963,9 @@ impl Completions {
         while index < lists.waiting.len() {
             // Upgraded at a marker entry only and kept for that entry alone (never across entries), so a scan with no
             // marker never holds the pool, and none holds it while application code runs for another entry or while a
-            // frame it emitted may run. The inner `None` is a pool that is gone: no marker can be observed then.
+            // frame it emitted may run. It is held for the marker's own query (backend code), so the pool's last
+            // reference can still drop on the polling thread there. The inner `None` is a pool that is gone: no marker
+            // can be observed then.
             let mut pool: Option<Option<Arc<LanePool>>> = None;
             let entry = &mut lists.waiting[index];
             let cancelled = entry.what.cancelled_in_chain();
@@ -3501,7 +3503,7 @@ mod tests {
     /// A scan emits a frame while it goes on querying later entries (application code), and another worker may run
     /// that frame meanwhile: the scan holds no upgrade of the lane pool at that point.
     #[test]
-    fn a_scan_holds_no_lane_pool_while_a_frame_it_emitted_may_run() {
+    fn a_scan_holds_no_lane_pool_while_a_later_entrys_application_code_runs() {
         const UNSEEN: usize = usize::MAX;
         let (completions, rig) = setup();
         let seen = Arc::new(AtomicUsize::new(UNSEEN));
@@ -3531,7 +3533,8 @@ mod tests {
             // The scan is inside the second entry's query: the first entry's frame was emitted before it.
             completions.pull(&mut |frame| frame.do_finally(), &mut |_| false, 1);
             let ran_with = seen.load(Ordering::Acquire);
-            let _ = go_tx.send(());
+            // Moved into this closure, so a failed assertion above drops it and the scan's wait ends at once.
+            drop(go_tx);
             scan.join().unwrap();
             assert_ne!(ran_with, UNSEEN, "the emitted frame ran during the scan");
             assert_eq!(ran_with, 1, "only the owner holds the pool");

@@ -743,13 +743,15 @@ impl std::error::Error for GraphError {}
 ///   successor (a fetch → parse chain).
 ///
 /// - **Lanes at drop.** The graph and its runs let go of their references to the runtime's lane pool before they drop
-///   their stages, and so does the [`Completions`] source for the frames it emits for the graph: it holds no upgrade of
-///   the pool, and none of the operations it was given for a stage (a marker-and-host wait, a retry wake-up), once it
-///   offers the frame that follows them. So when the last of the graph handle and its runs is gone, the stages' own state
-///   (dropped no earlier than that: a caller's clone of a stage's `Arc` outlives the graph) is dropped while neither the
-///   graph, nor its runs, nor that source hold the pool. An owner may take the drop of a token a stage holds to mean
-///   the graph holds no lane. Limits: a [`GraphRuntime`] clone someone else holds keeps the pool; a stage's host
-///   completion, and any other operation the application registered, is the application's own; and
+///   their stages, and the [`Completions`] source, once it has offered a graph's frames, holds nothing for them: not an
+///   upgrade of the pool and not the operations it was given for a stage (a marker-and-host wait, a retry wake-up). So
+///   when the last of the graph handle and its runs is gone, the stages' own state (dropped no earlier than that: a
+///   caller's clone of a stage's `Arc` outlives the graph) is dropped while the graph and its runs hold none of the
+///   runtime's lanes for it. An owner may take the drop of a token a stage holds to mean that. Limits: the source may
+///   still upgrade the pool briefly, for one marker query (backend code), while it scans any marker entry of any graph
+///   sharing it, so the pool's last reference can drop on a polling worker: a lane teardown must be safe there, or the
+///   owner must complete the `Completions` first. A [`GraphRuntime`] clone someone else holds keeps the pool; a stage's
+///   host completion, and any other operation the application registered, is the application's own; and
 ///   [`Completions::pending`] is no signal (it drops when a frame is handed out, which can be before the frame ends).
 pub struct StageGraph<Q, L: DeviceQueue + ?Sized = dyn DeviceQueue> {
     core: Arc<Core<Q, L>>,
