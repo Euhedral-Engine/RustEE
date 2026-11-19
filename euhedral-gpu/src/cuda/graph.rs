@@ -18,7 +18,7 @@ use super::enqueue::{Dest, Mode, Node, Recording, Target};
 use super::fns::{
     CAPTURE_MODE_RELAXED, CuGraph, CuGraphExec, ExecUpdateResultInfo, KernelNodeParams,
 };
-use super::stream::Fork;
+use super::stream::{Fork, strand_fork};
 use super::{CudaEnqueue, CudaGpu, CudaKernel, CudaQueue, CudaStream, from_cuda};
 
 /// `CU_EVENT_DISABLE_TIMING`.
@@ -285,13 +285,18 @@ impl Graph for CudaGraph {
         // Once the launch succeeded the graph is queued and reads the recording's buffers whatever fails after it, and
         // only a fault poisons the device, so later work may run and free them: the hold takes them now. The lane keeps
         // nothing: the caller holds the recording's buffers until the work ended.
-        if launched.is_ok() {
+        let queued = launched.is_ok();
+        if queued {
             hold.add_frozen(&self.kept);
         }
         let joined = launched.and_then(|()| {
             #[cfg(feature = "test-hooks")]
             if std::mem::take(&mut self.fail_join) {
-                return Err(GpuError::Capture("join failed by the test hook".into()));
+                return Err(GpuError::Call {
+                    call: "cuEventRecord",
+                    code: 1,
+                    name: "failed by the test hook".into(),
+                });
             }
             // SAFETY: events and streams of this device; the private stream is this thread's alone; the context is
             // current.
@@ -304,7 +309,13 @@ impl Graph for CudaGraph {
                 )
             }
         });
-        lane.give_fork(fork);
+        // Past the launch, the graph is queued on the private stream and the lane may not wait for it: nothing the caller can wait on
+        // covers it, and it must never see its buffers freed. The device becomes unrecoverable and the values stay
+        // alive forever (see `strand_fork`).
+        match &joined {
+            Err(e) if queued => strand_fork(&self.gpu, fork, e, self.kept.clone()),
+            _ => lane.give_fork(fork),
+        }
         joined?;
         Ok(())
     }

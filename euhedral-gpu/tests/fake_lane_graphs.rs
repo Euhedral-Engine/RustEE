@@ -548,7 +548,13 @@ fn a_replay_that_fails_after_its_work_was_queued_keeps_the_recordings_values_in_
     graph.fail_next_join();
     let result = graph.replay_on(&lane, &[], &mut hold);
     assert!(
-        matches!(result, Err(GpuError::Capture(_))),
+        matches!(
+            result,
+            Err(GpuError::Call {
+                call: "cuEventRecord",
+                ..
+            })
+        ),
         "{:?}",
         result.map(|_| ())
     );

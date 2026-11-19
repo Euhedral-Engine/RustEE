@@ -682,6 +682,12 @@ pub trait Graph: Send + fmt::Debug + 'static {
     ///
     /// The values the recording keeps are not given to the lane, which keeps none: a handle to them is added to `hold`,
     /// and the caller holds it until the work ended (in its quantum, released in `Stage::retired`).
+    ///
+    /// An `Err` before the launch queued nothing, and `hold` is as it was. An `Err` after the launch (the join back
+    /// into the lane failed) leaves the graph queued on the private stream, which no marker the caller can wait on
+    /// covers, so the caller cannot know when the work ended. The backend does not try to wait: on CUDA the device is
+    /// marked unrecoverable (later work is refused), the private stream is never reused, and the values `hold` took are
+    /// kept alive forever (leaked on purpose). `hold` may be released as usual; it frees nothing it took for that work.
     fn replay_on(
         &mut self,
         lane: &<<Self::Gpu as Gpu>::Stream as Stream>::Lane,

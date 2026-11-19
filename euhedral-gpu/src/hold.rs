@@ -83,6 +83,15 @@ impl GraphHold {
         self.direct.push(Held(value));
     }
 
+    /// Forgets what the hold keeps alive, so that it is never dropped: for work that may still read it and that nothing
+    /// can wait for (a join that failed with work queued; the device is unrecoverable then).
+    #[cfg(feature = "cuda")]
+    pub(crate) fn leak(&mut self) {
+        std::mem::forget(std::mem::take(&mut self.first));
+        std::mem::forget(std::mem::take(&mut self.more));
+        std::mem::forget(std::mem::take(&mut self.direct));
+    }
+
     /// Drops what the hold keeps alive. The device work it covers must have ended.
     pub fn release(&mut self) {
         self.first = None;

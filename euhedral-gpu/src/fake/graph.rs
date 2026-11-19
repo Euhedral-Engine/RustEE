@@ -80,7 +80,11 @@ impl Graph for FakeGraph {
         hold.add_frozen(&self.kept);
         #[cfg(feature = "test-hooks")]
         if std::mem::take(&mut self.fail_join) {
-            return Err(GpuError::Capture("join failed by the test hook".into()));
+            return Err(GpuError::Call {
+                call: "cuEventRecord",
+                code: 1,
+                name: "failed by the test hook".into(),
+            });
         }
         Ok(())
     }

@@ -20,8 +20,8 @@ use euhedral_core::generics::{FrameSink, LatticeSource};
 use euhedral_data_structures::queues::{Consumer, MpmcQueue, Multi, Producer};
 use euhedral_gpu::cuda::{CudaGpu, CudaKernel, CudaQueue};
 use euhedral_gpu::{
-    Args, Enqueue, Gpu, GpuError, Graph, GraphBody, GraphHold, Lane, LaneEnqueue, Launch, Module,
-    Ran, Sequence, SharedGraphCache, SharedLanes, StreamOptions, open_shared_lanes,
+    Args, Enqueue, Gpu, GpuError, Graph, GraphBody, GraphHold, Lane, LaneEnqueue, LaneStream,
+    Launch, Module, Ran, Sequence, SharedGraphCache, SharedLanes, StreamOptions, open_shared_lanes,
 };
 use euhedral_graph::{
     Completions, DEFAULT_RETRY_BACKSTOP, EdgeKind, GraphRuntime, LaneId, QuantumOutcome, Stage,
@@ -679,7 +679,13 @@ fn a_replay_that_fails_after_its_launch_keeps_the_recordings_values_in_the_hold(
     graph.fail_next_join();
     let result = graph.replay_on(&lane, &[], &mut hold);
     assert!(
-        matches!(result, Err(GpuError::Capture(_))),
+        matches!(
+            result,
+            Err(GpuError::Call {
+                call: "cuEventRecord",
+                ..
+            })
+        ),
         "{:?}",
         result.map(|_| ())
     );
@@ -687,36 +693,58 @@ fn a_replay_that_fails_after_its_launch_keeps_the_recordings_values_in_the_hold(
         !hold.is_empty(),
         "the graph was launched: the hold keeps what it reads"
     );
-    // The failed replay's work is on the graph's private stream, which the lane did not join: a second replay, which
-    // forks from the lane onto the same stream and joins it back, orders the lane behind both.
-    let mut second = GraphHold::new();
-    graph.replay_on(&lane, &[], &mut second).unwrap();
+    // The graph sits on the private stream, which the lane did not join: no marker covers it, so the device is
+    // unrecoverable and the values are never freed.
+    assert!(gpu.poisoned().is_some(), "the device is unrecoverable");
+    assert_eq!(lane.forks_made(), 1);
+    assert!(
+        graph.replay_on(&lane, &[], &mut GraphHold::new()).is_err(),
+        "later work is refused"
+    );
     drop(graph);
-    assert_eq!(
-        Arc::strong_count(&token),
-        2,
-        "the holds alone keep the value now"
-    );
-    settle();
-    let host = pinned.word();
-    let (_, marker) = lane
-        .submit_marked(|q| {
-            // SAFETY: the pinned block holds the word; the device word is live.
-            unsafe { q.copy_to_host(host.bytes(), block.addr, 4) }
-        })
-        .unwrap();
-    assert!(wait_until(Duration::from_secs(10), || lanes
-        .queues
-        .reached(marker)));
-    // SAFETY: the copy ended.
-    let seen = unsafe { (host.bytes() as *const u32).read_volatile() };
-    assert_eq!(seen, 3, "the recording and both replays ran");
-    drop(second);
-    assert_eq!(
-        Arc::strong_count(&token),
-        2,
-        "the first hold still keeps it"
-    );
     hold.release();
-    assert_eq!(Arc::strong_count(&token), 1);
+    // The lane's own work still ends (a marker is refused on a poisoned device, so give the device time instead).
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        Arc::strong_count(&token),
+        2,
+        "the leaked handle keeps the value alive: it never falls to the test's own"
+    );
+    drop(pinned);
+}
+
+/// A library's private stream joined back into the lane fails after work was queued on it: the lane never waited for
+/// that work, so the device is unrecoverable and the stream is never given back, in `submit` as in `submit_held`.
+#[test]
+fn a_failed_join_of_a_lent_private_stream_makes_the_device_unrecoverable() {
+    let Some(gpu) = gpu() else { return };
+    let lanes = lanes(&gpu, 1);
+    let lane = lanes.pool.lane(LaneId(0)).clone();
+    // A join that succeeds gives the stream back and leaves the device usable.
+    lane.submit(|q| {
+        assert!(q.raw_stream().is_some());
+        Ok(())
+    })
+    .unwrap();
+    assert!(gpu.poisoned().is_none());
+    assert_eq!(lane.forks_made(), 1);
+
+    lane.fail_next_join();
+    let result = lane.submit(|q| {
+        assert!(q.raw_stream().is_some());
+        Ok(())
+    });
+    assert!(
+        matches!(
+            result,
+            Err(GpuError::Call {
+                call: "cuEventRecord",
+                ..
+            })
+        ),
+        "{:?}",
+        result.map(|_| ())
+    );
+    assert!(gpu.poisoned().is_some(), "the device is unrecoverable");
+    assert!(lane.submit(|_| Ok(())).is_err(), "later work is refused");
 }

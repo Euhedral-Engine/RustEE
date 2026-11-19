@@ -5,17 +5,18 @@ semantics and the tests that pin it.
 
 ## A replay on a lane that fails after its launch keeps the recording's values in the caller's hold (`euhedral-gpu`) (2026-11-19)
 
-**What.** `Graph::replay_on` on the CUDA backend adds the recording's kept values to the caller's `GraphHold` as soon as the graph launch succeeded, before it records the join event and makes the lane wait for it. A failure of either of those two calls still returns its error, and the hold now keeps the values.
+**What.** `Graph::replay_on` on the CUDA backend adds the recording's kept values to the caller's `GraphHold` as soon as the graph launch succeeded. If the join back into the lane then fails (the join event's record, or the lane's wait for it), the device is marked unrecoverable and the private stream and the recording's values are leaked on purpose. The same holds when `LaneFork::finish` fails to join a private stream lent for library work in `submit`, `submit_held` and `submit_marked` (`submit_held` also leaks what its hold took).
 
-**Why.** The hold took the values only after the whole launch closure succeeded. When `cuGraphLaunch` succeeded and the join record or the wait then failed, the graph was queued and the hold kept nothing; only a fault poisons the device, so later work could run and free buffers the queued graph still read.
+**Why.** The hold took the values only after the whole launch closure succeeded, so a failed join left the graph queued with the hold empty. Filling the hold first was not enough: the queued work sits on the private stream, which the lane never joined, so no marker the caller can wait on covers it; the stage's retirement concluded at once and dropped the hold while the graph could still read the buffers. Only a fault poisoned the device, so later work could run too. Nothing can wait here (no stream synchronize), so the values are never freed.
 
-**Migration.** None. An error before the launch (the fork record or wait, a marker wait, the launch itself) leaves the hold as it was, as before. After an `Err` from `replay_on` the caller must release the hold only once the device work ended, as after an `Ok`, if the hold is not empty.
+**Migration.** None for a healthy driver. An `Err` from `replay_on` before the launch leaves the hold as it was and the device usable. An `Err` after the launch means the device is unrecoverable (`Gpu::poisoned()` reports the cause) and the hold's values are kept forever: the caller cannot observe that the work ended, and need not try; releasing the hold frees nothing it took for that work.
 
 **Semantics.**
-- The fake backend's `replay_on` queues the work and then fills the hold with nothing fallible between them, so it needed no change.
-- Feature `test-hooks`: `CudaGraph::fail_next_join` and `FakeGraph::fail_next_join` make the next `replay_on` fail after the launch (the work queued), once.
+- One helper (`strand_fork`) does it for every join failure after work was queued: records the cause with `note_unrecoverable`, forgets the fork and forgets a clone of the values the work reads.
+- The fake backend's `replay_on` queues the work and then fills the hold with nothing fallible between them, so it needed no change; it has no private stream.
+- Feature `test-hooks`: `CudaGraph::fail_next_join`, `FakeGraph::fail_next_join` (the next `replay_on` fails after the launch with `Call { call: "cuEventRecord", .. }`) and `CudaQueue::fail_next_join` (the next join of a lent private stream fails). One shot.
 
-**Tests.** `cuda_lane_graphs.rs`: `a_replay_that_fails_after_its_launch_keeps_the_recordings_values_in_the_hold` (fails on the old code at the assertion that the hold is not empty); `fake_lane_graphs.rs`: `a_replay_that_fails_after_its_work_was_queued_keeps_the_recordings_values_in_the_hold` (pins the fake's order).
+**Tests.** `cuda_lane_graphs.rs`: `a_replay_that_fails_after_its_launch_keeps_the_recordings_values_in_the_hold` and `a_failed_join_of_a_lent_private_stream_makes_the_device_unrecoverable` (both fail on the old code by assertion); `fake_lane_graphs.rs`: `a_replay_that_fails_after_its_work_was_queued_keeps_the_recordings_values_in_the_hold` (pins the fake's order).
 
 ## A killed quantum quiesces only behind its ordered stages' device work (`euhedral-graph`) (2026-11-18)
 
