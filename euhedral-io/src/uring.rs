@@ -2897,10 +2897,13 @@ mod tests {
         unsafe { libc::signal(libc::SIGIO, libc::SIG_IGN) };
         let holder = std::fs::File::open(&guard.0).unwrap();
         // SAFETY: a plain `fcntl` of a descriptor the test owns.
-        let leased =
-            unsafe { libc::fcntl(holder.as_raw_fd(), libc::F_SETLEASE, libc::F_RDLCK) } == 0;
-        if !leased {
-            eprintln!("no lease on this file system: the retry is tested without one");
+        let leased = unsafe { libc::fcntl(holder.as_raw_fd(), libc::F_SETLEASE, libc::F_RDLCK) };
+        if leased != 0 {
+            let error = io::Error::last_os_error();
+            // Only a file system without leases is a reason to skip; anything else (a stray writer, say) is a
+            // test that is broken.
+            assert_eq!(error.raw_os_error(), Some(libc::EINVAL), "{error}");
+            eprintln!("no lease on this file system: the test is skipped");
             return;
         }
         let engine = crate::positional::Positional::new();

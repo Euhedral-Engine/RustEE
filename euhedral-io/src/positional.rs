@@ -799,7 +799,7 @@ impl Engine for Positional {
                 op.skip -= 1;
                 op.waiting = true;
                 op.ready = false;
-            } else if !op.waiting || op.ready {
+            } else if (!op.waiting || op.ready) && !op.cancelled {
                 op.skip = 0;
                 due += 1;
             }
