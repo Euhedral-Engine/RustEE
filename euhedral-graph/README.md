@@ -293,8 +293,9 @@ the host (`GateRef::hold` consumes the reference: a stage takes one gate). A wai
 and the state it needs is not ready) holds the stage from `run`: it takes the gate with `cx.hold()` and answers
 `StageError::Held`; the release runs it again exactly once, with no retry and no allocation (the contract is on `Stage::run`:
 who may release, a release before `run` returns, a kill, `Gate::fail` and a dropped gate). A stage that never submitted is abandoned
-(`Stage::abandoned(quantum, home)`) at quiesce, after the quantum's lanes joined the home lane and before later quanta are
-released and the retirement is armed on home, so what the hook submits to home is covered by the retirement. A stage that finds its resources busy answers `StageError::Retry` and
+(`Stage::abandoned(quantum, home)`) at quiesce, after the quantum's lanes joined the home lane (for a stage that names a lane) and before later quanta are
+released and the retirement is armed on home, so what such a hook submits to home is covered by the retirement; a stage that names no lane does host work only, and its hook's `home` is not covered.
+ A stage that finds its resources busy answers `StageError::Retry` and
 runs again when a lane of the pool made progress, or after `GraphRuntime::retry_backstop` (default
 `DEFAULT_RETRY_BACKSTOP`, 20 ms: set it longer than any one pass on your devices). A stage can be
 **ordered** (`StageSpec::ordered`): its frames then run in the order they were published, on one
