@@ -394,10 +394,10 @@ pub trait Stage<Q, L: DeviceQueue + ?Sized = dyn DeviceQueue>: Send + Sync {
 
     /// The quantum ended without this stage submitting: it never ran (the quantum was killed, or a predecessor failed),
     /// or it ran and failed (Java `StageFrame.abandoned(home)`). Called once, at the quantum's boundary, in stage order,
-    /// after the quantum's other lanes joined the `home` lane (the retirement of a quantum with such a stage is armed on
-    /// `home`; a stage that names no lane does host work only, and `home` does not cover it) (when the lanes have control: a query-only lane cannot
+    /// after the quantum's other lanes joined the `home` lane (when the lanes have control: a query-only lane cannot
     /// join, and the hook then runs without the join, and a hook given a query-only lane has nothing to enqueue on it) and
-    /// before the retirement is armed on it. If that retirement cannot be armed on a home lane that has control, the quantum
+    /// before the retirement is armed on it (the retirement of a quantum with a stage that names a lane is armed on
+    /// `home`; a stage that names no lane does host work only, and `home` does not cover it). If that retirement cannot be armed on a home lane that has control, the quantum
     /// is noted as `DeviceFailed` (a quantum whose hook ran already has an earlier cause, which stands: the first cause
     /// wins), because what the hooks submitted is not covered, and the quantum still retires. So what the hook submits
     /// to `home` is ordered after the quantum's device work and covered by its retirement: a stage that enqueued part of
@@ -5334,6 +5334,36 @@ mod tests {
         h.pump();
         assert_eq!(h.retired(2), [QuantumOutcome::Completed]);
         assert_eq!(graph.live(), 0);
+    }
+
+    #[test]
+    fn a_quantum_that_used_no_lane_at_quiesce_retires_on_the_lane_a_later_cover_added() {
+        let h = Harness::controlled(2, usize::from);
+        // The earlier quantum (home lane 0) runs one CPU stage; the later one (home lane 1) a stage on lane 1 that waits
+        // for it, and submits after the earlier quantum quiesced.
+        let earlier = h.graph(&[(None, &[], Act::Cpu)], &[]);
+        let later = h.graph(&[(None, &[1], Act::Submit)], &[]);
+        let a = earlier.start(1, alive(), Vec::new());
+        let edge = ExternalEdge {
+            from: a,
+            from_stage: StageId(0),
+            to_stage: StageId(0),
+            kind: Submission,
+        };
+        let _ = later.start(2, alive(), vec![edge]);
+        h.pump();
+        assert_eq!(h.ran_with(2, 0).unwrap().0, Some(1));
+        assert_eq!(
+            h.hands[0].armed(),
+            0,
+            "nothing waits on the earlier quantum's unused home lane"
+        );
+        assert_eq!(h.hands[1].armed(), 2, "both retirements are on lane 1");
+        assert!(h.retired(1).is_empty(), "held by the later stage's work");
+        h.hands[1].finish();
+        h.pump();
+        assert_eq!(h.retired(1), [QuantumOutcome::Completed]);
+        assert_eq!(h.retired(2), [QuantumOutcome::Completed]);
     }
 
     #[test]
