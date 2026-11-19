@@ -11,8 +11,9 @@
 //!   ([`SlotArena`]) and scratch pieces ([`ScratchArena`]) through lock-free free lists; in the steady state no
 //!   allocation or free reaches a backend ([`BackendCalls`] counts the ones that do).
 //! - [`backend`]: the allocation side. The planner accounts and decides; a [`Backend`] allocates and frees, and a
-//!   [`Reaper`] queues frees behind the device work that last used the memory, and [`Reaper::reap`] runs the ones that
-//!   may block on the thread that calls it (a lattice worker, if a worker calls it: the `HOT-FIX` id M1).
+//!   [`Reaper`] queues frees behind the device work that last used the memory, and [`Reaper::reap`] frees the retired
+//!   prefix of its queue, in order, on the thread that calls it (long calls run on the worker that needs them;
+//!   `Device::attach_deferral` in `euhedral-gpu` keeps them off busy moments).
 //! - [`deferred`]: blocking driver calls (frees, unloads) held by a [`DeferredCalls`] lattice source until no lane has work
 //!   in flight (or a bound forces them), instead of made where the memory is dropped: a call on another thread still makes
 //!   every stream's enqueue wait for the running kernels.
@@ -23,7 +24,8 @@
 //! Nothing here owns a thread or takes a lock, and the planner waits for nothing: budgets and owner totals are
 //! atomics, and owner slots, give-back orders, the reaper and the pinned cache go through RustEE's lock-free queues.
 //! The one place that blocks is a driver free that waits for the device: [`Reaper::reap`] makes it on the calling
-//! thread (the `HOT-FIX` id M1). Give-back orders reach their owners
+//! thread, a worker if a worker reaps, as service time of that work; a deferral attached to the device
+//! (`Device::attach_deferral`) holds such frees for a moment with nothing in flight. Give-back orders reach their owners
 //! as frames of a `LatticeSource` ([`GiveBacks`]). Residency is planned, not discovered: every consumer's room is
 //! reserved, what spills to pinned host memory is decided up front, and what cannot fit is refused; released pinned
 //! buffers stay in a capacity cache.

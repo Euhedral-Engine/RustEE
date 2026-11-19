@@ -4,15 +4,16 @@
 //! claims first, then allocates, and keeps the claim with the memory ([`Allocation`]). A free that may block (CUDA's
 //! `cuMemFree` and `cuMemFreeHost` synchronize the device; Vulkan's adapters drain before a free) is queued in a
 //! [`Reaper`] behind the device work that last used the memory, so it is not freed while the device may still use it.
-//! [`Reaper::reap`] makes the frees on the thread that calls it: when that is a lattice worker, the blocking free runs
-//! on that worker and counts as the service time of the work that called `reap` (the `HOT-FIX` id M1 marks it). A caller whose
+//! [`Reaper::reap`] makes the frees of the retired prefix on the thread that calls it: long calls run on the worker
+//! that needs them, and the blocking time counts as the service time of the work that called `reap`. A device with a
+//! `DeferredCalls` attached (`Device::attach_deferral` in `euhedral-gpu`) keeps frees off busy moments. A caller whose
 //! frees are long enough to starve other work reaps from a thread of its own, or from a lattice set aside for
 //! blocking work.
 
 use std::fmt;
 
-use euhedral_data_structures::queues::{Consumer, MpmcQueue, Multi, Producer};
-use euhedral_data_structures::sync::HotScope;
+use euhedral_data_structures::queues::{Consumer, MpscQueue, Multi, Producer, Single};
+use euhedral_data_structures::sync::{ClaimCell, HotScope};
 
 use crate::planner::{Claim, LocationId};
 
@@ -97,14 +98,28 @@ impl<F: Fn() -> bool + Send> Retired for F {
     }
 }
 
-/// Frees queued behind the device work that last used them. `push` never waits; `reap` frees what has retired. A
-/// free is ordinary work: run `reap` on the owner's lane (its blocking time counts as that work's service time); only
-/// frees measured to block for much longer than the lattice's ordinary work go to a lattice set aside for them.
-// HOT-FIX(M1): `reap` makes the blocking driver frees (`cuMemFree`, `cuMemFreeHost`) on the worker that calls it.
+/// A queued free: the check that its work retired, and the item to drop.
+type Entry<T> = (Box<dyn Retired>, T);
+
+/// Frees queued behind the device work that last used them. `push` never waits; `reap` frees the retired prefix of
+/// the queue, in the order it was pushed, and stops at the first item whose work has not retired: that item stays at
+/// the front, so nothing behind it is freed before it (one queue should hold one stream's frees; a queue that mixes
+/// streams delays a retired item behind an unretired one of another stream).
+///
+/// Producers push from any thread. `reap` has one consumer at a time: a `reap` that finds another one running
+/// returns 0 at once and never waits.
+///
+/// Where a long free runs. Dropping a retired item makes the driver's `cuMemFree` or `cuMemFreeHost`, which
+/// synchronize the device, on the thread that called `reap`. Long calls run on the worker that needs them: when a
+/// lattice worker reaps, the free counts as the service time of the work that called `reap`, and nothing here moves
+/// it elsewhere. To keep frees off busy moments, attach a `DeferredCalls` to the device (`Device::attach_deferral`
+/// in `euhedral-gpu`): the frees are then queued and made at a moment with nothing in flight. A caller whose frees
+/// are long enough to starve other work reaps from a thread of its own, or from a lattice set aside for blocking
+/// work.
 pub struct Reaper<T: Send> {
-    queue: MpmcQueue<(Box<dyn Retired>, T)>,
-    producer: Producer<(Box<dyn Retired>, T), Multi>,
-    consumer: Consumer<(Box<dyn Retired>, T), Multi>,
+    queue: MpscQueue<Entry<T>>,
+    producer: Producer<Entry<T>, Multi>,
+    consumer: ClaimCell<Consumer<Entry<T>, Single>>,
 }
 
 impl<T: Send> fmt::Debug for Reaper<T> {
@@ -117,9 +132,9 @@ impl<T: Send> fmt::Debug for Reaper<T> {
 
 impl<T: Send> Default for Reaper<T> {
     fn default() -> Self {
-        let queue = MpmcQueue::new(64);
+        let queue = MpscQueue::new(64);
         let producer = queue.producer();
-        let consumer = queue.consumer();
+        let consumer = ClaimCell::new(queue.consumer());
         Reaper {
             queue,
             producer,
@@ -141,35 +156,25 @@ impl<T: Send> Reaper<T> {
         }
     }
 
-    /// Drops every queued item whose work retired and returns how many; the others stay queued (behind the newer
-    /// ones). Another thread reaping at the same moment makes this return early, never wait.
+    /// Drops the queued items from the front while their work has retired, in push order, and returns how many. The
+    /// first item whose work has not retired stays at the front, with everything behind it. A `reap` that finds
+    /// another one running (on another thread, or this thread from inside a free) returns 0 at once, never waits.
     pub fn reap(&self) -> usize {
         let _hot = HotScope::enter();
-        let mut n = 0;
-        let mut keep = Vec::new();
+        let Some(mut consumer) = self.consumer.try_claim() else {
+            return 0;
+        };
         let limit = self.queue.size_long();
-        self.consumer.drain(
-            |(r, item)| {
-                if r.retired() {
-                    drop(item);
-                    n += 1;
-                } else {
-                    keep.push((r, item));
-                }
-            },
-            limit,
-        );
-        for k in keep {
-            let _ = self.producer.offer(k);
-        }
-        n
+        consumer.drain_while(drop, |(r, _)| !r.retired(), limit) as usize
     }
 
-    /// Drops everything queued, retired or not (shutdown, after the device was drained).
+    /// Drops everything queued, retired or not (shutdown, after the device was drained). Returns 0 and drops nothing
+    /// if a `reap` is running.
     pub fn reap_all(&self) -> usize {
-        let mut n = 0;
-        self.consumer.drain_all(|_| n += 1);
-        n
+        let Some(mut consumer) = self.consumer.try_claim() else {
+            return 0;
+        };
+        consumer.drain_all(drop) as usize
     }
 
     pub fn pending(&self) -> usize {
