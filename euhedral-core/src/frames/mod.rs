@@ -120,7 +120,17 @@ pub struct FrameHeader {
     routing_hash: u64,
     origin: Option<CpuInfo>,
     routing_policy: RoutingPolicy,
+    placement: Option<PlacementMark>,
     kill_switch: Option<Arc<AtomicBool>>,
+}
+
+/// What a placement policy overwrote: the owner's policy and origin, and the origin the policy set. A later
+/// placement restores the owner's two while the header still carries the policy's mark.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PlacementMark {
+    pub(crate) owner_policy: RoutingPolicy,
+    pub(crate) owner_origin: Option<CpuInfo>,
+    pub(crate) placed_origin: CpuInfo,
 }
 
 impl FrameHeader {
@@ -131,6 +141,7 @@ impl FrameHeader {
             routing_hash: id_hash,
             origin: None,
             routing_policy: RoutingPolicy::Anywhere,
+            placement: None,
             kill_switch: None,
         }
     }
@@ -186,6 +197,14 @@ impl FrameHeader {
 
     pub fn set_routing_policy(&mut self, routing_policy: RoutingPolicy) {
         self.routing_policy = routing_policy;
+    }
+
+    pub(crate) fn placement(&self) -> Option<PlacementMark> {
+        self.placement
+    }
+
+    pub(crate) fn set_placement(&mut self, placement: Option<PlacementMark>) {
+        self.placement = placement;
     }
 
     pub fn kill_switch(&self) -> Option<&Arc<AtomicBool>> {

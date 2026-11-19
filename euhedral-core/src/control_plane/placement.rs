@@ -18,7 +18,7 @@
 //! [`set_placement_policy`](super::ControlPlaneLattice::set_placement_policy)); producers need not call the picker.
 
 use crate::flow_control::RoutingPolicy;
-use crate::frames::Frame;
+use crate::frames::{Frame, FrameHeader, PlacementMark};
 use crate::utils::math::unsigned_multiply_high;
 use euhedral_hardware_utils::topology::Topology;
 use euhedral_hardware_utils::util::CpuSet;
@@ -34,6 +34,12 @@ pub struct PlacementPicker<P> {
 impl<P: Fn(&dyn Frame) -> bool + Send + Sync + 'static> PlacementPicker<P> {
     /// A picker over `topology`'s CPUs: frames for which `predicate` holds go to a CPU of `a`, the others to one of
     /// `b`.
+    ///
+    /// The predicate sees the frame as its owner left it. On a first placement that is the frame as made; on a later
+    /// one (a key frame pushed again, header kept) the picker has first put back the routing policy and origin the
+    /// owner had set, so its own earlier mark (`CacheLocal` and the chosen CPU) is never seen. If the owner set a
+    /// policy or origin after the earlier placement, the predicate sees those. A frame the picker then cannot place
+    /// keeps the owner's fields.
     pub fn new(topology: Topology, predicate: P, a: CpuSet, b: CpuSet) -> Self {
         Self {
             predicate,
@@ -46,6 +52,7 @@ impl<P: Fn(&dyn Frame) -> bool + Send + Sync + 'static> PlacementPicker<P> {
     /// Picks a CPU for `frame` among `lattice_cpus`, the CPUs the lattice routes with, and sets the frame's origin to
     /// it. Returns whether it did: `false` when the frame cannot be placed and keeps the origin it had.
     pub fn pick(&self, frame: &mut dyn Frame, lattice_cpus: &CpuSet) -> bool {
+        Self::restore_owner_fields(frame.header_mut());
         let chosen = if (self.predicate)(&*frame) {
             &self.a
         } else {
@@ -63,9 +70,29 @@ impl<P: Fn(&dyn Frame) -> bool + Send + Sync + 'static> PlacementPicker<P> {
             return false;
         };
         let header = frame.header_mut();
+        header.set_placement(Some(PlacementMark {
+            owner_policy: header.routing_policy(),
+            owner_origin: header.origin(),
+            placed_origin: *info,
+        }));
         header.set_origin(Some(*info));
         header.set_routing_policy(RoutingPolicy::CacheLocal);
         true
+    }
+
+    /// Gives a frame this picker placed before the policy and origin its owner had set, if the owner has not set
+    /// others since: a frame pushed again is judged on what its owner left, not on the earlier mark.
+    fn restore_owner_fields(header: &mut FrameHeader) {
+        let Some(mark) = header.placement() else {
+            return;
+        };
+        header.set_placement(None);
+        if header.routing_policy() == RoutingPolicy::CacheLocal
+            && header.origin() == Some(mark.placed_origin)
+        {
+            header.set_routing_policy(mark.owner_policy);
+            header.set_origin(mark.owner_origin);
+        }
     }
 
     /// The picker as a placement policy for
@@ -139,6 +166,76 @@ mod tests {
         assert_eq!(origin(1, u64::MAX), (Some(6), RoutingPolicy::CacheLocal));
         assert_eq!(origin(0, 0), (Some(5), RoutingPolicy::CacheLocal));
         assert_eq!(origin(0, u64::MAX), (Some(5), RoutingPolicy::CacheLocal));
+    }
+
+    #[test]
+    fn a_frame_placed_again_is_judged_on_its_owners_policy_both_times() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let marked = Arc::new(AtomicUsize::new(0));
+        let (seen_calls, seen_marked) = (calls.clone(), marked.clone());
+        let picker = PlacementPicker::new(
+            topology(),
+            move |frame: &dyn Frame| {
+                let header = frame.header();
+                seen_calls.fetch_add(1, Ordering::Relaxed);
+                if header.origin().is_some() {
+                    seen_marked.fetch_add(1, Ordering::Relaxed);
+                }
+                header.routing_policy() == RoutingPolicy::CacheLocal
+            },
+            set(&[0, 2]),
+            set(&[1, 3]),
+        );
+        let lattice = set(&[0, 1, 2, 3]);
+        let mut frame = frame(5, 0);
+        frame
+            .header_mut()
+            .set_routing_policy(RoutingPolicy::CacheLocal);
+        for _ in 0..2 {
+            frame.header_mut().randomize_hash(9);
+            assert!(picker.pick(&mut *frame, &lattice));
+            let cpu = frame.header().origin().map(|info| info.cpu).unwrap();
+            assert!(
+                cpu.is_multiple_of(2),
+                "the owner's policy sends it to set A"
+            );
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            marked.load(Ordering::Relaxed),
+            0,
+            "the predicate never sees the picker's origin"
+        );
+    }
+
+    #[test]
+    fn a_frame_the_owner_re_marked_is_judged_on_the_new_marks() {
+        let picker = PlacementPicker::new(
+            topology(),
+            |frame: &dyn Frame| frame.header().routing_policy() == RoutingPolicy::Anywhere,
+            set(&[0]),
+            set(&[1]),
+        );
+        let lattice = set(&[0, 1]);
+        let mut frame = frame(5, 0);
+        assert!(picker.pick(&mut *frame, &lattice));
+        assert_eq!(frame.header().origin().map(|i| i.cpu), Some(0));
+        frame
+            .header_mut()
+            .set_routing_policy(RoutingPolicy::Anywhere);
+        assert!(picker.pick(&mut *frame, &lattice));
+        assert_eq!(frame.header().origin().map(|i| i.cpu), Some(0));
+        frame
+            .header_mut()
+            .set_routing_policy(RoutingPolicy::Anywhere);
+        frame.header_mut().set_origin(None);
+        frame
+            .header_mut()
+            .set_routing_policy(RoutingPolicy::CacheLocal);
+        assert!(picker.pick(&mut *frame, &lattice));
+        assert_eq!(frame.header().origin().map(|i| i.cpu), Some(1));
     }
 
     #[test]

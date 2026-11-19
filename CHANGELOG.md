@@ -3,6 +3,18 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## A frame placed again is judged on its owner's policy, not on the picker's mark (`euhedral-core`) (2026-11-19)
+
+**What.** `PlacementPicker::pick` remembers the routing policy and origin the owner had set (a private mark in the frame header, with the origin it chose) and, on the next placement of the same header, puts them back before it calls the predicate.
+
+**Why.** The picker marks every frame it places `CacheLocal` with the chosen CPU. A key frame (Completions, AsyncIo, Moves) is pushed again with its header kept, so it arrived already `CacheLocal` and a predicate such as `policy == CacheLocal` sent it to set A on its second push, behind a long call.
+
+**How to use.** Nothing to change. The predicate's contract is on `PlacementPicker::new`: it sees the frame as its owner left it, on a first and on every later placement.
+
+**Semantics.** The restore happens only if the header still carries the picker's mark (policy `CacheLocal` and the origin it set); a policy or origin the owner set since is kept and judged. A frame that cannot be placed on a later push keeps the owner's fields. No other placement behaviour changes; the header grows by one private field.
+
+**Tests.** `a_frame_placed_again_is_judged_on_its_owners_policy_both_times` (fails on the old code: the second call sees the picker's origin) and `a_frame_the_owner_re_marked_is_judged_on_the_new_marks`.
+
 ## A panic in `AsyncIo`'s completion and refusal paths neither stalls a ring nor skews the counts (`euhedral-io`) (2026-11-19)
 
 **What.** The io_uring engine takes a completion-queue or submission-queue lock a panic poisoned instead of skipping it, and a completion of no operation is raised by `AsyncIo::reap` after its counts are done. The reap drops the frame of an operation whose continuation panicked (it is counted by `panicked()` and by `pending`, and no consumer sees a frame for it). `submit` takes its `pending` and `unreaped` counts back through a guard, so they are right when dropping a refused continuation panics; the engine sets a flag the guard owns (`Engine::submit`'s `taken`) once it holds the operation, so a later panic does not undo the counts and a submission made while the refused continuation drops does not hide the refusal. An enter that unwinds leaves the ring's entries marked unsubmitted, so a later poll hands them over. A reap run inside a continuation keeps the enclosing reap's stray check. The Windows engine takes its poisoned ring lock the same way.
