@@ -18,6 +18,18 @@ semantics and the tests that pin it.
 
 **Tests.** The three tests above. A wait that returned before the flag was set or after fewer than 1,000 checks fails the wait test; a finalizer inside the timed span makes the first timed frame's finalizer see 0 instead of 1.
 
+## A fake lane keeps its marker slot through a panic, and two lane tests stop depending on scheduling (`euhedral-gpu`) (2026-11-19)
+
+**What.** The fake lane's `submit_marked` gives its reserved marker slot back when the closure panics. The ring's pin race stress test is replaced by a Loom test of `pin` against `reserve` and `Claim::record`. The replay-contention device test stocks the lane with one stream per worker first and asserts none is made beyond them. A test hook `stock_forks` (feature `test-hooks`) stocks a CUDA lane's private streams.
+
+**Why.** A panic in the closure left the slot reserved for the fake device's life, so enough panics made every later marker answer `Busy` (the CUDA lane's claim already gives its slot up on drop). The ring stress test asserted that its race granted a pin, which a loaded runner did not do. The device test failed about one run in twenty with one more stream than the warm-up had made: a worker that had not overlapped the others in the warm-up takes its first private stream later, which is the lane working, not a missed take.
+
+**How to use.** Nothing to change. In the ring, the model build (`--cfg loom`) yields in the claimant's wait and orders the pin handshake with fences, since the model checker does not order SeqCst accesses against each other.
+
+**Semantics.** A marked submission on the fake lane holds its slot from the reservation until the marker is pushed; an error or a panic before that releases it. A CUDA lane makes a private stream only when more workers overlap than ever did; with N streams stocked and at most N holders, none is made. No change to ring, replay or stream behaviour outside the model build.
+
+**Tests.** `a_panicking_submission_gives_its_marker_slot_back` (fails on the old code: the lane stays `Busy`). `loom_a_granted_pin_sees_its_own_marker_in_the_slot` (fails when the claimant does not wait out a pin). `six_workers_replaying_on_a_lane_stocked_with_six_streams_make_no_other_stream` (device): six streams before and after 1,560 contended rounds.
+
 ## Frames a refusing sink ends in place keep a flat stack and count their panics (`euhedral-graph`) (2026-11-19)
 
 **What.** A frame the stage sink refuses (a closed or full sink: a Retire frame, a stage a gate released, a stage frame the sink would not take) is ended in place through one trampoline per thread. The outermost end drains a list; an end that one of those ends causes is linked into the list through a field of the frame and runs after the current one. A stage run in place has its panic contained, so the frame still finishes and the stage's count drops. Every panic contained at an in-place end is counted: `StageGraph::contained_panics()`.

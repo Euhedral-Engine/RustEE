@@ -161,7 +161,7 @@
   "crate": "euhedral-gpu",
   "seeds": 1,
   "commands": [
-   "cargo miri test -p euhedral-gpu --lib -- ring::tests --skip ring::tests::a_granted_pin_always_sees_its_own_marker_in_the_slot --skip ring::tests::many_threads_make_distinct_markers_and_all_complete",
+   "cargo miri test -p euhedral-gpu --lib -- ring::tests --skip ring::tests::many_threads_make_distinct_markers_and_all_complete",
    "cargo miri test -p euhedral-gpu --features fake --lib -- instances::tests handles::tests hold::tests graph_cache::shared_tests --skip graph_cache::shared_tests::workers_running_one_key_at_once_each_get_their_own_instance_and_no_one_waits --skip handles::tests::a_take_never_misses_and_a_give_is_never_refused_while_a_handle_is_stocked_and_the_population_fits --skip handles::tests::threads_never_hold_one_handle_at_once --skip instances::tests::many_threads_never_share_an_instance_and_never_wait"
   ]
  },
@@ -189,7 +189,6 @@
   "seeds": 16,
   "commands": [
    "cargo miri test -p euhedral-gpu --test fake_shared_lane -- --exact many_parties_arming_at_once_each_see_exactly_their_own_retirement many_workers_submit_to_one_lane_and_every_marker_completes",
-   "cargo miri test -p euhedral-gpu --lib -- --exact ring::tests::a_granted_pin_always_sees_its_own_marker_in_the_slot",
    "cargo miri test -p euhedral-gpu --features fake --lib -- --exact handles::tests::a_take_never_misses_and_a_give_is_never_refused_while_a_handle_is_stocked_and_the_population_fits graph_cache::shared_tests::workers_running_one_key_at_once_each_get_their_own_instance_and_no_one_waits"
   ]
  }

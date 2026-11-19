@@ -175,7 +175,7 @@ pub struct CudaQueue {
     /// The private streams of this lane, stocked: a worker takes one to replay a graph or to capture on, uses it alone,
     /// and gives it back (see [`Fork`]).
     forks: HandlePool,
-    /// How many private streams were ever made (a test asks: after warm-up none is made, whatever the contention).
+    /// How many private streams were ever made (a test asks: a stream is made only when more workers overlap than ever did).
     forks_made: std::sync::atomic::AtomicUsize,
     /// A test hook: the next join of a private stream back into this lane fails.
     #[cfg(feature = "test-hooks")]
@@ -272,10 +272,25 @@ impl CudaQueue {
         self.raw
     }
 
-    /// How many private streams this lane ever made. (A test hook: a warmed lane makes no more, whatever the contention.)
+    /// How many private streams this lane ever made. (A test hook: a lane stocked with as many streams as there are
+    /// workers makes no more, however the workers race.)
     #[cfg(feature = "test-hooks")]
     pub fn forks_made(&self) -> usize {
         self.forks_made.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// A test hook (feature `test-hooks`): stocks the lane with `count` private streams, making the ones its stock lacks.
+    #[cfg(feature = "test-hooks")]
+    pub fn stock_forks(&self, count: usize) -> Result<(), GpuError> {
+        let _c = self.gpu.device().enter().map_err(from_cuda)?;
+        let mut taken = Vec::with_capacity(count);
+        for _ in 0..count {
+            taken.push(self.take_fork()?);
+        }
+        for fork in taken {
+            self.give_fork(fork);
+        }
+        Ok(())
     }
 
     /// A test hook (feature `test-hooks`): the next join of a private stream back into this lane fails after the work
