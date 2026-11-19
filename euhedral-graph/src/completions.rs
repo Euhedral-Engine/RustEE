@@ -112,7 +112,8 @@ pub trait Pending: Send {
 /// nothing (it runs no application code of its own), and a completed source pushes no poll frame.
 pub struct Completions {
     /// The lanes polled for markers, held weakly: the pool's owner decides where the lanes are destroyed, and the
-    /// source never keeps them alive. A marker counts as reached when its lane says so, also after the source has
+    /// source never keeps them alive (a scan holds an upgrade only while it queries one marker entry, and releases it before it
+    /// emits a frame). A marker counts as reached when its lane says so, also after the source has
     /// completed. Once the pool is gone no marker is reached any more (see [`Completions::new`]). `None` for a
     /// source built [`without_lanes`](Self::without_lanes): it takes no markers, and none is ever reached.
     lanes: Option<Weak<LanePool>>,
@@ -954,15 +955,16 @@ impl Completions {
             return 0;
         }
         let now = Instant::now();
-        // Upgraded at the first marker only, once for the whole scan, so a scan with no marker never holds the pool
-        // (application code runs in it). The inner `None` is a pool that is gone: no marker can be observed then.
-        let mut pool: Option<Option<Arc<LanePool>>> = None;
         let mut queued = 0;
         let mut index = 0;
         // What the entries left behind need next: the earliest deadline, and whether any can only be polled blind.
         let mut earliest = u64::MAX;
         let mut blind = false;
         while index < lists.waiting.len() {
+            // Upgraded at a marker entry only and kept for that entry alone (never across entries), so a scan with no
+            // marker never holds the pool, and none holds it while application code runs for another entry or while a
+            // frame it emitted may run. The inner `None` is a pool that is gone: no marker can be observed then.
+            let mut pool: Option<Option<Arc<LanePool>>> = None;
             let entry = &mut lists.waiting[index];
             let cancelled = entry.what.cancelled_in_chain();
             let pool_gone = !cancelled
@@ -1004,6 +1006,8 @@ impl Completions {
             let Ok((done, mut yielded)) = queried else {
                 self.panicked.fetch_add(1, Ordering::Relaxed);
                 log::error!("an operation's query panicked; its entry is dropped");
+                // Ending the entry runs application code: no upgrade of the pool is held while it does.
+                drop(pool);
                 if let Some(Waiting { what, .. }) = lists.take_head(index) {
                     // Ending it runs the application's `do_finally`, which may panic too.
                     let _ = panic::catch_unwind(AssertUnwindSafe(|| self.cancel(what)));
@@ -1025,11 +1029,21 @@ impl Completions {
             let Some(Waiting { what, last_seen }) = lists.take_head(index) else {
                 unreachable!("a done entry at index")
             };
+            // Nothing this scan holds may keep the lanes alive past the offer: once the frame is offered another
+            // worker may take and run it, and the last quantum's end drops its stage state, which an owner takes to
+            // mean that no lane is held. So the scan's upgrade of the pool, and the application's operation (a
+            // `MarkerAndHost` or a `RetryWake` holds the pool), are released first.
+            drop(pool);
             let (frame, since) = match what {
-                Waits::Ready(_, frame)
-                | Waits::Wake(_, frame)
-                | Waits::Marker(_, frame)
-                | Waits::Retired(_, frame) => (frame, last_seen),
+                Waits::Ready(op, frame) => {
+                    drop(op);
+                    (frame, last_seen)
+                }
+                Waits::Wake(op, frame) => {
+                    drop(op);
+                    (frame, last_seen)
+                }
+                Waits::Marker(_, frame) | Waits::Retired(_, frame) => (frame, last_seen),
                 Waits::At(deadline, frame) => (frame, deadline),
                 Waits::Pending(_) => (
                     yielded.take().expect("a pending that is done yielded"),
@@ -3448,5 +3462,79 @@ mod tests {
         completions.request(1);
         assert_eq!(hands.ids(), [2, 3, 4]);
         assert_eq!(completions.pending(), 0);
+    }
+
+    /// A frame that notes the pool's strong count when it ends.
+    struct CountsPool {
+        header: FrameHeader,
+        pool: Weak<LanePool>,
+        seen: Arc<AtomicUsize>,
+    }
+
+    impl Frame for CountsPool {
+        fn header(&self) -> &FrameHeader {
+            &self.header
+        }
+
+        fn header_mut(&mut self) -> &mut FrameHeader {
+            &mut self.header
+        }
+
+        fn do_finally(self: Box<Self>) {
+            self.seen.store(self.pool.strong_count(), Ordering::Release);
+        }
+    }
+
+    /// An operation whose query reports that it was reached, then waits (up to a deadline) for the test to let it go.
+    struct Blocks {
+        reached: std::sync::mpsc::Sender<()>,
+        go: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl Ready for Blocks {
+        fn is_ready(&mut self) -> bool {
+            let _ = self.reached.send(());
+            self.go.recv_timeout(Duration::from_secs(10)).is_ok()
+        }
+    }
+
+    /// A scan emits a frame while it goes on querying later entries (application code), and another worker may run
+    /// that frame meanwhile: the scan holds no upgrade of the lane pool at that point.
+    #[test]
+    fn a_scan_holds_no_lane_pool_while_a_frame_it_emitted_may_run() {
+        const UNSEEN: usize = usize::MAX;
+        let (completions, rig) = setup();
+        let seen = Arc::new(AtomicUsize::new(UNSEEN));
+        rig.lane.completed.store(1, Ordering::Release);
+        completions.after_marker(
+            Marker::new(rig.lane.id, LaneId(0), 1),
+            Box::new(CountsPool {
+                header: FrameHeader::new(1),
+                pool: Arc::downgrade(&rig._pool),
+                seen: seen.clone(),
+            }),
+        );
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel();
+        completions.after(
+            Box::new(Blocks {
+                reached: reached_tx,
+                go: go_rx,
+            }),
+            tagged(2),
+        );
+        thread::scope(|scope| {
+            let scan = scope.spawn(|| completions.reap());
+            reached_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the scan reached the blocking entry");
+            // The scan is inside the second entry's query: the first entry's frame was emitted before it.
+            completions.pull(&mut |frame| frame.do_finally(), &mut |_| false, 1);
+            let ran_with = seen.load(Ordering::Acquire);
+            let _ = go_tx.send(());
+            scan.join().unwrap();
+            assert_ne!(ran_with, UNSEEN, "the emitted frame ran during the scan");
+            assert_eq!(ran_with, 1, "only the owner holds the pool");
+        });
     }
 }

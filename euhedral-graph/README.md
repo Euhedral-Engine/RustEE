@@ -337,13 +337,16 @@ RustEE's: to have every quantum retire, stop starting quanta and complete `Compl
 of quanta that hold each other.)
 
 **Lanes at drop.** A graph lets go of the runtime's lanes before it drops its stages. The graph's shared state drops its
-`GraphRuntime` (and with it the `Arc<LanePool>`) before its stages, and each run drops its retried stages' wake-ups (which
-hold the pool) before its reference to that state. Once a stage's own state has been dropped, the graph and its runs hold
-none of the runtime's lanes, so an owner may take the drop of a token a stage carries to mean the graph is done with the
-lanes and start tearing them down, on whichever thread dropped it. This is the declaration order of those structs and
-nothing else: there is no notification. It covers the graph's own references only: a `GraphRuntime` clone someone else
-holds, and a completion the runtime still has in flight for a quantum (it holds the pool until it is polled), are not the
-graph's.
+`GraphRuntime` (and with it the `Arc<LanePool>`) before its stages, each run drops its retried stages' wake-ups (which
+hold the pool) before its reference to that state, and the `Completions` source holds no upgrade of the pool, and none of
+the operations it was given (a marker-and-host wait, a retry wake-up), once it has offered the frame that follows them: a
+scan upgrades the pool for one marker entry at a time, never across entries. So when the last of the graph handle and its
+runs is gone, the stages' own state (dropped no earlier than that: a caller's clone of a stage's `Arc` outlives the graph)
+is dropped while neither the graph, nor its runs, nor the source hold the pool. An owner may take the drop of a token a
+stage carries to mean the graph holds no lane, and start tearing the lanes down, on whichever thread dropped it. This is
+declaration order and the scan's order of release, nothing else: there is no notification. Limits: a `GraphRuntime` clone
+someone else holds keeps the pool; the application's own operations (a stage's host completion) are its own; and
+`Completions::pending()` is no signal (it drops when a frame is handed out, before the frame ends).
 
 Quanta are **pooled**. `start` takes a retired quantum's state from a bounded pool and `retire` gives it back,
 as the graph's frames go back to theirs, so after warm-up a quantum allocates nothing and takes no lock of its own. (A stage

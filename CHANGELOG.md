@@ -3,19 +3,20 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
-## A stage graph and its runs let go of the lanes before they drop their stages (`euhedral-graph`) (2026-11-19)
+## A stage graph, its runs and the completions scan let go of the lanes before the stages drop (`euhedral-graph`) (2026-11-19)
 
-**What.** When the last of a `StageGraph` handle and its runs drops, the graph's shared state drops its `GraphRuntime` (the lane pool) before the stages, and each run drops its retry wake-ups (each holds the pool) before its reference to that state. Nothing else changes: no stage runs, retires or is abandoned differently.
+**What.** When the last of a `StageGraph` handle and its runs drops, the graph's shared state drops its `GraphRuntime` (the lane pool) before the stages, and each run drops its retry wake-ups (each holds the pool) before its reference to that state. The `Completions` scan no longer holds the pool across entries, and drops a finished entry's operation (a `MarkerAndHost` or retry wake-up) before it offers the entry's frame. No stage runs, retires or is abandoned differently, and frames are emitted in the same order.
 
-**Why.** The stages dropped first and the pool references after, on the same thread. An owner that took the drop of a token held by a stage as the sign that the graph no longer holds the lanes, and started tearing the lanes down on another frame, raced that tail: the lanes could still be held, and their streams (and the device) ended up destroyed on whichever worker dropped the last run.
+**Why.** The stages dropped first and the pool references after, on the same thread. An owner that took the drop of a token held by a stage as the sign that the graph no longer holds the lanes, and started tearing the lanes down on another frame, raced that tail: the lanes could still be held, and their streams (and the device) ended up destroyed on whichever worker dropped the last run. The scan had the same tail: it upgraded the pool at its first marker and kept it for the rest of the scan, and kept a finished operation alive past `offer`, while another worker could already run the frame it offered (the polling and the handing-out are separate claims). When the last quantum ended with a boundary or retry frame, the stage token dropped while the scan still held the pool.
 
 **How to use.** Nothing to call. A stage may carry a token whose drop tells the owner the graph holds no lane; the owner may then tear the lanes down once its own references are gone.
 
 **Semantics.**
-- `Core` declares `runtime` first and `Run` declares `retry_wakes` before `core`; both carry a comment that the order is a guarantee. Dropping needs no code, so no lock or allocation is added.
-- Once a stage's own state has dropped, the graph and its runs hold none of the runtime's lanes. A `GraphRuntime` clone held elsewhere, and a completion the runtime still has in flight (it holds the pool until it is polled), are not the graph's and are not covered.
+- `Core` declares `runtime` first and `Run` declares `retry_wakes` before `core`; both carry a comment that the order is a guarantee. No lock or allocation is added.
+- `Completions::reap`: the upgrade of the pool lives for one marker entry (a pool upgrade per marker entry instead of one per scan), is released before the entry's frame is offered, and is not held while a panicked query's entry ends. A finished `Ready` or `Wake` operation is dropped before its frame is offered.
+- Once a stage's own state has dropped (no earlier than the last of the graph handle and runs going: a caller's clone of a stage's `Arc` outlives the graph), the graph, its runs and the source hold none of the runtime's lanes for it. Not covered: a `GraphRuntime` clone held elsewhere, and the application's own operations. `Completions::pending()` is no signal for it: it drops when a frame is handed out, before the frame ends.
 
-**Tests.** `stage_graph.rs`: `a_dropped_graph_holds_no_lane_once_its_stage_state_drops`, `the_last_run_dropping_on_a_worker_holds_no_lane_once_the_stage_state_drops` and `a_run_with_a_retry_wake_armed_holds_no_lane_once_the_stage_state_drops` (a stage's token reads the pool's strong count as it drops; all three fail on the old order).
+**Tests.** `stage_graph.rs`: `a_dropped_graph_holds_no_lane_once_its_stage_state_drops`, `the_last_run_dropping_on_a_worker_holds_no_lane_once_the_stage_state_drops` and `a_run_with_a_retry_wake_armed_holds_no_lane_once_the_stage_state_drops` (a stage's token reads the pool's strong count as it drops; all three fail on the old order). `completions.rs`: `a_scan_holds_no_lane_pool_while_a_frame_it_emitted_may_run` (a later entry's query blocks on a deadline-bounded channel while another thread runs the frame emitted before it; the pool count there is 2 with the scan's old whole-scan upgrade, 1 now).
 
 ## A replay on a lane that fails after its launch keeps the recording's values in the caller's hold (`euhedral-gpu`) (2026-11-19)
 
