@@ -275,12 +275,18 @@ fn a_continuation_that_panics_loses_its_operation_and_not_the_others_on(
     )
     .unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
+    let mut handed = 0;
     while io.pending() > 0 {
         assert!(Instant::now() < deadline, "the operations did not drain");
-        // The reap does not unwind: the panicking operation's frame is one that does nothing, and it is counted.
+        // The reap does not unwind: the panicking operation is counted and dropped, and no consumer sees a frame
+        // for it (only the second operation's reaches the consumer).
         io.reap();
-        io.pull(&mut |_| {}, &mut |_| false, 8);
+        io.pull(&mut |_| handed += 1, &mut |_| false, 8);
     }
+    assert_eq!(
+        handed, 1,
+        "the consumer sees the second operation's frame only"
+    );
     assert_eq!(ran.load(Ordering::Acquire), 1);
     assert_eq!(io.panicked(), 1);
 }

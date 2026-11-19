@@ -154,6 +154,10 @@ impl MarkerRing {
         };
         // The slot's previous marker completed (checked above): an awaiter that comes now sees this and waits for nothing.
         self.pins.reserved.fetch_max(value, Ordering::SeqCst);
+        // The model checker does not order SeqCst accesses against each other, which this handshake relies on: a fence
+        // stands in for it (see `SlotPins`).
+        #[cfg(loom)]
+        loom::sync::atomic::fence(Ordering::SeqCst);
         Ok(Claim {
             ring: self,
             value,
@@ -215,6 +219,9 @@ impl MarkerRing {
     pub(crate) fn pin(&self, value: u64) -> Option<Pin<'_>> {
         let slot = &self.pins.pins[self.slot(value)];
         slot.fetch_add(1, Ordering::SeqCst);
+        // As in `reserve`: the model checker needs the fence for the order the handshake relies on.
+        #[cfg(loom)]
+        loom::sync::atomic::fence(Ordering::SeqCst);
         if self.pins.reserved.load(Ordering::SeqCst) >= value + self.slots() {
             slot.fetch_sub(1, Ordering::SeqCst);
             return None;
@@ -248,6 +255,9 @@ impl Claim<'_> {
         let ring = self.ring;
         let slot = ring.slot(self.value);
         while ring.pins.pins[slot].load(Ordering::SeqCst) != 0 {
+            #[cfg(loom)]
+            loom::thread::yield_now();
+            #[cfg(not(loom))]
             #[allow(
                 clippy::disallowed_methods,
                 reason = "JAVA-BACKOFF: the wait is for an awaiter inside one driver call, as Java's `SpinWait` waits for a peer's short step"
@@ -441,67 +451,6 @@ mod tests {
         );
     }
 
-    /// A claimant re-records two slots as fast as it can while an awaiter pins the latest marker it was given: a pin that
-    /// is granted always finds the slot as its marker left it, for as long as the pin is up.
-    #[test]
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "two threads stand in for a lane's submitter and an awaiter on another lane"
-    )]
-    fn a_granted_pin_always_sees_its_own_marker_in_the_slot() {
-        use std::sync::atomic::AtomicBool;
-        const SLOTS: u64 = 2;
-        let ring = MarkerRing::new(SLOTS as usize);
-        let in_slot: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
-        let given = AtomicU64::new(0);
-        let stop = AtomicBool::new(false);
-        let granted = AtomicU64::new(0);
-        let rounds = if cfg!(miri) { 200 } else { 200_000 };
-        std::thread::scope(|scope| {
-            scope.spawn(|| {
-                let mut made = 0;
-                while made < rounds {
-                    ring.scan(|_| Query::Done);
-                    if let Ok(value) = ring.mark(
-                        || {},
-                        |slot| {
-                            // The number is in the slot only once it is recorded: set it as the record call does.
-                            let value = ring.claimed();
-                            in_slot[slot].store(value, Ordering::SeqCst);
-                            Ok(())
-                        },
-                    ) {
-                        given.store(value, Ordering::SeqCst);
-                        made += 1;
-                    }
-                }
-                stop.store(true, Ordering::SeqCst);
-            });
-            scope.spawn(|| {
-                while !stop.load(Ordering::SeqCst) {
-                    let value = given.load(Ordering::SeqCst);
-                    if value == 0 {
-                        continue;
-                    }
-                    if let Some(_pin) = ring.pin(value) {
-                        for _ in 0..4 {
-                            assert_eq!(
-                                in_slot[ring.slot(value)].load(Ordering::SeqCst),
-                                value,
-                                "the slot was re-recorded under a pin"
-                            );
-                        }
-                        granted.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-            });
-        });
-        assert!(
-            granted.load(Ordering::Relaxed) > 0,
-            "some pins were granted"
-        );
-    }
-
     /// Eight threads make markers on a ring of 16 while another scans: every number is handed out once, each slot is
     /// recorded by one thread at a time, and every number completes.
     #[test]
@@ -647,6 +596,57 @@ mod loom_tests {
                 Query::Done
             });
             maker.join().unwrap();
+        });
+    }
+
+    // A pin that is granted holds its slot as its marker left it: a claimant that re-records the slot waits the pin out,
+    // so what the awaiter reads under the pin is ordered after the write of the marker it pinned, and the claimant's
+    // write is ordered after the awaiter's read (the slot contents are a model cell: the checker reports any access
+    // the pin does not order). A pin that is refused is for a marker whose slot was claimed again.
+    #[test]
+    fn loom_a_granted_pin_sees_its_own_marker_in_the_slot() {
+        loom::model(|| {
+            let ring = Arc::new(MarkerRing::new(2));
+            let slots = Arc::new(Slots([
+                loom::cell::UnsafeCell::new(0),
+                loom::cell::UnsafeCell::new(0),
+            ]));
+            let record = |slots: Arc<Slots>, ring: Arc<MarkerRing>| {
+                move |slot: usize| {
+                    let value = ring.claimed();
+                    slots.0[slot].with_mut(|cell| {
+                        // SAFETY: the claimant owns the slot until it stores its entry.
+                        unsafe { *cell = value }
+                    });
+                    Ok(())
+                }
+            };
+            for _ in 0..2 {
+                ring.mark(|| {}, record(slots.clone(), ring.clone()))
+                    .unwrap();
+            }
+            ring.scan(|_| Query::Done);
+            // Marker 3 re-records marker 1's slot while an awaiter pins marker 1.
+            let claimant = {
+                let (ring, slots) = (ring.clone(), slots.clone());
+                thread::spawn(move || {
+                    let record = record(slots, ring.clone());
+                    // Refused outright when the pin is already up, which leaves the slot alone.
+                    ring.mark(|| {}, record)
+                })
+            };
+            if let Some(pin) = ring.pin(1) {
+                let seen = slots.0[ring.slot(1)].with(|cell| {
+                    // SAFETY: the pin keeps the claimant from writing the slot.
+                    unsafe { *cell }
+                });
+                assert_eq!(seen, 1, "the slot was re-recorded under a pin");
+                drop(pin);
+            }
+            assert!(matches!(
+                claimant.join().unwrap(),
+                Ok(3) | Err(GpuError::Busy)
+            ));
         });
     }
 }
