@@ -12,7 +12,8 @@
 //! allocates nothing and locks nothing.
 //!
 //! A frame that cannot be placed (the chosen set has no CPU in common with the lattice's) keeps the origin it had (the
-//! owner's, if it was placed before), and the picker returns `false` for it; it returns `true` for a frame whose origin it set.
+//! owner's, if it was placed before), and the picker returns `false` for it; it returns `true` for a frame whose
+//! origin it set.
 //!
 //! The policy covers pushed and pulled frames alike (see
 //! [`set_placement_policy`](super::ControlPlaneLattice::set_placement_policy)); producers need not call the picker.
@@ -41,7 +42,9 @@ impl<P: Fn(&dyn Frame) -> bool + Send + Sync + 'static> PlacementPicker<P> {
     /// restored only if the owner has not written it since (any call of `set_routing_policy` or `set_origin`, with
     /// whatever value, makes it the owner's); the predicate then sees that write. A frame the picker cannot place
     /// keeps the owner's fields. An owner origin that is not one of `topology`'s CPUs cannot be given back, so a
-    /// later placement sees the picker's origin in its place.
+    /// later placement sees the picker's origin in its place. The owner's origin is kept as a CPU index and rebuilt
+    /// from the restoring picker's topology, so pickers that place the same frame must share one `Topology`. A
+    /// custom placement policy that writes the policy or origin through the public setters writes them as the owner.
     pub fn new(topology: Topology, predicate: P, a: CpuSet, b: CpuSet) -> Self {
         Self {
             predicate,
@@ -52,7 +55,8 @@ impl<P: Fn(&dyn Frame) -> bool + Send + Sync + 'static> PlacementPicker<P> {
     }
 
     /// Picks a CPU for `frame` among `lattice_cpus`, the CPUs the lattice routes with, and sets the frame's origin to
-    /// it. Returns whether it did: `false` when the frame cannot be placed and keeps the origin it had.
+    /// it. Returns whether it did: `false` when the frame cannot be placed and keeps the origin it had (the owner's, if it was placed
+    /// before).
     pub fn pick(&self, frame: &mut dyn Frame, lattice_cpus: &CpuSet) -> bool {
         self.restore_owner_fields(frame.header_mut());
         let chosen = if (self.predicate)(&*frame) {
