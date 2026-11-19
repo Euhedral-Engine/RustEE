@@ -545,13 +545,12 @@ fn hits_replayed_as_recorded_give_the_results_of_the_eager_run() {
     drop((hold, hold_eager));
 }
 
-/// Under contention a replay never makes a private stream once the lane is warm: a take that scanned past a handle another
-/// worker moved retries instead of missing (a miss makes a stream, events and a box on the frame path), and a give always
-/// lands. Six workers replay one key for thousands of rounds: the lane made at most one stream per worker, however the
-/// takes and gives interleaved. How many streams that is depends on how many workers overlapped (a worker that never
-/// overlapped another made none yet), so the count is bounded by the workers, not pinned to the warm-up's.
+/// Under contention a replay never misses a stocked stream: a take that scanned past a handle another worker moved
+/// retries instead of missing (a miss makes a stream, events and a box on the frame path), and a give always lands. The
+/// lane is stocked with exactly one stream per worker first, so at most six streams are ever held and a correct pool
+/// never has to make one: the count is six before the rounds and six after them, whatever the interleaving.
 #[test]
-fn six_workers_replaying_under_contention_make_no_private_stream_after_warm_up() {
+fn six_workers_replaying_on_a_lane_stocked_with_six_streams_make_no_other_stream() {
     const N: usize = 6;
     let Some(gpu) = gpu() else { return };
     let Some(module) = module(&gpu) else { return };
@@ -560,6 +559,8 @@ fn six_workers_replaying_under_contention_make_no_private_stream_after_warm_up()
     let lanes = lanes(&gpu, 1);
     let lane = lanes.pool.lane(LaneId(0)).clone();
     let cache = SharedGraphCache::<CudaGpu, u32>::with_capacity(32);
+    lane.stock_forks(N).unwrap();
+    assert_eq!(lane.forks_made(), N);
 
     struct Add {
         kernel: CudaKernel,
@@ -618,10 +619,10 @@ fn six_workers_replaying_under_contention_make_no_private_stream_after_warm_up()
         (0, 0),
         "no recording failed on the device: {stats:?}"
     );
-    let made = lane.forks_made();
-    assert!(
-        (1..=N + 1).contains(&made),
-        "at most a stream per worker (and the recording's), however the takes raced: {made} (stats {stats:?})"
+    assert_eq!(
+        lane.forks_made(),
+        N,
+        "no stream was made beyond the stocked six: a take missed one (stats {stats:?})"
     );
     assert!(stats.replays > 1_000, "{stats:?}");
 }

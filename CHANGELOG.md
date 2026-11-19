@@ -3,17 +3,17 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
-## Three `euhedral-gpu` test defects: a ring pin test, a replay stream count, a panicking marked submission (2026-11-19)
+## A fake lane keeps its marker slot through a panic, and two lane tests stop depending on scheduling (`euhedral-gpu`) (2026-11-19)
 
-**What.** The fake lane's `submit_marked` gives its reserved marker slot back when the closure panics. The ring's pin race test no longer asserts that the race granted a pin; a single-threaded test pins the grant. The replay-contention device test bounds the streams the lane made by the worker count instead of by the count after warm-up.
+**What.** The fake lane's `submit_marked` gives its reserved marker slot back when the closure panics. The ring's pin race stress test is replaced by a Loom test of `pin` against `reserve` and `Claim::record`. The replay-contention device test stocks the lane with one stream per worker first and asserts none is made beyond them. A test hook `stock_forks` (feature `test-hooks`) stocks a CUDA lane's private streams.
 
-**Why.** A panic in the closure left the slot reserved for the fake device's life, so enough panics made every later marker answer `Busy` (the CUDA lane's claim already gives its slot up on drop). The ring test failed on a loaded runner when the scheduler never let a pin through. The device test failed about one run in twenty with one more stream than the warm-up had made: a worker that had not overlapped the others in the warm-up takes its first private stream later, which is the lane working, not a missed take.
+**Why.** A panic in the closure left the slot reserved for the fake device's life, so enough panics made every later marker answer `Busy` (the CUDA lane's claim already gives its slot up on drop). The ring stress test asserted that its race granted a pin, which a loaded runner did not do. The device test failed about one run in twenty with one more stream than the warm-up had made: a worker that had not overlapped the others in the warm-up takes its first private stream later, which is the lane working, not a missed take.
 
-**How to use.** Nothing to change.
+**How to use.** Nothing to change. In the ring, the model build (`--cfg loom`) yields in the claimant's wait and orders the pin handshake with fences, since the model checker does not order SeqCst accesses against each other.
 
-**Semantics.** A marked submission on the fake lane holds its slot from the reservation until the marker is pushed; an error or a panic before that releases it. No change to the ring, replay or stream code.
+**Semantics.** A marked submission on the fake lane holds its slot from the reservation until the marker is pushed; an error or a panic before that releases it. A CUDA lane makes a private stream only when more workers overlap than ever did; with N streams stocked and at most N holders, none is made. No change to ring, replay or stream behaviour outside the model build.
 
-**Tests.** `a_panicking_submission_gives_its_marker_slot_back` (fails on the old code: the lane stays `Busy` after two panics); `a_pin_on_a_slot_nobody_re_records_is_granted_and_sees_its_marker` (ring); the replay-contention device test asserts at most one stream per worker (and the recording's) after 1,560 rounds.
+**Tests.** `a_panicking_submission_gives_its_marker_slot_back` (fails on the old code: the lane stays `Busy`). `loom_a_granted_pin_sees_its_own_marker_in_the_slot` (fails when the claimant does not wait out a pin). `six_workers_replaying_on_a_lane_stocked_with_six_streams_make_no_other_stream` (device): six streams before and after 1,560 contended rounds.
 
 ## `AsyncIo` runs where the system refuses io_uring (`euhedral-io`) (2026-11-19)
 
