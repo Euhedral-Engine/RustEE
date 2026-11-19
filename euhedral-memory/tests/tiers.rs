@@ -944,3 +944,69 @@ fn a_stop_matched_completion_stays_first() {
         "the refused one is not sent to the back"
     );
 }
+
+#[test]
+fn completions_are_pushed_one_request_at_a_time() {
+    let r = rig([4, 4, 4], 8);
+    let o = r
+        .planner
+        .open_owner(OwnerSpec::new("consumer", Priority(50), Scope::Process));
+    let source = r.mover.moves();
+    let keep = Arc::new(Keep::default());
+    source.clone().add_downstream(keep.clone());
+    let seen: Arc<std::sync::Mutex<Vec<MoveDone>>> = Arc::default();
+    for _ in 0..3 {
+        moved(&r, o, &seen);
+    }
+    settle(&r.mover);
+    source.request(1);
+    source.request(1);
+    keep.run();
+    assert_eq!(seen.lock().unwrap().len(), 2, "two asked for, two pushed");
+}
+
+#[test]
+fn a_pull_pushes_completions_within_the_demand_a_request_banked_and_banks_none() {
+    let r = rig([4, 4, 4], 8);
+    let o = r
+        .planner
+        .open_owner(OwnerSpec::new("consumer", Priority(50), Scope::Process));
+    let source = r.mover.moves();
+    let keep = Arc::new(Keep::default());
+    source.clone().add_downstream(keep.clone());
+    let seen: Arc<std::sync::Mutex<Vec<MoveDone>>> = Arc::default();
+    // Demand for two is banked while nothing is done; the moves finish after.
+    source.request(2);
+    keep.run();
+    for _ in 0..3 {
+        moved(&r, o, &seen);
+    }
+    settle(&r.mover);
+    let mut none = |_: Box<dyn Frame>| panic!("no demand of its own");
+    assert_eq!(source.pull(&mut none, &mut |_| true, 0), 0);
+    keep.run();
+    assert_eq!(seen.lock().unwrap().len(), 2, "the banked demand");
+    assert_eq!(source.pull(&mut none, &mut |_| true, 0), 0);
+    keep.run();
+    assert_eq!(seen.lock().unwrap().len(), 2, "a pull banks nothing");
+}
+
+#[test]
+fn a_completion_a_pull_refused_is_pushed_first_by_the_next_request() {
+    let r = rig([4, 4, 4], 8);
+    let o = r
+        .planner
+        .open_owner(OwnerSpec::new("consumer", Priority(50), Scope::Process));
+    let seen: Arc<std::sync::Mutex<Vec<MoveDone>>> = Arc::default();
+    let first = moved(&r, o, &seen);
+    let second = moved(&r, o, &seen);
+    settle(&r.mover);
+    let source = r.mover.moves();
+    let keep = Arc::new(Keep::default());
+    source.clone().add_downstream(keep.clone());
+    assert_eq!(source.pull(&mut |_| panic!("refused"), &mut |_| true, 8), 0);
+    source.request(8);
+    keep.run();
+    let order: Vec<_> = seen.lock().unwrap().iter().map(|d| d.resident).collect();
+    assert_eq!(order, vec![first, second]);
+}

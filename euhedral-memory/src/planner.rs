@@ -1284,6 +1284,25 @@ impl GiveBacks {
     }
 }
 
+impl GiveBacks {
+    /// Pushes the queued orders (the held head first) within the demand a `request` banked.
+    fn push_banked(&self, inside: &mut Inside) {
+        let Some(downstream) = self.downstream.get() else {
+            return;
+        };
+        if inside.demand == 0 {
+            return;
+        }
+        let emitted = self.emit(
+            &mut inside.held,
+            &mut |f| downstream.push(f),
+            &mut |_| false,
+            inside.demand,
+        );
+        inside.demand -= emitted;
+    }
+}
+
 impl LatticeSource for GiveBacks {
     fn add_downstream(self: Arc<Self>, downstream: Arc<dyn LatticeReceiver>) {
         if self.complete.load(Ordering::Acquire) {
@@ -1304,6 +1323,9 @@ impl LatticeSource for GiveBacks {
         let Some(mut inside) = self.inside.try_enter() else {
             return 0;
         };
+        // A busy worker's pull is the only visit some sources get: it also pushes what the demand a request banked
+        // asks for, and banks nothing itself.
+        self.push_banked(&mut inside);
         self.emit(&mut inside.held, consumer, stop, demand)
     }
 
@@ -1318,14 +1340,7 @@ impl LatticeSource for GiveBacks {
             return;
         };
         inside.demand = inside.demand.saturating_add(demand);
-        let wanted = inside.demand;
-        let emitted = self.emit(
-            &mut inside.held,
-            &mut |f| downstream.push(f),
-            &mut |_| false,
-            wanted,
-        );
-        inside.demand -= emitted;
+        self.push_banked(&mut inside);
     }
 
     fn complete(&self) {

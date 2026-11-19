@@ -636,14 +636,18 @@ fn a_give_back_order_runs_its_handler_only_when_its_frame_executes() {
     assert_eq!(got.lock().unwrap().len(), 1);
 }
 
-/// Two elastic orders to one owner, the first for `GIB` and the second for `2 * GIB` (a claim of 3 GiB less the 1 GiB ordered), with the handler logging them.
-fn two_orders() -> (
+/// Three elastic orders to one owner, for `GIB`, `2 * GIB` and `3 * GIB` (each claim less what is already ordered), with
+/// the handler logging them. `before` runs first, with the planner.
+fn three_orders(
+    before: impl FnOnce(&std::sync::Arc<Planner>),
+) -> (
     std::sync::Arc<Planner>,
     std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
     euhedral_memory::Elastic,
 ) {
     use std::sync::{Arc, Mutex};
     let p = two_locations();
+    before(&p);
     let dev = p.location(LocationKind::Device { ordinal: 0 }).unwrap();
     let got: Arc<Mutex<Vec<u64>>> = Arc::default();
     let g = got.clone();
@@ -659,6 +663,10 @@ fn two_orders() -> (
     ));
     assert!(matches!(
         p.claim_or_reclaim(plan, dev, 3 * GIB, "y"),
+        ClaimResult::Reclaiming(_)
+    ));
+    assert!(matches!(
+        p.claim_or_reclaim(plan, dev, 6 * GIB, "z"),
         ClaimResult::Reclaiming(_)
     ));
     (p, got, held)
@@ -706,37 +714,37 @@ fn an_order_enqueued_after_demand_was_banked_is_delivered_by_the_next_request() 
 fn orders_are_pushed_only_within_the_demand_asked_for() {
     use euhedral_core::generics::LatticeSource;
     use std::sync::Arc;
-    let (p, got, _held) = two_orders();
+    let (p, got, _held) = three_orders(|_| {});
     let source = p.give_backs();
     let keep = Arc::new(Keep::default());
     source.clone().add_downstream(keep.clone());
     source.request(1);
     assert_eq!(keep.frames.lock().unwrap().len(), 1, "one asked for");
-    assert_eq!(p.orders_pending(), 1);
+    assert_eq!(p.orders_pending(), 2);
     source.request(1);
-    assert_eq!(keep.frames.lock().unwrap().len(), 2);
+    assert_eq!(keep.frames.lock().unwrap().len(), 2, "one more, not two");
     source.request(4);
     assert_eq!(
         keep.frames.lock().unwrap().len(),
-        2,
+        3,
         "nothing more is there"
     );
     for mut f in std::mem::take(&mut *keep.frames.lock().unwrap()) {
         f.execute().unwrap();
         f.do_finally();
     }
-    assert_eq!(*got.lock().unwrap(), vec![GIB, 2 * GIB]);
+    assert_eq!(*got.lock().unwrap(), vec![GIB, 2 * GIB, 3 * GIB]);
 }
 
 #[test]
 fn a_stop_matched_order_stays_first_for_its_owner() {
     use euhedral_core::generics::LatticeSource;
-    let (p, got, _held) = two_orders();
+    let (p, got, _held) = three_orders(|_| {});
     let source = p.give_backs();
     assert_eq!(source.pull(&mut |_| panic!("refused"), &mut |_| true, 8), 0);
-    assert_eq!(p.orders_pending(), 2, "the refused order still counts");
+    assert_eq!(p.orders_pending(), 3, "the refused order still counts");
     let mut frames = Vec::new();
-    assert_eq!(source.pull(&mut |f| frames.push(f), &mut |_| false, 8), 2);
+    assert_eq!(source.pull(&mut |f| frames.push(f), &mut |_| false, 8), 3);
     assert_eq!(p.orders_pending(), 0);
     for mut f in frames {
         f.execute().unwrap();
@@ -744,7 +752,50 @@ fn a_stop_matched_order_stays_first_for_its_owner() {
     }
     assert_eq!(
         *got.lock().unwrap(),
-        vec![GIB, 2 * GIB],
+        vec![GIB, 2 * GIB, 3 * GIB],
         "the refused order is not sent to the back"
     );
+}
+
+#[test]
+fn a_pull_pushes_queued_orders_within_the_demand_a_request_banked_and_banks_none() {
+    use euhedral_core::generics::LatticeSource;
+    use std::sync::Arc;
+    let keep = Arc::new(Keep::default());
+    let k = keep.clone();
+    // Demand for two is banked while nothing is queued; the orders come after, and only a pull visits the source.
+    let (p, _got, _held) = three_orders(move |p| {
+        let source = p.give_backs();
+        source.clone().add_downstream(k);
+        source.request(2);
+    });
+    let source = p.give_backs();
+    assert_eq!(keep.frames.lock().unwrap().len(), 0);
+    let mut none = |_: Box<dyn euhedral_core::frames::Frame>| panic!("no demand of its own");
+    assert_eq!(source.pull(&mut none, &mut |_| true, 0), 0);
+    assert_eq!(keep.frames.lock().unwrap().len(), 2, "the banked demand");
+    assert_eq!(source.pull(&mut none, &mut |_| true, 0), 0);
+    assert_eq!(
+        keep.frames.lock().unwrap().len(),
+        2,
+        "a pull banks nothing: the third waits"
+    );
+    assert_eq!(p.orders_pending(), 1);
+}
+
+#[test]
+fn an_order_a_pull_refused_is_pushed_first_by_the_next_request() {
+    use euhedral_core::generics::LatticeSource;
+    use std::sync::Arc;
+    let (p, got, _held) = three_orders(|_| {});
+    let source = p.give_backs();
+    let keep = Arc::new(Keep::default());
+    source.clone().add_downstream(keep.clone());
+    assert_eq!(source.pull(&mut |_| panic!("refused"), &mut |_| true, 8), 0);
+    source.request(8);
+    for mut f in std::mem::take(&mut *keep.frames.lock().unwrap()) {
+        f.execute().unwrap();
+        f.do_finally();
+    }
+    assert_eq!(*got.lock().unwrap(), vec![GIB, 2 * GIB, 3 * GIB]);
 }

@@ -20,16 +20,18 @@
 //!   consumer's end of the queue lives in the source's [`SourceCell`]. A call is made inside the cell, and a drain also
 //!   makes the calls queued while it runs. A thread that finds the cell entered does not see an empty queue, it sees a
 //!   busy one: [`DeferredCalls::drain`] returns 0 at once and [`DeferredCalls::run_through`] waits.
-//! - **Key frames.** The calls leave as blocking key frames, by request and push, never by pull: [`DeferredCalls::pull`]
-//!   hands out nothing. The owner gives the source a receiver that feeds the lattice that may block
-//!   (`add_downstream`; a queue the lattice already reads is enough) and asks for frames with `request`. A frame drains the whole
-//!   queue.
-//! - **When the frame leaves.** Only a worker's `request` on the source pushes it, when calls are queued and either the attached lane pool has nothing in flight ([`LanePool::idle`], every lane's last marker reached), or a
+//! - **Key frames.** The calls leave as blocking key frames, pushed, never handed out: [`DeferredCalls::pull`] hands out
+//!   nothing. The owner gives the source a receiver that is a vertex of the lattice that may block (`add_downstream`) and
+//!   asks for frames with `request`. The frames are pushed only while a worker of that lattice visits the source (a `request`,
+//!   or a `pull` within the demand a `request` banked): a receiver that is not a vertex whose workers visit the source, or that
+//!   requests once and is never visited again, never gets a call queued later, so frees never drain and `drain_soon` and the
+//!   bounds do nothing. A frame drains the whole queue.
+//! - **When the frame leaves.** Only a worker's visit to the source (`request`, or `pull`) pushes it, when calls are queued and either the attached lane pool has nothing in flight ([`LanePool::idle`], every lane's last marker reached), or a
 //!   bound is passed (the queued **device** bytes reach [`Bounds::max_bytes`], or the oldest call has waited
 //!   [`Bounds::max_age`]), or a thread asked for one with [`DeferredCalls::drain_soon`]. **A forced drain stalls every
 //!   stream's markers for as long as the kernels running at that moment.** `defer` and `drain_soon` only queue and set a
-//!   flag; they never push, so a call or a drain request waits for the next `request` a worker makes on the source (a
-//!   worker that finds nothing to do asks again on every cycle).
+//!   flag; they never push, so a call or a drain request waits for the next visit of a worker to the source (a
+//!   worker that finds nothing to do asks again on every cycle; a busy one pulls).
 //! - **Bytes.** A call carries the bytes it gives back and where ([`Place`]): [`DeferredCalls::pending_bytes`] says how
 //!   much, per place, for a planner that counts it as certain reclaim.
 //! - **Tickets.** `defer` returns a [`Ticket`]. [`DeferredCalls::run_through`] makes every call that is queued when it is
@@ -562,13 +564,22 @@ impl LatticeSource for DeferredCalls {
         self.downstream.attach(self.clone(), downstream);
     }
 
-    /// Hands out nothing: the calls leave as key frames, by [`request`](Self::request) and push.
+    /// Hands out nothing: the calls leave as key frames, pushed. A busy worker's pull is the visit some lattices give the
+    /// source, so it pushes the drain frame too when one is due, within the demand a `request` banked; it banks nothing.
     fn pull(
         &self,
         _consumer: &mut dyn FnMut(Box<dyn Frame>),
         _stop: &mut dyn FnMut(&dyn Frame) -> bool,
         _demand: u64,
     ) -> u64 {
+        if self.downstream.is_complete() {
+            return 0;
+        }
+        if let Some(mut banked) = self.demand.try_enter()
+            && self.due()
+        {
+            self.push_frame(&mut banked);
+        }
         0
     }
 
@@ -922,6 +933,29 @@ mod tests {
         assert_eq!(frames.0.lock().unwrap().len(), 1, "the next request pushes");
         assert_eq!(run(&frames), 1);
         assert_eq!(calls.pending(), 0);
+    }
+
+    #[test]
+    fn a_pull_pushes_the_drain_frame_within_the_demand_a_request_banked() {
+        let calls = DeferredCalls::new(Bounds::default());
+        let frames = Arc::new(Frames::default());
+        calls.clone().add_downstream(frames.clone());
+        let pool = Arc::new(LanePool::new(vec![Arc::new(Lane {
+            id: QueueId::next(),
+            issued: 1.into(),
+            completed: 1.into(),
+        })]));
+        calls.attach_pool(&pool).unwrap();
+        // Demand is banked while nothing waits; a call comes later and only a pull visits the source.
+        calls.request(1);
+        calls.handle().defer(Place::Device, 0, || {});
+        assert_eq!(frames.0.lock().unwrap().len(), 0);
+        assert_eq!(calls.pull(&mut |_| {}, &mut |_| false, 0), 0);
+        assert_eq!(frames.0.lock().unwrap().len(), 1, "the pull pushed it");
+        assert_eq!(run(&frames), 1);
+        calls.handle().defer(Place::Device, 0, || {});
+        assert_eq!(calls.pull(&mut |_| {}, &mut |_| false, 0), 0);
+        assert_eq!(frames.0.lock().unwrap().len(), 0, "a pull banks nothing");
     }
 
     #[test]

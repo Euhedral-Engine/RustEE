@@ -74,7 +74,13 @@ time (no toolkit, no link-time dependency).
   their call (with the bytes it gives back) instead of making it where the memory is dropped. The source makes the queue
   as one blocking key frame when its lane pool has nothing in flight (`LanePool::idle`: every lane's last marker reached),
   or when queued device bytes or the oldest call's age pass a bound, or when a thread asked with `drain_soon` (a forced drain stalls the markers for as long as the kernels
-  running at that moment). `defer` and `drain_soon` only queue and set a flag: the frame is pushed by the next `request` a worker makes on the source, never from the producer's thread (a free waits for that visit; a worker that has nothing to do asks again on every cycle). An allocation that fails with out-of-memory (`DeviceMemory`, `PinnedHost`, `Vmm::alloc_vmm`,
+  running at that moment). `defer` and `drain_soon` only queue and set a flag: the frame is pushed by the next visit a
+  worker makes to the source (a `request`, or a `pull` within the demand a `request` banked), never from the
+  producer's thread. A free waits for that visit; a worker with nothing to do asks again on every cycle, and a busy
+  one pulls. The receiver must be a vertex of the lattice whose workers visit the source: one that requests once and
+  is never visited again never gets a later call, so frees never drain and `drain_soon` and the bounds do nothing. An
+  owner that called `poll` from a tick now calls `request(1)` on the source there. An allocation that fails with
+  out-of-memory (`DeviceMemory`, `PinnedHost`, `Vmm::alloc_vmm`,
   `StreamPool`) makes the queued calls through a ticket and tries once more; `pending_bytes(Place)` is the memory a planner may
   count as certain reclaim (a lane's worker counts it and calls `drain_soon`, it does not drain); `free_blocks` reports that a free no longer waits when a deferral is attached. Measured not to
   hold up another stream's marker: `cuMemAlloc`, `cuMemAllocAsync`/`cuMemFreeAsync`, stream and event create/destroy,

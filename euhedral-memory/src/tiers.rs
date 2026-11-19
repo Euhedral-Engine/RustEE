@@ -1357,6 +1357,23 @@ impl Moves {
         n
     }
 
+    /// Pushes the queued completions (the held head first) within the demand a `request` banked.
+    fn push_banked(&self, inside: &mut Inside) {
+        let Some(downstream) = self.downstream.get() else {
+            return;
+        };
+        if inside.demand == 0 {
+            return;
+        }
+        let emitted = self.emit(
+            &mut inside.held,
+            &mut |f| downstream.push(f),
+            &mut |_| false,
+            inside.demand,
+        );
+        inside.demand -= emitted;
+    }
+
     /// Whether the pump frame is wanted now: the source is not complete, there is a downstream, and a pump is due. A
     /// freed slot asks for a pump at once; only the polling (copies in flight, a resident that could not be brought
     /// home) is paced.
@@ -1409,6 +1426,9 @@ impl LatticeSource for Moves {
         let Some(mut inside) = self.inside.try_enter() else {
             return 0;
         };
+        // A busy worker's pull is the only visit some sources get: it also pushes what the demand a request banked
+        // asks for (never the pump frame: that is long), and banks nothing itself.
+        self.push_banked(&mut inside);
         self.emit(&mut inside.held, consumer, stop, demand)
     }
 
@@ -1419,17 +1439,8 @@ impl LatticeSource for Moves {
         let Some(mut inside) = self.inside.try_enter() else {
             return;
         };
-        if let Some(downstream) = self.downstream.get() {
-            inside.demand = inside.demand.saturating_add(demand);
-            let wanted = inside.demand;
-            let emitted = self.emit(
-                &mut inside.held,
-                &mut |f| downstream.push(f),
-                &mut |_| false,
-                wanted,
-            );
-            inside.demand -= emitted;
-        }
+        inside.demand = inside.demand.saturating_add(demand);
+        self.push_banked(&mut inside);
         self.push_pump();
     }
 
