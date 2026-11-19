@@ -120,17 +120,32 @@ pub struct FrameHeader {
     routing_hash: u64,
     origin: Option<CpuInfo>,
     routing_policy: RoutingPolicy,
-    placement: Option<PlacementMark>,
+    placement: PlacementMark,
     kill_switch: Option<Arc<AtomicBool>>,
 }
 
-/// What a placement policy overwrote: the owner's policy and origin, and the origin the policy set. A later
-/// placement restores the owner's two while the header still carries the policy's mark.
+/// What a placement policy overwrote, and which fields it wrote last. The owner's public setters clear the flag of
+/// the field they write, so a later placement restores only fields still carrying the policy's own mark. It sits in the
+/// padding of the header.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PlacementMark {
+    /// The routing policy the owner had, valid while `policy_marked`.
     pub(crate) owner_policy: RoutingPolicy,
-    pub(crate) owner_origin: Option<CpuInfo>,
-    pub(crate) placed_origin: CpuInfo,
+    /// The CPU of the origin the owner had (`NO_CPU` for none), valid while `origin_marked`.
+    pub(crate) owner_cpu: u16,
+    pub(crate) policy_marked: bool,
+    pub(crate) origin_marked: bool,
+}
+
+impl PlacementMark {
+    /// The `owner_cpu` of a frame with no origin.
+    pub(crate) const NO_CPU: u16 = u16::MAX;
+    const NONE: Self = Self {
+        owner_policy: RoutingPolicy::Anywhere,
+        owner_cpu: Self::NO_CPU,
+        policy_marked: false,
+        origin_marked: false,
+    };
 }
 
 impl FrameHeader {
@@ -141,7 +156,7 @@ impl FrameHeader {
             routing_hash: id_hash,
             origin: None,
             routing_policy: RoutingPolicy::Anywhere,
-            placement: None,
+            placement: PlacementMark::NONE,
             kill_switch: None,
         }
     }
@@ -187,24 +202,38 @@ impl FrameHeader {
         self.origin
     }
 
+    /// Sets the origin as the owner's: a placement policy no longer treats it as its own mark.
     pub fn set_origin(&mut self, origin: Option<CpuInfo>) {
         self.origin = origin;
+        self.placement.origin_marked = false;
     }
 
     pub fn routing_policy(&self) -> RoutingPolicy {
         self.routing_policy
     }
 
+    /// Sets the routing policy as the owner's: a placement policy no longer treats it as its own mark.
     pub fn set_routing_policy(&mut self, routing_policy: RoutingPolicy) {
         self.routing_policy = routing_policy;
+        self.placement.policy_marked = false;
     }
 
-    pub(crate) fn placement(&self) -> Option<PlacementMark> {
-        self.placement
+    /// Writes the fields a placement policy chose, keeping `mark` (what it overwrote) for the next placement.
+    pub(crate) fn place(&mut self, mark: PlacementMark, origin: CpuInfo, policy: RoutingPolicy) {
+        self.placement = mark;
+        self.origin = Some(origin);
+        self.routing_policy = policy;
     }
 
-    pub(crate) fn set_placement(&mut self, placement: Option<PlacementMark>) {
-        self.placement = placement;
+    /// Puts back the fields a placement policy marked, given the origin to restore.
+    pub(crate) fn unplace(&mut self, origin: impl FnOnce(u16) -> Option<CpuInfo>) {
+        let mark = std::mem::replace(&mut self.placement, PlacementMark::NONE);
+        if mark.policy_marked {
+            self.routing_policy = mark.owner_policy;
+        }
+        if mark.origin_marked {
+            self.origin = origin(mark.owner_cpu);
+        }
     }
 
     pub fn kill_switch(&self) -> Option<&Arc<AtomicBool>> {

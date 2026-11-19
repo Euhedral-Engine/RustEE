@@ -5,15 +5,15 @@ semantics and the tests that pin it.
 
 ## A frame placed again is judged on its owner's policy, not on the picker's mark (`euhedral-core`) (2026-11-19)
 
-**What.** `PlacementPicker::pick` remembers the routing policy and origin the owner had set (a private mark in the frame header, with the origin it chose) and, on the next placement of the same header, puts them back before it calls the predicate.
+**What.** `PlacementPicker::pick` remembers the routing policy and origin the owner had set and, on the next placement of the same header, puts back each one the owner has not written since, before it calls the predicate. `FrameHeader::set_routing_policy` and `set_origin` mark their field as the owner's (any call, whatever the value); the picker writes through private setters that keep its mark. The mark is the owner's policy (one byte), the owner's origin as a CPU index (`u16`) and two flags, in the header's padding: the header stays 64 bytes.
 
-**Why.** The picker marks every frame it places `CacheLocal` with the chosen CPU. A key frame (Completions, AsyncIo, Moves) is pushed again with its header kept, so it arrived already `CacheLocal` and a predicate such as `policy == CacheLocal` sent it to set A on its second push, behind a long call.
+**Why.** The picker marks every frame it places `CacheLocal` with the chosen CPU. A key frame (Completions, AsyncIo, Moves) is pushed again with its header kept, so it arrived already `CacheLocal` and a predicate such as `policy == CacheLocal` sent it to set A on its second push, behind a long call. A pooled frame had the same fault: `FrameFactory::replace` stamps its own origin and leaves the policy.
 
 **How to use.** Nothing to change. The predicate's contract is on `PlacementPicker::new`: it sees the frame as its owner left it, on a first and on every later placement.
 
-**Semantics.** The restore happens only if the header still carries the picker's mark (policy `CacheLocal` and the origin it set); a policy or origin the owner set since is kept and judged. A frame that cannot be placed on a later push keeps the owner's fields. No other placement behaviour changes; the header grows by one private field.
+**Semantics.** A field the owner wrote after a placement (even with the value the picker wrote) is judged as written; a field it did not write is restored. `FrameFactory::replace` and `create` write the origin through the public setter, so a recycled frame is judged on the factory's origin and the owner's policy. A frame that cannot be placed on a later push keeps the owner's fields. An owner origin that is not one of the picker's topology CPUs cannot be given back, so a later placement sees the picker's origin in its place.
 
-**Tests.** `a_frame_placed_again_is_judged_on_its_owners_policy_both_times` (fails on the old code: the second call sees the picker's origin) and `a_frame_the_owner_re_marked_is_judged_on_the_new_marks`.
+**Tests.** `an_untouched_frame_pushed_again_stays_out_of_the_set_for_long_calls`, `an_owner_policy_survives_a_placement_and_the_origin_comes_back_too` and `a_recycled_frame_is_judged_on_the_policy_its_owner_left` (each fails on the code without the restore). `an_owner_that_marks_a_placed_frame_as_long_sends_it_to_set_a` and `the_header_does_not_grow` (64 bytes) are guards: they pass on the old code and pin the owner's own re-mark and the header size.
 
 ## A panic in `AsyncIo`'s completion and refusal paths neither stalls a ring nor skews the counts (`euhedral-io`) (2026-11-19)
 
