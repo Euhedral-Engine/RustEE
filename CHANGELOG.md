@@ -3,6 +3,47 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## A quantum retires on a lane it used (`euhedral-graph`) (2026-11-19)
+
+**What.** A `StageGraph` quantum arms its retirement on a lane it used, not always on its run's home lane. With one lane used, that lane; with several, its home lane when it is one of them, else the lowest of them that has control. The other lanes it used join that lane first, as before.
+
+**Why.** A run takes its home lane in turn over the pool. A quantum whose stages all ran on another lane retired behind whatever unrelated work sat on its home lane: a short query beside long documents waited for the documents' device work although its own finished in milliseconds.
+
+**How to use.** Nothing changes for callers; no new option.
+
+**Semantics.**
+- Every lane the quantum used is still joined before `retire` and the `retired` hooks run, and a killed quantum still holds for every host completion and the latest marker of each lane it used.
+- The home lane is still the retire lane when a stage that never submitted names a lane (its `abandoned` hook may enqueue on home, which the retirement must cover), and when the quantum used it. It stays the lane roots continue and the lane `abandoned` receives; a quantum that used no lane arms no retirement unless such a hook ran (the lane-less conclusion of 2026-11-05 is unchanged).
+- With several lanes used and none of them home, the lowest with control is chosen: any lane is correct, because the others are joined on the device.
+
+**Tests.** `stage_graph.rs`: `a_quantum_retires_on_a_lane_it_used_not_behind_work_on_its_home_lane` (fails on the old code: the retirement was armed on the held home lane) and `a_quantum_that_used_two_lanes_retires_after_joining_both`.
+
+## `Completions::lateness_us` measures from when a wait could first have been seen done (`euhedral-graph`) (2026-11-19)
+
+**What.** A wait claimed by a lane's retirement (`after_retired`) is measured from the instant the callback arrived (`RetireCell::arrive` stamps it), not from the registration or the last look. A timer was already measured from its deadline. A marker, a `Ready`, a `Wake` and a `Pending` keep the last look.
+
+**Why.** A retirement that rings the source's bell is not polled before it rings, so its last look stayed the registration and the poll that found it done counted the whole wait (a long callback) as lateness: a maximum of 113,546 us for a 110 ms wait, against a true lateness of a few hundred us.
+
+**How to use.** Nothing changes for callers; the numbers from `lateness_us` for such waits drop to the real delay of the poll. `RetireCell::arrive` reads the clock once.
+
+**Semantics.** Each sample is the poll that found the wait done minus: the deadline (timer), the arrival of the callback (retirement, rung or polled blind), the last look that found it in flight or its registration (the polled kinds, an upper bound of at most one blind-poll window). `rearm` clears the stamp.
+
+**Tests.** `lateness_of_a_timer_counts_from_its_deadline_not_its_registration` (a guard: the timer was already exact), `lateness_of_a_bell_gated_wait_counts_from_the_ring_not_its_registration` and `lateness_of_a_retirement_polled_blind_counts_from_its_arrival_too` (fail before), `lateness_of_a_polled_condition_counts_from_the_last_look` (guard).
+
+## CI runs the hot-path lock ratchet for every library change (CI) (2026-11-19)
+
+**What.** The workspace job runs `cargo test -p euhedral-core --test hot_fix_ratchet` whenever any crate is affected and `euhedral-core` is not (when it is, `cargo test` already runs it).
+
+**Why.** The ratchet counts `lock!` sites and `HOT-FIX` tags in every crate's library sources, but a change confined to another crate never affects `euhedral-core`, so a new lock site passed the pipeline that added it and turned main red.
+
+**How to use.** Nothing: a change that adds a lock site, or a tag use, fails its own pipeline.
+
+**Semantics.** One extra test binary on pipelines that do not affect `euhedral-core`; the GitLab child pipeline and `ci.yml` do the same.
+
+**Ratchet.** A file's `lock!` count in `LOCK_MACRO_SITES` still only shrinks (exact), except for a file on the new `LOCK_MACRO_CEILINGS` list, whose count is a ceiling (more sites fail, fewer pass). Only `euhedral-io/src/win/mod.rs` is on it, set far above its sites (1_000_000) until its locks go in the lock removal campaign, which removes the list. `HOT_FIX_TAGS` stays exact.
+
+**Tests.** `scripts/ci/test_gitlab_pipeline.py`: the ratchet step is present when only another crate is affected and absent when `euhedral-core` is (fails on the old script). `hot_fix_ratchet.rs`: an exact row fails with fewer or more sites, a ceiling row passes with fewer and fails with more.
+
 ## A killed quantum holds for everything it started, and killed waiting entries end at the next visit (`euhedral-graph`) (2026-11-19)
 
 **What.** A killed `StageGraph` quantum runs no `abandoned` hook, and lets go of nothing it holds, until every host completion it started is ready and the latest marker of each lane it used is reached. Before, only a stage that returned a completion held it, and an ordered stage's host completion with no marker held nothing once the kill ended it. In `Completions`, a waiting entry whose frame is killed (unordered, timer, marker, retirement, `Ready`, `Wake`) ends at the next visit of the source as a dead continuation, not only a chain head.
