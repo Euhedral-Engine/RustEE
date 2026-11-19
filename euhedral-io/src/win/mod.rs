@@ -470,7 +470,10 @@ enum Taken {
 impl Engine {
     /// A new unconnected stream socket of `to`'s family, ready for a connect.
     pub(super) fn new_socket(&self, to: std::net::SocketAddr) -> io::Result<usize> {
-        self.sys.new_socket(to)
+        let socket = self.sys.new_socket(to)?;
+        // The system made the value new: whatever closed with it before is not this socket.
+        self.forget(socket);
+        Ok(socket)
     }
 
     /// An engine over `sys`. Fails if there is no completion port.
@@ -1023,6 +1026,16 @@ impl Engine {
         Ok(())
     }
 
+    /// Forgets a handle value: the OS gives a closed handle's value to a new handle, which is not the one this
+    /// engine joined. The engine calls this itself for every handle it makes (a socket, an accepted socket, an
+    /// opened file); for a handle the caller made, the caller says so before it closes it, with nothing in flight
+    /// on it. Without it, a new handle of the same value that sits on another port would pass for ours (the OS's
+    /// refusal would be taken for "already joined"), and a new file would be kept off a ring.
+    pub(super) fn forget(&self, handle: Handle) {
+        lock!(&self.associated).remove(&handle);
+        lock!(&self.ringed).remove(&handle);
+    }
+
     /// Joins the handle to the engine's port. A handle already on a port is refused by the OS
     /// with `ERROR_INVALID_PARAMETER`: that is fine only for a handle this engine joined.
     fn join_port(&self, handle: Handle) -> io::Result<()> {
@@ -1336,6 +1349,10 @@ impl Engine {
             (Kind::Read { .. }, Err(error)) if is_end_of_file(&error) => Ok(0),
             (_, result) => result,
         };
+        // A file the engine just opened has a value the system gave anew.
+        if let (Kind::Open { .. }, Ok(file)) = (&op.kind, &result) {
+            self.forget(*file);
+        }
         let ended = match (&op.kind, result) {
             (_, Ok(n)) if piecewise && n > 0 => {
                 op.moved += n;
@@ -1601,6 +1618,7 @@ impl EngineTrait for Engine {
                 self.check_handle(listener, true)?;
                 self.join_port(listener)?;
                 let socket = self.sys.accept_socket(listener)?;
+                self.forget(socket);
                 let mut op = Self::op(Kind::Accept { listener }, Route::Port, buf, then);
                 op.accepting = Some(Accepting {
                     socket,

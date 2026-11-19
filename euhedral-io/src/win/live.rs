@@ -502,6 +502,32 @@ fn an_accepted_socket_carries_bytes_both_ways() {
 }
 
 #[test]
+fn a_socket_forgotten_while_open_is_refused_afterwards_and_nothing_hangs() {
+    both(|io| {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        let sent = |tag| IoBuf {
+            bytes: vec![tag; 4],
+            filled: 4,
+        };
+        // The first operation joins the socket to the port.
+        io.send(stream.as_raw_socket(), sent(1), then(1)).unwrap();
+        assert_eq!(one(io).done.unwrap().result.unwrap(), 4);
+        let mut got = [0u8; 4];
+        peer.read_exact(&mut got).unwrap();
+        // Forgotten while still open: the system refuses its next join, and the engine no longer takes that for
+        // its own. The refusal is at the call (no operation is in flight, so nothing can hang).
+        io.forget_socket(stream.as_raw_socket());
+        let error = io
+            .send(stream.as_raw_socket(), sent(2), then(2))
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{error}");
+        assert_eq!(io.pending(), 0);
+    });
+}
+
+#[test]
 fn a_connect_through_the_engine_reaches_the_listener() {
     both(|io| {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();

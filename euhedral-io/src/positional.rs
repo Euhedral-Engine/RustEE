@@ -37,8 +37,13 @@ const INCOMING_CHUNK: usize = 256;
 /// one that finds its descriptor not ready after all included; an operation that readiness says is not ready is
 /// not attempted and costs nothing.
 const ATTEMPTS_PER_POLL: usize = 64;
-/// The most pieces of one read or write a poll moves in a row before the next operation's turn.
+/// The most pieces of one read or write a poll moves in a row before the next operation's turn, while other
+/// operations are also due. An operation that is the only one due in a visit goes on until the visit's attempt
+/// budget is used.
 const PIECES_PER_TURN: usize = 4;
+/// The most visits an open that cannot proceed yet (a FIFO with no reader, a leased file) lets pass between two
+/// of its attempts. The wait doubles from one visit up to this.
+const OPEN_RETRY_VISITS_MAX: u32 = 64;
 /// Marks this engine's ids, so that an id of the io_uring engine is never taken for one of this.
 const ID_MARK: u64 = 1 << 62;
 
@@ -175,6 +180,10 @@ struct Op {
     /// This visit: the operation asked `poll(2)` about its descriptor, and what it answered.
     waiting: bool,
     ready: bool,
+    /// An open that could not proceed: how many visits pass before it is attempted again, and the wait after
+    /// that one (doubling to [`OPEN_RETRY_VISITS_MAX`]).
+    skip: u32,
+    next_skip: u32,
 }
 
 /// What one step of an operation came to.
@@ -484,7 +493,14 @@ fn open_step(path: &CString, flags: i32, mode: libc::mode_t) -> Step {
     if fd < 0 {
         let error = last_error();
         if error.raw_os_error() == Some(libc::ENXIO) && is_fifo(path) {
-            // A FIFO opened for writing has no reader yet: try again at a later visit.
+            // A FIFO opened for writing has no reader yet, and nothing tells when one appears: try again at a
+            // later visit, with growing gaps.
+            return Step::Idle;
+        }
+        // A file leased to another process: the lease holder is told, and a blocking open waits for the lease to
+        // break (or the holder to let go) where the non-blocking one this makes is refused at once. The caller
+        // who asked for `O_NONBLOCK` gets the refusal.
+        if flags & libc::O_NONBLOCK == 0 && would_block(&error) && is_regular(path) {
             return Step::Idle;
         }
         if interrupted(&error) {
@@ -506,6 +522,16 @@ fn open_step(path: &CString, flags: i32, mode: libc::mode_t) -> Step {
         }
     }
     Step::Done(Ok(fd as usize))
+}
+
+fn is_regular(path: &CString) -> bool {
+    // SAFETY: `stat` is plain integers: all zeros is a valid value.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `path` is a NUL-terminated string; `stat` is valid for the call to write.
+    unsafe {
+        libc::stat(path.as_ptr(), &raw mut stat) == 0
+            && stat.st_mode & libc::S_IFMT == libc::S_IFREG
+    }
 }
 
 fn is_fifo(path: &CString) -> bool {
@@ -686,6 +712,8 @@ impl Engine for Positional {
             stream: false,
             waiting: false,
             ready: false,
+            skip: 0,
+            next_skip: 1,
         })));
         taken.set(true);
         Ok(OpId::new(self.id, 0, token))
@@ -764,6 +792,26 @@ impl Engine for Positional {
                 }
             }
         }
+        // Operations that will be attempted this visit: one that is not due (its descriptor is not ready, or it is
+        // backing off) is no rival for the budget. A lone one takes all of it.
+        let mut due = 0;
+        for op in active.iter_mut() {
+            let ending = op.cancelled || op.limit.is_some_and(|at| now >= at);
+            if op.skip > 0 && !ending {
+                // Backing off: this visit passes it by, as for an operation whose descriptor is not ready.
+                op.skip -= 1;
+                op.waiting = true;
+                op.ready = false;
+            } else if (!op.waiting || op.ready) && !op.cancelled {
+                op.skip = 0;
+                due += 1;
+            }
+        }
+        let turns = if due == 1 {
+            ATTEMPTS_PER_POLL
+        } else {
+            PIECES_PER_TURN
+        };
         let mut budget = ATTEMPTS_PER_POLL;
         for _ in 0..active.len() {
             let Some(mut op) = active.pop_front() else {
@@ -793,8 +841,12 @@ impl Engine for Positional {
                         }
                         break;
                     }
-                    Step::Again if turn < PIECES_PER_TURN && !op.stream => continue,
+                    Step::Again if turn < turns && !op.stream => continue,
                     Step::Again | Step::Idle => {
+                        if matches!(op.kind, Kind::Open { .. }) {
+                            op.skip = op.next_skip;
+                            op.next_skip = (op.next_skip * 2).min(OPEN_RETRY_VISITS_MAX);
+                        }
                         active.push_back(op);
                         break;
                     }
