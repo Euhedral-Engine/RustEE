@@ -93,8 +93,8 @@ pub trait Pending: Send {
 /// A cancelled entry is not queried: its `do_finally` may run before its marker is reached, its retirement arrived or
 /// its `Ready` got ready (the `Ready` is dropped, before the frame's `do_finally` runs). A consumer whose frame stands
 /// for work that may still use what it holds keeps that hold itself, past the cancellation: [`StageGraph`](crate::StageGraph)
-/// hands a marker to a wait whose frame has no kill switch and no order, and takes a host completion's `Ready` back
-/// when it is dropped unfinished, to register it again the same way, so no chain holds it and no cancellation ends it.
+/// hands a marker to a wait whose frame has no kill switch and no order, and keeps a host completion's `Ready` in the
+/// frame (the entry only polls it) to register it again the same way, so no chain holds it and no cancellation ends it.
 ///
 /// A continuation is handed out even if its frame has died (its kill switch is set): the executor then
 /// skips it and runs its `do_finally`, which ends what it holds. So at shutdown
@@ -648,6 +648,10 @@ impl Completions {
     /// the device may still use what its frame holds, and finishing the frame would release it. It
     /// is the choice an I/O ring makes for its in-flight buffers. Wherever a frame's resources
     /// could be released while the device may still use them, they are not.
+    ///
+    /// That is for a frame without a kill switch: a frame whose kill switch is set ends at the next visit of the
+    /// source, before its marker is reached, whatever it waits on. A consumer whose frame stands for work that may
+    /// still use what it holds registers a frame with no kill switch, or keeps the hold itself.
     fn cancel(&self, what: Waits) {
         let unreached = match &what {
             Waits::Marker(marker, _) => !self.reached(*marker),
@@ -665,10 +669,13 @@ impl Completions {
                 drop(ready);
                 frame.do_finally();
             }
-            Waits::Wake(_, frame)
-            | Waits::Marker(_, frame)
-            | Waits::Retired(_, frame)
-            | Waits::At(_, frame) => frame.do_finally(),
+            Waits::Wake(wake, frame) => {
+                drop(wake);
+                frame.do_finally();
+            }
+            Waits::Marker(_, frame) | Waits::Retired(_, frame) | Waits::At(_, frame) => {
+                frame.do_finally()
+            }
             Waits::Pending(pending) => drop(pending),
         }
     }
@@ -848,6 +855,10 @@ impl Completions {
 
     /// Emits `frame` once `marker`'s work completed (a completion edge on a device lane). A marker of a queue that
     /// is not in this source's pool is never reached, so its frame is never emitted.
+    ///
+    /// A frame whose kill switch is set is emitted (dead) at the next visit, before the marker is reached, as any
+    /// cancelled entry: a consumer that needs the marker reached before the frame ends registers a frame with no kill
+    /// switch, or keeps the hold itself.
     ///
     /// A source built [`without_lanes`](Self::without_lanes) has no lane for any marker, and refuses the registration
     /// the way one after [`complete`](LatticeSource::complete) is refused, except for what the frame holds: the marker

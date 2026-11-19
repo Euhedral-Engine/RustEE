@@ -301,7 +301,7 @@ runs again when a lane of the pool made progress, or after `GraphRuntime::retry_
 lane of the lattice. The graph's **kill switch** goes on every stage frame of a quantum; a killed
 quantum's unrun stages are `abandoned`, once everything it started has ended. A stage's host completion holds the
 quantum live until it is ready, also on a kill: the kill ends the completion's entry in `Completions` at the source's
-next visit (an ordered stage's chain goes on), the entry hands the host completion back, and the quantum's count passes
+next visit (an ordered stage's chain goes on), the host completion stays in a slot of the completion's pooled frame (the entry only polls it), and the quantum's count passes
 to one pooled wait for it with no kill switch and no chain. A killed quantum also waits, before it quiesces, for the
 latest marker of every lane it used, whichever stage submitted it and whether or not the stage returned a completion
 (a completion edge's retirement is waited for too). So no `abandoned` hook runs, and nothing the quantum holds is let
@@ -447,7 +447,8 @@ Windows.
 The tests are unit tests in each module (the stage graph's drives its sources by hand), the fake
 device's, and `tests/credit_graph.rs`: one lattice of 4 workers, with a per-item
 stage graph, a `Sequencer`, a two-end count as the pool lease, credit-bounded admission, a jump to a new generation and a
-pause, and a timing executor that fails the test if any frame callback runs over 200 µs without
-the OS preempting it. It takes a few seconds and runs on the CPUs in `EUHEDRAL_TEST_CPUS` (default
+pause, and a timing executor that reports every frame callback over 200 µs that the OS did not preempt,
+and fails the test on one only when `EUHEDRAL_TEST_TIMING` is set (run with `-- --nocapture` to
+see the report). It takes a few seconds and runs on the CPUs in `EUHEDRAL_TEST_CPUS` (default
 `0,1,2,3`); as with `euhedral-core`'s tests that need particular hardware, it passes without
 checking anything when the process may not run on all of them. It needs Linux.

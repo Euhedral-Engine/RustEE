@@ -9,15 +9,26 @@ semantics and the tests that pin it.
 
 **Why.** A stage's work (a model request, a driver call polled on the host, device work with a marker only) may still use what the quantum holds when the kill comes; quiescing runs the hooks that release it. A killed timer an hour out, or an entry whose condition never comes, occupied the source until it did.
 
-**How to use.** Nothing to change. A host completion that never gets ready, or a marker a lane never reaches, now holds a killed quantum for ever (it did for an unordered stage's completion already): make the `Ready` end when its work does.
+**How to use.** A `StageGraph` user changes nothing. A direct `Completions` user whose frame has a kill switch and waits on `after_marker` or `after_retired` now gets its `do_finally` before the marker is reached, at the next visit after a kill (before, only a chain head did): a consumer whose frame stands for work that may still use what it holds registers a frame with no kill switch, or keeps the hold itself. A host completion that never gets ready, or a marker a lane never reaches, now holds a killed quantum for ever (it did for an unordered stage's completion already): make the `Ready` end when its work does.
 
 **Semantics.**
 - The kill is found at the next visit of the source (a poll); it does not wake it, and an entry behind a chain head ends when it becomes the head.
-- The entry's `Ready` is dropped before its frame's `do_finally` runs. The stage graph registers its host completions through a handoff that, dropped unfinished, gives the `Ready` back; the dead completion frame takes it and waits for it again in a frame with no kill switch and no order, then for the stage's marker if that is not reached. Nothing waits in a `Drop`.
+- The entry's `Ready` is dropped before its frame's `do_finally` runs. The stage graph keeps a host completion in a slot of the pooled completion frame, which the source's entry only polls (a `Wake`, no allocation of its own); the dead completion frame takes it from the slot and waits for it again in a frame with no kill switch and no order, then for the stage's marker if that is not reached. Nothing waits in a `Drop`.
 - When the last frame of a killed quantum ends, the quantum waits for the latest marker of each lane it used (one pooled frame per unreached lane) before it quiesces. A quantum that fails without a kill is unchanged.
 - Nothing changes for a quantum that is not killed.
 
-**Tests.** `completions.rs`: a killed unordered entry, a killed timer and a killed marker whose conditions never come end at the next reap and `pending` drops. `stage_graph.rs`: a killed quantum with a marker-only stage queued runs no `abandoned` hook until the marker is reached; a killed quantum whose ordered or unordered stage returned a host completion with no marker runs none until it is ready; the existing kill tests also make the host completions ready before the hooks. These fail on the old code.
+**Tests.** `completions.rs`: a killed unordered entry, a killed timer and a killed marker whose conditions never come end at the next reap and `pending` drops. `stage_graph.rs`: a killed quantum with a marker-only stage queued runs no `abandoned` hook until the marker is reached; a killed quantum whose stage returned a host completion with no marker runs none until it is ready (ordered and unordered: only the ordered half fails on the old code, the unordered one passes there); the existing kill tests also make the host completions ready before the hooks. These fail on the old code.
+## The credit-graph timing checks are opt-in (`euhedral-graph` tests) (2026-11-19)
+
+**What.** `euhedral-graph/tests/credit_graph.rs` prints the number of frame callbacks over 200 µs and the shutdown time, and asserts them only when `EUHEDRAL_TEST_TIMING` is set. Every functional check stays asserted.
+
+**Why.** On a busy machine the slow-pack test failed with one callback over 200 µs although every count was right: the delay came with no involuntary context switch (CPU quota, hypervisor steal, a hardware sibling), which the preemption count cannot tell apart from a slow frame.
+
+**How to use.** `EUHEDRAL_TEST_TIMING=1 cargo test -p euhedral-graph --test credit_graph` on a quiet machine asserts the timing. Without it, with `-- --nocapture` (libtest hides a passing test's output), the line `timing (reported, not asserted ...)` is printed. This replaces the earlier rule that asserted unless `CI` was set.
+
+**Semantics.** Asserted always: no late item, no order break at any hop, nothing beyond credit, nothing left over, made = sent + dropped, every quantum retired once, in flight <= pool. Asserted only with the variable: zero non-preempted callbacks over 200 µs, shutdown under 100 ms.
+
+**Tests.** `the_credit_graph_with_a_fast_pack`, `the_credit_graph_with_a_slow_pack`.
 
 ## `AsyncIo` runs where the system refuses io_uring (`euhedral-io`) (2026-11-19)
 

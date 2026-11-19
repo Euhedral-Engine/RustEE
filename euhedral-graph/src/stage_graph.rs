@@ -54,8 +54,8 @@ use euhedral_data_structures::sync::HotScope;
 use std::collections::VecDeque;
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
-use std::ptr::{self, NonNull};
-use std::sync::atomic::{AtomicBool, AtomicPtr};
+use std::ptr::NonNull;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
@@ -705,14 +705,17 @@ impl std::error::Error for GraphError {}
 ///   the quantum used is reached, whichever stage submitted it and whether or not it returned a completion. So no
 ///   `abandoned` hook runs, and nothing the quantum holds is let go, under work that may still use it. A kill is found
 ///   at the next visit of the source: nothing wakes it. A host completion that never gets ready (or a marker a lane
-///   never reaches) holds the quantum for ever.
+///   never reaches) holds the quantum for ever, and so do the later quanta waiting on its stages that never submitted (they are released when
+///   the quantum quiesces).
 /// - **A quantum is pooled.** `start` takes a retired quantum's state from the graph's pool (a
 ///   bounded queue) and `retire` gives it back, as frames go back to theirs; the stage, arrival,
 ///   boundary and retirement frames are pooled the same way. After warm-up, a quantum allocates
 ///   nothing and takes no lock of its own on its way (a take from a pool retries the queue's try-claim; it
 ///   never waits). A stage that returns a host completion allocates it, and
-///   a completion that waits for both a marker and a host completion allocates its wake-up. A retried stage's
-///   wake-up is pooled with its run: a retry allocates nothing.
+///   a completion that waits for both a marker and a host completion allocates its wake-up (a host completion alone
+///   is polled through a slot of the pooled completion frame: no allocation of the graph's). A retried stage's
+///   wake-up is pooled with its run: a retry allocates nothing. A kill allocates the `Vec` of the markers its quantum
+///   waits for, and a host completion it ended before it was ready is registered again in a pooled frame.
 ///
 /// More precisely:
 /// - **Lanes:** each stage's lane is continued by exactly one successor, its critical successor
@@ -1870,8 +1873,9 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Run<Q, L> {
     /// quantum holds while the device may still work on it. So it waits, before it quiesces, for the latest marker it
     /// submitted on each lane it used, whichever stage submitted it and whether or not the stage had a completion: each
     /// unreached one is one pooled frame with no kill switch and no order (nothing cancels it, no chain holds it)
-    /// that holds a live count until it is reached. Returns whether it waits; the last of the frames to end finds
-    /// every marker reached and quiesces.
+    /// that holds a live count until it is reached. Returns whether it waits; the last of the frames to end looks again
+    /// and quiesces if every marker is reached (a later quantum's stage that used this one may have covered a newer
+    /// marker meanwhile, which starts another round). A kill allocates the `Vec` of the markers it waits for.
     ///
     /// The live count is zero here, so no other frame of the quantum counts; the counts are taken before any frame is
     /// registered, so that one reached at once cannot end the quantum under the registrations still to come.
@@ -2236,7 +2240,7 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Run<Q, L> {
     /// their successors in that order, so an ordered successor keeps the predecessor's order.
     ///
     /// `holds` is the marker of the stage's own work. The frame carries it: if a kill cancels the completion before
-    /// that work is reached (an ordered stage's completion is a chain entry, which a kill ends at once), the quantum
+    /// that work is reached (a kill ends the completion's entry in the source at its next visit, whatever the stage's order), the quantum
     /// stays live until it is ([`hold_device_work`](Self::hold_device_work)).
     fn completes(
         self: &Arc<Self>,
@@ -2250,16 +2254,11 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Run<Q, L> {
             .core
             .frame(self, Kind::Completions(stage), self.header(ordered, true));
         frame.holds = holds;
-        // The host completion is registered through a handoff: a kill ends the entry, which drops it, and the frame's
-        // `do_finally` takes it back to wait for it again (`hold_host_work`).
+        // The host completion stays in the frame's pooled slot, which the entry only polls: a kill ends the entry, and
+        // the frame's `do_finally` takes the host completion back to wait for it again (`hold_host_work`).
         let host = host.map(|host| {
-            let back = Arc::new(HostBack(AtomicPtr::new(ptr::null_mut())));
-            frame.host_back = Some(back.clone());
-            Box::new(HostHandoff {
-                ready: Some(host),
-                done: false,
-                back,
-            }) as Box<dyn Ready>
+            frame.host.set(host);
+            frame.host.clone()
         });
         let completions = &self.core.runtime.completions;
         // Java `RetiredEdge`: the retirement is armed on the producer's lane, and its status settled when it arrives.
@@ -2282,7 +2281,7 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Run<Q, L> {
         }
         match (marker, host) {
             (Some(marker), None) => completions.after_marker(marker, frame),
-            (None, Some(host)) => completions.after(host, frame),
+            (None, Some(host)) => completions.after_wake(host, frame),
             (Some(marker), Some(host)) => completions.after(
                 Box::new(MarkerAndHost {
                     lanes: self.core.runtime.lanes.clone(),
@@ -2897,7 +2896,7 @@ struct MarkerAndHost<L: DeviceQueue + ?Sized> {
     lanes: Arc<LanePool<L>>,
     marker: Marker,
     marker_reached: bool,
-    host: Box<dyn Ready>,
+    host: Arc<HostBack>,
     host_ready: bool,
 }
 
@@ -2907,67 +2906,60 @@ impl<L: DeviceQueue + ?Sized + 'static> Ready for MarkerAndHost<L> {
             self.marker_reached = self.lanes.reached(self.marker);
         }
         if !self.host_ready {
-            self.host_ready = self.host.is_ready();
+            self.host_ready = Wake::is_ready(&*self.host);
         }
         self.marker_reached && self.host_ready
     }
 }
 
-/// Where a host completion goes when the entry that held it is dropped before it was ready (a kill ended the entry).
-/// One slot, written by the thread that drops the entry and read by the thread that runs the dead frame afterwards;
-/// the queue the frame goes out through orders the two.
-struct HostBack(AtomicPtr<Box<dyn Ready>>);
+/// A stage's host completion, held by the pooled frame of its completion and polled through the source's entry (a
+/// [`Wake`], so a `Completions` entry holds a clone of the frame's `Arc` and allocates nothing). One per pooled frame.
+///
+/// The entry only polls it: when a kill ends the entry (dropping its clone) before the host work is ready, the `Ready`
+/// is still here for the frame's `do_finally` to take and wait for again (`hold_host_work`). Ready, it is dropped and the
+/// slot is empty, which polls as ready.
+///
+/// The slot is plain state: the polling thread is the only one to touch it from the registration until the frame is
+/// emitted (or the entry ended), and the thread that runs the frame afterwards is ordered after it by the queue the
+/// frame goes out through.
+struct HostBack(Owned<Option<Box<dyn Ready>>>);
+
+// SAFETY: the slot is touched by one thread at a time, in the hand-over order above; the `Ready` moves between threads
+// and is `Send`.
+unsafe impl Sync for HostBack {}
 
 impl HostBack {
-    fn put(&self, host: Box<dyn Ready>) {
-        let new = Box::into_raw(Box::new(host));
-        let old = self.0.swap(new, Ordering::AcqRel);
-        if !old.is_null() {
-            // SAFETY: a non-null pointer in the slot came from `Box::into_raw` in `put` and is taken out once.
-            drop(unsafe { Box::from_raw(old) });
-        }
+    fn new() -> Self {
+        Self(Owned::new(None))
     }
 
+    /// Before the registration, by the thread that owns the frame.
+    fn set(&self, host: Box<dyn Ready>) {
+        // SAFETY: the frame is not registered yet: no other thread reaches the slot.
+        unsafe { self.0.write(|slot| *slot = Some(host)) }
+    }
+
+    /// The host work if it was not found ready (and dropped).
     fn take(&self) -> Option<Box<dyn Ready>> {
-        let old = self.0.swap(ptr::null_mut(), Ordering::AcqRel);
-        // SAFETY: as in `put`.
-        (!old.is_null()).then(|| *unsafe { Box::from_raw(old) })
+        // SAFETY: the entry that polled it is gone, and the frame's hand-over ordered its polls before this.
+        unsafe { self.0.write(Option::take) }
     }
 }
 
-impl Drop for HostBack {
-    fn drop(&mut self) {
-        drop(self.take());
-    }
-}
-
-/// A stage's host completion as its completion entry holds it: dropped before it reported ready, it goes to `back`
-/// instead of being let go, so that the kill that ended the entry does not end the wait for the host work.
-struct HostHandoff {
-    ready: Option<Box<dyn Ready>>,
-    done: bool,
-    back: Arc<HostBack>,
-}
-
-impl Ready for HostHandoff {
-    fn is_ready(&mut self) -> bool {
-        if !self.done
-            && let Some(ready) = &mut self.ready
-            && ready.is_ready()
-        {
-            self.done = true;
-            self.ready = None;
-        }
-        self.done
-    }
-}
-
-impl Drop for HostHandoff {
-    fn drop(&mut self) {
-        if !self.done
-            && let Some(ready) = self.ready.take()
-        {
-            self.back.put(ready);
+impl Wake for HostBack {
+    fn is_ready(&self) -> bool {
+        // SAFETY: only the polling thread reaches the slot while the entry is registered.
+        unsafe {
+            self.0.write(|slot| match slot {
+                None => true,
+                Some(ready) => {
+                    let done = ready.is_ready();
+                    if done {
+                        *slot = None;
+                    }
+                    done
+                }
+            })
         }
     }
 }
@@ -2975,14 +2967,14 @@ impl Drop for HostHandoff {
 /// A stage's completion that waits for a lane's retirement and a host completion.
 struct RetiredAndHost {
     cell: Arc<RetireCell>,
-    host: Box<dyn Ready>,
+    host: Arc<HostBack>,
     host_ready: bool,
 }
 
 impl Ready for RetiredAndHost {
     fn is_ready(&mut self) -> bool {
         if !self.host_ready {
-            self.host_ready = self.host.is_ready();
+            self.host_ready = Wake::is_ready(&*self.host);
         }
         self.host_ready && self.cell.arrived()
     }
@@ -3070,7 +3062,8 @@ enum Kind {
     /// quantum live until its host completion is ready). One a kill ended hands its count to a `DeviceWork` frame
     /// while the stage's marker is not reached.
     Completions(StageId),
-    /// The device work of a stage whose completion a kill ended was reached: drops the live count it held.
+    /// The device work of a stage whose completion a kill ended was reached, or the latest marker of a lane a killed
+    /// quantum used (`hold_killed_work`): drops the live count it held.
     DeviceWork,
     /// The host completion of a stage whose completion a kill ended is ready: holds the quantum for the stage's marker
     /// if that is not reached, else drops the live count it held.
@@ -3105,7 +3098,7 @@ struct GraphFrame<Q, L: DeviceQueue + ?Sized> {
     /// before it is reached.
     holds: Option<Marker>,
     /// A completion's: where its host completion goes if a kill ends the entry before it is ready.
-    host_back: Option<Arc<HostBack>>,
+    host: Arc<HostBack>,
     pool: Weak<Producer<Box<GraphFrame<Q, L>>, Multi>>,
 }
 
@@ -3120,7 +3113,7 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> GraphFrame<Q, 
             inputs: Vec::new(),
             waits: Vec::new(),
             holds: None,
-            host_back: None,
+            host: Arc::new(HostBack::new()),
             pool,
         }
     }
@@ -3160,7 +3153,7 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Frame for Grap
             Kind::Completions(stage) => {
                 run.completed(stage, alive);
                 if !alive {
-                    match self.host_back.take().and_then(|back| back.take()) {
+                    match self.host.take() {
                         Some(host) => host_work = Some((stage, host, self.holds)),
                         None => device_work = self.holds.map(|marker| (stage, marker)),
                     }
@@ -3233,7 +3226,7 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Frame for Grap
         self.kind = Kind::Idle;
         self.result = None;
         self.holds = None;
-        self.host_back = None;
+        drop(self.host.take());
         self.held.store(false, Ordering::Relaxed);
         self.header = FrameHeader::new(0);
         if let Some(pool) = self.pool.upgrade() {
