@@ -18,6 +18,22 @@ semantics and the tests that pin it.
 
 **Tests.** The three tests above. A wait that returned before the flag was set or after fewer than 1,000 checks fails the wait test; a finalizer inside the timed span makes the first timed frame's finalizer see 0 instead of 1.
 
+## A killed quantum holds for everything it started, and killed waiting entries end at the next visit (`euhedral-graph`) (2026-11-19)
+
+**What.** A killed `StageGraph` quantum runs no `abandoned` hook, and lets go of nothing it holds, until every host completion it started is ready and the latest marker of each lane it used is reached. Before, only a stage that returned a completion held it, and an ordered stage's host completion with no marker held nothing once the kill ended it. In `Completions`, a waiting entry whose frame is killed (unordered, timer, marker, retirement, `Ready`, `Wake`) ends at the next visit of the source as a dead continuation, not only a chain head.
+
+**Why.** A stage's work (a model request, a driver call polled on the host, device work with a marker only) may still use what the quantum holds when the kill comes; quiescing runs the hooks that release it. A killed timer an hour out, or an entry whose condition never comes, occupied the source until it did.
+
+**How to use.** A `StageGraph` user changes nothing. A direct `Completions` user whose frame has a kill switch and waits on `after_marker` or `after_retired` now gets its `do_finally` before the marker is reached, at the next visit after a kill (before, only a chain head did): a consumer whose frame stands for work that may still use what it holds registers a frame with no kill switch, or keeps the hold itself. A host completion that never gets ready, or a marker a lane never reaches, now holds a killed quantum for ever (it did for an unordered stage's completion already): make the `Ready` end when its work does.
+
+**Semantics.**
+- The kill is found at the next visit of the source (a poll); it does not wake it, and an entry behind a chain head ends when it becomes the head.
+- The entry's `Ready` is dropped before its frame's `do_finally` runs. The stage graph keeps a host completion in a slot of the pooled completion frame, which the source's entry only polls (a `Wake`, no allocation of its own); the dead completion frame takes it from the slot and waits for it again in a frame with no kill switch and no order, then for the stage's marker if that is not reached. Nothing waits in a `Drop`.
+- When the last frame of a killed quantum ends, the quantum waits for the latest marker of each lane it used (one pooled frame per unreached lane) before it quiesces. A quantum that fails without a kill is unchanged.
+- Nothing changes for a quantum that is not killed.
+
+**Tests.** `completions.rs`: a killed unordered entry, a killed timer and a killed marker whose conditions never come end at the next reap and `pending` drops. `stage_graph.rs`: a killed quantum with a marker-only stage queued runs no `abandoned` hook until the marker is reached; a killed quantum whose stage returned a host completion with no marker runs none until it is ready (ordered and unordered: only the ordered half fails on the old code, the unordered one passes there); the existing kill tests also make the host completions ready before the hooks. These fail on the old code.
+
 ## Handle reuse on Windows, and the positional fallback's long reads, FIFO opens and leased files (`euhedral-io`) (2026-11-19)
 
 **What.** The engine forgets the value of every socket, accepted socket and file it makes itself; `AsyncIo::forget_socket(socket)` and `forget_file(file)` tell it that a handle the caller made is about to close, and `euhedral-net` calls the former before its client, connection and listener sockets close. In the positional engine, an operation that is the only one due in a visit takes the whole attempt budget, and an open that cannot proceed backs off between attempts.

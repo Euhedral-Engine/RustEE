@@ -204,7 +204,8 @@ A lane is a `LaneSource`, and the source owns the lane's submitter.
 3. **Run.** Stages submit and return `Submitted`; they never wait. `StageError::Retry` runs the stage
    again.
 4. **Kill.** Set the `kill` switch you passed to `start`. The quantum's remaining stage frames are skipped
-   and its stages get `Stage::abandoned`. Device work already submitted runs to its end.
+   and its stages get `Stage::abandoned`, but only once everything the quantum started has ended: its host completions
+   are ready and the latest marker of each lane it used is reached.
 5. **Retire.** Once no frame of the quantum can run and its retirement boundary is reached, `retire`
    receives the quantum and its `QuantumOutcome` (`Completed`, `Failed` or `Killed`). Drop the `UnitGuard`
    there. A quantum that touched no lane has no boundary: `retire` runs in its own last frame, or in one pooled
