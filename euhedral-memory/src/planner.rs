@@ -1333,9 +1333,9 @@ impl LatticeSource for GiveBacks {
         if demand == 0 || self.complete.load(Ordering::Acquire) {
             return;
         }
-        let Some(downstream) = self.downstream.get() else {
+        if self.downstream.get().is_none() {
             return;
-        };
+        }
         let Some(mut inside) = self.inside.try_enter() else {
             return;
         };
