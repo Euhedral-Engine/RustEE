@@ -1,5 +1,6 @@
 //! Linux and Android: which engine an [`AsyncIo`] runs on, io_uring or the positional fallback.
 
+use std::cell::Cell;
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
@@ -69,10 +70,11 @@ impl Engine for Platform {
         buf: Buf,
         then: Then,
         limit: Option<Duration>,
+        taken: &Cell<bool>,
     ) -> io::Result<OpId> {
         match self {
-            Self::Uring(engine) => engine.submit(request, buf, then, limit),
-            Self::Positional(engine) => engine.submit(request, buf, then, limit),
+            Self::Uring(engine) => engine.submit(request, buf, then, limit, taken),
+            Self::Positional(engine) => engine.submit(request, buf, then, limit, taken),
         }
     }
 

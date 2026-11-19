@@ -4,7 +4,7 @@
 //! with unsafe code: the io_uring rings (`// SAFETY:` on every block).
 #![allow(unsafe_code)]
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::ffi::CString;
 use std::io;
@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     clippy::disallowed_types,
     reason = "HOT-FIX(I3), HOT-FIX(I4), HOT-FIX(I5), HOT-FIX(I6)"
 )]
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, TryLockError, Weak};
 use std::time::Duration;
 
 use euhedral_core::frames::Frame;
@@ -23,7 +23,7 @@ use io_uring::{IoUring, Submitter, opcode, squeue, types};
 
 use super::{
     AsyncIo, Buf, Cancelled, Create, Engine, LimitPassed, MAX_PIECE, OpId, OpenSpec, READ_PIECE,
-    Request, Then, conclude as conclude_io,
+    Request, Then, conclude as conclude_io, note_stray,
 };
 
 /// Entries of each ring's submission queue (its completion queue has twice as many).
@@ -590,6 +590,8 @@ impl Ring {
             sq.sync();
         }
         if pushed || queue.unsubmitted {
+            // Set before the call: if the enter unwinds, the entries are queued and a later poll hands them over.
+            queue.unsubmitted = true;
             queue.unsubmitted = enter(&self.uring.submitter()).is_err();
         }
     }
@@ -627,8 +629,12 @@ impl Ring {
             // Pairs with the fence after a holder lets go (see above): either this thread gets
             // `sq`, or the holder sees what this thread queued.
             std::sync::atomic::fence(Ordering::SeqCst);
-            let Ok(mut queue) = self.sq.try_lock() else {
-                return;
+            // A poisoned lock is taken, not skipped: a panic under it (a refused enter's hook, a failed
+            // check) must not leave the ring's entries unsubmitted for ever.
+            let mut queue = match self.sq.try_lock() {
+                Ok(queue) => queue,
+                Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                Err(TryLockError::WouldBlock) => return,
             };
             // The swap reads the pusher's `true`, so its entry is published for the drain below.
             self.waiting.swap(false, Ordering::SeqCst);
@@ -968,6 +974,7 @@ impl Engine for Uring {
         buf: Buf,
         then: Then,
         limit: Option<Duration>,
+        taken: &Cell<bool>,
     ) -> io::Result<OpId> {
         let kind = Self::kind(request)?;
         let ring = self.ring()?;
@@ -990,6 +997,8 @@ impl Engine for Uring {
             ring.offer(item);
             user_data
         };
+        // The ring has the operation: from here on a panic is not a refusal.
+        taken.set(true);
         ring.flush_waiting(&*self.enter);
         Ok(OpId::new(self.id as u64, ring.index, user_data))
     }
@@ -1023,8 +1032,12 @@ impl Engine for Uring {
         let rings: Vec<Arc<Ring>> = lock!(&self.rings).clone();
         for ring in &rings {
             ring.flush_waiting(&*self.enter);
-            let Ok(mut reaping) = ring.cq.try_lock() else {
-                continue;
+            // A poisoned lock is taken, not skipped: it guards a queue of ended operations that a
+            // panic cannot leave half-changed, and skipping it would never reap this ring again.
+            let mut reaping = match ring.cq.try_lock() {
+                Ok(reaping) => reaping,
+                Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                Err(TryLockError::WouldBlock) => continue,
             };
             // Operations that ended in the backlog, a cancel or a limit: no completion will say so.
             while room() {
@@ -1039,7 +1052,7 @@ impl Engine for Uring {
                         }
                     }
                     Reaped::Again | Reaped::Stray => {
-                        debug_assert!(false, "an ended operation ({user_data:#x}) of no operation")
+                        note_stray("an ended operation", user_data);
                     }
                 }
             }
@@ -1069,7 +1082,7 @@ impl Engine for Uring {
                     }
                     Reaped::Again => ring.flush_waiting(&*self.enter),
                     Reaped::Stray => {
-                        debug_assert!(false, "a completion ({user_data:#x}) of no operation")
+                        note_stray("a completion", user_data);
                     }
                 }
             }
@@ -2172,6 +2185,7 @@ mod tests {
                 .into(),
                 Then::Io(then(1)),
                 None,
+                &Cell::new(false),
             )
             .unwrap();
         let ring = engine.ring().unwrap();
@@ -2800,6 +2814,7 @@ mod tests {
                 IoBuf::default().into(),
                 open_then(1),
                 None,
+                &Cell::new(false),
             )
             .unwrap();
         let mut found = engine_found(&engine);
@@ -2823,6 +2838,7 @@ mod tests {
                 IoBuf::default().into(),
                 open_then(2),
                 None,
+                &Cell::new(false),
             )
             .unwrap();
         assert!(engine_found(&engine).is_empty());
@@ -2941,4 +2957,260 @@ mod tests {
         opening_or_renaming_what_is_not_there_fails_with_the_kernels_error,
         requests_push_completions_downstream,
     );
+
+    /// A completion that belongs to no operation (the `debug_assert!` of the poll fails in a debug build) does not
+    /// stop the ring's reaping for good: the next poll reaps it, and an operation submitted after it completes.
+    #[test]
+    fn a_stray_completion_does_not_stop_the_ring_from_being_reaped() {
+        let data = content(4096, 3);
+        let (_guard, file) = temp_file("stray", &data);
+        let io = AsyncIo::open_with(
+            Box::new(|submitter: &Submitter<'_>| submitter.submit()),
+            MAX_PIECE,
+        )
+        .unwrap();
+        // The first operation makes the thread's ring; the stray completion is queued behind it.
+        io.read(file.as_raw_fd(), 0, buf(16), then(1)).unwrap();
+        let uring = uring_of(&io);
+        let ring = lock!(&uring.rings)[0].clone();
+        ring.offer(Item::One(opcode::Nop::new().build().user_data(0x5757)));
+        ring.flush_waiting(&*uring.enter);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut seen: Vec<u64> = Vec::new();
+        let collect = |io: &AsyncIo, seen: &mut Vec<u64>| {
+            io.pull(
+                &mut |frame| seen.push(frame.header().id_hash()),
+                &mut |_| false,
+                u64::MAX,
+            );
+        };
+        // Reaps until the stray completion is met: it fails the check of the poll (in a debug build).
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "the stray completion was not reaped"
+            );
+            let reaped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| io.reap()));
+            collect(&io, &mut seen);
+            if reaped.is_err()
+                || (!cfg!(debug_assertions) && ring.in_kernel.load(Ordering::Acquire) == 0)
+            {
+                break;
+            }
+        }
+        // An operation submitted after it completes, and so does the first if the stray was ahead of it.
+        io.read(file.as_raw_fd(), 0, buf(16), then(2)).unwrap();
+        while !(seen.contains(&1) && seen.contains(&2)) {
+            assert!(
+                Instant::now() < deadline,
+                "the ring was never reaped again after the stray completion"
+            );
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| io.reap()));
+            collect(&io, &mut seen);
+        }
+        // The panic of a debug build skipped no count: nothing is left for a key to look at.
+        assert_eq!(io.pending(), 0);
+        assert_eq!(io.unreaped.load(Ordering::Acquire), 0);
+    }
+
+    /// An engine that refuses an operation drops its continuation; if that drop panics, `pending` and `unreaped`
+    /// are back where they were.
+    #[test]
+    fn a_refused_operation_whose_continuation_panics_on_drop_leaves_the_counts() {
+        struct Bomb;
+        impl Drop for Bomb {
+            fn drop(&mut self) {
+                if !std::thread::panicking() {
+                    panic!("the continuation's state failed to drop");
+                }
+            }
+        }
+        let io = AsyncIo::open_with(
+            Box::new(|submitter: &Submitter<'_>| submitter.submit()),
+            MAX_PIECE,
+        )
+        .unwrap();
+        let bomb = Bomb;
+        // A path with a NUL byte is refused by the engine, which drops the continuation.
+        let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            io.open_path(
+                std::path::Path::new("a\0b"),
+                OpenSpec::default(),
+                Box::new(move |_| {
+                    let _bomb = &bomb;
+                    Box::new(Done {
+                        header: FrameHeader::new(1),
+                        done: None,
+                        accepted: None,
+                    })
+                }),
+            )
+        }));
+        assert!(refused.is_err(), "the drop of the continuation panicked");
+        assert_eq!(io.pending(), 0);
+        assert_eq!(io.unreaped.load(Ordering::Acquire), 0);
+    }
+
+    /// A panic under the submission-queue lock (here the enter hook's, once) does not leave the ring's entries
+    /// unsubmitted: the operation was accepted, so its counts stay, and a later poll hands it over and reaps it.
+    #[test]
+    fn a_panic_under_the_submission_lock_does_not_stop_the_ring_from_submitting() {
+        let data = content(4096, 5);
+        let (_guard, file) = temp_file("sqpanic", &data);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        let io = AsyncIo::open_with(
+            Box::new(move |submitter: &Submitter<'_>| {
+                if counted.fetch_add(1, Ordering::AcqRel) == 0 {
+                    panic!("the enter hook failed");
+                }
+                submitter.submit()
+            }),
+            MAX_PIECE,
+        )
+        .unwrap();
+        let first = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            io.read(file.as_raw_fd(), 0, buf(16), then(1))
+        }));
+        assert!(first.is_err(), "the hook's panic reaches the submitter");
+        // The operation was accepted before the panic: counted, and handed over by a later poll, with no
+        // other submission to do it.
+        assert_eq!(io.pending(), 1);
+        let out = poll(&io, 1);
+        assert_eq!(out[0].0, 1);
+        assert_eq!(io.pending(), 0);
+        assert_eq!(io.unreaped.load(Ordering::Acquire), 0);
+    }
+
+    /// A panic under the completion-queue lock (a consumer's, in the test-only direct reap) does not stop the ring
+    /// from being reaped: the next reap takes the poisoned lock.
+    #[test]
+    fn a_panic_under_the_completion_lock_does_not_stop_the_ring_from_being_reaped() {
+        let data = content(4096, 9);
+        let (_guard, file) = temp_file("cqpanic", &data);
+        let io = AsyncIo::open_with(
+            Box::new(|submitter: &Submitter<'_>| submitter.submit()),
+            MAX_PIECE,
+        )
+        .unwrap();
+        io.read(file.as_raw_fd(), 0, buf(16), then(1)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            assert!(Instant::now() < deadline, "the read did not complete");
+            let reaped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                io.front.reap(
+                    &io.engine,
+                    &mut |_| panic!("the consumer failed"),
+                    &mut |_| false,
+                    8,
+                )
+            }));
+            if reaped.is_err() {
+                break;
+            }
+        }
+        io.read(file.as_raw_fd(), 0, buf(16), then(2)).unwrap();
+        let out = poll(&io, 1);
+        assert_eq!(out[0].0, 2);
+    }
+
+    /// A refused operation's continuation that submits another operation as it drops: the refusal still takes its
+    /// own counts back, and the inner operation keeps its own.
+    #[test]
+    fn a_refused_operation_whose_continuation_submits_as_it_drops_leaves_the_right_counts() {
+        struct Submits {
+            io: Arc<AsyncIo>,
+            fd: i32,
+        }
+        impl Drop for Submits {
+            fn drop(&mut self) {
+                self.io.read(self.fd, 0, buf(16), then(1)).unwrap();
+            }
+        }
+        let data = content(4096, 11);
+        let (_guard, file) = temp_file("nested", &data);
+        let io = AsyncIo::open_with(
+            Box::new(|submitter: &Submitter<'_>| submitter.submit()),
+            MAX_PIECE,
+        )
+        .unwrap();
+        let held = Submits {
+            io: io.clone(),
+            fd: file.as_raw_fd(),
+        };
+        let refused = io.open_path(
+            std::path::Path::new("a\0b"),
+            OpenSpec::default(),
+            Box::new(move |_| {
+                let _held = &held;
+                Box::new(Done {
+                    header: FrameHeader::new(9),
+                    done: None,
+                    accepted: None,
+                })
+            }),
+        );
+        assert!(refused.is_err());
+        assert_eq!(io.pending(), 1);
+        assert_eq!(io.unreaped.load(Ordering::Acquire), 1);
+        let out = poll(&io, 1);
+        assert_eq!(out[0].0, 1);
+        assert_eq!(io.pending(), 0);
+        assert_eq!(io.unreaped.load(Ordering::Acquire), 0);
+    }
+
+    /// A reap that a continuation runs (here on another `AsyncIo`) does not clear the stray completion the
+    /// enclosing reap met: the enclosing reap still fails its check (a debug build).
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_reap_inside_a_continuation_leaves_the_enclosing_reaps_stray_check() {
+        let data = content(4096, 13);
+        let (_guard, file) = temp_file("enclosing", &data);
+        let open = || {
+            AsyncIo::open_with(
+                Box::new(|submitter: &Submitter<'_>| submitter.submit()),
+                MAX_PIECE,
+            )
+            .unwrap()
+        };
+        let (io, other) = (open(), open());
+        io.read(file.as_raw_fd(), 0, buf(16), then(1)).unwrap();
+        poll(&io, 1);
+        let uring = uring_of(&io);
+        let ring = lock!(&uring.rings)[0].clone();
+        // The stray completion first, then an operation whose continuation reaps `other`.
+        ring.offer(Item::One(opcode::Nop::new().build().user_data(0x5757)));
+        ring.flush_waiting(&*uring.enter);
+        let ran = Arc::new(AtomicUsize::new(0));
+        let (seen, inner) = (ran.clone(), then(2));
+        io.read(
+            file.as_raw_fd(),
+            0,
+            buf(16),
+            Box::new(move |done| {
+                other.reap();
+                seen.fetch_add(1, Ordering::AcqRel);
+                inner(done)
+            }),
+        )
+        .unwrap();
+        // Both completions are in the ring's queue before the reap: the stray one first (it was posted before the
+        // read was submitted), so the reap meets it, then the continuation that reaps.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let queued = {
+                let _reaping = ring.cq.try_lock().expect("no reap is inside");
+                // SAFETY: the `cq` lock is held, so this is the only reader of the ring's completion queue; it
+                // takes nothing off.
+                unsafe { ring.uring.completion_shared() }.len()
+            };
+            if queued >= 2 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the completions were not posted");
+        }
+        let reaped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| io.reap()));
+        assert_eq!(ran.load(Ordering::Acquire), 1, "the nested reap ran");
+        assert!(reaped.is_err(), "the stray completion failed the check");
+    }
 }
