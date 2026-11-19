@@ -229,11 +229,10 @@ fn snapshots_read_while_writers_record() {
     }
 }
 
-/// Spins for `execute` in its body and for `finally` in its finalizer.
+/// Spins for `execute` in its body; its finalizer notes how many executes were timed when it began.
 struct Spinning {
     header: crate::frames::FrameHeader,
     execute: std::time::Duration,
-    finally: std::time::Duration,
     /// Where the finalizer writes how many executes the metrics had timed when it began.
     finalizer_saw: Option<(
         Arc<CachePadded<ExecutionMetrics>>,
@@ -270,7 +269,6 @@ impl crate::frames::Frame for Spinning {
                 std::sync::atomic::Ordering::Release,
             );
         }
-        spin(self.finally);
     }
 }
 
@@ -278,7 +276,6 @@ fn spinning() -> Box<Spinning> {
     Box::new(Spinning {
         header: crate::frames::FrameHeader::new(1),
         execute: std::time::Duration::from_micros(100),
-        finally: std::time::Duration::ZERO,
         finalizer_saw: None,
     })
 }
