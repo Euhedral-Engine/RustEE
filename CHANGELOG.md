@@ -15,7 +15,7 @@ semantics and the tests that pin it.
 - The ends run newest first on the thread that found the refusal, after the call that found it has returned to the outermost one; a refused frame no longer ends inside the call that offered it when that call is itself inside an in-place end.
 - A stage whose in-place run panics fails its quantum with a fatal error (as a stage that returns an error) and its frame ends with `do_finally_with_error`.
 - The counter is per graph, counts the contained panics of stage runs and of ends, and is a relaxed atomic add. Nothing allocates, locks or waits; the link is a field of the pooled frame.
-- A sink that hands back a frame that is not the graph's (checked with one `TypeId` comparison, no cast) has lost the graph's frame: its quantum never retires; the frame it handed back is ended.
+- A sink that hands back a frame that is not the graph's (checked with one `TypeId` comparison, no cast) has lost the graph's frame: its quantum never retires; the frame it handed back is ended. `StageGraph::refused_foreign()` counts those, so an owner that waits for `live() == 0` can tell.
 - The counter counts every panic that leaves a refused frame's end (a `retire`, a stage or the runtime dropped with the last run, a debug assertion of a closed `Completions`), and a stage's in-place run, whose message the quantum's failure carries. A payload whose own drop panics is contained and not counted again. The drain loop catches whatever still unwinds out of an end, so the list always drains; the end holds only the counter, never a strong reference to the run.
 - A trampoline was chosen over handing refused frames to `Completions`: the source may be closed exactly when the sink is (shutdown), and it would add a registration and a scan per frame.
 

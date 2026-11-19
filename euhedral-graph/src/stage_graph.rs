@@ -650,7 +650,9 @@ fn end_in_place<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static>(
     while let Some(frame) = current {
         // `end` contains what it runs; this catch is for what could still unwind out of it, so that the list always
         // drains.
-        let _ = catch_unwind(AssertUnwindSafe(|| frame.end()));
+        if let Err(panic) = catch_unwind(AssertUnwindSafe(|| frame.end())) {
+            let _ = catch_unwind(AssertUnwindSafe(|| drop(panic)));
+        }
         current = PENDING
             .try_with(|pending| {
                 pending.take().map(|mut head| {
@@ -845,6 +847,8 @@ struct Core<Q, L: DeviceQueue + ?Sized> {
     live: AtomicUsize,
     /// Panics contained where a refused frame ended in place.
     contained_panics: Arc<AtomicU64>,
+    /// Frames a sink handed back in place of the graph's own.
+    refused_foreign: AtomicU64,
     seeds: AtomicU64,
     /// Finished frames, for the next stages, arrivals and boundaries (of any run of the graph).
     frames: Pool<Box<GraphFrame<Q, L>>>,
@@ -1155,6 +1159,7 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> StageGraph<Q, 
                 retire: Box::new(retire),
                 live: AtomicUsize::new(0),
                 contained_panics: Arc::new(AtomicU64::new(0)),
+                refused_foreign: AtomicU64::new(0),
                 seeds: AtomicU64::new(0),
                 frames: Pool::new(POOLED_FRAMES),
             }),
@@ -1229,11 +1234,17 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> StageGraph<Q, 
     /// concludes, a stage or the runtime dropped with the last run, a debug assertion of a closed `Completions`
     /// source. (A `retired` hook that panics is already contained by the quantum, which fails; it does not count.) The
     /// frame still finished (the quantum concluded or failed, its count was dropped) and the thread went on. A
-    /// payload whose own drop panics is contained and not counted again. A sink that hands back a frame that is not
-    /// the graph's has lost the graph's frame (its quantum never retires); the frame it handed back is ended and counts
-    /// if it panics.
+    /// payload whose own drop panics is contained and not counted again. The frame a sink handed back in place of the
+    /// graph's own (see [`StageGraph::refused_foreign`]) counts here if it panics when it ends.
     pub fn contained_panics(&self) -> u64 {
         self.core.contained_panics.load(Ordering::Relaxed)
+    }
+
+    /// Times a sink handed back a frame that is not the graph's own, in place of the one it was given. The sink broke its
+    /// contract: the graph's frame is lost, so its quantum never retires and `live()` stays above 0, which an owner
+    /// that waits for `live() == 0` at shutdown can tell from this counter. The frame handed back is ended in place.
+    pub fn refused_foreign(&self) -> u64 {
+        self.core.refused_foreign.load(Ordering::Relaxed)
     }
 }
 
@@ -1830,9 +1841,10 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Run<Q, L> {
     /// and counted as a contained panic if that panics.
     fn end_refused(&self, frame: Box<dyn Frame>, runs_first: bool) {
         if !(&*frame as &dyn Any).is::<GraphFrame<Q, L>>() {
-            let ended = catch_unwind(AssertUnwindSafe(|| frame.do_finally()));
-            if ended.is_err() {
+            self.core.refused_foreign.fetch_add(1, Ordering::Relaxed);
+            if let Err(panic) = catch_unwind(AssertUnwindSafe(|| frame.do_finally())) {
                 self.core.contained_panics.fetch_add(1, Ordering::Relaxed);
+                let _ = catch_unwind(AssertUnwindSafe(|| drop(panic)));
             }
             return;
         }
@@ -7132,6 +7144,8 @@ mod tests {
             "the handed-back frame ended"
         );
         assert_eq!(graph.contained_panics(), 0);
+        assert_eq!(graph.refused_foreign(), 1);
+        assert_eq!(graph.live(), 1, "the graph's own frame is lost");
     }
 
     /// A later quantum's stage that submitted on a lane after this one ran covers its marker with this quantum's
