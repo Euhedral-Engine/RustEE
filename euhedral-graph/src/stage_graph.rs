@@ -13,8 +13,10 @@
 //! - **External edges** wait on a closable stack per stage (Java `StageFrame.externals`), sealed `Submitted` when the
 //!   stage submitted and `Swept` when its quantum quiesced without it.
 //! - **The retirement boundary** is the latest marker per used lane (Java `usedLanes`). With lanes that can be controlled
-//!   it is Java's `quiesce`: the other lanes join the home lane on the device and one retirement armed there ends the
-//!   quantum (`RetireCell`, `Completions::after_retired`); over a query-only lane it is one completion per lane. A
+//!   it is Java's `quiesce`: the other lanes join the retire lane on the device and one retirement armed there ends the
+//!   quantum (the retire lane is a lane the quantum used: its home lane when it used that, else the lowest it used with
+//!   control, and always the home lane when an `abandoned` hook of a stage that names a lane runs, since the hook may
+//!   enqueue there) (`RetireCell`, `Completions::after_retired`); over a query-only lane it is one completion per lane. A
 //!   host completion that no edge consumes holds a live count until it is done (Java `deferral`). A killed quantum
 //!   holds for everything it started, so that no `abandoned` hook runs, and nothing it holds is let go, under work that
 //!   may still use it: a completion's entry in `Completions` ends at the next visit after a kill, and hands its
@@ -394,7 +396,8 @@ pub trait Stage<Q, L: DeviceQueue + ?Sized = dyn DeviceQueue>: Send + Sync {
     /// or it ran and failed (Java `StageFrame.abandoned(home)`). Called once, at the quantum's boundary, in stage order,
     /// after the quantum's other lanes joined the `home` lane (when the lanes have control: a query-only lane cannot
     /// join, and the hook then runs without the join, and a hook given a query-only lane has nothing to enqueue on it) and
-    /// before the retirement is armed on it. If that retirement cannot be armed on a home lane that has control, the quantum
+    /// before the retirement is armed on it (the retirement of a quantum with a stage that names a lane is armed on
+    /// `home`; a stage that names no lane does host work only, and `home` does not cover it). If that retirement cannot be armed on a home lane that has control, the quantum
     /// is noted as `DeviceFailed` (a quantum whose hook ran already has an earlier cause, which stands: the first cause
     /// wins), because what the hooks submitted is not covered, and the quantum still retires. So what the hook submits
     /// to `home` is ordered after the quantum's device work and covered by its retirement: a stage that enqueued part of
@@ -757,7 +760,7 @@ impl std::error::Error for GraphError {}
 ///   arrived). The last arrival at a stage publishes it; the graph never scans for ready work.
 /// - Each quantum counts its published frames, armed completion edges and host completions. At zero
 ///   no stage can run again; the quantum's retirement boundary is armed with [`Completions`] (Java `quiesce`: the
-///   lanes it used join its home lane on the device and one retirement is armed there; lanes with no control
+///   lanes it used join a retire lane (one it used) on the device and one retirement is armed there; lanes with no control
 ///   get one completion per lane). The retirement frame runs each attempted stage's [`Stage::retired`] hook and hands
 ///   the quantum and its [`QuantumOutcome`] to `retire`. A quantum that touched no lane (see the module's conclude
 ///   rule) has no boundary: its own last frame runs the hooks and hands the quantum over, or, when the last hold goes
@@ -1633,12 +1636,15 @@ struct Run<Q, L: DeviceQueue + ?Sized> {
     lanes: LaneTable,
     /// Boundary completions still to come, and one for the arming.
     boundary_left: AtomicUsize,
-    /// Where the retirement armed on the home lane for the boundary leaves its status.
+    /// Where the retirement armed on the retire lane for the boundary leaves its status.
     retire_cell: Arc<RetireCell>,
     /// Whether the `abandoned` hook of a stage that names a lane ran this quantum (written by `quiesce`, read by the
     /// boundary).
     abandoned_on_lanes: Owned<bool>,
-    /// The latest marker value of each lane already awaited on the home lane (0: none), so the boundary joins only what
+    /// The lane the boundary joins the others to and arms the retirement on (chosen by `quiesce`; see
+    /// `choose_retire_lane`).
+    retire_lane: Owned<Option<LaneId>>,
+    /// The latest marker value of each lane already awaited on the retire lane (0: none), so the boundary joins only what
     /// later quanta added since `quiesce` joined.
     joined_values: Owned<Vec<u64>>,
     ext: Owned<ExtSlots>,
@@ -1677,6 +1683,7 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Run<Q, L> {
             boundary_left: AtomicUsize::new(0),
             retire_cell: Arc::new(RetireCell::new()),
             abandoned_on_lanes: Owned::new(false),
+            retire_lane: Owned::new(None),
             joined_values: Owned::new(Vec::new()),
             ext: Owned::new(ExtSlots::default()),
         })
@@ -2596,12 +2603,21 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Run<Q, L> {
         target.external_arrived(index);
     }
 
-    /// Java `quiesce`, up to the sweep: the quantum's own lanes join the home lane, the stages that never submitted are
-    /// abandoned (with the home lane, behind that join), and only then are later quanta waiting on its stages released,
+    /// Java `quiesce`, up to the sweep: the quantum's own lanes join the retire lane, the stages that never submitted are
+    /// abandoned (with the home lane, which is then the retire lane, behind that join), and only then are later quanta waiting on its stages released,
     /// so what a hook releases is there for them. Its own token is dropped (the retirement is armed once no pin is left).
     fn quiesce(self: &Arc<Self>, ends: Ends) {
         self.take_over_external_waits();
         let used = self.lanes.used();
+        // A quantum that used no lane yet and runs no hook that may enqueue joins nothing now: the boundary chooses
+        // its retire lane then, from the lanes used by then (a later quantum's `cover` adds lanes only while it pins
+        // this one, and the release of the last pin, which arms the boundary, is ordered after every such `cover`).
+        let hooks = self.hooks_may_enqueue();
+        // SAFETY: every stage is done and every pin is gone or kept by a later quantum: this thread is the only writer.
+        unsafe {
+            self.retire_lane
+                .set((used != 0 || hooks).then(|| self.choose_retire_lane(used)));
+        }
         if used != 0 {
             // A join this early covers the quantum's own markers; the boundary joins again for the markers later quanta
             // add while they pin it (an await of a marker that is already awaited orders nothing more).
@@ -2630,8 +2646,39 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Run<Q, L> {
         }
     }
 
+    /// Whether the `abandoned` hook of a stage that never submitted and names a lane will run: only such a hook may
+    /// enqueue on the home lane.
+    fn hooks_may_enqueue(&self) -> bool {
+        self.stages.iter().enumerate().any(|(index, state)| {
+            // SAFETY: every stage is done: `submitted` is no longer written.
+            !unsafe { state.submitted.get() } && !self.core.spec.stages[index].lanes.is_empty()
+        })
+    }
+
+    /// The lane the quantum's retirement is armed on, and the others it used join. A quantum that used a lane retires
+    /// on one it used, so its completion never waits behind work on a lane it never touched: its home lane when it used
+    /// that (or when the hook of a stage that never submitted and names a lane may enqueue on the home lane, which the
+    /// retirement must then cover), else the lowest lane it used that has control. With no lane used, or none with
+    /// control, the home lane.
+    fn choose_retire_lane(&self, used: u64) -> LaneId {
+        let home = self.home_lane;
+        if self.hooks_may_enqueue() || used & (1u64 << home.0) != 0 {
+            return home;
+        }
+        let lanes = &self.core.runtime.lanes;
+        let mut rest = used;
+        while rest != 0 {
+            let lane = rest.trailing_zeros() as u16;
+            rest &= rest - 1;
+            if lanes.lane(LaneId(lane)).control().is_some() {
+                return LaneId(lane);
+            }
+        }
+        home
+    }
+
     /// The quantum's boundary takes over the markers its external edges brought (Java `awaitExternals`, which joins
-    /// every slot's marker to the home lane), so a later quantum released onto this one still follows the quanta before
+    /// every slot's marker to the retire lane), so a later quantum released onto this one still follows the quanta before
     /// it. A stage that never submitted (killed, failed, a CPU stage) did not wait for them itself.
     fn take_over_external_waits(&self) {
         // SAFETY: every stage is done: the slots and their markers are no longer written.
@@ -2653,37 +2700,43 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Run<Q, L> {
         }
     }
 
-    /// Every pin is gone: Java `quiesce`. The lanes the quantum used join the home lane (when they have control), the
+    /// Every pin is gone: Java `quiesce`. The lanes the quantum used join the retire lane (when it has control), the
     /// stages that never submitted are abandoned (with the home lane, behind the join), and the retirement is armed:
-    /// one on the home lane, or one completion per lane the quantum used.
+    /// one on the retire lane, or one completion per lane the quantum used.
     ///
     /// `ends` is where the last hold went: [`Ends::OwnFrame`] when it went in the call that dropped the quantum's last
     /// live count, a frame of the quantum.
     fn arm_boundary(self: &Arc<Self>, ends: Ends) {
         let used = self.lanes.used();
+        // SAFETY: `quiesce` wrote it before this call, and this thread holds the last pin.
+        if unsafe { self.retire_lane.get() }.is_none() {
+            // SAFETY: as above.
+            unsafe { self.retire_lane.set(Some(self.choose_retire_lane(used))) };
+        }
         let joined = used != 0 && self.join_lanes(used);
         // SAFETY: written by `quiesce`, which happens before this call.
         let hooks_ran = unsafe { self.abandoned_on_lanes.get() };
-        let home_controls = self
+        let retire_controls = self
             .core
             .runtime
             .lanes
-            .lane(self.home_lane)
+            .lane(self.retire_lane())
             .control()
             .is_some();
         // Java always arms `home.notifyRetired` after `abandonUnsubmitted(home)`: here when a lane was used, or a hook of a
-        // stage that names a lane ran on a home lane that can arm one (what the hook submitted to home is covered before
-        // `retired` and `retire` drop anything; a query-only home lane gives a hook nothing to enqueue). A quantum with
+        // stage that names a lane ran on a home lane that can arm one (the retire lane is then home: what the hook
+        // submitted to home is covered before `retired` and `retire` drop anything; a query-only home lane gives a hook
+        // nothing to enqueue). A quantum with
         // neither has nothing on a lane for a retirement to cover and arms none: it concludes in the frame that ended its
         // last stage, or else in a pooled frame.
-        if used == 0 && (!hooks_ran || !home_controls) {
+        if used == 0 && (!hooks_ran || !retire_controls) {
             match ends {
                 Ends::OwnFrame => self.conclude(),
                 Ends::Elsewhere => self.offer_retirement(),
             }
             return;
         }
-        if (used == 0 || joined) && self.retire_on_home() {
+        if (used == 0 || joined) && self.arm_retirement() {
             return;
         }
         if used == 0 {
@@ -2717,15 +2770,15 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Run<Q, L> {
         }
     }
 
-    /// Every other lane the quantum used joins the home lane on the device (it awaits that lane's latest marker of the
+    /// Every other lane the quantum used joins the retire lane on the device (it awaits that lane's latest marker of the
     /// quantum). False when the lanes offer no control or a join was refused: the caller waits for each lane's marker
     /// instead.
     fn join_lanes(&self, used: u64) -> bool {
         let lanes = &self.core.runtime.lanes;
-        let Some(home) = lanes.lane(self.home_lane).control() else {
+        let Some(retire) = lanes.lane(self.retire_lane()).control() else {
             return false;
         };
-        let mut others = used & !(1u64 << self.home_lane.0);
+        let mut others = used & !(1u64 << self.retire_lane().0);
         while others != 0 {
             let lane = others.trailing_zeros() as usize;
             others &= others - 1;
@@ -2735,7 +2788,7 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Run<Q, L> {
             if seen == marker.value {
                 continue;
             }
-            if home.await_marker(marker).is_err() {
+            if retire.await_marker(marker).is_err() {
                 return false;
             }
             // SAFETY: as above.
@@ -2744,16 +2797,22 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Run<Q, L> {
         true
     }
 
-    /// Arms one retirement on the home lane, whose callback leaves its status in this run's cell. A frame emitted when
+    /// The lane `quiesce` chose for the retirement.
+    fn retire_lane(&self) -> LaneId {
+        // SAFETY: written by `quiesce` or the boundary, which happen before the retirement.
+        unsafe { self.retire_lane.get() }.unwrap_or(self.home_lane)
+    }
+
+    /// Arms one retirement on the retire lane, whose callback leaves its status in this run's cell. A frame emitted when
     /// the cell is filled settles it and concludes the quantum. False when the arming was refused (nothing is then
     /// waiting on the cell).
-    fn retire_on_home(self: &Arc<Self>) -> bool {
+    fn arm_retirement(self: &Arc<Self>) -> bool {
         let lanes = &self.core.runtime.lanes;
-        let Some(home) = lanes.lane(self.home_lane).control() else {
+        let Some(retire) = lanes.lane(self.retire_lane()).control() else {
             return false;
         };
         self.retire_cell.rearm();
-        if home.notify_retired(&self.retire_cell).is_err() {
+        if retire.notify_retired(&self.retire_cell).is_err() {
             return false;
         }
         let frame = self
@@ -2797,13 +2856,13 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Run<Q, L> {
         any
     }
 
-    /// The home lane's retirement arrived: settles its status. A failure of the device work fails the quantum.
+    /// The retire lane's retirement arrived: settles its status. A failure of the device work fails the quantum.
     fn settle_boundary(&self) {
         let lanes = &self.core.runtime.lanes;
         let Some(status) = self.retire_cell.status() else {
             return;
         };
-        if let Some(control) = lanes.lane(self.home_lane).control()
+        if let Some(control) = lanes.lane(self.retire_lane()).control()
             && let Some(error) = control.confirm_retired(status)
         {
             self.note(QuantumOutcome::DeviceFailed {
@@ -5278,6 +5337,36 @@ mod tests {
     }
 
     #[test]
+    fn a_quantum_that_used_no_lane_at_quiesce_retires_on_the_lane_a_later_cover_added() {
+        let h = Harness::controlled(2, usize::from);
+        // The earlier quantum (home lane 0) runs one CPU stage; the later one (home lane 1) a stage on lane 1 that waits
+        // for it, and submits after the earlier quantum quiesced.
+        let earlier = h.graph(&[(None, &[], Act::Cpu)], &[]);
+        let later = h.graph(&[(None, &[1], Act::Submit)], &[]);
+        let a = earlier.start(1, alive(), Vec::new());
+        let edge = ExternalEdge {
+            from: a,
+            from_stage: StageId(0),
+            to_stage: StageId(0),
+            kind: Submission,
+        };
+        let _ = later.start(2, alive(), vec![edge]);
+        h.pump();
+        assert_eq!(h.ran_with(2, 0).unwrap().0, Some(1));
+        assert_eq!(
+            h.hands[0].armed(),
+            0,
+            "nothing waits on the earlier quantum's unused home lane"
+        );
+        assert_eq!(h.hands[1].armed(), 2, "both retirements are on lane 1");
+        assert!(h.retired(1).is_empty(), "held by the later stage's work");
+        h.hands[1].finish();
+        h.pump();
+        assert_eq!(h.retired(1), [QuantumOutcome::Completed]);
+        assert_eq!(h.retired(2), [QuantumOutcome::Completed]);
+    }
+
+    #[test]
     fn the_boundary_covers_the_later_stage_that_used_the_quantum() {
         let h = Harness::new(2);
         // The earlier quantum submits on lane 0 only; the later one's root on lane 1.
@@ -6414,6 +6503,145 @@ mod tests {
             h.retired(1),
             h.ran(1)
         );
+        assert_eq!(graph.live(), 0);
+    }
+
+    /// A run retires on a lane it used: a short quantum on lane 1 whose run's home lane is 0 retires while lane 0 still
+    /// holds an unrelated quantum's work.
+    #[test]
+    fn a_quantum_retires_on_a_lane_it_used_not_behind_work_on_its_home_lane() {
+        let h = Harness::controlled(2, |_| 0);
+        let short = h.graph(&[(None, &[1], Act::Submit)], &[]);
+        let long = h.graph(&[(None, &[0], Act::Submit)], &[]);
+        // The runs are made as they start: the short one takes home lane 0, the long one lane 1.
+        let _ = short.start(1, alive(), Vec::new());
+        let _ = long.start(2, alive(), Vec::new());
+        h.pump();
+        assert_eq!(h.ran_with(1, 0).unwrap().0, Some(1));
+        assert_eq!(h.ran_with(2, 0).unwrap().0, Some(0));
+        let [a, b] = [&h.hands[0], &h.hands[1]];
+        assert_eq!(
+            (a.armed(), b.armed()),
+            (1, 1),
+            "each quantum's retirement is armed on the lane it used"
+        );
+        assert!(lock(&a.awaits).is_empty() && lock(&b.awaits).is_empty());
+        // Lane 0 stays held by the long quantum's work; lane 1 finishes.
+        b.finish();
+        h.pump();
+        assert_eq!(h.retired(1), [QuantumOutcome::Completed]);
+        assert!(h.retired(2).is_empty(), "the long quantum is still held");
+        a.finish();
+        h.pump();
+        assert_eq!(h.retired(2), [QuantumOutcome::Completed]);
+    }
+
+    /// A quantum that used two lanes, neither its home lane, retires on the lowest of them after joining the other, and
+    /// only once the retirement arrives.
+    #[test]
+    fn a_quantum_that_used_two_lanes_retires_after_joining_both() {
+        let h = Harness::controlled(3, usize::from);
+        let graph = h.graph(&[(None, &[1], Act::Submit), (None, &[2], Act::Submit)], &[]);
+        let _ = graph.start(1, alive(), Vec::new());
+        h.pump();
+        let [home, first, second] = [&h.hands[0], &h.hands[1], &h.hands[2]];
+        assert_eq!((home.armed(), first.armed(), second.armed()), (0, 1, 0));
+        let awaited = lock(&first.awaits).clone();
+        assert_eq!(awaited.len(), 1, "the retire lane joined the other lane");
+        assert_eq!((awaited[0].queue, awaited[0].value), (second.id, 1));
+        assert!(lock(&home.awaits).is_empty());
+        assert!(h.retired(1).is_empty());
+        first.finish();
+        h.pump();
+        assert_eq!(h.retired(1), [QuantumOutcome::Completed]);
+    }
+
+    /// A stage that names a lane failed beside work on another lane: its `abandoned` hook may enqueue on home, so the
+    /// retirement stays on home, which joined the used lane first.
+    #[test]
+    fn a_failed_lane_stage_beside_work_on_another_lane_retires_on_home() {
+        let h = Harness::controlled(2, usize::from);
+        let graph = h.graph(
+            &[(None, &[1], Act::Submit), (None, &[1], Act::Fail)],
+            &[(0, 1, Submission)],
+        );
+        let _ = graph.start(1, alive(), Vec::new());
+        h.pump();
+        assert_eq!(h.abandoned(1), [1]);
+        assert_eq!(
+            (h.hands[0].armed(), h.hands[1].armed()),
+            (1, 0),
+            "home covers the hook"
+        );
+        assert_eq!(lock(&h.hands[0].awaits).len(), 1);
+        h.finish_lanes();
+        h.pump();
+        assert_eq!(h.retired(1).len(), 1);
+    }
+
+    /// As above for a killed quantum whose second stage, which names lane 1, never ran.
+    #[test]
+    fn a_killed_lane_stage_beside_work_on_another_lane_retires_on_home() {
+        let h = Harness::controlled(2, usize::from);
+        let token = Token::default();
+        let graph = h.graph(
+            &[
+                (None, &[1], Act::Host(token.clone())),
+                (None, &[1], Act::Cpu),
+            ],
+            &[(0, 1, Completion)],
+        );
+        let kill = alive();
+        let _ = graph.start(1, kill.clone(), Vec::new());
+        h.pump();
+        kill.store(true, Ordering::Release);
+        h.pump();
+        token.0.store(true, Ordering::Release);
+        h.pump();
+        h.hands[1].finish();
+        h.pump();
+        h.pump();
+        assert_eq!(h.abandoned(1), [1]);
+        assert_eq!(lock(&h.hands[0].awaits).len(), 1, "lane 1 joined home");
+        h.finish_lanes();
+        h.pump();
+        assert_eq!(h.retired(1), [QuantumOutcome::Killed]);
+    }
+
+    /// A killed quantum whose unrun stage names no lane and that used only lane 1 retires on lane 1.
+    #[test]
+    fn a_killed_quantum_that_used_only_another_lane_retires_there() {
+        let h = Harness::controlled(2, usize::from);
+        let token = Token::default();
+        let graph = h.graph(
+            &[
+                (None, &[1], Act::Host(token.clone())),
+                (None, &[], Act::Cpu),
+            ],
+            &[(0, 1, Completion)],
+        );
+        let kill = alive();
+        let _ = graph.start(1, kill.clone(), Vec::new());
+        h.pump();
+        kill.store(true, Ordering::Release);
+        h.pump();
+        assert!(h.retired(1).is_empty());
+        token.0.store(true, Ordering::Release);
+        h.pump();
+        let before = h.hands[1].armed();
+        h.hands[1].finish();
+        h.pump();
+        h.pump();
+        assert_eq!(h.abandoned(1), [1]);
+        assert_eq!(
+            (h.hands[0].armed(), h.hands[1].armed() - before),
+            (0, 1),
+            "retires on the lane it used"
+        );
+        assert!(h.retired(1).is_empty(), "held until the retirement arrives");
+        h.hands[1].finish();
+        h.pump();
+        assert_eq!(h.retired(1), [QuantumOutcome::Killed]);
         assert_eq!(graph.live(), 0);
     }
 
