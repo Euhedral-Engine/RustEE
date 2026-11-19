@@ -34,6 +34,14 @@ class ChildPipeline(unittest.TestCase):
         self.assertNotIn("nothing-affected", jobs)
         self.assertIn("cargo test -p euhedral-hashing", jobs["workspace"]["script"])
 
+    def test_the_lock_ratchet_runs_when_any_crate_changes(self):
+        # The ratchet reads every crate's sources, but a change to another crate does not affect euhedral-core.
+        ratchet = "cargo test -p euhedral-core --test hot_fix_ratchet"
+        jobs = pipeline("any=true\nargs=-p euhedral-io\neuhedral_core=false\nmiri=false\n")
+        self.assertIn(ratchet, jobs["workspace"]["script"])
+        jobs = pipeline("any=true\nargs=-p euhedral-core\neuhedral_core=true\nmiri=false\n")
+        self.assertNotIn(ratchet, jobs["workspace"]["script"])
+
     def test_a_matrix_with_an_apostrophe_reaches_the_build_script_whole(self):
         # A shard's name carries the reason it runs, which can quote ("Miri's wiring"): the matrix is one shell word.
         matrix = {"include": [{"name": "canary: Miri's wiring (changed)", "seeds": 1, "cpu": 1, "mem": "1G",

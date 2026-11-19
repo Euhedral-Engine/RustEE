@@ -45,6 +45,20 @@ semantics and the tests that pin it.
 
 **Tests.** `lateness_of_a_timer_counts_from_its_deadline_not_its_registration` (a guard: the timer was already exact), `lateness_of_a_bell_gated_wait_counts_from_the_ring_not_its_registration` and `lateness_of_a_retirement_polled_blind_counts_from_its_arrival_too` (fail before), `lateness_of_a_polled_condition_counts_from_the_last_look` (guard).
 
+## CI runs the hot-path lock ratchet for every library change (CI) (2026-11-19)
+
+**What.** The workspace job runs `cargo test -p euhedral-core --test hot_fix_ratchet` whenever any crate is affected and `euhedral-core` is not (when it is, `cargo test` already runs it).
+
+**Why.** The ratchet counts `lock!` sites and `HOT-FIX` tags in every crate's library sources, but a change confined to another crate never affects `euhedral-core`, so a new lock site passed the pipeline that added it and turned main red.
+
+**How to use.** Nothing: a change that adds a lock site, or a tag use, fails its own pipeline.
+
+**Semantics.** One extra test binary on pipelines that do not affect `euhedral-core`; the GitLab child pipeline and `ci.yml` do the same.
+
+**Ratchet.** A file's `lock!` count in `LOCK_MACRO_SITES` still only shrinks (exact), except for a file on the new `LOCK_MACRO_CEILINGS` list, whose count is a ceiling (more sites fail, fewer pass). Only `euhedral-io/src/win/mod.rs` is on it, set far above its sites (1_000_000) until its locks go in the lock removal campaign, which removes the list. `HOT_FIX_TAGS` stays exact.
+
+**Tests.** `scripts/ci/test_gitlab_pipeline.py`: the ratchet step is present when only another crate is affected and absent when `euhedral-core` is (fails on the old script). `hot_fix_ratchet.rs`: an exact row fails with fewer or more sites, a ceiling row passes with fewer and fails with more.
+
 ## A killed quantum holds for everything it started, and killed waiting entries end at the next visit (`euhedral-graph`) (2026-11-19)
 
 **What.** A killed `StageGraph` quantum runs no `abandoned` hook, and lets go of nothing it holds, until every host completion it started is ready and the latest marker of each lane it used is reached. Before, only a stage that returned a completion held it, and an ordered stage's host completion with no marker held nothing once the kill ended it. In `Completions`, a waiting entry whose frame is killed (unordered, timer, marker, retirement, `Ready`, `Wake`) ends at the next visit of the source as a dead continuation, not only a chain head.
