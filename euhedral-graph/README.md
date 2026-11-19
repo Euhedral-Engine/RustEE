@@ -336,6 +336,20 @@ RustEE's: to have every quantum retire, stop starting quanta and complete `Compl
 (Retiring such a quantum in place instead would end its retirement frame on a refusing sink, which recurses down a chain
 of quanta that hold each other.)
 
+**Lanes at drop.** A graph lets go of the runtime's lanes before it drops its stages. The graph's shared state drops its
+`GraphRuntime` (and with it the `Arc<LanePool>`) before its stages, each run drops its retried stages' wake-ups (which
+hold the pool) before its reference to that state, and the `Completions` source, once it has offered a graph's frames,
+holds nothing for them: not an upgrade of the pool and not the operations it was given (a marker-and-host wait, a retry
+wake-up). So when the last of the graph handle and its runs is gone, the stages' own state (dropped no earlier than that:
+a caller's clone of a stage's `Arc` outlives the graph) is dropped while the graph and its runs hold none of the
+runtime's lanes for it. An owner may take the drop of a token a stage carries to mean that. This is declaration order and
+the scan's order of release, nothing else: there is no notification. Limits: the source may still upgrade the pool
+briefly (the length of one marker query, which is backend code) while it scans any marker entry, of this graph or of any
+other sharing the source, so the pool's last reference can drop on a polling worker: a lane teardown must be safe there,
+or the owner must complete the `Completions` first, so that no marker entries are left. A `GraphRuntime` clone someone
+else holds keeps the pool; the application's own operations (a stage's host completion) are its own; and
+`Completions::pending()` is no signal (it drops when a frame is handed out, before the frame ends).
+
 Quanta are **pooled**. `start` takes a retired quantum's state from a bounded pool and `retire` gives it back,
 as the graph's frames go back to theirs, so after warm-up a quantum allocates nothing and takes no lock of its own. (A stage
 that returns a host completion allocates it, and a completion that waits for both a marker and a host completion

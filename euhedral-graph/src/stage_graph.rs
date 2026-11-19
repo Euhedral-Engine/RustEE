@@ -314,6 +314,14 @@ impl<L: DeviceQueue + ?Sized> StageCx<'_, L> {
 }
 
 /// One stage's work for a quantum `Q`. It computes or submits, and returns; it never waits.
+///
+/// # Dropping
+///
+/// A stage's own state (what its fields own) is dropped when the last holder of its `Arc` goes: no earlier than the
+/// last of its graph's handle and runs, and later if a caller kept a clone. When it is the graph's last, the graph and
+/// its runs have already let go of the runtime's lanes (see [`StageGraph`]), so a stage may carry a token whose drop
+/// tells an owner that the graph no longer holds the lanes. Only the graph's and its runs' references are covered: a
+/// [`GraphRuntime`] someone else cloned keeps the pool.
 pub trait Stage<Q, L: DeviceQueue + ?Sized = dyn DeviceQueue>: Send + Sync {
     /// Runs the stage for `quantum`: it computes or submits, and returns; it never waits.
     ///
@@ -733,6 +741,18 @@ impl std::error::Error for GraphError {}
 ///   completion edges, by an arrival frame on the predecessor's ordered lane (completions are
 ///   emitted in registration order), so an ordered predecessor's order carries over to an ordered
 ///   successor (a fetch → parse chain).
+///
+/// - **Lanes at drop.** The graph and its runs let go of their references to the runtime's lane pool before they drop
+///   their stages, and the [`Completions`] source, once it has offered a graph's frames, holds nothing for them: not an
+///   upgrade of the pool and not the operations it was given for a stage (a marker-and-host wait, a retry wake-up). So
+///   when the last of the graph handle and its runs is gone, the stages' own state (dropped no earlier than that: a
+///   caller's clone of a stage's `Arc` outlives the graph) is dropped while the graph and its runs hold none of the
+///   runtime's lanes for it. An owner may take the drop of a token a stage holds to mean that. Limits: the source may
+///   still upgrade the pool briefly, for one marker query (backend code), while it scans any marker entry of any graph
+///   sharing it, so the pool's last reference can drop on a polling worker: a lane teardown must be safe there, or the
+///   owner must complete the `Completions` first. A [`GraphRuntime`] clone someone else holds keeps the pool; a stage's
+///   host completion, and any other operation the application registered, is the application's own; and
+///   [`Completions::pending`] is no signal (it drops when a frame is handed out, which can be before the frame ends).
 pub struct StageGraph<Q, L: DeviceQueue + ?Sized = dyn DeviceQueue> {
     core: Arc<Core<Q, L>>,
     /// Retired runs, for the next quanta.
@@ -750,11 +770,15 @@ impl<Q, L: DeviceQueue + ?Sized> fmt::Debug for StageGraph<Q, L> {
 
 /// What every run of a graph shares: the shape, the stages, the runtime, and the frame pool. Immutable but for its
 /// counters and the pool.
+///
+/// Field order is a guarantee: fields drop in declaration order, and `runtime` (which holds the lane pool) is first, so
+/// it is released before `stages` drop. Whatever a stage's own state does as it drops (an owner's token that starts
+/// tearing the lanes down) finds the graph holding none of the runtime's lanes through `Core`.
 struct Core<Q, L: DeviceQueue + ?Sized> {
+    runtime: GraphRuntime<L>,
     spec: StageGraphSpec,
     stages: Vec<Arc<dyn Stage<Q, L>>>,
     topology: Topology,
-    runtime: GraphRuntime<L>,
     retire: Box<dyn Fn(Q, QuantumOutcome) + Send + Sync>,
     live: AtomicUsize,
     seeds: AtomicU64,
@@ -1484,7 +1508,13 @@ impl LaneTable {
 }
 
 /// A quantum bound to its graph: pooled, and rebound to each quantum in turn.
+///
+/// Field order is a guarantee: fields drop in declaration order, and `retry_wakes` (each holds the lane pool) comes
+/// before `core`, whose drop (when this is the last run) drops the stages. A run's own lane references are therefore
+/// released before any stage state drops.
 struct Run<Q, L: DeviceQueue + ?Sized> {
+    /// Each stage's wake-up for when it answers `Retry`.
+    retry_wakes: Box<[Arc<RetryWake<L>>]>,
     core: Arc<Core<Q, L>>,
     /// Where the run goes when its quantum retires.
     home: Weak<Producer<Arc<Run<Q, L>>, Multi>>,
@@ -1504,8 +1534,6 @@ struct Run<Q, L: DeviceQueue + ?Sized> {
     /// The first reason the quantum did not complete; read by the retirement, after every frame is done.
     cause: FirstCause<QuantumOutcome>,
     stages: Box<[StageRun]>,
-    /// Each stage's wake-up for when it answers `Retry`.
-    retry_wakes: Box<[Arc<RetryWake<L>>]>,
     /// The lanes the quantum submitted to, and the latest marker value on each.
     lanes: LaneTable,
     /// Boundary completions still to come, and one for the arming.
@@ -1539,6 +1567,7 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Run<Q, L> {
             .collect();
         let lanes = LaneTable::new(core.runtime.lanes.len());
         Arc::new(Self {
+            retry_wakes,
             core,
             home,
             home_lane,
@@ -1549,7 +1578,6 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Run<Q, L> {
             stopped: AtomicBool::new(false),
             cause: FirstCause::new(),
             stages,
-            retry_wakes,
             lanes,
             boundary_left: AtomicUsize::new(0),
             retire_cell: Arc::new(RetireCell::new()),
@@ -5966,6 +5994,106 @@ mod tests {
             lock(&log).push(Event::Retired { q, outcome });
         })
         .unwrap()
+    }
+
+    /// A stage's own state that notes, as it drops, how many strong references the lane pool has.
+    struct PoolWatch {
+        pool: Weak<LanePool>,
+        seen: Arc<AtomicUsize>,
+    }
+
+    const UNSEEN: usize = usize::MAX;
+
+    impl Drop for PoolWatch {
+        fn drop(&mut self) {
+            self.seen.store(self.pool.strong_count(), Ordering::Relaxed);
+        }
+    }
+
+    /// A CPU stage that carries a [`PoolWatch`] and, if told to, answers `Retry` once.
+    struct Watched {
+        _watch: PoolWatch,
+        retry: AtomicBool,
+    }
+
+    impl Stage<u64> for Watched {
+        fn run(&self, _q: &u64, _cx: &StageCx<'_>) -> Result<Submitted, StageError> {
+            if self.retry.swap(false, Ordering::AcqRel) {
+                return Err(StageError::Retry);
+            }
+            Ok(Submitted::done())
+        }
+    }
+
+    /// A graph of one watched stage, the pool's strong count without the graph, and where the watch writes.
+    fn watched_graph(h: &Harness, retry: bool) -> (Arc<StageGraph<u64>>, usize, Arc<AtomicUsize>) {
+        let owner_only = Arc::strong_count(&h.runtime.lanes);
+        let seen = Arc::new(AtomicUsize::new(UNSEEN));
+        let stage = Arc::new(Watched {
+            _watch: PoolWatch {
+                pool: Arc::downgrade(&h.runtime.lanes),
+                seen: seen.clone(),
+            },
+            retry: AtomicBool::new(retry),
+        });
+        (one_stage_graph(h, stage, None), owner_only, seen)
+    }
+
+    /// The graph handle's drop (no quantum in flight) lets go of the lanes before its stage's state drops.
+    #[test]
+    fn a_dropped_graph_holds_no_lane_once_its_stage_state_drops() {
+        let h = Harness::new(1);
+        let (graph, owner_only, seen) = watched_graph(&h, false);
+        let _ = graph.start(1, alive(), Vec::new());
+        h.pump();
+        assert_eq!(h.retired(1), [QuantumOutcome::Completed]);
+        assert_eq!(seen.load(Ordering::Relaxed), UNSEEN, "the graph is alive");
+        drop(graph);
+        assert_eq!(seen.load(Ordering::Relaxed), owner_only);
+    }
+
+    /// The last run to drop, on a thread that runs frames, lets go of the lanes before the stage's state drops.
+    #[test]
+    #[allow(clippy::disallowed_methods)] // The test's own thread runs frames, as a lattice worker does.
+    fn the_last_run_dropping_on_a_worker_holds_no_lane_once_the_stage_state_drops() {
+        let h = Harness::new(1);
+        let (graph, owner_only, seen) = watched_graph(&h, false);
+        let _ = graph.start(1, alive(), Vec::new());
+        // The handle goes first: the quantum's frames hold the graph.
+        drop(graph);
+        assert_eq!(
+            seen.load(Ordering::Relaxed),
+            UNSEEN,
+            "a quantum is in flight"
+        );
+        std::thread::scope(|scope| {
+            scope.spawn(|| h.pump());
+        });
+        assert_eq!(h.retired(1), [QuantumOutcome::Completed]);
+        let dropped_with = seen.load(Ordering::Relaxed);
+        assert_ne!(dropped_with, UNSEEN, "the last run was dropped");
+        assert_eq!(dropped_with, owner_only);
+    }
+
+    /// A run whose retry wake is armed when the graph handle drops lets go of the lanes, its wake's included, before the
+    /// stage's state drops.
+    #[test]
+    fn a_run_with_a_retry_wake_armed_holds_no_lane_once_the_stage_state_drops() {
+        // A backstop of zero: the armed wake is due the first time it is polled.
+        let h = Harness::with_backstop(1, Duration::ZERO);
+        let (graph, owner_only, seen) = watched_graph(&h, true);
+        let _ = graph.start(1, alive(), Vec::new());
+        assert!(h.pump_once(), "the stage ran and answered Retry");
+        assert_eq!(h.runtime.retries.retries(), 1);
+        drop(graph);
+        assert_eq!(
+            seen.load(Ordering::Relaxed),
+            UNSEEN,
+            "the wake holds the run"
+        );
+        h.pump();
+        assert_eq!(h.retired(1), [QuantumOutcome::Completed]);
+        assert_eq!(seen.load(Ordering::Relaxed), owner_only);
     }
 
     /// A `pass_gate` that panics after it took (and kept) a gate fails the quantum all the same.
