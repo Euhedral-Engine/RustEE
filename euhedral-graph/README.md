@@ -343,8 +343,6 @@ it, and debug builds panic at the registration (`debug_assert!` in `Completions`
 contained end or into the consumer's drop of a `QuantumRef`. This holds for a quantum started after the close as for one
 in flight, and it is the safety rule that stays. Whether quanta retire at shutdown is the consumer's policy, not
 RustEE's: to have every quantum retire, stop starting quanta and complete `Completions` only after `live() == 0`.
-(Retiring such a quantum in place instead would end its retirement frame on a refusing sink, which recurses down a chain
-of quanta that hold each other.)
 
 **Lanes at drop.** A graph lets go of the runtime's lanes before it drops its stages. The graph's shared state drops its
 `GraphRuntime` (and with it the `Arc<LanePool>`) before its stages, each run drops its retried stages' wake-ups (which

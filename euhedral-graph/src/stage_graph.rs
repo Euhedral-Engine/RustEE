@@ -625,24 +625,41 @@ impl Drop for EndingScope {
 /// a nested call links its frame at the head of the thread's pending list and returns, and the outermost one ends the
 /// frames one after another. A panic of any of those ends is contained (the quantum has concluded, its run is back in
 /// the pool and its count is dropped by the time it is caught) and counted on the frame's graph
-/// ([`StageGraph::contained_panics`]); its payload is dropped.
+/// ([`StageGraph::contained_panics`]); its payload is dropped. The frames of the list end newest first.
 fn end_in_place<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static>(
-    mut frame: Box<GraphFrame<Q, L>>,
+    frame: Box<GraphFrame<Q, L>>,
 ) {
     if ENDING.get() {
-        frame.next = PENDING.take();
-        PENDING.set(Some(frame));
+        // The list is gone once the thread's locals are being destroyed: end the frame right here then.
+        let mut slot = Some(frame);
+        let linked = PENDING.try_with(|pending| {
+            let mut frame = slot.take().expect("the frame is linked once");
+            frame.next = pending.take();
+            pending.set(Some(frame));
+        });
+        if linked.is_err()
+            && let Some(frame) = slot
+        {
+            frame.end();
+        }
         return;
     }
     ENDING.set(true);
     let _scope = EndingScope;
     let mut current: Option<Box<dyn EndsInPlace + Send>> = Some(frame);
     while let Some(frame) = current {
-        frame.end();
-        current = PENDING.take().map(|mut head| {
-            PENDING.set(head.take_next());
-            head
-        });
+        // `end` contains what it runs; this catch is for what could still unwind out of it, so that the list always
+        // drains.
+        let _ = catch_unwind(AssertUnwindSafe(|| frame.end()));
+        current = PENDING
+            .try_with(|pending| {
+                pending.take().map(|mut head| {
+                    pending.set(head.take_next());
+                    head
+                })
+            })
+            .ok()
+            .flatten();
     }
 }
 
@@ -827,7 +844,7 @@ struct Core<Q, L: DeviceQueue + ?Sized> {
     retire: Box<dyn Fn(Q, QuantumOutcome) + Send + Sync>,
     live: AtomicUsize,
     /// Panics contained where a refused frame ended in place.
-    contained_panics: AtomicU64,
+    contained_panics: Arc<AtomicU64>,
     seeds: AtomicU64,
     /// Finished frames, for the next stages, arrivals and boundaries (of any run of the graph).
     frames: Pool<Box<GraphFrame<Q, L>>>,
@@ -1137,7 +1154,7 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> StageGraph<Q, 
                 runtime,
                 retire: Box::new(retire),
                 live: AtomicUsize::new(0),
-                contained_panics: AtomicU64::new(0),
+                contained_panics: Arc::new(AtomicU64::new(0)),
                 seeds: AtomicU64::new(0),
                 frames: Pool::new(POOLED_FRAMES),
             }),
@@ -1207,9 +1224,14 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> StageGraph<Q, 
         self.core.live.load(Ordering::Acquire)
     }
 
-    /// Panics contained where a frame the stage sink refused ended in place: a `retire` or a stage that panicked on
-    /// the thread that found the sink closed or full. Each such frame still finished (the quantum concluded or
-    /// failed, its count was dropped) and the thread went on; this is how an owner sees that it happened.
+    /// Panics contained where a frame the stage sink refused ended in place, since the graph was built. A panic of the
+    /// stage's run there counts, and so does any panic that leaves the frame's end: the `retire` of the quantum it
+    /// concludes, a stage or the runtime dropped with the last run, a debug assertion of a closed `Completions`
+    /// source. (A `retired` hook that panics is already contained by the quantum, which fails; it does not count.) The
+    /// frame still finished (the quantum concluded or failed, its count was dropped) and the thread went on. A
+    /// payload whose own drop panics is contained and not counted again. A sink that hands back a frame that is not
+    /// the graph's has lost the graph's frame (its quantum never retires); the frame it handed back is ended and counts
+    /// if it panics.
     pub fn contained_panics(&self) -> u64 {
         self.core.contained_panics.load(Ordering::Relaxed)
     }
@@ -1799,14 +1821,26 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Run<Q, L> {
     /// Offers `frame`; a refused one (the sink completed or is full) ends in place, contained.
     fn offer_frame(&self, frame: Box<GraphFrame<Q, L>>) {
         if let Err(frame) = self.core.runtime.stages.offer(frame) {
-            end_in_place(Self::refused(frame));
+            self.end_refused(frame, false);
         }
     }
 
-    /// The frame a sink handed back, which is the one this graph offered.
-    fn refused(frame: Box<dyn Frame>) -> Box<GraphFrame<Q, L>> {
-        // SAFETY: `FrameSink::offer` hands back the frame it was given, and a graph offers only its own frames.
-        unsafe { Box::from_raw(Box::into_raw(frame).cast::<GraphFrame<Q, L>>()) }
+    /// Ends a frame a sink handed back. A sink is to hand back the frame it was given; one that hands back another
+    /// has lost the graph's frame (its quantum never retires), and the frame it did hand back is finished in place
+    /// and counted as a contained panic if that panics.
+    fn end_refused(&self, frame: Box<dyn Frame>, runs_first: bool) {
+        if !(&*frame as &dyn Any).is::<GraphFrame<Q, L>>() {
+            let ended = catch_unwind(AssertUnwindSafe(|| frame.do_finally()));
+            if ended.is_err() {
+                self.core.contained_panics.fetch_add(1, Ordering::Relaxed);
+            }
+            return;
+        }
+        let frame: Box<dyn Any + Send> = frame;
+        if let Ok(mut frame) = frame.downcast::<GraphFrame<Q, L>>() {
+            frame.runs_first = runs_first;
+            end_in_place(frame);
+        }
     }
 
     /// Publishes `stage`, whose last incoming edge arrived (its live count is already taken).
@@ -1820,7 +1854,7 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Run<Q, L> {
                 stage,
                 StageError::Fatal("the stage sink no longer takes frames".into()),
             );
-            end_in_place(Self::refused(frame));
+            self.end_refused(frame, false);
         }
     }
 
@@ -1840,9 +1874,7 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Run<Q, L> {
             .core
             .frame(self, Kind::Stage(stage), self.header(None, true));
         if let Err(frame) = self.core.runtime.stages.offer(frame) {
-            let mut frame = Self::refused(frame);
-            frame.runs_first = true;
-            end_in_place(frame);
+            self.end_refused(frame, true);
         }
     }
 
@@ -3161,12 +3193,17 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> EndsInPlace fo
     }
 
     fn end(mut self: Box<Self>) {
-        let run = self.run.clone();
+        // The counter only: a strong reference to the run here could be the last one, and its drop (the stages', the
+        // `retire` closure's, the runtime's) would then run outside the catches below.
+        let counter = self
+            .run
+            .as_ref()
+            .map(|run| run.core.contained_panics.clone());
         let count = |panic: Box<dyn Any + Send>| {
-            if let Some(run) = &run {
-                run.core.contained_panics.fetch_add(1, Ordering::Relaxed);
+            if let Some(counter) = &counter {
+                counter.fetch_add(1, Ordering::Relaxed);
             }
-            // A payload whose drop panics is contained too.
+            // A payload whose drop panics is contained too (and not counted again).
             let _ = catch_unwind(AssertUnwindSafe(|| drop(panic)));
         };
         let mut outcome = Ok(());
@@ -3175,8 +3212,13 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> EndsInPlace fo
                 Ok(Err(FrameError::Cancelled) | Ok(())) => {}
                 Ok(Err(error)) => outcome = Err(error),
                 Err(panic) => {
+                    let message = panic
+                        .downcast_ref::<&str>()
+                        .map(|message| (*message).to_owned())
+                        .or_else(|| panic.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "a non-string payload".to_owned());
                     count(panic);
-                    outcome = Err(FrameError::failed("the stage panicked"));
+                    outcome = Err(FrameError::failed(format!("the stage panicked: {message}")));
                 }
             }
         }
@@ -6890,6 +6932,206 @@ mod tests {
         worker
             .join()
             .expect("the runs followed one another in a flat stack");
+    }
+
+    /// A quantum whose state holds the references of several others: the references drop in order inside one in-place
+    /// end, and the frames they cause end after it, newest first.
+    #[test]
+    fn a_fan_out_of_held_quanta_ends_in_place_newest_first_after_the_one_that_dropped_them() {
+        struct Fan(Vec<QuantumRef>, u64);
+
+        struct Host;
+
+        impl Stage<Fan> for Host {
+            fn run(&self, _: &Fan, _: &StageCx<'_>) -> Result<Submitted, StageError> {
+                Ok(Submitted::done())
+            }
+        }
+
+        let h = Harness::new(1);
+        let sink = Arc::new(Refuses {
+            inner: h.sink.clone(),
+            refuse: AtomicBool::new(false),
+        });
+        let mut runtime = h.runtime.clone();
+        runtime.stages = sink.clone();
+        let mut spec = StageGraphSpec::new();
+        spec.stage(StageSpec {
+            name: "host",
+            ordered: None,
+            lanes: Vec::new(),
+        });
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let log = order.clone();
+        let graph = StageGraph::new(
+            spec,
+            vec![Arc::new(Host) as Arc<dyn Stage<Fan>>],
+            runtime,
+            move |fan: Fan, _| {
+                lock(&log).push(fan.1);
+                drop(fan.0);
+            },
+        )
+        .unwrap();
+        let mut held = Vec::new();
+        for id in 1..=3 {
+            held.push(graph.start(Fan(Vec::new(), id), alive(), Vec::new()));
+            assert_eq!(h.pump(), 1);
+        }
+        let last = graph.start(Fan(held, 4), alive(), Vec::new());
+        assert_eq!(h.pump(), 1);
+        sink.refuse.store(true, Ordering::Release);
+        drop(last);
+        assert_eq!(*lock(&order), [4, 3, 2, 1]);
+        assert_eq!(graph.live(), 0);
+        assert_eq!(graph.contained_panics(), 0);
+    }
+
+    /// A stage whose drop panics, dropped with the last run inside an in-place end, while another frame waits on the
+    /// list: neither the panic nor the other frame is lost.
+    #[test]
+    fn a_last_run_whose_stage_drop_panics_in_an_in_place_end_leaves_no_frame_pending() {
+        struct Fan(Vec<QuantumRef>, u64);
+
+        struct Bomb(Arc<AtomicBool>);
+
+        impl Stage<Fan> for Bomb {
+            fn run(&self, _: &Fan, _: &StageCx<'_>) -> Result<Submitted, StageError> {
+                Ok(Submitted::done())
+            }
+        }
+
+        impl Drop for Bomb {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+                if !std::thread::panicking() {
+                    panic!("the stage's drop broke");
+                }
+            }
+        }
+
+        let h = Harness::new(1);
+        let sink = Arc::new(Refuses {
+            inner: h.sink.clone(),
+            refuse: AtomicBool::new(false),
+        });
+        let mut runtime = h.runtime.clone();
+        runtime.stages = sink.clone();
+        let one = || {
+            let mut spec = StageGraphSpec::new();
+            spec.stage(StageSpec {
+                name: "host",
+                ordered: None,
+                lanes: Vec::new(),
+            });
+            spec
+        };
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let retire = |order: &Arc<Mutex<Vec<u64>>>| {
+            let log = order.clone();
+            move |fan: Fan, _| {
+                lock(&log).push(fan.1);
+                drop(fan.0);
+            }
+        };
+        let dropped = Arc::new(AtomicBool::new(false));
+        let doomed = StageGraph::new(
+            one(),
+            vec![Arc::new(Bomb(dropped.clone())) as Arc<dyn Stage<Fan>>],
+            runtime.clone(),
+            retire(&order),
+        )
+        .unwrap();
+        let other = StageGraph::new(
+            one(),
+            vec![Arc::new(Bomb(Arc::new(AtomicBool::new(false)))) as Arc<dyn Stage<Fan>>],
+            runtime.clone(),
+            retire(&order),
+        )
+        .unwrap();
+        let holder = StageGraph::new(
+            one(),
+            vec![Arc::new(Bomb(Arc::new(AtomicBool::new(false)))) as Arc<dyn Stage<Fan>>],
+            runtime,
+            retire(&order),
+        )
+        .unwrap();
+        // 1 is the other graph's, 2 the doomed graph's, 3 holds them in this order: the doomed one ends first.
+        let first = other.start(Fan(Vec::new(), 1), alive(), Vec::new());
+        assert_eq!(h.pump(), 1);
+        let second = doomed.start(Fan(Vec::new(), 2), alive(), Vec::new());
+        assert_eq!(h.pump(), 1);
+        let third = holder.start(Fan(vec![first, second], 3), alive(), Vec::new());
+        assert_eq!(h.pump(), 1);
+        drop(doomed);
+        sink.refuse.store(true, Ordering::Release);
+        let dropped_ref = catch_unwind(AssertUnwindSafe(|| drop(third)));
+        assert!(dropped_ref.is_ok(), "nothing escaped the in-place ends");
+        assert!(dropped.load(Ordering::Acquire), "the last run dropped it");
+        assert_eq!(*lock(&order), [3, 2, 1], "the frame behind it still ended");
+        assert_eq!((other.live(), holder.live()), (0, 0));
+        // The frame ended on a thread that holds no list afterwards.
+        let _ = catch_unwind(AssertUnwindSafe(|| drop(other)));
+        let _ = catch_unwind(AssertUnwindSafe(|| drop(holder)));
+    }
+
+    /// A sink that hands back some other frame than the one it was given: nothing is cast, the frame it handed back is
+    /// ended, and the thread goes on.
+    #[test]
+    fn a_sink_that_hands_back_another_frame_has_that_frame_ended_and_nothing_else() {
+        struct Foreign(FrameHeader, Arc<AtomicU64>);
+
+        impl Frame for Foreign {
+            fn header(&self) -> &FrameHeader {
+                &self.0
+            }
+
+            fn header_mut(&mut self) -> &mut FrameHeader {
+                &mut self.0
+            }
+
+            fn do_finally(self: Box<Self>) {
+                self.1.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+
+        struct Swaps(Arc<AtomicU64>);
+
+        impl FrameSink for Swaps {
+            fn offer(&self, _: Box<dyn Frame>) -> Result<(), Box<dyn Frame>> {
+                Err(Box::new(Foreign(FrameHeader::new(0), self.0.clone())))
+            }
+        }
+
+        let h = Harness::new(1);
+        let ended = Arc::new(AtomicU64::new(0));
+        let mut runtime = h.runtime.clone();
+        runtime.stages = Arc::new(Swaps(ended.clone()));
+        let mut spec = StageGraphSpec::new();
+        spec.stage(StageSpec {
+            name: "host",
+            ordered: None,
+            lanes: Vec::new(),
+        });
+        let graph = StageGraph::new(
+            spec,
+            vec![Arc::new(Probe {
+                act: Act::Cpu,
+                gate: GateAct::Pass,
+                log: h.log.clone(),
+                hands: Vec::new(),
+            }) as Arc<dyn Stage<u64>>],
+            runtime,
+            |_, _| {},
+        )
+        .unwrap();
+        let _ = graph.start(1, alive(), Vec::new());
+        assert_eq!(
+            ended.load(Ordering::Acquire),
+            1,
+            "the handed-back frame ended"
+        );
+        assert_eq!(graph.contained_panics(), 0);
     }
 
     /// A later quantum's stage that submitted on a lane after this one ran covers its marker with this quantum's
