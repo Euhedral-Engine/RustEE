@@ -83,13 +83,18 @@ pub trait Pending: Send {
 /// yields one. Operations of different chains, and unordered ones, are emitted as they are found.
 ///
 /// A head that can never complete holds its chain until the consumer cancels it: nothing here times it out or
-/// releases it. Cancelling is setting the kill switch of the head's frame; the next visit to the head finds it, ends
+/// releases it. Cancelling is setting the kill switch of the frame; the next visit to the entry finds it, ends
 /// it as a dead continuation (handed out, skipped by the executor, its `do_finally` ending what it holds) and
-/// promotes the next entry. A head that panics in its query, or whose marker's pool is gone, ends the same way.
-/// A cancelled head is not queried: its `do_finally` may run before its marker is reached, its retirement arrived or
-/// its `Ready` got ready (the `Ready` is dropped). A consumer whose frame stands for device work that may still use
-/// what it holds keeps that hold itself, past the cancellation: [`StageGraph`](crate::StageGraph) hands it to a wait
-/// for the marker whose frame has no kill switch and no order, so no chain holds it and no cancellation ends it.
+/// promotes the next entry of its chain. This holds for every waiting entry with a frame, chain or not: unordered
+/// entries and timers too, so a cancelled timer an hour out does not occupy the source for the hour. A head that
+/// panics in its query, or whose marker's pool is gone, ends the same way. A cancellation is found by the next visit
+/// of the source (a poll, which a registration or a bell causes): it does not wake the source, and an entry that no
+/// poll visits (one behind a head in a chain) ends when it becomes the head. A [`Pending`] has no frame to cancel.
+/// A cancelled entry is not queried: its `do_finally` may run before its marker is reached, its retirement arrived or
+/// its `Ready` got ready (the `Ready` is dropped, before the frame's `do_finally` runs). A consumer whose frame stands
+/// for work that may still use what it holds keeps that hold itself, past the cancellation: [`StageGraph`](crate::StageGraph)
+/// hands a marker to a wait whose frame has no kill switch and no order, and keeps a host completion's `Ready` in the
+/// frame (the entry only polls it) to register it again the same way, so no chain holds it and no cancellation ends it.
 ///
 /// A continuation is handed out even if its frame has died (its kill switch is set): the executor then
 /// skips it and runs its `do_finally`, which ends what it holds. So at shutdown
@@ -318,8 +323,9 @@ struct Out {
     held: VecDeque<Box<dyn Frame>>,
 }
 
-/// A registered operation and when it was last seen in flight (an upper bound on when it completed
-/// is the poll that found it done; its lateness is at most the time since the previous look).
+/// A registered operation and when it was last seen in flight. For an operation polled blind (a marker, a `Ready`, a
+/// `Wake`, a `Pending`) the poll that finds it done measures its lateness from this: at most the time since the
+/// previous look.
 struct Waiting {
     what: Waits,
     last_seen: Instant,
@@ -361,11 +367,12 @@ impl Waits {
         }
     }
 
-    /// Whether the operation is in a chain and its frame was cancelled (its kill switch is set): the consumer's way to
-    /// release a chain whose head can never complete. It ends as found done, so its frame is handed out, skipped by
-    /// the executor, and its `do_finally` ends what it holds; the next of its chain takes its place.
-    fn cancelled_in_chain(&self) -> bool {
-        self.chain().is_some() && self.frame().is_some_and(|frame| !frame.header().is_alive())
+    /// Whether the operation's frame was cancelled (its kill switch is set): the consumer's way to release an entry
+    /// that can never complete, or not for a long time. It ends as found done at the next visit, so its frame is
+    /// handed out, skipped by the executor, and its `do_finally` ends what it holds; in a chain the next entry takes
+    /// its place. A `Pending` has no frame until it yields one: it is never cancelled.
+    fn cancelled(&self) -> bool {
+        self.frame().is_some_and(|frame| !frame.header().is_alive())
     }
 }
 
@@ -642,6 +649,10 @@ impl Completions {
     /// the device may still use what its frame holds, and finishing the frame would release it. It
     /// is the choice an I/O ring makes for its in-flight buffers. Wherever a frame's resources
     /// could be released while the device may still use them, they are not.
+    ///
+    /// A frame whose kill switch is set is ended by the reap before its marker is reached (see
+    /// [`after_marker`](Self::after_marker)). A consumer whose frame stands for work that may still use what it holds
+    /// registers a frame with no kill switch, or keeps the hold itself.
     fn cancel(&self, what: Waits) {
         let unreached = match &what {
             Waits::Marker(marker, _) => !self.reached(*marker),
@@ -654,11 +665,18 @@ impl Completions {
             return;
         }
         match what {
-            Waits::Ready(_, frame)
-            | Waits::Wake(_, frame)
-            | Waits::Marker(_, frame)
-            | Waits::Retired(_, frame)
-            | Waits::At(_, frame) => frame.do_finally(),
+            Waits::Ready(ready, frame) => {
+                // Dropped first: a `Ready` that hands its work on to the frame's `do_finally` has done so by then.
+                drop(ready);
+                frame.do_finally();
+            }
+            Waits::Wake(wake, frame) => {
+                drop(wake);
+                frame.do_finally();
+            }
+            Waits::Marker(_, frame) | Waits::Retired(_, frame) | Waits::At(_, frame) => {
+                frame.do_finally()
+            }
             Waits::Pending(pending) => drop(pending),
         }
     }
@@ -839,6 +857,10 @@ impl Completions {
     /// Emits `frame` once `marker`'s work completed (a completion edge on a device lane). A marker of a queue that
     /// is not in this source's pool is never reached, so its frame is never emitted.
     ///
+    /// A frame whose kill switch is set is emitted (dead) at the next visit, before the marker is reached, as any
+    /// cancelled entry: a consumer that needs the marker reached before the frame ends registers a frame with no kill
+    /// switch, or keeps the hold itself.
+    ///
     /// A source built [`without_lanes`](Self::without_lanes) has no lane for any marker, and refuses the registration
     /// the way one after [`complete`](LatticeSource::complete) is refused, except for what the frame holds: the marker
     /// names a lane somewhere, whose work may still be in flight, so the frame is leaked and counted in
@@ -900,9 +922,16 @@ impl Completions {
     /// interpolated within a bucket of [`Histogram`], so they are within one bucket's width (a
     /// quarter of the value) of the exact ones.
     ///
-    /// A timer's lateness is exact (emission − deadline). Another operation's is an upper bound:
-    /// the time from the last look that found it in flight (or its registration) to the poll that
-    /// found it done.
+    /// Each sample is the time from the earliest instant the source could have seen the wait done to
+    /// the poll that found it done (its emission is queued then):
+    /// - a timer ([`at`](Self::at)): from its deadline. Exact.
+    /// - a lane's retirement ([`after_retired`](Self::after_retired)): from the callback's arrival
+    ///   (the instant [`RetireCell::arrive`] began). Exact, whether the cell rings this source's bell or
+    ///   is polled blind. The wait itself is not counted.
+    /// - a marker, a [`Ready`], a `Wake`, a [`Pending`]: from the last look that found it in flight
+    ///   (its registration if there was none). An upper bound: the completion happened somewhere
+    ///   after that look, and these are polled blind, so while a worker visits the source it is at most the blind-poll window
+    ///   (16 to 100 us); with no visit it is the time since the last one.
     pub fn lateness_us(&self) -> (u64, u64, u64) {
         let h = self.lateness.snapshot();
         let up = |us: f64| us.ceil() as u64;
@@ -968,7 +997,7 @@ impl Completions {
             // can be observed then.
             let mut pool: Option<Option<Arc<LanePool>>> = None;
             let entry = &mut lists.waiting[index];
-            let cancelled = entry.what.cancelled_in_chain();
+            let cancelled = entry.what.cancelled();
             let pool_gone = !cancelled
                 && matches!(entry.what, Waits::Marker(..))
                 && pool.get_or_insert_with(|| self.pool()).is_none();
@@ -1045,7 +1074,9 @@ impl Completions {
                     drop(op);
                     (frame, last_seen)
                 }
-                Waits::Marker(_, frame) | Waits::Retired(_, frame) => (frame, last_seen),
+                Waits::Marker(_, frame) => (frame, last_seen),
+                // The callback's arrival, not the last look: a cell that rings is not polled before it.
+                Waits::Retired(cell, frame) => (frame, cell.arrived_at().unwrap_or(last_seen)),
                 Waits::At(deadline, frame) => (frame, deadline),
                 Waits::Pending(_) => (
                     yielded.take().expect("a pending that is done yielded"),
@@ -1444,6 +1475,20 @@ mod tests {
         })
     }
 
+    fn linked_unordered(
+        tag: u64,
+        ran: &Arc<Mutex<Vec<u64>>>,
+        kill: &Arc<AtomicBool>,
+    ) -> Box<dyn Frame> {
+        let mut header = FrameHeader::with_kill_switch(0, Some(kill.clone()));
+        header.randomize_hash(tag);
+        Box::new(Linked {
+            header,
+            tag,
+            ran: ran.clone(),
+        })
+    }
+
     /// One poll by hand, ending each continuation that comes out.
     fn poll_ending(completions: &Completions) {
         completions.reap();
@@ -1660,6 +1705,54 @@ mod tests {
     }
 
     #[test]
+    fn a_killed_unordered_entry_and_a_killed_timer_end_at_the_next_reap_though_their_conditions_never_come()
+     {
+        let (completions, rig) = setup();
+        let ran = Arc::new(Mutex::new(Vec::new()));
+        let (kill_ready, kill_timer, kill_marker, kill_kept) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        // None is in a chain: one never ready, one an hour out, one on a marker never reached, one never killed.
+        completions.after(
+            Box::new(Token::default()),
+            linked_unordered(1, &ran, &kill_ready),
+        );
+        completions.at(
+            Instant::now() + Duration::from_secs(3600),
+            linked_unordered(2, &ran, &kill_timer),
+        );
+        completions.after_marker(
+            Marker::new(rig.id, LaneId(0), 99),
+            linked_unordered(3, &ran, &kill_marker),
+        );
+        completions.after(
+            Box::new(Token::default()),
+            linked_unordered(4, &ran, &kill_kept),
+        );
+        poll_ending(&completions);
+        assert!(ran.lock().unwrap().is_empty());
+        assert_eq!(completions.pending(), 4);
+        for kill in [&kill_ready, &kill_timer] {
+            kill.store(true, Ordering::Release);
+        }
+        poll_ending(&completions);
+        assert_eq!(
+            *ran.lock().unwrap(),
+            [1, 2],
+            "the killed ones end as dead continuations at the next reap, the others keep waiting"
+        );
+        assert_eq!(completions.pending(), 2);
+        kill_marker.store(true, Ordering::Release);
+        poll_ending(&completions);
+        assert_eq!(*ran.lock().unwrap(), [1, 2, 3]);
+        assert_eq!(completions.pending(), 1);
+        // The last one is left to the source's drop.
+    }
+
+    #[test]
     fn a_timer_fires_at_or_after_its_deadline_and_its_lateness_is_measured() {
         let (completions, _rig) = setup();
         completions.at(Instant::now() + Duration::from_secs(3600), tagged(1));
@@ -1673,6 +1766,102 @@ mod tests {
         assert!(
             p50 >= 5_000 * 3 / 4 && p50 <= max,
             "the median is within a bucket of the one sample: {p50} of {max}"
+        );
+    }
+
+    /// Registers `what` as if it had been registered `age` ago, so a test sets the wait's length without waiting.
+    fn register_aged(completions: &Completions, what: Waits, age: Duration) {
+        completions.pending.fetch_add(1, Ordering::AcqRel);
+        completions.waiting.fetch_add(1, Ordering::AcqRel);
+        let last_seen = Instant::now()
+            .checked_sub(age)
+            .expect("an old enough clock");
+        let queued = completions
+            .incoming
+            .offer(Slot::Waiting(Waiting { what, last_seen }));
+        assert!(queued.is_ok());
+        completions.events.fetch_add(1, Ordering::Release);
+    }
+
+    const LONG_WAIT: Duration = Duration::from_secs(10);
+
+    #[test]
+    fn lateness_of_a_timer_counts_from_its_deadline_not_its_registration() {
+        let completions = bare();
+        let before = Instant::now();
+        let deadline = before + Duration::from_millis(5);
+        register_aged(&completions, Waits::At(deadline, tagged(1)), LONG_WAIT);
+        std::thread::sleep(Duration::from_millis(25));
+        assert_eq!(poll(&completions), [1]);
+        let after = Instant::now();
+        let (_, _, max) = completions.lateness_us();
+        assert!(max >= 20_000, "found 20 ms after its deadline: {max}");
+        assert!(
+            max <= (after - before).as_micros() as u64 + 1,
+            "not the wait: {max}"
+        );
+    }
+
+    #[test]
+    fn lateness_of_a_bell_gated_wait_counts_from_the_ring_not_its_registration() {
+        let completions = bare();
+        let cell = Arc::new(RetireCell::new());
+        assert!(cell.ring(&completions.events));
+        register_aged(
+            &completions,
+            Waits::Retired(cell.clone(), tagged(2)),
+            LONG_WAIT,
+        );
+        let before = Instant::now();
+        cell.arrive(0);
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(poll(&completions), [2]);
+        let after = Instant::now();
+        let (_, _, max) = completions.lateness_us();
+        assert!(max >= 20_000, "found 20 ms after the ring: {max}");
+        assert!(
+            max <= (after - before).as_micros() as u64 + 1,
+            "not the wait: {max}"
+        );
+    }
+
+    #[test]
+    fn lateness_of_a_retirement_polled_blind_counts_from_its_arrival_too() {
+        let completions = bare();
+        let cell = Arc::new(RetireCell::new());
+        register_aged(
+            &completions,
+            Waits::Retired(cell.clone(), tagged(3)),
+            LONG_WAIT,
+        );
+        let before = Instant::now();
+        cell.arrive(0);
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(poll(&completions), [3]);
+        let after = Instant::now();
+        let (_, _, max) = completions.lateness_us();
+        assert!(max >= 20_000, "found 20 ms after the arrival: {max}");
+        assert!(
+            max <= (after - before).as_micros() as u64 + 1,
+            "not the wait: {max}"
+        );
+    }
+
+    #[test]
+    fn lateness_of_a_polled_condition_counts_from_the_last_look() {
+        let completions = bare();
+        let token = Token::default();
+        register_aged(
+            &completions,
+            Waits::Ready(Box::new(token.clone()), tagged(4)),
+            LONG_WAIT,
+        );
+        token.done.store(true, Ordering::Release);
+        assert_eq!(poll(&completions), [4]);
+        let (_, _, max) = completions.lateness_us();
+        assert!(
+            max >= LONG_WAIT.as_micros() as u64,
+            "an upper bound from the registration, the last look: {max}"
         );
     }
 
