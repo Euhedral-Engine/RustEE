@@ -36,7 +36,7 @@
 #![allow(unsafe_code)]
 #![cfg_attr(not(windows), allow(dead_code))]
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::io;
 use std::path::PathBuf;
@@ -46,7 +46,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     clippy::disallowed_types,
     reason = "HOT-FIX(I9), HOT-FIX(I14), HOT-FIX(I15), HOT-FIX(I7), HOT-FIX(I8), HOT-FIX(I10), HOT-FIX(I11), HOT-FIX(I12), HOT-FIX(I13)"
 )]
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, TryLockError, Weak};
 use std::time::Duration;
 
 use euhedral_core::frames::Frame;
@@ -879,8 +879,11 @@ impl Engine {
     /// Hands what waits in the ring's backlog (or was built and not submitted) to the kernel,
     /// unless another thread is doing so right now.
     fn flush_ring(&self, ring: &Ring) {
-        let Ok(mut inner) = ring.inner.try_lock() else {
-            return;
+        // A poisoned lock is taken: it guards a flag a panic cannot leave broken.
+        let mut inner = match ring.inner.try_lock() {
+            Ok(inner) => inner,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => return,
         };
         if ring.broken.load(Ordering::Acquire) {
             // Nothing is handed to a ring that cannot be read; its entries were ended.
@@ -938,8 +941,10 @@ impl Engine {
     /// The next completion of `ring`, if the ring is not busy. A ring that cannot be read ends
     /// its operations with the error.
     fn pop(&self, ring: &Arc<Ring>) -> Option<Cqe> {
-        let Ok(inner) = ring.inner.try_lock() else {
-            return None;
+        let inner = match ring.inner.try_lock() {
+            Ok(inner) => inner,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => return None,
         };
         let popped = self.sys.ring_pop(ring.handle);
         drop(inner);
@@ -1075,8 +1080,10 @@ impl Engine {
     /// Starts the operation: its slot, then its call. The slot stays `Issuing` until the call is
     /// made (or, on a ring or the pool, until the entry or the job is handed over), so nothing
     /// that completes or fails operations touches the record while it is being filled.
-    fn start(&self, op: Op) -> io::Result<OpId> {
+    fn start(&self, op: Op, taken: &Cell<bool>) -> io::Result<OpId> {
         let held = self.begin(op, State::Issuing)?;
+        // The table has the operation: from here on a panic is not a refusal.
+        taken.set(true);
         let id = OpId::new(self.id as u64, held.slot, held.serial);
         self.launch(held);
         Ok(id)
@@ -1560,6 +1567,7 @@ impl EngineTrait for Engine {
         buf: Buf,
         then: Then,
         limit: Option<Duration>,
+        taken: &Cell<bool>,
     ) -> io::Result<OpId> {
         let mut op = match request {
             Request::Read { file, offset } => {
@@ -1626,7 +1634,7 @@ impl EngineTrait for Engine {
         });
         // An accept's socket made above is closed if no slot can be had.
         let accepted = op.accepting.as_ref().map(|accepting| accepting.socket);
-        let started = self.start(op);
+        let started = self.start(op, taken);
         if started.is_err()
             && let Some(socket) = accepted
         {

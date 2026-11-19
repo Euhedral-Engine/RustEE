@@ -13,6 +13,7 @@
 //! from the submitting and cancelling threads is shared.
 #![allow(unsafe_code)]
 
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::ffi::CString;
 use std::io;
@@ -670,6 +671,7 @@ impl Engine for Positional {
         buf: Buf,
         then: Then,
         limit: Option<Duration>,
+        taken: &Cell<bool>,
     ) -> io::Result<OpId> {
         let kind = kind(request)?;
         let token = self.next.fetch_add(1, Ordering::Relaxed);
@@ -685,6 +687,7 @@ impl Engine for Positional {
             waiting: false,
             ready: false,
         })));
+        taken.set(true);
         Ok(OpId::new(self.id, 0, token))
     }
 
