@@ -3,6 +3,22 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## Frames a refusing sink ends in place keep a flat stack and count their panics (`euhedral-graph`) (2026-11-19)
+
+**What.** A frame the stage sink refuses (a closed or full sink: a Retire frame, a stage a gate released, a stage frame the sink would not take) is ended in place through one trampoline per thread. The outermost end drains a list; an end that one of those ends causes is linked into the list through a field of the frame and runs after the current one. A stage run in place has its panic contained, so the frame still finishes and the stage's count drops. Every panic contained at an in-place end is counted: `StageGraph::contained_panics()`.
+
+**Why.** Dropping the last reference of a quantum on a refusing sink ended its Retire frame inside the dropping call; if its state held the previous quantum's reference, that ended in place inside it, one nested call per link, so a long chain overflowed the stack at shutdown. A stage that took its gate and released it before returning was run again inside the end of its previous run, one level per run. A panic in an in-place stage run unwound out of the releaser or the ending frame and left the stage's count undropped, so the quantum never retired. The payload of a contained panic was dropped with no trace.
+
+**How to use.** Nothing to call. Read `graph.contained_panics()` to see that a panic was contained at a refused frame's end (for instance in a shutdown report).
+
+**Semantics.**
+- The ends run newest first on the thread that found the refusal, after the call that found it has returned to the outermost one; a refused frame no longer ends inside the call that offered it when that call is itself inside an in-place end.
+- A stage whose in-place run panics fails its quantum with a fatal error (as a stage that returns an error) and its frame ends with `do_finally_with_error`.
+- The counter is per graph, counts the contained panics of stage runs and of ends, and is a relaxed atomic add. Nothing allocates, locks or waits; the link is a field of the pooled frame.
+- A trampoline was chosen over handing refused frames to `Completions`: the source may be closed exactly when the sink is (shutdown), and it would add a registration and a scan per frame.
+
+**Tests.** `stage_graph.rs`: `a_long_chain_of_held_quanta_retires_in_a_flat_stack_when_the_sink_refuses_the_retirements` (100,000 links on a 256 KiB stack), `a_stage_that_releases_itself_on_a_refusing_sink_runs_again_in_a_flat_stack` (20,000 runs on a 256 KiB stack) and `a_stage_that_panics_in_an_in_place_run_on_a_refusing_sink_still_retires_its_quantum` (counter 1, quantum retired, panic does not reach the releaser). With the trampoline off the first two overflow the stack and the third fails.
+
 ## `AsyncIo` runs where the system refuses io_uring (`euhedral-io`) (2026-11-19)
 
 **What.** On Linux and Android `AsyncIo::open` no longer fails when io_uring is refused. A positional engine (`pread`, `pwrite`, `open`, `rename`, `fstat` and non-blocking socket calls, made by the source's reap frame) takes over, with the same contract. `AsyncIo::backend()` returns `IoBackend::IoUring` or `IoBackend::Positional`, and `AsyncIoOptions::positional_io` forces the fallback.

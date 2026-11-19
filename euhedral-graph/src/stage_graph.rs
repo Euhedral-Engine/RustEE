@@ -33,12 +33,13 @@
 //!     another quantum's `retire`. `retire` runs on the thread that took that frame, never inside the call that
 //!     dropped the hold, so a `retire` that panics or drops further references stays on its own frame and a chain of
 //!     quanta that hold one another concludes one frame at a time. A sink that refuses the frame (it is closing, or
-//!     full) has it end in place on the offering thread, and a panic of `retire` there is contained.
+//!     full) has it end in place on the offering thread, with a flat stack (see [`StageGraph::contained_panics`]), and a
+//!     panic of `retire` there is contained.
 //! - **A `retire` that panics.** Java's `conclude` catches it and records it on the quantum. Here the outcome is
 //!   `retire`'s argument, so the quantum has concluded (its run is pooled again and its counts are dropped) when the
 //!   panic leaves it: in a frame of the quantum (its own last frame, the pooled `Retire` frame, a retirement frame) it
 //!   is rethrown to the executor that ran the frame, and where a refused frame ends in place (an offer the sink
-//!   refuses, a gate released into a refusing sink) it is contained and its payload dropped, so the thread that
+//!   refuses, a gate released into a refusing sink) it is contained, counted in [`StageGraph::contained_panics`] and its payload dropped, so the thread that
 //!   offered the frame, and the quantum it works for, go on. A frame that a [`Completions`] source cancels, or drops
 //!   with the source, ends in place only after the source completed (shutdown).
 
@@ -49,6 +50,8 @@
 
 use euhedral_data_structures::queues::{Consumer, MpmcQueue, Multi, Producer};
 use euhedral_data_structures::sync::HotScope;
+use std::any::Any;
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
@@ -592,13 +595,55 @@ impl<L: DeviceQueue + ?Sized> fmt::Debug for GraphRuntime<L> {
     }
 }
 
-/// Ends a frame in place, on the thread that found its sink refusing it. The end may conclude a quantum, and a `retire`
-/// that panics there is contained: the quantum has concluded (its run is back in the pool, its count dropped) by the time
-/// the panic is caught, and the caller, which holds a count of another quantum or of this one, goes on. The payload is
-/// dropped. (Java `conclude` catches a throwing `retire` and records it on the quantum; here the outcome is `retire`'s
-/// argument, so there is no quantum left to record it on.)
-fn contained(end: impl FnOnce()) {
-    let _ = catch_unwind(AssertUnwindSafe(end));
+thread_local! {
+    /// Whether this thread is inside [`end_in_place`]'s loop.
+    static ENDING: Cell<bool> = const { Cell::new(false) };
+    /// The frames whose in-place end was asked for inside that loop, newest first, chained by their `next` links.
+    static PENDING: Cell<Option<Box<dyn EndsInPlace + Send>>> = const { Cell::new(None) };
+}
+
+/// A graph frame whose sink refused it, type-erased so that frames of different graphs share one list.
+trait EndsInPlace: Send {
+    /// The frame after this one in the thread's pending list.
+    fn take_next(&mut self) -> Option<Box<dyn EndsInPlace + Send>>;
+    /// Runs the frame (when it was refused as a stage that still runs) and finishes it, containing every panic.
+    fn end(self: Box<Self>);
+}
+
+/// Resets [`ENDING`] when the loop of [`end_in_place`] is left, however it is left.
+struct EndingScope;
+
+impl Drop for EndingScope {
+    fn drop(&mut self) {
+        ENDING.set(false);
+    }
+}
+
+/// Ends a frame in place, on the thread that found its sink refusing it, with a flat stack. The end may conclude a
+/// quantum, whose `retire` may drop the last reference of another quantum, whose frame the sink refuses in turn, and
+/// so on, and a stage may release its own gate on every run. The outermost call on a thread drains a list instead:
+/// a nested call links its frame at the head of the thread's pending list and returns, and the outermost one ends the
+/// frames one after another. A panic of any of those ends is contained (the quantum has concluded, its run is back in
+/// the pool and its count is dropped by the time it is caught) and counted on the frame's graph
+/// ([`StageGraph::contained_panics`]); its payload is dropped.
+fn end_in_place<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static>(
+    mut frame: Box<GraphFrame<Q, L>>,
+) {
+    if ENDING.get() {
+        frame.next = PENDING.take();
+        PENDING.set(Some(frame));
+        return;
+    }
+    ENDING.set(true);
+    let _scope = EndingScope;
+    let mut current: Option<Box<dyn EndsInPlace + Send>> = Some(frame);
+    while let Some(frame) = current {
+        frame.end();
+        current = PENDING.take().map(|mut head| {
+            PENDING.set(head.take_next());
+            head
+        });
+    }
 }
 
 /// Where a call that drops a quantum's last live count, or its last hold, comes from.
@@ -781,6 +826,8 @@ struct Core<Q, L: DeviceQueue + ?Sized> {
     topology: Topology,
     retire: Box<dyn Fn(Q, QuantumOutcome) + Send + Sync>,
     live: AtomicUsize,
+    /// Panics contained where a refused frame ended in place.
+    contained_panics: AtomicU64,
     seeds: AtomicU64,
     /// Finished frames, for the next stages, arrivals and boundaries (of any run of the graph).
     frames: Pool<Box<GraphFrame<Q, L>>>,
@@ -1090,6 +1137,7 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> StageGraph<Q, 
                 runtime,
                 retire: Box::new(retire),
                 live: AtomicUsize::new(0),
+                contained_panics: AtomicU64::new(0),
                 seeds: AtomicU64::new(0),
                 frames: Pool::new(POOLED_FRAMES),
             }),
@@ -1157,6 +1205,13 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> StageGraph<Q, 
     /// Quanta started and not yet retired.
     pub fn live(&self) -> usize {
         self.core.live.load(Ordering::Acquire)
+    }
+
+    /// Panics contained where a frame the stage sink refused ended in place: a `retire` or a stage that panicked on
+    /// the thread that found the sink closed or full. Each such frame still finished (the quantum concluded or
+    /// failed, its count was dropped) and the thread went on; this is how an owner sees that it happened.
+    pub fn contained_panics(&self) -> u64 {
+        self.core.contained_panics.load(Ordering::Relaxed)
     }
 }
 
@@ -1742,10 +1797,16 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Run<Q, L> {
     }
 
     /// Offers `frame`; a refused one (the sink completed or is full) ends in place, contained.
-    fn offer_frame(&self, frame: Box<dyn Frame>) {
+    fn offer_frame(&self, frame: Box<GraphFrame<Q, L>>) {
         if let Err(frame) = self.core.runtime.stages.offer(frame) {
-            contained(|| frame.do_finally());
+            end_in_place(Self::refused(frame));
         }
+    }
+
+    /// The frame a sink handed back, which is the one this graph offered.
+    fn refused(frame: Box<dyn Frame>) -> Box<GraphFrame<Q, L>> {
+        // SAFETY: `FrameSink::offer` hands back the frame it was given, and a graph offers only its own frames.
+        unsafe { Box::from_raw(Box::into_raw(frame).cast::<GraphFrame<Q, L>>()) }
     }
 
     /// Publishes `stage`, whose last incoming edge arrived (its live count is already taken).
@@ -1759,7 +1820,7 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Run<Q, L> {
                 stage,
                 StageError::Fatal("the stage sink no longer takes frames".into()),
             );
-            contained(|| frame.do_finally());
+            end_in_place(Self::refused(frame));
         }
     }
 
@@ -1778,15 +1839,10 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Run<Q, L> {
         let frame = self
             .core
             .frame(self, Kind::Stage(stage), self.header(None, true));
-        if let Err(mut frame) = self.core.runtime.stages.offer(frame) {
-            if !frame.is_alive() {
-                contained(|| frame.do_finally());
-                return;
-            }
-            match frame.execute() {
-                Ok(()) | Err(FrameError::Cancelled) => contained(|| frame.do_finally()),
-                Err(error) => contained(|| frame.do_finally_with_error(error)),
-            }
+        if let Err(frame) = self.core.runtime.stages.offer(frame) {
+            let mut frame = Self::refused(frame);
+            frame.runs_first = true;
+            end_in_place(frame);
         }
     }
 
@@ -2972,6 +3028,10 @@ struct GraphFrame<Q, L: DeviceQueue + ?Sized> {
     /// A completion's: the marker of its stage's work, which holds the quantum live if a kill ends the completion
     /// before it is reached.
     holds: Option<Marker>,
+    /// Set on a stage frame the sink refused and that runs in place: its execute comes before its end.
+    runs_first: bool,
+    /// The next frame of the thread's pending list while this one waits there (see [`end_in_place`]).
+    next: Option<Box<dyn EndsInPlace + Send>>,
     pool: Weak<Producer<Box<GraphFrame<Q, L>>, Multi>>,
 }
 
@@ -2986,6 +3046,8 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> GraphFrame<Q, 
             inputs: Vec::new(),
             waits: Vec::new(),
             holds: None,
+            runs_first: false,
+            next: None,
             pool,
         }
     }
@@ -3084,10 +3146,46 @@ impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> Frame for Grap
         self.kind = Kind::Idle;
         self.result = None;
         self.holds = None;
+        self.runs_first = false;
         self.held.store(false, Ordering::Relaxed);
         self.header = FrameHeader::new(0);
         if let Some(pool) = self.pool.upgrade() {
             let _ = pool.offer(self);
+        }
+    }
+}
+
+impl<Q: Send + Sync + 'static, L: DeviceQueue + ?Sized + 'static> EndsInPlace for GraphFrame<Q, L> {
+    fn take_next(&mut self) -> Option<Box<dyn EndsInPlace + Send>> {
+        self.next.take()
+    }
+
+    fn end(mut self: Box<Self>) {
+        let run = self.run.clone();
+        let count = |panic: Box<dyn Any + Send>| {
+            if let Some(run) = &run {
+                run.core.contained_panics.fetch_add(1, Ordering::Relaxed);
+            }
+            // A payload whose drop panics is contained too.
+            let _ = catch_unwind(AssertUnwindSafe(|| drop(panic)));
+        };
+        let mut outcome = Ok(());
+        if self.runs_first && self.is_alive() {
+            match catch_unwind(AssertUnwindSafe(|| self.execute())) {
+                Ok(Err(FrameError::Cancelled) | Ok(())) => {}
+                Ok(Err(error)) => outcome = Err(error),
+                Err(panic) => {
+                    count(panic);
+                    outcome = Err(FrameError::failed("the stage panicked"));
+                }
+            }
+        }
+        let ended = catch_unwind(AssertUnwindSafe(|| match outcome {
+            Ok(()) => self.do_finally(),
+            Err(error) => self.do_finally_with_error(error),
+        }));
+        if let Err(panic) = ended {
+            count(panic);
         }
     }
 }
@@ -6644,6 +6742,154 @@ mod tests {
             })
             .unwrap();
         worker.join().expect("the chain ended in a flat stack");
+    }
+
+    /// The chain of held references again, with the sink refusing before the last reference is dropped: every Retire
+    /// frame ends in place, and the ends are drained in a loop, not nested one inside the other.
+    #[test]
+    fn a_long_chain_of_held_quanta_retires_in_a_flat_stack_when_the_sink_refuses_the_retirements() {
+        struct Chain(Option<QuantumRef>);
+
+        struct Host;
+
+        impl Stage<Chain> for Host {
+            fn run(&self, _: &Chain, _: &StageCx<'_>) -> Result<Submitted, StageError> {
+                Ok(Submitted::done())
+            }
+        }
+
+        let length: usize = if cfg!(miri) { 40 } else { 100_000 };
+        let worker = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                let h = Harness::new(1);
+                let sink = Arc::new(Refuses {
+                    inner: h.sink.clone(),
+                    refuse: AtomicBool::new(false),
+                });
+                let mut runtime = h.runtime.clone();
+                runtime.stages = sink.clone();
+                let mut spec = StageGraphSpec::new();
+                spec.stage(StageSpec {
+                    name: "host",
+                    ordered: None,
+                    lanes: Vec::new(),
+                });
+                let retired = Arc::new(AtomicU64::new(0));
+                let counted = retired.clone();
+                let graph = StageGraph::new(
+                    spec,
+                    vec![Arc::new(Host) as Arc<dyn Stage<Chain>>],
+                    runtime,
+                    move |link: Chain, _| {
+                        counted.fetch_add(1, Ordering::AcqRel);
+                        drop(link.0);
+                    },
+                )
+                .unwrap();
+                let mut previous = None;
+                for _ in 0..length {
+                    previous = Some(graph.start(Chain(previous.take()), alive(), Vec::new()));
+                    assert_eq!(h.pump(), 1, "a quantum runs its one frame");
+                }
+                assert_eq!(
+                    retired.load(Ordering::Acquire),
+                    0,
+                    "each is held by the next"
+                );
+                sink.refuse.store(true, Ordering::Release);
+                drop(previous);
+                assert_eq!(h.pump(), 0, "every retirement ended in place");
+                assert_eq!(retired.load(Ordering::Acquire), length as u64);
+                assert_eq!(graph.live(), 0);
+                assert_eq!(graph.contained_panics(), 0);
+            })
+            .unwrap();
+        worker.join().expect("the chain ended in a flat stack");
+    }
+
+    /// A stage that panics in the run a refusing sink had it do in place: the panic stays there and is counted, the stage
+    /// fails the quantum, and the quantum retires with its count dropped.
+    #[test]
+    fn a_stage_that_panics_in_an_in_place_run_on_a_refusing_sink_still_retires_its_quantum() {
+        for mut h in both_kinds_of_lane() {
+            let sink = Arc::new(Refuses {
+                inner: h.sink.clone(),
+                refuse: AtomicBool::new(false),
+            });
+            h.runtime.stages = sink.clone();
+            let held = Arc::new(Mutex::new(Vec::new()));
+            let graph = h.gated_graph(
+                &[(None, &[], Act::Panic)],
+                &[],
+                &[GateAct::Hold(held.clone())],
+            );
+            let _ = graph.start(1, alive(), Vec::new());
+            assert_eq!(h.pump(), 0, "the stage is held at its gate");
+            assert_eq!(graph.contained_panics(), 0);
+            sink.refuse.store(true, Ordering::Release);
+            let gate = lock(&held).pop().unwrap();
+            let released = catch_unwind(AssertUnwindSafe(|| gate.release()));
+            assert!(released.is_ok(), "the panic stayed where the stage ran");
+            assert!(
+                matches!(
+                    &h.retired(1)[..],
+                    [QuantumOutcome::Failed {
+                        stage: StageId(0),
+                        ..
+                    }]
+                ),
+                "{:?}",
+                h.retired(1)
+            );
+            assert_eq!(graph.live(), 0, "the count was dropped");
+            assert_eq!(graph.contained_panics(), 1);
+        }
+    }
+
+    /// A stage that takes its gate and releases it before it returns is published again by the end of its run, which a
+    /// refusing sink has run in place: the runs follow one another in a loop, not one inside the other.
+    #[test]
+    fn a_stage_that_releases_itself_on_a_refusing_sink_runs_again_in_a_flat_stack() {
+        let runs: u32 = if cfg!(miri) { 40 } else { 20_000 };
+        let worker = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                let h = Harness::new(1);
+                let sink = Arc::new(Refuses {
+                    inner: h.sink.clone(),
+                    refuse: AtomicBool::new(false),
+                });
+                let mut runtime = h.runtime.clone();
+                runtime.stages = sink.clone();
+                let mid = Holds::new(&h, 1, HoldAct::ReleaseAtOnce(runs));
+                let mut spec = StageGraphSpec::new();
+                spec.stage(StageSpec {
+                    name: "g",
+                    ordered: None,
+                    lanes: vec![],
+                });
+                let log = h.log.clone();
+                let graph = StageGraph::new(
+                    spec,
+                    vec![mid.clone() as Arc<dyn Stage<u64>>],
+                    runtime,
+                    move |q, outcome| {
+                        lock(&log).push(Event::Retired { q, outcome });
+                    },
+                )
+                .unwrap();
+                let _ = graph.start(1, alive(), Vec::new());
+                sink.refuse.store(true, Ordering::Release);
+                h.pump();
+                assert_eq!(mid.runs(), runs + 1);
+                assert_eq!(h.retired(1), [QuantumOutcome::Completed]);
+                assert_eq!(graph.live(), 0);
+            })
+            .unwrap();
+        worker
+            .join()
+            .expect("the runs followed one another in a flat stack");
     }
 
     /// A later quantum's stage that submitted on a lane after this one ran covers its marker with this quantum's
