@@ -2,8 +2,10 @@
 
 use std::fmt;
 use std::num::NonZeroU64;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
+
+use std::time::{Duration, Instant};
 
 use crate::sync::{AtomicI64, AtomicPtr};
 
@@ -126,8 +128,8 @@ pub(crate) type Bell = crate::sync::AtomicU64;
 
 /// Where a lane's retirement callback leaves its status: the sink an arm names (Java's `notifyRetired(listener)`).
 ///
-/// The callback only fills the cell with one atomic exchange (and rings a bell with one add, if a source claimed the
-/// cell): it makes no driver call, takes no lock and allocates nothing. Whoever armed the retirement finds the cell
+/// The callback only reads the clock and stores the arrival stamp, fills the cell with one atomic exchange (and rings a
+/// bell with one add, if a source claimed the cell): it makes no driver call, takes no lock and allocates nothing. Whoever armed the retirement finds the cell
 /// filled by polling it ([`Completions::after_retired`](crate::Completions) does) and settles the status in a frame,
 /// so a retirement is never anonymous: two parties arming on one lane each read their own cell.
 #[derive(Debug)]
@@ -138,6 +140,15 @@ pub struct RetireCell {
     /// strong reference to (`Arc::into_raw`), or null. The callback adds one to it after it filled the cell, so the
     /// source looks at the cell when it fills and not before. At most one source claims a cell.
     bell: AtomicPtr<Bell>,
+    /// When the callback arrived: 1 + nanoseconds since the process's first stamp, or 0 before. Written before the
+    /// status exchange, so whoever sees the status sees the stamp.
+    arrived_at: crate::sync::AtomicU64,
+}
+
+/// The origin of [`RetireCell`] stamps.
+fn stamp_origin() -> Instant {
+    static ORIGIN: OnceLock<Instant> = OnceLock::new();
+    *ORIGIN.get_or_init(Instant::now)
 }
 
 const PENDING: i64 = i64::MIN;
@@ -145,9 +156,12 @@ const PENDING: i64 = i64::MIN;
 impl RetireCell {
     /// A cell no callback has filled.
     pub fn new() -> Self {
+        // The origin is set here, so the callback never initialises it.
+        stamp_origin();
         Self {
             state: AtomicI64::new(PENDING),
             bell: AtomicPtr::new(std::ptr::null_mut()),
+            arrived_at: crate::sync::AtomicU64::new(0),
         }
     }
 
@@ -165,6 +179,12 @@ impl RetireCell {
         reason = "the bell is an `Arc::into_raw` the cell keeps alive; SAFETY below"
     )]
     pub fn arrive(&self, status: i32) {
+        // One clock read: the instant a source measures the lateness of its poll from.
+        let nanos = stamp_origin().elapsed().as_nanos();
+        self.arrived_at.store(
+            u64::try_from(nanos).unwrap_or(u64::MAX - 1) + 1,
+            Ordering::Relaxed,
+        );
         self.state.swap(i64::from(status), Ordering::AcqRel);
         let bell = self.bell.load(Ordering::Acquire);
         if !bell.is_null() {
@@ -222,6 +242,14 @@ impl RetireCell {
         self.state.load(Ordering::Acquire) != PENDING
     }
 
+    /// When the callback arrived, once it did (the clock read at the start of [`arrive`](Self::arrive)).
+    pub(crate) fn arrived_at(&self) -> Option<Instant> {
+        match self.arrived_at.load(Ordering::Relaxed) {
+            0 => None,
+            stamp => Some(stamp_origin() + Duration::from_nanos(stamp - 1)),
+        }
+    }
+
     /// The status the callback stored, once it arrived.
     pub fn status(&self) -> Option<i32> {
         match self.state.load(Ordering::Acquire) {
@@ -232,6 +260,7 @@ impl RetireCell {
 
     /// Readies the cell for another retirement. Only once the last one arrived and was settled.
     pub fn rearm(&self) {
+        self.arrived_at.store(0, Ordering::Relaxed);
         self.state.store(PENDING, Ordering::Release);
     }
 }
