@@ -14,9 +14,10 @@ semantics and the tests that pin it.
 **Semantics.**
 - A listener added or removed during a delivery takes effect from the next value.
 - An offer racing a close is delivered or dropped, never both; values left in the cell at close are dropped by the dispatch thread or when the monitor is dropped.
-- Registered listeners are released on the dispatch thread at close, as before.
+- A removed listener is released on the dispatch thread as soon as it takes the new list (an idle thread is woken for it), not at the next value.
+- Registered listeners, including ones removed while the close runs, are released on the dispatch thread at close, as before.
 
-**Tests.** `offers_racing_close_deliver_the_latest_or_nothing_after_close`, `a_burst_of_offers_delivers_the_last` (each replaced value dropped once), `listeners_added_during_dispatch_see_the_next_value`, `a_removed_listener_is_gone_for_the_next_value_and_the_list_is_freed`, `an_offer_takes_no_lock`; the H5 row of the ratchet is gone. The module runs under Miri in its own shard.
+**Tests.** `offers_racing_close_deliver_the_latest_or_nothing_after_close`, `a_burst_of_offers_delivers_the_last` (each replaced value dropped once), `listeners_added_during_dispatch_see_the_next_value`, `a_removed_listener_is_gone_for_the_next_value_and_the_list_is_freed`, `a_listener_removed_while_idle_is_freed_at_once`, `a_remove_racing_the_close_tail_leaves_nothing_behind`, `a_superseded_list_is_freed`, `an_offer_takes_no_lock`; the H5 row of the ratchet is gone. The module runs under Miri in its own shard.
 
 ## `Completions::lateness_us` measures from when a wait could first have been seen done (`euhedral-graph`) (2026-11-19)
 

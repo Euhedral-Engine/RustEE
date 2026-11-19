@@ -120,6 +120,7 @@ impl<T: Send + 'static> LatestValueDispatcher<T> {
             registry.listeners = listeners.into();
             self.shared
                 .publish_listeners(Arc::clone(&registry.listeners));
+            self.thread.unpark();
         }
         id
     }
@@ -139,6 +140,9 @@ impl<T: Send + 'static> LatestValueDispatcher<T> {
         if removed {
             self.shared
                 .publish_listeners(Arc::clone(&registry.listeners));
+            // An idle dispatch thread takes the list now, so a removed listener is freed here and
+            // not at the next value.
+            self.thread.unpark();
         }
         removed
     }
@@ -163,19 +167,6 @@ impl<T: Send + 'static> LatestValueDispatcher<T> {
         self.close(hook);
     }
 
-    fn close(&self, hook: Option<CloseHook>) {
-        {
-            // The hook is stored before `closing` is set, so the dispatch thread finds it.
-            let mut registry = self.shared.registry.lock();
-            if self.shared.closing.load(Ordering::SeqCst) {
-                return;
-            }
-            registry.close_hook = hook;
-            self.shared.closing.store(true, Ordering::SeqCst);
-        }
-        self.thread.unpark();
-    }
-
     /// Whether the dispatch thread has finished.
     pub(crate) fn is_closed(&self) -> bool {
         self.shared.closed.load(Ordering::SeqCst)
@@ -191,16 +182,24 @@ impl<T: Send + 'static> LatestValueDispatcher<T> {
     }
 }
 
-impl<T> Drop for LatestValueDispatcher<T> {
-    fn drop(&mut self) {
+impl<T> LatestValueDispatcher<T> {
+    fn close(&self, hook: Option<CloseHook>) {
         {
+            // The hook is stored before `closing` is set, so the dispatch thread finds it.
             let mut registry = self.shared.registry.lock();
-            if !self.shared.closing.load(Ordering::SeqCst) {
-                registry.close_hook = None;
-                self.shared.closing.store(true, Ordering::SeqCst);
+            if self.shared.closing.load(Ordering::SeqCst) {
+                return;
             }
+            registry.close_hook = hook;
+            self.shared.closing.store(true, Ordering::SeqCst);
         }
         self.thread.unpark();
+    }
+}
+
+impl<T> Drop for LatestValueDispatcher<T> {
+    fn drop(&mut self) {
+        self.close(None);
     }
 }
 
@@ -210,6 +209,8 @@ fn dispatch_loop<T>(shared: &Shared<T>) {
         if shared.closing.load(Ordering::SeqCst) {
             break;
         }
+        // The order is load-bearing: the value first, then the list, so a listener added before an
+        // offer (on the offering thread) sees that offer.
         if let Some(value) = shared.take_value() {
             if let Some(next) = shared.take_listeners() {
                 listeners = next;
@@ -221,23 +222,35 @@ fn dispatch_loop<T>(shared: &Shared<T>) {
                 }
             }
         } else {
-            // Idle: an offer or a close unparks this thread, and the token is sticky, so a wake-up
-            // between the take above and this park is not lost. A spurious return loops.
+            // Take a handed-over list before parking, so a removed listener is dropped now. An
+            // offer, a close or a registration change unparks this thread, and the token is
+            // sticky, so a wake-up between the takes above and this park is not lost. A spurious
+            // return loops.
+            //
+            // Dropping the replaced list runs listener destructors, which may block on this
+            // thread's park token; the state is looked at again before parking.
+            if let Some(next) = shared.take_listeners() {
+                listeners = next;
+                continue;
+            }
             #[allow(clippy::disallowed_methods, reason = "JAVA-BACKOFF")]
             thread::park();
         }
     }
     drop(shared.take_value());
-    drop(shared.take_listeners());
     drop(listeners);
-    let (hook, registered) = {
+    // Every publisher holds the registry lock, so emptying the cell inside it leaves nothing
+    // behind that a racing `remove_listener` published after this point.
+    let (hook, registered, handed_over) = {
         let mut registry = shared.registry.lock();
         (
             registry.close_hook.take(),
             std::mem::replace(&mut registry.listeners, Arc::from([])),
+            shared.take_listeners(),
         )
     };
     drop(registered);
+    drop(handed_over);
     shared.closed.store(true, Ordering::SeqCst);
     if let Some(hook) = hook
         && catch_unwind(AssertUnwindSafe(hook)).is_err()
@@ -509,7 +522,6 @@ mod tests {
         });
         dispatcher.offer(1);
         entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        // The list with the second listener is handed over but not yet taken.
         assert!(dispatcher.remove_listener(id));
         release.send(()).unwrap();
         dispatcher.offer(2);
@@ -527,5 +539,93 @@ mod tests {
         let _hot = HotScope::enter();
         dispatcher.offer(1);
         dispatcher.offer(2);
+    }
+
+    /// Counts the clones of a token that are alive.
+    fn live(token: &Arc<()>) -> usize {
+        Arc::strong_count(token)
+    }
+
+    fn wait_for_release(token: &Arc<()>) {
+        wait_until(|| live(token) == 1);
+    }
+
+    #[test]
+    fn a_listener_removed_while_idle_is_freed_at_once() {
+        let dispatcher = LatestValueDispatcher::<u32>::new("test-dispatcher").unwrap();
+        let token = Arc::new(());
+        let held = Arc::clone(&token);
+        let (done, done_rx) = mpsc::channel();
+        let done = Mutex::new(done);
+        let id = dispatcher.add_listener(move |_: &u32| {
+            let _ = &held;
+            done.lock().unwrap().send(()).unwrap();
+        });
+        dispatcher.offer(1);
+        done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(dispatcher.remove_listener(id));
+        wait_for_release(&token);
+    }
+
+    #[test]
+    fn a_remove_racing_the_close_tail_leaves_nothing_behind() {
+        struct Gated {
+            entered: Mutex<mpsc::Sender<()>>,
+            release: Mutex<mpsc::Receiver<()>>,
+        }
+        impl Drop for Gated {
+            fn drop(&mut self) {
+                self.entered.lock().unwrap().send(()).unwrap();
+                self.release.lock().unwrap().recv().unwrap();
+            }
+        }
+        let dispatcher = LatestValueDispatcher::<u32>::new("test-dispatcher").unwrap();
+        let (entered, entered_rx) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
+        let gated = Gated {
+            entered: Mutex::new(entered),
+            release: Mutex::new(release_rx),
+        };
+        let (done, done_rx) = mpsc::channel();
+        let done = Mutex::new(done);
+        let a = dispatcher.add_listener(move |_: &u32| {
+            let _ = &gated;
+            done.lock().unwrap().send(()).unwrap();
+        });
+        let b = dispatcher.add_listener(|_: &u32| {});
+        let token = Arc::new(());
+        let held = Arc::clone(&token);
+        dispatcher.add_listener(move |_: &u32| {
+            let _ = &held;
+        });
+        dispatcher.offer(1);
+        done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(dispatcher.remove_listener(a));
+        // The thread frees A's closure now and blocks in its drop.
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        dispatcher.begin_close(None);
+        assert!(dispatcher.remove_listener(b));
+        release.send(()).unwrap();
+        wait_until(|| dispatcher.is_closed());
+        assert_eq!(live(&token), 1);
+    }
+
+    #[test]
+    fn a_superseded_list_is_freed() {
+        let dispatcher = LatestValueDispatcher::<u32>::new("test-dispatcher").unwrap();
+        let first = Arc::new(());
+        let held = Arc::clone(&first);
+        let a = dispatcher.add_listener(move |_: &u32| {
+            let _ = &held;
+        });
+        let second = Arc::new(());
+        let held = Arc::clone(&second);
+        let b = dispatcher.add_listener(move |_: &u32| {
+            let _ = &held;
+        });
+        assert!(dispatcher.remove_listener(a));
+        assert!(dispatcher.remove_listener(b));
+        wait_for_release(&first);
+        wait_for_release(&second);
     }
 }
