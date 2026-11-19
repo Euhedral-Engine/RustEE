@@ -104,7 +104,7 @@
   "commands": [
    "cargo miri test -p euhedral-graph --lib -- stage_graph::tests::subscriptions_before stage_graph::tests::external_pins stage_graph::tests::a_rebound_run stage_graph::tests::a_cancelled_quantum stage_graph::tests::a_failed_middle_stage stage_graph::tests::a_cpu_middle_stage stage_graph::tests::a_killed_quantum_waits_for_its_ordered stage_graph::tests::a_killed_quantum_waits_for_a_host stage_graph::tests::a_killed_head_lets stage_graph::tests::a_quantum_killed_once stage_graph::tests::a_quantum_killed_with_two stage_graph::tests::a_stage_that_submits_into",
    "cargo miri test -p euhedral-graph --lib -- stage_graph::tests::a_later_quantum_on_another stage_graph::tests::an_edge_on_a_stage_that_never_runs stage_graph::tests::the_boundary_covers stage_graph::tests::an_external_completion_edge stage_graph::tests::a_later_quantums_stage_waits stage_graph::tests::an_earlier_quantum_retires",
-   "cargo miri test -p euhedral-graph --lib -- stage_graph::tests::a_quantum_joins stage_graph::tests::a_device_failure stage_graph::tests::a_hook_runs stage_graph::tests::a_quantum_that_ran_nothing stage_graph::tests::a_refused_retirement",
+   "cargo miri test -p euhedral-graph --lib -- stage_graph::tests::a_quantum_joins stage_graph::tests::a_quantum_retires_on_a_lane stage_graph::tests::a_quantum_that_used_two_lanes stage_graph::tests::a_device_failure stage_graph::tests::a_hook_runs stage_graph::tests::a_quantum_that_ran_nothing stage_graph::tests::a_refused_retirement",
    "cargo miri test -p euhedral-graph --lib -- stage_graph::tests::a_completion_edge_waits lanes::tests::a_fixed lanes::tests::a_reserved --skip lanes::tests::a_fixed_placement_is_a_function_of_the_stage_whichever_thread_asks"
   ]
  },

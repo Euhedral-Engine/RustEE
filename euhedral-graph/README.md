@@ -310,10 +310,10 @@ holds the quantum for ever.
 
 A quantum **retires** when none of its frames can run again and every lane it used has reached its
 last marker (its retirement boundary). When the lanes can be controlled (`DeviceQueue::control`, which a backend's
-shared lane gives, as Java's `GpuStream` does), the boundary is Java's `quiesce`: every other lane used joins the home
-lane on the device (the home lane awaits its latest marker), one retirement is armed on the home lane and fills the
+shared lane gives, as Java's `GpuStream` does), the boundary is Java's `quiesce`: every other lane used joins the
+**retire lane** on the device (it awaits their latest markers), one retirement is armed on it and fills the
 quantum's own `RetireCell`, and a retirement frame settles it, runs each attempted stage's `retired` hook and the
-quantum's terminal work, and recycles the quantum. A completion edge arms a retirement on the producing stage's lane the
+quantum's terminal work, and recycles the quantum. The retire lane is a lane the quantum used, so its completion never waits behind unrelated work on a lane it never touched: its home lane when it used that, else the lowest lane it used that has control. The home lane is still the retire lane when an `abandoned` hook of a stage that names a lane runs (the hook may enqueue on home, and the retirement must cover it), and it stays the lane of the roots, of the hooks, and of a quantum that used no lane. A completion edge arms a retirement on the producing stage's lane the
 same way (Java `RetiredEdge`); a device failure of that retirement ends the quantum as `QuantumOutcome::DeviceFailed`, not as a stage's failure, and releases no successor. For lanes that are only a query side (`dyn DeviceQueue` without control) the boundary
 stays one `Completions` marker edge per lane. A quantum that **touched no lane** (none of its stages submitted a
 marker, none was recorded for it, and no `abandoned` hook of a stage that names a lane ran on a home lane that can arm

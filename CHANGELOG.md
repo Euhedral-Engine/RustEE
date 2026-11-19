@@ -3,6 +3,21 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## A quantum retires on a lane it used (`euhedral-graph`) (2026-11-19)
+
+**What.** A `StageGraph` quantum arms its retirement on a lane it used, not always on its run's home lane. With one lane used, that lane; with several, its home lane when it is one of them, else the lowest of them that has control. The other lanes it used join that lane first, as before.
+
+**Why.** A run takes its home lane in turn over the pool. A quantum whose stages all ran on another lane retired behind whatever unrelated work sat on its home lane: a short query beside long documents waited for the documents' device work although its own finished in milliseconds.
+
+**How to use.** Nothing changes for callers; no new option.
+
+**Semantics.**
+- Every lane the quantum used is still joined before `retire` and the `retired` hooks run, and a killed quantum still holds for every host completion and the latest marker of each lane it used.
+- The home lane is still the retire lane when a stage that never submitted names a lane (its `abandoned` hook may enqueue on home, which the retirement must cover), and when the quantum used it. It stays the lane roots continue and the lane `abandoned` receives; a quantum that used no lane arms no retirement unless such a hook ran (the lane-less conclusion of 2026-11-05 is unchanged).
+- With several lanes used and none of them home, the lowest with control is chosen: any lane is correct, because the others are joined on the device.
+
+**Tests.** `stage_graph.rs`: `a_quantum_retires_on_a_lane_it_used_not_behind_work_on_its_home_lane` (fails on the old code: the retirement was armed on the held home lane) and `a_quantum_that_used_two_lanes_retires_after_joining_both`.
+
 ## A killed quantum holds for everything it started, and killed waiting entries end at the next visit (`euhedral-graph`) (2026-11-19)
 
 **What.** A killed `StageGraph` quantum runs no `abandoned` hook, and lets go of nothing it holds, until every host completion it started is ready and the latest marker of each lane it used is reached. Before, only a stage that returned a completion held it, and an ordered stage's host completion with no marker held nothing once the kill ended it. In `Completions`, a waiting entry whose frame is killed (unordered, timer, marker, retirement, `Ready`, `Wake`) ends at the next visit of the source as a dead continuation, not only a chain head.
