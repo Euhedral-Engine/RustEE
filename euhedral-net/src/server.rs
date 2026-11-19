@@ -483,6 +483,12 @@ impl Shared {
     fn check_finished(self: &Arc<Self>, ls: &mut ListenerState) {
         if ls.stopping && !ls.finished && ls.open == 0 && ls.accepting.is_none() && !ls.retrying {
             ls.finished = true;
+            if let (Some(listener), Some(io)) = (
+                &ls.listener,
+                ls.ctx.as_ref().and_then(|ctx| ctx.io.upgrade()),
+            ) {
+                io.forget_socket(raw_listener(listener));
+            }
             ls.listener = None;
             ls.timers = None;
             ls.ctx = None;

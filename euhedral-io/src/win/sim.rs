@@ -88,6 +88,8 @@ struct State {
     /// Calls that report failure and also queue a packet (what a warning status does).
     fail_with_packet: VecDeque<(Op, i32)>,
     elsewhere: HashSet<Handle>,
+    /// The value the next handle the system makes takes (a closed handle's, as the system reuses them).
+    mint: Option<Handle>,
     pop_error: Option<i32>,
     /// How many entries each ring submit handed over.
     submit_sizes: Vec<usize>,
@@ -172,6 +174,21 @@ impl Sim {
     /// `handle` already belongs to another completion port.
     pub(super) fn joined_elsewhere(&self, handle: Handle) {
         self.s().elsewhere.insert(handle);
+    }
+
+    /// The handle is closed and its value given to a new one, which belongs to no port, or (with `elsewhere`) to
+    /// another completion port.
+    pub(super) fn reuse(&self, handle: Handle, elsewhere: bool) {
+        let mut s = self.s();
+        s.associated.remove(&handle);
+        if elsewhere {
+            s.elsewhere.insert(handle);
+        }
+    }
+
+    /// The next handle the system makes takes the value `handle`.
+    pub(super) fn mint_next(&self, handle: Handle) {
+        self.s().mint = Some(handle);
     }
 
     /// An OS error code whose status is a warning.
@@ -467,6 +484,9 @@ impl Sim {
     }
 
     fn new_handle(s: &mut State) -> Handle {
+        if let Some(value) = s.mint.take() {
+            return value;
+        }
         s.next += 1;
         s.next
     }
