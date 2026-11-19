@@ -3,6 +3,18 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## The credit-graph scenario runs on a clock the test steps (`euhedral-graph` tests and `testing`) (2026-11-19)
+
+**What.** `testing::StepClock` is a clock a test owns, and `FakeDevice::pool_stepped(names, &clock)` builds a pool whose submissions complete when that clock reaches them (`FakeDevice::pool` keeps the wall clock). `FakeDevice::next_done_after_ns` gives the next time a submission on the pool completes. In `tests/credit_graph.rs` the fake consumer's schedule (the 0.5 s buffer, 120 items a second, the seek, the pause, the credit) and the device's completions read that one clock. The harness moves it to the next event only when the graph's code has done nothing for 0.5 ms of real time, so a late item is one the graph delivered after the consumer's frame, whatever the machine's speed.
+
+**Why.** The scenario ran on wall-clock time: with the 7 ms pack the margin over the consumer's rate is about 19 %, so a loaded machine could make an item late (or hit the 30 s and 5 s deadlines) although the graph was correct.
+
+**How to use.** `StepClock::new()`, `FakeDevice::pool_stepped`, then `advance_to` when the code under test has gone quiet. Nothing changes for users of `FakeDevice::pool`. The test's `EUHEDRAL_TEST_TIMING` checks (callbacks over 200 µs, shutdown under 100 ms) stay: they time real frames on the real clock, which a stepped clock does not replace, and stay printed unless the variable is set. The completions' wall-clock lateness line is no longer printed (on a stepped clock it measures only the harness).
+
+**Semantics.** Asserted always, on the stepped clock: no late item, no timeout (the stream finishes within 30 s of scenario time and at most a million steps), nothing left after the drain (which steps time until the pool and the graph are empty), no order break at any hop, nothing beyond credit, made = sent + dropped, every quantum retired once, in flight <= pool. The only real-time bounds are a 120 s guard against a hang and a 20 ms wait for the frame a due completion releases; neither is a property under test. A step has quiet when the graph's own code (stages, sequencer release, pack, send, control, lease ends) shows no activity for the window; the lattice's idle polling does not count.
+
+**Tests.** `the_credit_graph_with_a_fast_pack`, `the_credit_graph_with_a_slow_pack`, and `a_pack_slower_than_the_consumer_makes_items_late` (a 16 ms pack, slower than the consumer: `late > 0` while every other check holds), which shows the stepped scenario counts a real lateness.
+
 ## A panic in `AsyncIo`'s completion and refusal paths neither stalls a ring nor skews the counts (`euhedral-io`) (2026-11-19)
 
 **What.** The io_uring engine takes a completion-queue or submission-queue lock a panic poisoned instead of skipping it, and a completion of no operation is raised by `AsyncIo::reap` after its counts are done. The reap drops the frame of an operation whose continuation panicked (it is counted by `panicked()` and by `pending`, and no consumer sees a frame for it). `submit` takes its `pending` and `unreaped` counts back through a guard, so they are right when dropping a refused continuation panics; the engine sets a flag the guard owns (`Engine::submit`'s `taken`) once it holds the operation, so a later panic does not undo the counts and a submission made while the refused continuation drops does not hide the refusal. An enter that unwinds leaves the ring's entries marked unsubmitted, so a later poll hands them over. A reap run inside a continuation keeps the enclosing reap's stray check. The Windows engine takes its poisoned ring lock the same way.

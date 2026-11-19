@@ -12,19 +12,24 @@
 //!   zero frees the pool slot, which may admit the next item.
 //! - **Admission** = credit horizon and pool (16), from the control lane (credits, jumps to a new generation) and from
 //!   lease releases.
-//! - **The fake consumer** (the harness, on the test thread) takes 120 items a second, credits 1 s
-//!   ahead, starts after 0.5 s, jumps at 1.5 s to seq 480 (a `Seek`: a new generation, with a new kill
-//!   switch), pauses 0.4 s and takes items to the end of the 6 s stream.
+//! - **One stepped clock.** The fake consumer (the harness, on the test thread) and the `FakeDevice`s read one
+//!   `StepClock` the harness owns. It advances to the next event (a device submission completing, or the
+//!   consumer's next frame, seek or pause end) only when the graph's code has done nothing for a short real
+//!   window, so "late" counts what the graph did, not how fast the machine ran.
+//! - **The fake consumer** takes 120 items a second, credits 1 s ahead, starts after 0.5 s, jumps at 1.5 s to
+//!   seq 480 (a `Seek`: a new generation, with a new kill switch), pauses 0.4 s and takes items to the end of
+//!   the 6 s stream, all in the scenario's time.
 //! - **Order at every hop** (fetch, parse, sequencer release, pack, send, sent) is checked within
 //!   each generation.
-//! - **The no-wait check:** a timing executor measures every frame callback (execute + finalizer)
-//!   and counts the ones over 200 µs that the OS did not preempt (no involuntary context switch
+//! - **The no-wait check:** a timing executor measures every frame callback (execute + finalizer) on the
+//!   wall clock and counts the ones over 200 µs that the OS did not preempt (no involuntary context switch
 //!   during it).
 //!
 //! Pass: 0 late, 0 out of order, 0 beyond credit, 0 left (items, slots, completions, quanta), made
-//! = sent + dropped, in flight <= pool. With `EUHEDRAL_TEST_TIMING` set (a quiet machine), also no
-//! callback over 200 µs and shutdown under 100 ms; otherwise those two are printed, not asserted
-//! (run with `-- --nocapture` to see the line; libtest hides a passing test's output).
+//! = sent + dropped, in flight <= pool, the stream finishing within its time. A pack slower than the consumer
+//! must make items late. With `EUHEDRAL_TEST_TIMING` set (a quiet machine), also no callback over 200 µs and
+//! shutdown under 100 ms; otherwise those two are printed, not asserted (run with `-- --nocapture` to see the
+//! line; libtest hides a passing test's output). The only real-time bound left is a 120 s guard against a hang.
 //!
 //! `EUHEDRAL_TEST_CPUS` (default 0,1,2,3) picks the lattice's CPUs. As in `euhedral-core`'s tests
 //! that need particular hardware, the test passes without checking anything when this process may
@@ -34,7 +39,7 @@
     reason = "test fixtures: the test thread locks its records"
 )]
 #![cfg(target_os = "linux")]
-// The fake consumer is test harness, not a frame: it looks at the wire every millisecond.
+// The fake consumer is test harness, not a frame: it waits in real time for the lattice to go quiet.
 #![allow(clippy::disallowed_methods)]
 
 use std::collections::{BTreeMap, VecDeque};
@@ -50,7 +55,7 @@ use euhedral_core::generics::AbstractExecutor;
 use euhedral_core::generics::LatticeSource;
 use euhedral_core::impls::BaseCloneableObject;
 use euhedral_core::ingest::{IngestSink, QueueIngestSink};
-use euhedral_graph::testing::FakeDevice;
+use euhedral_graph::testing::{FakeDevice, StepClock};
 use euhedral_graph::{
     Completions, DEFAULT_RETRY_BACKSTOP, DeviceQueue, EdgeKind, GraphRuntime, Lake, LaneId,
     LanePool, Marker, QuantumOutcome, Sequencer, Slot, Stage, StageCx, StageError, StageGraph,
@@ -59,7 +64,6 @@ use euhedral_graph::{
 use euhedral_hardware_utils::affinity;
 
 const FPS: u64 = 120;
-const FRAME: Duration = Duration::from_nanos(1_000_000_000 / FPS);
 const END: u64 = 6 * FPS;
 const AHEAD: u64 = FPS;
 const START_BUFFER: u64 = FPS / 2;
@@ -103,6 +107,10 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[derive(Default)]
 struct CallbackStats {
     count: AtomicU64,
+    /// What the graph's own code has done (a stage ran, an item moved on, a control message was taken, a
+    /// lease ended): the harness's sign that the lattice is still at work. The lattice's own idle polling
+    /// does not count.
+    activity: AtomicU64,
     max_ns: AtomicU64,
     /// Over 200 µs with no involuntary context switch: a frame that waited or worked too long.
     slow: AtomicU64,
@@ -161,7 +169,6 @@ impl AbstractExecutor for TimingExecutor {
         let took = started.elapsed();
         let (v1, i1) = switches();
         let s = stats();
-        s.count.fetch_add(1, Ordering::Relaxed);
         s.max_ns.fetch_max(
             u64::try_from(took.as_nanos()).unwrap_or(u64::MAX),
             Ordering::Relaxed,
@@ -177,6 +184,7 @@ impl AbstractExecutor for TimingExecutor {
             }
             .fetch_add(1, Ordering::Relaxed);
         }
+        s.count.fetch_add(1, Ordering::AcqRel);
     }
 }
 
@@ -198,7 +206,13 @@ fn hops() -> &'static Hops {
     })
 }
 
+/// The graph's own code did something.
+fn touch() {
+    stats().activity.fetch_add(1, Ordering::AcqRel);
+}
+
 fn hop(index: usize, generation: u32, seq: u64) {
+    touch();
     let hops = hops();
     let mut last = lock(&hops.last);
     let (e, p) = last[index];
@@ -278,6 +292,7 @@ impl Item {
 
 impl Drop for Item {
     fn drop(&mut self) {
+        touch();
         self.drop_slot();
         self.lease.end();
     }
@@ -474,6 +489,7 @@ impl Ctx {
             ],
             runtime,
             move |item: Item, outcome| {
+                touch();
                 let Some(ctx) = me.upgrade() else { return };
                 ctx.counts.retired.fetch_add(1, Ordering::Relaxed);
                 match outcome {
@@ -546,6 +562,7 @@ impl Ctx {
     /// A item's lease ended (retired, and sent or dropped): its pool slot is free, which may admit
     /// the next.
     fn release(&self, sent: bool) {
+        touch();
         if sent {
             &self.counts.sent
         } else {
@@ -566,6 +583,7 @@ impl Ctx {
     }
 
     fn on_credit(&self, generation: u32, horizon: u64) {
+        touch();
         {
             let mut link = lock(&self.link);
             if generation != link.generation || horizon <= link.horizon {
@@ -577,6 +595,7 @@ impl Ctx {
     }
 
     fn seek(&self, generation: u32, to: u64, horizon: u64) {
+        touch();
         {
             let mut link = lock(&self.link);
             link.kill.store(true, Ordering::Release);
@@ -720,7 +739,70 @@ impl Frame for ControlFrame {
 }
 
 // ---------------------------------------------------------------------------------------------
-// The fake consumer (the harness).
+// The stepped clock and the fake consumer (the harness).
+
+/// How long the lattice must show no frame starting or running before the harness takes it for quiet. The
+/// graph needs no real time to be right: this only lets a frame that is already queued reach a worker, so
+/// the harness steps time when the lattice has nothing left to do at the current time.
+const QUIET_FOR: Duration = Duration::from_micros(500);
+/// After a step that made a device submission complete, how long the harness waits for the frame that
+/// completion releases to start, before it starts counting a quiet window.
+const RELEASE_WITHIN: Duration = Duration::from_millis(20);
+/// A real-time guard that only catches a hang; no assertion depends on it.
+const HANG_GUARD: Duration = Duration::from_secs(120);
+/// The bound on the scenario's own time (the stream is under 7 s): beyond it nothing is making progress.
+const STREAM_TIME_LIMIT_NS: u64 = 30_000_000_000;
+
+/// The test-owned time, and what advances it.
+struct Stepper {
+    clock: Arc<StepClock>,
+    device: Arc<FakeDevice>,
+    started: Instant,
+}
+
+impl Stepper {
+    fn now_ns(&self) -> u64 {
+        self.clock.now_ns()
+    }
+
+    /// Waits until the graph's code has done nothing for `QUIET_FOR`; with `within`, first until it has done
+    /// something since `before` (a completion that became due releases a frame) or that long has passed.
+    fn settle(&self, before: u64, within: Option<Duration>) {
+        let activity = || stats().activity.load(Ordering::Acquire);
+        let waiting = Instant::now();
+        while let Some(within) = within
+            && activity() == before
+            && waiting.elapsed() < within
+            && self.started.elapsed() < HANG_GUARD
+        {
+            std::thread::sleep(Duration::from_micros(50));
+        }
+        let mut seen = activity();
+        let mut since = Instant::now();
+        loop {
+            std::thread::sleep(Duration::from_micros(50));
+            let now = activity();
+            if now != seen {
+                seen = now;
+                since = Instant::now();
+            } else if since.elapsed() >= QUIET_FOR {
+                return;
+            }
+            assert!(
+                self.started.elapsed() < HANG_GUARD,
+                "the lattice never went quiet"
+            );
+        }
+    }
+
+    /// Sets the clock to `next` and lets the lattice go quiet at the new time.
+    fn step_to(&self, next: u64) {
+        let before = stats().activity.load(Ordering::Acquire);
+        let due = self.device.next_done_after_ns(self.now_ns()) == Some(next);
+        self.clock.advance_to(next);
+        self.settle(before, due.then_some(RELEASE_WITHIN));
+    }
+}
 
 #[derive(Default, Debug)]
 struct ConsumerReport {
@@ -729,14 +811,22 @@ struct ConsumerReport {
     out_of_order: u64,
     stale_dropped: u64,
     over_credit: u64,
+    /// In the scenario's time, not the wall clock's.
     start_latency: Option<Duration>,
     seek_latency: Option<Duration>,
     timed_out: bool,
+    steps: u64,
 }
 
-fn consumer(ctx: &Arc<Ctx>) -> ConsumerReport {
+const FRAME_NS: u64 = 1_000_000_000 / FPS;
+
+fn consumer(ctx: &Arc<Ctx>, stepper: &Stepper) -> ConsumerReport {
     let mut report = ConsumerReport::default();
+    // Every control message is taken by a frame that shows as activity, so after a send the harness waits for
+    // that before it looks for quiet.
+    let sent_control = std::cell::Cell::new(false);
     let send = |msg: Control| {
+        sent_control.set(true);
         let frame = ControlFrame {
             header: FrameHeader::new(CONTROL),
             ctx: ctx.clone(),
@@ -747,25 +837,33 @@ fn consumer(ctx: &Arc<Ctx>) -> ConsumerReport {
             "control sink closed"
         );
     };
-    let begun = Instant::now();
     let mut generation = 1u32;
     let mut buffer: BTreeMap<u64, ()> = BTreeMap::new();
     let mut last_rx: Option<u64> = None;
     let mut playhead = 0u64;
-    let mut playing_since: Option<(Instant, u64)> = None;
-    let mut asked_at = Instant::now();
+    // (when it began, the pts it began at), in ns of the scenario's time.
+    let mut playing_since: Option<(u64, u64)> = None;
+    let mut asked_at = 0u64;
     let mut seeked = false;
-    let mut paused_until: Option<Instant> = None;
+    let mut paused_until: Option<u64> = None;
     let mut paused_done = false;
     let mut credited = AHEAD;
     let mut eos = false;
+    let before = stats().activity.load(Ordering::Acquire);
     send(Control::Seek {
         generation,
         to: 0,
         horizon: AHEAD,
     });
+    stepper.settle(before, Some(HANG_GUARD));
     loop {
+        let before = stats().activity.load(Ordering::Acquire);
+        sent_control.set(false);
+        let now = stepper.now_ns();
+        // What this pass did: if it did anything the lattice must go quiet at this time before the next pass.
+        let mut acted = false;
         let msgs: Vec<Msg> = lock(&ctx.wire).drain(..).collect();
+        acted |= !msgs.is_empty();
         for msg in msgs {
             match msg {
                 Msg::Packet { generation: e, seq } if e == generation => {
@@ -776,7 +874,7 @@ fn consumer(ctx: &Arc<Ctx>) -> ConsumerReport {
                         report.out_of_order += 1;
                     }
                     if last_rx.is_none() {
-                        let latency = asked_at.elapsed();
+                        let latency = Duration::from_nanos(now - asked_at);
                         if seeked {
                             report.seek_latency = Some(latency);
                         } else {
@@ -791,9 +889,9 @@ fn consumer(ctx: &Arc<Ctx>) -> ConsumerReport {
                 Msg::End { .. } => {}
             }
         }
-        let now = Instant::now();
-        if !seeked && now.duration_since(begun) >= SEEK_AT {
+        if !seeked && now >= SEEK_AT.as_nanos() as u64 {
             seeked = true;
+            acted = true;
             generation += 1;
             buffer.clear();
             last_rx = None;
@@ -812,19 +910,22 @@ fn consumer(ctx: &Arc<Ctx>) -> ConsumerReport {
                 paused_until = None;
                 paused_done = true;
                 playing_since = Some((now, playhead));
+                acted = true;
             }
         } else if !paused_done && seeked && playhead >= PAUSE_AT_PTS {
-            paused_until = Some(now + PAUSE_FOR);
+            paused_until = Some(now + PAUSE_FOR.as_nanos() as u64);
             playing_since = None;
+            acted = true;
         }
         if playing_since.is_none() && paused_until.is_none() {
             let have = buffer.range(playhead..).count() as u64;
             if have > 0 && have >= START_BUFFER.min(END - playhead) {
                 playing_since = Some((now, playhead));
+                acted = true;
             }
         }
         if let Some((since, from)) = playing_since {
-            let due = from + (now.duration_since(since).as_nanos() / FRAME.as_nanos()) as u64;
+            let due = from + (now - since) / FRAME_NS;
             while playhead < due.min(END) {
                 if buffer.remove(&playhead).is_some() {
                     report.shown += 1;
@@ -832,11 +933,13 @@ fn consumer(ctx: &Arc<Ctx>) -> ConsumerReport {
                     report.late += 1;
                 }
                 playhead += 1;
+                acted = true;
             }
         }
         let horizon = playhead + AHEAD;
         if horizon > credited {
             credited = horizon;
+            acted = true;
             send(Control::Credit {
                 generation,
                 horizon,
@@ -845,11 +948,40 @@ fn consumer(ctx: &Arc<Ctx>) -> ConsumerReport {
         if eos && playhead >= END {
             return report;
         }
-        if begun.elapsed() > Duration::from_secs(30) {
-            report.timed_out = true;
-            return report;
+        if acted {
+            stepper.settle(before, sent_control.get().then_some(HANG_GUARD));
+            continue;
         }
-        std::thread::sleep(Duration::from_millis(1));
+        // Nothing more to do at this time: the next thing that can happen is a device submission
+        // completing or one of the consumer's own times.
+        let mut next = stepper.device.next_done_after_ns(now);
+        let mut consider = |at: u64| {
+            if at > now {
+                next = Some(next.map_or(at, |n| n.min(at)));
+            }
+        };
+        if !seeked {
+            consider(SEEK_AT.as_nanos() as u64);
+        }
+        if let Some(until) = paused_until {
+            consider(until);
+        }
+        if let Some((since, from)) = playing_since
+            && playhead < END
+        {
+            consider(since + (playhead - from + 1) * FRAME_NS);
+        }
+        report.steps += 1;
+        match next {
+            Some(next) if next <= STREAM_TIME_LIMIT_NS && report.steps < 1_000_000 => {
+                stepper.step_to(next);
+            }
+            // Nothing can happen any more, or the stream has outlived its time: it will not finish.
+            _ => {
+                report.timed_out = true;
+                return report;
+            }
+        }
     }
 }
 
@@ -887,41 +1019,83 @@ fn lattice(cpus: &[usize]) -> Arc<ControlPlaneLattice> {
     lattice
 }
 
-/// One scenario on its own lattice, asserting the pass criteria (the report is printed).
-fn scenario(pack_cost: Duration) {
+/// What one scenario did.
+struct Outcome {
+    report: ConsumerReport,
+    inversions: Vec<(&'static str, u64)>,
+    left: u64,
+    quanta_left: usize,
+    slots_left: usize,
+    pending_left: usize,
+    made: u64,
+    sent: u64,
+    dropped: u64,
+    retired: u64,
+    failed: u64,
+    max_in_flight: u64,
+    /// Callbacks over 200 µs of the wall clock, and the wall-clock time of the lattice's shutdown.
+    slow: u64,
+    closed_in: Duration,
+}
+
+/// One scenario on its own lattice, on a clock the harness steps. `None` when this process may not run on the
+/// CPUs asked for.
+fn run(pack_cost: Duration) -> Option<Outcome> {
     let cpus = cpus();
     let allowed = affinity::base_mask();
     if !cpus.iter().all(|&cpu| allowed.contains(cpu)) {
         // This process may not run on every requested CPU: pass without checking, as
         // euhedral-core's tests do.
-        return;
+        return None;
     }
     let lattice = lattice(&cpus);
-    let (lanes, devices) =
-        FakeDevice::pool(&["disk", "parse", "compute-a", "compute-b", "pack", "nic"]);
+    let clock = StepClock::new();
+    let (lanes, devices) = FakeDevice::pool_stepped(
+        &["disk", "parse", "compute-a", "compute-b", "pack", "nic"],
+        &clock,
+    );
+    let probe = devices[0].clone();
     let ctx = Ctx::new(lattice.clone(), pack_cost, lanes, devices);
     lattice.add_upstream(ctx.completions.clone()).unwrap();
     let unit = ctx.stages.admit().unwrap(); // attaches the lake's sinks
     lattice.add_upstream(ctx.control.delegate()).unwrap();
     let s = stats();
-    for counter in [&s.count, &s.max_ns, &s.slow, &s.preempted, &s.voluntary] {
+    for counter in [
+        &s.count,
+        &s.activity,
+        &s.max_ns,
+        &s.slow,
+        &s.preempted,
+        &s.voluntary,
+    ] {
         counter.store(0, Ordering::Relaxed);
     }
+    let stepper = Stepper {
+        clock,
+        device: probe,
+        started: Instant::now(),
+    };
 
-    let report = consumer(&ctx);
+    let report = consumer(&ctx, &stepper);
 
-    let closing = Instant::now();
+    // The drain: nothing more is admitted; time goes on until what is in flight has finished or no
+    // submission is left to complete.
     lock(&ctx.link).closed = true;
-    let deadline = Instant::now() + Duration::from_secs(5);
     let graph = ctx.graph.get().unwrap().clone();
-    while (ctx.in_flight() > 0 || graph.live() > 0) && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(1));
+    let mut drain_steps = 0u64;
+    while (ctx.in_flight() > 0 || graph.live() > 0) && drain_steps < 1_000_000 {
+        let Some(next) = stepper.device.next_done_after_ns(stepper.now_ns()) else {
+            // Nothing is left to complete: let the lattice finish what only needs a worker.
+            stepper.settle(0, None);
+            break;
+        };
+        stepper.step_to(next);
+        drain_steps += 1;
     }
     let left = ctx.in_flight();
     let quanta_left = graph.live();
     let slots_left = ctx.sequencer.get().unwrap().len();
     let pending_left = ctx.completions.pending();
-    let drained_in = closing.elapsed();
     let closing = Instant::now();
     ctx.control.complete_gracefully();
     drop(unit);
@@ -933,12 +1107,10 @@ fn scenario(pack_cost: Duration) {
     let c = &ctx.counts;
     let get = |a: &AtomicU64| a.load(Ordering::Relaxed);
     let (callbacks, slow) = (get(&s.count), get(&s.slow));
-    let (p50, p99, max) = ctx.completions.lateness_us();
     println!("pack {pack_cost:?}, CPUs {cpus:?}: {report:?}");
     println!(
         "made {} sent {} dropped {} retired {} (killed {}, failed {}); max in flight {} (pool {POOL}); left: {left} \
-         items, {quanta_left} quanta, {slots_left} slots, {pending_left} completions; drained in {drained_in:?}, \
-         closed in {closed_in:?}",
+         items, {quanta_left} quanta, {slots_left} slots, {pending_left} completions; {drain_steps} drain steps",
         get(&c.made),
         get(&c.sent),
         get(&c.dropped),
@@ -948,8 +1120,8 @@ fn scenario(pack_cost: Duration) {
         get(&c.max_in_flight),
     );
     println!(
-        "callbacks: {callbacks}, max {:?}, over 200 µs: {slow} (+{} preempted by the OS), blocking at all: {}; \
-         completion found after done (upper bound) p50 {p50} µs, p99 {p99} µs, max {max} µs",
+        "wall-clock callbacks: {callbacks}, max {:?}, over 200 µs: {slow} (+{} preempted by the OS), blocking at all: {}; \
+         shutdown {closed_in:?}",
         Duration::from_nanos(get(&s.max_ns)),
         get(&s.preempted),
         get(&s.voluntary),
@@ -961,39 +1133,64 @@ fn scenario(pack_cost: Duration) {
         .collect();
     *lock(&hops().last) = [(0, 0); 6];
     println!("order breaks per hop, within a generation: {inversions:?}");
-    assert!(!report.timed_out, "the consumer timed out");
-    assert_eq!(report.late, 0, "late");
-    assert_eq!(report.out_of_order, 0, "out of order");
+    Some(Outcome {
+        report,
+        inversions,
+        left,
+        quanta_left,
+        slots_left,
+        pending_left,
+        made: get(&c.made),
+        sent: get(&c.sent),
+        dropped: get(&c.dropped),
+        retired: get(&c.retired),
+        failed: get(&c.failed_outcomes),
+        max_in_flight: get(&c.max_in_flight),
+        slow,
+        closed_in,
+    })
+}
+
+/// What holds whatever the pack costs: order, credit, accounting, drain.
+fn assert_graph_correct(o: &Outcome) {
+    assert!(!o.report.timed_out, "the stream did not finish");
+    assert_eq!(o.report.out_of_order, 0, "out of order");
     assert!(
-        inversions.iter().all(|(_, n)| *n == 0),
-        "order broke at a hop: {inversions:?}"
+        o.inversions.iter().all(|(_, n)| *n == 0),
+        "order broke at a hop: {:?}",
+        o.inversions
     );
-    assert_eq!(report.over_credit, 0, "beyond credit");
+    assert_eq!(o.report.over_credit, 0, "beyond credit");
     assert_eq!(
-        (left, quanta_left, slots_left, pending_left),
+        (o.left, o.quanta_left, o.slots_left, o.pending_left),
         (0, 0, 0, 0),
         "left over"
     );
-    assert_eq!(
-        get(&c.made),
-        get(&c.sent) + get(&c.dropped),
-        "made = sent + dropped"
-    );
-    assert_eq!(get(&c.retired), get(&c.made), "every quantum retired once");
-    assert_eq!(get(&c.failed_outcomes), 0);
-    assert!(get(&c.max_in_flight) <= POOL);
-    // Timing is a report unless EUHEDRAL_TEST_TIMING is set: a loaded machine delays a callback
+    assert_eq!(o.made, o.sent + o.dropped, "made = sent + dropped");
+    assert_eq!(o.retired, o.made, "every quantum retired once");
+    assert_eq!(o.failed, 0);
+    assert!(o.max_in_flight <= POOL);
+}
+
+/// A pack the consumer's rate can be met with: the graph is correct and no item is late.
+fn scenario(pack_cost: Duration) {
+    let Some(o) = run(pack_cost) else { return };
+    assert_graph_correct(&o);
+    assert_eq!(o.report.late, 0, "late");
+    // Wall-clock timing is a report unless EUHEDRAL_TEST_TIMING is set: a loaded machine delays a callback
     // without an involuntary context switch (CPU quota, hypervisor steal, a sibling thread), which
     // the preemption count cannot see. Set it on a quiet machine to assert.
     if std::env::var_os("EUHEDRAL_TEST_TIMING").is_none() {
         println!(
-            "timing (reported, not asserted; set EUHEDRAL_TEST_TIMING=1 to assert): {slow} callbacks over 200 µs, shutdown {closed_in:?}"
+            "timing (reported, not asserted; set EUHEDRAL_TEST_TIMING=1 to assert): {} callbacks over 200 µs, shutdown {:?}",
+            o.slow, o.closed_in
         );
     } else {
-        assert_eq!(slow, 0, "frame callbacks over 200 µs (not preempted)");
+        assert_eq!(o.slow, 0, "frame callbacks over 200 µs (not preempted)");
         assert!(
-            closed_in < Duration::from_millis(100),
-            "shutdown took {closed_in:?}"
+            o.closed_in < Duration::from_millis(100),
+            "shutdown took {:?}",
+            o.closed_in
         );
     }
 }
@@ -1012,4 +1209,16 @@ fn the_credit_graph_with_a_fast_pack() {
 fn the_credit_graph_with_a_slow_pack() {
     let _one = lock(&ONE_AT_A_TIME);
     scenario(Duration::from_micros(7000));
+}
+
+/// The stepped scenario counts lateness: a 16 ms pack (62 items a second) is slower than the consumer's 120 items a second, so the
+/// stream runs dry and items are late, while the graph stays correct.
+#[test]
+fn a_pack_slower_than_the_consumer_makes_items_late() {
+    let _one = lock(&ONE_AT_A_TIME);
+    let Some(o) = run(Duration::from_micros(16000)) else {
+        return;
+    };
+    assert_graph_correct(&o);
+    assert!(o.report.late > 0, "a pack slower than the consumer is late");
 }
