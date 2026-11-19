@@ -131,3 +131,5 @@ mise exec -- cargo test -p euhedral-memory --features cuda       # + the CUDA ba
 mise exec -- cargo run --release -p euhedral-memory --features cuda --example alloc_sweep   # CUDA against Vulkan
 mise exec -- cargo run --release -p euhedral-memory --features cuda --example copy_rate     # pinned host <-> device GB/s
 ```
+The device tests are in `tests/cuda.rs`. A test that finds no driver or card prints `DEVICE-TEST-SKIPPED` through its `skip` function and returns, never silently. The GitLab pipeline's `device` job runs them on the card, and `scripts/ci/device_check.py` fails the job on any such line.
+

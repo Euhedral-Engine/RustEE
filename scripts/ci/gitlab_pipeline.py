@@ -23,7 +23,8 @@ WORKSPACE = {"ARBITER_ARGS": "--threads 8 --mem 6G", "ARBITER_EST": "240", **DOC
 # The device job asks for a shared grant of card memory (the machine's one card is also used by people), and its container
 # gets the card by device nodes and the host's driver libraries, as the arbiter's own container does: the machine has no
 # NVIDIA container runtime, so `--gpus all` is refused. NVRTC is not installed system-wide: the project variable
-# EUHEDRAL_NVRTC_DIR names the directory of its libraries on the host, mounted read-only at the same path.
+# EUHEDRAL_NVRTC_DIR names the directory of its libraries on the host, mounted read-only at the same path (the runner
+# expands it into `docker run` before any script line runs, so an unset variable is docker's `invalid spec: ::ro`).
 DRIVER_LIBS = "/usr/lib/x86_64-linux-gnu"
 DEVICE_DOCKER = " ".join(
     ["--security-opt seccomp=unconfined", "--device /dev/nvidiactl", "--device /dev/nvidia0", "--device /dev/nvidia-uvm",
@@ -73,9 +74,7 @@ if yes("any"):
             "stage": "test", "variables": DEVICE,
             "script": STABLE + [
                 "set -o pipefail",
-                'test -n "$EUHEDRAL_NVRTC_DIR" || { echo "the project variable EUHEDRAL_NVRTC_DIR is not set"; exit 1; }',
                 'export EUHEDRAL_NVRTC="$EUHEDRAL_NVRTC_DIR/libnvrtc.so.13" LD_LIBRARY_PATH="$EUHEDRAL_NVRTC_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"',
-                "nvidia-smi -L || true",
             ] + device,
         }
 

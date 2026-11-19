@@ -36,7 +36,13 @@ struct Rig {
 }
 
 fn rig() -> Option<Rig> {
-    let gpu = CudaGpu::open(0).ok()?;
+    let gpu = match CudaGpu::open(0) {
+        Ok(gpu) => gpu,
+        Err(e) => {
+            skip::skip(format_args!("no CUDA device ({e})"));
+            return None;
+        }
+    };
     let module = match CudaModule::from_source(&gpu, SOURCE, &CompileOptions::default()) {
         Ok(m) => m,
         Err(e) => {

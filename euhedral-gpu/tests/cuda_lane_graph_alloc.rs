@@ -63,9 +63,18 @@ const OPS_PTX: &[u8] = include_bytes!("kernels/ops.ptx");
 
 fn module(gpu: &Arc<CudaGpu>) -> Option<CudaModule> {
     if gpu.driver_version() >= 13010 {
-        CudaModule::from_image(gpu, OPS_PTX).ok()
+        Some(
+            CudaModule::from_image(gpu, OPS_PTX)
+                .expect("the prebuilt test kernels load on a 13.1 driver"),
+        )
     } else {
-        CudaModule::from_source(gpu, OPS, &Default::default()).ok()
+        match CudaModule::from_source(gpu, OPS, &Default::default()) {
+            Ok(module) => Some(module),
+            Err(e) => {
+                skip::skip(format_args!("no way to compile the test kernels ({e})"));
+                None
+            }
+        }
     }
 }
 

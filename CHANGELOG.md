@@ -3,6 +3,20 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## The device tests run on the card in CI, and a skip fails the job (CI) (2026-11-19)
+
+**What.** The GitLab pipeline has a `device` job that runs `cargo test --features cuda` of `euhedral-memory` and `euhedral-gpu` on the machine's card, under a shared grant of card memory, with the card's device nodes, the host's driver libraries and NVRTC in its container. Every device test that cannot run prints a `DEVICE-TEST-SKIPPED` line through one helper per crate, and `scripts/ci/device_check.py` fails the job on such a line or on a `tests/cuda*.rs` binary that did not run. A skip for a feature this card lacks prints `DEVICE-TEST-SKIPPED-HARDWARE` and is listed and accepted.
+
+**Why.** A device test with no driver or card returned early and passed, so a green pipeline said nothing about the device code. The cuda test steps also made the workspace job wait for the card.
+
+**How to use.** Nothing for callers. A device test that must skip calls `skip::skip(..)` (`skip_hardware` for a missing card feature), never a bare `return`. The project variable `EUHEDRAL_NVRTC_DIR` names the NVRTC library directory on the runner's host. GitHub's runners have no card: the job is GitLab-only.
+
+**Semantics.**
+- The job runs the tests with `--nocapture` so the skip lines reach the log.
+- `an_allocation_that_runs_out_of_memory_makes_the_deferred_frees_and_tries_again` asks for more than the card has, so it holds one 64 MiB block instead of most of the free memory; it proves the deferred free is made on the out-of-memory, not that the retried allocation succeeds.
+
+**Tests.** `scripts/ci/test_device_check.py` (a skip fails, a hardware skip is accepted, a binary that did not run fails) and `test_gitlab_pipeline.py` (the job, its grant and its steps). On a pipeline without the card the job fails with the skip lines.
+
 ## A quantum retires on a lane it used (`euhedral-graph`) (2026-11-19)
 
 **What.** A `StageGraph` quantum arms its retirement on a lane it used, not always on its run's home lane. With one lane used, that lane; with several, its home lane when it is one of them, else the lowest of them that has control. The other lanes it used join that lane first, as before.
