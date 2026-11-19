@@ -141,6 +141,35 @@ mod tests {
         assert_eq!(flow.read(), Some(stats(3.0)));
     }
 
+    /// Writes the first `done` fields of a publish by hand, with the sequence odd, as a publisher
+    /// stopped between two of its stores would leave them.
+    fn stop_mid_publish(flow: &PublishedFlow, value: f64, done: usize) -> u64 {
+        let inner = &*flow.inner;
+        let sequence = inner.sequence.load(Ordering::Relaxed);
+        inner.sequence.store(sequence + 1, Ordering::Relaxed);
+        for field in &inner.fields[..done] {
+            field.store(value.to_bits(), Ordering::Relaxed);
+        }
+        sequence
+    }
+
+    #[test]
+    fn a_read_during_a_publish_returns_nothing_not_a_mix() {
+        let flow = PublishedFlow::new();
+        flow.publish(&stats(1.0));
+        for done in 0..=5 {
+            let sequence = stop_mid_publish(&flow, 2.0, done);
+            // Old and new fields are mixed now; every attempt must refuse them.
+            assert_eq!(flow.read(), None, "{done} fields written");
+            for field in &flow.inner.fields[done..] {
+                field.store(2.0f64.to_bits(), Ordering::Relaxed);
+            }
+            flow.inner.sequence.store(sequence + 2, Ordering::Release);
+            assert_eq!(flow.read(), Some(stats(2.0)));
+            flow.publish(&stats(1.0));
+        }
+    }
+
     #[test]
     fn readers_never_see_a_torn_publish() {
         let flow = PublishedFlow::new();
@@ -153,20 +182,18 @@ mod tests {
                     value += 1.0;
                 }
             });
-            // The publisher may not be scheduled yet on a small runner; count reads only once it has published.
-            while flow.read().is_none() {
-                std::thread::yield_now();
-            }
-            let mut seen = 0;
+            // A read may return nothing when the publisher is stopped mid-write (it is not
+            // scheduled), so how many reads succeed says nothing; each one that does must be whole.
             for _ in 0..20_000 {
                 if let Some(read) = flow.read() {
                     assert_eq!(read, stats(read.average));
-                    seen += 1;
                 }
             }
             stop.store(true, Ordering::Relaxed);
-            assert!(seen > 0);
         });
+        // The publisher has ended, so a publish now reads whole.
+        flow.publish(&stats(9.0));
+        assert_eq!(flow.read(), Some(stats(9.0)));
     }
 
     #[test]

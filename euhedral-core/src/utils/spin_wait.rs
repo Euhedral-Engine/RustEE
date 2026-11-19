@@ -30,9 +30,7 @@ pub fn await_while(mut condition: impl FnMut() -> bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::Instant;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     #[test]
     fn returns_at_once_when_the_condition_is_false() {
@@ -56,17 +54,22 @@ mod tests {
 
     #[test]
     fn waits_for_another_thread() {
-        let released = Arc::new(AtomicBool::new(false));
-        let releaser = {
-            let released = released.clone();
-            thread::spawn(move || {
-                thread::sleep(Duration::from_millis(20));
+        // The releaser sets the flag only after the waiter has checked 1,000 times, which is past
+        // its spinning and yielding and into its parks; the waiter may not return before that.
+        const CHECKS_BEFORE_RELEASE: u32 = 1_000;
+        let released = AtomicBool::new(false);
+        let checks = AtomicU32::new(0);
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                await_while(|| checks.load(Ordering::Acquire) < CHECKS_BEFORE_RELEASE);
                 released.store(true, Ordering::Release);
-            })
-        };
-        let start = Instant::now();
-        await_while(|| !released.load(Ordering::Acquire));
-        assert!(start.elapsed() >= Duration::from_millis(20));
-        releaser.join().unwrap();
+            });
+            await_while(|| {
+                checks.fetch_add(1, Ordering::AcqRel);
+                !released.load(Ordering::Acquire)
+            });
+            assert!(released.load(Ordering::Acquire));
+            assert!(checks.load(Ordering::Acquire) >= CHECKS_BEFORE_RELEASE);
+        });
     }
 }

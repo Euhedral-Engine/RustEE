@@ -3,6 +3,21 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## Three load-sensitive core tests judge the code, not the scheduler (`euhedral-core`) (2026-11-19)
+
+**What.** Test changes only; no product code changed. `PublishedFlow`'s sequence lock was checked against its reader and is correct (writer: odd sequence, release fence, fields, even sequence with release; reader: acquire load, fields, acquire fence, sequence compared): a torn publish cannot be returned.
+
+**Why.** `readers_never_see_a_torn_publish` asserted that 20,000 reads returned at least one value. A read returns nothing when it meets a publish in progress for 64 attempts, so a publisher descheduled between its stores on a loaded runner made every read return nothing and the test failed, although nothing was torn. `waits_for_another_thread` asserted that 20 ms of wall time had passed, which a stalled releaser thread or a coarse clock can break either way. `run_times_execute_alone_on_a_thread_with_a_sink` bounded two 100 us executes at 2 ms, which a preempted thread exceeds.
+
+**How to use.** Nothing to change.
+
+**Semantics.**
+- The torn-read test no longer counts successful reads; it asserts every read that succeeds is whole. A new test stops a publish after each of 0 to 5 fields and asserts the read returns nothing, then the whole new value once the publish ends.
+- The wait test orders events: the releaser sets the flag only after the waiter has checked 1,000 times (through its spins, yields and parks), and the waiter must return with the flag set and at least 1,000 checks made.
+- The run-time test uses 40 ms finalizers and bounds the longest timed execute at 20 ms, half a finalizer: a timed finalizer breaks it, a preempted execute does not. Count 2 and a sum of at least 200 us are kept.
+
+**Tests.** The three tests above. A wait that returned before the flag was set or after fewer than 1,000 checks, or a service-time timer that included the finalizer, fails them.
+
 ## `AsyncIo` runs where the system refuses io_uring (`euhedral-io`) (2026-11-19)
 
 **What.** On Linux and Android `AsyncIo::open` no longer fails when io_uring is refused. A positional engine (`pread`, `pwrite`, `open`, `rename`, `fstat` and non-blocking socket calls, made by the source's reap frame) takes over, with the same contract. `AsyncIo::backend()` returns `IoBackend::IoUring` or `IoBackend::Positional`, and `AsyncIoOptions::positional_io` forces the fallback.

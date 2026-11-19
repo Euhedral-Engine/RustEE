@@ -266,7 +266,7 @@ fn spinning() -> Box<Spinning> {
     Box::new(Spinning {
         header: crate::frames::FrameHeader::new(1),
         execute: std::time::Duration::from_micros(100),
-        finally: std::time::Duration::from_millis(3),
+        finally: std::time::Duration::from_millis(40),
     })
 }
 
@@ -310,9 +310,10 @@ fn run_times_execute_alone_on_a_thread_with_a_sink() {
     };
     let service_time = snapshot.summary().unwrap();
     assert_eq!(service_time.count, 2);
-    // 100 µs of execute each; the 3 ms finalizers are not in it.
+    // 100 µs of execute each; the 40 ms finalizers are not in it. The bound is half a finalizer: a
+    // timed finalizer breaks it, a preempted execute does not.
     assert!(service_time.sum >= 200_000.0, "{service_time:?}");
-    assert!(service_time.max < 2_000_000.0, "{service_time:?}");
+    assert!(service_time.max < 20_000_000.0, "{service_time:?}");
 }
 
 #[test]
