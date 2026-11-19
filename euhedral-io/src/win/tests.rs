@@ -969,6 +969,87 @@ fn a_pool_job_that_panics_or_is_dropped_still_ends_its_operation() {
 }
 
 #[test]
+fn a_new_socket_of_a_closed_ones_value_that_sits_on_another_port_is_refused() {
+    let h = Harness::new();
+    let sock = h.sim.sock();
+    h.engine.join_port(sock).unwrap();
+    h.engine.forget(sock);
+    h.sim.reuse(sock, true);
+    let error = h.engine.join_port(sock).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+}
+
+#[test]
+fn a_new_file_of_a_closed_ones_value_is_offered_a_ring() {
+    let h = Harness::with(Some(full_probe()), true, MAX_PIECE);
+    let file = h.sim.file(&content(100));
+    // The old file joined the port, and closed.
+    h.engine.join_port(file).unwrap();
+    h.engine.forget(file);
+    h.sim.reuse(file, false);
+    h.read(file, 0, 10, 1).unwrap();
+    assert_eq!(ended(h.one()).result.unwrap(), 10);
+    assert_eq!(h.sim.rings_made(), 1, "a new file is not kept off a ring");
+}
+
+#[test]
+fn a_socket_the_engine_makes_of_a_closed_ones_value_is_not_taken_for_it() {
+    let h = Harness::new();
+    let old = h.sim.sock();
+    h.engine.join_port(old).unwrap();
+    // It closes, and the system gives its value to the engine's new socket, which sits on another port.
+    h.sim.reuse(old, true);
+    h.sim.mint_next(old);
+    let to = std::net::SocketAddr::from(([127, 0, 0, 1], 80));
+    let new = h.engine.new_socket(to).unwrap();
+    assert_eq!(new, old);
+    let error = h.engine.join_port(new).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+}
+
+#[test]
+fn an_accepted_socket_of_a_closed_ones_value_is_not_taken_for_it() {
+    let h = Harness::new();
+    let old = h.sim.sock();
+    h.engine.join_port(old).unwrap();
+    let listener = h.sim.sock();
+    h.sim.reuse(old, true);
+    h.sim.mint_next(old);
+    h.submit(Request::Accept { listener }, IoBuf::default(), raw_then(1))
+        .unwrap();
+    let accepted = h.one().raw.unwrap().unwrap();
+    assert_eq!(accepted, old);
+    let error = h.engine.join_port(accepted).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+}
+
+#[test]
+fn a_file_the_engine_opens_of_a_closed_ones_value_is_offered_a_ring() {
+    let h = Harness::with(Some(full_probe()), true, MAX_PIECE);
+    let old = h.sim.file(&content(100));
+    // The old file joined the port, and closed; the system gives its value to the engine's open.
+    h.engine.join_port(old).unwrap();
+    h.sim.reuse(old, false);
+    h.sim.mint_next(old);
+    let path = Path::new("scratch").join("reused");
+    h.sim.put_file(&path, &content(100));
+    h.submit(
+        Request::Open {
+            path,
+            spec: OpenSpec::default(),
+        },
+        IoBuf::default(),
+        raw_then(1),
+    )
+    .unwrap();
+    let file = h.one().raw.unwrap().unwrap();
+    assert_eq!(file, old);
+    h.read(file, 0, 10, 2).unwrap();
+    assert_eq!(ended(h.one()).result.unwrap(), 10);
+    assert_eq!(h.sim.rings_made(), 1, "a new file is not kept off a ring");
+}
+
+#[test]
 fn a_handle_that_belongs_to_another_port_is_refused() {
     let h = Harness::new();
     let file = h.sim.file(&content(100));

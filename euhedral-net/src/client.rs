@@ -182,6 +182,9 @@ fn raw_of(socket: &OwnedSock) -> RawSock {
 impl Call {
     /// Ends the call: the socket closes, `then` runs and the frame it returns goes to the sink.
     fn deliver(&mut self, result: Result<Response, NetError>) {
+        if let (Some(socket), Some(io)) = (&self.socket, self.io.upgrade()) {
+            io.forget_socket(raw_of(socket));
+        }
         self.socket = None;
         if let Some(then) = self.then.take() {
             let _ = self.sink.offer(then(result));

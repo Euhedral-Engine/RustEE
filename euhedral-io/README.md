@@ -125,12 +125,19 @@ assert_eq!(io.backend(), IoBackend::Positional);
   that operations wait for (sockets, accept, pipes), and attempts only the ones it reports ready; a socket that is
   not ready costs that one shared call and no attempt of its own. An attempt is one piece of a read or write
   (`pread`, `pwrite`, at most 256 KiB), one non-blocking socket call, or the whole of an open, a rename or a length
-  (`fstat`). A visit makes at most 64 attempts, and every attempt counts against that.
+  (`fstat`). A visit makes at most 64 attempts, and every attempt counts against that. An operation that is the only
+  one due in a visit (the others wait for a descriptor that is not ready, back off or were cancelled) goes on until
+  the 64 are used, so a lone long read moves up to 16 MiB a visit; with two or more due, each moves at most 4 pieces
+  in a row.
 - **Streams.** A pipe, tty or character device cannot be read at an offset (`ESPIPE`): such an operation goes on as
   a stream, waits for readiness and then uses `read` or `write`; the offset is ignored.
 - **Opening a FIFO** never holds the worker: the open is made with `O_NONBLOCK` and the flag is cleared on the
   descriptor that comes back. A write open with no reader (`ENXIO`) stays in the line and is retried at later visits,
-  so a limit or a cancel still ends it. `open_path` therefore never waits for the other end of a FIFO.
+  so a limit or a cancel still ends it, with growing gaps (1, 2, 4 ... 64 visits) between attempts, since nothing
+  signals that a reader appeared. `open_path` therefore never waits for the other end of a FIFO.
+- **A leased file** (`F_SETLEASE` held by another process) makes the non-blocking open fail with `EWOULDBLOCK`. For a
+  caller that did not ask for `O_NONBLOCK` the open is retried with the same gaps until the lease breaks (45 s by
+  default), as a blocking open would wait; a limit shorter than that ends it with `LimitPassed`.
 - **What it costs.** There is no kernel queue: the calls run on the worker that reaps, one reap at a time, so a
   file operation holds a worker for the length of its piece, and path calls (`open_path`, `rename`) for as long
   as the file system takes. It is a correct fallback, not a fast one.
@@ -148,6 +155,16 @@ assert_eq!(io.backend(), IoBackend::Positional);
 - **Dropping** an `AsyncIo` with operations in flight frees their buffers and runs no continuation: nothing
   is in a kernel that could still write them (the io_uring engine leaks them instead).
 - `AsyncIoOptions::positional_io` forces the fallback where io_uring works; the other options do not apply to it.
+
+### Closing handles on Windows
+
+The Windows engine remembers which handle values it joined to its completion port, and the system gives a closed
+handle's value to the next handle made. Sockets and files the engine makes itself (`socket_for`, accepted sockets,
+`open_path`) need nothing. For a socket or file you made, call `io.forget_socket(raw)` or `io.forget_file(raw)` before
+you close it, with nothing in flight on it (both do nothing elsewhere). A handle forgotten while it is still open is
+refused by the system at its next join and no longer taken for ours: every later operation on it fails with
+`InvalidInput` ("belongs to another completion port"); none hangs. A handle one `AsyncIo` made and a different
+`AsyncIo` uses counts as caller-made for that other one: forget it there before closing it.
 
 ### Time limits and cancel
 
