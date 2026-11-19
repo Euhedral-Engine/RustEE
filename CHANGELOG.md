@@ -3,6 +3,18 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## A lake dropped by a frame takes its lifecycle lock off the hot scope (`euhedral-graph`) (2026-11-19)
+
+**What.** `Drop for Lake` suspends the hot scopes of its thread before it takes the attached-set lock, as `complete` and `detach` do.
+
+**Why.** The last `Arc<Lake>` can be held by a frame or by its `UnitGuard` and dropped on a lattice worker inside the hot scope. In a debug build that tripped the lifecycle-lock check and aborted the process, now and then at the end of a run. Release builds were not affected.
+
+**How to use.** Nothing to change: a frame may own the last reference to a lake.
+
+**Semantics.** Only the debug check changes; the drop still takes the set, clears the registry cell and lets the set finish.
+
+**Tests.** `tests/lake_drop_cold.rs`: `the_last_reference_to_a_lake_dropped_by_a_frame_takes_no_lock_inside_the_hot_scope` (reports a violation at the drop's lock on the old code; own binary because the hook is process-wide).
+
 ## A replay on a lane that fails after its launch keeps the recording's values in the caller's hold (`euhedral-gpu`) (2026-11-19)
 
 **What.** `Graph::replay_on` on the CUDA backend adds the recording's kept values to the caller's `GraphHold` as soon as the graph launch succeeded. If the join back into the lane then fails (the join event's record, or the lane's wait for it), the device is marked unrecoverable and the private stream and the recording's values are leaked on purpose. The same holds when `LaneFork::finish` fails to join a private stream lent for library work in `submit`, `submit_held` and `submit_marked` (`submit_held` also leaks what its hold took).
