@@ -18,6 +18,7 @@ semantics and the tests that pin it.
 - Nothing changes for a quantum that is not killed.
 
 **Tests.** `completions.rs`: a killed unordered entry, a killed timer and a killed marker whose conditions never come end at the next reap and `pending` drops. `stage_graph.rs`: a killed quantum with a marker-only stage queued runs no `abandoned` hook until the marker is reached; a killed quantum whose stage returned a host completion with no marker runs none until it is ready (ordered and unordered: only the ordered half fails on the old code, the unordered one passes there); the existing kill tests also make the host completions ready before the hooks. These fail on the old code.
+
 ## The credit-graph timing checks are opt-in (`euhedral-graph` tests) (2026-11-19)
 
 **What.** `euhedral-graph/tests/credit_graph.rs` prints the number of frame callbacks over 200 µs and the shutdown time, and asserts them only when `EUHEDRAL_TEST_TIMING` is set. Every functional check stays asserted.

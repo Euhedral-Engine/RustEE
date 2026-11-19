@@ -649,9 +649,9 @@ impl Completions {
     /// is the choice an I/O ring makes for its in-flight buffers. Wherever a frame's resources
     /// could be released while the device may still use them, they are not.
     ///
-    /// That is for a frame without a kill switch: a frame whose kill switch is set ends at the next visit of the
-    /// source, before its marker is reached, whatever it waits on. A consumer whose frame stands for work that may
-    /// still use what it holds registers a frame with no kill switch, or keeps the hold itself.
+    /// A frame whose kill switch is set is ended by the reap before its marker is reached (see
+    /// [`after_marker`](Self::after_marker)). A consumer whose frame stands for work that may still use what it holds
+    /// registers a frame with no kill switch, or keeps the hold itself.
     fn cancel(&self, what: Waits) {
         let unreached = match &what {
             Waits::Marker(marker, _) => !self.reached(*marker),

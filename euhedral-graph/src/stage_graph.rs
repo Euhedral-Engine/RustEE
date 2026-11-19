@@ -3097,7 +3097,7 @@ struct GraphFrame<Q, L: DeviceQueue + ?Sized> {
     /// A completion's: the marker of its stage's work, which holds the quantum live if a kill ends the completion
     /// before it is reached.
     holds: Option<Marker>,
-    /// A completion's: where its host completion goes if a kill ends the entry before it is ready.
+    /// A completion's: the slot its host completion is kept and polled in.
     host: Arc<HostBack>,
     pool: Weak<Producer<Box<GraphFrame<Q, L>>, Multi>>,
 }
