@@ -3,6 +3,23 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## `AsyncIo` runs where the system refuses io_uring (`euhedral-io`) (2026-11-19)
+
+**What.** On Linux and Android `AsyncIo::open` no longer fails when io_uring is refused. A positional engine (`pread`, `pwrite`, `open`, `rename`, `fstat` and non-blocking socket calls, made by the source's reap frame) takes over, with the same contract. `AsyncIo::backend()` returns `IoBackend::IoUring` or `IoBackend::Positional`, and `AsyncIoOptions::positional_io` forces the fallback.
+
+**Why.** Docker's and Podman's default seccomp profile, Kubernetes `RuntimeDefault`, `kernel.io_uring_disabled` and gVisor refuse `io_uring_setup`, and a program that did its file I/O through `AsyncIo` stopped at startup with "Operation not permitted". Only `--security-opt seccomp=unconfined` made it start.
+
+**How to use.** Nothing to change: `AsyncIo::open()` picks the engine. `io.backend()` says which one it picked; `AsyncIo::open_with_options(AsyncIoOptions { positional_io: true, ..AsyncIoOptions::default() })` forces the fallback on a machine where io_uring works. `AsyncIoOptions` has a new field, so code that builds it with a struct literal adds `..AsyncIoOptions::default()`.
+
+**Semantics.**
+- The fallback is chosen when the first ring's setup fails with `EPERM`, `EACCES` or `ENOSYS`. Any other error fails the open as before.
+- It owns no thread and waits for nothing. A submission queues the operation; the reap frame takes one step of each operation per visit (one piece of at most 256 KiB of a read, write or send, one non-blocking attempt of a socket call, or a whole open, rename or length), at most 64 steps a visit, and hands the ended ones on in the order they ended. One reap runs at a time, so its file calls run one after another on the reaping worker.
+- Every operation of the io_uring engine is offered: reads (into a `Vec` or caller memory), writes, sends, receives, accept, connect, datagrams, `open_path`, `open_file`, `rename`, `file_len`, time limits and `cancel`. Short reads and writes go on with the rest; a read that finds no bytes is `UnexpectedEof`; a write that moves nothing is `WriteZero`; a limit or cancel is looked at before each step. A connect makes a blocking socket non-blocking for its handshake and restores its flags when it ends.
+- Dropping an `AsyncIo` with operations in flight frees their buffers and runs no continuation (the io_uring engine leaks them, as the kernel may still write them).
+- The io_uring engine and the Windows engines are unchanged.
+
+**Tests.** The file and socket tests of the engine module run once on io_uring and once on the positional engine (`on_io_uring`, `on_positional`); the short read, write and send tests and the send that a closed peer stops run on both. `linux.rs`: a setup refused with `EPERM`, `EACCES` or `ENOSYS` selects the fallback and `backend()` reports it, any other error fails the open, the option forces it without trying io_uring (these fail on the old code, which has neither the fallback nor the accessor). Fallback only: a refused read, a cancel and a limit of an idle receive, drop with operations in flight, and a connect that restores a blocking socket's flags.
+
 ## A replay on a lane that fails after its launch keeps the recording's values in the caller's hold (`euhedral-gpu`) (2026-11-19)
 
 **What.** `Graph::replay_on` on the CUDA backend adds the recording's kept values to the caller's `GraphHold` as soon as the graph launch succeeded. If the join back into the lane then fails (the join event's record, or the lane's wait for it), the device is marked unrecoverable and the private stream and the recording's values are leaked on purpose. The same holds when `LaneFork::finish` fails to join a private stream lent for library work in `submit`, `submit_held` and `submit_marked` (`submit_held` also leaks what its hold took).

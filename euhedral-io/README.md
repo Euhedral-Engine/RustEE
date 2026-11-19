@@ -22,6 +22,7 @@ from there. Like the rest of the control plane it owns no thread and nothing in 
 | `RawFile`, `RawSock`, `OwnedFile`, `OwnedSock` | The handle aliases of the platform. |
 | `Continuation` | What turns a completed operation's result into the next frame. |
 | [`uring`](src/uring.rs) | The io_uring engine, on Linux and Android. |
+| [`positional`](src/positional.rs) | The fallback engine, on Linux and Android, for a system that refuses io_uring. |
 | [`win`](src/win/mod.rs) | The Windows engines: IoRing and completion ports. |
 
 Feature `async-io` (default) builds all of it; without it, or on macOS (no engine yet), the crate is empty.
@@ -74,7 +75,7 @@ The memory comes back whether the read succeeded or failed, and `then` always ru
 is leaked (never dropped) and `result` is the ring's failure. The region is cut into pieces
 internally, each landing at its own offset. `read` stays as it was, for a `Vec`-backed `IoBuf`.
 
-- **Linux and Android:** io_uring, with one ring per submitting thread. An operation belongs to the
+- **Linux and Android:** io_uring (or the positional fallback, below), with one ring per submitting thread. An operation belongs to the
   thread that submitted it, and lattice workers live as long as the lattice.
 - **Windows:** one I/O completion port per `AsyncIo`, polled with a zero timeout, for every
   operation, and one IoRing per submitting thread for file reads and writes where the OS has a
@@ -89,6 +90,51 @@ internally, each landing at its own offset. `read` stays as it was, for a `Vec`-
   that extends a file is synchronous on NTFS. Tested on a real Windows by
   [CI](../.github/workflows/windows.yml) on every push to the `graph` branch.
 - **macOS:** no engine yet.
+
+### The fallback where io_uring is refused
+
+A container or sandbox may refuse io_uring: Docker's and Podman's default seccomp profile, Kubernetes `RuntimeDefault`,
+`kernel.io_uring_disabled`, gVisor. `AsyncIo::open` then does not fail: when the first ring's setup is refused with
+`EPERM`, `EACCES` or `ENOSYS` (and only those: any other error still fails the open), it runs on the
+positional engine, and `backend()` says which engine it got. The contract is the same: continuations, short reads and
+writes resubmitted for the rest, refusals delivered to the continuation, time limits and cancel, `pending`, and the
+same counters.
+
+```
+# #[cfg(any(target_os = "linux", target_os = "android"))]
+# {
+use euhedral_io::{AsyncIo, AsyncIoOptions, IoBackend};
+
+// Where io_uring works this is `IoUring`; where the system refuses it, `Positional`.
+let io = AsyncIo::open().unwrap();
+println!("asynchronous I/O runs on {:?}", io.backend());
+
+// Choose the fallback on purpose (tests, or a deployment that wants it everywhere).
+let io = AsyncIo::open_with_options(AsyncIoOptions {
+    positional_io: true,
+    ..AsyncIoOptions::default()
+})
+.unwrap();
+assert_eq!(io.backend(), IoBackend::Positional);
+# }
+```
+
+- **No thread, no wait.** The fallback is an engine under the same `AsyncIo` source. A submission queues the
+  operation; the reap frame (the work a worker does for the source, see above) takes one step of each operation in
+  flight per visit and hands the ended ones on. A step is one piece of a read or write (`pread`, `pwrite`, at most 256 KiB), one
+  non-blocking attempt of a socket call (`MSG_DONTWAIT`, or `poll(2)` with no timeout), or the whole of an open,
+  a rename or a length (`fstat`). A visit takes at most 64 steps. A socket that is not ready costs a step and no wait.
+- **What it costs.** There is no kernel queue: the calls run on the worker that reaps, one reap at a time, so a
+  file operation holds a worker for the length of its piece, and path calls (`open_path`, `rename`) for as long
+  as the file system takes. It is a correct fallback, not a fast one.
+- **Everything the io_uring engine offers is offered:** reads (into a `Vec` or caller memory), writes, sends,
+  receives, accept, connect, datagrams, `open_path`, `open_file`, `rename`, `file_len`, and `send_with`, `recv_with`,
+  `accept_with`, `connect_with` with limits and `cancel`. A limit or cancel is looked at before every step, so it ends
+  an operation that waits for a socket and one between two pieces. A connect makes a blocking socket non-blocking for its
+  handshake and puts its flags back when it ends.
+- **Dropping** an `AsyncIo` with operations in flight frees their buffers and runs no continuation: nothing
+  is in a kernel that could still write them (the io_uring engine leaks them instead).
+- `AsyncIoOptions::positional_io` forces the fallback where io_uring works; the other options do not apply to it.
 
 ### Time limits and cancel
 

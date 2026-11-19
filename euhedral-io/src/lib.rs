@@ -8,6 +8,7 @@
 //! | Platform | Engine | Module |
 //! |---|---|---|
 //! | Linux, Android | io_uring | `uring` |
+//! | Linux, Android, where the system refuses io_uring | positional calls (`pread`, `pwrite`, ...) made by the reap frame | `positional` |
 //! | Windows | IoRing for file reads and writes where the OS has a kernel ring, I/O completion ports for everything else | `win` |
 //!
 //! The feature `async-io` (default) builds the crate's contents; without it, or on a platform with no
@@ -59,7 +60,15 @@ macro_rules! lock {
 pub type Continuation<T> = Box<dyn FnOnce(T) -> Box<dyn Frame> + Send>;
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
+mod linux;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod positional;
+#[cfg(any(target_os = "linux", target_os = "android"))]
 mod uring;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use linux::IoBackend;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use linux::Platform;
 // Windows runs the engine; every other platform compiles it for its simulated tests.
 #[cfg(any(windows, test))]
 mod win;
@@ -351,12 +360,17 @@ pub struct AsyncIoOptions {
     /// On Windows, use IoRing for file reads and writes where the OS has a kernel ring (Windows 11 22H2 and
     /// later, which has file reads and writes); `false` forces completion ports everywhere. Ignored on other platforms.
     pub windows_ioring: bool,
+    /// On Linux and Android, run on the positional engine (`pread`, `pwrite` and the like, made by the reap
+    /// frame) even where io_uring works. Without it, the positional engine is used only where the system
+    /// refuses io_uring. Ignored on other platforms.
+    pub positional_io: bool,
 }
 
 impl Default for AsyncIoOptions {
     fn default() -> Self {
         Self {
             windows_ioring: true,
+            positional_io: false,
         }
     }
 }
@@ -635,8 +649,6 @@ pub(crate) trait Engine: Send + Sync {
     fn poll(&self, room: &mut dyn FnMut() -> bool, offer: &mut dyn FnMut(Box<dyn Frame>) -> bool);
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
-type Platform = uring::Uring;
 #[cfg(windows)]
 type Platform = win::Engine;
 
@@ -644,7 +656,9 @@ type Platform = win::Engine;
 /// completion is the frame its continuation builds, emitted when the lattice's workers poll this
 /// source.
 ///
-/// The engine is io_uring on Linux and Android. On Windows it is IoRing for file reads and writes
+/// The engine is io_uring on Linux and Android, or, where the system refuses io_uring (or
+/// [`AsyncIoOptions::positional_io`] asks for it), positional calls made by the reap frame (see
+/// [`backend`](AsyncIo::backend)). On Windows it is IoRing for file reads and writes
 /// where the OS has a kernel ring, and I/O completion ports for everything else (sockets, accept,
 /// connect, and files without a ring); open and rename run on the OS thread pool, the one place
 /// this crate uses threads it did not create, and post their result to the completion port. Every
