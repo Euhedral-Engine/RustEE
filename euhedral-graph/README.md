@@ -336,6 +336,15 @@ RustEE's: to have every quantum retire, stop starting quanta and complete `Compl
 (Retiring such a quantum in place instead would end its retirement frame on a refusing sink, which recurses down a chain
 of quanta that hold each other.)
 
+**Lanes at drop.** A graph lets go of the runtime's lanes before it drops its stages. The graph's shared state drops its
+`GraphRuntime` (and with it the `Arc<LanePool>`) before its stages, and each run drops its retried stages' wake-ups (which
+hold the pool) before its reference to that state. Once a stage's own state has been dropped, the graph and its runs hold
+none of the runtime's lanes, so an owner may take the drop of a token a stage carries to mean the graph is done with the
+lanes and start tearing them down, on whichever thread dropped it. This is the declaration order of those structs and
+nothing else: there is no notification. It covers the graph's own references only: a `GraphRuntime` clone someone else
+holds, and a completion the runtime still has in flight for a quantum (it holds the pool until it is polled), are not the
+graph's.
+
 Quanta are **pooled**. `start` takes a retired quantum's state from a bounded pool and `retire` gives it back,
 as the graph's frames go back to theirs, so after warm-up a quantum allocates nothing and takes no lock of its own. (A stage
 that returns a host completion allocates it, and a completion that waits for both a marker and a host completion

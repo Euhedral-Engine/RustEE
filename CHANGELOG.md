@@ -3,6 +3,20 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## A stage graph and its runs let go of the lanes before they drop their stages (`euhedral-graph`) (2026-11-19)
+
+**What.** When the last of a `StageGraph` handle and its runs drops, the graph's shared state drops its `GraphRuntime` (the lane pool) before the stages, and each run drops its retry wake-ups (each holds the pool) before its reference to that state. Nothing else changes: no stage runs, retires or is abandoned differently.
+
+**Why.** The stages dropped first and the pool references after, on the same thread. An owner that took the drop of a token held by a stage as the sign that the graph no longer holds the lanes, and started tearing the lanes down on another frame, raced that tail: the lanes could still be held, and their streams (and the device) ended up destroyed on whichever worker dropped the last run.
+
+**How to use.** Nothing to call. A stage may carry a token whose drop tells the owner the graph holds no lane; the owner may then tear the lanes down once its own references are gone.
+
+**Semantics.**
+- `Core` declares `runtime` first and `Run` declares `retry_wakes` before `core`; both carry a comment that the order is a guarantee. Dropping needs no code, so no lock or allocation is added.
+- Once a stage's own state has dropped, the graph and its runs hold none of the runtime's lanes. A `GraphRuntime` clone held elsewhere, and a completion the runtime still has in flight (it holds the pool until it is polled), are not the graph's and are not covered.
+
+**Tests.** `stage_graph.rs`: `a_dropped_graph_holds_no_lane_once_its_stage_state_drops`, `the_last_run_dropping_on_a_worker_holds_no_lane_once_the_stage_state_drops` and `a_run_with_a_retry_wake_armed_holds_no_lane_once_the_stage_state_drops` (a stage's token reads the pool's strong count as it drops; all three fail on the old order).
+
 ## A replay on a lane that fails after its launch keeps the recording's values in the caller's hold (`euhedral-gpu`) (2026-11-19)
 
 **What.** `Graph::replay_on` on the CUDA backend adds the recording's kept values to the caller's `GraphHold` as soon as the graph launch succeeded. If the join back into the lane then fails (the join event's record, or the lane's wait for it), the device is marked unrecoverable and the private stream and the recording's values are leaked on purpose. The same holds when `LaneFork::finish` fails to join a private stream lent for library work in `submit`, `submit_held` and `submit_marked` (`submit_held` also leaks what its hold took).
