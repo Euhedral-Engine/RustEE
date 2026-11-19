@@ -975,10 +975,10 @@ fn a_pull_pushes_nothing_and_leaves_the_banked_demand_to_the_next_request() {
     let keep = Arc::new(Keep::default());
     source.clone().add_downstream(keep.clone());
     let seen: Arc<std::sync::Mutex<Vec<MoveDone>>> = Arc::default();
-    // Demand for two is banked while nothing is done; the moves finish after.
-    source.request(2);
+    // Demand for one is banked while nothing is done; the moves finish after.
+    source.request(1);
     keep.run();
-    for _ in 0..3 {
+    for _ in 0..4 {
         moved(&r, o, &seen);
     }
     settle(&r.mover);
@@ -994,7 +994,8 @@ fn a_pull_pushes_nothing_and_leaves_the_banked_demand_to_the_next_request() {
         0,
         "it hands out to its consumer"
     );
-    // The bank is untouched by the pull: a request that adds one finds three asked for, two completions left.
+    // One banked, one more asked, so exactly two are pushed. A pull that took its hand-out from the bank would push
+    // one; one that banked its demand would push three.
     source.request(1);
     keep.run();
     assert_eq!(seen.lock().unwrap().len(), 2);

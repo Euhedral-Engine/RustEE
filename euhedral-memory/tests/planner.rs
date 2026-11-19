@@ -763,12 +763,20 @@ fn a_pull_pushes_nothing_and_leaves_the_banked_demand_to_the_next_request() {
     use std::sync::Arc;
     let keep = Arc::new(Keep::default());
     let k = keep.clone();
-    // Demand for two is banked while nothing is queued; the orders come after.
+    // Demand for one is banked while nothing is queued; the orders come after.
     let (p, _got, _held) = three_orders(move |p| {
         let source = p.give_backs();
         source.clone().add_downstream(k);
-        source.request(2);
+        source.request(1);
     });
+    // A fourth order, so that more are queued than the bank and the pull's hand-out together ask for.
+    let dev = p.location(LocationKind::Device { ordinal: 0 }).unwrap();
+    let extra = p.open_owner(OwnerSpec::new("extra", Priority(100), Scope::Plan(2)));
+    assert!(matches!(
+        p.claim_or_reclaim(extra, dev, 10 * GIB, "w"),
+        ClaimResult::Reclaiming(_)
+    ));
+    assert_eq!(p.orders_pending(), 4);
     let source = p.give_backs();
     let mut none = |_: Box<dyn euhedral_core::frames::Frame>| panic!("no demand of its own");
     assert_eq!(source.pull(&mut none, &mut |_| false, 0), 0);
@@ -784,10 +792,12 @@ fn a_pull_pushes_nothing_and_leaves_the_banked_demand_to_the_next_request() {
         0,
         "it hands out to its consumer"
     );
-    // The bank is untouched by the pull: a request that adds one finds three asked for, two orders left.
+    assert_eq!(p.orders_pending(), 3);
+    // The bank is the one asked for by requests alone: one banked, one more asked, so exactly two are pushed. A pull
+    // that took its hand-out from the bank would push one; one that banked its demand would push three.
     source.request(1);
     assert_eq!(keep.frames.lock().unwrap().len(), 2);
-    assert_eq!(p.orders_pending(), 0);
+    assert_eq!(p.orders_pending(), 1);
 }
 
 #[test]
