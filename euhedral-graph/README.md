@@ -320,7 +320,7 @@ marker, none was recorded for it, and no `abandoned` hook of a stage that names 
 a retirement) has no device work to retire and arms no retirement: it concludes in its own last frame (the frame that
 ends its last stage, its last host completion or the frame that abandons its stages), or, when its last hold goes
 anywhere else (a dropped `QuantumRef`, a later quantum's stage releasing its pin, a gate failed from outside), in one
-pooled frame; `retire` never runs inside the call that drops a hold (a sink that refuses the frame has it end in place on that thread, where a panic of `retire` is contained). `retire` then receives the
+pooled frame; `retire` never runs inside the call that drops a hold (a sink that refuses the frame has it end in place on that thread, where a panic of `retire` is contained and counted: see "Frames that end in place"). `retire` then receives the
 quantum and its `QuantumOutcome`: `Completed`, `Failed`, `DeviceFailed` or `Killed`. `live()` counts quanta not
 retired yet.
 
@@ -331,6 +331,16 @@ covered by a retirement as for any quantum, so the quantum retires when the devi
 cannot tell covered work from uncovered: a retirement that could not be armed notes `DeviceFailed`, but when a hook ran
 the cause is claimed already.
 
+**Frames that end in place.** A frame the stage sink refuses (a closed lake or queue source, a full sink) is not lost: a
+stage frame a gate released runs where it was released and every refused frame is finished there, so its count is dropped
+and a quantum retires. Those ends keep a flat stack: the outermost one on a thread drains a list, and one that a `retire`
+or a stage causes meanwhile (a later quantum's state dropping the reference of an earlier one, a stage that releases its
+own gate before it returns) is linked at the head of that list through a field of the frame and ended after the current
+one, newest first, so a chain of 100,000 held references or any number of self-releasing runs costs no deeper stack than
+one and allocates nothing. A panic of a stage run or of an end there is contained (the quantum is failed, or has
+concluded, and its count dropped) and counted: `StageGraph::contained_panics()` is the number since the graph was built,
+for an owner that wants to see it (the payload is dropped; there is no hook).
+
 **A closed `Completions` source.** A quantum that waits for a retirement or a marker registers a frame with the
 `Completions` source. A source that is closed refuses the registration and leaks the frame, as it documents (device work
 may still read what the frame holds, so it is never freed under it): the quantum never retires and `live()` keeps counting
@@ -338,8 +348,6 @@ it, and debug builds panic at the registration (`debug_assert!` in `Completions`
 contained end or into the consumer's drop of a `QuantumRef`. This holds for a quantum started after the close as for one
 in flight, and it is the safety rule that stays. Whether quanta retire at shutdown is the consumer's policy, not
 RustEE's: to have every quantum retire, stop starting quanta and complete `Completions` only after `live() == 0`.
-(Retiring such a quantum in place instead would end its retirement frame on a refusing sink, which recurses down a chain
-of quanta that hold each other.)
 
 **Lanes at drop.** A graph lets go of the runtime's lanes before it drops its stages. The graph's shared state drops its
 `GraphRuntime` (and with it the `Arc<LanePool>`) before its stages, each run drops its retried stages' wake-ups (which
