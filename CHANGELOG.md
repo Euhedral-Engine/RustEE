@@ -18,6 +18,21 @@ semantics and the tests that pin it.
 
 **Tests.** `an_order_enqueued_after_demand_was_banked_is_delivered_by_the_next_request`, `a_stop_matched_order_stays_first_for_its_owner`, `a_completion_finished_after_demand_was_banked_is_delivered_by_the_next_request`, `a_stop_matched_completion_stays_first` and `defer_and_drain_soon_from_another_thread_push_nothing_until_a_request` and the three tests that a `pull` pushes within banked demand (`a_pull_pushes_queued_orders_within_the_demand_a_request_banked_and_banks_none`, `a_pull_pushes_completions_within_the_demand_a_request_banked_and_banks_none`, `a_pull_pushes_the_drain_frame_within_the_demand_a_request_banked`) (fail before), `orders_are_pushed_only_within_the_demand_asked_for` and `completions_are_pushed_only_within_the_demand_asked_for` (guards).
 
+## A quantum retires on a lane it used (`euhedral-graph`) (2026-11-19)
+
+**What.** A `StageGraph` quantum arms its retirement on a lane it used, not always on its run's home lane. With one lane used, that lane; with several, its home lane when it is one of them, else the lowest of them that has control. The other lanes it used join that lane first, as before.
+
+**Why.** A run takes its home lane in turn over the pool. A quantum whose stages all ran on another lane retired behind whatever unrelated work sat on its home lane: a short query beside long documents waited for the documents' device work although its own finished in milliseconds.
+
+**How to use.** Nothing changes for callers; no new option.
+
+**Semantics.**
+- Every lane the quantum used is still joined before `retire` and the `retired` hooks run, and a killed quantum still holds for every host completion and the latest marker of each lane it used.
+- The home lane is still the retire lane when a stage that never submitted names a lane (its `abandoned` hook may enqueue on home, which the retirement must cover), and when the quantum used it. It stays the lane roots continue and the lane `abandoned` receives; a quantum that used no lane arms no retirement unless such a hook ran (the lane-less conclusion of 2026-11-05 is unchanged).
+- With several lanes used and none of them home, the lowest with control is chosen: any lane is correct, because the others are joined on the device.
+
+**Tests.** `stage_graph.rs`: `a_quantum_retires_on_a_lane_it_used_not_behind_work_on_its_home_lane` (fails on the old code: the retirement was armed on the held home lane) and `a_quantum_that_used_two_lanes_retires_after_joining_both`.
+
 ## `Completions::lateness_us` measures from when a wait could first have been seen done (`euhedral-graph`) (2026-11-19)
 
 **What.** A wait claimed by a lane's retirement (`after_retired`) is measured from the instant the callback arrived (`RetireCell::arrive` stamps it), not from the registration or the last look. A timer was already measured from its deadline. A marker, a `Ready`, a `Wake` and a `Pending` keep the last look.
