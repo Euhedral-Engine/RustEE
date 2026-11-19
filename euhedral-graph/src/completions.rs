@@ -323,8 +323,9 @@ struct Out {
     held: VecDeque<Box<dyn Frame>>,
 }
 
-/// A registered operation and when it was last seen in flight (an upper bound on when it completed
-/// is the poll that found it done; its lateness is at most the time since the previous look).
+/// A registered operation and when it was last seen in flight. For an operation polled blind (a marker, a `Ready`, a
+/// `Wake`, a `Pending`) the poll that finds it done measures its lateness from this: at most the time since the
+/// previous look.
 struct Waiting {
     what: Waits,
     last_seen: Instant,
@@ -921,9 +922,15 @@ impl Completions {
     /// interpolated within a bucket of [`Histogram`], so they are within one bucket's width (a
     /// quarter of the value) of the exact ones.
     ///
-    /// A timer's lateness is exact (emission − deadline). Another operation's is an upper bound:
-    /// the time from the last look that found it in flight (or its registration) to the poll that
-    /// found it done.
+    /// Each sample is the time from the earliest instant the source could have seen the wait done to
+    /// the poll that found it done (its emission is queued then):
+    /// - a timer ([`at`](Self::at)): from its deadline. Exact.
+    /// - a lane's retirement ([`after_retired`](Self::after_retired)): from the callback's arrival
+    ///   (the instant [`RetireCell::arrive`] began). Exact, whether the cell rings this source's bell or
+    ///   is polled blind. The wait itself is not counted.
+    /// - a marker, a [`Ready`], a `Wake`, a [`Pending`]: from the last look that found it in flight
+    ///   (its registration if there was none). An upper bound: the completion happened somewhere
+    ///   after that look, and these are polled blind (every 16 to 100 us), so it is at most a window.
     pub fn lateness_us(&self) -> (u64, u64, u64) {
         let h = self.lateness.snapshot();
         let up = |us: f64| us.ceil() as u64;
@@ -1066,7 +1073,9 @@ impl Completions {
                     drop(op);
                     (frame, last_seen)
                 }
-                Waits::Marker(_, frame) | Waits::Retired(_, frame) => (frame, last_seen),
+                Waits::Marker(_, frame) => (frame, last_seen),
+                // The callback's arrival, not the last look: a cell that rings is not polled before it.
+                Waits::Retired(cell, frame) => (frame, cell.arrived_at().unwrap_or(last_seen)),
                 Waits::At(deadline, frame) => (frame, deadline),
                 Waits::Pending(_) => (
                     yielded.take().expect("a pending that is done yielded"),
@@ -1756,6 +1765,95 @@ mod tests {
         assert!(
             p50 >= 5_000 * 3 / 4 && p50 <= max,
             "the median is within a bucket of the one sample: {p50} of {max}"
+        );
+    }
+
+    /// Registers `what` as if it had been registered `age` ago, so a test sets the wait's length without waiting.
+    fn register_aged(completions: &Completions, what: Waits, age: Duration) {
+        completions.pending.fetch_add(1, Ordering::AcqRel);
+        completions.waiting.fetch_add(1, Ordering::AcqRel);
+        let last_seen = Instant::now()
+            .checked_sub(age)
+            .expect("an old enough clock");
+        let queued = completions
+            .incoming
+            .offer(Slot::Waiting(Waiting { what, last_seen }));
+        assert!(queued.is_ok());
+        completions.events.fetch_add(1, Ordering::Release);
+    }
+
+    const LONG_WAIT: Duration = Duration::from_secs(10);
+
+    #[test]
+    fn lateness_of_a_timer_counts_from_its_deadline_not_its_registration() {
+        let completions = bare();
+        let deadline = Instant::now() + Duration::from_millis(5);
+        register_aged(&completions, Waits::At(deadline, tagged(1)), LONG_WAIT);
+        std::thread::sleep(Duration::from_millis(25));
+        assert_eq!(poll(&completions), [1]);
+        let (_, _, max) = completions.lateness_us();
+        assert!(max >= 20_000, "found 20 ms after its deadline: {max}");
+        assert!(
+            max < LONG_WAIT.as_micros() as u64 / 2,
+            "not the wait: {max}"
+        );
+    }
+
+    #[test]
+    fn lateness_of_a_bell_gated_wait_counts_from_the_ring_not_its_registration() {
+        let completions = bare();
+        let cell = Arc::new(RetireCell::new());
+        assert!(cell.ring(&completions.events));
+        register_aged(
+            &completions,
+            Waits::Retired(cell.clone(), tagged(2)),
+            LONG_WAIT,
+        );
+        cell.arrive(0);
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(poll(&completions), [2]);
+        let (_, _, max) = completions.lateness_us();
+        assert!(max >= 20_000, "found 20 ms after the ring: {max}");
+        assert!(
+            max < LONG_WAIT.as_micros() as u64 / 2,
+            "not the wait: {max}"
+        );
+    }
+
+    #[test]
+    fn lateness_of_a_retirement_polled_blind_counts_from_its_arrival_too() {
+        let completions = bare();
+        let cell = Arc::new(RetireCell::new());
+        register_aged(
+            &completions,
+            Waits::Retired(cell.clone(), tagged(3)),
+            LONG_WAIT,
+        );
+        cell.arrive(0);
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(poll(&completions), [3]);
+        let (_, _, max) = completions.lateness_us();
+        assert!(
+            max >= 20_000 && max < LONG_WAIT.as_micros() as u64 / 2,
+            "{max}"
+        );
+    }
+
+    #[test]
+    fn lateness_of_a_polled_condition_counts_from_the_last_look() {
+        let completions = bare();
+        let token = Token::default();
+        register_aged(
+            &completions,
+            Waits::Ready(Box::new(token.clone()), tagged(4)),
+            LONG_WAIT,
+        );
+        token.done.store(true, Ordering::Release);
+        assert_eq!(poll(&completions), [4]);
+        let (_, _, max) = completions.lateness_us();
+        assert!(
+            max >= LONG_WAIT.as_micros() as u64,
+            "an upper bound from the registration, the last look: {max}"
         );
     }
 
