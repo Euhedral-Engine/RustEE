@@ -455,7 +455,6 @@ mod tests {
         let in_slot: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
         let given = AtomicU64::new(0);
         let stop = AtomicBool::new(false);
-        let granted = AtomicU64::new(0);
         let rounds = if cfg!(miri) { 200 } else { 200_000 };
         std::thread::scope(|scope| {
             scope.spawn(|| {
@@ -491,15 +490,35 @@ mod tests {
                                 "the slot was re-recorded under a pin"
                             );
                         }
-                        granted.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             });
         });
-        assert!(
-            granted.load(Ordering::Relaxed) > 0,
-            "some pins were granted"
-        );
+    }
+
+    /// A pin is granted for a marker whose slot nobody is re-recording, and holds the slot against the claimant for as
+    /// long as it is up: the grant the race test above relies on, made without a race.
+    #[test]
+    fn a_pin_on_a_slot_nobody_re_records_is_granted_and_sees_its_marker() {
+        let ring = MarkerRing::new(2);
+        let in_slot = AtomicU64::new(0);
+        let value = ring
+            .mark(
+                || {},
+                |_| {
+                    in_slot.store(ring.claimed(), Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        let pin = ring.pin(value).expect("nobody is re-recording the slot");
+        assert_eq!(in_slot.load(Ordering::SeqCst), value);
+        drop(pin);
+        // Marker 2 takes the other slot; marker 3 re-records marker 1's slot, so marker 1's pin is now refused.
+        ring.mark(|| {}, ok).unwrap();
+        ring.scan(|_| Query::Done);
+        ring.mark(|| {}, ok).unwrap();
+        assert!(ring.pin(value).is_none(), "the slot was re-claimed");
     }
 
     /// Eight threads make markers on a ring of 16 while another scans: every number is handed out once, each slot is

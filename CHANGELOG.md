@@ -3,6 +3,18 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## Three `euhedral-gpu` test defects: a ring pin test, a replay stream count, a panicking marked submission (2026-11-19)
+
+**What.** The fake lane's `submit_marked` gives its reserved marker slot back when the closure panics. The ring's pin race test no longer asserts that the race granted a pin; a single-threaded test pins the grant. The replay-contention device test bounds the streams the lane made by the worker count instead of by the count after warm-up.
+
+**Why.** A panic in the closure left the slot reserved for the fake device's life, so enough panics made every later marker answer `Busy` (the CUDA lane's claim already gives its slot up on drop). The ring test failed on a loaded runner when the scheduler never let a pin through. The device test failed about one run in twenty with one more stream than the warm-up had made: a worker that had not overlapped the others in the warm-up takes its first private stream later, which is the lane working, not a missed take.
+
+**How to use.** Nothing to change.
+
+**Semantics.** A marked submission on the fake lane holds its slot from the reservation until the marker is pushed; an error or a panic before that releases it. No change to the ring, replay or stream code.
+
+**Tests.** `a_panicking_submission_gives_its_marker_slot_back` (fails on the old code: the lane stays `Busy` after two panics); `a_pin_on_a_slot_nobody_re_records_is_granted_and_sees_its_marker` (ring); the replay-contention device test asserts at most one stream per worker (and the recording's) after 1,560 rounds.
+
 ## `AsyncIo` runs where the system refuses io_uring (`euhedral-io`) (2026-11-19)
 
 **What.** On Linux and Android `AsyncIo::open` no longer fails when io_uring is refused. A positional engine (`pread`, `pwrite`, `open`, `rename`, `fstat` and non-blocking socket calls, made by the source's reap frame) takes over, with the same contract. `AsyncIo::backend()` returns `IoBackend::IoUring` or `IoBackend::Positional`, and `AsyncIoOptions::positional_io` forces the fallback.

@@ -192,22 +192,35 @@ impl Lane for FakeQueue {
         self.gpu.alive()?;
         // The refusal comes here, before the work.
         self.gpu.reserve_mark(self.global())?;
-        match f(&mut FakeLaneEnqueue { queue: self }) {
-            Ok(result) => {
-                let value = self.gpu.push_reserved_mark(self.global(), self.lane.0);
-                Ok((result, Marker::new(DeviceQueue::id(self), self.lane, value)))
-            }
-            Err(error) => {
-                self.gpu.cancel_reserved_mark(self.global());
-                Err(error)
-            }
-        }
+        // Given back on an error and on a panic in `f`; kept once the marker is pushed.
+        let mut reservation = Reservation {
+            queue: self,
+            kept: false,
+        };
+        let result = f(&mut FakeLaneEnqueue { queue: self })?;
+        let value = self.gpu.push_reserved_mark(self.global(), self.lane.0);
+        reservation.kept = true;
+        Ok((result, Marker::new(DeviceQueue::id(self), self.lane, value)))
     }
 
     fn mark(&self) -> Result<Marker, GpuError> {
         self.gpu.alive()?;
         let value = self.gpu.push_mark(self.global(), self.lane.0)?;
         Ok(Marker::new(DeviceQueue::id(self), self.lane, value))
+    }
+}
+
+/// A marker slot reserved ahead of the work: given back when dropped unless the marker was pushed.
+struct Reservation<'a> {
+    queue: &'a FakeQueue,
+    kept: bool,
+}
+
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) {
+        if !self.kept {
+            self.queue.gpu.cancel_reserved_mark(self.queue.global());
+        }
     }
 }
 
