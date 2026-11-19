@@ -176,6 +176,27 @@ fn a_failed_submission_gives_its_marker_slot_back() {
     lane.submit_marked(|_| Ok(())).unwrap();
 }
 
+/// A submission whose closure panics gives its marker slot back, as one whose work fails does: more panics than the lane
+/// has marker slots leave its capacity as it was.
+#[test]
+fn a_panicking_submission_gives_its_marker_slot_back() {
+    let gpu = gpu();
+    let lanes = open_with(&gpu, 1, 2);
+    let lane = lanes.pool.lane(LaneId(0)).clone();
+    for _ in 0..3 {
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = lane.submit_marked(|_| -> Result<(), GpuError> { panic!("the work panicked") });
+        }));
+        assert!(panicked.is_err());
+    }
+    lane.mark().unwrap();
+    lane.submit_marked(|_| Ok(())).unwrap();
+    assert!(
+        matches!(lane.submit_marked(|_| Ok(())), Err(GpuError::Busy)),
+        "the lane holds exactly its two markers"
+    );
+}
+
 /// Waits for a retirement cell to be filled: a frame emitted when the callback has run.
 fn after_retired(completions: &Arc<Completions>, cell: &Arc<RetireCell>) {
     completions.after_retired(cell.clone(), Box::new(DummyFrame::INSTANCE));
