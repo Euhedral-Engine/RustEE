@@ -43,6 +43,8 @@ jobs = {}
 
 if yes("any"):
     cmds = ["cargo fmt --all --check", f"cargo clippy {out['args']} --all-targets -- -D warnings", f"cargo test {out['args']}"]
+    if not yes("euhedral_core"):  # the ratchet reads every crate's sources; euhedral-core's own tests ran it otherwise
+        cmds += ["cargo test -p euhedral-core --test hot_fix_ratchet"]
     if yes("euhedral_core"):
         cmds += ["cargo test --release -p euhedral-core --lib -- flow_control::vertex generics:: ingest:: "
                  "flow_control::hot_source utils::stop_watch flow_control::edge control_plane::cache flow_control::views"]

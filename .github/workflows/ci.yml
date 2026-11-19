@@ -156,6 +156,11 @@ jobs:
       - name: Test
         run: cargo test $AFFECTED
 
+      # The ratchet reads every crate's library sources; euhedral-core's tests run it when that crate is affected.
+      - name: Hot-path lock ratchet
+        if: needs.changes.outputs.euhedral_core != 'true'
+        run: cargo test -p euhedral-core --test hot_fix_ratchet
+
       - name: Which ring did the runner offer (euhedral-io on Windows)
         if: runner.os == 'Windows' && needs.changes.outputs.euhedral_io == 'true'
         run: cargo test -p euhedral-io --lib the_machines_ring_is_reported -- --nocapture
