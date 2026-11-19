@@ -18,6 +18,18 @@ semantics and the tests that pin it.
 
 **Tests.** `stage_graph.rs`: `a_quantum_retires_on_a_lane_it_used_not_behind_work_on_its_home_lane` (fails on the old code: the retirement was armed on the held home lane) and `a_quantum_that_used_two_lanes_retires_after_joining_both`.
 
+## `Completions::lateness_us` measures from when a wait could first have been seen done (`euhedral-graph`) (2026-11-19)
+
+**What.** A wait claimed by a lane's retirement (`after_retired`) is measured from the instant the callback arrived (`RetireCell::arrive` stamps it), not from the registration or the last look. A timer was already measured from its deadline. A marker, a `Ready`, a `Wake` and a `Pending` keep the last look.
+
+**Why.** A retirement that rings the source's bell is not polled before it rings, so its last look stayed the registration and the poll that found it done counted the whole wait (a long callback) as lateness: a maximum of 113,546 us for a 110 ms wait, against a true lateness of a few hundred us.
+
+**How to use.** Nothing changes for callers; the numbers from `lateness_us` for such waits drop to the real delay of the poll. `RetireCell::arrive` reads the clock once.
+
+**Semantics.** Each sample is the poll that found the wait done minus: the deadline (timer), the arrival of the callback (retirement, rung or polled blind), the last look that found it in flight or its registration (the polled kinds, an upper bound of at most one blind-poll window). `rearm` clears the stamp.
+
+**Tests.** `lateness_of_a_timer_counts_from_its_deadline_not_its_registration` (a guard: the timer was already exact), `lateness_of_a_bell_gated_wait_counts_from_the_ring_not_its_registration` and `lateness_of_a_retirement_polled_blind_counts_from_its_arrival_too` (fail before), `lateness_of_a_polled_condition_counts_from_the_last_look` (guard).
+
 ## A killed quantum holds for everything it started, and killed waiting entries end at the next visit (`euhedral-graph`) (2026-11-19)
 
 **What.** A killed `StageGraph` quantum runs no `abandoned` hook, and lets go of nothing it holds, until every host completion it started is ready and the latest marker of each lane it used is reached. Before, only a stage that returned a completion held it, and an ordered stage's host completion with no marker held nothing once the kill ended it. In `Completions`, a waiting entry whose frame is killed (unordered, timer, marker, retirement, `Ready`, `Wake`) ends at the next visit of the source as a dead continuation, not only a chain head.
