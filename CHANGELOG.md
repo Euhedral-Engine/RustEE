@@ -3,6 +3,18 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## CI runs the hot-path lock ratchet for every library change (CI) (2026-11-19)
+
+**What.** The workspace job runs `cargo test -p euhedral-core --test hot_fix_ratchet` whenever any crate is affected and `euhedral-core` is not (when it is, `cargo test` already runs it).
+
+**Why.** The ratchet counts `lock!` sites and `HOT-FIX` tags in every crate's library sources, but a change confined to another crate never affects `euhedral-core`, so a new lock site passed the pipeline that added it and turned main red.
+
+**How to use.** Nothing: a change that adds a lock site, or a tag use, fails its own pipeline.
+
+**Semantics.** One extra test binary on pipelines that do not affect `euhedral-core`; the GitLab child pipeline and `ci.yml` do the same.
+
+**Tests.** `scripts/ci/test_gitlab_pipeline.py`: the ratchet step is present when only another crate is affected and absent when `euhedral-core` is. Fails on the old script.
+
 ## A killed quantum holds for everything it started, and killed waiting entries end at the next visit (`euhedral-graph`) (2026-11-19)
 
 **What.** A killed `StageGraph` quantum runs no `abandoned` hook, and lets go of nothing it holds, until every host completion it started is ready and the latest marker of each lane it used is reached. Before, only a stage that returned a completion held it, and an ordered stage's host completion with no marker held nothing once the kill ended it. In `Completions`, a waiting entry whose frame is killed (unordered, timer, marker, retirement, `Ready`, `Wake`) ends at the next visit of the source as a dead continuation, not only a chain head.
