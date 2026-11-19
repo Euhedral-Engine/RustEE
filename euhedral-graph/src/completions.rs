@@ -83,13 +83,18 @@ pub trait Pending: Send {
 /// yields one. Operations of different chains, and unordered ones, are emitted as they are found.
 ///
 /// A head that can never complete holds its chain until the consumer cancels it: nothing here times it out or
-/// releases it. Cancelling is setting the kill switch of the head's frame; the next visit to the head finds it, ends
+/// releases it. Cancelling is setting the kill switch of the frame; the next visit to the entry finds it, ends
 /// it as a dead continuation (handed out, skipped by the executor, its `do_finally` ending what it holds) and
-/// promotes the next entry. A head that panics in its query, or whose marker's pool is gone, ends the same way.
-/// A cancelled head is not queried: its `do_finally` may run before its marker is reached, its retirement arrived or
-/// its `Ready` got ready (the `Ready` is dropped). A consumer whose frame stands for device work that may still use
-/// what it holds keeps that hold itself, past the cancellation: [`StageGraph`](crate::StageGraph) hands it to a wait
-/// for the marker whose frame has no kill switch and no order, so no chain holds it and no cancellation ends it.
+/// promotes the next entry of its chain. This holds for every waiting entry with a frame, chain or not: unordered
+/// entries and timers too, so a cancelled timer an hour out does not occupy the source for the hour. A head that
+/// panics in its query, or whose marker's pool is gone, ends the same way. A cancellation is found by the next visit
+/// of the source (a poll, which a registration or a bell causes): it does not wake the source, and an entry that no
+/// poll visits (one behind a head in a chain) ends when it becomes the head. A [`Pending`] has no frame to cancel.
+/// A cancelled entry is not queried: its `do_finally` may run before its marker is reached, its retirement arrived or
+/// its `Ready` got ready (the `Ready` is dropped, before the frame's `do_finally` runs). A consumer whose frame stands
+/// for work that may still use what it holds keeps that hold itself, past the cancellation: [`StageGraph`](crate::StageGraph)
+/// hands a marker to a wait whose frame has no kill switch and no order, and takes a host completion's `Ready` back
+/// when it is dropped unfinished, to register it again the same way, so no chain holds it and no cancellation ends it.
 ///
 /// A continuation is handed out even if its frame has died (its kill switch is set): the executor then
 /// skips it and runs its `do_finally`, which ends what it holds. So at shutdown
@@ -361,11 +366,12 @@ impl Waits {
         }
     }
 
-    /// Whether the operation is in a chain and its frame was cancelled (its kill switch is set): the consumer's way to
-    /// release a chain whose head can never complete. It ends as found done, so its frame is handed out, skipped by
-    /// the executor, and its `do_finally` ends what it holds; the next of its chain takes its place.
-    fn cancelled_in_chain(&self) -> bool {
-        self.chain().is_some() && self.frame().is_some_and(|frame| !frame.header().is_alive())
+    /// Whether the operation's frame was cancelled (its kill switch is set): the consumer's way to release an entry
+    /// that can never complete, or not for a long time. It ends as found done at the next visit, so its frame is
+    /// handed out, skipped by the executor, and its `do_finally` ends what it holds; in a chain the next entry takes
+    /// its place. A `Pending` has no frame until it yields one: it is never cancelled.
+    fn cancelled(&self) -> bool {
+        self.frame().is_some_and(|frame| !frame.header().is_alive())
     }
 }
 
@@ -654,8 +660,12 @@ impl Completions {
             return;
         }
         match what {
-            Waits::Ready(_, frame)
-            | Waits::Wake(_, frame)
+            Waits::Ready(ready, frame) => {
+                // Dropped first: a `Ready` that hands its work on to the frame's `do_finally` has done so by then.
+                drop(ready);
+                frame.do_finally();
+            }
+            Waits::Wake(_, frame)
             | Waits::Marker(_, frame)
             | Waits::Retired(_, frame)
             | Waits::At(_, frame) => frame.do_finally(),
@@ -968,7 +978,7 @@ impl Completions {
             // can be observed then.
             let mut pool: Option<Option<Arc<LanePool>>> = None;
             let entry = &mut lists.waiting[index];
-            let cancelled = entry.what.cancelled_in_chain();
+            let cancelled = entry.what.cancelled();
             let pool_gone = !cancelled
                 && matches!(entry.what, Waits::Marker(..))
                 && pool.get_or_insert_with(|| self.pool()).is_none();
@@ -1444,6 +1454,20 @@ mod tests {
         })
     }
 
+    fn linked_unordered(
+        tag: u64,
+        ran: &Arc<Mutex<Vec<u64>>>,
+        kill: &Arc<AtomicBool>,
+    ) -> Box<dyn Frame> {
+        let mut header = FrameHeader::with_kill_switch(0, Some(kill.clone()));
+        header.randomize_hash(tag);
+        Box::new(Linked {
+            header,
+            tag,
+            ran: ran.clone(),
+        })
+    }
+
     /// One poll by hand, ending each continuation that comes out.
     fn poll_ending(completions: &Completions) {
         completions.reap();
@@ -1657,6 +1681,54 @@ mod tests {
             "the cancelled head ends (its frame is handed out dead) and the next goes out in the same scan"
         );
         assert_eq!(completions.pending(), 0);
+    }
+
+    #[test]
+    fn a_killed_unordered_entry_and_a_killed_timer_end_at_the_next_reap_though_their_conditions_never_come()
+     {
+        let (completions, rig) = setup();
+        let ran = Arc::new(Mutex::new(Vec::new()));
+        let (kill_ready, kill_timer, kill_marker, kill_kept) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        // None is in a chain: one never ready, one an hour out, one on a marker never reached, one never killed.
+        completions.after(
+            Box::new(Token::default()),
+            linked_unordered(1, &ran, &kill_ready),
+        );
+        completions.at(
+            Instant::now() + Duration::from_secs(3600),
+            linked_unordered(2, &ran, &kill_timer),
+        );
+        completions.after_marker(
+            Marker::new(rig.id, LaneId(0), 99),
+            linked_unordered(3, &ran, &kill_marker),
+        );
+        completions.after(
+            Box::new(Token::default()),
+            linked_unordered(4, &ran, &kill_kept),
+        );
+        poll_ending(&completions);
+        assert!(ran.lock().unwrap().is_empty());
+        assert_eq!(completions.pending(), 4);
+        for kill in [&kill_ready, &kill_timer] {
+            kill.store(true, Ordering::Release);
+        }
+        poll_ending(&completions);
+        assert_eq!(
+            *ran.lock().unwrap(),
+            [1, 2],
+            "the killed ones end as dead continuations at the next reap, the others keep waiting"
+        );
+        assert_eq!(completions.pending(), 2);
+        kill_marker.store(true, Ordering::Release);
+        poll_ending(&completions);
+        assert_eq!(*ran.lock().unwrap(), [1, 2, 3]);
+        assert_eq!(completions.pending(), 1);
+        // The last one is left to the source's drop.
     }
 
     #[test]

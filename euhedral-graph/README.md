@@ -98,7 +98,10 @@ Continuations are emitted in registration order, so frames on one ordered lane k
 registration order and a reap queries only the head of a chain, then the next once the head was found done, up to the first
 not done. A chain's head holds the rest until it completes, fails or is cancelled (its frame's kill switch is set: the head ends as a
 dead continuation and the next takes its place); a head that can never complete holds its chain until the consumer cancels
-it, and nothing times it out. A lane that advances between two queries cannot let a later registration out first, and the
+it, and nothing times it out. A waiting entry of any kind whose frame is cancelled (unordered, a timer, a marker, a
+retirement) ends the same way at the next visit of the source, so a cancelled timer an hour out does not occupy it for the
+hour; the cancellation does not wake the source, and an entry behind a head ends when it becomes the head. A `Ready` of a
+cancelled entry is dropped before the frame's `do_finally` runs. A lane that advances between two queries cannot let a later registration out first, and the
 entries held behind a head cost nothing. Timers are not part of a chain (a scan reads the clock once, so timers cannot be found done out of order,
 and each goes out at its own deadline), and a `Pending` has no frame until it yields one, so its frame goes out when it is
 yielded. Operations of different chains, and unordered ones, are emitted as they are found. A
@@ -296,12 +299,14 @@ runs again when a lane of the pool made progress, or after `GraphRuntime::retry_
 `DEFAULT_RETRY_BACKSTOP`, 20 ms: set it longer than any one pass on your devices). A stage can be
 **ordered** (`StageSpec::ordered`): its frames then run in the order they were published, on one
 lane of the lattice. The graph's **kill switch** goes on every stage frame of a quantum; a killed
-quantum's unrun stages are `abandoned`. A stage's completion (a host completion, or the marker a completion edge waits
-for) holds the quantum live until the stage's device work is reached, also on a kill: an ordered stage's completion is a
-chain entry, which the kill ends at once so its chain goes on, and the quantum's count then passes to one pooled wait for
-the stage's marker (or its completion edge's retirement) that has no kill switch and no chain. So no `abandoned` hook
-runs, and nothing the quantum holds is let go, under that work. A host completion with no marker, on an ordered stage,
-holds nothing once the kill ended it.
+quantum's unrun stages are `abandoned`, once everything it started has ended. A stage's host completion holds the
+quantum live until it is ready, also on a kill: the kill ends the completion's entry in `Completions` at the source's
+next visit (an ordered stage's chain goes on), the entry hands the host completion back, and the quantum's count passes
+to one pooled wait for it with no kill switch and no chain. A killed quantum also waits, before it quiesces, for the
+latest marker of every lane it used, whichever stage submitted it and whether or not the stage returned a completion
+(a completion edge's retirement is waited for too). So no `abandoned` hook runs, and nothing the quantum holds is let
+go, under work that may still use it; a host completion that never gets ready, or a marker a lane never reaches,
+holds the quantum for ever.
 
 A quantum **retires** when none of its frames can run again and every lane it used has reached its
 last marker (its retirement boundary). When the lanes can be controlled (`DeviceQueue::control`, which a backend's
