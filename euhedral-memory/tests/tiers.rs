@@ -851,3 +851,96 @@ fn a_pull_pushes_and_hands_out_no_key_a_request_pushes_it_and_a_key_out_is_never
     );
     assert_eq!(keep.frames.lock().unwrap().len(), 1);
 }
+
+/// A resident of `r` at the fast tier, moved to the middle one, whose completion handler logs into `seen`.
+fn moved(
+    r: &Rig,
+    owner: OwnerId,
+    seen: &Arc<std::sync::Mutex<Vec<MoveDone>>>,
+) -> euhedral_memory::ResidentId {
+    let [a, b, _] = r.locations;
+    let s = seen.clone();
+    let id = r
+        .mover
+        .place(owner, a, SLOT, Arc::new(move |d| s.lock().unwrap().push(d)))
+        .unwrap();
+    r.mover.move_to(id, b).unwrap();
+    id
+}
+
+#[test]
+fn a_completion_finished_after_demand_was_banked_is_delivered_by_the_next_request() {
+    let r = rig([2, 2, 2], 8);
+    let o = r
+        .planner
+        .open_owner(OwnerSpec::new("consumer", Priority(50), Scope::Process));
+    let source = r.mover.moves();
+    let keep = Arc::new(Keep::default());
+    source.clone().add_downstream(keep.clone());
+    // The lattice asked for frames, and nothing was done yet.
+    source.request(8);
+    assert_eq!(keep.frames.lock().unwrap().len(), 0);
+    let seen: Arc<std::sync::Mutex<Vec<MoveDone>>> = Arc::default();
+    moved(&r, o, &seen);
+    // The move finishes on the pump's thread: it only enqueues the completion, it pushes nothing.
+    settle(&r.mover);
+    assert_eq!(
+        keep.frames.lock().unwrap().len(),
+        0,
+        "a finished move pushes nothing"
+    );
+    // The next request that a worker makes delivers it, within the demand banked before and now.
+    source.request(1);
+    keep.run();
+    assert_eq!(seen.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn completions_are_pushed_only_within_the_demand_asked_for() {
+    let r = rig([4, 4, 4], 8);
+    let o = r
+        .planner
+        .open_owner(OwnerSpec::new("consumer", Priority(50), Scope::Process));
+    let source = r.mover.moves();
+    let keep = Arc::new(Keep::default());
+    source.clone().add_downstream(keep.clone());
+    let seen: Arc<std::sync::Mutex<Vec<MoveDone>>> = Arc::default();
+    for _ in 0..3 {
+        moved(&r, o, &seen);
+    }
+    settle(&r.mover);
+    source.request(2);
+    // (A pump frame may come too: it is a control frame, not part of the demand.)
+    keep.run();
+    assert_eq!(seen.lock().unwrap().len(), 2, "two asked for, two pushed");
+    source.request(5);
+    keep.run();
+    assert_eq!(seen.lock().unwrap().len(), 3, "the third, and no more");
+}
+
+#[test]
+fn a_stop_matched_completion_stays_first() {
+    let r = rig([4, 4, 4], 8);
+    let o = r
+        .planner
+        .open_owner(OwnerSpec::new("consumer", Priority(50), Scope::Process));
+    let seen: Arc<std::sync::Mutex<Vec<MoveDone>>> = Arc::default();
+    let first = moved(&r, o, &seen);
+    let second = moved(&r, o, &seen);
+    settle(&r.mover);
+    let source = r.mover.moves();
+    // A worker whose stop refuses the first completion takes none, and it stays at the head.
+    assert_eq!(source.pull(&mut |_| panic!("refused"), &mut |_| true, 8), 0);
+    let mut frames = Vec::new();
+    assert_eq!(source.pull(&mut |f| frames.push(f), &mut |_| false, 8), 2);
+    for mut f in frames {
+        f.execute().unwrap();
+        f.do_finally();
+    }
+    let order: Vec<_> = seen.lock().unwrap().iter().map(|d| d.resident).collect();
+    assert_eq!(
+        order,
+        vec![first, second],
+        "the refused one is not sent to the back"
+    );
+}

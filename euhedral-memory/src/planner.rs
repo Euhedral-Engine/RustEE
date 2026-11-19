@@ -13,7 +13,6 @@ use std::sync::atomic::{
 };
 
 use euhedral_data_structures::queues::{Consumer, MpmcQueue, Multi, Producer};
-use euhedral_data_structures::sync::HotScope;
 
 /// The most locations a planner has (a device or two, pinned and pageable host memory).
 pub const MAX_LOCATIONS: usize = 8;
@@ -731,7 +730,6 @@ impl Planner {
                 let handler = unsafe { (*h).clone() };
                 if self.orders.0.offer((handler, order.clone())).is_ok() {
                     self.orders_pending.fetch_add(1, Ordering::AcqRel);
-                    self.source.wake();
                 }
             }
             self.unpin(OwnerId {
@@ -800,9 +798,12 @@ impl Planner {
         o
     }
 
-    pub(crate) fn requeue_order(&self, o: (GiveBackHandler, GiveBack)) {
-        if self.orders.0.offer(o).is_ok() {
+    /// An order the source holds at its head (refused by a `stop`) still counts as pending.
+    pub(crate) fn hold_count(&self, held: bool) {
+        if held {
             self.orders_pending.fetch_add(1, Ordering::AcqRel);
+        } else {
+            self.orders_pending.fetch_sub(1, Ordering::AcqRel);
         }
     }
 
@@ -1197,23 +1198,32 @@ impl Elastic {
 // Give-back orders as frames
 
 use euhedral_core::frames::{Frame, RunnableFrame};
-use euhedral_core::generics::{LatticeReceiver, LatticeSource};
+use euhedral_core::generics::{LatticeReceiver, LatticeSource, SourceCell};
 
 /// A `LatticeSource` of give-back frames: each order runs its owner's handler on whichever worker the frame is
-/// routed to (ordered per owner: the frame's id hash is the owner's). Nothing polls the planner: an order wakes the
-/// downstream lattice with a push when it has demand.
+/// routed to (ordered per owner: the frame's id hash is the owner's). A claimer only enqueues an order; the next
+/// worker `request` (or `pull`) that enters the source hands it out, so an order waits for the next visit of a worker
+/// to the source and no producer thread pushes.
 pub struct GiveBacks {
     planner: std::sync::Weak<Planner>,
     downstream: std::sync::OnceLock<Arc<dyn LatticeReceiver>>,
-    demand: AtomicU64,
+    /// What only the worker inside the source touches.
+    inside: SourceCell<Inside>,
     complete: AtomicBool,
+}
+
+/// The source's plain state.
+#[derive(Default)]
+struct Inside {
+    /// Frames the lattice asked for and has not been given.
+    demand: u64,
+    /// The order a `stop` refused, kept at the head: the next hand-out starts with it.
+    held: Option<(GiveBackHandler, GiveBack)>,
 }
 
 impl fmt::Debug for GiveBacks {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("GiveBacks")
-            .field("demand", &self.demand.load(Ordering::Acquire))
-            .finish_non_exhaustive()
+        f.debug_struct("GiveBacks").finish_non_exhaustive()
     }
 }
 
@@ -1222,7 +1232,7 @@ impl GiveBacks {
         GiveBacks {
             planner,
             downstream: std::sync::OnceLock::new(),
-            demand: AtomicU64::new(0),
+            inside: SourceCell::new(Inside::default()),
             complete: AtomicBool::new(false),
         }
     }
@@ -1237,9 +1247,11 @@ impl GiveBacks {
         ))
     }
 
-    /// Emits up to `demand` order frames into `consumer`, stopping before one `stop` refuses.
+    /// Emits up to `demand` order frames into `consumer`, in the order they were queued, stopping before one `stop`
+    /// refuses (it stays first).
     fn emit(
         &self,
+        held: &mut Option<(GiveBackHandler, GiveBack)>,
         consumer: &mut dyn FnMut(Box<dyn Frame>),
         stop: &mut dyn FnMut(&dyn Frame) -> bool,
         demand: u64,
@@ -1249,39 +1261,26 @@ impl GiveBacks {
         };
         let mut n = 0;
         while n < demand {
-            let Some((handler, order)) = p.take_order() else {
+            let next = match held.take() {
+                Some(order) => {
+                    p.hold_count(false);
+                    Some(order)
+                }
+                None => p.take_order(),
+            };
+            let Some((handler, order)) = next else {
                 break;
             };
             let frame = Self::frame(handler.clone(), order.clone());
             if stop(&*frame) {
-                p.requeue_order((handler, order));
+                p.hold_count(true);
+                *held = Some((handler, order));
                 break;
             }
             consumer(frame);
             n += 1;
         }
         n
-    }
-
-    /// An order was queued: push it downstream if the lattice asked for frames.
-    // HOT-FIX(S1): a producer pushes to the downstream itself, outside `request`.
-    fn wake(&self) {
-        let _hot = HotScope::enter();
-        let Some(downstream) = self.downstream.get() else {
-            return;
-        };
-        let demand = self.demand.load(Ordering::Acquire);
-        if demand == 0 {
-            return;
-        }
-        let emitted = self.emit(&mut |f| downstream.push(f), &mut |_| false, demand);
-        if emitted > 0 {
-            let _ = self
-                .demand
-                .try_update(Ordering::AcqRel, Ordering::Acquire, |d| {
-                    Some(d.saturating_sub(emitted))
-                });
-        }
     }
 }
 
@@ -1302,15 +1301,31 @@ impl LatticeSource for GiveBacks {
         stop: &mut dyn FnMut(&dyn Frame) -> bool,
         demand: u64,
     ) -> u64 {
-        self.emit(consumer, stop, demand)
+        let Some(mut inside) = self.inside.try_enter() else {
+            return 0;
+        };
+        self.emit(&mut inside.held, consumer, stop, demand)
     }
 
     fn request(&self, demand: u64) {
         if demand == 0 || self.complete.load(Ordering::Acquire) {
             return;
         }
-        self.demand.fetch_add(demand, Ordering::AcqRel);
-        self.wake();
+        let Some(downstream) = self.downstream.get() else {
+            return;
+        };
+        let Some(mut inside) = self.inside.try_enter() else {
+            return;
+        };
+        inside.demand = inside.demand.saturating_add(demand);
+        let wanted = inside.demand;
+        let emitted = self.emit(
+            &mut inside.held,
+            &mut |f| downstream.push(f),
+            &mut |_| false,
+            wanted,
+        );
+        inside.demand -= emitted;
     }
 
     fn complete(&self) {

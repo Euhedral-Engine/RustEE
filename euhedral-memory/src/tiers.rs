@@ -24,9 +24,8 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU16, AtomicU32, AtomicU64, 
 use std::sync::{Arc, OnceLock, Weak};
 
 use euhedral_core::frames::{Frame, FrameError, FrameHeader, RunnableFrame};
-use euhedral_core::generics::{KeyPacing, KeySlot, LatticeReceiver, LatticeSource};
+use euhedral_core::generics::{KeyPacing, KeySlot, LatticeReceiver, LatticeSource, SourceCell};
 use euhedral_data_structures::queues::{Consumer, MpmcQueue, Multi, Producer};
-use euhedral_data_structures::sync::HotScope;
 use euhedral_graph::{DeviceQueue, Marker};
 
 use crate::backend::Retired;
@@ -1031,7 +1030,6 @@ impl Mover {
         }
         if let Some(h) = handler {
             let _ = self.done.0.offer((h, done));
-            self.source.wake();
         }
     }
 
@@ -1205,10 +1203,14 @@ impl Drop for Mover {
 /// no pump to run sees no frame. A pump that finished nothing is followed by a window of time (16 us, doubling to 100 us:
 /// [`KeyPacing`]) in which a visit pushes the frame again only for something new, while the mover only polls (copies in
 /// flight, a resident that could not be brought home); a freed slot, a new move or a find ends the window.
+///
+/// A finished move only enqueues its completion; the next worker `request` (or `pull`) that enters the source hands it
+/// out, so no producer thread pushes.
 pub struct Moves {
     mover: Weak<Mover>,
     downstream: OnceLock<Arc<dyn LatticeReceiver>>,
-    demand: AtomicU64,
+    /// What only the worker inside the source touches.
+    inside: SourceCell<Inside>,
     complete: AtomicBool,
     /// The pump frame, while it is home.
     key: KeySlot<PumpFrame>,
@@ -1292,11 +1294,18 @@ impl Drop for PumpFrame {
     }
 }
 
+/// The source's plain state.
+#[derive(Default)]
+struct Inside {
+    /// Frames the lattice asked for and has not been given.
+    demand: u64,
+    /// The completion a `stop` refused, kept at the head: the next hand-out starts with it.
+    held: Option<(MoveHandler, MoveDone)>,
+}
+
 impl fmt::Debug for Moves {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Moves")
-            .field("demand", &self.demand.load(Ordering::Acquire))
-            .finish_non_exhaustive()
+        f.debug_struct("Moves").finish_non_exhaustive()
     }
 }
 
@@ -1308,7 +1317,7 @@ impl Moves {
             events: AtomicU64::new(0),
             mover,
             downstream: OnceLock::new(),
-            demand: AtomicU64::new(0),
+            inside: SourceCell::new(Inside::default()),
             complete: AtomicBool::new(false),
         }
     }
@@ -1320,8 +1329,11 @@ impl Moves {
         Box::new(RunnableFrame::new(id, Arc::new(move || handler(done))))
     }
 
+    /// Emits up to `demand` completion frames into `consumer`, in the order they finished, stopping before one `stop`
+    /// refuses (it stays first).
     fn emit(
         &self,
+        held: &mut Option<(MoveHandler, MoveDone)>,
         consumer: &mut dyn FnMut(Box<dyn Frame>),
         stop: &mut dyn FnMut(&dyn Frame) -> bool,
         demand: u64,
@@ -1331,48 +1343,18 @@ impl Moves {
         };
         let mut n = 0;
         while n < demand {
-            let Some((handler, done)) = m.take_done() else {
+            let Some((handler, done)) = held.take().or_else(|| m.take_done()) else {
                 break;
             };
             let frame = Self::frame(handler.clone(), done);
             if stop(&*frame) {
-                let _ = m.done.0.offer((handler, done));
+                *held = Some((handler, done));
                 break;
             }
             consumer(frame);
             n += 1;
         }
         n
-    }
-
-    // HOT-FIX(S2): a producer pushes to the downstream itself, outside `request`.
-    fn wake(&self) {
-        let _hot = HotScope::enter();
-        let Some(downstream) = self.downstream.get() else {
-            return;
-        };
-        let demand = self.demand.load(Ordering::Acquire);
-        if demand == 0 {
-            return;
-        }
-        let Some(m) = self.mover.upgrade() else {
-            return;
-        };
-        let mut emitted = 0;
-        while emitted < demand {
-            let Some((handler, done)) = m.take_done() else {
-                break;
-            };
-            downstream.push(Self::frame(handler, done));
-            emitted += 1;
-        }
-        if emitted > 0 {
-            let _ = self
-                .demand
-                .try_update(Ordering::AcqRel, Ordering::Acquire, |d| {
-                    Some(d.saturating_sub(emitted))
-                });
-        }
     }
 
     /// Whether the pump frame is wanted now: the source is not complete, there is a downstream, and a pump is due. A
@@ -1424,15 +1406,30 @@ impl LatticeSource for Moves {
         stop: &mut dyn FnMut(&dyn Frame) -> bool,
         demand: u64,
     ) -> u64 {
-        self.emit(consumer, stop, demand)
+        let Some(mut inside) = self.inside.try_enter() else {
+            return 0;
+        };
+        self.emit(&mut inside.held, consumer, stop, demand)
     }
 
     fn request(&self, demand: u64) {
         if demand == 0 || self.complete.load(Ordering::Acquire) {
             return;
         }
-        self.demand.fetch_add(demand, Ordering::AcqRel);
-        self.wake();
+        let Some(mut inside) = self.inside.try_enter() else {
+            return;
+        };
+        if let Some(downstream) = self.downstream.get() {
+            inside.demand = inside.demand.saturating_add(demand);
+            let wanted = inside.demand;
+            let emitted = self.emit(
+                &mut inside.held,
+                &mut |f| downstream.push(f),
+                &mut |_| false,
+                wanted,
+            );
+            inside.demand -= emitted;
+        }
         self.push_pump();
     }
 

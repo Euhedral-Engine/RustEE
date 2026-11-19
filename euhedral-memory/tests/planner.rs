@@ -635,3 +635,116 @@ fn a_give_back_order_runs_its_handler_only_when_its_frame_executes() {
     }
     assert_eq!(got.lock().unwrap().len(), 1);
 }
+
+/// Two elastic orders to one owner, the first for `GIB` and the second for `2 * GIB` (a claim of 3 GiB less the 1 GiB ordered), with the handler logging them.
+fn two_orders() -> (
+    std::sync::Arc<Planner>,
+    std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
+    euhedral_memory::Elastic,
+) {
+    use std::sync::{Arc, Mutex};
+    let p = two_locations();
+    let dev = p.location(LocationKind::Device { ordinal: 0 }).unwrap();
+    let got: Arc<Mutex<Vec<u64>>> = Arc::default();
+    let g = got.clone();
+    let buffer = p.open_owner(
+        OwnerSpec::new("buffer", Priority(1), Scope::Epoch(1))
+            .on_give_back(Arc::new(move |o| g.lock().unwrap().push(o.bytes))),
+    );
+    let held = p.elastic(buffer, dev, 0, 100 * GIB, "slots").unwrap();
+    let plan = p.open_owner(OwnerSpec::new("plan", Priority(100), Scope::Plan(1)));
+    assert!(matches!(
+        p.claim_or_reclaim(plan, dev, GIB, "x"),
+        ClaimResult::Reclaiming(_)
+    ));
+    assert!(matches!(
+        p.claim_or_reclaim(plan, dev, 3 * GIB, "y"),
+        ClaimResult::Reclaiming(_)
+    ));
+    (p, got, held)
+}
+
+#[test]
+fn an_order_enqueued_after_demand_was_banked_is_delivered_by_the_next_request() {
+    use euhedral_core::generics::LatticeSource;
+    use std::sync::Arc;
+    let p = two_locations();
+    let dev = p.location(LocationKind::Device { ordinal: 0 }).unwrap();
+    let buffer = p.open_owner(
+        OwnerSpec::new("buffer", Priority(1), Scope::Epoch(1)).on_give_back(Arc::new(|_| {})),
+    );
+    let _held = p.elastic(buffer, dev, 0, 100 * GIB, "slots").unwrap();
+    let plan = p.open_owner(OwnerSpec::new("plan", Priority(100), Scope::Plan(1)));
+    let source = p.give_backs();
+    let keep = Arc::new(Keep::default());
+    source.clone().add_downstream(keep.clone());
+    // The lattice asked for frames and found none.
+    source.request(1);
+    assert_eq!(keep.frames.lock().unwrap().len(), 0);
+    // A claim on another thread queues an order: it pushes nothing.
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            assert!(matches!(
+                p.claim_or_reclaim(plan, dev, GIB, "x"),
+                ClaimResult::Reclaiming(_)
+            ));
+        });
+    });
+    assert_eq!(p.orders_pending(), 1);
+    assert_eq!(
+        keep.frames.lock().unwrap().len(),
+        0,
+        "the producer's thread pushed"
+    );
+    // The next request a worker makes delivers it.
+    source.request(1);
+    assert_eq!(keep.frames.lock().unwrap().len(), 1);
+    assert_eq!(p.orders_pending(), 0);
+}
+
+#[test]
+fn orders_are_pushed_only_within_the_demand_asked_for() {
+    use euhedral_core::generics::LatticeSource;
+    use std::sync::Arc;
+    let (p, got, _held) = two_orders();
+    let source = p.give_backs();
+    let keep = Arc::new(Keep::default());
+    source.clone().add_downstream(keep.clone());
+    source.request(1);
+    assert_eq!(keep.frames.lock().unwrap().len(), 1, "one asked for");
+    assert_eq!(p.orders_pending(), 1);
+    source.request(1);
+    assert_eq!(keep.frames.lock().unwrap().len(), 2);
+    source.request(4);
+    assert_eq!(
+        keep.frames.lock().unwrap().len(),
+        2,
+        "nothing more is there"
+    );
+    for mut f in std::mem::take(&mut *keep.frames.lock().unwrap()) {
+        f.execute().unwrap();
+        f.do_finally();
+    }
+    assert_eq!(*got.lock().unwrap(), vec![GIB, 2 * GIB]);
+}
+
+#[test]
+fn a_stop_matched_order_stays_first_for_its_owner() {
+    use euhedral_core::generics::LatticeSource;
+    let (p, got, _held) = two_orders();
+    let source = p.give_backs();
+    assert_eq!(source.pull(&mut |_| panic!("refused"), &mut |_| true, 8), 0);
+    assert_eq!(p.orders_pending(), 2, "the refused order still counts");
+    let mut frames = Vec::new();
+    assert_eq!(source.pull(&mut |f| frames.push(f), &mut |_| false, 8), 2);
+    assert_eq!(p.orders_pending(), 0);
+    for mut f in frames {
+        f.execute().unwrap();
+        f.do_finally();
+    }
+    assert_eq!(
+        *got.lock().unwrap(),
+        vec![GIB, 2 * GIB],
+        "the refused order is not sent to the back"
+    );
+}

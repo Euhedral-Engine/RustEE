@@ -3,6 +3,21 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## Give-back orders, move completions and deferred calls reach the lattice at the next worker `request` (`euhedral-memory`) (2026-11-19)
+
+**What.** `GiveBacks`, `Moves` and `DeferredCalls` no longer push to their downstream from a producer's thread. A claim that orders a give-back, a finished move and a `defer` or `drain_soon` only enqueue (or set a flag); the next `request` (or, for orders and completions, `pull`) a worker makes on the source hands the frames out, within the demand it banked. `DeferredCalls::poll` and `Deferral::poll` are removed: `request` evaluates the conditions. A stop-matched order or completion stays at the head of its source and is the first handed out next time, where it used to be re-queued at the tail. The `HOT-FIX` marks S1 and S2 are gone.
+
+**Why.** A push outside `request`/`pull` ran a source's hand-out on arbitrary threads: two emitters could push more than the demand, and the re-queue at the tail reordered one owner's orders.
+
+**How to use.** Nothing changes for the callers of `claim_or_reclaim`, `Mover` or `Deferral::defer`. An owner that called `Deferral::poll` from a tick drops the call: a lattice worker's `request` does it. Latency: an order, a completion or a drain frame waits for the next visit of a worker to the source (an idle worker asks again on every cycle), not for the next instruction of the thread that produced it. A lattice with no running worker delivers nothing, as before for `pull`. `DeferredCalls::drain` and the out-of-memory retry's direct paths are unchanged, so `drain_soon` is for the thread that must not block and `drain`, `run_through` or `reclaim` for the one that may.
+
+**Semantics.**
+- The source's plain state (banked demand, the held head) lives in a `SourceCell`; a `request` or `pull` that finds the cell entered returns without banking.
+- `request` banks demand and pushes up to it; `pull` hands out at most its own demand and banks nothing.
+- `Planner::orders_pending` still counts an order the source holds at its head.
+
+**Tests.** `an_order_enqueued_after_demand_was_banked_is_delivered_by_the_next_request`, `a_stop_matched_order_stays_first_for_its_owner`, `a_completion_finished_after_demand_was_banked_is_delivered_by_the_next_request`, `a_stop_matched_completion_stays_first` and `defer_and_drain_soon_from_another_thread_push_nothing_until_a_request` (fail before), `orders_are_pushed_only_within_the_demand_asked_for` and `completions_are_pushed_only_within_the_demand_asked_for` (guards).
+
 ## `Completions::lateness_us` measures from when a wait could first have been seen done (`euhedral-graph`) (2026-11-19)
 
 **What.** A wait claimed by a lane's retirement (`after_retired`) is measured from the instant the callback arrived (`RetireCell::arrive` stamps it), not from the registration or the last look. A timer was already measured from its deadline. A marker, a `Ready`, a `Wake` and a `Pending` keep the last look.

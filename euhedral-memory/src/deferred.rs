@@ -24,12 +24,12 @@
 //!   hands out nothing. The owner gives the source a receiver that feeds the lattice that may block
 //!   (`add_downstream`; a queue the lattice already reads is enough) and asks for frames with `request`. A frame drains the whole
 //!   queue.
-//! - **When the frame leaves.** [`DeferredCalls::poll`] (also called by every `defer`) pushes one when calls are queued
-//!   and either the attached lane pool has nothing in flight ([`LanePool::idle`], every lane's last marker reached), or a
+//! - **When the frame leaves.** Only a worker's `request` on the source pushes it, when calls are queued and either the attached lane pool has nothing in flight ([`LanePool::idle`], every lane's last marker reached), or a
 //!   bound is passed (the queued **device** bytes reach [`Bounds::max_bytes`], or the oldest call has waited
 //!   [`Bounds::max_age`]), or a thread asked for one with [`DeferredCalls::drain_soon`]. **A forced drain stalls every
-//!   stream's markers for as long as the kernels running at that moment.** Nothing calls `poll` on its own: the owner calls
-//!   it from a tick it already has.
+//!   stream's markers for as long as the kernels running at that moment.** `defer` and `drain_soon` only queue and set a
+//!   flag; they never push, so a call or a drain request waits for the next `request` a worker makes on the source (a
+//!   worker that finds nothing to do asks again on every cycle).
 //! - **Bytes.** A call carries the bytes it gives back and where ([`Place`]): [`DeferredCalls::pending_bytes`] says how
 //!   much, per place, for a planner that counts it as certain reclaim.
 //! - **Tickets.** `defer` returns a [`Ticket`]. [`DeferredCalls::run_through`] makes every call that is queued when it is
@@ -140,8 +140,8 @@ pub struct DeferredCalls {
     bounds: Bounds,
     pool: OnceLock<Weak<LanePool>>,
     downstream: DownstreamSlot,
-    /// Frames the owner asked for and has not been given (`u64::MAX`: unbounded).
-    demand: AtomicU64,
+    /// Frames the owner asked for and has not been given (`u64::MAX`: unbounded). Only `request` touches it.
+    demand: SourceCell<u64>,
     /// A drain frame is out (pushed and not yet finished or dropped).
     frame_out: AtomicBool,
     me: Weak<DeferredCalls>,
@@ -204,8 +204,8 @@ impl WeakDeferral {
 }
 
 impl Deferral {
-    /// Queues `call` (`bytes` is the memory it gives back at `place`, 0 if none) and returns its ticket. Never waits. May
-    /// push the drain frame (see [`DeferredCalls::poll`]).
+    /// Queues `call` (`bytes` is the memory it gives back at `place`, 0 if none) and returns its ticket. Never waits and
+    /// pushes nothing: the drain frame leaves at the next worker `request` on the source.
     pub fn defer(&self, place: Place, bytes: u64, call: impl FnOnce() + Send + 'static) -> Ticket {
         self.0.push(place, bytes, Box::new(call))
     }
@@ -223,11 +223,6 @@ impl Deferral {
     /// Makes the calls queued now, through `ticket`'s; see [`DeferredCalls::run_through`].
     pub fn run_through(&self, ticket: Ticket) -> bool {
         self.0.run_through(ticket)
-    }
-
-    /// Pushes the drain frame if its conditions hold; see [`DeferredCalls::poll`].
-    pub fn poll(&self) {
-        self.0.poll();
     }
 
     /// Asks for a drain without waiting for it; see [`DeferredCalls::drain_soon`].
@@ -282,7 +277,7 @@ impl DeferredCalls {
             bounds,
             pool: OnceLock::new(),
             downstream: DownstreamSlot::new(),
-            demand: AtomicU64::new(0),
+            demand: SourceCell::new(0),
             frame_out: AtomicBool::new(false),
             me: me.clone(),
             #[cfg(test)]
@@ -385,7 +380,6 @@ impl DeferredCalls {
         let _ = self
             .oldest
             .compare_exchange(0, at, Ordering::Relaxed, Ordering::Relaxed);
-        self.poll();
         ticket
     }
 
@@ -405,26 +399,22 @@ impl DeferredCalls {
             .is_some_and(|pool| pool.idle())
     }
 
-    /// Pushes the drain frame when calls wait, no drain frame is out, a downstream asked for one, and the pool is idle, a
-    /// bound is passed or a drain was asked for. Cheap when nothing waits (two atomic loads).
-    pub fn poll(&self) {
-        if self.pending() == 0 || self.frame_out.load(Ordering::Relaxed) {
-            return;
-        }
-        if self.drain_requested.load(Ordering::Relaxed) || self.forced() || self.quiet() {
-            self.push_frame();
-        }
+    /// Whether the drain frame is wanted: calls wait, no drain frame is out, and the pool is idle, a bound is passed or a
+    /// drain was asked for. Cheap when nothing waits (two atomic loads).
+    fn due(&self) -> bool {
+        self.pending() != 0
+            && !self.frame_out.load(Ordering::Relaxed)
+            && (self.drain_requested.load(Ordering::Relaxed) || self.forced() || self.quiet())
     }
 
-    /// Asks for a drain without waiting for it: the drain frame is pushed now (when a downstream asked for frames) and the
-    /// calls are made by whichever thread runs it. For a thread that must not block (a lane's worker that found the memory it
-    /// wants is waiting in the queue).
+    /// Asks for a drain without waiting for it: sets a flag and nothing else. The next worker `request` on the source
+    /// (when a downstream asked for frames) pushes the drain frame, and whichever thread runs it makes the calls. For a
+    /// thread that must not block (a lane's worker that found the memory it wants is waiting in the queue).
     pub fn drain_soon(&self) {
         self.drain_requested.store(true, Ordering::Relaxed);
-        self.poll();
     }
 
-    fn push_frame(&self) {
+    fn push_frame(&self, demand: &mut u64) {
         let Some(me) = self.me.upgrade() else { return };
         let Some(receiver) = self.downstream.receiver() else {
             return;
@@ -433,18 +423,12 @@ impl DeferredCalls {
             return;
         }
         // One frame of the demand; `u64::MAX` is unbounded.
-        let banked = self
-            .demand
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |d| {
-                if d == u64::MAX {
-                    Some(d)
-                } else {
-                    d.checked_sub(1)
-                }
-            });
-        if banked.is_err() {
+        if *demand == 0 {
             self.frame_out.store(false, Ordering::Relaxed);
             return;
+        }
+        if *demand != u64::MAX {
+            *demand -= 1;
         }
         // The guard clears `frame_out` when the frame is dropped, run or not (a killed frame is dropped unrun).
         struct Out(Arc<DeferredCalls>);
@@ -588,18 +572,19 @@ impl LatticeSource for DeferredCalls {
         0
     }
 
-    /// Banks `demand` frames (`u64::MAX`: unbounded) for the drains that [`poll`](Self::poll) pushes, and pushes one now if
-    /// the conditions hold.
+    /// Banks `demand` frames (`u64::MAX`: unbounded) and pushes the drain frame if the conditions hold (see the
+    /// [module](self)). This is the only place a frame leaves: `defer` and `drain_soon` never push.
     fn request(&self, demand: u64) {
         if demand == 0 || self.downstream.is_complete() {
             return;
         }
-        let _ = self
-            .demand
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |d| {
-                Some(d.saturating_add(demand))
-            });
-        self.poll();
+        let Some(mut banked) = self.demand.try_enter() else {
+            return;
+        };
+        *banked = banked.saturating_add(demand);
+        if self.due() {
+            self.push_frame(&mut banked);
+        }
     }
 
     /// Stops pushing frames and tells the downstream. The calls still queued stay for [`drain`](DeferredCalls::drain) and the
@@ -883,13 +868,14 @@ mod tests {
         let (log, call) = recorder();
         let d = calls.handle();
         d.defer(Place::Device, 0, call(0));
-        calls.poll();
+        calls.request(1);
         assert_eq!(run(&frames), 0, "a lane has marked work in flight");
         lane.completed.store(5, Ordering::Release);
-        calls.poll();
-        calls.poll();
+        calls.request(1);
+        calls.request(1);
         assert_eq!(frames.0.lock().unwrap().len(), 1, "one frame at a time");
         d.defer(Place::Device, 0, call(1));
+        calls.request(1);
         assert_eq!(run(&frames), 1);
         assert_eq!(
             *log.lock().unwrap(),
@@ -897,12 +883,45 @@ mod tests {
             "the frame made everything queued"
         );
         d.defer(Place::Device, 0, call(2));
+        calls.request(1);
         assert_eq!(
             run(&frames),
             1,
             "the frame that finished let the next one leave"
         );
         assert_eq!(*log.lock().unwrap(), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn defer_and_drain_soon_from_another_thread_push_nothing_until_a_request() {
+        let calls = DeferredCalls::new(Bounds::default());
+        let frames = Arc::new(Frames::default());
+        calls.clone().add_downstream(frames.clone());
+        // The lattice asked for frames; the pool has nothing in flight.
+        calls.request(u64::MAX);
+        let pool = Arc::new(LanePool::new(vec![Arc::new(Lane {
+            id: QueueId::next(),
+            issued: 1.into(),
+            completed: 1.into(),
+        })]));
+        calls.attach_pool(&pool).unwrap();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let d = calls.handle();
+                d.defer(Place::Device, 0, || {});
+                d.drain_soon();
+            });
+        });
+        assert_eq!(calls.pending(), 1);
+        assert_eq!(
+            frames.0.lock().unwrap().len(),
+            0,
+            "a producer's thread pushed the frame"
+        );
+        calls.request(1);
+        assert_eq!(frames.0.lock().unwrap().len(), 1, "the next request pushes");
+        assert_eq!(run(&frames), 1);
+        assert_eq!(calls.pending(), 0);
     }
 
     #[test]
@@ -923,14 +942,15 @@ mod tests {
         calls.attach_pool(&pool).unwrap();
         let d = calls.handle();
         d.defer(Place::Device, 60, || {});
-        calls.poll();
+        calls.request(1);
         assert_eq!(run(&frames), 0, "under both bounds");
         d.defer(Place::Device, 60, || {});
+        calls.request(1);
         assert_eq!(run(&frames), 1, "the bytes bound");
         assert_eq!(calls.pending(), 0);
         d.defer(Place::Device, 1, || {});
         wait_for(|| {
-            calls.poll();
+            calls.request(1);
             !frames.0.lock().unwrap().is_empty()
         });
         assert_eq!(run(&frames), 1, "the age bound");
@@ -943,10 +963,8 @@ mod tests {
             ..Bounds::default()
         });
         calls.handle().defer(Place::Device, 5, || {});
-        calls.poll();
         let frames = Arc::new(Frames::default());
         calls.clone().add_downstream(frames.clone());
-        calls.poll();
         assert_eq!(frames.0.lock().unwrap().len(), 0, "no demand yet");
         calls.request(1);
         assert_eq!(frames.0.lock().unwrap().len(), 1);
@@ -1161,10 +1179,11 @@ mod tests {
         calls.attach_pool(&pool).unwrap();
         assert_eq!(calls.attach_pool(&pool), Err(PoolAttached));
         calls.handle().defer(Place::Device, 0, || {});
+        calls.request(1);
         assert_eq!(frames.0.lock().unwrap().len(), 1, "idle: a frame leaves");
         frames.0.lock().unwrap().clear();
         drop(pool);
-        calls.poll();
+        calls.request(1);
         assert_eq!(
             frames.0.lock().unwrap().len(),
             0,
@@ -1188,10 +1207,12 @@ mod tests {
         d.defer(Place::Device, 5, || {});
         assert_eq!(frames.0.lock().unwrap().len(), 0, "busy, under the bounds");
         d.drain_soon();
+        calls.request(1);
         assert_eq!(frames.0.lock().unwrap().len(), 1);
         assert_eq!(run(&frames), 1);
         assert_eq!(calls.pending(), 0);
         d.defer(Place::Device, 5, || {});
+        calls.request(1);
         assert_eq!(frames.0.lock().unwrap().len(), 0, "the request was spent");
     }
 
@@ -1213,6 +1234,7 @@ mod tests {
         let d = calls.handle();
         d.defer(Place::Host, 1000, || {});
         d.defer(Place::Host, 1000, || {});
+        calls.request(1);
         assert_eq!(
             frames.0.lock().unwrap().len(),
             0,
@@ -1223,6 +1245,7 @@ mod tests {
             (2000, 0)
         );
         d.defer(Place::Device, 100, || {});
+        calls.request(1);
         assert_eq!(
             frames.0.lock().unwrap().len(),
             1,
@@ -1253,13 +1276,13 @@ mod tests {
         let d = calls.handle();
         d.defer(Place::Device, 0, || {});
         wait_for(|| {
-            calls.poll();
+            calls.request(1);
             !frames.0.lock().unwrap().is_empty()
         });
         assert_eq!(run(&frames), 1);
         // A new call is young: the old call's age is not charged to it.
         d.defer(Place::Device, 0, || {});
-        calls.poll();
+        calls.request(1);
         assert_eq!(frames.0.lock().unwrap().len(), 0);
     }
 }
