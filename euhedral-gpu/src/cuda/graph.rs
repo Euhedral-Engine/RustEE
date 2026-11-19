@@ -41,6 +41,9 @@ pub struct CudaGraph {
     /// The buffers its copies read, frozen and shared with every replay: a replay hands a handle to its stream, which
     /// holds it until the next retirement armed after the replay is confirmed.
     kept: Frozen,
+    /// A test hook: the next replay on a lane fails its join after the launch.
+    #[cfg(feature = "test-hooks")]
+    fail_join: bool,
 }
 
 // SAFETY: the graph and its executable belong to the primary context. Every use is a driver call, and every call
@@ -63,6 +66,13 @@ impl Drop for CudaGraph {
 }
 
 impl CudaGraph {
+    /// A test hook (feature `test-hooks`): the next `replay_on` fails after its launch succeeded, at the record of the
+    /// join event, as a refused driver call would. One shot.
+    #[cfg(feature = "test-hooks")]
+    pub fn fail_next_join(&mut self) {
+        self.fail_join = true;
+    }
+
     /// A test hook (feature `test-hooks`): the types of the edges into the node of launch `launch` in the recorded
     /// graph (0 default, 1 programmatic), or `None` when the driver cannot report them.
     #[cfg(feature = "test-hooks")]
@@ -248,7 +258,8 @@ impl Graph for CudaGraph {
         // The worker launches on a private stream forked from the lane (see `Fork`): never on the lane itself.
         let fork = lane.take_fork()?;
         let f = &self.gpu.device().driver.fns;
-        let replayed = (|| {
+        // Before the launch nothing is queued: a failure leaves the hold as it was.
+        let launched = (|| {
             // SAFETY: events and streams of this device; the lane's and the private stream are in use by this thread (the
             // private one alone); the context is current.
             unsafe {
@@ -268,7 +279,23 @@ impl Graph for CudaGraph {
                 self.gpu.check(
                     "cuGraphLaunch",
                     (self.gpu.fns.graph_launch)(self.exec, fork.stream),
-                )?;
+                )
+            }
+        })();
+        // Once the launch succeeded the graph is queued and reads the recording's buffers whatever fails after it, and
+        // only a fault poisons the device, so later work may run and free them: the hold takes them now. The lane keeps
+        // nothing: the caller holds the recording's buffers until the work ended.
+        if launched.is_ok() {
+            hold.add_frozen(&self.kept);
+        }
+        let joined = launched.and_then(|()| {
+            #[cfg(feature = "test-hooks")]
+            if std::mem::take(&mut self.fail_join) {
+                return Err(GpuError::Capture("join failed by the test hook".into()));
+            }
+            // SAFETY: events and streams of this device; the private stream is this thread's alone; the context is
+            // current.
+            unsafe {
                 self.gpu
                     .check("cuEventRecord", (f.event_record)(fork.join, fork.stream))?;
                 self.gpu.check(
@@ -276,11 +303,9 @@ impl Graph for CudaGraph {
                     (self.gpu.fns.stream_wait_event)(lane.raw, fork.join, 0),
                 )
             }
-        })();
+        });
         lane.give_fork(fork);
-        replayed?;
-        // The lane keeps nothing: the caller holds the recording's buffers until the work ended.
-        hold.add_frozen(&self.kept);
+        joined?;
         Ok(())
     }
 }
@@ -689,6 +714,8 @@ impl CudaGpu {
             fingerprint: rec.hasher.finish(),
             streams,
             kept: rec.frozen,
+            #[cfg(feature = "test-hooks")]
+            fail_join: false,
         })
     }
 }

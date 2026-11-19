@@ -3,6 +3,20 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## A replay on a lane that fails after its launch keeps the recording's values in the caller's hold (`euhedral-gpu`) (2026-11-19)
+
+**What.** `Graph::replay_on` on the CUDA backend adds the recording's kept values to the caller's `GraphHold` as soon as the graph launch succeeded, before it records the join event and makes the lane wait for it. A failure of either of those two calls still returns its error, and the hold now keeps the values.
+
+**Why.** The hold took the values only after the whole launch closure succeeded. When `cuGraphLaunch` succeeded and the join record or the wait then failed, the graph was queued and the hold kept nothing; only a fault poisons the device, so later work could run and free buffers the queued graph still read.
+
+**Migration.** None. An error before the launch (the fork record or wait, a marker wait, the launch itself) leaves the hold as it was, as before. After an `Err` from `replay_on` the caller must release the hold only once the device work ended, as after an `Ok`, if the hold is not empty.
+
+**Semantics.**
+- The fake backend's `replay_on` queues the work and then fills the hold with nothing fallible between them, so it needed no change.
+- Feature `test-hooks`: `CudaGraph::fail_next_join` and `FakeGraph::fail_next_join` make the next `replay_on` fail after the launch (the work queued), once.
+
+**Tests.** `cuda_lane_graphs.rs`: `a_replay_that_fails_after_its_launch_keeps_the_recordings_values_in_the_hold` (fails on the old code at the assertion that the hold is not empty); `fake_lane_graphs.rs`: `a_replay_that_fails_after_its_work_was_queued_keeps_the_recordings_values_in_the_hold` (pins the fake's order).
+
 ## A killed quantum quiesces only behind its ordered stages' device work (`euhedral-graph`) (2026-11-18)
 
 **What.** A `StageGraph` quantum that is killed while an ordered stage's device work is not reached no longer quiesces at once: no `abandoned` hook runs and nothing it holds is let go until that work is reached. Then both happen, once.

@@ -20,8 +20,8 @@ use euhedral_core::generics::{FrameSink, LatticeSource};
 use euhedral_data_structures::queues::{Consumer, MpmcQueue, Multi, Producer};
 use euhedral_gpu::cuda::{CudaGpu, CudaKernel, CudaQueue};
 use euhedral_gpu::{
-    Args, Enqueue, GpuError, GraphBody, GraphHold, Lane, LaneEnqueue, Launch, Module, Ran,
-    SharedGraphCache, SharedLanes, StreamOptions, open_shared_lanes,
+    Args, Enqueue, Gpu, GpuError, Graph, GraphBody, GraphHold, Lane, LaneEnqueue, Launch, Module,
+    Ran, Sequence, SharedGraphCache, SharedLanes, StreamOptions, open_shared_lanes,
 };
 use euhedral_graph::{
     Completions, DEFAULT_RETRY_BACKSTOP, EdgeKind, GraphRuntime, LaneId, QuantumOutcome, Stage,
@@ -628,4 +628,95 @@ fn six_workers_replaying_under_contention_make_no_private_stream_after_warm_up()
         "no stream was made after warm-up: no take missed, however the workers raced (stats {stats:?})"
     );
     assert!(stats.replays > 1_000, "{stats:?}");
+}
+
+/// A replay on a lane whose launch succeeded but whose join failed has queued the graph: the hold keeps the recording's
+/// values all the same (a later wait or the release of the quantum may free what the work reads). A replay that fails
+/// before the launch queues nothing and leaves the hold as it was. On a real driver the failed join is made by the test
+/// hook.
+#[test]
+fn a_replay_that_fails_after_its_launch_keeps_the_recordings_values_in_the_hold() {
+    let Some(gpu) = gpu() else { return };
+    let Some(module) = module(&gpu) else { return };
+    let (_mem, block) = device_word(&gpu);
+    let add = module.kernel("add_u32").unwrap();
+    let pinned = Pinned::new(&gpu);
+    let lanes = lanes(&gpu, 1);
+    let lane = lanes.pool.lane(LaneId(0)).clone();
+    let token = Arc::new(());
+    let mut record_hold = GraphHold::new();
+    let mut graph = gpu
+        .record_on(&[&*lane], &mut record_hold, |seq| {
+            seq.submit(0, |enq| {
+                enq.keep(Box::new(token.clone()));
+                // SAFETY: the device word is live.
+                unsafe {
+                    enq.launch(
+                        &add,
+                        Launch::linear(1, 1),
+                        &Args::new()
+                            .device(block.addr)
+                            .device(block.addr)
+                            .arg(1u32)
+                            .arg(1u32),
+                    )
+                }
+            })
+        })
+        .unwrap();
+    let settle = || {
+        let (_, marker) = lane.submit_marked(|_| Ok(())).unwrap();
+        assert!(wait_until(Duration::from_secs(10), || lanes
+            .queues
+            .reached(marker)));
+    };
+    // The recording's own work ends, then the record's hold goes: only the graph holds the value.
+    settle();
+    record_hold.release();
+    assert_eq!(Arc::strong_count(&token), 2, "the test and the graph");
+
+    let mut hold = GraphHold::new();
+    graph.fail_next_join();
+    let result = graph.replay_on(&lane, &[], &mut hold);
+    assert!(
+        matches!(result, Err(GpuError::Capture(_))),
+        "{:?}",
+        result.map(|_| ())
+    );
+    assert!(
+        !hold.is_empty(),
+        "the graph was launched: the hold keeps what it reads"
+    );
+    // The failed replay's work is on the graph's private stream, which the lane did not join: a second replay, which
+    // forks from the lane onto the same stream and joins it back, orders the lane behind both.
+    let mut second = GraphHold::new();
+    graph.replay_on(&lane, &[], &mut second).unwrap();
+    drop(graph);
+    assert_eq!(
+        Arc::strong_count(&token),
+        2,
+        "the holds alone keep the value now"
+    );
+    settle();
+    let host = pinned.word();
+    let (_, marker) = lane
+        .submit_marked(|q| {
+            // SAFETY: the pinned block holds the word; the device word is live.
+            unsafe { q.copy_to_host(host.bytes(), block.addr, 4) }
+        })
+        .unwrap();
+    assert!(wait_until(Duration::from_secs(10), || lanes
+        .queues
+        .reached(marker)));
+    // SAFETY: the copy ended.
+    let seen = unsafe { (host.bytes() as *const u32).read_volatile() };
+    assert_eq!(seen, 3, "the recording and both replays ran");
+    drop(second);
+    assert_eq!(
+        Arc::strong_count(&token),
+        2,
+        "the first hold still keeps it"
+    );
+    hold.release();
+    assert_eq!(Arc::strong_count(&token), 1);
 }
