@@ -31,6 +31,7 @@
     any(target_os = "linux", target_os = "android", windows)
 ))]
 
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::fmt;
 use std::io;
@@ -578,19 +579,11 @@ pub(crate) fn conclude(
 }
 
 thread_local! {
-    /// Set by an engine once it holds a submitted operation (see [`accepted`]).
-    static ACCEPTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// The first completion of no operation a poll met on this thread, until the reap that ran it checks it.
     #[cfg(debug_assertions)]
     static STRAY: std::cell::Cell<Option<(&'static str, u64)>> = const { std::cell::Cell::new(None) };
     /// Continuations that panicked on this thread since the last [`take_lost`].
     static LOST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-/// Called by an engine as soon as it holds the operation it was given: a panic after it is not a refusal, and the
-/// operation's counts stay (it will be reaped).
-pub(crate) fn accepted() {
-    ACCEPTED.with(|accepted| accepted.set(true));
 }
 
 /// Records a completion that belongs to no operation. The reap that ran the poll raises it once its counts are
@@ -662,12 +655,16 @@ pub(crate) trait Engine: Send + Sync {
     /// Starts the operation and returns at once, with the id that cancels it. On `Err`, nothing
     /// was started: `then` and the buffer are dropped without running. With a `limit`, the
     /// operation ends with a [`LimitPassed`] error if it is still in flight when the limit has passed.
+    ///
+    /// `taken` is set the moment the engine holds the operation (it will be reaped): an unwind after that is not a
+    /// refusal, and the caller keeps the operation's counts.
     fn submit(
         &self,
         request: Request,
         buf: Buf,
         then: Then,
         limit: Option<Duration>,
+        taken: &Cell<bool>,
     ) -> io::Result<OpId>;
 
     /// Asks for the operation to end early, with [`Cancelled`] (or its real result, if that came
@@ -787,12 +784,14 @@ pub struct AsyncIo {
 struct Uncount<'a> {
     pending: &'a AtomicUsize,
     unreaped: &'a AtomicUsize,
+    /// Set by the engine once it holds the operation.
+    taken: Cell<bool>,
 }
 
 impl Drop for Uncount<'_> {
     fn drop(&mut self) {
         // The engine holds the operation (a panic came after it did): it will be reaped and counts itself.
-        if ACCEPTED.with(std::cell::Cell::take) {
+        if self.taken.get() {
             return;
         }
         self.pending.fetch_sub(1, Ordering::AcqRel);
@@ -1168,8 +1167,10 @@ impl AsyncIo {
     pub fn reap(&self) -> usize {
         // Continuations that panicked on this thread before this reap are none of its business.
         take_lost();
+        // A stray an enclosing reap of this thread noted (this reap may run inside its continuation) is not this
+        // reap's: it is put back at the end.
         #[cfg(debug_assertions)]
-        STRAY.with(std::cell::Cell::take);
+        let enclosing = STRAY.with(std::cell::Cell::take);
         let reaped = self.front.reap_ready(&self.engine);
         let lost = take_lost();
         if lost > 0 {
@@ -1186,7 +1187,9 @@ impl AsyncIo {
         }
         // The counts are done: a completion of no operation fails here, in a debug build, and leaves them right.
         #[cfg(debug_assertions)]
-        if let Some((what, user_data)) = STRAY.with(std::cell::Cell::take) {
+        let stray = STRAY.with(|stray| stray.replace(enclosing));
+        #[cfg(debug_assertions)]
+        if let Some((what, user_data)) = stray {
             debug_assert!(false, "{what} ({user_data:#x}) of no operation");
         }
         reaped
@@ -1249,9 +1252,11 @@ impl AsyncIo {
         let counted = Uncount {
             pending: &self.front.pending,
             unreaped: &self.unreaped,
+            taken: Cell::new(false),
         };
-        ACCEPTED.with(|accepted| accepted.set(false));
-        let started = self.engine.submit(request, buf, then, limit);
+        let started = self
+            .engine
+            .submit(request, buf, then, limit, &counted.taken);
         if started.is_ok() {
             std::mem::forget(counted);
             // Something new for the key to look at, however far its back-off had come (counted after the engine has

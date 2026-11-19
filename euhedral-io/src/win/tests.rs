@@ -1,6 +1,7 @@
 //! The engine's state machines against the simulated `Sys`: every operation's success, error and
 //! short transfers, the ring and its fallbacks, a full submission queue, held-back frames.
 
+use std::cell::Cell;
 use std::io;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -137,7 +138,9 @@ impl Harness {
         limit: Option<Duration>,
     ) -> io::Result<OpId> {
         self.front.pending.fetch_add(1, Ordering::AcqRel);
-        let started = self.engine.submit(request, buf.into(), then, limit);
+        let started = self
+            .engine
+            .submit(request, buf.into(), then, limit, &Cell::new(false));
         if started.is_err() {
             self.front.pending.fetch_sub(1, Ordering::AcqRel);
         }
@@ -155,9 +158,13 @@ impl Harness {
     fn read_owned(&self, file: Handle, offset: u64, memory: Vec<u8>, tag: u64) -> io::Result<()> {
         let (buf, then) = owned_read(memory, tag);
         self.front.pending.fetch_add(1, Ordering::AcqRel);
-        let started = self
-            .engine
-            .submit(Request::Read { file, offset }, buf, then, None);
+        let started = self.engine.submit(
+            Request::Read { file, offset },
+            buf,
+            then,
+            None,
+            &Cell::new(false),
+        );
         if started.is_err() {
             self.front.pending.fetch_sub(1, Ordering::AcqRel);
         }

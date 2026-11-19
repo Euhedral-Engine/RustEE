@@ -4,7 +4,7 @@
 //! with unsafe code: the io_uring rings (`// SAFETY:` on every block).
 #![allow(unsafe_code)]
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::ffi::CString;
 use std::io;
@@ -23,7 +23,7 @@ use io_uring::{IoUring, Submitter, opcode, squeue, types};
 
 use super::{
     AsyncIo, Buf, Cancelled, Create, Engine, LimitPassed, MAX_PIECE, OpId, OpenSpec, READ_PIECE,
-    Request, Then, accepted, conclude as conclude_io, note_stray,
+    Request, Then, conclude as conclude_io, note_stray,
 };
 
 /// Entries of each ring's submission queue (its completion queue has twice as many).
@@ -590,6 +590,8 @@ impl Ring {
             sq.sync();
         }
         if pushed || queue.unsubmitted {
+            // Set before the call: if the enter unwinds, the entries are queued and a later poll hands them over.
+            queue.unsubmitted = true;
             queue.unsubmitted = enter(&self.uring.submitter()).is_err();
         }
     }
@@ -972,6 +974,7 @@ impl Engine for Uring {
         buf: Buf,
         then: Then,
         limit: Option<Duration>,
+        taken: &Cell<bool>,
     ) -> io::Result<OpId> {
         let kind = Self::kind(request)?;
         let ring = self.ring()?;
@@ -995,7 +998,7 @@ impl Engine for Uring {
             user_data
         };
         // The ring has the operation: from here on a panic is not a refusal.
-        accepted();
+        taken.set(true);
         ring.flush_waiting(&*self.enter);
         Ok(OpId::new(self.id as u64, ring.index, user_data))
     }
@@ -2182,6 +2185,7 @@ mod tests {
                 .into(),
                 Then::Io(then(1)),
                 None,
+                &Cell::new(false),
             )
             .unwrap();
         let ring = engine.ring().unwrap();
@@ -2810,6 +2814,7 @@ mod tests {
                 IoBuf::default().into(),
                 open_then(1),
                 None,
+                &Cell::new(false),
             )
             .unwrap();
         let mut found = engine_found(&engine);
@@ -2833,6 +2838,7 @@ mod tests {
                 IoBuf::default().into(),
                 open_then(2),
                 None,
+                &Cell::new(false),
             )
             .unwrap();
         assert!(engine_found(&engine).is_empty());
@@ -3067,12 +3073,11 @@ mod tests {
             io.read(file.as_raw_fd(), 0, buf(16), then(1))
         }));
         assert!(first.is_err(), "the hook's panic reaches the submitter");
-        // The operation was accepted before the panic: counted, and handed over by a later poll.
+        // The operation was accepted before the panic: counted, and handed over by a later poll, with no
+        // other submission to do it.
         assert_eq!(io.pending(), 1);
-        io.read(file.as_raw_fd(), 0, buf(16), then(2)).unwrap();
-        let mut tags: Vec<u64> = poll(&io, 2).iter().map(|(tag, _)| *tag).collect();
-        tags.sort_unstable();
-        assert_eq!(tags, [1, 2]);
+        let out = poll(&io, 1);
+        assert_eq!(out[0].0, 1);
         assert_eq!(io.pending(), 0);
         assert_eq!(io.unreaped.load(Ordering::Acquire), 0);
     }
@@ -3107,5 +3112,90 @@ mod tests {
         io.read(file.as_raw_fd(), 0, buf(16), then(2)).unwrap();
         let out = poll(&io, 1);
         assert_eq!(out[0].0, 2);
+    }
+
+    /// A refused operation's continuation that submits another operation as it drops: the refusal still takes its
+    /// own counts back, and the inner operation keeps its own.
+    #[test]
+    fn a_refused_operation_whose_continuation_submits_as_it_drops_leaves_the_right_counts() {
+        struct Submits {
+            io: Arc<AsyncIo>,
+            fd: i32,
+        }
+        impl Drop for Submits {
+            fn drop(&mut self) {
+                self.io.read(self.fd, 0, buf(16), then(1)).unwrap();
+            }
+        }
+        let data = content(4096, 11);
+        let (_guard, file) = temp_file("nested", &data);
+        let io = AsyncIo::open_with(
+            Box::new(|submitter: &Submitter<'_>| submitter.submit()),
+            MAX_PIECE,
+        )
+        .unwrap();
+        let held = Submits {
+            io: io.clone(),
+            fd: file.as_raw_fd(),
+        };
+        let refused = io.open_path(
+            std::path::Path::new("a\0b"),
+            OpenSpec::default(),
+            Box::new(move |_| {
+                let _held = &held;
+                Box::new(Done {
+                    header: FrameHeader::new(9),
+                    done: None,
+                    accepted: None,
+                })
+            }),
+        );
+        assert!(refused.is_err());
+        assert_eq!(io.pending(), 1);
+        assert_eq!(io.unreaped.load(Ordering::Acquire), 1);
+        let out = poll(&io, 1);
+        assert_eq!(out[0].0, 1);
+        assert_eq!(io.pending(), 0);
+        assert_eq!(io.unreaped.load(Ordering::Acquire), 0);
+    }
+
+    /// A reap that a continuation runs (here on another `AsyncIo`) does not clear the stray completion the
+    /// enclosing reap met: the enclosing reap still fails its check (a debug build).
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_reap_inside_a_continuation_leaves_the_enclosing_reaps_stray_check() {
+        let data = content(4096, 13);
+        let (_guard, file) = temp_file("enclosing", &data);
+        let open = || {
+            AsyncIo::open_with(
+                Box::new(|submitter: &Submitter<'_>| submitter.submit()),
+                MAX_PIECE,
+            )
+            .unwrap()
+        };
+        let (io, other) = (open(), open());
+        io.read(file.as_raw_fd(), 0, buf(16), then(1)).unwrap();
+        poll(&io, 1);
+        let uring = uring_of(&io);
+        let ring = lock!(&uring.rings)[0].clone();
+        // The stray completion first, then an operation whose continuation reaps `other`.
+        ring.offer(Item::One(opcode::Nop::new().build().user_data(0x5757)));
+        ring.flush_waiting(&*uring.enter);
+        let ran = Arc::new(AtomicUsize::new(0));
+        let (seen, inner) = (ran.clone(), then(2));
+        io.read(
+            file.as_raw_fd(),
+            0,
+            buf(16),
+            Box::new(move |done| {
+                other.reap();
+                seen.fetch_add(1, Ordering::AcqRel);
+                inner(done)
+            }),
+        )
+        .unwrap();
+        let reaped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| io.reap()));
+        assert_eq!(ran.load(Ordering::Acquire), 1, "the nested reap ran");
+        assert!(reaped.is_err(), "the stray completion failed the check");
     }
 }

@@ -36,7 +36,7 @@
 #![allow(unsafe_code)]
 #![cfg_attr(not(windows), allow(dead_code))]
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::io;
 use std::path::PathBuf;
@@ -1080,10 +1080,10 @@ impl Engine {
     /// Starts the operation: its slot, then its call. The slot stays `Issuing` until the call is
     /// made (or, on a ring or the pool, until the entry or the job is handed over), so nothing
     /// that completes or fails operations touches the record while it is being filled.
-    fn start(&self, op: Op) -> io::Result<OpId> {
+    fn start(&self, op: Op, taken: &Cell<bool>) -> io::Result<OpId> {
         let held = self.begin(op, State::Issuing)?;
         // The table has the operation: from here on a panic is not a refusal.
-        super::accepted();
+        taken.set(true);
         let id = OpId::new(self.id as u64, held.slot, held.serial);
         self.launch(held);
         Ok(id)
@@ -1567,6 +1567,7 @@ impl EngineTrait for Engine {
         buf: Buf,
         then: Then,
         limit: Option<Duration>,
+        taken: &Cell<bool>,
     ) -> io::Result<OpId> {
         let mut op = match request {
             Request::Read { file, offset } => {
@@ -1633,7 +1634,7 @@ impl EngineTrait for Engine {
         });
         // An accept's socket made above is closed if no slot can be had.
         let accepted = op.accepting.as_ref().map(|accepting| accepting.socket);
-        let started = self.start(op);
+        let started = self.start(op, taken);
         if started.is_err()
             && let Some(socket) = accepted
         {
