@@ -12,11 +12,23 @@ semantics and the tests that pin it.
 **How to use.** Nothing to change.
 
 **Semantics.**
-- The torn-read test no longer counts successful reads; it asserts every read that succeeds is whole. A new test stops a publish after each of 0 to 5 fields and asserts the read returns nothing, then the whole new value once the publish ends.
-- The wait test orders events: the releaser sets the flag only after the waiter has checked 1,000 times (through its spins, yields and parks), and the waiter must return with the flag set and at least 1,000 checks made.
-- The run-time test uses 40 ms finalizers and bounds the longest timed execute at 20 ms, half a finalizer: a timed finalizer breaks it, a preempted execute does not. Count 2 and a sum of at least 200 us are kept.
+- The torn-read test publishes once before the publisher thread starts, no longer counts successful reads, asserts every read that succeeds is whole, and stops the publisher from a drop guard so a failed assertion does not hang. A new test stops a publish after each of 0 to 5 fields and asserts the read returns nothing, then the whole new value once the publish ends (it runs under Miri).
+- The wait test orders events: the releaser sets the flag only after the waiter has checked 1,000 times (through its spins, yields and parks); the waiter must return because the flag was set, with at least 1,000 checks made. Both waits also end at a 30 s deadline, so a wait that never returns fails instead of hanging.
+- The run-time test no longer measures time. Each frame's finalizer records how many executes the metrics had timed when it began: 0 with no sink, 1 and 2 for the two timed frames (a frame's own execute is counted before its finalizer starts), and 2 for the dead frame and the frame after the sink. Count 2 and a sum of at least 200 us are kept.
 
-**Tests.** The three tests above. A wait that returned before the flag was set or after fewer than 1,000 checks, or a service-time timer that included the finalizer, fails them.
+**Tests.** The three tests above. A wait that returned before the flag was set or after fewer than 1,000 checks fails the wait test; a finalizer inside the timed span makes the first timed frame's finalizer see 0 instead of 1.
+
+## The credit-graph timing checks are opt-in (`euhedral-graph` tests) (2026-11-19)
+
+**What.** `euhedral-graph/tests/credit_graph.rs` prints the number of frame callbacks over 200 µs and the shutdown time, and asserts them only when `EUHEDRAL_TEST_TIMING` is set. Every functional check stays asserted.
+
+**Why.** On a busy machine the slow-pack test failed with one callback over 200 µs although every count was right: the delay came with no involuntary context switch (CPU quota, hypervisor steal, a hardware sibling), which the preemption count cannot tell apart from a slow frame.
+
+**How to use.** `EUHEDRAL_TEST_TIMING=1 cargo test -p euhedral-graph --test credit_graph` on a quiet machine asserts the timing. Without it, with `-- --nocapture` (libtest hides a passing test's output), the line `timing (reported, not asserted ...)` is printed. This replaces the earlier rule that asserted unless `CI` was set.
+
+**Semantics.** Asserted always: no late item, no order break at any hop, nothing beyond credit, nothing left over, made = sent + dropped, every quantum retired once, in flight <= pool. Asserted only with the variable: zero non-preempted callbacks over 200 µs, shutdown under 100 ms.
+
+**Tests.** `the_credit_graph_with_a_fast_pack`, `the_credit_graph_with_a_slow_pack`.
 
 ## `AsyncIo` runs where the system refuses io_uring (`euhedral-io`) (2026-11-19)
 

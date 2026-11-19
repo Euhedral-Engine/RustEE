@@ -172,11 +172,21 @@ mod tests {
 
     #[test]
     fn readers_never_see_a_torn_publish() {
+        struct Stop<'a>(&'a std::sync::atomic::AtomicBool);
+        impl Drop for Stop<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
         let flow = PublishedFlow::new();
+        // Published before the publisher thread starts, so no read returns at "nothing published".
+        flow.publish(&stats(1.0));
         let stop = std::sync::atomic::AtomicBool::new(false);
         std::thread::scope(|scope| {
+            // Stops the publisher when the scope body ends, also by a failed assertion.
+            let _stop = Stop(&stop);
             scope.spawn(|| {
-                let mut value = 1.0;
+                let mut value = 2.0;
                 while !stop.load(Ordering::Relaxed) {
                     flow.publish(&stats(value));
                     value += 1.0;
@@ -189,11 +199,10 @@ mod tests {
                     assert_eq!(read, stats(read.average));
                 }
             }
-            stop.store(true, Ordering::Relaxed);
         });
         // The publisher has ended, so a publish now reads whole.
-        flow.publish(&stats(9.0));
-        assert_eq!(flow.read(), Some(stats(9.0)));
+        flow.publish(&stats(-9.0));
+        assert_eq!(flow.read(), Some(stats(-9.0)));
     }
 
     #[test]
