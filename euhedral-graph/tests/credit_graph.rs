@@ -22,7 +22,9 @@
 //!   during it).
 //!
 //! Pass: 0 late, 0 out of order, 0 beyond credit, 0 left (items, slots, completions, quanta), made
-//! = sent + dropped, in flight <= pool, no callback over 200 µs, shutdown under 100 ms.
+//! = sent + dropped, in flight <= pool. With `EUHEDRAL_TEST_TIMING` set (a quiet machine), also no
+//! callback over 200 µs and shutdown under 100 ms; otherwise those two are printed, not asserted
+//! (run with `-- --nocapture` to see the line; libtest hides a passing test's output).
 //!
 //! `EUHEDRAL_TEST_CPUS` (default 0,1,2,3) picks the lattice's CPUs. As in `euhedral-core`'s tests
 //! that need particular hardware, the test passes without checking anything when this process may
@@ -980,10 +982,12 @@ fn scenario(pack_cost: Duration) {
     assert_eq!(get(&c.retired), get(&c.made), "every quantum retired once");
     assert_eq!(get(&c.failed_outcomes), 0);
     assert!(get(&c.max_in_flight) <= POOL);
-    // Timing is asserted on a quiet machine. A shared runner has two cores and other jobs, so there it is reported.
-    if std::env::var_os("CI").is_some() {
+    // Timing is a report unless EUHEDRAL_TEST_TIMING is set: a loaded machine delays a callback
+    // without an involuntary context switch (CPU quota, hypervisor steal, a sibling thread), which
+    // the preemption count cannot see. Set it on a quiet machine to assert.
+    if std::env::var_os("EUHEDRAL_TEST_TIMING").is_none() {
         println!(
-            "timing (reported, not asserted, under CI): {slow} callbacks over 200 µs, shutdown {closed_in:?}"
+            "timing (reported, not asserted; set EUHEDRAL_TEST_TIMING=1 to assert): {slow} callbacks over 200 µs, shutdown {closed_in:?}"
         );
     } else {
         assert_eq!(slow, 0, "frame callbacks over 200 µs (not preempted)");

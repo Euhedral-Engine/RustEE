@@ -155,7 +155,7 @@ impl MarkerRing {
         // The slot's previous marker completed (checked above): an awaiter that comes now sees this and waits for nothing.
         self.pins.reserved.fetch_max(value, Ordering::SeqCst);
         // The model checker does not order SeqCst accesses against each other, which this handshake relies on: a fence
-        // stands in for it (see `Pins`).
+        // stands in for it (see `SlotPins`).
         #[cfg(loom)]
         loom::sync::atomic::fence(Ordering::SeqCst);
         Ok(Claim {
@@ -255,9 +255,6 @@ impl Claim<'_> {
         let ring = self.ring;
         let slot = ring.slot(self.value);
         while ring.pins.pins[slot].load(Ordering::SeqCst) != 0 {
-            #[cfg(loom)]
-            loom::thread::yield_now();
-            #[cfg(not(loom))]
             #[cfg(loom)]
             loom::thread::yield_now();
             #[cfg(not(loom))]
@@ -603,17 +600,24 @@ mod loom_tests {
     }
 
     // A pin that is granted holds its slot as its marker left it: a claimant that re-records the slot waits the pin out,
-    // so an awaiter under the pin never reads what the claimant wrote. (The slot contents are atomics of the model, read
-    // and written with no ordering of their own: only the pin orders them.) A pin that is refused is for a marker whose
-    // slot was claimed again.
+    // so what the awaiter reads under the pin is ordered after the write of the marker it pinned, and the claimant's
+    // write is ordered after the awaiter's read (the slot contents are a model cell: the checker reports any access
+    // the pin does not order). A pin that is refused is for a marker whose slot was claimed again.
     #[test]
     fn loom_a_granted_pin_sees_its_own_marker_in_the_slot() {
         loom::model(|| {
             let ring = Arc::new(MarkerRing::new(2));
-            let slots = Arc::new([LoomCell::new(0), LoomCell::new(0)]);
-            let record = |slots: Arc<[LoomCell; 2]>, ring: Arc<MarkerRing>| {
+            let slots = Arc::new(Slots([
+                loom::cell::UnsafeCell::new(0),
+                loom::cell::UnsafeCell::new(0),
+            ]));
+            let record = |slots: Arc<Slots>, ring: Arc<MarkerRing>| {
                 move |slot: usize| {
-                    slots[slot].store(ring.claimed(), Ordering::Relaxed);
+                    let value = ring.claimed();
+                    slots.0[slot].with_mut(|cell| {
+                        // SAFETY: the claimant owns the slot until it stores its entry.
+                        unsafe { *cell = value }
+                    });
                     Ok(())
                 }
             };
@@ -632,7 +636,10 @@ mod loom_tests {
                 })
             };
             if let Some(pin) = ring.pin(1) {
-                let seen = slots[ring.slot(1)].load(Ordering::Relaxed);
+                let seen = slots.0[ring.slot(1)].with(|cell| {
+                    // SAFETY: the pin keeps the claimant from writing the slot.
+                    unsafe { *cell }
+                });
                 assert_eq!(seen, 1, "the slot was re-recorded under a pin");
                 drop(pin);
             }

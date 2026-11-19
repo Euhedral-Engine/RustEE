@@ -611,8 +611,7 @@ fn six_workers_replaying_on_a_lane_stocked_with_six_streams_make_no_other_stream
             }
         });
     };
-    rounds(60);
-    rounds(1_500);
+    rounds(1_560);
     let stats = cache.stats();
     assert_eq!(
         (stats.failed_records, stats.failed_rerecords),
