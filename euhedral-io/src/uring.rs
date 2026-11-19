@@ -2991,7 +2991,11 @@ mod tests {
             .recv_with(ours.as_raw_fd(), buf(64), OpOptions::default(), then(2))
             .unwrap();
         io.cancel(doomed);
-        assert_eq!(io.reap(), 1, "the cancelled operation ended in this visit");
+        assert_eq!(
+            io.reap(),
+            1,
+            "the read did not take the whole visit: only the cancelled operation ended"
+        );
         assert_eq!(counts(&io).1, 5, "four pieces and the cancelled attempt");
         let ended = poll(&io, 2);
         let cancelled = ended.iter().find(|(tag, _)| *tag == 2).unwrap();

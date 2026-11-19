@@ -39,8 +39,8 @@ const INCOMING_CHUNK: usize = 256;
 const ATTEMPTS_PER_POLL: usize = 64;
 /// The most pieces of one read or write a poll moves in a row before the next operation's turn, while other
 /// operations are also due (one that is cancelled or past its limit is due: it takes an attempt to end; one that
-/// waits for a descriptor that is not ready or backs off is not). An operation that is the only one due in a visit goes on until the visit's attempt
-/// budget is used.
+/// waits for a descriptor that is not ready or backs off is not). An operation that is the only one due in a
+/// visit goes on until the visit's attempt budget is used.
 const PIECES_PER_TURN: usize = 4;
 /// The most visits an open that cannot proceed yet (a FIFO with no reader, a leased file) lets pass between two
 /// of its attempts. The wait doubles from one visit up to this.
