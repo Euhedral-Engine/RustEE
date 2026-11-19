@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     clippy::disallowed_types,
     reason = "HOT-FIX(I3), HOT-FIX(I4), HOT-FIX(I5), HOT-FIX(I6)"
 )]
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, TryLockError, Weak};
 use std::time::Duration;
 
 use euhedral_core::frames::Frame;
@@ -1023,9 +1023,16 @@ impl Engine for Uring {
         let rings: Vec<Arc<Ring>> = lock!(&self.rings).clone();
         for ring in &rings {
             ring.flush_waiting(&*self.enter);
-            let Ok(mut reaping) = ring.cq.try_lock() else {
-                continue;
+            // A poisoned lock is taken, not skipped: it guards a queue of ended operations that a
+            // panic cannot leave half-changed, and skipping it would never reap this ring again.
+            let mut reaping = match ring.cq.try_lock() {
+                Ok(reaping) => reaping,
+                Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                Err(TryLockError::WouldBlock) => continue,
             };
+            // The first completion that belongs to no operation: checked once the lock is let go,
+            // so that a failed check unwinds outside it.
+            let mut stray = None;
             // Operations that ended in the backlog, a cancel or a limit: no completion will say so.
             while room() {
                 let Some(Ended { user_data, why }) = reaping.poll() else {
@@ -1039,7 +1046,7 @@ impl Engine for Uring {
                         }
                     }
                     Reaped::Again | Reaped::Stray => {
-                        debug_assert!(false, "an ended operation ({user_data:#x}) of no operation")
+                        stray.get_or_insert(("an ended operation", user_data));
                     }
                 }
             }
@@ -1069,12 +1076,16 @@ impl Engine for Uring {
                     }
                     Reaped::Again => ring.flush_waiting(&*self.enter),
                     Reaped::Stray => {
-                        debug_assert!(false, "a completion ({user_data:#x}) of no operation")
+                        stray.get_or_insert(("a completion", user_data));
                     }
                 }
             }
+            drop(reaping);
             // Room freed in the completion queue may let the backlog in.
             ring.flush_waiting(&*self.enter);
+            if let Some((what, user_data)) = stray {
+                debug_assert!(false, "{what} ({user_data:#x}) of no operation");
+            }
         }
     }
 }
@@ -2941,4 +2952,94 @@ mod tests {
         opening_or_renaming_what_is_not_there_fails_with_the_kernels_error,
         requests_push_completions_downstream,
     );
+
+    /// A completion that belongs to no operation (the `debug_assert!` of the poll fails in a debug build) does not
+    /// stop the ring's reaping for good: the next poll reaps it, and an operation submitted after it completes.
+    #[test]
+    fn a_stray_completion_does_not_stop_the_ring_from_being_reaped() {
+        let data = content(4096, 3);
+        let (_guard, file) = temp_file("stray", &data);
+        let io = AsyncIo::open_with(
+            Box::new(|submitter: &Submitter<'_>| submitter.submit()),
+            MAX_PIECE,
+        )
+        .unwrap();
+        // The first operation makes the thread's ring; the stray completion is queued behind it.
+        io.read(file.as_raw_fd(), 0, buf(16), then(1)).unwrap();
+        let uring = uring_of(&io);
+        let ring = lock!(&uring.rings)[0].clone();
+        ring.offer(Item::One(opcode::Nop::new().build().user_data(0x5757)));
+        ring.flush_waiting(&*uring.enter);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut seen: Vec<u64> = Vec::new();
+        let collect = |io: &AsyncIo, seen: &mut Vec<u64>| {
+            io.pull(
+                &mut |frame| seen.push(frame.header().id_hash()),
+                &mut |_| false,
+                u64::MAX,
+            );
+        };
+        // Reaps until the stray completion is met: it fails the check of the poll (in a debug build).
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "the stray completion was not reaped"
+            );
+            let reaped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| io.reap()));
+            collect(&io, &mut seen);
+            if reaped.is_err()
+                || (!cfg!(debug_assertions) && ring.in_kernel.load(Ordering::Acquire) == 0)
+            {
+                break;
+            }
+        }
+        // An operation submitted after it completes, and so does the first if the stray was ahead of it.
+        io.read(file.as_raw_fd(), 0, buf(16), then(2)).unwrap();
+        while !(seen.contains(&1) && seen.contains(&2)) {
+            assert!(
+                Instant::now() < deadline,
+                "the ring was never reaped again after the stray completion"
+            );
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| io.reap()));
+            collect(&io, &mut seen);
+        }
+    }
+
+    /// An engine that refuses an operation drops its continuation; if that drop panics, `pending` and `unreaped`
+    /// are back where they were.
+    #[test]
+    fn a_refused_operation_whose_continuation_panics_on_drop_leaves_the_counts() {
+        struct Bomb;
+        impl Drop for Bomb {
+            fn drop(&mut self) {
+                if !std::thread::panicking() {
+                    panic!("the continuation's state failed to drop");
+                }
+            }
+        }
+        let io = AsyncIo::open_with(
+            Box::new(|submitter: &Submitter<'_>| submitter.submit()),
+            MAX_PIECE,
+        )
+        .unwrap();
+        let bomb = Bomb;
+        // A path with a NUL byte is refused by the engine, which drops the continuation.
+        let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            io.open_path(
+                std::path::Path::new("a\0b"),
+                OpenSpec::default(),
+                Box::new(move |_| {
+                    let _bomb = &bomb;
+                    Box::new(Done {
+                        header: FrameHeader::new(1),
+                        done: None,
+                        accepted: None,
+                    })
+                }),
+            )
+        }));
+        assert!(refused.is_err(), "the drop of the continuation panicked");
+        assert_eq!(io.pending(), 0);
+        assert_eq!(io.unreaped.load(Ordering::Acquire), 0);
+    }
 }

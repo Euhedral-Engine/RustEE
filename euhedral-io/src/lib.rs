@@ -586,7 +586,13 @@ fn take_lost() -> usize {
     LOST.with(std::cell::Cell::take)
 }
 
-/// The frame of an operation whose continuation panicked: it has nothing to do.
+/// Whether `frame` is the [`Lost`] frame of an operation whose continuation panicked.
+fn is_lost(frame: &dyn Frame) -> bool {
+    (frame as &dyn std::any::Any).is::<Lost>()
+}
+
+/// The frame of an operation whose continuation panicked: it has nothing to do. The reap counts it and drops it, so
+/// no consumer sees it.
 struct Lost(FrameHeader);
 
 impl Frame for Lost {
@@ -746,8 +752,22 @@ pub struct AsyncIo {
     pacing: KeyPacing,
     /// Operations submitted, counted once the engine has them: what gives the key something new to look at.
     events: AtomicU64,
-    /// Operations whose continuation panicked (their frame is a [`Lost`] one that does nothing).
+    /// Operations whose continuation panicked (their frame is a [`Lost`] one, dropped by the reap).
     panicked: AtomicUsize,
+}
+
+/// The counts of an operation the engine has not accepted: taken back when it drops, which is when the engine
+/// refuses the operation (returning or unwinding), and forgotten once the engine has it.
+struct Uncount<'a> {
+    pending: &'a AtomicUsize,
+    unreaped: &'a AtomicUsize,
+}
+
+impl Drop for Uncount<'_> {
+    fn drop(&mut self) {
+        self.pending.fetch_sub(1, Ordering::AcqRel);
+        self.unreaped.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// The portable state of the `LatticeSource`.
@@ -817,9 +837,15 @@ impl Front {
         };
         let mut reaped = 0;
         engine.poll(&mut || true, &mut |frame| {
+            reaped += 1;
+            // An operation whose continuation panicked has no work to hand out: it is counted
+            // reaped and dropped here.
+            if is_lost(&*frame) {
+                self.pending.fetch_sub(1, Ordering::AcqRel);
+                return true;
+            }
             // The queue is unbounded: an offer is never refused.
             let _ = ready.offer(frame);
-            reaped += 1;
             true
         });
         reaped
@@ -849,6 +875,10 @@ impl Front {
         }
         let handed = std::cell::Cell::new(handed);
         engine.poll(&mut || handed.get() < demand, &mut |frame| {
+            if is_lost(&*frame) {
+                self.pending.fetch_sub(1, Ordering::AcqRel);
+                return true;
+            }
             if stop(&*frame) {
                 out.held.push_back(frame);
                 return false;
@@ -1124,8 +1154,8 @@ impl AsyncIo {
     }
 
     /// Operations whose continuation panicked while the engine reaped them: the panic was caught where the operation
-    /// had already left the engine (it did not unwind through it), the operation's frame is one that does nothing, and
-    /// the operations behind it were reaped all the same.
+    /// had already left the engine (it did not unwind through it), the operation's frame is dropped by the reap (no consumer sees
+    /// it), and the operations behind it were reaped all the same.
     pub fn panicked(&self) -> usize {
         self.panicked.load(Ordering::Relaxed)
     }
@@ -1175,11 +1205,15 @@ impl AsyncIo {
         // not pending.
         self.front.pending.fetch_add(1, Ordering::AcqRel);
         self.unreaped.fetch_add(1, Ordering::AcqRel);
+        // Undoes the counts if the engine refuses the operation, also by unwinding: dropping the
+        // refused continuation runs the application's code.
+        let counted = Uncount {
+            pending: &self.front.pending,
+            unreaped: &self.unreaped,
+        };
         let started = self.engine.submit(request, buf, then, limit);
-        if started.is_err() {
-            self.front.pending.fetch_sub(1, Ordering::AcqRel);
-            self.unreaped.fetch_sub(1, Ordering::AcqRel);
-        } else {
+        if started.is_ok() {
+            std::mem::forget(counted);
             // Something new for the key to look at, however far its back-off had come (counted after the engine has
             // the operation, so a reap that sees the count sees the operation).
             self.events.fetch_add(1, Ordering::Release);
