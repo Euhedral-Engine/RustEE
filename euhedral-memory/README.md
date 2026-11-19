@@ -84,7 +84,9 @@ time (no toolkit, no link-time dependency).
   `cuGraphInstantiateWithFlags`/`cuGraphExecDestroy`/`cuGraphDestroy`, `cuTexObjectCreate`/`Destroy`, the VMM calls and
   `cuMemGetInfo`.
 - **No locks.** Budgets are CAS loops on atomics. Owner slots, give-back orders, the reaper and the caches are lock-free
-  queues.
+  queues. `Reaper::reap` has one consumer at a time (a second `reap` returns 0 at once), frees the retired prefix of
+  its queue in order and keeps an unretired head at the front. A long driver free runs on the worker that reaps;
+  `Device::attach_deferral` keeps frees off busy moments.
 
 ```rust
 use euhedral_memory::{

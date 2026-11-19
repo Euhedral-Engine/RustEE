@@ -18,6 +18,18 @@ semantics and the tests that pin it.
 
 **Tests.** `an_order_enqueued_after_demand_was_banked_is_delivered_by_the_next_request`, `a_stop_matched_order_stays_first_for_its_owner`, `a_completion_finished_after_demand_was_banked_is_delivered_by_the_next_request`, `a_stop_matched_completion_stays_first` and `defer_and_drain_soon_from_another_thread_push_nothing_until_a_request` (fail before), `orders_are_pushed_only_within_the_demand_asked_for` and `completions_are_pushed_only_within_the_demand_asked_for` (guards), `a_pull_pushes_nothing_and_leaves_the_banked_demand_to_the_next_request` (orders and completions) and `a_pull_pushes_nothing_even_when_a_frame_is_due` (deferred calls). `orders_are_pushed_only_within_the_demand_asked_for` and `completions_are_pushed_one_request_at_a_time` fail when `request` stops subtracting what it pushed from the bank, and `an_order_a_pull_refused_is_pushed_first_by_the_next_request` and `a_completion_a_pull_refused_is_pushed_first_by_the_next_request` are the refused-first twins; the latter fails when `Moves::request` ignores the held head.
 
+## `Reaper` frees the retired prefix of its queue in order and never waits (`euhedral-memory`) (2026-11-19)
+
+**What.** `Reaper::reap` has one consumer at a time (a `ClaimCell` holds the queue's single consumer). It drops items from the front while their work has retired and stops at the first unretired one, which stays at the front. A `reap` that finds another running returns 0 at once. The per-call keep-`Vec` and the re-offer of unretired items behind newer ones are gone, and so is the `HOT-FIX` marker M1.
+
+**Why.** The old `reap` drained the queue, kept unretired items in a `Vec` (an allocation per call) and offered them back behind newer ones, which reordered the queue.
+
+**How to use.** Nothing changes in the calls. Keep one stream's frees in one `Reaper`. A long free (`cuMemFree`, `cuMemFreeHost`) still runs on the worker that calls `reap`, as service time of that work; attach a `DeferredCalls` (`Device::attach_deferral`) to keep frees off busy moments.
+
+**Semantics.** Behaviour change: a retired item behind an unretired one now waits for it (head-of-line) instead of being freed first and the unretired one moved to the back. An item whose work never retires (a marker of another queue, or of a queue that faulted and never reaches it) now holds every item behind it until `reap_all` or the drop of the `Reaper`; before, only that one item stayed queued. Items are freed in push order. Producers push from any thread.
+
+**Tests.** `reap_frees_the_retired_prefix_and_allocates_nothing` and `an_unretired_head_is_kept_at_the_front` (fail before), `a_reap_from_inside_a_reap_returns_at_once` (a guard) and `a_panicking_free_releases_the_claim`.
+
 ## A quantum retires on a lane it used (`euhedral-graph`) (2026-11-19)
 
 **What.** A `StageGraph` quantum arms its retirement on a lane it used, not always on its run's home lane. With one lane used, that lane; with several, its home lane when it is one of them, else the lowest of them that has control. The other lanes it used join that lane first, as before.
