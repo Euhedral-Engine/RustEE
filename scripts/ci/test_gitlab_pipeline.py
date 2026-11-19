@@ -51,8 +51,8 @@ class ChildPipeline(unittest.TestCase):
         jobs = pipeline("any=true\nargs=-p x\nmiri=true\nmiri_matrix=" + json.dumps(matrix) + "\n")
         jobs = {name: job for name, job in jobs.items() if name not in ("workflow", "stages", "variables")}
         args = {name: job["variables"]["ARBITER_ARGS"] for name, job in jobs.items() if "variables" in job}
-        self.assertEqual(args["miri 0: a (seeds 0..8)"], "--cpu shared:8 --mem 2G")
-        self.assertEqual(args["miri 1: b"], "--cpu shared:1 --mem 1G")
+        self.assertEqual(args["miri 0: a (seeds 0..8)"], "--threads 8 --mem 2G")
+        self.assertEqual(args["miri 1: b"], "--threads 1 --mem 1G")
         self.assertEqual(jobs["miri 0: a (seeds 0..8)"]["variables"]["MIRIFLAGS"], "-Zmiri-many-seeds=0..8")
         for name, job in jobs.items():
             if "ARBITER_EST" in job.get("variables", {}):

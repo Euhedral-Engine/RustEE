@@ -18,8 +18,8 @@ DOCKER = {"DOCKER_ARGS": "--security-opt seccomp=unconfined"}
 # (at most the runner's 600 s cap). A Miri test job asks for its own seeds' cores and its shard's memory (the matrix).
 # Measured peaks: the workspace job (fmt, Clippy, every test, release stress, loom) about 4.5 GB and, with a warm build,
 # 4 cores on average over 80 s; miri-build 1.3 GB and about 1 core over 15 s.
-WORKSPACE = {"ARBITER_ARGS": "--cpu shared:8 --mem 6G", "ARBITER_EST": "240", **DOCKER}
-MIRI_BUILD = {"ARBITER_ARGS": "--cpu shared:2 --mem 2G", "ARBITER_EST": "60", **DOCKER}
+WORKSPACE = {"ARBITER_ARGS": "--threads 8 --mem 6G", "ARBITER_EST": "240", **DOCKER}
+MIRI_BUILD = {"ARBITER_ARGS": "--threads 2 --mem 2G", "ARBITER_EST": "60", **DOCKER}
 MIRI_TEST_EST = "240"
 STABLE = ["mise install rust >/dev/null", 'eval "$(mise env -s bash)"', "rustc --version"]
 MIRI_SETUP = [
@@ -68,7 +68,7 @@ if yes("miri"):
     for i, shard in enumerate(matrix["include"]):
         jobs[f"miri {i}: {shard['name']}"] = {
             "stage": "test", "needs": ["miri-build"],
-            "variables": {"ARBITER_ARGS": f"--cpu shared:{shard['cpu']} --mem {shard['mem']}", "ARBITER_EST": MIRI_TEST_EST,
+            "variables": {"ARBITER_ARGS": f"--threads {shard['cpu']} --mem {shard['mem']}", "ARBITER_EST": MIRI_TEST_EST,
                           "MIRIFLAGS": shard["miriflags"], "COMMANDS": shard["commands"], **DOCKER},
             "script": MIRI_SETUP + [
                 "git ls-files -z | xargs -0 touch -d 2000-01-01",

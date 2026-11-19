@@ -23,7 +23,7 @@ stages: [plan, run]
 
 plan:
   stage: plan
-  variables: { ARBITER_ARGS: "--cpu shared:2" }
+  variables: { ARBITER_ARGS: "--threads 2 --mem 8G" }
   before_script:
     # This job runs the merge request's own code: the GitHub App's key must not be in its environment (the variables
     # belong to the environment `github-proxy`, which only the `windows` job declares).
@@ -59,7 +59,7 @@ workflows:
   timeout: 10m
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-  variables: { ARBITER_ARGS: "--cpu shared:2 --mem 2G", ARBITER_EST: "120" }
+  variables: { ARBITER_ARGS: "--threads 2 --mem 2G", ARBITER_EST: "120" }
   script:
     - mise exec actionlint@1.7.12 -- actionlint .github/workflows/*.yml
 
