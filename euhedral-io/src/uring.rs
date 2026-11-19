@@ -2978,6 +2978,39 @@ mod tests {
         assert_eq!(io.reap(), 2);
     }
 
+    /// A cancelled operation due in the same visit is a rival: the live read moves four pieces, not all the budget.
+    #[test]
+    fn a_cancelled_operation_in_the_visit_is_a_rival_for_the_budget() {
+        let data = content(12 * crate::READ_PIECE, 6);
+        let (_guard, file) = temp_file("long-read-rival", &data);
+        let io = positional();
+        io.read(file.as_raw_fd(), 0, buf(data.len()), then(1))
+            .unwrap();
+        let (ours, _theirs) = socket_pair(4096);
+        let doomed = io
+            .recv_with(ours.as_raw_fd(), buf(64), OpOptions::default(), then(2))
+            .unwrap();
+        io.cancel(doomed);
+        assert_eq!(
+            io.reap(),
+            1,
+            "the read did not take the whole visit: only the cancelled operation ended"
+        );
+        assert_eq!(counts(&io).1, 5, "four pieces and the cancelled attempt");
+        let ended = poll(&io, 2);
+        let cancelled = ended.iter().find(|(tag, _)| *tag == 2).unwrap();
+        assert!(Cancelled::is(
+            cancelled
+                .1
+                .done
+                .as_ref()
+                .unwrap()
+                .result
+                .as_ref()
+                .unwrap_err()
+        ));
+    }
+
     /// An accept on a blocking listener cannot block the reap, and leaves the listener as it was.
     #[test]
     fn a_positional_accept_leaves_a_blocking_listener_blocking() {
