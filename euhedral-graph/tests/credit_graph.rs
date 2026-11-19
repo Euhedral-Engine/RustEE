@@ -13,9 +13,13 @@
 //! - **Admission** = credit horizon and pool (16), from the control lane (credits, jumps to a new generation) and from
 //!   lease releases.
 //! - **One stepped clock.** The fake consumer (the harness, on the test thread) and the `FakeDevice`s read one
-//!   `StepClock` the harness owns. It advances to the next event (a device submission completing, or the
-//!   consumer's next frame, seek or pause end) only when the graph's code has done nothing for a short real
-//!   window, so "late" counts what the graph did, not how fast the machine ran.
+//!   `StepClock` the harness owns. It advances to the next event (a timer of the ledger below, or the
+//!   consumer's next frame, seek or pause end) only when nothing is owed, so "late" counts what the graph did,
+//!   not how fast the machine ran.
+//! - **An exact ledger** (`Ledger`): the test counts every callback of its own code the graph still owes (a stage
+//!   run, a pack, a dispatch, a send, a retirement, a control frame) and every timer (a marker's completion that
+//!   releases one). The harness waits for the count to reach zero, then moves what is due at the clock into the
+//!   count, and only when neither holds does time move. Nothing is read from the lattice.
 //! - **The fake consumer** takes 120 items a second, credits 1 s ahead, starts after 0.5 s, jumps at 1.5 s to
 //!   seq 480 (a `Seek`: a new generation, with a new kill switch), pauses 0.4 s and takes items to the end of
 //!   the 6 s stream, all in the scenario's time.
@@ -25,15 +29,16 @@
 //!   wall clock and counts the ones over 200 µs that the OS did not preempt (no involuntary context switch
 //!   during it).
 //!
-//! Pass: 0 late, 0 out of order, 0 beyond credit, 0 left (items, slots, completions, quanta), made
+//! Pass: the numbers of each scenario exactly (`Pinned`: shown, late, made, sent, dropped, the start and seek
+//! latencies in scenario time), 0 late (except the slow-pack scenario), 0 out of order, 0 beyond credit, 0 left (items, slots, completions, quanta), made
 //! = sent + dropped, in flight <= pool, the stream finishing within its time. A pack slower than the consumer
 //! must make items late. With `EUHEDRAL_TEST_TIMING` set (a quiet machine), also no callback over 200 µs and
 //! shutdown under 100 ms; otherwise those two are printed, not asserted (run with `-- --nocapture` to see the
 //! line; libtest hides a passing test's output).
 //!
-//! Real time still decides when the harness takes the lattice for quiet: a window (`QUIET_FOR`) with no
-//! activity of the graph's code, a 20 ms wait for the frame a due completion releases, and a 120 s guard
-//! against a hang. No assertion is on a real-time bound; the window only chooses when scenario time moves.
+//! Real time decides only how long the harness waits for the count to reach zero, and a guard (60 s) against a
+//! hang: a ledger that disagrees with the graph (a retirement expected early, a callback never made) hangs into
+//! it and fails. No assertion is on a real-time bound.
 //!
 //! `EUHEDRAL_TEST_CPUS` (default 0,1,2,3) picks the lattice's CPUs. As in `euhedral-core`'s tests
 //! that need particular hardware, the test passes without checking anything when this process may
@@ -43,7 +48,7 @@
     reason = "test fixtures: the test thread locks its records"
 )]
 #![cfg(target_os = "linux")]
-// The fake consumer is test harness, not a frame: it waits in real time for the lattice to go quiet.
+// The fake consumer is test harness, not a frame: it waits in real time for the ledger to reach zero.
 #![allow(clippy::disallowed_methods)]
 
 use std::collections::{BTreeMap, VecDeque};
@@ -111,10 +116,6 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[derive(Default)]
 struct CallbackStats {
     count: AtomicU64,
-    /// What the graph's own code has done (a stage ran, an item moved on, a control message was taken, a
-    /// lease ended): the harness's sign that the lattice is still at work. The lattice's own idle polling
-    /// does not count.
-    activity: AtomicU64,
     max_ns: AtomicU64,
     /// Over 200 µs with no involuntary context switch: a frame that waited or worked too long.
     slow: AtomicU64,
@@ -210,13 +211,7 @@ fn hops() -> &'static Hops {
     })
 }
 
-/// The graph's own code did something.
-fn touch() {
-    stats().activity.fetch_add(1, Ordering::AcqRel);
-}
-
 fn hop(index: usize, generation: u32, seq: u64) {
-    touch();
     let hops = hops();
     let mut last = lock(&hops.last);
     let (e, p) = last[index];
@@ -281,9 +276,20 @@ struct Item {
     /// The lease. Dropping the item is its retirement end; while the item holds its slot, the
     /// sent-or-dropped end is the item's too.
     lease: Arc<Lease>,
+    /// Per lane the item has submitted on, when its latest marker completes (the stage graph's boundary: see
+    /// `Ledger`).
+    lanes: Mutex<BTreeMap<u16, u64>>,
 }
 
 impl Item {
+    /// Notes a submission on `lane` that completes at `done` and returns when the item's quantum retires if
+    /// nothing else is submitted: the latest marker of each lane it used, the latest of those.
+    fn submitted(&self, lane: u16, done: u64) -> u64 {
+        let mut lanes = lock(&self.lanes);
+        lanes.insert(lane, done);
+        lanes.values().copied().max().unwrap_or(done)
+    }
+
     /// The item will never reach the sequencer: its slot is abandoned and its sent-or-dropped end
     /// ends unsent.
     fn drop_slot(&self) {
@@ -296,7 +302,6 @@ impl Item {
 
 impl Drop for Item {
     fn drop(&mut self) {
-        touch();
         self.drop_slot();
         self.lease.end();
     }
@@ -304,11 +309,16 @@ impl Drop for Item {
 
 struct Device {
     lanes: Vec<Arc<FakeDevice>>,
+    ledger: Ledger,
 }
 
 impl Device {
-    fn submit(&self, lane: u16, cost: Duration, waits: &[Marker]) -> Marker {
-        self.lanes[usize::from(lane)].submit(cost, waits)
+    /// Submits on `lane`: the marker and when it completes, in the scenario's time.
+    fn submit(&self, lane: u16, cost: Duration, waits: &[Marker]) -> (Marker, u64) {
+        let device = &self.lanes[usize::from(lane)];
+        let marker = device.submit(cost, waits);
+        let done = device.done_at_ns(marker).expect("a submission has a time");
+        (marker, done)
     }
 }
 
@@ -317,7 +327,12 @@ struct Fetch(Arc<Device>);
 impl Stage<Item> for Fetch {
     fn run(&self, item: &Item, cx: &StageCx<'_>) -> Result<Submitted, StageError> {
         hop(0, item.generation, item.seq);
-        Ok(Submitted::marker(self.0.submit(DISK, FETCH, cx.waits)))
+        let (marker, done) = self.0.submit(DISK, FETCH, cx.waits);
+        // The completion edge: the parse is released when this marker completes.
+        let at = item.submitted(DISK, done);
+        self.0.ledger.at(at, None);
+        self.0.ledger.pay();
+        Ok(Submitted::marker(marker))
     }
 
     fn abandoned(&self, item: &Item, _home: &dyn DeviceQueue) {
@@ -330,7 +345,12 @@ struct Parse(Arc<Device>);
 impl Stage<Item> for Parse {
     fn run(&self, item: &Item, cx: &StageCx<'_>) -> Result<Submitted, StageError> {
         hop(1, item.generation, item.seq);
-        Ok(Submitted::marker(self.0.submit(PARSE_Q, PARSE, cx.waits)))
+        let (marker, done) = self.0.submit(PARSE_Q, PARSE, cx.waits);
+        item.submitted(PARSE_Q, done);
+        // The submission edge: the compute is published at once.
+        self.0.ledger.owe(1);
+        self.0.ledger.pay();
+        Ok(Submitted::marker(marker))
     }
 
     fn abandoned(&self, item: &Item, _home: &dyn DeviceQueue) {
@@ -345,7 +365,8 @@ impl Stage<Item> for Compute {
         // The lane is the item's, not the pool's pick (which is random per thread): the same items go to the
         // same lanes on every run.
         let lane = COMPUTE_A + (item.seq % 2) as u16;
-        let marker = self.0.submit(lane, COMPUTE, cx.waits);
+        let (marker, done) = self.0.submit(lane, COMPUTE, cx.waits);
+        let retire_at = item.submitted(lane, done);
         if let Some(slot) = lock(&item.slot).take() {
             let Item {
                 generation,
@@ -361,6 +382,9 @@ impl Stage<Item> for Compute {
                 lease: item.lease.clone(),
             });
         }
+        // The quantum retires when the latest marker of each lane it used is reached, then its retirement runs.
+        self.0.ledger.at(retire_at, None);
+        self.0.ledger.pay();
         Ok(Submitted::marker(marker))
     }
 
@@ -428,7 +452,10 @@ impl Ctx {
             stages: Lake::new(lattice, STAGE_SINKS, Duration::ZERO),
             control: QueueIngestSink::new(),
             completions: Completions::new(&lanes),
-            device: Arc::new(Device { lanes: devices }),
+            device: Arc::new(Device {
+                lanes: devices,
+                ledger: Ledger::default(),
+            }),
             graph: OnceLock::new(),
             sequencer: OnceLock::new(),
             link: Mutex::new(Admission {
@@ -451,6 +478,8 @@ impl Ctx {
         let sequencer = Sequencer::ordered(move |ready: Staged| {
             let Some(ctx) = me.upgrade() else { return };
             hop(2, ready.generation, ready.seq);
+            // The release offers one pack, and its end pays.
+            ctx.device.ledger.owe(1);
             let frame = Pack {
                 header: FrameHeader::with_kill_switch(PACKER, Some(ready.kill.clone())),
                 ctx: ctx.clone(),
@@ -495,7 +524,6 @@ impl Ctx {
             ],
             runtime,
             move |item: Item, outcome| {
-                touch();
                 let Some(ctx) = me.upgrade() else { return };
                 ctx.counts.retired.fetch_add(1, Ordering::Relaxed);
                 match outcome {
@@ -508,6 +536,8 @@ impl Ctx {
                     }
                 }
                 drop(item);
+                // The item's last obligation, paid after everything the retirement set going.
+                ctx.device.ledger.pay();
             },
         )
         .expect("a valid graph");
@@ -532,6 +562,8 @@ impl Ctx {
             while self.again.swap(false, Ordering::AcqRel) {
                 while let Some((item, kill)) = self.make() {
                     let graph = self.graph.get().expect("the graph");
+                    // The first stage's run is owed from the start.
+                    self.device.ledger.owe(1);
                     let _ = graph.start(item, kill, Vec::new());
                 }
             }
@@ -561,6 +593,7 @@ impl Ctx {
             kill: link.kill.clone(),
             slot: Mutex::new(Some(slot)),
             lease: Lease::new(self.me.clone()),
+            lanes: Mutex::new(BTreeMap::new()),
         };
         Some((item, link.kill.clone()))
     }
@@ -568,7 +601,6 @@ impl Ctx {
     /// A item's lease ended (retired, and sent or dropped): its pool slot is free, which may admit
     /// the next.
     fn release(&self, sent: bool) {
-        touch();
         if sent {
             &self.counts.sent
         } else {
@@ -589,7 +621,6 @@ impl Ctx {
     }
 
     fn on_credit(&self, generation: u32, horizon: u64) {
-        touch();
         {
             let mut link = lock(&self.link);
             if generation != link.generation || horizon <= link.horizon {
@@ -601,10 +632,12 @@ impl Ctx {
     }
 
     fn seek(&self, generation: u32, to: u64, horizon: u64) {
-        touch();
         {
             let mut link = lock(&self.link);
             link.kill.store(true, Ordering::Release);
+            // The seek runs alone (the harness sent it with nothing owed), so no frame is between its kill check
+            // and its run: the kill takes hold of every sleeping obligation at once.
+            self.device.ledger.kill(link.generation);
             link.kill = Arc::new(AtomicBool::new(false));
             link.generation = generation;
             link.next = to;
@@ -643,20 +676,27 @@ impl Frame for Pack {
 
     fn do_finally(mut self: Box<Self>) {
         let ready = self.ready.take().expect("once");
+        let ledger = &self.ctx.device.ledger;
         if !self.header.is_alive() {
+            // Dropping the item ends its lease, which may admit the next: before this frame's end is paid.
+            drop(ready);
+            ledger.pay();
             return;
         }
         hop(3, ready.generation, ready.seq);
-        let marker = self
+        let (marker, done) = self
             .ctx
             .device
             .submit(PACK_Q, self.ctx.pack_cost, &[ready.marker]);
+        // The dispatch follows the pack's completion; a seek ends that entry at once.
+        ledger.at(done, Some(ready.generation));
         let next = Dispatch {
             header: FrameHeader::with_kill_switch(SOCKET, Some(ready.kill.clone())),
             ctx: self.ctx.clone(),
             ready: Some(ready),
         };
         self.ctx.completions.after_marker(marker, Box::new(next));
+        ledger.pay();
     }
 }
 
@@ -672,17 +712,22 @@ impl Frame for Dispatch {
 
     fn do_finally(mut self: Box<Self>) {
         let ready = self.ready.take().expect("once");
+        let ledger = &self.ctx.device.ledger;
         if !self.header.is_alive() {
+            drop(ready);
+            ledger.pay();
             return;
         }
         hop(4, ready.generation, ready.seq);
-        let marker = self.ctx.device.submit(NIC, SEND, &[]);
+        let (marker, done) = self.ctx.device.submit(NIC, SEND, &[]);
+        ledger.at(done, None);
         let next = Sent {
             header: FrameHeader::new(0x5e47),
             ctx: self.ctx.clone(),
             ready: Some(ready),
         };
         self.ctx.completions.after_marker(marker, Box::new(next));
+        ledger.pay();
     }
 }
 
@@ -703,6 +748,9 @@ impl Frame for Sent {
             generation: ready.generation,
             seq: ready.seq,
         });
+        // The lease's end may admit the next item: before this frame's end is paid.
+        drop(ready);
+        self.ctx.device.ledger.pay();
     }
 }
 
@@ -740,6 +788,7 @@ impl Frame for ControlFrame {
             }) => self.ctx.seek(generation, to, horizon),
             None => {}
         }
+        self.ctx.device.ledger.pay();
         Ok(())
     }
 }
@@ -747,24 +796,98 @@ impl Frame for ControlFrame {
 // ---------------------------------------------------------------------------------------------
 // The stepped clock and the fake consumer (the harness).
 
-/// A real-time window, not a proof of quiet: the harness takes the lattice for quiet at the current scenario
-/// time once the graph's own code (a stage run, a hop, a control message taken, a lease end, an item's
-/// drop, a retirement; not the lattice's idle polling) has not counted an activity for this long. A frame
-/// that is queued but has not reached a worker within the window is missed, so on a machine stalled for
-/// longer the harness can step time early. An exact test needs a count of the frames the lattice holds.
-const QUIET_FOR: Duration = Duration::from_micros(500);
-/// After a step that made a device submission complete, the longest real time the harness waits for the
-/// graph's code to show an activity (the frame the completion releases) before it starts the quiet window.
-const RELEASE_WITHIN: Duration = Duration::from_millis(20);
-/// A real-time guard that only catches a hang; no assertion depends on it.
-const HANG_GUARD: Duration = Duration::from_secs(120);
+/// A real-time guard that only catches a hang: the longest the harness waits for the obligations owed to be
+/// paid. No assertion depends on it.
+const HANG_GUARD: Duration = Duration::from_secs(60);
 /// The bound on the scenario's own time (the stream is under 7 s): beyond it nothing is making progress.
 const STREAM_TIME_LIMIT_NS: u64 = 30_000_000_000;
+
+/// What the test knows the graph still has to do, counted by the test itself; the lattice's own queues and counters
+/// are not read. An obligation is one callback of the test's code that will happen, with no further time needed (a
+/// frame queued or running), or one thing waiting for a time (a timer). The harness moves scenario time only when
+/// nothing is owed, and moves a timer that is due into what is owed, so the graph has done everything it can at
+/// one time before the next time begins. Real time decides only how long the harness waits for a count to reach
+/// zero.
+///
+/// The model, per item, in the order a handler works: register what follows (a timer, or a new obligation), then pay
+/// its own. So the count never reaches zero while a handler's follow-up is unaccounted.
+/// - Starting an item owes its fetch's run. The fetch registers a timer at its marker's completion, which releases
+///   the parse (a completion edge) and pays. The parse owes the compute (a submission edge: published at once)
+///   and pays; the compute registers the item's retirement timer, its slot's in-order release owes a pack, and
+///   it pays.
+/// - The retirement rule lives in `stage_graph.rs` (the module docs, `arm_boundary`, `hold_killed_work`): a
+///   quantum retires on the latest marker of each lane it used, once its frames have ended, and a kill ends the
+///   completion entries at their next visit and the quantum then waits for the same markers. The timer is
+///   therefore the latest of the item's markers, one per lane (`Item::submitted`), whether or not the item
+///   was killed on the way. When it is due the retirement owes one callback: the retirement closure, which
+///   pays last, after the item's drop has ended its lease.
+/// - The pack owes a dispatch timer at its marker (or, killed, only ends); the dispatch a send timer at the
+///   NIC's marker; the send ends the item's lease. A dispatch whose frame carries a kill switch is an entry
+///   the lattice ends at its next visit after the kill, so a seek makes those owed at once.
+/// - A control message owes its frame's run.
+#[derive(Default)]
+struct Ledger {
+    owed: AtomicU64,
+    timers: Mutex<Vec<Timer>>,
+}
+
+struct Timer {
+    /// Scenario time, ns.
+    at: u64,
+    /// A dispatch entry of this generation (ended at once by a seek of it).
+    dispatch_of: Option<u32>,
+}
+
+impl Ledger {
+    fn owe(&self, n: u64) {
+        self.owed.fetch_add(n, Ordering::SeqCst);
+    }
+
+    fn pay(&self) {
+        let was = self.owed.fetch_sub(1, Ordering::SeqCst);
+        assert!(was > 0, "paid what was not owed");
+    }
+
+    fn owed(&self) -> u64 {
+        self.owed.load(Ordering::SeqCst)
+    }
+
+    /// One thing is owed once scenario time reaches `at`.
+    fn at(&self, at: u64, dispatch_of: Option<u32>) {
+        lock(&self.timers).push(Timer { at, dispatch_of });
+    }
+
+    /// A seek of `generation`: its dispatch entries end at the lattice's next visit.
+    fn kill(&self, generation: u32) {
+        let mut timers = lock(&self.timers);
+        let before = timers.len();
+        timers.retain(|t| t.dispatch_of != Some(generation));
+        self.owe((before - timers.len()) as u64);
+    }
+
+    /// Moves what is due at `now` into what is owed; how many.
+    fn sweep(&self, now: u64) -> usize {
+        let mut timers = lock(&self.timers);
+        let before = timers.len();
+        timers.retain(|t| t.at > now);
+        let due = before - timers.len();
+        self.owe(due as u64);
+        due
+    }
+
+    fn next(&self) -> Option<u64> {
+        lock(&self.timers).iter().map(|t| t.at).min()
+    }
+
+    fn waiting(&self) -> usize {
+        lock(&self.timers).len()
+    }
+}
 
 /// The test-owned time, and what advances it.
 struct Stepper {
     clock: Arc<StepClock>,
-    device: Arc<FakeDevice>,
+    ctx: Arc<Ctx>,
     started: Instant,
 }
 
@@ -773,42 +896,41 @@ impl Stepper {
         self.clock.now_ns()
     }
 
-    /// Waits until the graph's code has done nothing for `QUIET_FOR`; with `within`, first until it has done
-    /// something since `before` (a completion that became due releases a frame) or that long has passed.
-    fn settle(&self, before: u64, within: Option<Duration>) {
-        let activity = || stats().activity.load(Ordering::Acquire);
-        let waiting = Instant::now();
-        while let Some(within) = within
-            && activity() == before
-            && waiting.elapsed() < within
-            && self.started.elapsed() < HANG_GUARD
-        {
-            std::thread::sleep(Duration::from_micros(50));
-        }
-        let mut seen = activity();
-        let mut since = Instant::now();
+    fn ledger(&self) -> &Ledger {
+        &self.ctx.device.ledger
+    }
+
+    /// Waits (in real time) until nothing is owed, then moves what is due into what is owed, until nothing is
+    /// owed and nothing is due: the graph has done everything it can at this scenario time.
+    fn settle(&self) {
+        let ledger = self.ledger();
         loop {
-            std::thread::sleep(Duration::from_micros(50));
-            let now = activity();
-            if now != seen {
-                seen = now;
-                since = Instant::now();
-            } else if since.elapsed() >= QUIET_FOR {
+            let waiting = Instant::now();
+            while ledger.owed() > 0 {
+                assert!(
+                    waiting.elapsed() < HANG_GUARD && self.started.elapsed() < 20 * HANG_GUARD,
+                    "the graph never paid {} obligations at {} ns ({} timers waiting)",
+                    ledger.owed(),
+                    self.now_ns(),
+                    ledger.waiting()
+                );
+                std::thread::sleep(Duration::from_micros(20));
+            }
+            if ledger.sweep(self.now_ns()) == 0 {
                 return;
             }
-            assert!(
-                self.started.elapsed() < HANG_GUARD,
-                "the lattice never went quiet"
-            );
         }
     }
 
-    /// Sets the clock to `next` and lets the lattice go quiet at the new time.
+    /// The next time something is waiting for.
+    fn next_timer(&self) -> Option<u64> {
+        self.ledger().next()
+    }
+
+    /// Sets the clock to `next` and lets the graph do all it can at the new time.
     fn step_to(&self, next: u64) {
-        let before = stats().activity.load(Ordering::Acquire);
-        let due = self.device.next_done_after_ns(self.now_ns()) == Some(next);
         self.clock.advance_to(next);
-        self.settle(before, due.then_some(RELEASE_WITHIN));
+        self.settle();
     }
 }
 
@@ -830,11 +952,9 @@ const FRAME_NS: u64 = 1_000_000_000 / FPS;
 
 fn consumer(ctx: &Arc<Ctx>, stepper: &Stepper) -> ConsumerReport {
     let mut report = ConsumerReport::default();
-    // Every control message is taken by a frame that shows as activity, so after a send the harness waits for
-    // that before it looks for quiet.
-    let sent_control = std::cell::Cell::new(false);
     let send = |msg: Control| {
-        sent_control.set(true);
+        // Owed before it is offered: the frame's end pays it.
+        stepper.ledger().owe(1);
         let frame = ControlFrame {
             header: FrameHeader::new(CONTROL),
             ctx: ctx.clone(),
@@ -857,16 +977,13 @@ fn consumer(ctx: &Arc<Ctx>, stepper: &Stepper) -> ConsumerReport {
     let mut paused_done = false;
     let mut credited = AHEAD;
     let mut eos = false;
-    let before = stats().activity.load(Ordering::Acquire);
     send(Control::Seek {
         generation,
         to: 0,
         horizon: AHEAD,
     });
-    stepper.settle(before, Some(HANG_GUARD));
+    stepper.settle();
     loop {
-        let before = stats().activity.load(Ordering::Acquire);
-        sent_control.set(false);
         let now = stepper.now_ns();
         // What this pass did: if it did anything the lattice must go quiet at this time before the next pass.
         let mut acted = false;
@@ -957,12 +1074,12 @@ fn consumer(ctx: &Arc<Ctx>, stepper: &Stepper) -> ConsumerReport {
             return report;
         }
         if acted {
-            stepper.settle(before, sent_control.get().then_some(HANG_GUARD));
+            stepper.settle();
             continue;
         }
         // Nothing more to do at this time: the next thing that can happen is a device submission
         // completing or one of the consumer's own times.
-        let mut next = stepper.device.next_done_after_ns(now);
+        let mut next = stepper.next_timer();
         let mut consider = |at: u64| {
             if at > now {
                 next = Some(next.map_or(at, |n| n.min(at)));
@@ -1062,25 +1179,17 @@ fn run(pack_cost: Duration) -> Option<Outcome> {
         &["disk", "parse", "compute-a", "compute-b", "pack", "nic"],
         &clock,
     );
-    let probe = devices[0].clone();
     let ctx = Ctx::new(lattice.clone(), pack_cost, lanes, devices);
     lattice.add_upstream(ctx.completions.clone()).unwrap();
     let unit = ctx.stages.admit().unwrap(); // attaches the lake's sinks
     lattice.add_upstream(ctx.control.delegate()).unwrap();
     let s = stats();
-    for counter in [
-        &s.count,
-        &s.activity,
-        &s.max_ns,
-        &s.slow,
-        &s.preempted,
-        &s.voluntary,
-    ] {
+    for counter in [&s.count, &s.max_ns, &s.slow, &s.preempted, &s.voluntary] {
         counter.store(0, Ordering::Relaxed);
     }
     let stepper = Stepper {
         clock,
-        device: probe,
+        ctx: ctx.clone(),
         started: Instant::now(),
     };
 
@@ -1092,9 +1201,7 @@ fn run(pack_cost: Duration) -> Option<Outcome> {
     let graph = ctx.graph.get().unwrap().clone();
     let mut drain_steps = 0u64;
     while (ctx.in_flight() > 0 || graph.live() > 0) && drain_steps < 1_000_000 {
-        let Some(next) = stepper.device.next_done_after_ns(stepper.now_ns()) else {
-            // Nothing is left to complete: let the lattice finish what only needs a worker.
-            stepper.settle(0, None);
+        let Some(next) = stepper.next_timer() else {
             break;
         };
         stepper.step_to(next);
@@ -1184,11 +1291,57 @@ fn assert_graph_correct(o: &Outcome) {
     assert!(o.max_in_flight <= POOL);
 }
 
+/// What a scenario does, exactly: on the stepped clock with the ledger the same on every run and every machine.
+struct Pinned {
+    shown: u64,
+    late: u64,
+    made: u64,
+    sent: u64,
+    dropped: u64,
+    /// Scenario time, ns.
+    start_latency: u64,
+    seek_latency: u64,
+}
+
+fn assert_pinned(o: &Outcome, pinned: &Pinned) {
+    let got = Pinned {
+        shown: o.report.shown,
+        late: o.report.late,
+        made: o.made,
+        sent: o.sent,
+        dropped: o.dropped,
+        start_latency: o.report.start_latency.map_or(0, |d| d.as_nanos() as u64),
+        seek_latency: o.report.seek_latency.map_or(0, |d| d.as_nanos() as u64),
+    };
+    assert_eq!(
+        (
+            got.shown,
+            got.late,
+            got.made,
+            got.sent,
+            got.dropped,
+            got.start_latency,
+            got.seek_latency
+        ),
+        (
+            pinned.shown,
+            pinned.late,
+            pinned.made,
+            pinned.sent,
+            pinned.dropped,
+            pinned.start_latency,
+            pinned.seek_latency
+        ),
+        "(shown, late, made, sent, dropped, start latency, seek latency) of the scenario"
+    );
+}
+
 /// A pack the consumer's rate can be met with: the graph is correct and no item is late.
-fn scenario(pack_cost: Duration) {
+fn scenario(pack_cost: Duration, pinned: &Pinned) {
     let Some(o) = run(pack_cost) else { return };
     assert_graph_correct(&o);
     assert_eq!(o.report.late, 0, "late");
+    assert_pinned(&o, pinned);
     // Wall-clock timing is a report unless EUHEDRAL_TEST_TIMING is set: a loaded machine delays a callback
     // without an involuntary context switch (CPU quota, hypervisor steal, a sibling thread), which
     // the preemption count cannot see. Set it on a quiet machine to assert.
@@ -1213,14 +1366,36 @@ static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
 #[test]
 fn the_credit_graph_with_a_fast_pack() {
     let _one = lock(&ONE_AT_A_TIME);
-    scenario(Duration::from_micros(2500));
+    scenario(
+        Duration::from_micros(2500),
+        &Pinned {
+            shown: 397,
+            late: 0,
+            made: 517,
+            sent: 516,
+            dropped: 1,
+            start_latency: 10_500_000,
+            seek_latency: 11_833_281,
+        },
+    );
 }
 
 /// A 7 ms pack: the pack is the bottleneck, the pool fills, and the seek kills a full pool.
 #[test]
 fn the_credit_graph_with_a_slow_pack() {
     let _one = lock(&ONE_AT_A_TIME);
-    scenario(Duration::from_micros(7000));
+    scenario(
+        Duration::from_micros(7000),
+        &Pinned {
+            shown: 368,
+            late: 0,
+            made: 469,
+            sent: 453,
+            dropped: 16,
+            start_latency: 15_000_000,
+            seek_latency: 118_000_000,
+        },
+    );
 }
 
 /// The stepped scenario counts lateness: a 16 ms pack (62 items a second) is slower than the consumer's 120 items a second, so the
@@ -1233,4 +1408,16 @@ fn a_pack_slower_than_the_consumer_makes_items_late() {
     };
     assert_graph_correct(&o);
     assert!(o.report.late > 0, "a pack slower than the consumer is late");
+    assert_pinned(
+        &o,
+        &Pinned {
+            shown: 240,
+            late: 63,
+            made: 349,
+            sent: 333,
+            dropped: 16,
+            start_latency: 24_000_000,
+            seek_latency: 268_000_000,
+        },
+    );
 }
