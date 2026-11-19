@@ -425,7 +425,7 @@ impl Sightings {
 /// each worker forks a stream of its own from the lane for its replay (an event recorded on the lane and awaited by the
 /// private stream), makes its cross-lane waits and the launch there, and joins the lane back (an event recorded on the
 /// private stream and awaited by the lane); the lane's marker is recorded after that join. The private streams are
-/// stocked per lane and reused, so nothing is created after warm-up. The waits are therefore an argument of the run
+/// stocked per lane and reused: one is created only when more workers overlap than ever did. The waits are therefore an argument of the run
 /// ([`run_after`](Self::run_after)), not something the stage enqueues on the lane first.
 ///
 /// **Why the instance may go back once the replay is enqueued.** A launch's parameters are fixed when it is issued (an
