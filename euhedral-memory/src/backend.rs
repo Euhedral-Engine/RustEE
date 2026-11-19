@@ -6,7 +6,7 @@
 //! [`Reaper`] behind the device work that last used the memory, so it is not freed while the device may still use it.
 //! [`Reaper::reap`] makes the frees of the retired prefix on the thread that calls it: long calls run on the worker
 //! that needs them, and the blocking time counts as the service time of the work that called `reap`. A device with a
-//! `DeferredCalls` attached (`Device::attach_deferral` in `euhedral-gpu`) keeps frees off busy moments. A caller whose
+//! `DeferredCalls` attached (`Device::attach_deferral`, in this crate's `cuda` module) keeps frees off busy moments. A caller whose
 //! frees are long enough to starve other work reaps from a thread of its own, or from a lattice set aside for
 //! blocking work.
 
@@ -104,7 +104,9 @@ type Entry<T> = (Box<dyn Retired>, T);
 /// Frees queued behind the device work that last used them. `push` never waits; `reap` frees the retired prefix of
 /// the queue, in the order it was pushed, and stops at the first item whose work has not retired: that item stays at
 /// the front, so nothing behind it is freed before it (one queue should hold one stream's frees; a queue that mixes
-/// streams delays a retired item behind an unretired one of another stream).
+/// streams delays a retired item behind an unretired one of another stream). An item whose work never retires (a
+/// marker of another queue, or of a queue that faulted and never reaches it) holds every item behind it until
+/// `reap_all` or the drop of the `Reaper`; it is not skipped.
 ///
 /// Producers push from any thread. `reap` has one consumer at a time: a `reap` that finds another one running
 /// returns 0 at once and never waits.
@@ -113,7 +115,7 @@ type Entry<T> = (Box<dyn Retired>, T);
 /// synchronize the device, on the thread that called `reap`. Long calls run on the worker that needs them: when a
 /// lattice worker reaps, the free counts as the service time of the work that called `reap`, and nothing here moves
 /// it elsewhere. To keep frees off busy moments, attach a `DeferredCalls` to the device (`Device::attach_deferral`
-/// in `euhedral-gpu`): the frees are then queued and made at a moment with nothing in flight. A caller whose frees
+/// in this crate's `cuda` module): the frees are then queued and made at a moment with nothing in flight. A caller whose frees
 /// are long enough to starve other work reaps from a thread of its own, or from a lattice set aside for blocking
 /// work.
 pub struct Reaper<T: Send> {

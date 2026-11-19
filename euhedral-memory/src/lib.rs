@@ -13,7 +13,7 @@
 //! - [`backend`]: the allocation side. The planner accounts and decides; a [`Backend`] allocates and frees, and a
 //!   [`Reaper`] queues frees behind the device work that last used the memory, and [`Reaper::reap`] frees the retired
 //!   prefix of its queue, in order, on the thread that calls it (long calls run on the worker that needs them;
-//!   `Device::attach_deferral` in `euhedral-gpu` keeps them off busy moments).
+//!   `Device::attach_deferral` in the `cuda` module keeps them off busy moments).
 //! - [`deferred`]: blocking driver calls (frees, unloads) held by a [`DeferredCalls`] lattice source until no lane has work
 //!   in flight (or a bound forces them), instead of made where the memory is dropped: a call on another thread still makes
 //!   every stream's enqueue wait for the running kernels.

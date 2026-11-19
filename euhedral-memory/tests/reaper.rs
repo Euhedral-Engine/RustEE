@@ -123,7 +123,7 @@ fn an_unretired_head_is_kept_at_the_front() {
 }
 
 #[test]
-fn a_reap_racing_a_reap_returns_without_waiting() {
+fn a_reap_from_inside_a_reap_returns_at_once() {
     // The inner reap runs from inside the outer one (a free, or a retirement check, that reaps): the claim is
     // held, so it returns at once with nothing freed.
     let order = Order::new(4);
@@ -144,4 +144,22 @@ fn a_reap_racing_a_reap_returns_without_waiting() {
     assert_eq!(inner_result.load(Ordering::SeqCst), 0);
     assert_eq!(order.freed(), vec![0, 1]);
     assert_eq!(r.reap_all(), 0);
+}
+
+#[test]
+fn a_panicking_free_releases_the_claim() {
+    struct Bomb;
+    impl Drop for Bomb {
+        fn drop(&mut self) {
+            panic!("a free that panics");
+        }
+    }
+    let order = Order::new(4);
+    let r: Reaper<Box<dyn Send>> = Reaper::new();
+    r.push(|| true, Box::new(Bomb));
+    r.push(|| true, Box::new(Item(1, order.clone())));
+    let first = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| r.reap()));
+    assert!(first.is_err());
+    assert_eq!(r.reap(), 1, "the claim was released; the rest is freed");
+    assert_eq!(order.freed(), vec![1]);
 }
