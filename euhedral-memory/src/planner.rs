@@ -1320,6 +1320,9 @@ impl LatticeSource for GiveBacks {
         stop: &mut dyn FnMut(&dyn Frame) -> bool,
         demand: u64,
     ) -> u64 {
+        if self.complete.load(Ordering::Acquire) {
+            return 0;
+        }
         let Some(mut inside) = self.inside.try_enter() else {
             return 0;
         };

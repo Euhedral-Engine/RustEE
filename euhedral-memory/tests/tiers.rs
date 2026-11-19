@@ -1010,3 +1010,26 @@ fn a_completion_a_pull_refused_is_pushed_first_by_the_next_request() {
     let order: Vec<_> = seen.lock().unwrap().iter().map(|d| d.resident).collect();
     assert_eq!(order, vec![first, second]);
 }
+
+#[test]
+fn a_pull_after_complete_pushes_nothing() {
+    let r = rig([4, 4, 4], 8);
+    let o = r
+        .planner
+        .open_owner(OwnerSpec::new("consumer", Priority(50), Scope::Process));
+    let source = r.mover.moves();
+    let keep = Arc::new(Keep::default());
+    source.clone().add_downstream(keep.clone());
+    let seen: Arc<std::sync::Mutex<Vec<MoveDone>>> = Arc::default();
+    source.request(2);
+    keep.run();
+    moved(&r, o, &seen);
+    settle(&r.mover);
+    source.complete();
+    assert_eq!(
+        source.pull(&mut |_| panic!("complete"), &mut |_| false, 8),
+        0
+    );
+    keep.run();
+    assert!(seen.lock().unwrap().is_empty());
+}

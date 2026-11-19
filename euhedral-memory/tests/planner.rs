@@ -799,3 +799,23 @@ fn an_order_a_pull_refused_is_pushed_first_by_the_next_request() {
     }
     assert_eq!(*got.lock().unwrap(), vec![GIB, 2 * GIB, 3 * GIB]);
 }
+
+#[test]
+fn a_pull_after_complete_pushes_nothing() {
+    use euhedral_core::generics::LatticeSource;
+    use std::sync::Arc;
+    let keep = Arc::new(Keep::default());
+    let k = keep.clone();
+    let (p, _got, _held) = three_orders(move |p| {
+        let source = p.give_backs();
+        source.clone().add_downstream(k);
+        source.request(2);
+    });
+    let source = p.give_backs();
+    source.complete();
+    assert_eq!(
+        source.pull(&mut |_| panic!("complete"), &mut |_| false, 8),
+        0
+    );
+    assert_eq!(keep.frames.lock().unwrap().len(), 0);
+}
