@@ -766,13 +766,15 @@ fn conclude(op: Op, result: io::Result<usize>) -> Box<dyn Frame> {
     conclude_io(buf, then, fills, result)
 }
 
-fn c_path(path: &std::path::Path) -> io::Result<CString> {
+pub(super) fn c_path(path: &std::path::Path) -> io::Result<CString> {
     use std::os::unix::ffi::OsStrExt;
     CString::new(path.as_os_str().as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a path with a NUL byte"))
 }
 
-fn socket_address(to: std::net::SocketAddr) -> (Box<libc::sockaddr_storage>, libc::socklen_t) {
+pub(super) fn socket_address(
+    to: std::net::SocketAddr,
+) -> (Box<libc::sockaddr_storage>, libc::socklen_t) {
     // SAFETY: `sockaddr_storage` is plain old data; all zeros is a valid (unspecified) address.
     let mut storage: Box<libc::sockaddr_storage> = Box::new(unsafe { std::mem::zeroed() });
     let len = match to {
@@ -821,10 +823,30 @@ fn socket_address(to: std::net::SocketAddr) -> (Box<libc::sockaddr_storage>, lib
 impl Uring {
     /// The engine on the native `io_uring_enter`; the error is the first ring's setup refusal.
     pub(super) fn native() -> io::Result<Self> {
-        Self::with(
+        Self::probed(
             Box::new(|submitter: &Submitter<'_>| submitter.submit()),
             MAX_PIECE,
         )
+    }
+
+    /// As [`with`](Self::with), after proving that the kernel accepts a submission: some seccomp profiles allow
+    /// `io_uring_setup` and refuse `io_uring_enter`, and every operation would then wait for ever. A no-op is
+    /// submitted through `enter` on a ring of its own, which returns at once (it does not wait for the
+    /// completion); the error is whatever `enter` refused with.
+    pub(super) fn probed(enter: Box<Enter>, max_piece: usize) -> io::Result<Self> {
+        let ring = Ring::new(0, 2)?;
+        {
+            // SAFETY: the ring is this function's own: this is its only `SubmissionQueue`.
+            let mut sq = unsafe { ring.uring.submission_shared() };
+            let nop = opcode::Nop::new().build().user_data(IGNORED);
+            // SAFETY: a no-op entry reads no memory.
+            if unsafe { sq.push(&nop) }.is_err() {
+                return Err(io::Error::other("the probe ring has no room"));
+            }
+        }
+        enter(&ring.uring.submitter())?;
+        drop(ring);
+        Self::with(enter, max_piece)
     }
 
     /// An engine with `enter` in place of `io_uring_enter` and pieces of at most `max_piece` bytes
@@ -924,7 +946,7 @@ impl Uring {
 }
 
 /// `open(2)` flags for an [`OpenSpec`].
-fn open_flags(spec: OpenSpec) -> i32 {
+pub(super) fn open_flags(spec: OpenSpec) -> i32 {
     let access = match (spec.read, spec.write) {
         (_, false) => libc::O_RDONLY,
         (false, true) => libc::O_WRONLY,
@@ -2482,7 +2504,7 @@ mod tests {
         let io = positional();
         let (ours, mut theirs) = socket_pair(4096);
         let limit = OpOptions {
-            limit: Some(Duration::from_millis(20)),
+            limit: Some(Duration::ZERO),
         };
         io.recv_with(ours.as_raw_fd(), buf(64), limit, then(1))
             .unwrap();
@@ -2546,11 +2568,243 @@ mod tests {
         let done = poll(&io, 1).pop().unwrap().1.done.unwrap();
         assert!(done.result.is_ok());
         assert_eq!(fd_flags(socket.as_raw_fd()), before);
+        // The handshake ran non-blocking: the engine asked `poll(2)` about the socket.
+        assert!(
+            counts(&io).0 >= 1,
+            "the connect went through the readiness call"
+        );
     }
 
     fn fd_flags(fd: RawFd) -> i32 {
         // SAFETY: a plain `fcntl` of a descriptor the test owns.
         unsafe { libc::fcntl(fd, libc::F_GETFL) }
+    }
+
+    /// The positional engine of an `AsyncIo` opened on it.
+    fn positional_of(io: &AsyncIo) -> &crate::positional::Positional {
+        match &io.engine {
+            Platform::Positional(engine) => engine,
+            Platform::Uring(_) => unreachable!("opened on the positional engine"),
+        }
+    }
+
+    fn counts(io: &AsyncIo) -> (usize, usize) {
+        let engine = positional_of(io);
+        (
+            engine.readiness_calls.load(Ordering::Relaxed),
+            engine.attempts.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Operations that wait for a descriptor cost one readiness call between them, and no attempt of their own.
+    #[test]
+    fn idle_receives_cost_one_readiness_call_per_reap_and_no_attempts() {
+        let io = positional();
+        let pairs: Vec<_> = (0..50).map(|_| socket_pair(4096)).collect();
+        for (n, (ours, _theirs)) in pairs.iter().enumerate() {
+            io.recv(ours.as_raw_fd(), buf(64), then(n as u64)).unwrap();
+        }
+        assert_eq!(io.reap(), 0);
+        assert_eq!(counts(&io), (1, 0), "one call, no receive attempted");
+        assert_eq!(io.reap(), 0);
+        assert_eq!(counts(&io), (2, 0));
+        // A file read beside them is attempted (it needs no readiness) and the idle ones still are not.
+        let data = content(100, 9);
+        let (_guard, file) = temp_file("beside", &data);
+        io.read(file.as_raw_fd(), 0, buf(100), then(1000)).unwrap();
+        assert_eq!(io.reap(), 1);
+        assert_eq!(counts(&io), (3, 1));
+        // One of them becomes ready: only it is attempted.
+        let (_, theirs) = &pairs[7];
+        (&*theirs).write_all(b"x").unwrap();
+        assert_eq!(io.reap(), 1);
+        assert_eq!(counts(&io), (4, 2));
+    }
+
+    /// The attempts of a reap are bounded however many operations are ready.
+    #[test]
+    fn a_reap_makes_at_most_the_attempt_budget() {
+        let io = positional();
+        let (ours, mut theirs) = socket_pair(4096);
+        theirs.write_all(&[1; 200]).unwrap();
+        for n in 0..100 {
+            io.recv(ours.as_raw_fd(), buf(1), then(n)).unwrap();
+        }
+        io.reap();
+        assert_eq!(counts(&io).1, 64);
+    }
+
+    /// A pipe is not seekable: a read and a write on it go on as a stream, on either engine.
+    fn a_pipe_carries_a_write_and_a_read(io: Arc<AsyncIo>) {
+        let mut ends = [0; 2];
+        // SAFETY: `pipe2` fills the two descriptors of the array.
+        let made = unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) };
+        assert_eq!(made, 0);
+        // SAFETY: both descriptors were just made and nothing else owns them.
+        let (read_end, write_end) =
+            unsafe { (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) };
+        let data = content(100, 21);
+        // The read waits for the write.
+        io.read(read_end.as_raw_fd(), 0, buf(100), then(1)).unwrap();
+        io.write(
+            write_end.as_raw_fd(),
+            0,
+            IoBuf {
+                filled: data.len(),
+                bytes: data.clone(),
+            },
+            then(2),
+        )
+        .unwrap();
+        let mut done = poll(&io, 2);
+        done.sort_by_key(|(tag, _)| *tag);
+        let read = done.remove(0).1.done.unwrap();
+        assert_eq!(read.result.unwrap(), 100);
+        assert_eq!(read.buf.bytes, data);
+        assert_eq!(done.remove(0).1.done.unwrap().result.unwrap(), 100);
+        assert_eq!(io.pending(), 0);
+    }
+
+    fn fifo_path(name: &str) -> (TempFile, std::ffi::CString) {
+        let (guard, file) = temp_file(name, b"");
+        drop(file);
+        std::fs::remove_file(&guard.0).unwrap();
+        let path = {
+            use std::os::unix::ffi::OsStrExt;
+            std::ffi::CString::new(guard.0.as_os_str().as_bytes()).unwrap()
+        };
+        // SAFETY: `path` is a NUL-terminated string.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        (guard, path)
+    }
+
+    fn open_request(path: &std::path::Path, write: bool) -> Request {
+        Request::Open {
+            path: path.to_owned(),
+            spec: crate::OpenSpec {
+                read: !write,
+                write,
+                create: Create::Never,
+                unix_mode: 0o644,
+            },
+        }
+    }
+
+    fn open_then(tag: u64) -> Then {
+        Then::Raw(Box::new(move |result| {
+            Box::new(Done {
+                header: FrameHeader::new(tag),
+                done: Some(IoDone {
+                    buf: IoBuf::default(),
+                    result,
+                }),
+                accepted: None,
+            })
+        }))
+    }
+
+    /// The frames an engine's poll found.
+    #[allow(clippy::vec_box)] // the frames come out of the engine boxed
+    fn engine_found(engine: &dyn Engine) -> Vec<Box<Done>> {
+        let mut found = Vec::new();
+        engine.poll(&mut || true, &mut |frame| {
+            found.push(
+                (frame as Box<dyn std::any::Any>)
+                    .downcast::<Done>()
+                    .expect("a Done frame"),
+            );
+            true
+        });
+        found
+    }
+
+    /// Opening a FIFO never holds the reaping worker; a write open with no reader waits in the line and a cancel
+    /// reaches it. The descriptor comes back blocking, as from io_uring.
+    #[test]
+    fn a_fifo_open_never_holds_the_reap_and_a_cancel_ends_the_open_that_has_no_reader() {
+        let (guard, _path) = fifo_path("fifo");
+        let engine = crate::positional::Positional::new();
+        engine
+            .submit(
+                open_request(&guard.0, false),
+                IoBuf::default().into(),
+                open_then(1),
+                None,
+            )
+            .unwrap();
+        let mut found = engine_found(&engine);
+        let read_end = found
+            .pop()
+            .expect("the read open ended at once")
+            .done
+            .unwrap()
+            .result
+            .unwrap();
+        assert_eq!(
+            fd_flags(read_end as RawFd) & libc::O_NONBLOCK,
+            0,
+            "blocking, as io_uring's"
+        );
+        // SAFETY: the engine opened this descriptor for us.
+        unsafe { libc::close(read_end as RawFd) };
+        let id = engine
+            .submit(
+                open_request(&guard.0, true),
+                IoBuf::default().into(),
+                open_then(2),
+                None,
+            )
+            .unwrap();
+        assert!(engine_found(&engine).is_empty());
+        assert!(engine_found(&engine).is_empty());
+        engine.cancel(id);
+        let error = engine_found(&engine)
+            .pop()
+            .unwrap()
+            .done
+            .unwrap()
+            .result
+            .unwrap_err();
+        assert!(Cancelled::is(&error), "{error}");
+    }
+
+    /// An accept on a blocking listener cannot block the reap, and leaves the listener as it was.
+    #[test]
+    fn a_positional_accept_leaves_a_blocking_listener_blocking() {
+        let io = positional();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let before = fd_flags(listener.as_raw_fd());
+        assert_eq!(before & libc::O_NONBLOCK, 0);
+        io.accept(
+            listener.as_raw_fd(),
+            Box::new(|accepted| {
+                Box::new(Done {
+                    header: FrameHeader::new(1),
+                    done: None,
+                    accepted: Some(accepted),
+                })
+            }),
+        )
+        .unwrap();
+        assert_eq!(io.reap(), 0, "nothing to accept: the reap returns");
+        assert_eq!(fd_flags(listener.as_raw_fd()), before);
+        #[allow(clippy::disallowed_types)] // the test's peer
+        let _peer = std::net::TcpStream::connect(addr).unwrap();
+        assert!(poll(&io, 1).pop().unwrap().1.accepted.unwrap().is_ok());
+        assert_eq!(fd_flags(listener.as_raw_fd()), before);
+    }
+
+    /// A connect (or its guard) dropped with the handshake under way puts the socket's flags back.
+    #[test]
+    fn dropping_a_connect_under_way_restores_the_sockets_flags() {
+        let (ours, _theirs) = socket_pair(4096);
+        let before = fd_flags(ours.as_raw_fd());
+        // SAFETY: a plain `fcntl` of a socket the test owns.
+        unsafe { libc::fcntl(ours.as_raw_fd(), libc::F_SETFL, before | libc::O_NONBLOCK) };
+        let guard = crate::positional::Restore::new(ours.as_raw_fd(), Some(before));
+        drop(guard);
+        assert_eq!(fd_flags(ours.as_raw_fd()), before);
     }
 
     /// An `AsyncIo` on io_uring, or on the positional engine.
@@ -2599,6 +2853,7 @@ mod tests {
     }
 
     on_both_engines!(
+        a_pipe_carries_a_write_and_a_read,
         a_reads_completion_is_a_frame_emitted_when_polled_after_its_bytes_arrived,
         a_read_past_the_end_of_the_file_fails,
         a_read_the_file_ends_inside_completes_with_the_bytes_there_were,

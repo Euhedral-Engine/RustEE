@@ -130,6 +130,29 @@ mod tests {
         }
     }
 
+    /// A ring that sets up but whose `io_uring_enter` is refused (as some seccomp profiles do) is not used.
+    #[test]
+    fn an_enter_the_system_refuses_selects_the_positional_engine() {
+        use io_uring::Submitter;
+        for code in [libc::EPERM, libc::EACCES, libc::ENOSYS] {
+            let engine = Platform::choose(AsyncIoOptions::default(), || {
+                Uring::probed(
+                    Box::new(move |_: &Submitter<'_>| Err(io::Error::from_raw_os_error(code))),
+                    super::super::MAX_PIECE,
+                )
+            })
+            .unwrap();
+            assert_eq!(engine.backend(), IoBackend::Positional, "errno {code}");
+        }
+        let refused = Platform::choose(AsyncIoOptions::default(), || {
+            Uring::probed(
+                Box::new(|_: &Submitter<'_>| Err(io::Error::from_raw_os_error(libc::ENOMEM))),
+                super::super::MAX_PIECE,
+            )
+        });
+        assert!(matches!(refused, Err(ref e) if e.raw_os_error() == Some(libc::ENOMEM)));
+    }
+
     #[test]
     fn any_other_setup_error_fails_the_open() {
         for code in [libc::ENOMEM, libc::EMFILE, libc::EINVAL, libc::ENFILE] {
@@ -154,12 +177,9 @@ mod tests {
 
     #[test]
     fn by_default_io_uring_is_used_where_it_works() {
+        // These tests run where io_uring works: the default is io_uring.
         let io = AsyncIo::open().unwrap();
-        // A machine that refuses io_uring runs the fallback; the open must not fail either way.
-        assert!(matches!(
-            io.backend(),
-            IoBackend::IoUring | IoBackend::Positional
-        ));
+        assert_eq!(io.backend(), IoBackend::IoUring);
     }
 
     #[test]

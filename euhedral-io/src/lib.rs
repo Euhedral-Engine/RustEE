@@ -702,7 +702,7 @@ type Platform = win::Engine;
 ///   written). On Windows every write goes in pieces of at most 256 KiB, so that one piece is a
 ///   bounded wait for the worker that submits it.
 /// - **Dropping** an `AsyncIo` with operations in flight leaks their buffers (the kernel may still
-///   write them).
+///   write them) and runs no continuation. The positional engine has nothing in a kernel, so it frees them.
 ///
 /// **Who does what.** `request` and `pull` run at every visit of a worker, and reaping asks the kernel (a system call
 /// and a lock) and calls the application's continuations, which is heavy and high-frequency work. So they only hand
@@ -1206,7 +1206,7 @@ impl AsyncIo {
     /// that finds no bytes at all fails with `UnexpectedEof`. The region is cut into pieces as a
     /// `read`'s buffer is, and the pieces land at their own offsets. A submission that returns `Err`
     /// started nothing: `buf` and `then` are dropped without running, and an empty region is
-    /// refused. `then` always runs once the read was submitted. If the engine can no longer tell
+    /// refused. `then` runs once the read was submitted, unless the `AsyncIo` is dropped with the read in flight (it never runs then). If the engine can no longer tell
     /// whether the kernel still writes the region (a ring that broke), it leaks `buf`: `then` runs
     /// with `buf` `None` and the ring's failure as the result (see [`IoMemory`]).
     pub fn read_into<B: IoMemory>(

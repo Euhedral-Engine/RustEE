@@ -13,6 +13,8 @@
 // Fixtures write files synchronously, outside any lattice.
 #![allow(clippy::disallowed_methods)]
 
+mod common;
+
 use std::cell::Cell;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -105,11 +107,10 @@ fn temp_file(name: &str, content: &[u8]) -> (TempFile, std::fs::File) {
     (TempFile(path), file)
 }
 
-#[test]
-fn a_request_and_a_pull_reap_nothing_and_the_key_frame_does() {
+fn a_request_and_a_pull_reap_nothing_and_the_key_frame_does_on(open: fn() -> Arc<AsyncIo>) {
     use std::os::fd::AsRawFd;
     let (_guard, file) = temp_file("key", &[7; 4096]);
-    let io = AsyncIo::open().unwrap();
+    let io = open();
     let keep = Arc::new(Keep::default());
     io.clone().add_downstream(keep.clone());
 
@@ -162,8 +163,14 @@ fn a_request_and_a_pull_reap_nothing_and_the_key_frame_does() {
 }
 
 #[test]
-fn no_key_frame_is_pushed_while_nothing_is_in_flight() {
-    let io = AsyncIo::open().unwrap();
+fn a_request_and_a_pull_reap_nothing_and_the_key_frame_does() {
+    for open in common::engines() {
+        a_request_and_a_pull_reap_nothing_and_the_key_frame_does_on(open);
+    }
+}
+
+fn no_key_frame_is_pushed_while_nothing_is_in_flight_on(open: fn() -> Arc<AsyncIo>) {
+    let io = open();
     let keep = Arc::new(Keep::default());
     io.clone().add_downstream(keep.clone());
     for _ in 0..4 {
@@ -173,11 +180,17 @@ fn no_key_frame_is_pushed_while_nothing_is_in_flight() {
 }
 
 #[test]
-fn an_operation_that_never_ends_is_reaped_ever_less_often() {
+fn no_key_frame_is_pushed_while_nothing_is_in_flight() {
+    for open in common::engines() {
+        no_key_frame_is_pushed_while_nothing_is_in_flight_on(open);
+    }
+}
+
+fn an_operation_that_never_ends_is_reaped_ever_less_often_on(open: fn() -> Arc<AsyncIo>) {
     use std::io::Write;
     use std::os::fd::AsRawFd;
     let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
-    let io = AsyncIo::open().unwrap();
+    let io = open();
     let keep = Arc::new(Keep::default());
     io.clone().add_downstream(keep.clone());
     io.recv(
@@ -226,10 +239,18 @@ fn an_operation_that_never_ends_is_reaped_ever_less_often() {
 }
 
 #[test]
-fn a_continuation_that_panics_loses_its_operation_and_not_the_others() {
+fn an_operation_that_never_ends_is_reaped_ever_less_often() {
+    for open in common::engines() {
+        an_operation_that_never_ends_is_reaped_ever_less_often_on(open);
+    }
+}
+
+fn a_continuation_that_panics_loses_its_operation_and_not_the_others_on(
+    open: fn() -> Arc<AsyncIo>,
+) {
     use std::os::fd::AsRawFd;
     let (_guard, file) = temp_file("panic", &[7; 4096]);
-    let io = AsyncIo::open().unwrap();
+    let io = open();
     let buf = || IoBuf {
         bytes: vec![0; 64],
         filled: 0,
@@ -265,10 +286,18 @@ fn a_continuation_that_panics_loses_its_operation_and_not_the_others() {
 }
 
 #[test]
-fn a_pull_pushes_and_hands_out_no_key_a_request_pushes_it_and_a_key_out_is_never_out_twice() {
+fn a_continuation_that_panics_loses_its_operation_and_not_the_others() {
+    for open in common::engines() {
+        a_continuation_that_panics_loses_its_operation_and_not_the_others_on(open);
+    }
+}
+
+fn a_pull_pushes_and_hands_out_no_key_a_request_pushes_it_and_a_key_out_is_never_out_twice_on(
+    open: fn() -> Arc<AsyncIo>,
+) {
     use std::os::fd::AsRawFd;
     let (ours, _theirs) = std::os::unix::net::UnixStream::pair().unwrap();
-    let io = AsyncIo::open().unwrap();
+    let io = open();
     let keep = Arc::new(Keep::default());
     io.clone().add_downstream(keep.clone());
     io.recv(
@@ -308,10 +337,20 @@ fn a_pull_pushes_and_hands_out_no_key_a_request_pushes_it_and_a_key_out_is_never
 }
 
 #[test]
-fn a_reap_that_runs_while_a_pull_holds_the_hand_out_leaves_the_pushing_to_a_request() {
+fn a_pull_pushes_and_hands_out_no_key_a_request_pushes_it_and_a_key_out_is_never_out_twice() {
+    for open in common::engines() {
+        a_pull_pushes_and_hands_out_no_key_a_request_pushes_it_and_a_key_out_is_never_out_twice_on(
+            open,
+        );
+    }
+}
+
+fn a_reap_that_runs_while_a_pull_holds_the_hand_out_leaves_the_pushing_to_a_request_on(
+    open: fn() -> Arc<AsyncIo>,
+) {
     use std::os::fd::AsRawFd;
     let (_guard, file) = temp_file("held", &[7; 4096]);
-    let io = AsyncIo::open().unwrap();
+    let io = open();
     let keep = Arc::new(Keep::default());
     io.clone().add_downstream(keep.clone());
     let read = |id: u64| {
@@ -364,4 +403,11 @@ fn a_reap_that_runs_while_a_pull_holds_the_hand_out_leaves_the_pushing_to_a_requ
     // The next request serves what waited, within the demand it banked.
     io.request(1);
     assert_eq!(keep.kept(), 3);
+}
+
+#[test]
+fn a_reap_that_runs_while_a_pull_holds_the_hand_out_leaves_the_pushing_to_a_request() {
+    for open in common::engines() {
+        a_reap_that_runs_while_a_pull_holds_the_hand_out_leaves_the_pushing_to_a_request_on(open);
+    }
 }

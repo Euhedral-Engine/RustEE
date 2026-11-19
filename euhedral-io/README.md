@@ -81,7 +81,7 @@ internally, each landing at its own offset. `read` stays as it was, for a `Vec`-
   operation, and one IoRing per submitting thread for file reads and writes where the OS has a
   kernel ring for both (Windows 11 22H2 and later; not one emulated in user mode). The ring
   functions are looked up at run time, so the library still loads where they are missing. A file
-  keeps its route: IoRing refuses a handle that belongs to a completion port. `AsyncIoOptions { windows_ioring: false }` forces the port.
+  keeps its route: IoRing refuses a handle that belongs to a completion port. `AsyncIoOptions { windows_ioring: false, ..AsyncIoOptions::default() }` forces the port.
   Windows has no asynchronous open, rename or file length, so those run on the OS thread pool and leave their
   result in a queue the poll drains: the one place the crate uses threads it did not create. Handles must be
   opened for overlapped I/O (`open_path` does, and so do Rust's sockets) and must not skip the port
@@ -120,10 +120,17 @@ assert_eq!(io.backend(), IoBackend::Positional);
 ```
 
 - **No thread, no wait.** The fallback is an engine under the same `AsyncIo` source. A submission queues the
-  operation; the reap frame (the work a worker does for the source, see above) takes one step of each operation in
-  flight per visit and hands the ended ones on. A step is one piece of a read or write (`pread`, `pwrite`, at most 256 KiB), one
-  non-blocking attempt of a socket call (`MSG_DONTWAIT`, or `poll(2)` with no timeout), or the whole of an open,
-  a rename or a length (`fstat`). A visit takes at most 64 steps. A socket that is not ready costs a step and no wait.
+  operation; the reap frame (the work a worker does for the source, see above) walks the operations in flight once
+  per visit and hands the ended ones on. A visit makes one `poll(2)` call with a zero timeout over the descriptors
+  that operations wait for (sockets, accept, pipes), and attempts only the ones it reports ready; a socket that is
+  not ready costs that one shared call and no attempt of its own. An attempt is one piece of a read or write
+  (`pread`, `pwrite`, at most 256 KiB), one non-blocking socket call, or the whole of an open, a rename or a length
+  (`fstat`). A visit makes at most 64 attempts, and every attempt counts against that.
+- **Streams.** A pipe, tty or character device cannot be read at an offset (`ESPIPE`): such an operation goes on as
+  a stream, waits for readiness and then uses `read` or `write`; the offset is ignored.
+- **Opening a FIFO** never holds the worker: the open is made with `O_NONBLOCK` and the flag is cleared on the
+  descriptor that comes back. A write open with no reader (`ENXIO`) stays in the line and is retried at later visits,
+  so a limit or a cancel still ends it. `open_path` therefore never waits for the other end of a FIFO.
 - **What it costs.** There is no kernel queue: the calls run on the worker that reaps, one reap at a time, so a
   file operation holds a worker for the length of its piece, and path calls (`open_path`, `rename`) for as long
   as the file system takes. It is a correct fallback, not a fast one.
@@ -131,7 +138,13 @@ assert_eq!(io.backend(), IoBackend::Positional);
   receives, accept, connect, datagrams, `open_path`, `open_file`, `rename`, `file_len`, and `send_with`, `recv_with`,
   `accept_with`, `connect_with` with limits and `cancel`. A limit or cancel is looked at before every step, so it ends
   an operation that waits for a socket and one between two pieces. A connect makes a blocking socket non-blocking for its
-  handshake and puts its flags back when it ends.
+  handshake and puts its flags back when it ends (also when the `AsyncIo` is dropped first). An accept on a
+  blocking listener sets `O_NONBLOCK` only around the `accept4` call and restores the flags on every path; a
+  listener that another blocking accepter shares may see `EAGAIN` in that window.
+- **The probe.** At open the engine also enters a ring with a no-op, without waiting. A system that allows
+  `io_uring_setup` but refuses `io_uring_enter` (or a needed register call) with `EPERM`, `EACCES` or `ENOSYS`
+  gets the fallback too. On kernels before 5.12 a ring is charged to the memlock limit, and a refusal with `ENOMEM`
+  there still fails the open: it is not a permission refusal.
 - **Dropping** an `AsyncIo` with operations in flight frees their buffers and runs no continuation: nothing
   is in a kernel that could still write them (the io_uring engine leaks them instead).
 - `AsyncIoOptions::positional_io` forces the fallback where io_uring works; the other options do not apply to it.
