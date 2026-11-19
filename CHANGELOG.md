@@ -3,6 +3,22 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## A killed quantum holds for everything it started, and killed waiting entries end at the next visit (`euhedral-graph`) (2026-11-19)
+
+**What.** A killed `StageGraph` quantum runs no `abandoned` hook, and lets go of nothing it holds, until every host completion it started is ready and the latest marker of each lane it used is reached. Before, only a stage that returned a completion held it, and an ordered stage's host completion with no marker held nothing once the kill ended it. In `Completions`, a waiting entry whose frame is killed (unordered, timer, marker, retirement, `Ready`, `Wake`) ends at the next visit of the source as a dead continuation, not only a chain head.
+
+**Why.** A stage's work (a model request, a driver call polled on the host, device work with a marker only) may still use what the quantum holds when the kill comes; quiescing runs the hooks that release it. A killed timer an hour out, or an entry whose condition never comes, occupied the source until it did.
+
+**How to use.** A `StageGraph` user changes nothing. A direct `Completions` user whose frame has a kill switch and waits on `after_marker` or `after_retired` now gets its `do_finally` before the marker is reached, at the next visit after a kill (before, only a chain head did): a consumer whose frame stands for work that may still use what it holds registers a frame with no kill switch, or keeps the hold itself. A host completion that never gets ready, or a marker a lane never reaches, now holds a killed quantum for ever (it did for an unordered stage's completion already): make the `Ready` end when its work does.
+
+**Semantics.**
+- The kill is found at the next visit of the source (a poll); it does not wake it, and an entry behind a chain head ends when it becomes the head.
+- The entry's `Ready` is dropped before its frame's `do_finally` runs. The stage graph keeps a host completion in a slot of the pooled completion frame, which the source's entry only polls (a `Wake`, no allocation of its own); the dead completion frame takes it from the slot and waits for it again in a frame with no kill switch and no order, then for the stage's marker if that is not reached. Nothing waits in a `Drop`.
+- When the last frame of a killed quantum ends, the quantum waits for the latest marker of each lane it used (one pooled frame per unreached lane) before it quiesces. A quantum that fails without a kill is unchanged.
+- Nothing changes for a quantum that is not killed.
+
+**Tests.** `completions.rs`: a killed unordered entry, a killed timer and a killed marker whose conditions never come end at the next reap and `pending` drops. `stage_graph.rs`: a killed quantum with a marker-only stage queued runs no `abandoned` hook until the marker is reached; a killed quantum whose stage returned a host completion with no marker runs none until it is ready (ordered and unordered: only the ordered half fails on the old code, the unordered one passes there); the existing kill tests also make the host completions ready before the hooks. These fail on the old code.
+
 ## Handle reuse on Windows, and the positional fallback's long reads, FIFO opens and leased files (`euhedral-io`) (2026-11-19)
 
 **What.** The engine forgets the value of every socket, accepted socket and file it makes itself; `AsyncIo::forget_socket(socket)` and `forget_file(file)` tell it that a handle the caller made is about to close, and `euhedral-net` calls the former before its client, connection and listener sockets close. In the positional engine, an operation that is the only one due in a visit takes the whole attempt budget, and an open that cannot proceed backs off between attempts.
@@ -17,6 +33,7 @@ semantics and the tests that pin it.
 - Positional: a write open of a FIFO with no reader, and an open of a regular file refused with `EWOULDBLOCK` (a lease held elsewhere) when the caller did not ask for `O_NONBLOCK`, are retried with growing gaps of 1, 2, 4 ... 64 visits, until they open, are cancelled or pass their limit (both end them at the next visit). There is no signal for "a reader appeared" or "the lease broke", so the wait is the longest gap at most. A lease breaks after `/proc/sys/fs/lease-break-time` seconds (45 by default); a caller with a limit shorter than that gets `LimitPassed`, as a blocking open would not.
 
 **Tests.** `win::tests`: a socket from `socket_for`, an accepted socket and an opened file that reuse a closed value (one that had joined the port) behave as fresh without any call, and so do caller-made ones after `forget` (all fail without it). `uring::tests`: a lone long read moves 12 pieces in one reap and two share 4 each; a FIFO open with no reader makes at most 10 attempts in 100 visits and opens once a reader is there; an open of a file leased with `F_SETLEASE` waits and succeeds after `F_UNLCK` (these three fail on the old code).
+
 ## A panic in `AsyncIo`'s completion and refusal paths neither stalls a ring nor skews the counts (`euhedral-io`) (2026-11-19)
 
 **What.** The io_uring engine takes a completion-queue or submission-queue lock a panic poisoned instead of skipping it, and a completion of no operation is raised by `AsyncIo::reap` after its counts are done. The reap drops the frame of an operation whose continuation panicked (it is counted by `panicked()` and by `pending`, and no consumer sees a frame for it). `submit` takes its `pending` and `unreaped` counts back through a guard, so they are right when dropping a refused continuation panics; the engine sets a flag the guard owns (`Engine::submit`'s `taken`) once it holds the operation, so a later panic does not undo the counts and a submission made while the refused continuation drops does not hide the refusal. An enter that unwinds leaves the ring's entries marked unsubmitted, so a later poll hands them over. A reap run inside a continuation keeps the enclosing reap's stray check. The Windows engine takes its poisoned ring lock the same way.
@@ -70,6 +87,7 @@ semantics and the tests that pin it.
 **Semantics.** Asserted always: no late item, no order break at any hop, nothing beyond credit, nothing left over, made = sent + dropped, every quantum retired once, in flight <= pool. Asserted only with the variable: zero non-preempted callbacks over 200 µs, shutdown under 100 ms.
 
 **Tests.** `the_credit_graph_with_a_fast_pack`, `the_credit_graph_with_a_slow_pack`.
+
 ## `AsyncIo` runs where the system refuses io_uring (`euhedral-io`) (2026-11-19)
 
 **What.** On Linux and Android `AsyncIo::open` no longer fails when io_uring is refused. A positional engine (`pread`, `pwrite`, `open`, `rename`, `fstat` and non-blocking socket calls, made by the source's reap frame) takes over, with the same contract. `AsyncIo::backend()` returns `IoBackend::IoUring` or `IoBackend::Positional`, and `AsyncIoOptions::positional_io` forces the fallback.
