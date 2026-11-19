@@ -1082,6 +1082,8 @@ impl Engine {
     /// that completes or fails operations touches the record while it is being filled.
     fn start(&self, op: Op) -> io::Result<OpId> {
         let held = self.begin(op, State::Issuing)?;
+        // The table has the operation: from here on a panic is not a refusal.
+        super::accepted();
         let id = OpId::new(self.id as u64, held.slot, held.serial);
         self.launch(held);
         Ok(id)

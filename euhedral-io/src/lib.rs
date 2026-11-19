@@ -558,7 +558,8 @@ impl Buf {
 ///
 /// The continuation is the application's code. One that panics is caught here, where the operation has already left
 /// the engine: the panic does not unwind through the engine, and the operation's frame is a [`Lost`] one that does
-/// nothing. The thread counts it for the [`AsyncIo::reap`] that is running ([`take_lost`]).
+/// nothing, and the reap drops it (no consumer sees it). The thread counts it for the [`AsyncIo::reap`] that is
+/// running ([`take_lost`]).
 pub(crate) fn conclude(
     buf: Buf,
     then: Then,
@@ -577,8 +578,32 @@ pub(crate) fn conclude(
 }
 
 thread_local! {
+    /// Set by an engine once it holds a submitted operation (see [`accepted`]).
+    static ACCEPTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The first completion of no operation a poll met on this thread, until the reap that ran it checks it.
+    #[cfg(debug_assertions)]
+    static STRAY: std::cell::Cell<Option<(&'static str, u64)>> = const { std::cell::Cell::new(None) };
     /// Continuations that panicked on this thread since the last [`take_lost`].
     static LOST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Called by an engine as soon as it holds the operation it was given: a panic after it is not a refusal, and the
+/// operation's counts stay (it will be reaped).
+pub(crate) fn accepted() {
+    ACCEPTED.with(|accepted| accepted.set(true));
+}
+
+/// Records a completion that belongs to no operation. The reap that ran the poll raises it once its counts are
+/// done (in a debug build), so that no unwind skips them or holds an engine's lock.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg_attr(not(debug_assertions), allow(unused_variables))]
+pub(crate) fn note_stray(what: &'static str, user_data: u64) {
+    #[cfg(debug_assertions)]
+    STRAY.with(|stray| {
+        if stray.get().is_none() {
+            stray.set(Some((what, user_data)));
+        }
+    });
 }
 
 /// How many continuations panicked on this thread since the last call.
@@ -732,7 +757,8 @@ type Platform = win::Engine;
 /// the reaped continuations' frames to `consumer`. `AsyncIo` never runs a frame. The consumer
 /// decides when the frame runs: a lattice queues it for a worker, and a test may run it inside the
 /// consumer or after `pull` returns. A reap finds only what completed by then: reap and pull again
-/// until the completions you expect came out.
+/// until the completions you expect came out, and count an operation whose continuation panicked as ended though no
+/// frame comes out for it (see [`panicked`](AsyncIo::panicked), [`pending`](AsyncIo::pending)).
 ///
 /// A pull stops before the first continuation its `stop` matches; that one (and what is reaped
 /// after it) goes out on a later pull, in order. The lattice's direct pulls stop before ordered
@@ -765,6 +791,10 @@ struct Uncount<'a> {
 
 impl Drop for Uncount<'_> {
     fn drop(&mut self) {
+        // The engine holds the operation (a panic came after it did): it will be reaped and counts itself.
+        if ACCEPTED.with(std::cell::Cell::take) {
+            return;
+        }
         self.pending.fetch_sub(1, Ordering::AcqRel);
         self.unreaped.fetch_sub(1, Ordering::AcqRel);
     }
@@ -1128,14 +1158,18 @@ impl AsyncIo {
     }
 
     /// Reaps once, by the caller: asks the engine for the operations that ended and queues their
-    /// continuations' frames for [`pull`](LatticeSource::pull) and `request`. Returns how many it
-    /// found. Returns 0 at once if another reap is inside.
+    /// continuations' frames for [`pull`](LatticeSource::pull) and `request`. Returns how many operations it
+    /// reaped, counting those whose continuation panicked (no frame comes out for them). Returns 0 at once if
+    /// another reap is inside. In a debug build it panics, after its counts are done, on a completion that belongs
+    /// to no operation.
     ///
     /// This is the work of the key frame that `request` pushes into a lattice, which runs on a worker
     /// like any other frame. A caller that drives an `AsyncIo` by hand calls it before it pulls.
     pub fn reap(&self) -> usize {
         // Continuations that panicked on this thread before this reap are none of its business.
         take_lost();
+        #[cfg(debug_assertions)]
+        STRAY.with(std::cell::Cell::take);
         let reaped = self.front.reap_ready(&self.engine);
         let lost = take_lost();
         if lost > 0 {
@@ -1149,6 +1183,11 @@ impl AsyncIo {
                 self.front.request_pending.store(true, Ordering::SeqCst);
                 self.front.serve_requests();
             }
+        }
+        // The counts are done: a completion of no operation fails here, in a debug build, and leaves them right.
+        #[cfg(debug_assertions)]
+        if let Some((what, user_data)) = STRAY.with(std::cell::Cell::take) {
+            debug_assert!(false, "{what} ({user_data:#x}) of no operation");
         }
         reaped
     }
@@ -1211,6 +1250,7 @@ impl AsyncIo {
             pending: &self.front.pending,
             unreaped: &self.unreaped,
         };
+        ACCEPTED.with(|accepted| accepted.set(false));
         let started = self.engine.submit(request, buf, then, limit);
         if started.is_ok() {
             std::mem::forget(counted);

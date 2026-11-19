@@ -5,7 +5,7 @@ semantics and the tests that pin it.
 
 ## A panic in `AsyncIo`'s completion and refusal paths neither stalls a ring nor skews the counts (`euhedral-io`) (2026-11-19)
 
-**What.** The io_uring poll takes a completion-queue lock a panic poisoned instead of skipping it, and checks for a completion of no operation after it has let the lock go. The reap drops the frame of an operation whose continuation panicked (it is counted by `panicked()` and by `pending`, and no consumer sees a frame for it). `submit` takes its `pending` and `unreaped` counts back through a guard, so they are right when dropping a refused continuation panics. The Windows engine takes its poisoned ring lock the same way.
+**What.** The io_uring engine takes a completion-queue or submission-queue lock a panic poisoned instead of skipping it, and a completion of no operation is raised by `AsyncIo::reap` after its counts are done. The reap drops the frame of an operation whose continuation panicked (it is counted by `panicked()` and by `pending`, and no consumer sees a frame for it). `submit` takes its `pending` and `unreaped` counts back through a guard, so they are right when dropping a refused continuation panics; the engines tell the guard once they hold the operation, so a later panic does not undo the counts. The Windows engine takes its poisoned ring lock the same way.
 
 **Why.** A failed `debug_assert!` inside the guard poisoned the lock, and `try_lock` treated the poisoned lock as busy for ever: the ring was never reaped again and its operations hung. A hand-driven caller that downcast every frame it pulled to its own type panicked on the frame of a panicked continuation. A continuation whose drop runs user code and panics skipped the decrements of a refused submission, leaving `pending` above zero for ever.
 
@@ -13,7 +13,7 @@ semantics and the tests that pin it.
 
 **Semantics.** The locks guard no state a panic can leave half-changed. A reap still panics in a debug build on a completion of no operation, but after the ring's queue is let go, so the next reap goes on. The refused submission's panic still unwinds to the caller, with the counts as before the call.
 
-**Tests.** `a_stray_completion_does_not_stop_the_ring_from_being_reaped` (the next reap after the failed check still completes an operation) and `a_refused_operation_whose_continuation_panics_on_drop_leaves_the_counts` in `uring.rs`; `a_continuation_that_panics_loses_its_operation_and_not_the_others` in `tests/key_frame.rs` now counts the frames the consumer sees. All three fail on the old code.
+**Tests.** `a_panic_under_the_submission_lock_does_not_stop_the_ring_from_submitting` and `a_panic_under_the_completion_lock_does_not_stop_the_ring_from_being_reaped` (a panicking enter hook; a panicking consumer of the direct reap), `a_stray_completion_does_not_stop_the_ring_from_being_reaped` (the next reap after the failed check still completes an operation, and `unreaped` ends at zero) and `a_refused_operation_whose_continuation_panics_on_drop_leaves_the_counts` in `uring.rs`; `a_continuation_that_panics_loses_its_operation_and_not_the_others` in `tests/key_frame.rs` now counts the frames the consumer sees. Each fails on the code without its fix. The Windows poison arms are not driven by a test: the simulated system has no hook that panics under the ring lock.
 
 ## `AsyncIo` runs where the system refuses io_uring (`euhedral-io`) (2026-11-19)
 
