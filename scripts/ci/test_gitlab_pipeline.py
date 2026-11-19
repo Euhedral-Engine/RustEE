@@ -34,6 +34,22 @@ class ChildPipeline(unittest.TestCase):
         self.assertNotIn("nothing-affected", jobs)
         self.assertIn("cargo test -p euhedral-hashing", jobs["workspace"]["script"])
 
+    def test_the_device_tests_run_in_their_own_job_on_a_shared_grant_of_the_card(self):
+        jobs = pipeline("any=true\nargs=-p euhedral-gpu\nmiri=false\neuhedral_gpu=true\neuhedral_memory=true\n")
+        device = jobs["device"]
+        self.assertRegex(device["variables"]["ARBITER_ARGS"], r"--gpu shared:\d+\b")
+        self.assertIn("--device /dev/nvidia0", device["variables"]["DOCKER_ARGS"])
+        script = "\n".join(device["script"])
+        for crate in ("euhedral-gpu", "euhedral-memory"):
+            self.assertIn(f"cargo test -p {crate} --features cuda -- --nocapture", script)
+            self.assertIn(f"device_check.py device-{crate}.log {crate}/tests", script)
+        self.assertIn("set -o pipefail", device["script"])
+        self.assertNotIn("--features cuda -- --nocapture", "\n".join(jobs["workspace"]["script"]))
+        self.assertNotIn("cargo test -p euhedral-gpu --features cuda", "\n".join(jobs["workspace"]["script"]))
+
+    def test_a_change_to_no_device_crate_has_no_device_job(self):
+        self.assertNotIn("device", pipeline("any=true\nargs=-p euhedral-hashing\nmiri=false\n"))
+
     def test_a_matrix_with_an_apostrophe_reaches_the_build_script_whole(self):
         # A shard's name carries the reason it runs, which can quote ("Miri's wiring"): the matrix is one shell word.
         matrix = {"include": [{"name": "canary: Miri's wiring (changed)", "seeds": 1, "cpu": 1, "mem": "1G",

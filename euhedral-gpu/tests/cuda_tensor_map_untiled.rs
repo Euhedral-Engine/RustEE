@@ -12,6 +12,9 @@
     reason = "the test thread is not a lattice worker: it polls and sleeps"
 )]
 
+#[path = "common/skip.rs"]
+mod skip;
+
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -69,15 +72,15 @@ extern "C" __global__ void tile_copy(unsigned* out, int c0, int c1, const __grid
 #[test]
 fn a_map_that_was_never_encoded_fails_the_launch_fast() {
     let Ok(gpu) = CudaGpu::open(0) else {
-        eprintln!("no CUDA device: skipped");
+        skip::skip(format_args!("no CUDA device: skipped"));
         return;
     };
     if gpu.arch().0 < 9 {
-        eprintln!("compute capability below 9.0: skipped");
+        skip::skip_hardware(format_args!("compute capability below 9.0: skipped"));
         return;
     }
     let Ok(module) = CudaModule::from_source(&gpu, SOURCE, &CompileOptions::default()) else {
-        eprintln!("no way to compile the test kernels: skipped");
+        skip::skip(format_args!("no way to compile the test kernels: skipped"));
         return;
     };
     let (_pool, mut s) = gpu.open_lanes(&["a"], StreamOptions::default()).unwrap();

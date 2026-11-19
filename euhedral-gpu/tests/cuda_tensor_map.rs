@@ -7,6 +7,9 @@
     reason = "the test thread is not a lattice worker: it polls and sleeps"
 )]
 
+#[path = "common/skip.rs"]
+mod skip;
+
 use std::time::{Duration, Instant};
 
 use euhedral_gpu::cuda::{CudaGpu, CudaKernel, CudaModule, CudaStream};
@@ -147,18 +150,20 @@ fn a_tile_copied_through_a_tensor_map_equals_its_source() {
     let gpu = match CudaGpu::open(0) {
         Ok(gpu) => gpu,
         Err(e) => {
-            eprintln!("no CUDA device: skipped ({e})");
+            skip::skip(format_args!("no CUDA device: skipped ({e})"));
             return;
         }
     };
     if gpu.arch().0 < 9 {
-        eprintln!("compute capability below 9.0: skipped");
+        skip::skip_hardware(format_args!("compute capability below 9.0: skipped"));
         return;
     }
     let module = match CudaModule::from_source(&gpu, SOURCE, &CompileOptions::default()) {
         Ok(module) => module,
         Err(e) => {
-            eprintln!("no way to compile the test kernels: skipped ({e})");
+            skip::skip(format_args!(
+                "no way to compile the test kernels: skipped ({e})"
+            ));
             return;
         }
     };
@@ -194,7 +199,9 @@ fn a_tile_copied_through_a_tensor_map_equals_its_source() {
         Err(e) => panic!("the driver refused a valid description: {e}"),
     };
     let Some(first) = map(src.addr) else {
-        eprintln!("the driver has no cuTensorMapEncodeTiled: skipped");
+        skip::skip_hardware(format_args!(
+            "the driver has no cuTensorMapEncodeTiled: skipped"
+        ));
         return;
     };
     // The same description encodes to the same bytes; another address does not.

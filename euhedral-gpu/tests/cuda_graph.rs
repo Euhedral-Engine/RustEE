@@ -5,6 +5,9 @@
     reason = "the test thread is not a lattice worker: it polls, sleeps and runs peer threads"
 )]
 
+#[path = "common/skip.rs"]
+mod skip;
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -64,7 +67,7 @@ impl Fixture {
         let gpu = match CudaGpu::open(0) {
             Ok(gpu) => gpu,
             Err(e) => {
-                eprintln!("no CUDA device: skipped ({e})");
+                skip::skip(format_args!("no CUDA device: skipped ({e})"));
                 return None;
             }
         };

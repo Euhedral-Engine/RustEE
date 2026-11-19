@@ -10,6 +10,9 @@
               held values sit behind a lock the test owns"
 )]
 
+#[path = "common/skip.rs"]
+mod skip;
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -149,11 +152,11 @@ impl Stage<Work, CudaQueue> for Adds {
 #[test]
 fn warm_stages_submit_and_quanta_run_without_allocating() {
     let Ok(gpu) = CudaGpu::open(0) else {
-        eprintln!("no CUDA device: skipped");
+        skip::skip(format_args!("no CUDA device: skipped"));
         return;
     };
     let Some(module) = module(&gpu) else {
-        eprintln!("no kernel module: skipped");
+        skip::skip(format_args!("no kernel module: skipped"));
         return;
     };
     let mem = euhedral_memory::cuda::DeviceMemory {

@@ -6,6 +6,9 @@
     reason = "the test thread is not a lattice worker: it waits for the device"
 )]
 
+#[path = "common/skip.rs"]
+mod skip;
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -37,7 +40,7 @@ fn rig() -> Option<Rig> {
     let module = match CudaModule::from_source(&gpu, SOURCE, &CompileOptions::default()) {
         Ok(m) => m,
         Err(e) => {
-            eprintln!("no kernel compiler: skipped ({e})");
+            skip::skip(format_args!("no kernel compiler: skipped ({e})"));
             return None;
         }
     };

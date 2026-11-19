@@ -7,6 +7,9 @@
     reason = "the test thread is not a lattice worker: it waits for the driver's callbacks after the drop"
 )]
 
+#[path = "common/skip.rs"]
+mod skip;
+
 use std::time::Duration;
 
 use euhedral_gpu::cuda::{CudaGpu, CudaModule, leaked_shared_sides};
@@ -18,7 +21,7 @@ const OPS_PTX: &[u8] = include_bytes!("kernels/ops.ptx");
 #[test]
 fn a_stream_dropped_after_its_pool_is_safe_with_callbacks_still_to_come() {
     let Ok(gpu) = CudaGpu::open(0) else {
-        eprintln!("no CUDA device: skipped");
+        skip::skip(format_args!("no CUDA device: skipped"));
         return;
     };
     let module = if gpu.driver_version() >= 13010 {
@@ -27,7 +30,7 @@ fn a_stream_dropped_after_its_pool_is_safe_with_callbacks_still_to_come() {
         CudaModule::from_source(&gpu, OPS, &CompileOptions::default())
     };
     let Ok(module) = module else {
-        eprintln!("no way to load the test kernels: skipped");
+        skip::skip(format_args!("no way to load the test kernels: skipped"));
         return;
     };
     let (spin, poke) = (

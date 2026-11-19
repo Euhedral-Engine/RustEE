@@ -4,7 +4,8 @@
 Reads scripts/ci/affected.py's `key=value` output on stdin and writes JSON (valid YAML) to stdout: the `workspace`
 job (fmt, Clippy, tests, release stress tests, loom, CUDA build), `miri-build` (Miri's sysroot and every selection
 of tests, handed to the shards as an artifact) and one `miri` job per affected shard. Windows is not covered.
-Keep the steps in step with ci.yml.
+Keep the steps in step with ci.yml, except the `device` job, which only this pipeline has: GitHub's runners have no card.
+The `device` job runs the device tests of euhedral-gpu and euhedral-memory on the machine's card.
 """
 import json
 import shlex
@@ -19,6 +20,17 @@ DOCKER = {"DOCKER_ARGS": "--security-opt seccomp=unconfined"}
 # Measured peaks: the workspace job (fmt, Clippy, every test, release stress, loom) about 4.5 GB and, with a warm build,
 # 4 cores on average over 80 s; miri-build 1.3 GB and about 1 core over 15 s.
 WORKSPACE = {"ARBITER_ARGS": "--threads 8 --mem 6G", "ARBITER_EST": "240", **DOCKER}
+# The device job asks for a shared grant of card memory (the machine's one card is also used by people), and its container
+# gets the card by device nodes and the host's driver libraries, as the arbiter's own container does: the machine has no
+# NVIDIA container runtime, so `--gpus all` is refused. NVRTC is not installed system-wide: the project variable
+# EUHEDRAL_NVRTC_DIR names the directory of its libraries on the host, mounted read-only at the same path.
+DRIVER_LIBS = "/usr/lib/x86_64-linux-gnu"
+DEVICE_DOCKER = " ".join(
+    ["--security-opt seccomp=unconfined", "--device /dev/nvidiactl", "--device /dev/nvidia0", "--device /dev/nvidia-uvm",
+     f"-v {DRIVER_LIBS}/libcuda.so.1:{DRIVER_LIBS}/libcuda.so.1:ro",
+     f"-v {DRIVER_LIBS}/libnvidia-ptxjitcompiler.so.1:{DRIVER_LIBS}/libnvidia-ptxjitcompiler.so.1:ro",
+     "-v $EUHEDRAL_NVRTC_DIR:$EUHEDRAL_NVRTC_DIR:ro"])
+DEVICE = {"ARBITER_ARGS": "--threads 4 --mem 6G --gpu shared:4", "ARBITER_EST": "300", "DOCKER_ARGS": DEVICE_DOCKER}
 MIRI_BUILD = {"ARBITER_ARGS": "--threads 2 --mem 2G", "ARBITER_EST": "60", **DOCKER}
 MIRI_TEST_EST = "240"
 STABLE = ["mise install rust >/dev/null", 'eval "$(mise env -s bash)"', "rustc --version"]
@@ -45,11 +57,25 @@ if yes("any"):
         cmds += ["RUSTFLAGS='--cfg loom' cargo test -p euhedral-gpu --release --lib -- ring::loom instances::loom handles::loom",
                  "cargo test -p euhedral-gpu --release --lib --features fake -- graph_cache::shared_tests::a_hit_replayed_as_recorded"]
     if yes("euhedral_memory"):
-        cmds += ["cargo clippy -p euhedral-memory --all-targets --features cuda -- -D warnings",
-                 "cargo test -p euhedral-memory --features cuda"]
+        cmds += ["cargo clippy -p euhedral-memory --all-targets --features cuda -- -D warnings"]
     if yes("euhedral_gpu"):
-        cmds += ["cargo clippy -p euhedral-gpu --all-targets --features cuda -- -D warnings", "cargo test -p euhedral-gpu --features cuda"]
+        cmds += ["cargo clippy -p euhedral-gpu --all-targets --features cuda -- -D warnings"]
     jobs["workspace"] = {"stage": "test", "variables": WORKSPACE, "script": STABLE + cmds}
+    # The device tests, on the card. A device test with no driver, card or NVRTC returns early and passes, so each
+    # crate's output is read by device_check.py, which fails the job on such a skip or on a test binary that did not run.
+    device = [f"cargo test -p {crate} --features cuda -- --nocapture 2>&1 | tee device-{crate}.log\n"
+              f"python3 -I scripts/ci/device_check.py device-{crate}.log {crate}/tests"
+              for crate, key in (("euhedral-memory", "euhedral_memory"), ("euhedral-gpu", "euhedral_gpu")) if yes(key)]
+    if device:
+        jobs["device"] = {
+            "stage": "test", "variables": DEVICE,
+            "script": STABLE + [
+                "set -o pipefail",
+                'test -n "$EUHEDRAL_NVRTC_DIR" || { echo "the project variable EUHEDRAL_NVRTC_DIR is not set"; exit 1; }',
+                'export EUHEDRAL_NVRTC="$EUHEDRAL_NVRTC_DIR/libnvrtc.so.13" LD_LIBRARY_PATH="$EUHEDRAL_NVRTC_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"',
+                "nvidia-smi -L || true",
+            ] + device,
+        }
 
 if yes("miri"):
     matrix = json.loads(out["miri_matrix"])
