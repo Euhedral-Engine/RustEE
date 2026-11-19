@@ -498,6 +498,8 @@ impl Lake {
 impl Drop for Lake {
     /// A lake dropped before it completed lets its sinks drain and complete.
     fn drop(&mut self) {
+        // The last reference may go in a frame, inside a hot scope: letting go is lifecycle work.
+        let _cold = HotScope::leave();
         let attached = self.current.lock().take();
         // The registry holds the set too: let go of it with the lake.
         self.registry.set_cell(&self.generation, None);
