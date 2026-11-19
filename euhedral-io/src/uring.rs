@@ -3194,6 +3194,21 @@ mod tests {
             }),
         )
         .unwrap();
+        // Both completions are in the ring's queue before the reap: the stray one first (it was posted before the
+        // read was submitted), so the reap meets it, then the continuation that reaps.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let queued = {
+                let _reaping = ring.cq.try_lock().expect("no reap is inside");
+                // SAFETY: the `cq` lock is held, so this is the only reader of the ring's completion queue; it
+                // takes nothing off.
+                unsafe { ring.uring.completion_shared() }.len()
+            };
+            if queued >= 2 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the completions were not posted");
+        }
         let reaped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| io.reap()));
         assert_eq!(ran.load(Ordering::Acquire), 1, "the nested reap ran");
         assert!(reaped.is_err(), "the stray completion failed the check");
