@@ -208,7 +208,12 @@ impl Lane for CudaQueue {
         let _c = self.gpu.device().enter().map_err(from_cuda)?;
         let fork = LaneFork::new(self);
         let result = f(&mut CudaEnqueue::on_lane(&self.gpu, self, &fork, hold));
-        fork.finish()?;
+        let finished = fork.finish();
+        if fork.stranded() {
+            // Work may still read what the body kept, and nothing can wait for it.
+            hold.leak();
+        }
+        finished?;
         result
     }
 

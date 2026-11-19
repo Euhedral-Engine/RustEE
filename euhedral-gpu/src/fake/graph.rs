@@ -18,9 +18,18 @@ pub struct FakeGraph {
     streams: usize,
     /// The buffers the recording reads, frozen and shared with every replay (see `Graph::replay`).
     kept: Frozen,
+    /// A test hook: the next replay on a lane fails after its work was queued.
+    #[cfg(feature = "test-hooks")]
+    fail_join: bool,
 }
 
 impl FakeGraph {
+    /// A test hook (feature `test-hooks`): the next `replay_on` fails after its work was queued. One shot.
+    #[cfg(feature = "test-hooks")]
+    pub fn fail_next_join(&mut self) {
+        self.fail_join = true;
+    }
+
     fn kernels(&self) -> Vec<u64> {
         self.ops
             .iter()
@@ -66,8 +75,17 @@ impl Graph for FakeGraph {
             lane.await_now(*marker)?;
         }
         self.push_ops(|op| lane.push_op(op));
-        // The lane keeps nothing: the caller holds the recording's buffers until the work ended.
+        // The lane keeps nothing: the caller holds the recording's buffers until the work ended. The work is queued, so
+        // the hold takes them whatever fails after.
         hold.add_frozen(&self.kept);
+        #[cfg(feature = "test-hooks")]
+        if std::mem::take(&mut self.fail_join) {
+            return Err(GpuError::Call {
+                call: "cuEventRecord",
+                code: 1,
+                name: "failed by the test hook".into(),
+            });
+        }
         Ok(())
     }
 }
@@ -291,6 +309,8 @@ impl FakeGpu {
             fingerprint,
             streams: count,
             kept: rec.frozen,
+            #[cfg(feature = "test-hooks")]
+            fail_join: false,
         })
     }
 

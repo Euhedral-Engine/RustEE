@@ -16,8 +16,8 @@ use euhedral_core::generics::{FrameSink, LatticeSource};
 use euhedral_data_structures::queues::{Consumer, MpmcQueue, Multi, Producer};
 use euhedral_gpu::fake::{FakeGpu, FakeKernel, FakeModule, FakeOp, FakeQueue};
 use euhedral_gpu::{
-    Args, CompileOptions, Enqueue, GpuError, GraphBody, GraphHold, Lane, LaneEnqueue, Launch,
-    Module, Ran, SharedGraphCache, SharedLanes, StreamOptions, open_shared_lanes,
+    Args, CompileOptions, Enqueue, Gpu, GpuError, Graph, GraphBody, GraphHold, Lane, LaneEnqueue,
+    Launch, Module, Ran, Sequence, SharedGraphCache, SharedLanes, StreamOptions, open_shared_lanes,
 };
 use euhedral_graph::{
     Completions, DEFAULT_RETRY_BACKSTOP, EdgeKind, GraphRuntime, LaneControl, LaneId,
@@ -518,4 +518,58 @@ fn a_recorded_key_whose_body_starts_to_do_library_work_runs_directly_from_then_o
     assert_eq!(*lock(&calls), 3, "the library call was made every time");
     assert_eq!(word(&gpu, at), 1 + 1 + 3, "and every unit's work ran once");
     assert!(cache.is_empty(), "the instance went");
+}
+
+/// A replay on a lane that fails after its work was queued keeps the recording's values in the hold all the same: the
+/// work reads them when the device gets to it, and a failure of the join must not leave them to be freed first. The
+/// fake models the order a card has (queue, then fail); the card's own test is in `cuda_lane_graphs`.
+#[test]
+fn a_replay_that_fails_after_its_work_was_queued_keeps_the_recordings_values_in_the_hold() {
+    let gpu = gpu();
+    let add = kernel(&gpu);
+    let at = gpu.alloc(4);
+    let lanes = lanes(&gpu, 1);
+    let lane = lanes.pool.lane(LaneId(0)).clone();
+    let token = Arc::new(());
+    let mut record_hold = GraphHold::new();
+    let mut graph = gpu
+        .record_on(&[&*lane], &mut record_hold, |seq| {
+            seq.submit(0, |enq| {
+                enq.keep(Box::new(token.clone()));
+                add_by(enq, &add, at, 1)
+            })
+        })
+        .unwrap();
+    gpu.run_until_idle();
+    record_hold.release();
+    assert_eq!(Arc::strong_count(&token), 2, "the test and the graph");
+
+    let mut hold = GraphHold::new();
+    graph.fail_next_join();
+    let result = graph.replay_on(&lane, &[], &mut hold);
+    assert!(
+        matches!(
+            result,
+            Err(GpuError::Call {
+                call: "cuEventRecord",
+                ..
+            })
+        ),
+        "{:?}",
+        result.map(|_| ())
+    );
+    assert!(
+        !hold.is_empty(),
+        "the work was queued: the hold keeps what it reads"
+    );
+    drop(graph);
+    assert_eq!(
+        Arc::strong_count(&token),
+        2,
+        "the hold alone keeps the value now"
+    );
+    gpu.run_until_idle();
+    assert_eq!(word(&gpu, at), 2, "the recording ran, and the replay too");
+    hold.release();
+    assert_eq!(Arc::strong_count(&token), 1);
 }

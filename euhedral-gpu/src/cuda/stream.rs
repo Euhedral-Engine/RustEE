@@ -14,7 +14,8 @@ use crate::{
     GpuError, POISONED_STATUS, RetireListener, RetireTicket, Stream, StreamOptions, StreamPriority,
 };
 
-use super::{CudaEnqueue, CudaGpu, from_cuda};
+use super::{CudaEnqueue, CudaGpu, from_cuda, note_unrecoverable};
+use crate::hold::Frozen;
 use crate::lanes::Probe;
 use crate::ring::{MarkerRing, Query};
 
@@ -176,6 +177,9 @@ pub struct CudaQueue {
     forks: HandlePool,
     /// How many private streams were ever made (a test asks: after warm-up none is made, whatever the contention).
     forks_made: std::sync::atomic::AtomicUsize,
+    /// A test hook: the next join of a private stream back into this lane fails.
+    #[cfg(feature = "test-hooks")]
+    fail_join: std::sync::atomic::AtomicBool,
 }
 
 /// The private streams a lane keeps stocked. A stream beyond them (more exist than slots: more workers replaying at once
@@ -274,6 +278,26 @@ impl CudaQueue {
         self.forks_made.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// A test hook (feature `test-hooks`): the next join of a private stream back into this lane fails after the work
+    /// on it was queued, as a refused `cuEventRecord` would. One shot.
+    #[cfg(feature = "test-hooks")]
+    pub fn fail_next_join(&self) {
+        self.fail_join
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether the test hook asks the join to fail (and takes the request).
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn take_join_failure(&self) -> Option<GpuError> {
+        self.fail_join
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+            .then(|| GpuError::Call {
+                call: "cuEventRecord",
+                code: 1,
+                name: "failed by the test hook".into(),
+            })
+    }
+
     /// Claims the next marker, ahead of the work it will follow. `Err(Busy)` before anything is submitted.
     pub(crate) fn reserve(&self) -> Result<crate::ring::Claim<'_>, GpuError> {
         self.gpu.poison.check()?;
@@ -368,6 +392,8 @@ pub(crate) struct LaneFork<'a> {
     fork: std::cell::RefCell<Option<Box<Fork>>>,
     /// A fork that could not be made or joined: `finish` returns it, so the submission does not end without it.
     failed: std::cell::RefCell<Option<GpuError>>,
+    /// Whether a join failed after work was queued on the private stream (see [`strand_fork`]).
+    stranded: std::cell::Cell<bool>,
 }
 
 impl std::fmt::Debug for LaneFork<'_> {
@@ -384,7 +410,14 @@ impl<'a> LaneFork<'a> {
             queue,
             fork: std::cell::RefCell::new(None),
             failed: std::cell::RefCell::new(None),
+            stranded: std::cell::Cell::new(false),
         }
+    }
+
+    /// Whether the join of the private stream failed with work queued on it: the device is unrecoverable, and what
+    /// the caller holds for that work must be kept forever (see [`strand_fork`]).
+    pub(crate) fn stranded(&self) -> bool {
+        self.stranded.get()
     }
 
     /// The stream the closure's operations go to: the lane's until a library asks for a stream, the private one after.
@@ -445,7 +478,7 @@ impl<'a> LaneFork<'a> {
     pub(crate) fn finish(&self) -> Result<(), GpuError> {
         if let Some(fork) = self.fork.borrow_mut().take() {
             let f = &self.queue.gpu.device().driver.fns;
-            // SAFETY: as in `private`; the private stream is still this thread\'s.
+            // SAFETY: as in `private`; the private stream is still this thread's.
             let joined = unsafe {
                 self.queue
                     .gpu
@@ -457,9 +490,18 @@ impl<'a> LaneFork<'a> {
                         )
                     })
             };
-            self.queue.give_fork(fork);
-            if let Err(e) = joined {
-                self.failed.borrow_mut().get_or_insert(e);
+            #[cfg(feature = "test-hooks")]
+            let joined = match self.queue.take_join_failure() {
+                Some(e) => Err(e),
+                None => joined,
+            };
+            match joined {
+                Ok(()) => self.queue.give_fork(fork),
+                Err(e) => {
+                    strand_fork(&self.queue.gpu, fork, &e, None);
+                    self.stranded.set(true);
+                    self.failed.borrow_mut().get_or_insert(e);
+                }
             }
         }
         match self.failed.borrow_mut().take() {
@@ -473,6 +515,17 @@ impl Drop for LaneFork<'_> {
     fn drop(&mut self) {
         let _ = self.finish();
     }
+}
+
+/// A private stream whose join back into its lane failed after work was queued on it. The lane does not wait for that
+/// work, so no marker the caller can wait on covers it, and the caller would conclude the work ended and free what it
+/// reads. Nothing here can wait (no `cuStreamSynchronize`), so the device is marked unrecoverable (later work is
+/// refused), the stream is never given back or destroyed, and `kept` (a clone of what the work reads, if any) is
+/// forgotten: those values are leaked on purpose, as `CudaQueue`'s drop leaks the sink it cannot prove idle.
+pub(crate) fn strand_fork(gpu: &CudaGpu, fork: Box<Fork>, err: &GpuError, kept: Frozen) {
+    note_unrecoverable(&gpu.poison, err);
+    std::mem::forget(fork);
+    std::mem::forget(kept);
 }
 
 /// Destroys a private stream and its events (after the work on it ended: its lane waited for the join).
@@ -634,6 +687,8 @@ impl CudaStream {
                     sink,
                     forks: HandlePool::new(FORKS_STOCKED),
                     forks_made: std::sync::atomic::AtomicUsize::new(0),
+                    #[cfg(feature = "test-hooks")]
+                    fail_join: std::sync::atomic::AtomicBool::new(false),
                 }),
                 shadow: None,
                 retire,
