@@ -3,7 +3,7 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
-## The GitLab pipeline is removed (2026-11-20)
+## The GitLab pipeline is removed (CI) (2026-11-20)
 
 **What.** `.gitlab-ci.yml`, its generator `scripts/ci/gitlab_pipeline.py` and that script's test are gone. CI is the Gitea workflow (`.gitea/workflows/ci.yml`) and its twin, the GitHub workflow (`.github/workflows/ci.yml`); the `Test the scripts` step of both no longer runs the removed test. The README's merge request section is now about pull requests.
 
@@ -11,7 +11,7 @@ semantics and the tests that pin it.
 
 **How to use.** Require `ci / ci-ok (pull_request)` on Gitea. Bring a branch up to date with `git fetch gitea && git merge gitea/main`.
 
-**Semantics.** No job of either workflow changed.
+**Semantics.** No job's behaviour changed: the `changes` job only stops running the removed test.
 
 **Tests.** `scripts/ci/test_workflow_twins.py` still pins the two workflows together.
 
