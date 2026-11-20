@@ -6,6 +6,9 @@
     reason = "the test thread is not a lattice worker: it polls and sleeps"
 )]
 
+#[path = "common/skip.rs"]
+mod skip;
+
 use std::time::{Duration, Instant};
 
 use euhedral_gpu::cuda::{CudaGpu, CudaKernel, CudaModule, CudaStream};
@@ -98,18 +101,20 @@ fn a_programmatic_chain_gives_the_same_result_eagerly_and_from_a_recorded_update
     let gpu = match CudaGpu::open(0) {
         Ok(gpu) => gpu,
         Err(e) => {
-            eprintln!("no CUDA device: skipped ({e})");
+            skip::skip(format_args!("no CUDA device: skipped ({e})"));
             return;
         }
     };
     if gpu.arch().0 < 9 {
-        eprintln!("compute capability below 9.0: skipped");
+        skip::skip_hardware(format_args!("compute capability below 9.0: skipped"));
         return;
     }
     let module = match CudaModule::from_source(&gpu, SOURCE, &CompileOptions::default()) {
         Ok(module) => module,
         Err(e) => {
-            eprintln!("no way to compile the test kernels: skipped ({e})");
+            skip::skip(format_args!(
+                "no way to compile the test kernels: skipped ({e})"
+            ));
             return;
         }
     };
@@ -180,7 +185,9 @@ fn a_programmatic_chain_gives_the_same_result_eagerly_and_from_a_recorded_update
             settle(&mut s[0], &pool);
             assert_eq!(plain.edge_types_into(1), Some(vec![0]), "a plain edge");
         }
-        None => eprintln!("the driver cannot report edge types: the edge assertion is skipped"),
+        None => skip::skip_hardware(format_args!(
+            "the driver cannot report edge types: the edge assertion is skipped"
+        )),
     }
 
     // After an update pass with new arguments.

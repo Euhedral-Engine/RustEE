@@ -28,7 +28,7 @@ pub fn gpu() -> Option<Arc<CudaGpu>> {
     match CudaGpu::open(0) {
         Ok(gpu) => Some(gpu),
         Err(e) => {
-            eprintln!("no CUDA device: skipped ({e})");
+            super::skip::skip(format_args!("no CUDA device: skipped ({e})"));
             None
         }
     }
@@ -44,7 +44,9 @@ pub fn module(gpu: &Arc<CudaGpu>) -> Option<CudaModule> {
     match module {
         Ok(module) => Some(module),
         Err(e) => {
-            eprintln!("no way to load the test kernels: skipped ({e})");
+            super::skip::skip(format_args!(
+                "no way to load the test kernels: skipped ({e})"
+            ));
             None
         }
     }

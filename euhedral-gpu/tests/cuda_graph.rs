@@ -5,6 +5,9 @@
     reason = "the test thread is not a lattice worker: it polls, sleeps and runs peer threads"
 )]
 
+#[path = "common/skip.rs"]
+mod skip;
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -24,9 +27,18 @@ const BYTES: usize = N * 4;
 
 fn ops(gpu: &Arc<CudaGpu>) -> Option<CudaModule> {
     if gpu.driver_version() >= 13010 {
-        CudaModule::from_image(gpu, OPS_PTX).ok()
+        Some(
+            CudaModule::from_image(gpu, OPS_PTX)
+                .expect("the prebuilt test kernels load on a 13.1 driver"),
+        )
     } else {
-        CudaModule::from_source(gpu, OPS, &CompileOptions::default()).ok()
+        match CudaModule::from_source(gpu, OPS, &CompileOptions::default()) {
+            Ok(module) => Some(module),
+            Err(e) => {
+                skip::skip(format_args!("no way to compile the test kernels ({e})"));
+                None
+            }
+        }
     }
 }
 
@@ -64,7 +76,7 @@ impl Fixture {
         let gpu = match CudaGpu::open(0) {
             Ok(gpu) => gpu,
             Err(e) => {
-                eprintln!("no CUDA device: skipped ({e})");
+                skip::skip(format_args!("no CUDA device: skipped ({e})"));
                 return None;
             }
         };

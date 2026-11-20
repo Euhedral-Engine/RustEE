@@ -30,8 +30,7 @@ pub fn await_while(mut condition: impl FnMut() -> bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::time::Instant;
 
     #[test]
@@ -56,17 +55,39 @@ mod tests {
 
     #[test]
     fn waits_for_another_thread() {
-        let released = Arc::new(AtomicBool::new(false));
-        let releaser = {
-            let released = released.clone();
-            thread::spawn(move || {
-                thread::sleep(Duration::from_millis(20));
+        // The releaser sets the flag only after the waiter has checked 1,000 times, which is past
+        // its spinning and yielding and into its parks; the waiter may not return before that.
+        // Both waits end at the deadline, so a wait that never returns fails the test.
+        const CHECKS_BEFORE_RELEASE: u32 = 1_000;
+        struct Release<'a>(&'a AtomicBool);
+        impl Drop for Release<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let released = AtomicBool::new(false);
+        let checks = AtomicU32::new(0);
+        thread::scope(|scope| {
+            let _release = Release(&released);
+            scope.spawn(|| {
+                await_while(|| {
+                    checks.load(Ordering::Acquire) < CHECKS_BEFORE_RELEASE
+                        && Instant::now() < deadline
+                });
                 released.store(true, Ordering::Release);
-            })
-        };
-        let start = Instant::now();
-        await_while(|| !released.load(Ordering::Acquire));
-        assert!(start.elapsed() >= Duration::from_millis(20));
-        releaser.join().unwrap();
+            });
+            let mut flag_was_set = false;
+            await_while(|| {
+                checks.fetch_add(1, Ordering::AcqRel);
+                flag_was_set = released.load(Ordering::Acquire);
+                !flag_was_set && Instant::now() < deadline
+            });
+            assert!(
+                flag_was_set,
+                "the wait ended at the deadline, not at the flag"
+            );
+            assert!(checks.load(Ordering::Acquire) >= CHECKS_BEFORE_RELEASE);
+        });
     }
 }

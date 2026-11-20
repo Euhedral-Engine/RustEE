@@ -51,7 +51,7 @@ fn open() -> Option<Opened> {
     let gpu = match CudaGpu::open(0) {
         Ok(gpu) => gpu,
         Err(e) => {
-            eprintln!("no CUDA device: skipped ({e})");
+            common::skip::skip(format_args!("no CUDA device: skipped ({e})"));
             return None;
         }
     };
@@ -179,7 +179,7 @@ fn round(gpu: Arc<CudaGpu>, module: CudaModule, driver: &Driver) -> Duration {
 #[test]
 fn a_device_released_completely_opens_again_ten_times() {
     let Ok(driver) = Driver::shared() else {
-        eprintln!("no CUDA driver: skipped");
+        common::skip::skip(format_args!("no CUDA driver: skipped"));
         return;
     };
     assert!(
@@ -194,7 +194,7 @@ fn a_device_released_completely_opens_again_ten_times() {
         };
         assert!(driver.primary_context_active(0).unwrap());
         let Some((module, how)) = load_module(&gpu) else {
-            eprintln!("neither NVRTC nor a 13.1 driver: skipped");
+            common::skip::skip(format_args!("neither NVRTC nor a 13.1 driver: skipped"));
             return;
         };
         let release = round(gpu, module, &driver);

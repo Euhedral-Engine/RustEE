@@ -229,11 +229,15 @@ fn snapshots_read_while_writers_record() {
     }
 }
 
-/// Spins for `execute` in its body and for `finally` in its finalizer.
+/// Spins for `execute` in its body; its finalizer notes how many executes were timed when it began.
 struct Spinning {
     header: crate::frames::FrameHeader,
     execute: std::time::Duration,
-    finally: std::time::Duration,
+    /// Where the finalizer writes how many executes the metrics had timed when it began.
+    finalizer_saw: Option<(
+        Arc<CachePadded<ExecutionMetrics>>,
+        Arc<std::sync::atomic::AtomicU64>,
+    )>,
 }
 
 fn spin(duration: std::time::Duration) {
@@ -258,7 +262,13 @@ impl crate::frames::Frame for Spinning {
     }
 
     fn do_finally(self: Box<Self>) {
-        spin(self.finally);
+        // Not asserted here: a finalizer's panic is swallowed.
+        if let Some((metrics, saw)) = &self.finalizer_saw {
+            saw.store(
+                metrics.service_time_totals().0,
+                std::sync::atomic::Ordering::Release,
+            );
+        }
     }
 }
 
@@ -266,8 +276,18 @@ fn spinning() -> Box<Spinning> {
     Box::new(Spinning {
         header: crate::frames::FrameHeader::new(1),
         execute: std::time::Duration::from_micros(100),
-        finally: std::time::Duration::from_millis(3),
+        finalizer_saw: None,
     })
+}
+
+/// A frame whose finalizer reads `metrics`' timed-execute count, and where it left it.
+fn observed(
+    metrics: &Arc<CachePadded<ExecutionMetrics>>,
+) -> (Box<Spinning>, Arc<std::sync::atomic::AtomicU64>) {
+    let saw = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+    let mut frame = spinning();
+    frame.finalizer_saw = Some((metrics.clone(), saw.clone()));
+    (frame, saw)
 }
 
 #[test]
@@ -279,27 +299,42 @@ fn run_times_execute_alone_on_a_thread_with_a_sink() {
     let config = MetricsConfig::default().with_registry(Some(registry));
     let metrics = ExecutionMetrics::new(&config, 0, 0).unwrap();
     let executor = DefaultExecutor::new();
+    let (before_sink, saw_before_sink) = observed(&metrics);
+    let (first, saw_first) = observed(&metrics);
+    let (second, saw_second) = observed(&metrics);
+    let (dead_frame, saw_dead) = observed(&metrics);
+    let (after_sink, saw_after_sink) = observed(&metrics);
     std::thread::scope(|scope| {
         scope
             .spawn(|| {
                 // Without a sink nothing is timed.
-                executor.run(spinning());
+                executor.run(before_sink);
                 assert_eq!(metrics.service_time_totals().0, 0);
                 {
                     let _sink = ServiceTimeSink::install(metrics.clone());
-                    executor.run(spinning());
-                    executor.run(spinning());
+                    executor.run(first);
+                    executor.run(second);
                     // A frame that is not alive is not executed, so not timed.
                     let kill = Arc::new(std::sync::atomic::AtomicBool::new(true));
-                    let mut dead = spinning();
+                    let mut dead = dead_frame;
                     dead.header = crate::frames::FrameHeader::with_kill_switch(2, Some(kill));
                     executor.run(dead);
                 }
-                executor.run(spinning());
+                executor.run(after_sink);
             })
             .join()
             .unwrap();
     });
+    // How many executes had been timed when each finalizer began. A frame's own execute is
+    // already counted when its finalizer starts; a finalizer inside the timed span would see one
+    // fewer.
+    let saw =
+        |cell: &Arc<std::sync::atomic::AtomicU64>| cell.load(std::sync::atomic::Ordering::Acquire);
+    assert_eq!(saw(&saw_before_sink), 0);
+    assert_eq!(saw(&saw_first), 1);
+    assert_eq!(saw(&saw_second), 2);
+    assert_eq!(saw(&saw_dead), 2);
+    assert_eq!(saw(&saw_after_sink), 2);
     let snapshot = {
         let mut meters = Vec::new();
         metrics.collect(0, &mut meters);
@@ -310,9 +345,8 @@ fn run_times_execute_alone_on_a_thread_with_a_sink() {
     };
     let service_time = snapshot.summary().unwrap();
     assert_eq!(service_time.count, 2);
-    // 100 µs of execute each; the 3 ms finalizers are not in it.
+    // 100 µs of execute each.
     assert!(service_time.sum >= 200_000.0, "{service_time:?}");
-    assert!(service_time.max < 2_000_000.0, "{service_time:?}");
 }
 
 #[test]
