@@ -442,7 +442,7 @@ jobs:
     if: always()
     runs-on: arbiter-docker
     env:
-      ARBITER_ARGS: "--threads 1 --mem 512M"
+      ARBITER_ARGS: "--threads 1 --mem 1G"
       ARBITER_EST: "30"
     steps:
       - name: Every needed job passed or was skipped
