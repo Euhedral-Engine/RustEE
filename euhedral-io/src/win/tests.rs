@@ -858,7 +858,7 @@ fn an_ioring_hresult_keeps_a_win32_code_and_otherwise_says_what_it_was() {
 
 /// The address of the `OVERLAPPED` of slot 0.
 fn first_overlapped(h: &Harness) -> usize {
-    lock!(&h.engine.table).slots[0].rec.0.as_ptr() as usize
+    h.engine.slab.cell(0).unwrap().rec() as usize
 }
 
 #[test]
@@ -907,7 +907,7 @@ fn a_late_packet_never_ends_the_operation_that_reused_its_slot() {
     let first = h.pull_n(1);
     assert_eq!(ended_clone_error(&first[0]), Some(234));
     assert_eq!(
-        h.sim.packets_waiting() + lock!(&h.engine.inbox).len(),
+        h.sim.packets_waiting() + h.engine.inbox_len(),
         1,
         "the late packet waits"
     );
@@ -1993,4 +1993,94 @@ fn one_poll_walks_the_ring_of_every_submitting_thread() {
     let mut got = got;
     got.sort_unstable();
     assert_eq!(got, tag_ids(0..THREADS));
+}
+
+// ---- the slab and the limits, with no lock
+
+#[test]
+fn a_packet_for_a_slot_with_a_cancel_in_the_call_waits_for_the_next_poll() {
+    let h = Harness::new();
+    let sock = h.sim.sock();
+    h.sim.feed(sock, b"data");
+    h.sim.hold(true);
+    let id = h
+        .submit_limited(Request::Recv { sock }, recv_buf(), io_then(1), None)
+        .unwrap();
+    // A cancel is in its call (the slot is pinned) when the kernel finishes the operation.
+    let cell = h.engine.slab.cell(id.lane()).unwrap();
+    let asked = cell.ask_to_end(id.token(), super::End::Cancelled);
+    assert_eq!(asked, super::slab::Asked::Cancel);
+    h.sim.release();
+    assert!(
+        h.pull_with(&mut |_| false).is_empty(),
+        "the slot stays while the cancel names its record"
+    );
+    assert_eq!(h.pending(), 1);
+    assert_eq!(h.engine.inbox_len(), 1, "its packet waits");
+    cell.unpin();
+    assert_eq!(ended(h.one()).result.unwrap(), 4);
+    assert_eq!(h.pending(), 0);
+}
+
+#[test]
+fn limits_begun_on_8_threads_each_expire_once() {
+    let h = Harness::new();
+    let file = h.sim.file(&content(10));
+    let now = super::sys::Sys::now_ns(&*h.sim);
+    let held = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..8u64)
+            .map(|thread| {
+                let engine = &h.engine;
+                scope.spawn(move || {
+                    (0..4u64)
+                        .map(|i| {
+                            let mut op = Engine::op(
+                                super::Kind::Read { file, offset: 0 },
+                                super::Route::Port,
+                                IoBuf::default().into(),
+                                io_then(thread * 10 + i),
+                            );
+                            op.deadline = Some(now + 100 + thread * 4 + i);
+                            let held = engine.begin(op, super::State::Issuing).unwrap();
+                            engine.set_state(held, super::State::InFlight);
+                            held.slot
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(held.len(), 32);
+    h.front.pending.fetch_add(32, Ordering::AcqRel);
+    assert_eq!(h.engine.next_deadline.load(Ordering::Acquire), now + 100);
+    // Nothing before the first limit.
+    h.sim.advance(Duration::from_nanos(99));
+    h.pull_with(&mut |_| false);
+    for slot in &held {
+        assert_eq!(h.engine.slab.cell(*slot).unwrap().load().end(), None);
+    }
+    // Half of them pass.
+    h.sim.advance(Duration::from_nanos(1 + 15));
+    h.pull_with(&mut |_| false);
+    let ended = held
+        .iter()
+        .filter(|slot| {
+            h.engine.slab.cell(**slot).unwrap().load().end() == Some(super::End::TimedOut)
+        })
+        .count();
+    assert_eq!(ended, 16);
+    assert_eq!(
+        h.engine.next_deadline.load(Ordering::Acquire),
+        now + 100 + 16
+    );
+    h.sim.advance(Duration::from_nanos(100));
+    h.pull_with(&mut |_| false);
+    assert_eq!(
+        h.engine.next_deadline.load(Ordering::Acquire),
+        super::NO_DEADLINE
+    );
 }
