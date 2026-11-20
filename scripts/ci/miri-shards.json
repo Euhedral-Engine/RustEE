@@ -193,11 +193,11 @@
   ]
  },
  {
-  "name": "io: windows slab",
+  "name": "io: windows slab and handle set",
   "crate": "euhedral-io",
   "seeds": 8,
   "commands": [
-   "cargo miri test -p euhedral-io --lib -- win::slab::tests::"
+   "cargo miri test -p euhedral-io --lib -- win::slab::tests:: win::handles::tests::"
   ]
  }
 ]

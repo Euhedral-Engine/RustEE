@@ -49,6 +49,7 @@ use euhedral_data_structures::sync::HotScope;
 
 /// Locks a mutex for the engines' remaining shared tables, taking the state of a lock a panic poisoned.
 /// A macro, so that it names no lock type; the fields it locks carry their `HOT-FIX` tags.
+#[cfg(any(target_os = "linux", target_os = "android"))]
 macro_rules! lock {
     ($mutex:expr) => {
         $mutex

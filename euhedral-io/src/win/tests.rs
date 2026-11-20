@@ -734,7 +734,7 @@ fn a_file_keeps_its_route() {
         .sys
         .associate(h.engine.port.handle, joined)
         .unwrap();
-    h.engine.associated.lock().unwrap().insert(joined);
+    h.engine.associated.insert(joined);
     h.read(joined, 0, 10, 1).unwrap();
     assert_eq!(ended(h.one()).result.unwrap(), 10);
     assert_eq!(h.sim.rings_made(), 0, "no ring for a file on the port");
@@ -2108,4 +2108,24 @@ fn a_ring_that_breaks_while_another_thread_submits_hands_nothing_to_the_kernel()
         assert!(error.to_string().contains("IoRing failed"), "{error}");
     }
     assert_eq!(h.pending(), 0);
+}
+
+#[test]
+fn a_handle_value_the_system_gave_again_joins_the_port_again() {
+    let h = Harness::new();
+    let file = h.sim.file(&content(100));
+    h.read(file, 0, 10, 1).unwrap();
+    h.drain(1);
+    // The caller closes the handle and says so; the same value comes back as a new handle.
+    h.engine.forget(file);
+    h.sim.reuse(file, false);
+    h.read(file, 0, 10, 2).unwrap();
+    h.drain(1);
+    let joins = h
+        .sim
+        .log()
+        .iter()
+        .filter(|l| l.starts_with("associate"))
+        .count();
+    assert_eq!(joins, 2);
 }

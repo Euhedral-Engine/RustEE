@@ -37,21 +37,21 @@
 #![cfg_attr(not(windows), allow(dead_code))]
 
 use std::cell::{Cell, RefCell, UnsafeCell};
-use std::collections::{BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeSet, VecDeque};
 use std::io;
 use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 use std::ptr::NonNull;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-#[allow(clippy::disallowed_types, reason = "HOT-FIX(I11), HOT-FIX(I12)")]
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use euhedral_core::frames::Frame;
 use euhedral_data_structures::queues::{Consumer, MpscQueue, Multi, Producer, Single};
 use euhedral_data_structures::sync::ClaimCell;
 
+use self::handles::HandleSet;
 use self::slab::{Asked, End, RouteTag, Slab, SlotCell, State};
 use self::sys::{
     ACCEPT_BUF, BuildError, Cqe, Handle, IORING_VERSION_3, Overlapped, Packet, STATUS_CANCELLED,
@@ -63,6 +63,7 @@ use super::{
     OpenSpec, READ_PIECE, Request, Then, conclude as conclude_io, invalid,
 };
 
+mod handles;
 #[cfg(all(windows, test))]
 mod live;
 #[cfg(windows)]
@@ -462,14 +463,12 @@ pub(super) struct Engine {
     /// What only the polling thread touches.
     poller: PollOwned<Poller>,
     /// The handles this engine joined to its port.
-    #[allow(clippy::disallowed_types, reason = "HOT-FIX(I11)")]
-    associated: Mutex<HashSet<Handle>>,
+    associated: HandleSet,
     /// File reads and writes go through rings (only where the OS has both: a handle that a ring
     /// serves must not belong to a port, and a write has to follow its reads there).
     ring_files: bool,
     /// The file handles a ring serves.
-    #[allow(clippy::disallowed_types, reason = "HOT-FIX(I12)")]
-    ringed: Mutex<HashSet<Handle>>,
+    ringed: HandleSet,
     /// The rings, by index: a ring is set once, never removed, and made after its index was
     /// reserved in `ring_count` (a poll that finds the index not set yet skips it: the ring has no
     /// operation).
@@ -504,7 +503,6 @@ impl Engine {
     }
 
     /// An engine over `sys`. Fails if there is no completion port.
-    #[allow(clippy::disallowed_types, reason = "HOT-FIX(I11), HOT-FIX(I12)")]
     pub(super) fn new(
         sys: Arc<dyn Sys>,
         options: AsyncIoOptions,
@@ -540,11 +538,11 @@ impl Engine {
             slab: Slab::new(MAX_OPS as u32),
             last_serial: AtomicU64::new(0),
             limits: limits.producer(),
-            associated: Mutex::new(HashSet::new()),
+            associated: HandleSet::default(),
             ring_files: probe.is_some_and(|probe| {
                 probe.read && probe.write && probe.version >= IORING_VERSION_3
             }),
-            ringed: Mutex::new(HashSet::new()),
+            ringed: HandleSet::default(),
             rings: (0..MAX_RINGS).map(|_| OnceLock::new()).collect(),
             ring_count: AtomicUsize::new(0),
             max_piece: max_piece.clamp(1, MAX_PIECE),
@@ -1088,8 +1086,8 @@ impl Engine {
     /// on it. Without it, a new handle of the same value that sits on another port would pass for ours (the OS's
     /// refusal would be taken for "already joined"), and a new file would be kept off a ring.
     pub(super) fn forget(&self, handle: Handle) {
-        lock!(&self.associated).remove(&handle);
-        lock!(&self.ringed).remove(&handle);
+        self.associated.remove(handle);
+        self.ringed.remove(handle);
     }
 
     /// Joins the handle to the engine's port. A handle already on a port is refused by the OS
@@ -1097,11 +1095,11 @@ impl Engine {
     fn join_port(&self, handle: Handle) -> io::Result<()> {
         match self.sys.associate(self.port.handle, handle) {
             Ok(()) => {
-                lock!(&self.associated).insert(handle);
+                self.associated.insert(handle);
                 Ok(())
             }
             Err(error) if error.raw_os_error() == Some(87) => {
-                if lock!(&self.associated).contains(&handle) {
+                if self.associated.contains(handle) {
                     Ok(())
                 } else {
                     Err(invalid(
@@ -1118,12 +1116,12 @@ impl Engine {
     /// handle that belongs to a port (`ERROR_INVALID_PARAMETER`), so a handle that joined the
     /// port stays on it, and one a ring serves is never joined.
     fn file_route(&self, handle: Handle) -> io::Result<Route> {
-        if self.ring_files && !lock!(&self.associated).contains(&handle) {
+        if self.ring_files && !self.associated.contains(handle) {
             if let Some(ring) = self.ring() {
-                lock!(&self.ringed).insert(handle);
+                self.ringed.insert(handle);
                 return Ok(Route::Ring(ring));
             }
-            if lock!(&self.ringed).contains(&handle) {
+            if self.ringed.contains(handle) {
                 return Err(io::Error::other(
                     "this file handle is served by IoRing, and no ring is available to this thread",
                 ));
