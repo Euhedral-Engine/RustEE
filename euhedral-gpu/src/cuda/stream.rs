@@ -780,6 +780,12 @@ impl CudaStream {
         Ok(())
     }
 
+    /// The stream's own driver stream. (A test hook: a library is never lent it.)
+    #[cfg(feature = "test-hooks")]
+    pub fn raw_stream_for_tests(&self) -> CuStream {
+        self.raw
+    }
+
     /// The context current on the calling thread for as long as the guard lives.
     pub(crate) fn enter(&self) -> Result<euhedral_memory::cuda::Current<'_>, GpuError> {
         self.gpu.device().enter().map_err(from_cuda)

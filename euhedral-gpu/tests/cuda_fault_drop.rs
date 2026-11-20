@@ -2,9 +2,10 @@
 //! the callbacks after the drop; each pushes into the stream's retirement queue, which must still be alive. A sticky
 //! fault is for the whole process, so this file holds one test. Skips, passing, with no device.
 //!
-//! The driver runs the host callbacks of a context one at a time. The test holds that one thread inside a callback of
-//! a stream of its own, so the callbacks of the faulted stream cannot be delivered until the test lets go, after the
-//! drop: that the callbacks are still to come at the drop is the test's doing, whatever the speed of any thread.
+//! The stream under test starts with a host callback that the test holds, and the four retirements and a last callback
+//! follow it in the stream; a callback blocks the later work of its stream until it returns. The fault is made on
+//! another lane, so the callbacks are still to come at the drop whatever the speed of any thread, and the test lets
+//! the hold go only after the drop.
 #![cfg(feature = "cuda")]
 #![allow(
     clippy::disallowed_methods,
@@ -41,6 +42,15 @@ fn wait_for(flag: &AtomicBool) -> bool {
     true
 }
 
+/// Lets the holding callback return when it goes out of scope, a panic included.
+struct Release;
+
+impl Drop for Release {
+    fn drop(&mut self) {
+        RELEASED.store(true, Ordering::Release);
+    }
+}
+
 unsafe extern "system" fn hold(_: *mut c_void, _: i32, _: *mut c_void) {
     HOLDING.store(true, Ordering::Release);
     wait_for(&RELEASED);
@@ -69,21 +79,24 @@ fn a_stream_dropped_after_its_pool_is_safe_with_callbacks_still_to_come() {
         return;
     };
     let poke = module.kernel("poke").unwrap();
-    // A stream of the test's own, with a callback that holds the driver's callback thread until `RELEASED`.
     let fns = GpuFns::load(&gpu.device().driver).unwrap();
+    let (pool, mut streams) = gpu
+        .open_lanes(&["a", "b"], StreamOptions::default())
+        .unwrap();
+    let mut faulter = streams.remove(1);
+    let mut stream = streams.remove(0);
+    // Whatever happens next, the callback thread goes free when the test ends.
+    let _release = Release;
+    // The head of the stream under test: a callback that holds the stream, so everything queued behind it in the
+    // stream (the four retirements, then `after`) is delivered only after the test lets go.
     {
         let _current = gpu.device().enter().unwrap();
-        let mut raw = std::ptr::null_mut();
+        let raw = stream.raw_stream_for_tests();
         let callback: StreamCallback = hold;
-        // SAFETY: an out pointer; the context is current; the callbacks are plain functions.
+        // SAFETY: the context is current; the stream is alive; the callbacks are plain functions.
         unsafe {
-            assert_eq!((fns.stream_create_with_priority)(&mut raw, 1, 0), 0);
             assert_eq!(
                 (fns.stream_add_callback)(raw, callback, std::ptr::null_mut(), 0),
-                0
-            );
-            assert_eq!(
-                (fns.stream_add_callback)(raw, after, std::ptr::null_mut(), 0),
                 0
             );
         }
@@ -92,18 +105,33 @@ fn a_stream_dropped_after_its_pool_is_safe_with_callbacks_still_to_come() {
         wait_for(&HOLDING),
         "the callback thread never took the hold"
     );
-    let (pool, mut streams) = gpu.open_lanes(&["a"], StreamOptions::default()).unwrap();
-    let mut stream = streams.remove(0);
-    stream
-        .submit(|q| {
-            // SAFETY: `poke` writes through an address that is not mapped: the deliberate fault of this test, with the
-            // retirements below armed behind it.
-            unsafe { q.launch(&poke, Launch::linear(1, 1), &Args::new().device(0x10)) }
-        })
-        .unwrap();
     for _ in 0..4 {
         stream.arm_retirement().unwrap();
     }
+    {
+        let _current = gpu.device().enter().unwrap();
+        // SAFETY: as above.
+        unsafe {
+            assert_eq!(
+                (fns.stream_add_callback)(
+                    stream.raw_stream_for_tests(),
+                    after,
+                    std::ptr::null_mut(),
+                    0
+                ),
+                0
+            );
+        }
+    }
+    // The fault comes from another lane, after the arming above (a launch after a fault could not arm). Dropping that
+    // lane's stream waits for its work, so the fault is in place when this returns, whatever the speed of this thread.
+    faulter
+        .submit(|q| {
+            // SAFETY: `poke` writes through an address that is not mapped: the deliberate fault of this test.
+            unsafe { q.launch(&poke, Launch::linear(1, 1), &Args::new().device(0x10)) }
+        })
+        .unwrap();
+    drop(faulter);
     // The device is observed poisoned before the driver delivers any callback (a lattice worker polling right after a
     // fault is noticed): polling reports the four retirements as poisoned, and nothing is armed any more, yet all four
     // callbacks are still to come.
@@ -124,7 +152,7 @@ fn a_stream_dropped_after_its_pool_is_safe_with_callbacks_still_to_come() {
         1,
         "the shared side is kept alive for the callbacks still to come"
     );
-    // Let the callback thread go: the driver delivers the four callbacks, then the one queued behind the holding one.
+    // Let the stream go: the driver delivers its four callbacks, then the one queued behind them.
     // A callback that pushed into freed memory would crash here or later.
     RELEASED.store(true, Ordering::Release);
     assert!(wait_for(&AFTER), "the driver never delivered the callbacks");

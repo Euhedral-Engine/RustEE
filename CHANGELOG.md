@@ -5,15 +5,15 @@ semantics and the tests that pin it.
 
 ## The stream-drop-after-pool device test holds its callbacks back instead of racing them (`euhedral-gpu`, tests only) (2026-11-19)
 
-**What.** `a_stream_dropped_after_its_pool_is_safe_with_callbacks_still_to_come` no longer relies on a 125M-cycle `spin` kernel still running when the stream is dropped. The test holds the driver's callback thread inside a callback of a stream of its own, so the faulted stream's four retirement callbacks cannot be delivered until the test releases it after the drop. No library code changed.
+**What.** `a_stream_dropped_after_its_pool_is_safe_with_callbacks_still_to_come` no longer relies on a 125M-cycle `spin` kernel still running when the stream is dropped. The stream under test starts with a host callback that the test holds, and the four retirements and a last callback follow it in the stream. The fault is made on a second lane, whose stream is dropped (and so waited for) after the arming. `CudaStream::raw_stream_for_tests` is added under the `test-hooks` feature; no behaviour changed.
 
 **Why.** On a slow test thread the driver delivered the callbacks before `drop(stream)`, nothing was pending and the exact assertion on `leaked_shared_sides()` saw 0 where it expects 1.
 
 **How to use.** Nothing: a test change.
 
-**Semantics.** The driver runs the host callbacks of a context one at a time, so a callback that waits on a test-owned flag keeps every later callback of the context queued. The test waits, bounded only by a 60 s fail-fast guard, for a callback queued behind the holding one, which the driver runs after the four retirements.
+**Semantics.** A host callback blocks the later work of its stream until it returns, so the four retirements cannot be delivered while the test holds the first callback, and the fault comes from another lane after they are armed. The test lets the hold go after the drop and waits, bounded only by a 60 s fail-fast guard, for the last callback queued behind the retirements. A drop guard releases the hold if the test panics.
 
-**Tests.** The same test; with a 1 s sleep before `drop(pool)` and another before `drop(stream)` it passes every run, and it fails with that delay when the holding callback returns at once.
+**Tests.** The same test; with a 1 s sleep before the retirements are armed and another before `drop(pool)` it passes every run, where the earlier gating (a callback on a separate stream) panicked with error 700 when arming after the fault.
 
 ## Give-back orders, move completions and deferred calls reach the lattice at the next worker `request` (`euhedral-memory`) (2026-11-19)
 
