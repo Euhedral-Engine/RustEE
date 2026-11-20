@@ -6,10 +6,9 @@ self-hosted-runner:
     - arbiter-docker-unconfined
     - arbiter-gpu
 
-# Gitea's artifact backend takes the v3 actions, which actionlint flags as too old for GitHub, and a `uses` with a full
-# URL is how Gitea reaches an action in its own instance. Only these two messages, only in Gitea's workflow.
+# Gitea's artifact backend takes the v3 actions, which actionlint flags as too old for GitHub. Only this message, only in
+# Gitea's workflow.
 paths:
   .gitea/workflows/*.yml:
     ignore:
       - 'the runner of "actions/(upload|download)-artifact@v3" action is too old'
-      - 'specifying action "http://localhost:8929/[^"]*" in invalid format'

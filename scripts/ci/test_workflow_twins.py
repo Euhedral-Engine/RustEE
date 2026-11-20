@@ -11,6 +11,7 @@ the actions differ (checkout, caches, artifacts). The `ci-ok` needs list may dif
 import json
 import os
 import re
+import subprocess
 import sys
 import unittest
 
@@ -255,10 +256,39 @@ class Gitea(unittest.TestCase):
         self.assertEqual(
             windows["if"], "github.event_name == 'pull_request' && needs.changes.outputs.any == 'true'"
         )
-        proxy = next(s for s in windows["steps"] if "github-actions-proxy" in s.get("uses", ""))
-        self.assertTrue(proxy["uses"].endswith("/euhedral/ci/github-actions-proxy@v4"))
+        proxy = next(s for s in windows["steps"] if s.get("uses") == "./.ci/github-actions-proxy")
         self.assertEqual(proxy["with"]["inputs"], "only_os=windows-2025\nbase_ref=${{ github.base_ref }}\n")
         self.assertEqual(proxy["with"]["workflow"], "ci.yml")
+
+    def test_the_proxy_action_is_cloned_from_the_forge_at_its_tag(self):
+        windows = GITEA["jobs"]["windows"]["steps"]
+        names = [s.get("name") for s in windows]
+        fetch = windows[names.index("Fetch the proxy action (gitea)")]
+        self.assertLess(windows.index(fetch), next(i for i, s in enumerate(windows) if s.get("uses") == "./.ci/github-actions-proxy"))
+        self.assertEqual(fetch["env"]["FORGE_URL"], "${{ vars.FORGE_URL }}")
+        self.assertEqual(fetch["env"]["FORGE_TOKEN"], "${{ github.token }}")
+        run = fetch["run"]
+        self.assertIn('"$FORGE_URL/euhedral/ci.git" .ci', run)
+        self.assertRegex(run, r"--depth 1 --branch v4 ")
+        self.assertNotRegex(run, r"--branch v4\w")  # exactly the tag v4
+        # The token is a header of this one command: not in a URL, not echoed, not stored in the clone.
+        self.assertNotIn("@", run.replace("$FORGE_URL", ""))
+        self.assertNotIn("echo", run.replace('echo "the variable FORGE_URL is unset"', ""))
+        self.assertNotIn("config", run.replace("http.extraHeader", ""))
+        self.assertNotIn("secrets.", json.dumps(fetch))
+
+    def test_no_host_or_port_is_written_in_either_workflow(self):
+        for path in (".gitea/workflows/ci.yml", ".github/workflows/ci.yml"):
+            with open(os.path.join(ROOT, path)) as f:
+                text = f.read()
+            self.assertNotIn("localhost", text, path)
+            self.assertNotRegex(text, r"https?://[\w.-]+:\d+", path)
+            self.assertNotRegex(text, r":(8929|18929|2224|12224|3002|13002)\b", path)
+
+    def test_the_clone_directory_is_no_tracked_path(self):
+        out = subprocess.run(["git", "ls-files", ".ci"], cwd=ROOT, capture_output=True, text=True, check=True).stdout
+        self.assertEqual(out.strip(), "")
+        # affected.py reads the diff of tracked files only, so an untracked clone is never a changed file.
 
     def test_the_apps_key_is_read_only_by_the_windows_job(self):
         # Replaces the plan job's check that no GitHub App variable is in a job that runs a pull request's own code.
@@ -268,13 +298,16 @@ class Gitea(unittest.TestCase):
             for job, body in doc["jobs"].items():
                 if name == "gitea" and job == "windows":
                     self.assertIn("secrets.GH_APP_PRIVATE_KEY_B64", json.dumps(body))
+                    for step in body["steps"]:
+                        has = "secrets." in json.dumps(step)
+                        self.assertEqual(has, step.get("uses") == "./.ci/github-actions-proxy", step.get("name"))
                 else:
                     self.assertNotIn("secrets.", json.dumps(body), f"{name}: {job}")
 
     def test_every_action_is_one_the_forge_can_run(self):
         allowed = {
             "actions/checkout@v4", "actions/upload-artifact@v3", "actions/download-artifact@v3",
-            "http://localhost:8929/euhedral/ci/github-actions-proxy@v4",
+            "./.ci/github-actions-proxy",
         }
         used = {s["uses"] for body in GITEA["jobs"].values() for s in body["steps"] if "uses" in s}
         self.assertLessEqual(used, allowed)

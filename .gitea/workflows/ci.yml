@@ -398,7 +398,20 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: http://localhost:8929/euhedral/ci/github-actions-proxy@v4
+      # The proxy action is cloned from this forge, at its protected tag, into `.ci` (a path no tracked file has, and the
+      # job's later steps do not walk the tree), and called as a local action: no host or port is written in this file.
+      # The job's own token reaches git for this one command as a header, so it is neither written to the clone's
+      # configuration nor printed.
+      - name: Fetch the proxy action (gitea)
+        env:
+          FORGE_URL: ${{ vars.FORGE_URL }}
+          FORGE_TOKEN: ${{ github.token }}
+        run: |
+          test -n "$FORGE_URL" || { echo "the variable FORGE_URL is unset"; exit 1; }
+          auth=$(printf 'x-access-token:%s' "$FORGE_TOKEN" | base64 -w0)
+          git -c "http.extraHeader=Authorization: Basic $auth" clone --quiet --depth 1 --branch v4 "$FORGE_URL/euhedral/ci.git" .ci
+
+      - uses: ./.ci/github-actions-proxy
         with:
           repo: Euhedral-Engine/RustEE
           workflow: ci.yml
