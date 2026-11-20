@@ -88,7 +88,7 @@ internally, each landing at its own offset. `read` stays as it was, for a `Vec`-
   on success; a handle that would block or never complete is refused. A handle joins the engine's
   port and can serve one `AsyncIo`, ever. Writes go in pieces of at most 256 KiB, since a write
   that extends a file is synchronous on NTFS. Tested on a real Windows by
-  [CI](../.github/workflows/windows.yml) on every push to the `graph` branch.
+  [CI](../.github/workflows/ci.yml) (its `workspace` job on `windows-2025`).
 - **macOS:** no engine yet.
 
 ### The fallback where io_uring is refused
@@ -234,8 +234,7 @@ mise exec -- cargo test -p euhedral-io
 The Windows engine's state machines run on every platform against a simulated `Sys` (the seam over
 the Windows calls, in `src/win/sim.rs`). Its real calls (`src/win/real.rs`) compile on Windows only;
 `.github/workflows/ci.yml` runs formatting, Clippy and the tests of the whole workspace on Ubuntu and
-Windows, and the workflow `.github/workflows/windows.yml` runs `cargo test -p euhedral-io` on a
-`windows-2025` runner, where `src/win/live.rs` exercises files, loopback sockets, open and rename,
+Windows; on its `windows-2025` runner `src/win/live.rs` exercises files, loopback sockets, open and rename,
 each twice: with IoRing and forced onto the completion port.
 
 The tests are unit tests in each module (they drive the source by hand) and `tests/io_owned.rs`.
