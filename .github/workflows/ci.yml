@@ -346,8 +346,14 @@ jobs:
       - name: Every needed job passed or was skipped
         env:
           RESULTS: ${{ join(needs.*.result, ' ') }}
+          ANY: ${{ needs.changes.outputs.any }}
         run: |
           echo "results: $RESULTS"
           case " $RESULTS " in
             *" failure "*|*" cancelled "*) exit 1 ;;
+          esac
+          # If `changes` passed but published nothing, no later job ran: that is not a pass.
+          case "$ANY" in
+            true|false) ;;
+            *) echo "changes published no result"; exit 1 ;;
           esac

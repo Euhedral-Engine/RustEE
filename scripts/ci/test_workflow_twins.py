@@ -2,7 +2,7 @@
 """Pins .gitea/workflows/ci.yml and .github/workflows/ci.yml to each other, and the Gitea one to what its jobs promise.
 Run: python3 scripts/ci/test_workflow_twins.py (needs PyYAML).
 
-The two files are twins: for the jobs both have, the steps that are not forge-only are the same, field for field and in
+The two files are twins: for the jobs both have, the steps that are not forge-only are the same, key for key and in
 order. A forge-only step has a name that ends in `(gitea)` or `(github)`; a step that `uses` an action may differ, since
 the actions differ (checkout, caches, artifacts). The `ci-ok` needs list may differ. Everything else a job promises
 (which jobs a change runs, the leases, the device job, the one place a secret is read) is pinned for the Gitea file below.
@@ -33,8 +33,8 @@ def load(path):
 GITEA = load(".gitea/workflows/ci.yml")
 GITHUB = load(".github/workflows/ci.yml")
 TWIN_JOBS = ["changes", "workspace", "miri-build", "miri", "ci-ok"]
-TWIN_FIELDS = ["name", "if", "run", "env", "id", "shell", "working-directory"]
 DOCKER_LABELS = {"arbiter-docker", "arbiter-docker-unconfined", "arbiter-gpu"}
+SECRETS = re.compile(r"\bsecrets\b")  # `secrets.X`, `toJSON(secrets)` and `secrets[...]` alike
 CHANGES_OUTPUT = re.compile(r"needs\.changes\.outputs\.(\w+)")
 
 
@@ -47,9 +47,9 @@ def forge_only(step):
 
 
 def shared(doc, job):
-    """The steps of `job` both files must have, as the fields that are compared."""
+    """The steps of `job` both files must have, with every key."""
     return [
-        {k: s[k] for k in TWIN_FIELDS if k in s}
+        dict(s)  # every key: a step that differs in any (`if`, `continue-on-error`, `with`, ...) is not a twin
         for s in steps(doc, job)
         if "uses" not in s and not forge_only(s)
     ]
@@ -156,8 +156,47 @@ class Gitea(unittest.TestCase):
         self.assertEqual(on["push"], {"branches": ["main"]})
         self.assertIn("workflow_dispatch", on)
 
-    def test_a_pull_request_run_is_cancelled_by_a_newer_push_and_main_is_not(self):
+    def test_a_pull_request_run_is_cancelled_by_a_newer_push_and_a_push_to_main_is_not(self):
         self.assertEqual(GITEA["concurrency"]["cancel-in-progress"], "${{ github.event_name == 'pull_request' }}")
+        # A push to main has a group of its own (its commit): a newer queued run must not replace a pending one.
+        self.assertEqual(
+            GITEA["concurrency"]["group"],
+            "ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}",
+        )
+
+    def test_no_job_or_step_may_fail_without_failing_the_run(self):
+        self.assertNotIn("continue-on-error", json.dumps(GITEA))
+
+    def test_every_job_has_exactly_these_keys_and_conditions(self):
+        keys = {
+            "changes": {"runs-on", "env", "outputs", "steps"},
+            "workflows": {"if", "runs-on", "env", "steps"},
+            "workspace": {"needs", "if", "runs-on", "defaults", "env", "steps"},
+            "device": {"needs", "if", "runs-on", "defaults", "env", "steps"},
+            "miri-build": {"needs", "if", "runs-on", "env", "steps"},
+            "miri": {"name", "needs", "if", "strategy", "runs-on", "env", "steps"},
+            "windows": {"needs", "if", "runs-on", "timeout-minutes", "env", "steps"},
+            "ci-ok": {"needs", "if", "runs-on", "env", "steps"},
+        }
+        self.assertEqual({j: set(b) for j, b in GITEA["jobs"].items()}, keys)
+        conditions = {
+            "workflows": "github.event_name == 'pull_request'",
+            "workspace": "needs.changes.outputs.any == 'true'",
+            "device": "needs.changes.outputs.euhedral_memory == 'true' || needs.changes.outputs.euhedral_gpu == 'true'",
+            "miri-build": "needs.changes.outputs.miri == 'true'",
+            "miri": "needs.changes.outputs.miri == 'true'",
+            "windows": "github.event_name == 'pull_request' && needs.changes.outputs.any == 'true'",
+            "ci-ok": "always()",
+        }
+        self.assertEqual({j: b["if"] for j, b in GITEA["jobs"].items() if "if" in b}, conditions)
+
+    def test_ci_ok_fails_when_changes_published_nothing(self):
+        # If `changes` passed but its outputs did not arrive, every later job is skipped: not a pass.
+        for doc in (GITEA, GITHUB):
+            self.assertIn("changes", doc["jobs"]["ci-ok"]["needs"])
+            step = steps(doc, "ci-ok")[0]
+            self.assertEqual(step["env"]["ANY"], "${{ needs.changes.outputs.any }}")
+            self.assertRegex(step["run"], r'case "\$ANY" in\s+true\|false\) ;;\s+\*\) [^\n]*exit 1 ;;')
 
     def test_a_change_that_affects_nothing_still_passes(self):
         # Every job but the first and the gate is gated on what `changes` found (or is the workflow lint).
@@ -268,21 +307,29 @@ class Gitea(unittest.TestCase):
         self.assertEqual(fetch["env"]["FORGE_URL"], "${{ vars.FORGE_URL }}")
         self.assertEqual(fetch["env"]["FORGE_TOKEN"], "${{ github.token }}")
         run = fetch["run"]
-        self.assertIn('"$FORGE_URL/euhedral/ci.git" .ci', run)
-        self.assertRegex(run, r"--depth 1 --branch v4 ")
-        self.assertNotRegex(run, r"--branch v4\w")  # exactly the tag v4
-        # The token is a header of this one command: not in a URL, not echoed, not stored in the clone.
+        self.assertIn('"$FORGE_URL/euhedral/ci.git" refs/tags/v4', run)
+        self.assertNotRegex(run, r"refs/tags/v4\w")  # exactly the tag v4, by its full ref (a branch v4 must not win)
+        self.assertIn("git init -q .ci", run)
+        self.assertIn("git -C .ci fetch -q --depth 1", run)
+        self.assertIn("git -C .ci checkout -q --detach FETCH_HEAD", run)
+        self.assertNotIn("clone", run)
+        self.assertNotIn("--branch", run)
+        # The token is this command's environment: not in argv or a URL, not echoed, not stored in `.ci/.git/config`.
+        self.assertIn("GIT_CONFIG_KEY_0=http.extraHeader", run)
         self.assertNotIn("@", run.replace("$FORGE_URL", ""))
         self.assertNotIn("echo", run.replace('echo "the variable FORGE_URL is unset"', ""))
-        self.assertNotIn("config", run.replace("http.extraHeader", ""))
-        self.assertNotIn("secrets.", json.dumps(fetch))
+        self.assertNotIn("git config", run)
+        self.assertNotIn("config --", run)
+        self.assertIsNone(SECRETS.search(json.dumps(fetch)))
 
     def test_no_host_or_port_is_written_in_either_workflow(self):
         for path in (".gitea/workflows/ci.yml", ".github/workflows/ci.yml"):
             with open(os.path.join(ROOT, path)) as f:
                 text = f.read()
             self.assertNotIn("localhost", text, path)
-            self.assertNotRegex(text, r"https?://[\w.-]+:\d+", path)
+            # No URL at all: a host, with or without a port, is the forge's to say (an allowed one is listed here).
+            allowed = []
+            self.assertEqual([u for u in re.findall(r"[\w+.-]*://\S*", text) if u not in allowed], [], path)
             self.assertNotRegex(text, r":(8929|18929|2224|12224|3002|13002)\b", path)
 
     def test_the_clone_directory_is_no_tracked_path(self):
@@ -294,15 +341,15 @@ class Gitea(unittest.TestCase):
         # Replaces the plan job's check that no GitHub App variable is in a job that runs a pull request's own code.
         for doc, name in ((GITEA, "gitea"), (GITHUB, "github")):
             top = {k: v for k, v in doc.items() if k != "jobs"}
-            self.assertNotIn("secrets.", json.dumps(top), name)
+            self.assertIsNone(SECRETS.search(json.dumps(top)), name)
             for job, body in doc["jobs"].items():
                 if name == "gitea" and job == "windows":
                     self.assertIn("secrets.GH_APP_PRIVATE_KEY_B64", json.dumps(body))
                     for step in body["steps"]:
-                        has = "secrets." in json.dumps(step)
+                        has = SECRETS.search(json.dumps(step)) is not None
                         self.assertEqual(has, step.get("uses") == "./.ci/github-actions-proxy", step.get("name"))
                 else:
-                    self.assertNotIn("secrets.", json.dumps(body), f"{name}: {job}")
+                    self.assertIsNone(SECRETS.search(json.dumps(body)), f"{name}: {job}")
 
     def test_every_action_is_one_the_forge_can_run(self):
         allowed = {
