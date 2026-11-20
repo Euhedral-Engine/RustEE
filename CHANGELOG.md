@@ -3,6 +3,18 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## The stream-drop-after-pool device test holds its callbacks back instead of racing them (`euhedral-gpu`, tests only) (2026-11-19)
+
+**What.** `a_stream_dropped_after_its_pool_is_safe_with_callbacks_still_to_come` no longer relies on a 125M-cycle `spin` kernel still running when the stream is dropped. The test holds the driver's callback thread inside a callback of a stream of its own, so the faulted stream's four retirement callbacks cannot be delivered until the test releases it after the drop. No library code changed.
+
+**Why.** On a slow test thread the driver delivered the callbacks before `drop(stream)`, nothing was pending and the exact assertion on `leaked_shared_sides()` saw 0 where it expects 1.
+
+**How to use.** Nothing: a test change.
+
+**Semantics.** The driver runs the host callbacks of a context one at a time, so a callback that waits on a test-owned flag keeps every later callback of the context queued. The test waits, bounded only by a 60 s fail-fast guard, for a callback queued behind the holding one, which the driver runs after the four retirements.
+
+**Tests.** The same test; with a 1 s sleep before `drop(pool)` and another before `drop(stream)` it passes every run, and it fails with that delay when the holding callback returns at once.
+
 ## Give-back orders, move completions and deferred calls reach the lattice at the next worker `request` (`euhedral-memory`) (2026-11-19)
 
 **What.** `GiveBacks`, `Moves` and `DeferredCalls` no longer push to their downstream from a producer's thread. A claim that orders a give-back, a finished move and a `defer` or `drain_soon` only enqueue (or set a flag). Delivery happens when a worker serving the source hands items out in `pull` (orders and completions, within the `pull`'s own demand) or pushes them in `request` (within the demand it banked). A `pull` never pushes and never changes the bank. `DeferredCalls::poll` and `Deferral::poll` are removed: `request` evaluates the conditions. A stop-matched order or completion stays at the head of its source and is the first handed out next time, where it used to be re-queued at the tail. The `HOT-FIX` marks S1 and S2 are gone.
