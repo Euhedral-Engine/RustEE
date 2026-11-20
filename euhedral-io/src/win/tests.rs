@@ -1153,7 +1153,7 @@ fn a_flush_builds_a_bounded_number_of_entries_and_a_submission_never_waits_for_o
     h.read(file, 0, 10, 99).unwrap(); // makes this thread's ring
     h.drain(1);
     let ring = h.engine.rings[0].get().unwrap().clone();
-    let busy = lock!(&ring.inner);
+    let busy = ring.inner.try_claim().expect("free");
     // Another thread is submitting: this one only queues its entries (it must not wait).
     for tag in 0..40u64 {
         h.read(file, tag * 10, 10, tag).unwrap();
@@ -1382,7 +1382,7 @@ fn an_operation_ended_by_the_issuers_recheck_of_a_broken_ring_leaks_its_buffer()
         offset: 0,
         user_data: super::token(held.slot, held.generation),
     };
-    lock!(&ring.backlog).push_back(entry);
+    assert!(ring.incoming.offer(entry).is_ok());
     // ... and a concurrent flush (which saw the ring healthy) builds it: the kernel has it.
     h.engine.flush_ring(&ring);
     assert_eq!(
@@ -1513,7 +1513,7 @@ fn an_owned_read_whose_ring_broke_leaks_its_memory_and_its_continuation_says_so(
         offset: 0,
         user_data: super::token(held.slot, held.generation),
     };
-    lock!(&ring.backlog).push_back(entry);
+    assert!(ring.incoming.offer(entry).is_ok());
     h.engine.flush_ring(&ring);
     ring.broken.store(true, Ordering::Release);
     h.engine.end_if_broken(&ring, entry.user_data);
@@ -2083,4 +2083,29 @@ fn limits_begun_on_8_threads_each_expire_once() {
         h.engine.next_deadline.load(Ordering::Acquire),
         super::NO_DEADLINE
     );
+}
+
+#[test]
+fn a_ring_that_breaks_while_another_thread_submits_hands_nothing_to_the_kernel() {
+    let h = Harness::with(Some(full_probe()), true, MAX_PIECE);
+    let file = h.sim.file(&content(100));
+    h.read(file, 0, 10, 99).unwrap(); // makes this thread's ring
+    h.drain(1);
+    let ring = h.engine.rings[0].get().unwrap().clone();
+    let submits = h.sim.submit_sizes().len();
+    let busy = ring.inner.try_claim().expect("free");
+    for tag in 0..3u64 {
+        h.read(file, tag * 10, 10, tag).unwrap();
+    }
+    // The ring breaks while the claim is held elsewhere: its operations end at once ...
+    h.engine.break_ring(&ring, &io::Error::from_raw_os_error(5));
+    drop(busy);
+    // ... and the entries that were waiting are dropped by the next flush, not built.
+    h.engine.flush_ring(&ring);
+    assert_eq!(h.sim.submit_sizes().len(), submits);
+    for done in h.drain(3) {
+        let error = ended(done).result.unwrap_err();
+        assert!(error.to_string().contains("IoRing failed"), "{error}");
+    }
+    assert_eq!(h.pending(), 0);
 }

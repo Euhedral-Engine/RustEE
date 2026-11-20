@@ -44,8 +44,6 @@ const HOT_FIX_TAGS: &[(&str, usize)] = &[
     ("I6", 3),
     ("I11", 3),
     ("I12", 3),
-    ("I14", 3),
-    ("I15", 3),
     ("S6a", 1),
 ];
 
@@ -55,11 +53,7 @@ const HOT_FIX_TAGS: &[(&str, usize)] = &[
 /// [`LOCK_MACRO_CEILINGS`] has its listed count as a ceiling instead.
 const LOCK_MACRO_SITES: &[(&str, &[&str], usize)] = &[
     ("euhedral-io/src/uring.rs", &["I3", "I4", "I5", "I6"], 7),
-    (
-        "euhedral-io/src/win/mod.rs",
-        &["I11", "I12", "I14", "I15"],
-        1_000_000,
-    ),
+    ("euhedral-io/src/win/mod.rs", &["I11", "I12"], 1_000_000),
 ];
 
 /// Files of [`LOCK_MACRO_SITES`] whose listed count is only a ceiling: fewer sites pass. The locks of the Windows

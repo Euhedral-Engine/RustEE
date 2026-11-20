@@ -44,15 +44,13 @@ use std::path::PathBuf;
 use std::ptr::NonNull;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-#[allow(
-    clippy::disallowed_types,
-    reason = "HOT-FIX(I14), HOT-FIX(I15), HOT-FIX(I11), HOT-FIX(I12)"
-)]
-use std::sync::{Arc, Mutex, TryLockError, Weak};
+#[allow(clippy::disallowed_types, reason = "HOT-FIX(I11), HOT-FIX(I12)")]
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use euhedral_core::frames::Frame;
 use euhedral_data_structures::queues::{Consumer, MpscQueue, Multi, Producer, Single};
+use euhedral_data_structures::sync::ClaimCell;
 
 use self::slab::{Asked, End, RouteTag, Slab, SlotCell, State};
 use self::sys::{
@@ -322,14 +320,12 @@ struct Ring {
     /// Its place in the engine's rings.
     index: usize,
     handle: Handle,
-    /// Building entries and submitting: one thread at a time, and a thread that finds it taken
-    /// leaves its entry in the backlog for the holder or the next poll.
-    #[allow(clippy::disallowed_types, reason = "HOT-FIX(I14)")]
-    inner: Mutex<RingInner>,
-    /// Entries waiting for room in the kernel's queues, the oldest first. Its own lock, held only
-    /// to push or take, so a submission never waits behind a submit.
-    #[allow(clippy::disallowed_types, reason = "HOT-FIX(I15)")]
-    backlog: Mutex<VecDeque<Entry>>,
+    /// Building entries, submitting and popping: one thread at a time. A thread that finds it
+    /// claimed has left its entry in `incoming`, for the holder (who looks again after it lets go)
+    /// or the next poll.
+    inner: ClaimCell<RingInner>,
+    /// Entries waiting for room in the kernel's queues, the oldest first; submissions only add.
+    incoming: Producer<Entry, Multi>,
     /// Entries built and not yet popped; at most the completion queue's size, so it never
     /// overflows.
     in_kernel: AtomicUsize,
@@ -341,6 +337,8 @@ struct Ring {
 struct RingInner {
     /// Entries are built that the kernel has not taken (a submit failed).
     unsubmitted: bool,
+    /// The other end of `Ring::incoming`.
+    backlog: Consumer<Entry, Single>,
 }
 
 impl Drop for Ring {
@@ -869,7 +867,6 @@ impl Engine {
     // ---- rings
 
     /// The calling thread's ring, made on first use; `None` if there is none to be had.
-    #[allow(clippy::disallowed_types, reason = "HOT-FIX(I14), HOT-FIX(I15)")]
     fn ring(&self) -> Option<Arc<Ring>> {
         MINE.with_borrow_mut(|mine| {
             mine.retain(|(_, ring)| ring.strong_count() > 0);
@@ -897,12 +894,16 @@ impl Engine {
                 self.sys.ring_close(handle);
                 return None;
             };
+            let backlog: MpscQueue<Entry> = MpscQueue::with_pool(HAND_OFF_CHUNK, 2);
             let ring = Arc::new(Ring {
                 sys: self.sys.clone(),
                 index,
                 handle,
-                inner: Mutex::new(RingInner { unsubmitted: false }),
-                backlog: Mutex::new(VecDeque::new()),
+                inner: ClaimCell::new(RingInner {
+                    unsubmitted: false,
+                    backlog: backlog.consumer(),
+                }),
+                incoming: backlog.producer(),
                 in_kernel: AtomicUsize::new(0),
                 capacity: 2 * RING_ENTRIES as usize,
                 broken: AtomicBool::new(false),
@@ -917,21 +918,34 @@ impl Engine {
     /// Hands what waits in the ring's backlog (or was built and not submitted) to the kernel,
     /// unless another thread is doing so right now.
     fn flush_ring(&self, ring: &Ring) {
-        // A poisoned lock is taken: it guards a flag a panic cannot leave broken.
-        let mut inner = match ring.inner.try_lock() {
-            Ok(inner) => inner,
-            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-            Err(TryLockError::WouldBlock) => return,
-        };
+        loop {
+            let Some(mut claim) = ring.inner.try_claim() else {
+                // The holder looks for what was offered before it lets go.
+                return;
+            };
+            let drained = self.flush_claimed(ring, &mut claim);
+            // An entry offered after the holder's last look finds the claim held; letting go with
+            // a full fence makes the holder see it, or the offerer win the claim.
+            claim.release_seq_cst();
+            if !drained || ring.incoming.is_empty() {
+                return;
+            }
+        }
+    }
+
+    /// The flush, by the holder of the claim. `true` if it left nothing waiting that it could have
+    /// built (it did not stop for room).
+    fn flush_claimed(&self, ring: &Ring, inner: &mut RingInner) -> bool {
         if ring.broken.load(Ordering::Acquire) {
             // Nothing is handed to a ring that cannot be read; its entries were ended.
-            lock!(&ring.backlog).clear();
-            return;
+            inner.backlog.drain_all(drop);
+            return true;
         }
         let sys = &*self.sys;
         let mut built = 0;
+        let mut drained = true;
         while built < FLUSH_ENTRIES && ring.in_kernel.load(Ordering::Acquire) < ring.capacity {
-            let Some(entry) = lock!(&ring.backlog).front().copied() else {
+            let Some(entry) = inner.backlog.peek().copied() else {
                 break;
             };
             // SAFETY: the entry's pointer is into its record's buffer, which stays untouched
@@ -959,33 +973,36 @@ impl Engine {
             };
             match built_now {
                 Ok(()) => {
-                    lock!(&ring.backlog).pop_front();
+                    inner.backlog.poll();
                     ring.in_kernel.fetch_add(1, Ordering::AcqRel);
                     built += 1;
                 }
-                Err(BuildError::Full) => break,
+                Err(BuildError::Full) => {
+                    drained = false;
+                    break;
+                }
                 Err(BuildError::Other(error)) => {
-                    lock!(&ring.backlog).pop_front();
+                    inner.backlog.poll();
                     // Not built: the kernel never had the buffer.
                     self.fail_token(entry.user_data, error, false);
                 }
             }
         }
+        if built >= FLUSH_ENTRIES || ring.in_kernel.load(Ordering::Acquire) >= ring.capacity {
+            drained = false;
+        }
         if built > 0 || inner.unsubmitted {
             inner.unsubmitted = sys.ring_submit(ring.handle).is_err();
         }
+        drained
     }
 
     /// The next completion of `ring`, if the ring is not busy. A ring that cannot be read ends
     /// its operations with the error.
     fn pop(&self, ring: &Arc<Ring>) -> Option<Cqe> {
-        let inner = match ring.inner.try_lock() {
-            Ok(inner) => inner,
-            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-            Err(TryLockError::WouldBlock) => return None,
-        };
+        let claim = ring.inner.try_claim()?;
         let popped = self.sys.ring_pop(ring.handle);
-        drop(inner);
+        drop(claim);
         match popped {
             Ok(Some(cqe)) => {
                 ring.in_kernel.fetch_sub(1, Ordering::AcqRel);
@@ -1040,10 +1057,11 @@ impl Engine {
                 error: ring_failed_with(error),
             });
         }
-        // The backlog is cleared under the submit lock, so a flush never pops an entry another
-        // thread has just taken out from under it.
-        let _inner = lock!(&ring.inner);
-        lock!(&ring.backlog).clear();
+        // The backlog is cleared by the holder of the claim. A flush that holds it clears it as it
+        // finds the ring broken.
+        if let Some(mut inner) = ring.inner.try_claim() {
+            inner.backlog.drain_all(drop);
+        }
     }
 
     // ---- starting operations
@@ -1200,7 +1218,8 @@ impl Engine {
             Call::Ring(ring, entry) => {
                 // The record is not touched again: the entry may complete as soon as it is built.
                 self.set_state(held, State::InFlight);
-                lock!(&ring.backlog).push_back(entry);
+                let queued = ring.incoming.offer(entry);
+                debug_assert!(queued.is_ok(), "the unbounded queue refused an entry");
                 self.end_if_broken(&ring, entry.user_data);
                 if !ring.broken.load(Ordering::Acquire) {
                     self.flush_ring(&ring);
