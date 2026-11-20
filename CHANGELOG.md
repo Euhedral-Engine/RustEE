@@ -13,7 +13,7 @@ semantics and the tests that pin it.
 
 **Semantics.** A host callback blocks the later work of its stream until it returns, so the four retirements cannot be delivered while the test holds the first callback, and the fault comes from another lane after they are armed. The test lets the hold go after the drop and waits, bounded only by a 60 s fail-fast guard, for the last callback queued behind the retirements. A drop guard releases the hold if the test panics.
 
-**Tests.** The same test; with a 1 s sleep before the retirements are armed and another before `drop(pool)` it passes every run, where the earlier gating (a callback on a separate stream) panicked with error 700 when arming after the fault.
+**Tests.** The same test; with a 1 s sleep before the retirements are armed and another before `drop(pool)` it passes every run, where the old test, with a 1 s delay before the arming, armed after the fault and panicked with error 700.
 
 ## Give-back orders, move completions and deferred calls reach the lattice at the next worker `request` (`euhedral-memory`) (2026-11-19)
 

@@ -123,7 +123,7 @@ fn a_stream_dropped_after_its_pool_is_safe_with_callbacks_still_to_come() {
             );
         }
     }
-    // The fault comes from another lane, after the arming above (a launch after a fault could not arm). Dropping that
+    // The fault comes from another lane, after the arming above (arming after a fault fails with error 700). Dropping that
     // lane's stream waits for its work, so the fault is in place when this returns, whatever the speed of this thread.
     faulter
         .submit(|q| {
