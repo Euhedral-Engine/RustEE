@@ -41,10 +41,11 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::io;
 use std::path::PathBuf;
 use std::ptr::NonNull;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 #[allow(
     clippy::disallowed_types,
-    reason = "HOT-FIX(I14), HOT-FIX(I15), HOT-FIX(I7), HOT-FIX(I10), HOT-FIX(I11), HOT-FIX(I12), HOT-FIX(I13)"
+    reason = "HOT-FIX(I14), HOT-FIX(I15), HOT-FIX(I7), HOT-FIX(I10), HOT-FIX(I11), HOT-FIX(I12)"
 )]
 use std::sync::{Arc, Mutex, TryLockError, Weak};
 use std::time::Duration;
@@ -382,6 +383,8 @@ enum Call {
 /// One submitting thread's ring.
 struct Ring {
     sys: Arc<dyn Sys>,
+    /// Its place in the engine's rings.
+    index: usize,
     handle: Handle,
     /// Building entries and submitting: one thread at a time, and a thread that finds it taken
     /// leaves its entry in the backlog for the holder or the next poll.
@@ -460,8 +463,11 @@ pub(super) struct Engine {
     /// The file handles a ring serves.
     #[allow(clippy::disallowed_types, reason = "HOT-FIX(I12)")]
     ringed: Mutex<HashSet<Handle>>,
-    #[allow(clippy::disallowed_types, reason = "HOT-FIX(I13)")]
-    rings: Mutex<Vec<Arc<Ring>>>,
+    /// The rings, by index: a ring is set once, never removed, and made after its index was
+    /// reserved in `ring_count` (a poll that finds the index not set yet skips it: the ring has no
+    /// operation).
+    rings: Box<[OnceLock<Arc<Ring>>]>,
+    ring_count: AtomicUsize,
     max_piece: usize,
     /// The soonest deadline in `Table::limits` (`NO_DEADLINE` when there is none), kept in step
     /// under the table's lock, so that a poll takes no lock for limits until one has passed.
@@ -493,7 +499,7 @@ impl Engine {
     /// An engine over `sys`. Fails if there is no completion port.
     #[allow(
         clippy::disallowed_types,
-        reason = "HOT-FIX(I7), HOT-FIX(I10), HOT-FIX(I11), HOT-FIX(I12), HOT-FIX(I13)"
+        reason = "HOT-FIX(I7), HOT-FIX(I10), HOT-FIX(I11), HOT-FIX(I12)"
     )]
     pub(super) fn new(
         sys: Arc<dyn Sys>,
@@ -530,7 +536,8 @@ impl Engine {
                 probe.read && probe.write && probe.version >= IORING_VERSION_3
             }),
             ringed: Mutex::new(HashSet::new()),
-            rings: Mutex::new(Vec::new()),
+            rings: (0..MAX_RINGS).map(|_| OnceLock::new()).collect(),
+            ring_count: AtomicUsize::new(0),
             max_piece: max_piece.clamp(1, MAX_PIECE),
             next_deadline: AtomicU64::new(NO_DEADLINE),
             strays: AtomicUsize::new(0),
@@ -885,13 +892,23 @@ impl Engine {
                 }
                 mine.retain(|(id, _)| *id != self.id);
             }
-            let mut rings = lock!(&self.rings);
-            if rings.len() >= MAX_RINGS {
+            if self.ring_count.load(Ordering::Acquire) >= MAX_RINGS {
                 return None;
             }
             let handle = self.sys.ring_create(RING_ENTRIES).ok()?;
+            // Another thread may have taken the last index meanwhile.
+            let Ok(index) = self
+                .ring_count
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                    (n < MAX_RINGS).then_some(n + 1)
+                })
+            else {
+                self.sys.ring_close(handle);
+                return None;
+            };
             let ring = Arc::new(Ring {
                 sys: self.sys.clone(),
+                index,
                 handle,
                 inner: Mutex::new(RingInner { unsubmitted: false }),
                 backlog: Mutex::new(VecDeque::new()),
@@ -899,7 +916,8 @@ impl Engine {
                 capacity: 2 * RING_ENTRIES as usize,
                 broken: AtomicBool::new(false),
             });
-            rings.push(ring.clone());
+            // Each index is reserved by one thread, which sets it once.
+            let _ = self.rings[index].set(ring.clone());
             mine.push((self.id, Arc::downgrade(&ring)));
             Some(ring)
         })
@@ -1721,8 +1739,8 @@ impl EngineTrait for Engine {
         if !self.poll_port(room, offer) {
             return;
         }
-        let rings: Vec<Arc<Ring>> = lock!(&self.rings).clone();
-        for ring in &rings {
+        let made = self.ring_count.load(Ordering::Acquire).min(MAX_RINGS);
+        for ring in self.rings[..made].iter().filter_map(OnceLock::get) {
             self.flush_ring(ring);
             while room() {
                 let Some(cqe) = self.pop(ring) else {

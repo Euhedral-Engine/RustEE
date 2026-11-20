@@ -1095,7 +1095,7 @@ fn a_ring_completion_or_a_packet_ends_only_a_record_on_its_own_route() {
     assert_eq!(h.engine.strays.load(Ordering::Relaxed), 1);
     // A ring completion with the wrong generation, or on a record not routed through the ring,
     // ends nothing either.
-    let ring = lock!(&h.engine.rings)[0].clone();
+    let ring = h.engine.rings[0].get().unwrap().clone();
     assert!(
         h.engine.take_token(0, 1 + 7, Some(&ring)).is_none(),
         "wrong generation"
@@ -1152,7 +1152,7 @@ fn a_flush_builds_a_bounded_number_of_entries_and_a_submission_never_waits_for_o
     let file = h.sim.file(&data);
     h.read(file, 0, 10, 99).unwrap(); // makes this thread's ring
     h.drain(1);
-    let ring = lock!(&h.engine.rings)[0].clone();
+    let ring = h.engine.rings[0].get().unwrap().clone();
     let busy = lock!(&ring.inner);
     // Another thread is submitting: this one only queues its entries (it must not wait).
     for tag in 0..40u64 {
@@ -1965,4 +1965,32 @@ fn pool_results_from_many_threads_are_each_polled_once() {
     );
     assert!(h.pull_with(&mut |_| false).is_empty(), "each only once");
     assert_eq!(h.engine.strays.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn one_poll_walks_the_ring_of_every_submitting_thread() {
+    const THREADS: u64 = 6;
+    let h = Harness::with(Some(full_probe()), true, MAX_PIECE);
+    let file = h.sim.file(&content(100));
+    std::thread::scope(|scope| {
+        for tag in 0..THREADS {
+            let h = &h;
+            scope.spawn(move || h.read(file, 0, 10, tag).unwrap());
+        }
+    });
+    assert_eq!(h.sim.rings_made(), THREADS as usize, "one ring per thread");
+    assert_eq!(
+        h.engine.ring_count.load(Ordering::Acquire),
+        THREADS as usize
+    );
+    let done = h.pull_with(&mut |_| false);
+    assert_eq!(
+        done.len(),
+        THREADS as usize,
+        "a single poll took every ring's end"
+    );
+    let got: Vec<u64> = done.iter().map(|d| d.header.id_hash()).collect();
+    let mut got = got;
+    got.sort_unstable();
+    assert_eq!(got, tag_ids(0..THREADS));
 }
