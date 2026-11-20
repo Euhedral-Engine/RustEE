@@ -399,6 +399,13 @@ impl<T> Slab<T> {
         debug_assert!(queued.is_ok(), "the unbounded queue refused a slot");
     }
 
+    /// Counts a slot as made without making its chunk, as a thread that was paused between the
+    /// two does.
+    #[cfg(test)]
+    pub(super) fn reserve_without_chunk(&self) {
+        self.made.fetch_add(1, Ordering::AcqRel);
+    }
+
     /// Slots made so far (some may not be readable yet).
     pub(super) fn made(&self) -> u32 {
         self.made.load(Ordering::Acquire).min(self.max)
@@ -602,8 +609,18 @@ mod tests {
         let slot = slab.alloc().unwrap();
         let cell = slab.cell(slot).unwrap();
         let rounds = if cfg!(miri) { 10 } else { 200 };
+        // Set when the canceller ends, even by a failed assertion: the poller's side then stops
+        // waiting for an unpin that will not come.
+        let gone = std::sync::atomic::AtomicBool::new(false);
+        struct Gone<'a>(&'a std::sync::atomic::AtomicBool);
+        impl Drop for Gone<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
         std::thread::scope(|scope| {
             let canceller = scope.spawn(|| {
+                let _gone = Gone(&gone);
                 let mut pinned = Vec::new();
                 for serial in 1..=rounds {
                     if cell.ask_to_end(serial, End::Cancelled) == Asked::Cancel {
@@ -624,7 +641,10 @@ mod tests {
                     .take(|word| if word.pinned() { Err(()) } else { Ok(()) })
                     .is_err()
                 {
-                    std::hint::spin_loop();
+                    if gone.load(Ordering::Acquire) {
+                        // The canceller failed or ended with the slot pinned.
+                        assert!(!cell.load().pinned(), "a pin was left behind");
+                    }
                 }
                 cell.release();
             }

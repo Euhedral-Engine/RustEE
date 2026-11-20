@@ -43,7 +43,7 @@ use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 use std::ptr::NonNull;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering, fence};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -857,7 +857,11 @@ impl Engine {
     /// already ended it. A concurrent flush may have built the entry before the ring broke, so
     /// the kernel may own the buffer: it is leaked.
     fn end_if_broken(&self, ring: &Ring, user_data: usize) {
-        if ring.broken.load(Ordering::Acquire) {
+        // One half of a store-buffer pair with `break_ring`: this side wrote the slot's state
+        // (`InFlight`) and reads `broken`; that side writes `broken` and reads the slots' words.
+        // The fences make at least one of them see the other's write.
+        fence(Ordering::SeqCst);
+        if ring.broken.load(Ordering::SeqCst) {
             self.fail_token(user_data, ring_failed(), true);
         }
     }
@@ -1017,12 +1021,17 @@ impl Engine {
     /// The ring cannot be read: every operation routed through it ends with `error`. Their
     /// buffers are leaked, since the kernel may still write them.
     fn break_ring(&self, ring: &Arc<Ring>, error: &io::Error) {
-        if ring.broken.swap(true, Ordering::AcqRel) {
+        if ring.broken.swap(true, Ordering::SeqCst) {
             return;
         }
+        // The other half of the pair with `end_if_broken`.
+        fence(Ordering::SeqCst);
         let mut failed = Vec::new();
         for slot in 0..self.slab.made() {
-            let cell = self.cell(slot);
+            // A slot counted as made may have no chunk yet: its operation is not in flight.
+            let Some(cell) = self.slab.cell(slot) else {
+                continue;
+            };
             let word = cell.load();
             if word.state() != State::InFlight
                 || word.route() != RouteTag::Ring

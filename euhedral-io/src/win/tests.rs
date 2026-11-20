@@ -2129,3 +2129,89 @@ fn a_handle_value_the_system_gave_again_joins_the_port_again() {
         .count();
     assert_eq!(joins, 2);
 }
+
+#[test]
+fn a_rest_offered_while_the_owner_builds_is_submitted_once() {
+    use std::sync::atomic::AtomicBool;
+    let h = Harness::with(Some(full_probe()), true, MAX_PIECE);
+    let file = h.sim.file(&content(100));
+    h.read(file, 0, 10, 1).unwrap(); // makes this thread's ring
+    h.drain(1);
+    let ring = h.engine.ring().unwrap();
+    // A second operation, in flight and with its entry built, but not yet offered.
+    let op = Engine::op(
+        super::Kind::Read { file, offset: 10 },
+        super::Route::Ring(ring.clone()),
+        IoBuf {
+            bytes: vec![0u8; 10],
+            filled: 0,
+        }
+        .into(),
+        io_then(2),
+    );
+    let held = h.engine.begin(op, super::State::Issuing).unwrap();
+    h.front.pending.fetch_add(1, Ordering::AcqRel);
+    h.engine.set_state(held, super::State::InFlight);
+    let entry = super::Entry {
+        write: false,
+        file,
+        // SAFETY: the slot is `InFlight` with nothing else touching the record in this test.
+        buf: unsafe {
+            (*held.rec.as_ptr())
+                .op
+                .as_mut()
+                .unwrap()
+                .buf
+                .bytes_mut()
+                .as_mut_ptr() as usize
+        },
+        len: 10,
+        offset: 10,
+        user_data: super::token(held.slot, held.generation),
+    };
+    // Another thread offers it after the owner's last look at the queue and before the owner lets
+    // go: the owner is in its submit then.
+    let offered = Arc::new(AtomicBool::new(false));
+    {
+        let (ring, offered) = (ring.clone(), offered.clone());
+        h.sim.on_submit(Arc::new(move || {
+            if !offered.swap(true, Ordering::AcqRel) {
+                assert!(ring.incoming.offer(entry).is_ok());
+            }
+        }));
+    }
+    let before = h.sim.submit_sizes().len();
+    h.read(file, 0, 10, 3).unwrap();
+    assert!(offered.load(Ordering::Acquire));
+    // Without waiting for a poll, the owner looked again and submitted the rest, once.
+    assert_eq!(h.sim.submit_sizes()[before..], [1, 1]);
+    assert_eq!(h.drain(2).len(), 2);
+    assert_eq!(h.pending(), 0);
+}
+
+#[test]
+fn a_ring_that_breaks_while_a_slot_is_being_made_ends_what_is_in_flight() {
+    let h = Harness::with(Some(full_probe()), true, MAX_PIECE);
+    let file = h.sim.file(&content(100));
+    h.sim.hold(true);
+    h.read(file, 0, 10, 1).unwrap();
+    let ring = h.engine.ring().unwrap();
+    // Another thread counted the first slot of the next chunk and is not done making the chunk.
+    while h.engine.slab.made() < 65 {
+        h.engine.slab.reserve_without_chunk();
+    }
+    assert!(h.engine.slab.cell(64).is_none());
+    h.engine.break_ring(&ring, &io::Error::from_raw_os_error(5));
+    let error = ended(h.one()).result.unwrap_err();
+    assert!(error.to_string().contains("IoRing failed"), "{error}");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "two polls are inside one engine")]
+fn a_poll_inside_a_poll_is_refused_in_debug() {
+    let h = Harness::new();
+    // SAFETY: deliberately not: this is the second entry the check must refuse.
+    let _first = unsafe { h.engine.poller.enter() };
+    let _second = unsafe { h.engine.poller.enter() };
+}
