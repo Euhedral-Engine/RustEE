@@ -1,0 +1,457 @@
+# The pipeline on Gitea's runners: the twin of .github/workflows/ci.yml (scripts/ci/test_workflow_twins.py pins the two
+# together). The steps shared with it are identical; a step whose name ends in `(gitea)` exists only here, and one that
+# ends in `(github)` only there. What this file has and the GitHub one lacks: the `device` job (the machine's card), the
+# `windows` job (GitHub's runner builds and tests Windows, through the proxy action of euhedral/ci), and a run on a push
+# to main. What the GitHub one has and this lacks: the Windows matrix leg, rust-cache, and the manual run's `only_os`.
+#
+# `changes` runs scripts/ci/affected.py and publishes the affected crates; every other job is gated on its outputs, so a
+# change to documentation alone runs `changes` and `ci-ok` only. `ci-ok` always runs and fails only if a job failed or
+# was cancelled (a skipped job counts as passed): it is the one check to require, as `ci / ci-ok (pull_request)`. The
+# workflow's name and that job's id are what make the context's name, so they do not change.
+#
+# Labels (the runners' contract): `arbiter-docker` is a container job under the arbiter; `arbiter-docker-unconfined` is
+# the same with seccomp unconfined, which io_uring (euhedral-io) needs; `arbiter-gpu` is the same with the card attached
+# (the device nodes, the driver libraries and NVRTC come from that runner's configuration, not from this file). The
+# lease of a job is its `ARBITER_ARGS` and `ARBITER_EST` (seconds, at most 600). A docker job sets no `timeout-minutes`:
+# the runner holds it to its lease.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        description: Branch to compare with, to run what a pull request against it would run (empty runs everything)
+        type: string
+        default: ""
+
+# A push to a pull request aborts the run it supersedes (one group per pull request). Every other run has a group of its
+# own, its commit, so a push to main is never replaced by a newer one: each push is diffed only against its own `before`,
+# and a run dropped from the queue would leave its changes untested on main.
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: never
+  # The image trusts the runner's own checkout path; this one is the job's.
+  MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}
+
+jobs:
+  changes:
+    runs-on: arbiter-docker
+    env:
+      ARBITER_ARGS: "--threads 2 --mem 8G"
+      ARBITER_EST: "120"
+    outputs:
+      any: ${{ steps.affected.outputs.any }}
+      everything: ${{ steps.affected.outputs.everything }}
+      args: ${{ steps.affected.outputs.args }}
+      miri: ${{ steps.affected.outputs.miri }}
+      miri_matrix: ${{ steps.affected.outputs.miri_matrix }}
+      euhedral_data_structures: ${{ steps.affected.outputs.euhedral_data_structures }}
+      euhedral_hashing: ${{ steps.affected.outputs.euhedral_hashing }}
+      euhedral_hardware_utils: ${{ steps.affected.outputs.euhedral_hardware_utils }}
+      euhedral_core: ${{ steps.affected.outputs.euhedral_core }}
+      euhedral_graph: ${{ steps.affected.outputs.euhedral_graph }}
+      euhedral_io: ${{ steps.affected.outputs.euhedral_io }}
+      euhedral_memory: ${{ steps.affected.outputs.euhedral_memory }}
+      euhedral_net: ${{ steps.affected.outputs.euhedral_net }}
+      euhedral_gpu: ${{ steps.affected.outputs.euhedral_gpu }}
+      euhedral_benchmarks: ${{ steps.affected.outputs.euhedral_benchmarks }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # `cargo metadata` of the runner's own toolchain is all the script needs.
+      - name: Test the scripts
+        run: |
+          python3 scripts/ci/test_affected.py
+          python3 scripts/ci/test_miri_build.py
+          python3 scripts/ci/test_gitlab_pipeline.py
+          python3 scripts/ci/test_workflow_twins.py
+          python3 scripts/ci/test_device_check.py
+
+      - name: Compute the affected crates
+        id: affected
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          BASE_INPUT: ${{ inputs.base_ref }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          case "$EVENT" in
+            # Against the merge base with the PR's base branch, which is not always main (stacked PRs).
+            pull_request) python3 scripts/ci/affected.py --base "origin/$BASE_REF" --head HEAD --merge-base --github-output "$GITHUB_OUTPUT" ;;
+            # A push to main (Gitea's twin of this file runs on it): against the commit main was at before the push.
+            push)
+              if [ -n "$BEFORE" ] && [ "${BEFORE#0000}" = "$BEFORE" ]; then
+                python3 scripts/ci/affected.py --base "$BEFORE" --head HEAD --github-output "$GITHUB_OUTPUT"
+              else
+                python3 scripts/ci/affected.py --all --github-output "$GITHUB_OUTPUT"
+              fi ;;
+            *)
+              if [ -n "$BASE_INPUT" ]; then
+                python3 scripts/ci/affected.py --base "origin/$BASE_INPUT" --head HEAD --merge-base --github-output "$GITHUB_OUTPUT"
+              else
+                python3 scripts/ci/affected.py --all --github-output "$GITHUB_OUTPUT"
+              fi ;;
+          esac
+
+  # The workflow files: syntax, expressions, shell steps.
+  workflows:
+    if: github.event_name == 'pull_request'
+    runs-on: arbiter-docker
+    env:
+      ARBITER_ARGS: "--threads 2 --mem 2G"
+      ARBITER_EST: "120"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: actionlint (gitea)
+        run: mise exec actionlint@1.7.12 -- actionlint .github/workflows/*.yml .gitea/workflows/*.yml
+
+  workspace:
+    needs: changes
+    if: needs.changes.outputs.any == 'true'
+    runs-on: arbiter-docker-unconfined
+    # Bash everywhere: it stops at the first failing command of a multi-line step.
+    defaults:
+      run:
+        shell: bash
+    env:
+      ARBITER_ARGS: "--threads 8 --mem 6G"
+      ARBITER_EST: "240"
+      AFFECTED: ${{ needs.changes.outputs.args }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # mise installs the toolchain; the later steps get its environment (rustup's directories, its toolchain) and its
+      # directories on PATH through the files the runner reads between steps.
+      - name: Install the toolchain pinned in mise.toml (gitea)
+        run: |
+          mise install rust >/dev/null
+          mise env --json | python3 -c '
+          import json, os, sys
+          env = json.load(sys.stdin)
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+              for key in ("CARGO_HOME", "RUSTUP_HOME", "RUSTUP_TOOLCHAIN"):
+                  if key in env:
+                      f.write(key + "=" + env[key] + "\n")
+          have = os.environ["PATH"].split(":")
+          with open(os.environ["GITHUB_PATH"], "a") as f:
+              for entry in env.get("PATH", "").split(":"):
+                  if entry and entry not in have:
+                      f.write(entry + "\n")
+          '
+          eval "$(mise env -s bash)"
+          rustc --version
+          cargo --version
+
+      # Cheap, so it checks the whole workspace.
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy $AFFECTED --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test $AFFECTED
+
+      # The ratchet reads every crate's library sources; euhedral-core's tests run it when that crate is affected.
+      - name: Hot-path lock ratchet
+        if: needs.changes.outputs.euhedral_core != 'true'
+        run: cargo test -p euhedral-core --test hot_fix_ratchet
+
+      - name: Which ring did the runner offer (euhedral-io on Windows)
+        if: runner.os == 'Windows' && needs.changes.outputs.euhedral_io == 'true'
+        run: cargo test -p euhedral-io --lib the_machines_ring_is_reported -- --nocapture
+
+      # The memory orderings are tested optimised.
+      # One run per binary: the filters are alternatives, and the build is shared.
+      - name: Source-invariant stress tests in release (euhedral-core)
+        if: needs.changes.outputs.euhedral_core == 'true'
+        run: >
+          cargo test --release -p euhedral-core --lib --
+          flow_control::vertex generics:: ingest:: flow_control::hot_source utils::stop_watch flow_control::edge
+          control_plane::cache flow_control::views
+
+      - name: Source-invariant stress tests in release (euhedral-graph)
+        if: needs.changes.outputs.euhedral_graph == 'true'
+        run: |
+          cargo test --release -p euhedral-graph --lib -- sequencer completions::
+          cargo test --release -p euhedral-graph --test lake
+
+      - name: Loom models (euhedral-data-structures)
+        if: runner.os == 'Linux' && needs.changes.outputs.euhedral_data_structures == 'true'
+        env:
+          RUSTFLAGS: --cfg loom
+        run: cargo test -p euhedral-data-structures --release --lib -- sync::claim_cell::loom queues::chunk::loom
+
+      - name: Loom models (euhedral-graph)
+        if: runner.os == 'Linux' && needs.changes.outputs.euhedral_graph == 'true'
+        env:
+          RUSTFLAGS: --cfg loom
+        run: cargo test -p euhedral-graph --release --lib -- sequencer::loom stage_graph::loom take_all::loom lanes::loom
+
+      - name: Loom models (euhedral-gpu)
+        if: runner.os == 'Linux' && needs.changes.outputs.euhedral_gpu == 'true'
+        env:
+          RUSTFLAGS: --cfg loom
+        run: cargo test -p euhedral-gpu --release --lib -- ring::loom instances::loom handles::loom
+
+      # The build without debug assertions: a hit replayed as recorded runs no pass of the body.
+      - name: Replay as recorded, release (euhedral-gpu)
+        if: runner.os == 'Linux' && needs.changes.outputs.euhedral_gpu == 'true'
+        run: cargo test -p euhedral-gpu --release --lib --features fake -- graph_cache::shared_tests::a_hit_replayed_as_recorded
+
+      # Built and linted on Linux and Windows; the tests skip with no device (no driver library is the skip). GitHub's
+      # runners have no card, so only the Gitea pipeline's `device` job runs them on one, and fails on a skip.
+      - name: CUDA backend (euhedral-memory)
+        if: needs.changes.outputs.euhedral_memory == 'true'
+        run: |
+          cargo clippy -p euhedral-memory --all-targets --features cuda -- -D warnings
+          cargo test -p euhedral-memory --features cuda
+
+      - name: CUDA backend (euhedral-gpu)
+        if: needs.changes.outputs.euhedral_gpu == 'true'
+        run: |
+          cargo clippy -p euhedral-gpu --all-targets --features cuda -- -D warnings
+          cargo test -p euhedral-gpu --features cuda
+
+  # The device tests of euhedral-memory and euhedral-gpu, on the machine's card. A device test with no driver, card or
+  # NVRTC returns early and passes, so each crate's output is read by device_check.py, which fails the job on such a
+  # skip or on a test binary that did not run. The card, the driver libraries and the NVRTC directory are attached by
+  # the `arbiter-gpu` runner's own configuration (its seccomp profile too). If a runner must take them from the job
+  # instead, add to this job (the NVRTC directory is the repository variable):
+  #   container:
+  #     image: local/ci-base:latest
+  #     options: >-
+  #       --security-opt seccomp=unconfined --device /dev/nvidiactl --device /dev/nvidia0 --device /dev/nvidia-uvm
+  #       -v /usr/lib/x86_64-linux-gnu/libcuda.so.1:/usr/lib/x86_64-linux-gnu/libcuda.so.1:ro
+  #       -v /usr/lib/x86_64-linux-gnu/libnvidia-ptxjitcompiler.so.1:/usr/lib/x86_64-linux-gnu/libnvidia-ptxjitcompiler.so.1:ro
+  #       -v ${{ vars.EUHEDRAL_NVRTC_DIR }}:${{ vars.EUHEDRAL_NVRTC_DIR }}:ro
+  device:
+    needs: changes
+    if: needs.changes.outputs.euhedral_memory == 'true' || needs.changes.outputs.euhedral_gpu == 'true'
+    runs-on: arbiter-gpu
+    defaults:
+      run:
+        shell: bash
+    env:
+      ARBITER_ARGS: "--threads 4 --mem 6G --gpu shared:4"
+      ARBITER_EST: "300"
+      EUHEDRAL_NVRTC_DIR: ${{ vars.EUHEDRAL_NVRTC_DIR }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the toolchain pinned in mise.toml (gitea)
+        run: |
+          mise install rust >/dev/null
+          mise env --json | python3 -c '
+          import json, os, sys
+          env = json.load(sys.stdin)
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+              for key in ("CARGO_HOME", "RUSTUP_HOME", "RUSTUP_TOOLCHAIN"):
+                  if key in env:
+                      f.write(key + "=" + env[key] + "\n")
+          have = os.environ["PATH"].split(":")
+          with open(os.environ["GITHUB_PATH"], "a") as f:
+              for entry in env.get("PATH", "").split(":"):
+                  if entry and entry not in have:
+                      f.write(entry + "\n")
+          '
+          eval "$(mise env -s bash)"
+          rustc --version
+          cargo --version
+
+      - name: NVRTC (gitea)
+        run: |
+          test -n "$EUHEDRAL_NVRTC_DIR" || { echo "the repository variable EUHEDRAL_NVRTC_DIR is unset"; exit 1; }
+          echo "EUHEDRAL_NVRTC=$EUHEDRAL_NVRTC_DIR/libnvrtc.so.13" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$EUHEDRAL_NVRTC_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+
+      - name: Device tests (euhedral-memory) (gitea)
+        if: needs.changes.outputs.euhedral_memory == 'true'
+        run: |
+          set -o pipefail
+          cargo test -p euhedral-memory --features cuda -- --nocapture 2>&1 | tee device-euhedral-memory.log
+          python3 -I scripts/ci/device_check.py device-euhedral-memory.log euhedral-memory/tests
+
+      - name: Device tests (euhedral-gpu) (gitea)
+        if: needs.changes.outputs.euhedral_gpu == 'true'
+        run: |
+          set -o pipefail
+          cargo test -p euhedral-gpu --features cuda -- --nocapture 2>&1 | tee device-euhedral-gpu.log
+          python3 -I scripts/ci/device_check.py device-euhedral-gpu.log euhedral-gpu/tests
+
+  # Nothing is built twice: `miri-build` builds Miri's sysroot and, once, every selection of tests the shards run
+  # (scripts/ci/miri-shards.json, selected by `changes`), and hands its target directory and sysroot to the shards as an
+  # artifact (a tarball, which keeps file times), so a shard only installs the toolchain and runs tests.
+  miri-build:
+    needs: changes
+    if: needs.changes.outputs.miri == 'true'
+    runs-on: arbiter-docker-unconfined
+    env:
+      ARBITER_ARGS: "--threads 2 --mem 2G"
+      ARBITER_EST: "60"
+      MATRIX: ${{ needs.changes.outputs.miri_matrix }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned nightly toolchain with Miri
+        run: |
+          toolchain=$(cat scripts/ci/miri-toolchain)
+          rustup toolchain install "$toolchain" --profile minimal --component miri --component rust-src
+          echo "RUSTUP_TOOLCHAIN=$toolchain" >> "$GITHUB_ENV"
+
+      # Built from the fresh checkout, whose files are newer than anything restored: nothing stale is reused.
+      - name: Build Miri's sysroot and the tests
+        run: |
+          cargo miri setup
+          python3 scripts/ci/miri_build.py --matrix "$MATRIX" > miri-build.sh
+          bash -ex miri-build.sh
+          # A name in a shard that no test has (a renamed test) would silently drop it from the run.
+          python3 scripts/ci/miri_build.py --check-names --matrix "$MATRIX"
+
+      # The commit the build is of: a shard refuses a build that is not of its own checkout.
+      - name: Pack the target directory and the sysroot
+        run: |
+          git rev-parse HEAD > target/miri/built-from-commit
+          tar --use-compress-program="zstd -T0 -3" -C / -cf "$RUNNER_TEMP/miri-build.tar.zst" "${GITHUB_WORKSPACE#/}/target/miri" "${HOME#/}/.cache/miri"
+
+      # Gitea's artifact backend takes the v3 actions; v4 refuses a server that is not github.com.
+      - name: Upload the build (gitea)
+        uses: actions/upload-artifact@v3
+        with:
+          name: miri-build
+          path: ${{ runner.temp }}/miri-build.tar.zst
+          # A re-run of one shard days later still finds it; a re-run of the build replaces it.
+          retention-days: 7
+
+  # One job per shard of `changes`' matrix (a dynamic matrix: Gitea 28 or newer). The `if` keeps an empty matrix from
+  # being expanded, which would fail the job. A matrix job's lease is the job's own, set before the matrix expands, so
+  # it asks for the largest shard: the most seeds one job runs (scripts/ci/affected.py SEEDS_PER_JOB) and the most memory
+  # a shard asks for (its `mem`, or MIRI_MEM); test_workflow_twins.py checks both against the shards file.
+  miri:
+    name: miri (${{ matrix.name }})
+    needs: [changes, miri-build]
+    if: needs.changes.outputs.miri == 'true'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.changes.outputs.miri_matrix) }}
+    runs-on: arbiter-docker-unconfined
+    env:
+      ARBITER_ARGS: "--threads 8 --mem 2G"
+      ARBITER_EST: "240"
+      MIRIFLAGS: ${{ matrix.miriflags }}
+      COMMANDS: ${{ matrix.commands }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned nightly toolchain with Miri
+        run: |
+          toolchain=$(cat scripts/ci/miri-toolchain)
+          rustup toolchain install "$toolchain" --profile minimal --component miri --component rust-src
+          echo "RUSTUP_TOOLCHAIN=$toolchain" >> "$GITHUB_ENV"
+
+      # Cargo rebuilds what a source newer than its output may have changed. The build job built from this commit, so
+      # the sources are dated before its outputs, which are then used as they are.
+      - name: Date the sources
+        run: git ls-files -z | xargs -0 touch -d 2000-01-01
+
+      - name: Download the build (gitea)
+        uses: actions/download-artifact@v3
+        with:
+          name: miri-build
+          path: ${{ runner.temp }}
+
+      - name: Unpack the target directory and the sysroot
+        run: |
+          tar --use-compress-program="zstd -T0" -C / -xf "$RUNNER_TEMP/miri-build.tar.zst"
+          built=$(cat target/miri/built-from-commit)
+          test "$built" = "$(git rev-parse HEAD)" || { echo "the build is of $built, this checkout is $(git rev-parse HEAD): re-run the build job"; exit 1; }
+
+      # -e stops at the first failing command; -x logs each command as it starts.
+      - name: Miri
+        run: bash -ex -c "$COMMANDS"
+
+  # Windows is built and tested by GitHub's runner: the action pushes the pull request's commit to a temporary branch of
+  # the GitHub repository, runs ci.yml there with `only_os=windows-2025`, waits for the result and removes the branch. Pull
+  # requests only. The job waits and holds nothing, so it is not under the arbiter. It is the only job that reads a secret:
+  # the GitHub App's key is not in a job that runs a pull request's own code (test_workflow_twins.py checks it).
+  windows:
+    needs: changes
+    if: github.event_name == 'pull_request' && needs.changes.outputs.any == 'true'
+    runs-on: arbiter-docker
+    timeout-minutes: 100
+    env:
+      ARBITER: "off"
+    steps:
+      # GitHub refuses a shallow push.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # The proxy action is cloned from this forge, at its protected tag, into `.ci` (a path no tracked file has, and the
+      # job's later steps do not walk the tree), and called as a local action: no host or port is written in this file.
+      # The job's own token reaches git for this one command as a header, so it is neither written to the clone's
+      # configuration nor printed.
+      - name: Fetch the proxy action (gitea)
+        env:
+          FORGE_URL: ${{ vars.FORGE_URL }}
+          FORGE_TOKEN: ${{ github.token }}
+        run: |
+          test -n "$FORGE_URL" || { echo "the variable FORGE_URL is unset"; exit 1; }
+          auth=$(printf 'x-access-token:%s' "$FORGE_TOKEN" | base64 -w0)
+          git init -q .ci
+          # The tag by its full ref: a branch named v4 would win a plain name. The header is this command's, not stored.
+          GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.extraHeader GIT_CONFIG_VALUE_0="Authorization: Basic $auth" \
+            git -C .ci fetch -q --depth 1 "$FORGE_URL/euhedral/ci.git" refs/tags/v4
+          git -C .ci checkout -q --detach FETCH_HEAD
+
+      - uses: ./.ci/github-actions-proxy
+        with:
+          repo: Euhedral-Engine/RustEE
+          workflow: ci.yml
+          sha: ${{ github.event.pull_request.head.sha }}
+          label: ${{ github.event.pull_request.number }}
+          # The branch carries the pull request's changes to workflow files, which a push is only allowed to make with this.
+          permissions: contents:write,actions:write,workflows:write
+          inputs: |
+            only_os=windows-2025
+            base_ref=${{ github.base_ref }}
+          app-id: ${{ secrets.GH_APP_ID }}
+          installation-id: ${{ secrets.GH_APP_INSTALLATION_ID }}
+          private-key-b64: ${{ secrets.GH_APP_PRIVATE_KEY_B64 }}
+
+  # Always runs, and fails only if a job failed or was cancelled: a job skipped because no crate it covers was affected
+  # counts as success. This is the one check to require on a branch.
+  ci-ok:
+    needs: [changes, workflows, workspace, device, miri-build, miri, windows]
+    if: always()
+    runs-on: arbiter-docker
+    env:
+      ARBITER_ARGS: "--threads 1 --mem 512M"
+      ARBITER_EST: "30"
+    steps:
+      - name: Every needed job passed or was skipped
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+          ANY: ${{ needs.changes.outputs.any }}
+        run: |
+          echo "results: $RESULTS"
+          case " $RESULTS " in
+            *" failure "*|*" cancelled "*) exit 1 ;;
+          esac
+          # If `changes` passed but published nothing, no later job ran: that is not a pass.
+          case "$ANY" in
+            true|false) ;;
+            *) echo "changes published no result"; exit 1 ;;
+          esac

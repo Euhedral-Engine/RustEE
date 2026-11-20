@@ -60,7 +60,9 @@ doctests.
 
 ## Merge requests
 
-A merge request's pipeline (`.gitlab-ci.yml`) checks the workflows with actionlint, runs the Linux checks and
+On Gitea, a pull request's workflow (`.gitea/workflows/ci.yml`, the twin of `.github/workflows/ci.yml`; a test pins the
+two together) runs the same jobs and ends in the one check to require, `ci / ci-ok (pull_request)`. Until the move, a
+merge request's pipeline (`.gitlab-ci.yml`) checks the workflows with actionlint, runs the Linux checks and
 Miri for the affected crates on the project's runner (a child pipeline), and has GitHub Actions run the Windows job
 and report the result. It must succeed before the merge, and the history is semi-linear:
 the branch must contain the target. Bring a branch up to date with a merge, never a rebase or a force-push:

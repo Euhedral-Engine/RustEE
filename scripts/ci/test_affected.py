@@ -68,12 +68,17 @@ class Affected(unittest.TestCase):
             self.assertEqual(sorted(crates), sorted(NAMES), f)
 
     def test_the_workflow_runs_the_workspace_jobs_in_full(self):
-        self.assertEqual(run(".github/workflows/ci.yml"), (sorted(NAMES), True))
+        for f in [".github/workflows/ci.yml", ".gitea/workflows/ci.yml"]:
+            self.assertEqual(run(f), (sorted(NAMES), True), f)
+
+    def test_the_gitea_directory_is_a_root_build_file_apart_from_the_workflow(self):
+        for f in [".gitea/CODEOWNERS", ".gitea/workflows/other.yml", ".gitea/rollover.toml"]:
+            self.assertEqual(run(f), (sorted(NAMES), True), f)
 
     def test_ci_files_that_select_no_crate(self):
         for f in [
-            ".github/workflows/cache-warm.yml", "scripts/ci/affected.py", "scripts/ci/test_affected.py",
-            "scripts/ci/miri_build.py", "scripts/ci/miri-shards.json", "scripts/ci/miri-toolchain",
+            ".github/workflows/cache-warm.yml", ".github/actionlint.yaml", "scripts/ci/affected.py",
+            "scripts/ci/test_affected.py", "scripts/ci/miri_build.py", "scripts/ci/miri-shards.json", "scripts/ci/miri-toolchain",
         ]:
             self.assertEqual(run(f), ([], False), f)
 
@@ -163,6 +168,25 @@ class Miri(unittest.TestCase):
         self.assertIn("canary", self.select(".github/workflows/ci.yml")[0][1])
         self.assertEqual(self.names(".github/workflows/ci.yml", "euhedral-core/src/a.rs"), ["a", "b", "c"])
         self.assertEqual(self.names(".github/workflows/ci.yml", "euhedral-graph/src/a.rs"), ["b", "c"])
+
+    def test_the_gitea_workflow_runs_the_canary_too(self):
+        self.assertEqual(self.names(".gitea/workflows/ci.yml"), ["c"])
+        why = self.select(".gitea/workflows/ci.yml")[0][1]
+        self.assertIn("canary", why)
+        self.assertIn(".gitea/workflows/ci.yml", why)
+        self.assertEqual(self.names(".gitea/workflows/ci.yml", "euhedral-graph/src/a.rs"), ["b", "c"])
+
+    def test_both_workflows_changed_name_both_in_the_canary_reason(self):
+        why = self.select(".github/workflows/ci.yml", ".gitea/workflows/ci.yml")
+        self.assertEqual([s["name"] for s, _ in why], ["c"])
+        self.assertIn(".github/workflows/ci.yml and .gitea/workflows/ci.yml", why[0][1])
+
+    def test_the_actionlint_labels_run_no_shard(self):
+        self.assertEqual(self.names(".github/actionlint.yaml"), [])
+
+    def test_the_gitea_directory_runs_every_shard_but_the_workflow(self):
+        for f in [".gitea/CODEOWNERS", ".gitea/workflows/other.yml"]:
+            self.assertEqual(self.names(f), ["a", "b", "c"], f)
 
     def test_the_workflow_without_a_canary_runs_no_shard(self):
         shards = [{k: v for k, v in s.items() if k != "canary"} for s in self.SHARDS]

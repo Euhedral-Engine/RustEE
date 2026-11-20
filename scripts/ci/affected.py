@@ -12,14 +12,16 @@ diff cannot be computed. Nothing is affected when only documentation changed: `*
 doctests are part of the crate.
 
 The CI files select less than a root build file does:
-  .github/workflows/ci.yml        the workspace jobs run in full (they validate the workflow); Miri runs what the
-                                  crate changes select, and the canary shard (the fastest single-threaded one, marked
-                                  `"canary": true` in miri-shards.json), so Miri's wiring is exercised
-  .github/workflows/cache-warm.yml, scripts/ci/*.py   no crate (the `changes` job runs the script tests; the warm-up
-                                  never runs for a pull request)
+  .github/workflows/ci.yml, .gitea/workflows/ci.yml   the workspace jobs run in full (they validate the workflow);
+                                  Miri runs what the crate changes select, and the canary shard (the fastest
+                                  single-threaded one, marked `"canary": true` in miri-shards.json), so Miri's wiring is
+                                  exercised. Either file does it: they are twins, each run on its own forge
+  .github/workflows/cache-warm.yml, .github/actionlint.yaml, scripts/ci/*.py   no crate (the `changes` job runs the
+                                  script tests; the warm-up never runs for a pull request; actionlint's labels are read
+                                  by the `workflows` job, which is not a crate's)
   scripts/ci/miri-shards.json     no crate; Miri runs the shards that were added or changed against the base
   scripts/ci/miri-toolchain       no crate; the pinned nightly changes Miri's results, so Miri runs every shard
-Any other file under .github/ or scripts/ci/ is a root build file.
+Any other file under .github/, .gitea/ or scripts/ci/ is a root build file.
 
 Usage:
   affected.py --base REV [--head REV] [--merge-base]   diff `REV..HEAD` (`REV...HEAD` with --merge-base)
@@ -64,14 +66,15 @@ EVERYTHING = [
     "build.rs",
     ".cargo/*",
     ".github/*",
+    ".gitea/*",
     "scripts/ci/*",
 ]
 
 # CI files that select less (see the module docstring); they are looked at before EVERYTHING.
-CI_WORKFLOW = ".github/workflows/ci.yml"
+CI_WORKFLOWS = [".github/workflows/ci.yml", ".gitea/workflows/ci.yml"]
 SHARDS_FILE = "scripts/ci/miri-shards.json"
 TOOLCHAIN_FILE = "scripts/ci/miri-toolchain"
-CI_NO_CRATES = [".github/workflows/cache-warm.yml", "scripts/ci/*.py", SHARDS_FILE, TOOLCHAIN_FILE]
+CI_NO_CRATES = [".github/workflows/cache-warm.yml", ".github/actionlint.yaml", "scripts/ci/*.py", SHARDS_FILE, TOOLCHAIN_FILE]
 
 # A change to only these affects nothing.
 DOCS = ["*.md", "docs/*", "LICENSE*", ".gitignore"]
@@ -152,7 +155,7 @@ def affected(graph, files, workflow_is_everything=True):
     for f in files:
         if matches(f, CI_NO_CRATES):
             continue
-        if f == CI_WORKFLOW:
+        if f in CI_WORKFLOWS:
             if workflow_is_everything:
                 return set(graph.dirs), True, f"{f} is the workflow itself: its jobs run in full"
             continue
@@ -217,10 +220,12 @@ def miri_selection(graph, files, shards, old_shards=()):
             why[s["name"]].append(f"{TOOLCHAIN_FILE} changed: the nightly changes Miri's results")
         if SHARDS_FILE in files and old.get(s["name"]) != s:
             why[s["name"]].append("the shard is new or changed in " + SHARDS_FILE)
-    if CI_WORKFLOW in files:
+    changed_workflows = [w for w in CI_WORKFLOWS if w in files]
+    if changed_workflows:
         canary = [s for s in shards if s.get("canary")]
         if canary:
-            why[canary[0]["name"]].append(f"canary: {CI_WORKFLOW} changed, so Miri's wiring is exercised")
+            names = " and ".join(changed_workflows)
+            why[canary[0]["name"]].append(f"canary: {names} changed, so Miri's wiring is exercised")
     return [(s, "; ".join(why[s["name"]])) for s in shards if why[s["name"]]]
 
 

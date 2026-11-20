@@ -474,7 +474,7 @@ mise exec -- cargo test -p euhedral-gpu --features cuda      # + the CUDA backen
 CUDA_HOME=/path/to/toolkit mise exec -- cargo test -p euhedral-gpu --features cuda   # + kernels compiled from source
 mise exec -- cargo run -p euhedral-gpu --features cuda --example graph_replay        # the acceptance program
 ```
-The device tests are the `tests/cuda*.rs` binaries. A device test that finds no driver, card or NVRTC returns early and passes, so it says so through the one skip helper (`tests/common/skip.rs`: `skip`, or `skip_hardware` for a feature this card lacks) and never returns silently. The GitLab pipeline's `device` job runs them on the card and `scripts/ci/device_check.py` fails the job on any `skip` line, on a `tests/cuda*.rs` binary that did not run; a hardware skip is listed and accepted.
+The device tests are the `tests/cuda*.rs` binaries. A device test that finds no driver, card or NVRTC returns early and passes, so it says so through the one skip helper (`tests/common/skip.rs`: `skip`, or `skip_hardware` for a feature this card lacks) and never returns silently. The `device` job of the pipeline (`.gitea/workflows/ci.yml`, and the GitLab pipeline until the move) runs them on the card and `scripts/ci/device_check.py` fails the job on any `skip` line, on a `tests/cuda*.rs` binary that did not run; a hardware skip is listed and accepted.
 
 
 NVRTC is found through `EUHEDRAL_NVRTC` (a library file) or `CUDA_HOME` (a toolkit); without it, tests that compile from
