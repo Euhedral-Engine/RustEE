@@ -604,6 +604,32 @@ mod tests {
     }
 
     #[test]
+    fn a_slot_asked_to_end_while_issuing_stays_pinned_after_its_arm_until_the_arm_callers_unpin() {
+        let slab: Slab<Rec> = Slab::new(10);
+        let slot = slab.alloc().unwrap();
+        let cell = slab.cell(slot).unwrap();
+        cell.open(State::Issuing, RouteTag::Port, 0, true, 1);
+        // The cancel comes while the call is being made: recorded, no pin.
+        assert_eq!(cell.ask_to_end(1, End::Cancelled), Asked::Recorded);
+        assert!(!cell.load().pinned());
+        // The call goes in flight: the arm pins, and only its caller's unpin lets the slot go
+        // (no canceller is left to clear it).
+        assert!(cell.arm(State::InFlight));
+        assert!(cell.load().pinned());
+        assert!(
+            cell.take(|word| if word.pinned() { Err(()) } else { Ok(()) })
+                .is_err()
+        );
+        // A second ask finds the reason recorded already and pins nothing more.
+        assert_eq!(cell.ask_to_end(1, End::TimedOut), Asked::Nothing);
+        cell.unpin();
+        let word = cell.take(|word| if word.pinned() { Err(()) } else { Ok(()) });
+        assert_eq!(word.unwrap().end(), Some(End::Cancelled));
+        cell.release();
+        assert!(!cell.load().pinned());
+    }
+
+    #[test]
     fn a_cancel_racing_the_end_of_the_operation_never_pins_the_next_one() {
         let slab: Slab<Rec> = Slab::new(100);
         let slot = slab.alloc().unwrap();
@@ -635,7 +661,12 @@ mod tests {
             });
             for serial in 1..=rounds {
                 cell.open(State::Issuing, RouteTag::Port, 0, true, serial);
-                cell.arm(State::InFlight);
+                // Asked to end while issuing, the arm pins the slot and its caller cancels, then
+                // unpins: the contract of `arm`.
+                if cell.arm(State::InFlight) {
+                    assert!(cell.load().pinned());
+                    cell.unpin();
+                }
                 // The poller's side: a pinned slot is left, and taken once it is not.
                 while cell
                     .take(|word| if word.pinned() { Err(()) } else { Ok(()) })
