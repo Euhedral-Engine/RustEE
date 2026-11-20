@@ -46,6 +46,20 @@ semantics and the tests that pin it.
 
 **Tests.** `the_credit_graph_with_a_fast_pack`, `the_credit_graph_with_a_slow_pack`, and `a_pack_slower_than_the_consumer_makes_items_late` (a 16 ms pack, slower than the consumer: pins 63 late while every other check holds), which shows the stepped scenario counts a real lateness. Each pins its numbers exactly; sixteen runs of the test binary, eight alone and eight with a second copy running beside them, gave the same numbers every time.
 
+## The device tests run on the card in CI, and a skip fails the job (CI) (2026-11-19)
+
+**What.** The GitLab pipeline has a `device` job that runs `cargo test --features cuda` of `euhedral-memory` and `euhedral-gpu` on the machine's card, under a shared grant of card memory, with the card's device nodes, the host's driver libraries and NVRTC in its container. Every device test that cannot run prints a `DEVICE-TEST-SKIPPED` line through one helper per crate, and `scripts/ci/device_check.py` fails the job on such a line or on a `tests/cuda*.rs` binary that did not run. A skip for a feature this card lacks prints `DEVICE-TEST-SKIPPED-HARDWARE` and is listed and accepted.
+
+**Why.** A device test with no driver or card returned early and passed, so a green pipeline said nothing about the device code. The cuda test steps also made the workspace job wait for the card.
+
+**How to use.** Nothing for callers. A device test that must skip calls `skip::skip(..)` (`skip_hardware` for a missing card feature), never a bare `return`. The project variable `EUHEDRAL_NVRTC_DIR` names the NVRTC library directory on the runner's host. GitHub's runners have no card: the job is GitLab-only.
+
+**Semantics.**
+- The job runs the tests with `--nocapture` so the skip lines reach the log.
+- `an_allocation_that_runs_out_of_memory_makes_the_deferred_frees_and_tries_again` asks for more than the card has, so it holds one 64 MiB block instead of most of the free memory; it proves the deferred free is made on the out-of-memory, not that the retried allocation succeeds.
+
+**Tests.** `scripts/ci/test_device_check.py` (a skip fails, a hardware skip is accepted, a binary that did not run fails) and `test_gitlab_pipeline.py` (the job, its grant and its steps). On a pipeline without the card the job fails with the skip lines.
+
 ## The stream-drop-after-pool device test holds its callbacks back instead of racing them (`euhedral-gpu`, tests only) (2026-11-19)
 
 **What.** `a_stream_dropped_after_its_pool_is_safe_with_callbacks_still_to_come` no longer relies on a 125M-cycle `spin` kernel still running when the stream is dropped. The stream under test starts with a host callback that the test holds, and the four retirements and a last callback follow it in the stream. The fault is made on a second lane, whose stream is dropped (and so waited for) after the arming. `CudaStream::raw_stream_for_tests` is added under the `test-hooks` feature; no behaviour changed.

@@ -89,6 +89,7 @@ jobs:
           python3 scripts/ci/test_affected.py
           python3 scripts/ci/test_miri_build.py
           python3 scripts/ci/test_gitlab_pipeline.py
+          python3 scripts/ci/test_device_check.py
 
       - name: Compute the affected crates
         id: affected
@@ -202,7 +203,8 @@ jobs:
         if: runner.os == 'Linux' && needs.changes.outputs.euhedral_gpu == 'true'
         run: cargo test -p euhedral-gpu --release --lib --features fake -- graph_cache::shared_tests::a_hit_replayed_as_recorded
 
-      # Built and linted on Linux and Windows; the tests skip with no device (no driver library is the skip).
+      # Built and linted on Linux and Windows; the tests skip with no device (no driver library is the skip). GitHub's
+      # runners have no card, so only the GitLab pipeline's `device` job runs them on one, and fails on a skip.
       - name: CUDA backend (euhedral-memory)
         if: needs.changes.outputs.euhedral_memory == 'true'
         run: |

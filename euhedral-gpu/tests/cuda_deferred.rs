@@ -116,16 +116,16 @@ fn an_allocation_that_runs_out_of_memory_makes_the_deferred_frees_and_tries_agai
     let _serial = serial();
     let Some(gpu) = gpu() else { return };
     let device = gpu.device().clone();
-    let (free, _) = device.mem_info().unwrap();
-    // Two blocks of 60 % of the free memory cannot both exist.
-    let bytes = free / 10 * 6;
+    let (_, total) = device.mem_info().unwrap();
+    // More than the card has: out of memory whatever else runs on it, and the test holds nothing but one small block.
+    let too_much = total + (1 << 20);
     let mem = DeviceMemory {
         device: device.clone(),
         location: LocationId(0),
     };
-    let first = mem.alloc(bytes).unwrap();
+    let first = mem.alloc(64 << 20).unwrap();
     assert!(
-        mem.alloc(bytes).is_err(),
+        mem.alloc(too_much).is_err(),
         "without a deferral the memory is not there"
     );
     let calls = DeferredCalls::new(Bounds::default());
@@ -135,14 +135,13 @@ fn an_allocation_that_runs_out_of_memory_makes_the_deferred_frees_and_tries_agai
     // SAFETY: the block came from `mem` and nothing uses it.
     unsafe { mem.free(first) };
     assert_eq!(calls.pending(), 1);
-    let second = mem
-        .alloc(bytes)
-        .expect("the deferred free was made and the allocation retried");
+    // The out-of-memory makes the deferred free and tries once more; the card still cannot give this much, so the
+    // error is the caller's.
+    assert!(mem.alloc(too_much).is_err());
+    assert_eq!(calls.pending(), 0, "the deferred free was made");
+    // A second failure finds nothing waiting.
+    assert!(mem.alloc(too_much).is_err());
     assert_eq!(calls.pending(), 0);
-    // A second failure is the caller's: nothing is waiting this time.
-    assert!(mem.alloc(bytes).is_err());
-    // SAFETY: as above.
-    unsafe { mem.free(second) };
     calls.drain();
 }
 

@@ -6,6 +6,9 @@
     reason = "the test thread is not a lattice worker: it polls and sleeps"
 )]
 
+#[path = "common/skip.rs"]
+mod skip;
+
 use std::time::{Duration, Instant};
 
 use euhedral_gpu::cuda::{CudaGpu, CudaModule};
@@ -35,14 +38,16 @@ fn a_launch_with_64_kib_of_dynamic_shared_memory_runs_after_opt_in() {
     let gpu = match CudaGpu::open(0) {
         Ok(gpu) => gpu,
         Err(e) => {
-            eprintln!("no CUDA device: skipped ({e})");
+            skip::skip(format_args!("no CUDA device: skipped ({e})"));
             return;
         }
     };
     let module = match CudaModule::from_source(&gpu, SOURCE, &CompileOptions::default()) {
         Ok(module) => module,
         Err(e) => {
-            eprintln!("no way to compile the test kernels: skipped ({e})");
+            skip::skip(format_args!(
+                "no way to compile the test kernels: skipped ({e})"
+            ));
             return;
         }
     };

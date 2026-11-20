@@ -11,6 +11,9 @@
               held values sit behind a lock the test owns"
 )]
 
+#[path = "common/skip.rs"]
+mod skip;
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -60,9 +63,18 @@ const OPS_PTX: &[u8] = include_bytes!("kernels/ops.ptx");
 
 fn module(gpu: &Arc<CudaGpu>) -> Option<CudaModule> {
     if gpu.driver_version() >= 13010 {
-        CudaModule::from_image(gpu, OPS_PTX).ok()
+        Some(
+            CudaModule::from_image(gpu, OPS_PTX)
+                .expect("the prebuilt test kernels load on a 13.1 driver"),
+        )
     } else {
-        CudaModule::from_source(gpu, OPS, &Default::default()).ok()
+        match CudaModule::from_source(gpu, OPS, &Default::default()) {
+            Ok(module) => Some(module),
+            Err(e) => {
+                skip::skip(format_args!("no way to compile the test kernels ({e})"));
+                None
+            }
+        }
     }
 }
 
@@ -175,11 +187,11 @@ impl Stage<Work, CudaQueue> for Replays {
 #[test]
 fn warm_stages_replay_cached_graphs_and_quanta_run_without_allocating() {
     let Ok(gpu) = CudaGpu::open(0) else {
-        eprintln!("no CUDA device: skipped");
+        skip::skip(format_args!("no CUDA device: skipped"));
         return;
     };
     let Some(module) = module(&gpu) else {
-        eprintln!("no kernel module: skipped");
+        skip::skip(format_args!("no kernel module: skipped"));
         return;
     };
     let mem = euhedral_memory::cuda::DeviceMemory {

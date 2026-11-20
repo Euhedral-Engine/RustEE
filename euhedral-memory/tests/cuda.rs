@@ -8,17 +8,32 @@
 use euhedral_memory::cuda::{Device, DeviceMemory, Driver, PinnedHost, StreamPool, Vmm};
 use euhedral_memory::{Backend, LocationId};
 
+/// How a device test says it did not run: CI reads the test output for this line (`scripts/ci/device_check.py`) and
+/// fails the device job, because a test that skipped for want of a driver or a card proved nothing.
+fn skip(reason: &str) {
+    eprintln!("DEVICE-TEST-SKIPPED: {reason}");
+}
+
 fn device() -> Option<std::sync::Arc<Device>> {
-    let d = Driver::load().ok()?;
-    Device::open(d, 0).ok()
+    let driver = match Driver::load() {
+        Ok(driver) => driver,
+        Err(e) => {
+            skip(&format!("no CUDA driver ({e})"));
+            return None;
+        }
+    };
+    match Device::open(driver, 0) {
+        Ok(device) => Some(device),
+        Err(e) => {
+            skip(&format!("no CUDA device ({e:?})"));
+            None
+        }
+    }
 }
 
 #[test]
 fn each_backend_allocates_and_frees() {
-    let Some(dev) = device() else {
-        eprintln!("no CUDA device: skipped");
-        return;
-    };
+    let Some(dev) = device() else { return };
     let loc = LocationId(0);
     let (free0, total) = dev.mem_info().unwrap();
     assert!(free0 > 0 && total >= free0);
@@ -188,7 +203,7 @@ fn residents_move_between_the_device_and_host_tiers_by_stream_copies() {
 #[test]
 fn the_shared_driver_is_loaded_once() {
     let Ok(first) = Driver::shared() else {
-        eprintln!("no CUDA driver: skipped");
+        skip("no CUDA driver");
         return;
     };
     let second = Driver::shared().unwrap();
@@ -198,7 +213,7 @@ fn the_shared_driver_is_loaded_once() {
 #[test]
 fn symbols_beyond_the_table_are_found() {
     let Ok(d) = Driver::shared() else {
-        eprintln!("no CUDA driver: skipped");
+        skip("no CUDA driver");
         return;
     };
     assert!(!d.symbol(c"cuLaunchKernel").is_null());

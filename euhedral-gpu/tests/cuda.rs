@@ -9,6 +9,9 @@
     reason = "the test thread is not a lattice worker: it polls and sleeps, and test fixtures use files"
 )]
 
+#[path = "common/skip.rs"]
+mod skip;
+
 use std::sync::Arc;
 
 use euhedral_gpu::cuda::CudaGpu;
@@ -18,7 +21,7 @@ fn gpu() -> Option<Arc<CudaGpu>> {
     match CudaGpu::open(0) {
         Ok(gpu) => Some(gpu),
         Err(e) => {
-            eprintln!("no CUDA device: skipped ({e})");
+            skip::skip(format_args!("no CUDA device: skipped ({e})"));
             None
         }
     }
@@ -365,7 +368,7 @@ mod compiler {
     #[test]
     fn an_architecture_nvrtc_does_not_list_is_an_error_naming_it() {
         let Ok(nvrtc) = Nvrtc::shared(None) else {
-            eprintln!("no NVRTC: skipped");
+            skip::skip(format_args!("no NVRTC: skipped"));
             return;
         };
         let r = nvrtc.arch_specific_target_for((99, 9));
@@ -379,7 +382,7 @@ mod compiler {
     fn nvrtc_compiles_for_this_device() {
         let Some(gpu) = gpu() else { return };
         let Ok(nvrtc) = Nvrtc::shared(None) else {
-            eprintln!("no NVRTC: skipped");
+            skip::skip(format_args!("no NVRTC: skipped"));
             return;
         };
         let (major, minor) = gpu.arch();
@@ -399,7 +402,7 @@ mod compiler {
     #[test]
     fn another_compiler_library_is_refused_once_one_is_loaded() {
         let Ok(loaded) = Nvrtc::shared(None) else {
-            eprintln!("no NVRTC: skipped");
+            skip::skip(format_args!("no NVRTC: skipped"));
             return;
         };
         let again = Nvrtc::shared(None).unwrap();
@@ -416,7 +419,7 @@ mod compiler {
     fn a_compile_error_returns_the_log() {
         let Some(gpu) = gpu() else { return };
         let Ok(nvrtc) = Nvrtc::shared(None) else {
-            eprintln!("no NVRTC: skipped");
+            skip::skip(format_args!("no NVRTC: skipped"));
             return;
         };
         let target = nvrtc.target_for(gpu.arch()).unwrap();
@@ -445,7 +448,7 @@ mod modules {
     fn nvrtc_available() -> bool {
         let ok = Nvrtc::shared(None).is_ok();
         if !ok {
-            eprintln!("no NVRTC: the source half is skipped");
+            skip::skip(format_args!("no NVRTC: the source half is skipped"));
         }
         ok
     }
@@ -477,7 +480,9 @@ mod modules {
                 "kernels differ in identity"
             );
         } else {
-            eprintln!("driver older than 13.1: the image half is skipped");
+            skip::skip_hardware(format_args!(
+                "driver older than 13.1: the image half is skipped"
+            ));
         }
     }
 
@@ -569,7 +574,7 @@ mod launches {
             modules.push(CudaModule::from_image(&gpu, OPS_PTX).unwrap());
         }
         if modules.is_empty() {
-            eprintln!("neither NVRTC nor a 13.1 driver: skipped");
+            skip::skip(format_args!("neither NVRTC nor a 13.1 driver: skipped"));
             return;
         }
         let (pool, mut s) = gpu
@@ -684,18 +689,22 @@ extern "C" __global__ void report(unsigned* out) {
     fn an_arch_specific_module_compiles_with_the_arch_specific_macro_defined() {
         let Some(gpu) = gpu() else { return };
         if Nvrtc::shared(None).is_err() {
-            eprintln!("no NVRTC: skipped");
+            skip::skip(format_args!("no NVRTC: skipped"));
             return;
         }
         if gpu.arch().0 < 9 {
-            eprintln!("no architecture-specific target before sm_90: skipped");
+            skip::skip_hardware(format_args!(
+                "no architecture-specific target before sm_90: skipped"
+            ));
             return;
         }
         let Ok(nvrtc) = Nvrtc::shared(None) else {
             return;
         };
         if let Err(e) = nvrtc.arch_specific_target_for(gpu.arch()) {
-            eprintln!("NVRTC does not list this device: skipped ({e})");
+            skip::skip(format_args!(
+                "NVRTC does not list this device: skipped ({e})"
+            ));
             return;
         }
         let specific = CompileOptions {
@@ -757,9 +766,18 @@ mod markers {
     /// The test kernels, from the image when the driver takes it, else from source.
     pub fn ops(gpu: &Arc<CudaGpu>) -> Option<CudaModule> {
         if gpu.driver_version() >= 13010 {
-            CudaModule::from_image(gpu, OPS_PTX).ok()
+            Some(
+                CudaModule::from_image(gpu, OPS_PTX)
+                    .expect("the prebuilt test kernels load on a 13.1 driver"),
+            )
         } else {
-            CudaModule::from_source(gpu, OPS, &CompileOptions::default()).ok()
+            match CudaModule::from_source(gpu, OPS, &CompileOptions::default()) {
+                Ok(module) => Some(module),
+                Err(e) => {
+                    skip::skip(format_args!("no way to compile the test kernels ({e})"));
+                    None
+                }
+            }
         }
     }
 

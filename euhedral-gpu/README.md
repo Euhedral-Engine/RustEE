@@ -470,10 +470,12 @@ The traits and the fake compile on every platform the workspace builds on.
 
 ```sh
 mise exec -- cargo test -p euhedral-gpu                      # traits, fake backend, layering check: no device needed
-mise exec -- cargo test -p euhedral-gpu --features cuda      # + the CUDA backend (its tests skip, passing, without a device)
+mise exec -- cargo test -p euhedral-gpu --features cuda      # + the CUDA backend (its device tests skip, passing, without a device)
 CUDA_HOME=/path/to/toolkit mise exec -- cargo test -p euhedral-gpu --features cuda   # + kernels compiled from source
 mise exec -- cargo run -p euhedral-gpu --features cuda --example graph_replay        # the acceptance program
 ```
+The device tests are the `tests/cuda*.rs` binaries. A device test that finds no driver, card or NVRTC returns early and passes, so it says so through the one skip helper (`tests/common/skip.rs`: `skip`, or `skip_hardware` for a feature this card lacks) and never returns silently. The GitLab pipeline's `device` job runs them on the card and `scripts/ci/device_check.py` fails the job on any `skip` line, on a `tests/cuda*.rs` binary that did not run; a hardware skip is listed and accepted.
+
 
 NVRTC is found through `EUHEDRAL_NVRTC` (a library file) or `CUDA_HOME` (a toolkit); without it, tests that compile from
 source skip and prebuilt images still load. The tests `tests/cuda_fault.rs` and `tests/cuda_lanes_fault.rs` are processes of their own, because a device
