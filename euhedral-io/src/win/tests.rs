@@ -734,7 +734,7 @@ fn a_file_keeps_its_route() {
         .sys
         .associate(h.engine.port.handle, joined)
         .unwrap();
-    h.engine.associated.lock().unwrap().insert(joined);
+    h.engine.associated.insert(joined);
     h.read(joined, 0, 10, 1).unwrap();
     assert_eq!(ended(h.one()).result.unwrap(), 10);
     assert_eq!(h.sim.rings_made(), 0, "no ring for a file on the port");
@@ -858,7 +858,7 @@ fn an_ioring_hresult_keeps_a_win32_code_and_otherwise_says_what_it_was() {
 
 /// The address of the `OVERLAPPED` of slot 0.
 fn first_overlapped(h: &Harness) -> usize {
-    lock!(&h.engine.table).slots[0].rec.0.as_ptr() as usize
+    h.engine.slab.cell(0).unwrap().rec() as usize
 }
 
 #[test]
@@ -907,7 +907,7 @@ fn a_late_packet_never_ends_the_operation_that_reused_its_slot() {
     let first = h.pull_n(1);
     assert_eq!(ended_clone_error(&first[0]), Some(234));
     assert_eq!(
-        h.sim.packets_waiting() + lock!(&h.engine.inbox).len(),
+        h.sim.packets_waiting() + h.engine.inbox_len(),
         1,
         "the late packet waits"
     );
@@ -1095,7 +1095,7 @@ fn a_ring_completion_or_a_packet_ends_only_a_record_on_its_own_route() {
     assert_eq!(h.engine.strays.load(Ordering::Relaxed), 1);
     // A ring completion with the wrong generation, or on a record not routed through the ring,
     // ends nothing either.
-    let ring = lock!(&h.engine.rings)[0].clone();
+    let ring = h.engine.rings[0].get().unwrap().clone();
     assert!(
         h.engine.take_token(0, 1 + 7, Some(&ring)).is_none(),
         "wrong generation"
@@ -1152,8 +1152,8 @@ fn a_flush_builds_a_bounded_number_of_entries_and_a_submission_never_waits_for_o
     let file = h.sim.file(&data);
     h.read(file, 0, 10, 99).unwrap(); // makes this thread's ring
     h.drain(1);
-    let ring = lock!(&h.engine.rings)[0].clone();
-    let busy = lock!(&ring.inner);
+    let ring = h.engine.rings[0].get().unwrap().clone();
+    let busy = ring.inner.try_claim().expect("free");
     // Another thread is submitting: this one only queues its entries (it must not wait).
     for tag in 0..40u64 {
         h.read(file, tag * 10, 10, tag).unwrap();
@@ -1382,7 +1382,7 @@ fn an_operation_ended_by_the_issuers_recheck_of_a_broken_ring_leaks_its_buffer()
         offset: 0,
         user_data: super::token(held.slot, held.generation),
     };
-    lock!(&ring.backlog).push_back(entry);
+    assert!(ring.incoming.offer(entry).is_ok());
     // ... and a concurrent flush (which saw the ring healthy) builds it: the kernel has it.
     h.engine.flush_ring(&ring);
     assert_eq!(
@@ -1513,7 +1513,7 @@ fn an_owned_read_whose_ring_broke_leaks_its_memory_and_its_continuation_says_so(
         offset: 0,
         user_data: super::token(held.slot, held.generation),
     };
-    lock!(&ring.backlog).push_back(entry);
+    assert!(ring.incoming.offer(entry).is_ok());
     h.engine.flush_ring(&ring);
     ring.broken.store(true, Ordering::Release);
     h.engine.end_if_broken(&ring, entry.user_data);
@@ -1871,4 +1871,348 @@ fn a_send_ended_between_pieces_says_how_many_bytes_went() {
     h.engine.cancel(id);
     let error = ended(h.one()).result.unwrap_err();
     assert_eq!(Cancelled::moved_of(&error), Some(100));
+}
+
+// ---- hand-offs to the poller
+
+/// The ids of the frames `tags` name (the order a poll delivers them in is not the point).
+fn tag_ids(tags: impl IntoIterator<Item = u64>) -> Vec<u64> {
+    let mut ids: Vec<u64> = tags
+        .into_iter()
+        .map(|tag| FrameHeader::new(tag).id_hash())
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+#[test]
+fn failures_from_4_submitters_are_each_delivered_once() {
+    const THREADS: u64 = 4;
+    const EACH: u64 = 8;
+    let h = Harness::new();
+    let file = h.sim.file(&content(10));
+    h.front
+        .pending
+        .fetch_add((THREADS * EACH) as usize, Ordering::AcqRel);
+    std::thread::scope(|scope| {
+        for thread in 0..THREADS {
+            let engine = &*h.engine;
+            scope.spawn(move || {
+                for i in 0..EACH {
+                    let op = Engine::op(
+                        super::Kind::Read { file, offset: 0 },
+                        super::Route::Port,
+                        IoBuf::default().into(),
+                        io_then(thread * 100 + i),
+                    );
+                    let held = engine.begin(op, super::State::Issuing).unwrap();
+                    engine.fail(held, io::Error::from_raw_os_error(5));
+                }
+            });
+        }
+    });
+    let done = h.drain((THREADS * EACH) as usize);
+    for done in &done {
+        assert!(done.done.as_ref().unwrap().result.is_err());
+    }
+    let got: Vec<u64> = done.iter().map(|done| done.header.id_hash()).collect();
+    assert_eq!(
+        got,
+        tag_ids((0..THREADS).flat_map(|t| (0..EACH).map(move |i| t * 100 + i)))
+    );
+    assert!(h.pull_with(&mut |_| false).is_empty(), "each only once");
+    assert_eq!(h.engine.strays.load(Ordering::Relaxed), 0);
+    assert_eq!(h.pending(), 0);
+}
+
+#[test]
+fn pool_results_from_many_threads_are_each_polled_once() {
+    const JOBS: u64 = 32;
+    let h = Harness::new();
+    let file = h.sim.file(&content(10));
+    h.front.pending.fetch_add(JOBS as usize, Ordering::AcqRel);
+    let mut deliveries = Vec::new();
+    for tag in 0..JOBS {
+        let op = Engine::op(
+            super::Kind::FileLen { file },
+            super::Route::Pool,
+            IoBuf::default().into(),
+            raw_then(tag),
+        );
+        let held = h.engine.begin(op, super::State::Issuing).unwrap();
+        h.engine.set_state(held, super::State::InFlight);
+        deliveries.push((tag, h.engine.delivery(held)));
+    }
+    std::thread::scope(|scope| {
+        while !deliveries.is_empty() {
+            let chunk = deliveries.split_off(deliveries.len().saturating_sub(4));
+            scope.spawn(move || {
+                for (tag, delivery) in chunk {
+                    delivery.deliver(Ok(tag as usize + 1000));
+                }
+            });
+        }
+    });
+    let done = h.drain(JOBS as usize);
+    let mut sums: Vec<usize> = done
+        .into_iter()
+        .map(|done| done.raw.unwrap().unwrap())
+        .collect();
+    sums.sort_unstable();
+    assert_eq!(
+        sums,
+        (0..JOBS as usize).map(|i| i + 1000).collect::<Vec<_>>()
+    );
+    assert!(h.pull_with(&mut |_| false).is_empty(), "each only once");
+    assert_eq!(h.engine.strays.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn one_poll_walks_the_ring_of_every_submitting_thread() {
+    const THREADS: u64 = 6;
+    let h = Harness::with(Some(full_probe()), true, MAX_PIECE);
+    let file = h.sim.file(&content(100));
+    std::thread::scope(|scope| {
+        for tag in 0..THREADS {
+            let h = &h;
+            scope.spawn(move || h.read(file, 0, 10, tag).unwrap());
+        }
+    });
+    assert_eq!(h.sim.rings_made(), THREADS as usize, "one ring per thread");
+    assert_eq!(
+        h.engine.ring_count.load(Ordering::Acquire),
+        THREADS as usize
+    );
+    let done = h.pull_with(&mut |_| false);
+    assert_eq!(
+        done.len(),
+        THREADS as usize,
+        "a single poll took every ring's end"
+    );
+    let got: Vec<u64> = done.iter().map(|d| d.header.id_hash()).collect();
+    let mut got = got;
+    got.sort_unstable();
+    assert_eq!(got, tag_ids(0..THREADS));
+}
+
+// ---- the slab and the limits, with no lock
+
+#[test]
+fn a_packet_for_a_slot_with_a_cancel_in_the_call_waits_for_the_next_poll() {
+    let h = Harness::new();
+    let sock = h.sim.sock();
+    h.sim.feed(sock, b"data");
+    h.sim.hold(true);
+    let id = h
+        .submit_limited(Request::Recv { sock }, recv_buf(), io_then(1), None)
+        .unwrap();
+    // A cancel is in its call (the slot is pinned) when the kernel finishes the operation.
+    let cell = h.engine.slab.cell(id.lane()).unwrap();
+    let asked = cell.ask_to_end(id.token(), super::End::Cancelled);
+    assert_eq!(asked, super::slab::Asked::Cancel);
+    h.sim.release();
+    assert!(
+        h.pull_with(&mut |_| false).is_empty(),
+        "the slot stays while the cancel names its record"
+    );
+    assert_eq!(h.pending(), 1);
+    assert_eq!(h.engine.inbox_len(), 1, "its packet waits");
+    cell.unpin();
+    assert_eq!(ended(h.one()).result.unwrap(), 4);
+    assert_eq!(h.pending(), 0);
+}
+
+#[test]
+fn limits_begun_on_8_threads_each_expire_once() {
+    let h = Harness::new();
+    let file = h.sim.file(&content(10));
+    let now = super::sys::Sys::now_ns(&*h.sim);
+    let held = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..8u64)
+            .map(|thread| {
+                let engine = &h.engine;
+                scope.spawn(move || {
+                    (0..4u64)
+                        .map(|i| {
+                            let mut op = Engine::op(
+                                super::Kind::Read { file, offset: 0 },
+                                super::Route::Port,
+                                IoBuf::default().into(),
+                                io_then(thread * 10 + i),
+                            );
+                            op.deadline = Some(now + 100 + thread * 4 + i);
+                            let held = engine.begin(op, super::State::Issuing).unwrap();
+                            engine.set_state(held, super::State::InFlight);
+                            held.slot
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(held.len(), 32);
+    h.front.pending.fetch_add(32, Ordering::AcqRel);
+    assert_eq!(h.engine.next_deadline.load(Ordering::Acquire), now + 100);
+    // Nothing before the first limit.
+    h.sim.advance(Duration::from_nanos(99));
+    h.pull_with(&mut |_| false);
+    for slot in &held {
+        assert_eq!(h.engine.slab.cell(*slot).unwrap().load().end(), None);
+    }
+    // Half of them pass.
+    h.sim.advance(Duration::from_nanos(1 + 15));
+    h.pull_with(&mut |_| false);
+    let ended = held
+        .iter()
+        .filter(|slot| {
+            h.engine.slab.cell(**slot).unwrap().load().end() == Some(super::End::TimedOut)
+        })
+        .count();
+    assert_eq!(ended, 16);
+    assert_eq!(
+        h.engine.next_deadline.load(Ordering::Acquire),
+        now + 100 + 16
+    );
+    h.sim.advance(Duration::from_nanos(100));
+    h.pull_with(&mut |_| false);
+    assert_eq!(
+        h.engine.next_deadline.load(Ordering::Acquire),
+        super::NO_DEADLINE
+    );
+}
+
+#[test]
+fn a_ring_that_breaks_while_another_thread_submits_hands_nothing_to_the_kernel() {
+    let h = Harness::with(Some(full_probe()), true, MAX_PIECE);
+    let file = h.sim.file(&content(100));
+    h.read(file, 0, 10, 99).unwrap(); // makes this thread's ring
+    h.drain(1);
+    let ring = h.engine.rings[0].get().unwrap().clone();
+    let submits = h.sim.submit_sizes().len();
+    let busy = ring.inner.try_claim().expect("free");
+    for tag in 0..3u64 {
+        h.read(file, tag * 10, 10, tag).unwrap();
+    }
+    // The ring breaks while the claim is held elsewhere: its operations end at once ...
+    h.engine.break_ring(&ring, &io::Error::from_raw_os_error(5));
+    drop(busy);
+    // ... and the entries that were waiting are dropped by the next flush, not built.
+    h.engine.flush_ring(&ring);
+    assert_eq!(h.sim.submit_sizes().len(), submits);
+    for done in h.drain(3) {
+        let error = ended(done).result.unwrap_err();
+        assert!(error.to_string().contains("IoRing failed"), "{error}");
+    }
+    assert_eq!(h.pending(), 0);
+}
+
+#[test]
+fn a_handle_value_the_system_gave_again_joins_the_port_again() {
+    let h = Harness::new();
+    let file = h.sim.file(&content(100));
+    h.read(file, 0, 10, 1).unwrap();
+    h.drain(1);
+    // The caller closes the handle and says so; the same value comes back as a new handle.
+    h.engine.forget(file);
+    h.sim.reuse(file, false);
+    h.read(file, 0, 10, 2).unwrap();
+    h.drain(1);
+    let joins = h
+        .sim
+        .log()
+        .iter()
+        .filter(|l| l.starts_with("associate"))
+        .count();
+    assert_eq!(joins, 2);
+}
+
+#[test]
+fn a_rest_offered_while_the_owner_builds_is_submitted_once() {
+    use std::sync::atomic::AtomicBool;
+    let h = Harness::with(Some(full_probe()), true, MAX_PIECE);
+    let file = h.sim.file(&content(100));
+    h.read(file, 0, 10, 1).unwrap(); // makes this thread's ring
+    h.drain(1);
+    let ring = h.engine.ring().unwrap();
+    // A second operation, in flight and with its entry built, but not yet offered.
+    let op = Engine::op(
+        super::Kind::Read { file, offset: 10 },
+        super::Route::Ring(ring.clone()),
+        IoBuf {
+            bytes: vec![0u8; 10],
+            filled: 0,
+        }
+        .into(),
+        io_then(2),
+    );
+    let held = h.engine.begin(op, super::State::Issuing).unwrap();
+    h.front.pending.fetch_add(1, Ordering::AcqRel);
+    h.engine.set_state(held, super::State::InFlight);
+    let entry = super::Entry {
+        write: false,
+        file,
+        // SAFETY: the slot is `InFlight` with nothing else touching the record in this test.
+        buf: unsafe {
+            (*held.rec.as_ptr())
+                .op
+                .as_mut()
+                .unwrap()
+                .buf
+                .bytes_mut()
+                .as_mut_ptr() as usize
+        },
+        len: 10,
+        offset: 10,
+        user_data: super::token(held.slot, held.generation),
+    };
+    // Another thread offers it after the owner's last look at the queue and before the owner lets
+    // go: the owner is in its submit then.
+    let offered = Arc::new(AtomicBool::new(false));
+    {
+        let (ring, offered) = (ring.clone(), offered.clone());
+        h.sim.on_submit(Arc::new(move || {
+            if !offered.swap(true, Ordering::AcqRel) {
+                assert!(ring.incoming.offer(entry).is_ok());
+            }
+        }));
+    }
+    let before = h.sim.submit_sizes().len();
+    h.read(file, 0, 10, 3).unwrap();
+    assert!(offered.load(Ordering::Acquire));
+    // Without waiting for a poll, the owner looked again and submitted the rest, once.
+    assert_eq!(h.sim.submit_sizes()[before..], [1, 1]);
+    assert_eq!(h.drain(2).len(), 2);
+    assert_eq!(h.pending(), 0);
+}
+
+#[test]
+fn a_ring_that_breaks_while_a_slot_is_being_made_ends_what_is_in_flight() {
+    let h = Harness::with(Some(full_probe()), true, MAX_PIECE);
+    let file = h.sim.file(&content(100));
+    h.sim.hold(true);
+    h.read(file, 0, 10, 1).unwrap();
+    let ring = h.engine.ring().unwrap();
+    // Another thread counted the first slot of the next chunk and is not done making the chunk.
+    while h.engine.slab.made() < 65 {
+        h.engine.slab.reserve_without_chunk();
+    }
+    assert!(h.engine.slab.cell(64).is_none());
+    h.engine.break_ring(&ring, &io::Error::from_raw_os_error(5));
+    let error = ended(h.one()).result.unwrap_err();
+    assert!(error.to_string().contains("IoRing failed"), "{error}");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "two polls are inside one engine")]
+fn a_poll_inside_a_poll_is_refused_in_debug() {
+    let h = Harness::new();
+    // SAFETY: no poll runs in this test.
+    let _first = unsafe { h.engine.poller.enter() };
+    // SAFETY: deliberately not sound: this is the second entry the debug check must refuse.
+    let _second = unsafe { h.engine.poller.enter() };
 }

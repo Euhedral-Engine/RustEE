@@ -11,8 +11,7 @@
 //!   or, for a call, `JAVA-BACKOFF`; or it is a test-only `cfg_attr`, or a file-level allow of a file on
 //!   [`EXEMPT_FILES`].
 //! - A file that locks through the `lock!` macro, which names no lock type, has its call sites counted per file
-//!   ([`LOCK_MACRO_SITES`]); the count only shrinks, except for a file on [`LOCK_MACRO_CEILINGS`], whose listed
-//!   count is a ceiling (more sites fail, fewer pass).
+//!   ([`LOCK_MACRO_SITES`]); the count only shrinks.
 //! - A type alias may not name a lock type: the lint reports the alias, not its uses, so an alias would hide the lock
 //!   from every site that uses it.
 
@@ -41,34 +40,14 @@ const HOT_FIX_TAGS: &[(&str, usize)] = &[
     ("I4", 3),
     ("I5", 3),
     ("I6", 3),
-    ("I7", 3),
-    ("I8", 3),
-    ("I9", 3),
-    ("I10", 3),
-    ("I11", 3),
-    ("I12", 3),
-    ("I13", 3),
-    ("I14", 3),
-    ("I15", 3),
     ("S6a", 1),
 ];
 
 /// The `lock!(..)` call sites by file (the macro names no lock type, so the lint cannot see them), with the ids of the
 /// audit the locks it takes belong to. A file's count only shrinks (a change that removes sites lowers it), and is 0
-/// once none of its ids is listed in [`HOT_FIX_TAGS`]; a file not listed here has no site. A file on
-/// [`LOCK_MACRO_CEILINGS`] has its listed count as a ceiling instead.
-const LOCK_MACRO_SITES: &[(&str, &[&str], usize)] = &[
-    ("euhedral-io/src/uring.rs", &["I3", "I4", "I5", "I6"], 7),
-    (
-        "euhedral-io/src/win/mod.rs",
-        &["I7", "I8", "I9", "I10", "I11", "I12", "I13", "I14", "I15"],
-        1_000_000,
-    ),
-];
-
-/// Files of [`LOCK_MACRO_SITES`] whose listed count is only a ceiling: fewer sites pass. The locks of the Windows
-/// engine go in the lock removal campaign, which removes this list and sets that file's count exactly.
-const LOCK_MACRO_CEILINGS: &[&str] = &["euhedral-io/src/win/mod.rs"];
+/// once none of its ids is listed in [`HOT_FIX_TAGS`]; a file not listed here has no site.
+const LOCK_MACRO_SITES: &[(&str, &[&str], usize)] =
+    &[("euhedral-io/src/uring.rs", &["I3", "I4", "I5", "I6"], 7)];
 
 /// Files whose file-level `allow` of a disallowed type is part of their design.
 const EXEMPT_FILES: &[&str] = &[
@@ -415,22 +394,18 @@ fn lock_sites(text: &str) -> usize {
     count
 }
 
-/// What is wrong with the `lock!` sites `found` per file, against the listed rows: a row's count is exact unless its
-/// file is among `ceilings`, where it is a ceiling.
+/// What is wrong with the `lock!` sites `found` per file, against the listed rows: a row's count is exact.
 fn lock_site_problems(
     rows: &[(&str, &[&str], usize)],
-    ceilings: &[&str],
     listed: &BTreeSet<&str>,
     mut found: BTreeMap<String, usize>,
 ) -> Vec<String> {
     let mut problems = Vec::new();
     for (file, ids, count) in rows {
         let actual = found.remove(*file).unwrap_or(0);
-        let ceiling = ceilings.contains(file);
-        if actual > *count || (!ceiling && actual != *count) {
+        if actual != *count {
             problems.push(format!(
-                "{file}: listed {count} `lock!(` sites{}, found {actual}",
-                if ceiling { " at most" } else { "" }
+                "{file}: listed {count} `lock!(` sites, found {actual}"
             ));
         }
         if *count > 0 && !ids.iter().any(|id| listed.contains(id)) {
@@ -448,7 +423,7 @@ fn lock_site_problems(
 }
 
 #[test]
-fn the_lock_macro_sites_are_the_listed_ones_and_only_the_ceilings_may_have_fewer() {
+fn the_lock_macro_sites_are_the_listed_ones() {
     let listed: BTreeSet<&str> = HOT_FIX_TAGS.iter().map(|(id, _)| *id).collect();
     let mut found: BTreeMap<String, usize> = BTreeMap::new();
     for (path, text) in sources() {
@@ -456,30 +431,24 @@ fn the_lock_macro_sites_are_the_listed_ones_and_only_the_ceilings_may_have_fewer
             found.insert(path, lock_sites(&text));
         }
     }
-    let problems = lock_site_problems(LOCK_MACRO_SITES, LOCK_MACRO_CEILINGS, &listed, found);
+    let problems = lock_site_problems(LOCK_MACRO_SITES, &listed, found);
     assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
 
 #[test]
-fn an_exact_row_fails_with_fewer_sites_and_a_ceiling_row_passes() {
+fn an_exact_row_fails_with_fewer_or_more_sites() {
     let listed: BTreeSet<&str> = ["A"].into();
-    let rows: &[(&str, &[&str], usize)] = &[("exact.rs", &["A"], 3), ("ceiling.rs", &["A"], 3)];
-    let found = |exact, ceiling| {
-        BTreeMap::from([
-            ("exact.rs".to_string(), exact),
-            ("ceiling.rs".to_string(), ceiling),
-        ])
+    let rows: &[(&str, &[&str], usize)] = &[("exact.rs", &["A"], 3)];
+    let check = |sites| {
+        lock_site_problems(
+            rows,
+            &listed,
+            BTreeMap::from([("exact.rs".to_string(), sites)]),
+        )
     };
-    let check =
-        |exact, ceiling| lock_site_problems(rows, &["ceiling.rs"], &listed, found(exact, ceiling));
-    assert!(check(3, 3).is_empty());
-    assert!(
-        check(3, 2).is_empty(),
-        "a ceiling row passes with fewer sites"
-    );
-    assert_eq!(check(2, 3).len(), 1, "an exact row fails with fewer sites");
-    assert_eq!(check(4, 3).len(), 1, "an exact row fails with more sites");
-    assert_eq!(check(3, 4).len(), 1, "a ceiling row fails with more sites");
+    assert!(check(3).is_empty());
+    assert_eq!(check(2).len(), 1, "an exact row fails with fewer sites");
+    assert_eq!(check(4).len(), 1, "an exact row fails with more sites");
 }
 
 #[test]

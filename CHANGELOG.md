@@ -3,6 +3,22 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## The Windows engine takes no lock (`euhedral-io`) (2026-11-19)
+
+**What.** `AsyncIo`'s Windows engine has no mutex. The operation table is a slab of records that never move, each with one atomic word (state, end reason, cancel pin, route, ring, generation). Failures and pool results reach the poller through queues. A ring's submit side and pop belong to one claimant at a time (a `ClaimCell`); other threads only queue their entries. The joined and ring-served handle sets are lock-free, and the limits are queued to the poller, which keeps them in a set only it touches. The `HOT-FIX` marks I7 to I15 are gone.
+
+**Why.** Every submission, completion and cancel of the engine took one table lock, and a submission could wait behind a poll.
+
+**How to use.** Nothing changes for callers; `forget_file` and `forget_socket` keep their contract.
+
+**Semantics.**
+- A cancel pins its slot while `CancelIoEx` is made: a packet for a pinned slot is left for the next poll, so a record is never reused under a cancel that names it.
+- A limit ends its operation at the first poll after the deadline, as before; `next_deadline` falls back to none once the last limited operation ends.
+- A thread that finds its ring claimed leaves its entry for the holder, who looks again after it lets go, or for the next poll.
+- One thread at a time is on a ring's submit and pop (as before); whether a ring tolerates two is not relied on.
+
+**Tests.** `win::slab` and `win::handles` unit tests (also run under Miri), `failures_from_4_submitters_are_each_delivered_once`, `pool_results_from_many_threads_are_each_polled_once`, `one_poll_walks_the_ring_of_every_submitting_thread`, `a_packet_for_a_slot_with_a_cancel_in_the_call_waits_for_the_next_poll`, `limits_begun_on_8_threads_each_expire_once`, `a_ring_that_breaks_while_another_thread_submits_hands_nothing_to_the_kernel` and `a_handle_value_the_system_gave_again_joins_the_port_again`.
+
 ## Three load-sensitive core tests judge the code, not the scheduler (`euhedral-core`) (2026-11-19)
 
 **What.** Test changes only; no product code changed. `PublishedFlow`'s sequence lock was checked against its reader and is correct (writer: odd sequence, release fence, fields, even sequence with release; reader: acquire load, fields, acquire fence, sequence compared): a torn publish cannot be returned.

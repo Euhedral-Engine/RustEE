@@ -105,6 +105,8 @@ pub(super) struct Sim {
     /// Runs in the middle of an asynchronous call, after the kernel finished it and before the
     /// call returns (the moment a poll on another thread could see its packet).
     hook: Mutex<Option<Hook>>,
+    /// Runs at the start of every ring submit (before the entries are taken).
+    submit_hook: Mutex<Option<Hook>>,
 }
 
 fn hresult_for(error: &io::Error) -> i32 {
@@ -123,6 +125,7 @@ impl Sim {
                 ..State::default()
             }),
             hook: Mutex::new(None),
+            submit_hook: Mutex::new(None),
         }
     }
 
@@ -219,6 +222,11 @@ impl Sim {
     /// `hook` runs inside every read call, after its completion was queued.
     pub(super) fn on_read(&self, hook: Hook) {
         *self.hook.lock().unwrap() = Some(hook);
+    }
+
+    /// `hook` runs at the start of every ring submit.
+    pub(super) fn on_submit(&self, hook: Hook) {
+        *self.submit_hook.lock().unwrap() = Some(hook);
     }
 
     /// Packets queued and not yet dequeued, plus held ones.
@@ -847,6 +855,10 @@ impl Sys for Sim {
     }
 
     fn ring_submit(&self, ring: Handle) -> io::Result<()> {
+        let hook = self.submit_hook.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            hook();
+        }
         let mut s = self.s();
         if s.fail_submits > 0 {
             s.fail_submits -= 1;

@@ -199,5 +199,13 @@
    "cargo miri test -p euhedral-gpu --test fake_shared_lane -- --exact many_parties_arming_at_once_each_see_exactly_their_own_retirement many_workers_submit_to_one_lane_and_every_marker_completes",
    "cargo miri test -p euhedral-gpu --features fake --lib -- --exact handles::tests::a_take_never_misses_and_a_give_is_never_refused_while_a_handle_is_stocked_and_the_population_fits graph_cache::shared_tests::workers_running_one_key_at_once_each_get_their_own_instance_and_no_one_waits"
   ]
+ },
+ {
+  "name": "io: windows slab and handle set",
+  "crate": "euhedral-io",
+  "seeds": 8,
+  "commands": [
+   "cargo miri test -p euhedral-io --lib -- win::slab::tests:: win::handles::tests::"
+  ]
  }
 ]
