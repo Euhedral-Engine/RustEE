@@ -410,9 +410,12 @@ jobs:
         run: |
           test -n "$FORGE_URL" || { echo "the variable FORGE_URL is unset"; exit 1; }
           auth=$(printf 'x-access-token:%s' "$FORGE_TOKEN" | base64 -w0)
+          rm -rf .ci # the checkout may track files under .ci; the action must come from the tag alone
           git init -q .ci
-          # The tag by its full ref: a branch named v4 would win a plain name. The header is this command's, not stored.
-          GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.extraHeader GIT_CONFIG_VALUE_0="Authorization: Basic $auth" \
+          # The tag by its full ref: a branch named v4 would win a plain name. The header is this one command's and is not
+          # stored in .ci/.git/config; it is scoped to the forge's address, and curl drops a custom Authorization header
+          # when a redirect changes the host, so another host never receives it.
+          GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="http.$FORGE_URL/.extraHeader" GIT_CONFIG_VALUE_0="Authorization: Basic $auth" \
             git -C .ci fetch -q --depth 1 "$FORGE_URL/euhedral/ci.git" refs/tags/v4
           git -C .ci checkout -q --detach FETCH_HEAD
 

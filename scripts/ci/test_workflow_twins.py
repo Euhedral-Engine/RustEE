@@ -315,7 +315,8 @@ class Gitea(unittest.TestCase):
         self.assertNotIn("clone", run)
         self.assertNotIn("--branch", run)
         # The token is this command's environment: not in argv or a URL, not echoed, not stored in `.ci/.git/config`.
-        self.assertIn("GIT_CONFIG_KEY_0=http.extraHeader", run)
+        self.assertIn('GIT_CONFIG_KEY_0="http.$FORGE_URL/.extraHeader"', run)
+        self.assertLess(run.index("rm -rf .ci"), run.index("git init -q .ci"))
         self.assertNotIn("@", run.replace("$FORGE_URL", ""))
         self.assertNotIn("echo", run.replace('echo "the variable FORGE_URL is unset"', ""))
         self.assertNotIn("git config", run)
