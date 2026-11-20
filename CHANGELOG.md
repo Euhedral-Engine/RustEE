@@ -3,6 +3,18 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## The GitLab pipeline is removed (2026-11-20)
+
+**What.** `.gitlab-ci.yml`, its generator `scripts/ci/gitlab_pipeline.py` and that script's test are gone. CI is the Gitea workflow (`.gitea/workflows/ci.yml`) and its twin, the GitHub workflow (`.github/workflows/ci.yml`); the `Test the scripts` step of both no longer runs the removed test. The README's merge request section is now about pull requests.
+
+**Why.** The repository moved from GitLab to Gitea, and the GitLab pipeline checked nothing the two workflows do not.
+
+**How to use.** Require `ci / ci-ok (pull_request)` on Gitea. Bring a branch up to date with `git fetch gitea && git merge gitea/main`.
+
+**Semantics.** No job of either workflow changed.
+
+**Tests.** `scripts/ci/test_workflow_twins.py` still pins the two workflows together.
+
 ## The Windows engine takes no lock (`euhedral-io`) (2026-11-19)
 
 **What.** `AsyncIo`'s Windows engine has no mutex. The operation table is a slab of records that never move, each with one atomic word (state, end reason, cancel pin, route, ring, generation). Failures and pool results reach the poller through queues. A ring's submit side and pop belong to one claimant at a time (a `ClaimCell`); other threads only queue their entries. The joined and ring-served handle sets are lock-free, and the limits are queued to the poller, which keeps them in a set only it touches. The `HOT-FIX` marks I7 to I15 are gone.

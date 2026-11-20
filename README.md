@@ -58,15 +58,14 @@ on, and pass without checking anything when the host lacks them; see the
 [`euhedral-core` README](euhedral-core/README.md#build-and-test). Each crate README's examples run as
 doctests.
 
-## Merge requests
+## Pull requests
 
-On Gitea, a pull request's workflow (`.gitea/workflows/ci.yml`, the twin of `.github/workflows/ci.yml`; a test pins the
-two together) runs the same jobs and ends in the one check to require, `ci / ci-ok (pull_request)`. Until the move, a
-merge request's pipeline (`.gitlab-ci.yml`) checks the workflows with actionlint, runs the Linux checks and
-Miri for the affected crates on the project's runner (a child pipeline), and has GitHub Actions run the Windows job
-and report the result. It must succeed before the merge, and the history is semi-linear:
-the branch must contain the target. Bring a branch up to date with a merge, never a rebase or a force-push:
+A pull request's workflow (`.gitea/workflows/ci.yml`, the twin of `.github/workflows/ci.yml`; a test pins the two
+together) runs the checks, Miri for the affected crates and the Linux tests, and has GitHub Actions run the Windows job
+and report the result. It ends in the one check to require, `ci / ci-ok (pull_request)`, which must succeed before the
+merge, and the history is semi-linear: the branch must contain the target. Bring a branch up to date with a merge, never
+a rebase or a force-push:
 
 ```sh
-git fetch gitlab && git merge gitlab/main && git push gitlab <branch>
+git fetch gitea && git merge gitea/main && git push gitea <branch>
 ```
