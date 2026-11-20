@@ -17,6 +17,18 @@ semantics and the tests that pin it.
 
 **Tests.** `scripts/ci/test_device_check.py` (a skip fails, a hardware skip is accepted, a binary that did not run fails) and `test_gitlab_pipeline.py` (the job, its grant and its steps). On a pipeline without the card the job fails with the skip lines.
 
+## `Reaper` frees the retired prefix of its queue in order and never waits (`euhedral-memory`) (2026-11-19)
+
+**What.** `Reaper::reap` has one consumer at a time (a `ClaimCell` holds the queue's single consumer). It drops items from the front while their work has retired and stops at the first unretired one, which stays at the front. A `reap` that finds another running returns 0 at once. The per-call keep-`Vec` and the re-offer of unretired items behind newer ones are gone, and so is the `HOT-FIX` marker M1.
+
+**Why.** The old `reap` drained the queue, kept unretired items in a `Vec` (an allocation per call) and offered them back behind newer ones, which reordered the queue.
+
+**How to use.** Nothing changes in the calls. Keep one stream's frees in one `Reaper`. A long free (`cuMemFree`, `cuMemFreeHost`) still runs on the worker that calls `reap`, as service time of that work; attach a `DeferredCalls` (`Device::attach_deferral`) to keep frees off busy moments.
+
+**Semantics.** Behaviour change: a retired item behind an unretired one now waits for it (head-of-line) instead of being freed first and the unretired one moved to the back. An item whose work never retires (a marker of another queue, or of a queue that faulted and never reaches it) now holds every item behind it until `reap_all` or the drop of the `Reaper`; before, only that one item stayed queued. Items are freed in push order. Producers push from any thread.
+
+**Tests.** `reap_frees_the_retired_prefix_and_allocates_nothing` and `an_unretired_head_is_kept_at_the_front` (fail before), `a_reap_from_inside_a_reap_returns_at_once` (a guard) and `a_panicking_free_releases_the_claim`.
+
 ## A quantum retires on a lane it used (`euhedral-graph`) (2026-11-19)
 
 **What.** A `StageGraph` quantum arms its retirement on a lane it used, not always on its run's home lane. With one lane used, that lane; with several, its home lane when it is one of them, else the lowest of them that has control. The other lanes it used join that lane first, as before.
