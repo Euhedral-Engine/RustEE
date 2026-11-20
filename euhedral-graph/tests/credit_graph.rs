@@ -30,11 +30,18 @@
 //!   during it).
 //!
 //! Pass: the numbers of each scenario exactly (`Pinned`: shown, late, made, sent, dropped, the start and seek
-//! latencies in scenario time), 0 late (except the slow-pack scenario), 0 out of order, 0 beyond credit, 0 left (items, slots, completions, quanta), made
-//! = sent + dropped, in flight <= pool, the stream finishing within its time. A pack slower than the consumer
+//! latencies in scenario time), 0 late (except `a_pack_slower_than_the_consumer_makes_items_late`, a 16 ms pack,
+//! which pins 63 late), 0 out of order, 0 beyond credit, 0 left (items, slots, completions, quanta), made =
+//! sent + dropped, in flight <= pool, the stream finishing within its time. A pack slower than the consumer
 //! must make items late. With `EUHEDRAL_TEST_TIMING` set (a quiet machine), also no callback over 200 µs and
 //! shutdown under 100 ms; otherwise those two are printed, not asserted (run with `-- --nocapture` to see the
 //! line; libtest hides a passing test's output).
+//!
+//! The seek runs with nothing owed (the harness sends it at quiet), so no frame is between its kill check and its
+//! run when the kill lands: the race of a kill against a completion in flight is not exercised here. The
+//! `Completions` and `StageGraph` unit tests cover it (`stage_graph.rs`: `a_kill_while_a_retry_waits_abandons_the_stage_and_retires_killed`,
+//! `a_kill_stops_the_unrun_stages_but_retires_the_submitted_work`,
+//! `a_quantum_killed_before_it_ran_abandons_every_stage_and_retires_killed`).
 //!
 //! Real time decides only how long the harness waits for the count to reach zero, and a guard (60 s) against a
 //! hang: a ledger that disagrees with the graph (a retirement expected early, a callback never made) hangs into
@@ -189,7 +196,7 @@ impl AbstractExecutor for TimingExecutor {
             }
             .fetch_add(1, Ordering::Relaxed);
         }
-        s.count.fetch_add(1, Ordering::AcqRel);
+        s.count.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -309,7 +316,7 @@ impl Drop for Item {
 
 struct Device {
     lanes: Vec<Arc<FakeDevice>>,
-    ledger: Ledger,
+    ledger: Arc<Ledger>,
 }
 
 impl Device {
@@ -454,7 +461,7 @@ impl Ctx {
             completions: Completions::new(&lanes),
             device: Arc::new(Device {
                 lanes: devices,
-                ledger: Ledger::default(),
+                ledger: Arc::new(Ledger::default()),
             }),
             graph: OnceLock::new(),
             sequencer: OnceLock::new(),
@@ -536,8 +543,12 @@ impl Ctx {
                     }
                 }
                 drop(item);
-                // The item's last obligation, paid after everything the retirement set going.
-                ctx.device.ledger.pay();
+                // The item's last obligation, paid after everything the retirement set going and after this
+                // closure let go of the context: the harness may drop the last of its own references as soon as
+                // nothing is owed, and the lattice must not end on a worker.
+                let ledger = ctx.device.ledger.clone();
+                drop(ctx);
+                ledger.pay();
             },
         )
         .expect("a valid graph");
@@ -676,10 +687,11 @@ impl Frame for Pack {
 
     fn do_finally(mut self: Box<Self>) {
         let ready = self.ready.take().expect("once");
-        let ledger = &self.ctx.device.ledger;
+        let ledger = self.ctx.device.ledger.clone();
         if !self.header.is_alive() {
             // Dropping the item ends its lease, which may admit the next: before this frame's end is paid.
             drop(ready);
+            drop(self);
             ledger.pay();
             return;
         }
@@ -696,6 +708,7 @@ impl Frame for Pack {
             ready: Some(ready),
         };
         self.ctx.completions.after_marker(marker, Box::new(next));
+        drop(self);
         ledger.pay();
     }
 }
@@ -712,9 +725,10 @@ impl Frame for Dispatch {
 
     fn do_finally(mut self: Box<Self>) {
         let ready = self.ready.take().expect("once");
-        let ledger = &self.ctx.device.ledger;
+        let ledger = self.ctx.device.ledger.clone();
         if !self.header.is_alive() {
             drop(ready);
+            drop(self);
             ledger.pay();
             return;
         }
@@ -727,6 +741,7 @@ impl Frame for Dispatch {
             ready: Some(ready),
         };
         self.ctx.completions.after_marker(marker, Box::new(next));
+        drop(self);
         ledger.pay();
     }
 }
@@ -750,7 +765,9 @@ impl Frame for Sent {
         });
         // The lease's end may admit the next item: before this frame's end is paid.
         drop(ready);
-        self.ctx.device.ledger.pay();
+        let ledger = self.ctx.device.ledger.clone();
+        drop(self);
+        ledger.pay();
     }
 }
 
@@ -788,8 +805,14 @@ impl Frame for ControlFrame {
             }) => self.ctx.seek(generation, to, horizon),
             None => {}
         }
-        self.ctx.device.ledger.pay();
         Ok(())
+    }
+
+    fn do_finally(self: Box<Self>) {
+        // Paid once the frame has let go of the context (see the retirement closure).
+        let ledger = self.ctx.device.ledger.clone();
+        drop(self);
+        ledger.pay();
     }
 }
 
@@ -857,8 +880,11 @@ impl Ledger {
         lock(&self.timers).push(Timer { at, dispatch_of });
     }
 
-    /// A seek of `generation`: its dispatch entries end at the lattice's next visit.
+    /// A seek of `generation`: its dispatch entries end at the lattice's next visit. The seek runs alone, so
+    /// the only obligation owed is its own control frame: no compute or other stage frame is queued for the kill to
+    /// skip (a skipped frame would never pay), which is checked here.
     fn kill(&self, generation: u32) {
+        assert_eq!(self.owed(), 1, "a seek with a frame owed besides its own");
         let mut timers = lock(&self.timers);
         let before = timers.len();
         timers.retain(|t| t.dispatch_of != Some(generation));
@@ -985,7 +1011,7 @@ fn consumer(ctx: &Arc<Ctx>, stepper: &Stepper) -> ConsumerReport {
     stepper.settle();
     loop {
         let now = stepper.now_ns();
-        // What this pass did: if it did anything the lattice must go quiet at this time before the next pass.
+        // What this pass did: if it did anything, the graph must settle at this time before the next pass.
         let mut acted = false;
         let msgs: Vec<Msg> = lock(&ctx.wire).drain(..).collect();
         acted |= !msgs.is_empty();
@@ -1196,7 +1222,7 @@ fn run(pack_cost: Duration) -> Option<Outcome> {
     let report = consumer(&ctx, &stepper);
 
     // The drain: nothing more is admitted; time goes on until what is in flight has finished or no
-    // submission is left to complete.
+    // timer is left.
     lock(&ctx.link).closed = true;
     let graph = ctx.graph.get().unwrap().clone();
     let mut drain_steps = 0u64;
@@ -1207,8 +1233,23 @@ fn run(pack_cost: Duration) -> Option<Outcome> {
         stepper.step_to(next);
         drain_steps += 1;
     }
+    // The last item's lease ends (in flight 0) before its retirement pays its final obligation: wait for it.
+    stepper.settle();
+    assert!(
+        stepper.ledger().owed() == 0 && stepper.ledger().waiting() == 0,
+        "the ledger is not empty after the drain: {} owed, {} timers, next {:?}, now {}, in flight {}, live {}",
+        stepper.ledger().owed(),
+        stepper.ledger().waiting(),
+        stepper.next_timer(),
+        stepper.now_ns(),
+        ctx.in_flight(),
+        graph.live()
+    );
     let left = ctx.in_flight();
     let quanta_left = graph.live();
+    // Everything owed is paid, and every frame let go of its context before paying: the graph ends here, on the
+    // test thread, and the lattice with it.
+    drop(graph);
     let slots_left = ctx.sequencer.get().unwrap().len();
     let pending_left = ctx.completions.pending();
     let closing = Instant::now();
