@@ -1872,3 +1872,97 @@ fn a_send_ended_between_pieces_says_how_many_bytes_went() {
     let error = ended(h.one()).result.unwrap_err();
     assert_eq!(Cancelled::moved_of(&error), Some(100));
 }
+
+// ---- hand-offs to the poller
+
+/// The ids of the frames `tags` name (the order a poll delivers them in is not the point).
+fn tag_ids(tags: impl IntoIterator<Item = u64>) -> Vec<u64> {
+    let mut ids: Vec<u64> = tags
+        .into_iter()
+        .map(|tag| FrameHeader::new(tag).id_hash())
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+#[test]
+fn failures_from_4_submitters_are_each_delivered_once() {
+    const THREADS: u64 = 4;
+    const EACH: u64 = 8;
+    let h = Harness::new();
+    let file = h.sim.file(&content(10));
+    h.front
+        .pending
+        .fetch_add((THREADS * EACH) as usize, Ordering::AcqRel);
+    std::thread::scope(|scope| {
+        for thread in 0..THREADS {
+            let engine = &*h.engine;
+            scope.spawn(move || {
+                for i in 0..EACH {
+                    let op = Engine::op(
+                        super::Kind::Read { file, offset: 0 },
+                        super::Route::Port,
+                        IoBuf::default().into(),
+                        io_then(thread * 100 + i),
+                    );
+                    let held = engine.begin(op, super::State::Issuing).unwrap();
+                    engine.fail(held, io::Error::from_raw_os_error(5));
+                }
+            });
+        }
+    });
+    let done = h.drain((THREADS * EACH) as usize);
+    for done in &done {
+        assert!(done.done.as_ref().unwrap().result.is_err());
+    }
+    let got: Vec<u64> = done.iter().map(|done| done.header.id_hash()).collect();
+    assert_eq!(
+        got,
+        tag_ids((0..THREADS).flat_map(|t| (0..EACH).map(move |i| t * 100 + i)))
+    );
+    assert!(h.pull_with(&mut |_| false).is_empty(), "each only once");
+    assert_eq!(h.engine.strays.load(Ordering::Relaxed), 0);
+    assert_eq!(h.pending(), 0);
+}
+
+#[test]
+fn pool_results_from_many_threads_are_each_polled_once() {
+    const JOBS: u64 = 32;
+    let h = Harness::new();
+    let file = h.sim.file(&content(10));
+    h.front.pending.fetch_add(JOBS as usize, Ordering::AcqRel);
+    let mut deliveries = Vec::new();
+    for tag in 0..JOBS {
+        let op = Engine::op(
+            super::Kind::FileLen { file },
+            super::Route::Pool,
+            IoBuf::default().into(),
+            raw_then(tag),
+        );
+        let held = h.engine.begin(op, super::State::Issuing).unwrap();
+        h.engine.set_state(held, super::State::InFlight);
+        deliveries.push((tag, h.engine.delivery(held)));
+    }
+    std::thread::scope(|scope| {
+        while !deliveries.is_empty() {
+            let chunk = deliveries.split_off(deliveries.len().saturating_sub(4));
+            scope.spawn(move || {
+                for (tag, delivery) in chunk {
+                    delivery.deliver(Ok(tag as usize + 1000));
+                }
+            });
+        }
+    });
+    let done = h.drain(JOBS as usize);
+    let mut sums: Vec<usize> = done
+        .into_iter()
+        .map(|done| done.raw.unwrap().unwrap())
+        .collect();
+    sums.sort_unstable();
+    assert_eq!(
+        sums,
+        (0..JOBS as usize).map(|i| i + 1000).collect::<Vec<_>>()
+    );
+    assert!(h.pull_with(&mut |_| false).is_empty(), "each only once");
+    assert_eq!(h.engine.strays.load(Ordering::Relaxed), 0);
+}

@@ -44,12 +44,14 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 #[allow(
     clippy::disallowed_types,
-    reason = "HOT-FIX(I9), HOT-FIX(I14), HOT-FIX(I15), HOT-FIX(I7), HOT-FIX(I8), HOT-FIX(I10), HOT-FIX(I11), HOT-FIX(I12), HOT-FIX(I13)"
+    reason = "HOT-FIX(I14), HOT-FIX(I15), HOT-FIX(I7), HOT-FIX(I10), HOT-FIX(I11), HOT-FIX(I12), HOT-FIX(I13)"
 )]
 use std::sync::{Arc, Mutex, TryLockError, Weak};
 use std::time::Duration;
 
 use euhedral_core::frames::Frame;
+use euhedral_data_structures::queues::{Consumer, MpscQueue, Multi, Producer, Single};
+use euhedral_data_structures::sync::ClaimCell;
 
 use self::sys::{
     ACCEPT_BUF, BuildError, Cqe, Handle, IORING_VERSION_3, Overlapped, Packet, STATUS_CANCELLED,
@@ -88,6 +90,9 @@ const MAX_OPS: usize = (1 << SLOT_BITS) - 1;
 /// only 12 on 32-bit ones, where a slot's generation wraps after 4096 issues. That is enough: a
 /// stale ring completion would need its slot reissued exactly a multiple of 4096 times meanwhile.
 const GENERATION_MASK: usize = usize::MAX >> SLOT_BITS;
+
+/// Entries of a chunk of the queues that hand failures and pool results to the poller.
+const HAND_OFF_CHUNK: usize = 256;
 
 static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
 /// `Engine::next_deadline` when no operation has a limit.
@@ -296,8 +301,7 @@ struct PoolDone {
 
 /// Delivers a pool job's result, or, if the job is dropped or panics first, an error.
 struct Delivery {
-    #[allow(clippy::disallowed_types, reason = "HOT-FIX(I9)")]
-    queue: Arc<Mutex<VecDeque<PoolDone>>>,
+    queue: Producer<PoolDone, Multi>,
     slot: u32,
     generation: u32,
     result: Option<io::Result<usize>>,
@@ -317,11 +321,12 @@ impl Drop for Delivery {
                 "the OS thread pool did not finish the job (it panicked or refused it)",
             ))
         });
-        lock!(&self.queue).push_back(PoolDone {
+        let queued = self.queue.offer(PoolDone {
             slot: self.slot,
             generation: self.generation,
             result,
         });
+        debug_assert!(queued.is_ok(), "the unbounded queue refused a pool result");
     }
 }
 
@@ -420,18 +425,27 @@ struct Entry {
     user_data: usize,
 }
 
+/// The state of the polling thread: the drain sides of the engine's hand-off queues.
+struct Poller {
+    failed: Consumer<Failed, Single>,
+    pool_done: Consumer<PoolDone, Single>,
+}
+
 pub(super) struct Engine {
     id: usize,
     sys: Arc<dyn Sys>,
     port: Port,
     #[allow(clippy::disallowed_types, reason = "HOT-FIX(I7)")]
     table: Mutex<Table>,
-    /// Operations whose call failed at once, to end with that error at the next poll.
-    #[allow(clippy::disallowed_types, reason = "HOT-FIX(I8)")]
-    ready: Mutex<VecDeque<Failed>>,
-    /// What open, rename and file length jobs left.
-    #[allow(clippy::disallowed_types, reason = "HOT-FIX(I9)")]
-    pool_done: Arc<Mutex<VecDeque<PoolDone>>>,
+    /// Operations whose call failed at once, to end with that error at the next poll: any thread
+    /// offers, the poller drains ([`Poller::failed`]).
+    failed: Producer<Failed, Multi>,
+    /// What open, rename and file length jobs left: the pool's threads offer, the poller drains
+    /// ([`Poller::pool_done`]).
+    pool_done: Producer<PoolDone, Multi>,
+    /// What only the polling thread touches. A poll that finds it claimed leaves at once: the
+    /// lattice runs one poll at a time, so that is only a poll that re-entered itself.
+    poller: ClaimCell<Poller>,
     /// Packets taken from the port and not yet handled (a poll stops when the caller has room for
     /// no more, and leaves the packets of slots whose call is still returning); only the polling
     /// thread touches it.
@@ -479,7 +493,7 @@ impl Engine {
     /// An engine over `sys`. Fails if there is no completion port.
     #[allow(
         clippy::disallowed_types,
-        reason = "HOT-FIX(I7), HOT-FIX(I8), HOT-FIX(I10), HOT-FIX(I11), HOT-FIX(I12), HOT-FIX(I13)"
+        reason = "HOT-FIX(I7), HOT-FIX(I10), HOT-FIX(I11), HOT-FIX(I12), HOT-FIX(I13)"
     )]
     pub(super) fn new(
         sys: Arc<dyn Sys>,
@@ -497,13 +511,19 @@ impl Engine {
             .then(|| sys.ring_probe())
             .flatten()
             .filter(|probe| !probe.emulated);
+        let failed: MpscQueue<Failed> = MpscQueue::with_pool(HAND_OFF_CHUNK, 2);
+        let pool_done: MpscQueue<PoolDone> = MpscQueue::with_pool(HAND_OFF_CHUNK, 2);
         Ok(Self {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             sys,
             port,
             table: Mutex::new(Table::default()),
-            ready: Mutex::new(VecDeque::new()),
-            pool_done: Arc::default(),
+            failed: failed.producer(),
+            pool_done: pool_done.producer(),
+            poller: ClaimCell::new(Poller {
+                failed: failed.consumer(),
+                pool_done: pool_done.consumer(),
+            }),
             inbox: Mutex::new(VecDeque::new()),
             associated: Mutex::new(HashSet::new()),
             ring_files: probe.is_some_and(|probe| {
@@ -791,10 +811,16 @@ impl Engine {
         })
     }
 
+    /// Hands a failure to the poller.
+    fn offer_failed(&self, failed: Failed) {
+        let queued = self.failed.offer(failed);
+        debug_assert!(queued.is_ok(), "the unbounded queue refused a failure");
+    }
+
     /// The operation fails at its call: it ends with `error` at the next poll.
     fn fail(&self, held: Held, error: io::Error) {
         self.set_state(held, State::Busy);
-        lock!(&self.ready).push_back(Failed {
+        self.offer_failed(Failed {
             slot: held.slot,
             generation: held.generation,
             error,
@@ -825,7 +851,7 @@ impl Engine {
                 op.buf.leak();
             }
         }
-        lock!(&self.ready).push_back(Failed {
+        self.offer_failed(Failed {
             slot: held.0,
             generation: held.1,
             error,
@@ -996,7 +1022,7 @@ impl Engine {
             if let Some(op) = op {
                 op.buf.leak();
             }
-            lock!(&self.ready).push_back(Failed {
+            self.offer_failed(Failed {
                 slot,
                 generation,
                 error: ring_failed_with(error),
@@ -1531,11 +1557,12 @@ impl Engine {
     /// Operations whose call failed at once, or whose ring broke.
     fn poll_failed(
         &self,
+        poller: &mut Poller,
         room: &mut dyn FnMut() -> bool,
         offer: &mut dyn FnMut(Box<dyn Frame>) -> bool,
     ) -> bool {
         while room() {
-            let Some(failed) = lock!(&self.ready).pop_front() else {
+            let Some(failed) = poller.failed.poll() else {
                 break;
             };
             let Some(held) = self.take_failed(&failed) else {
@@ -1668,13 +1695,17 @@ impl EngineTrait for Engine {
     }
 
     fn poll(&self, room: &mut dyn FnMut() -> bool, offer: &mut dyn FnMut(Box<dyn Frame>) -> bool) {
+        let Some(mut poller) = self.poller.try_claim() else {
+            return;
+        };
+        let poller = &mut *poller;
         self.expire_limits();
-        if !self.poll_failed(room, offer) {
+        if !self.poll_failed(poller, room, offer) {
             return;
         }
         // What open, rename and file length jobs left.
         while room() {
-            let Some(done) = lock!(&self.pool_done).pop_front() else {
+            let Some(done) = poller.pool_done.poll() else {
                 break;
             };
             let Some(held) = self.take_token(done.slot, done.generation as usize, None) else {
@@ -1718,7 +1749,7 @@ impl EngineTrait for Engine {
             self.flush_ring(ring);
         }
         // Operations of a ring that broke during this poll, and those that failed to build.
-        self.poll_failed(room, offer);
+        self.poll_failed(poller, room, offer);
     }
 }
 

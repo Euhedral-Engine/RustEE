@@ -43,8 +43,6 @@ const HOT_FIX_TAGS: &[(&str, usize)] = &[
     ("I5", 3),
     ("I6", 3),
     ("I7", 3),
-    ("I8", 3),
-    ("I9", 3),
     ("I10", 3),
     ("I11", 3),
     ("I12", 3),
@@ -62,7 +60,7 @@ const LOCK_MACRO_SITES: &[(&str, &[&str], usize)] = &[
     ("euhedral-io/src/uring.rs", &["I3", "I4", "I5", "I6"], 7),
     (
         "euhedral-io/src/win/mod.rs",
-        &["I7", "I8", "I9", "I10", "I11", "I12", "I13", "I14", "I15"],
+        &["I7", "I10", "I11", "I12", "I13", "I14", "I15"],
         1_000_000,
     ),
 ];
