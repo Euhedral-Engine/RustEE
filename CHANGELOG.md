@@ -3,6 +3,21 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## Three load-sensitive core tests judge the code, not the scheduler (`euhedral-core`) (2026-11-19)
+
+**What.** Test changes only; no product code changed. `PublishedFlow`'s sequence lock was checked against its reader and is correct (writer: odd sequence, release fence, fields, even sequence with release; reader: acquire load, fields, acquire fence, sequence compared): a torn publish cannot be returned.
+
+**Why.** `readers_never_see_a_torn_publish` asserted that 20,000 reads returned at least one value. A read returns nothing when it meets a publish in progress for 64 attempts, so a publisher descheduled between its stores on a loaded runner made every read return nothing and the test failed, although nothing was torn. `waits_for_another_thread` asserted that 20 ms of wall time had passed, which a stalled releaser thread or a coarse clock can break either way. `run_times_execute_alone_on_a_thread_with_a_sink` bounded two 100 us executes at 2 ms, which a preempted thread exceeds.
+
+**How to use.** Nothing to change.
+
+**Semantics.**
+- The torn-read test publishes once before the publisher thread starts, no longer counts successful reads, asserts every read that succeeds is whole, and stops the publisher from a drop guard so a failed assertion does not hang. A new test stops a publish after each of 0 to 5 fields and asserts the read returns nothing, then the whole new value once the publish ends (it runs under Miri).
+- The wait test orders events: the releaser sets the flag only after the waiter has checked 1,000 times (through its spins, yields and parks); the waiter must return because the flag was set, with at least 1,000 checks made. Both waits also end at a 30 s deadline, so a wait that never returns fails instead of hanging.
+- The run-time test no longer measures time. Each frame's finalizer records how many executes the metrics had timed when it began: 0 with no sink, 1 and 2 for the two timed frames (a frame's own execute is counted before its finalizer starts), and 2 for the dead frame and the frame after the sink. Count 2 and a sum of at least 200 us are kept.
+
+**Tests.** The three tests above. A wait that returned before the flag was set or after fewer than 1,000 checks fails the wait test; a finalizer inside the timed span makes the first timed frame's finalizer see 0 instead of 1.
+
 ## Give-back orders, move completions and deferred calls reach the lattice at the next worker `request` (`euhedral-memory`) (2026-11-19)
 
 **What.** `GiveBacks`, `Moves` and `DeferredCalls` no longer push to their downstream from a producer's thread. A claim that orders a give-back, a finished move and a `defer` or `drain_soon` only enqueue (or set a flag). Delivery happens when a worker serving the source hands items out in `pull` (orders and completions, within the `pull`'s own demand) or pushes them in `request` (within the demand it banked). A `pull` never pushes and never changes the bank. `DeferredCalls::poll` and `Deferral::poll` are removed: `request` evaluates the conditions. A stop-matched order or completion stays at the head of its source and is the first handed out next time, where it used to be re-queued at the tail. The `HOT-FIX` marks S1 and S2 are gone.
