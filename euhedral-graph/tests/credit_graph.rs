@@ -39,7 +39,8 @@
 //!
 //! The seek runs with nothing owed (the harness sends it at quiet), so no frame is between its kill check and its
 //! run when the kill lands: the race of a kill against a completion in flight is not exercised here. The
-//! `Completions` and `StageGraph` unit tests cover it (`stage_graph.rs`: `a_kill_while_a_retry_waits_abandons_the_stage_and_retires_killed`,
+//! `Completions` and `StageGraph` unit tests cover it (`stage_graph.rs`:
+//! `a_kill_while_a_retry_waits_abandons_the_stage_and_retires_killed`,
 //! `a_kill_stops_the_unrun_stages_but_retires_the_submitted_work`,
 //! `a_quantum_killed_before_it_ran_abandons_every_stage_and_retires_killed`).
 //!
@@ -645,10 +646,10 @@ impl Ctx {
     fn seek(&self, generation: u32, to: u64, horizon: u64) {
         {
             let mut link = lock(&self.link);
-            link.kill.store(true, Ordering::Release);
-            // The seek runs alone (the harness sent it with nothing owed), so no frame is between its kill check
-            // and its run: the kill takes hold of every sleeping obligation at once.
+            // The sleeping obligations are made owed before the old kill switch is set: a worker that sees the
+            // switch ends a killed dispatch and pays at once, which must already be owed.
             self.device.ledger.kill(link.generation);
+            link.kill.store(true, Ordering::Release);
             link.kill = Arc::new(AtomicBool::new(false));
             link.generation = generation;
             link.next = to;
@@ -880,9 +881,10 @@ impl Ledger {
         lock(&self.timers).push(Timer { at, dispatch_of });
     }
 
-    /// A seek of `generation`: its dispatch entries end at the lattice's next visit. The seek runs alone, so
-    /// the only obligation owed is its own control frame: no compute or other stage frame is queued for the kill to
-    /// skip (a skipped frame would never pay), which is checked here.
+    /// A seek of `generation`: its dispatch entries end at the lattice's next visit, so they are made owed. The
+    /// seek runs alone: the check here is that the only obligation owed is its own control frame, so no frame that
+    /// is owed is queued for the kill to skip (a skipped frame would never pay). It does not check the stage
+    /// timers, which a killed item may leave waiting.
     fn kill(&self, generation: u32) {
         assert_eq!(self.owed(), 1, "a seek with a frame owed besides its own");
         let mut timers = lock(&self.timers);
@@ -955,6 +957,9 @@ impl Stepper {
 
     /// Sets the clock to `next` and lets the graph do all it can at the new time.
     fn step_to(&self, next: u64) {
+        // What is due at `next` is owed before time reaches it: a worker polling in between may see the marker
+        // complete and pay at once.
+        self.ledger().sweep(next);
         self.clock.advance_to(next);
         self.settle();
     }
@@ -1192,6 +1197,11 @@ struct Outcome {
 /// One scenario on its own lattice, on a clock the harness steps. `None` when this process may not run on the
 /// CPUs asked for.
 fn run(pack_cost: Duration) -> Option<Outcome> {
+    // A scenario that panicked never reached the reset at its end.
+    *lock(&hops().last) = [(0, 0); 6];
+    for count in &hops().inversions {
+        count.store(0, Ordering::Relaxed);
+    }
     let cpus = cpus();
     let allowed = affinity::base_mask();
     if !cpus.iter().all(|&cpu| allowed.contains(cpu)) {
@@ -1247,8 +1257,8 @@ fn run(pack_cost: Duration) -> Option<Outcome> {
     );
     let left = ctx.in_flight();
     let quanta_left = graph.live();
-    // Everything owed is paid, and every frame let go of its context before paying: the graph ends here, on the
-    // test thread, and the lattice with it.
+    // Everything owed is paid, and every frame let go of its context before paying. This is only a clone of the
+    // graph; the context, the graph and the lattice end on the test thread at the end of the scenario.
     drop(graph);
     let slots_left = ctx.sequencer.get().unwrap().len();
     let pending_left = ctx.completions.pending();
@@ -1287,9 +1297,8 @@ fn run(pack_cost: Duration) -> Option<Outcome> {
         .zip(&hops().inversions)
         .map(|(name, count)| (*name, count.swap(0, Ordering::Relaxed)))
         .collect();
-    *lock(&hops().last) = [(0, 0); 6];
     println!("order breaks per hop, within a generation: {inversions:?}");
-    Some(Outcome {
+    let outcome = Outcome {
         report,
         inversions,
         left,
@@ -1304,7 +1313,13 @@ fn run(pack_cost: Duration) -> Option<Outcome> {
         max_in_flight: get(&c.max_in_flight),
         slow,
         closed_in,
-    })
+    };
+    // The frames let go of the context before they paid, and the lattice is closed: the context and then the
+    // lattice end here, on the test thread, never on a worker.
+    drop(stepper);
+    drop(ctx);
+    drop(lattice);
+    Some(outcome)
 }
 
 /// What holds whatever the pack costs: order, credit, accounting, drain.
