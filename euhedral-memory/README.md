@@ -74,14 +74,19 @@ time (no toolkit, no link-time dependency).
   their call (with the bytes it gives back) instead of making it where the memory is dropped. The source makes the queue
   as one blocking key frame when its lane pool has nothing in flight (`LanePool::idle`: every lane's last marker reached),
   or when queued device bytes or the oldest call's age pass a bound, or when a thread asked with `drain_soon` (a forced drain stalls the markers for as long as the kernels
-  running at that moment). An allocation that fails with out-of-memory (`DeviceMemory`, `PinnedHost`, `Vmm::alloc_vmm`,
+  running at that moment). `defer` and `drain_soon` only queue and set a flag: the frame is pushed by the next `request` a worker makes on the source, never from the
+  producer's thread and never by a `pull`. A free waits for that request; a worker with nothing to do asks again on every cycle. The receiver must be a
+  vertex of the lattice whose workers visit the source: one that requests once and is never visited again never gets a later call, so frees never drain
+  and `drain_soon` and the bounds do nothing. An allocation that fails with out-of-memory (`DeviceMemory`, `PinnedHost`, `Vmm::alloc_vmm`,
   `StreamPool`) makes the queued calls through a ticket and tries once more; `pending_bytes(Place)` is the memory a planner may
   count as certain reclaim (a lane's worker counts it and calls `drain_soon`, it does not drain); `free_blocks` reports that a free no longer waits when a deferral is attached. Measured not to
   hold up another stream's marker: `cuMemAlloc`, `cuMemAllocAsync`/`cuMemFreeAsync`, stream and event create/destroy,
   `cuGraphInstantiateWithFlags`/`cuGraphExecDestroy`/`cuGraphDestroy`, `cuTexObjectCreate`/`Destroy`, the VMM calls and
   `cuMemGetInfo`.
 - **No locks.** Budgets are CAS loops on atomics. Owner slots, give-back orders, the reaper and the caches are lock-free
-  queues.
+  queues. `Reaper::reap` has one consumer at a time (a second `reap` returns 0 at once), frees the retired prefix of
+  its queue in order and keeps an unretired head at the front. A long driver free runs on the worker that reaps;
+  `Device::attach_deferral` keeps frees off busy moments.
 
 ```rust
 use euhedral_memory::{
