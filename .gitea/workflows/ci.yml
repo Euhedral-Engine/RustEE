@@ -399,8 +399,8 @@ jobs:
         with:
           fetch-depth: 0
 
-      # The proxy action is cloned from this forge, at its protected tag, into `.ci` (a path no tracked file has, and the
-      # job's later steps do not walk the tree), and called as a local action: no host or port is written in this file.
+      # The proxy action is cloned from this forge, at its protected tag, into `.ci` (no file on main is tracked there, a
+      # branch's files there are removed first, and the job's later steps do not walk the tree), and called as a local action: no host or port is written in this file.
       # The job's own token reaches git for this one command as a header, so it is neither written to the clone's
       # configuration nor printed.
       - name: Fetch the proxy action (gitea)
@@ -413,9 +413,10 @@ jobs:
           rm -rf .ci # the checkout may track files under .ci; the action must come from the tag alone
           git init -q .ci
           # The tag by its full ref: a branch named v4 would win a plain name. The header is this one command's and is not
-          # stored in .ci/.git/config; it is scoped to the forge's address, and curl drops a custom Authorization header
-          # when a redirect changes the host, so another host never receives it.
-          GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="http.$FORGE_URL/.extraHeader" GIT_CONFIG_VALUE_0="Authorization: Basic $auth" \
+          # stored in .ci/.git/config. It is scoped to the forge's address, and git follows no redirect here: after a
+          # redirect git would send the header to the host it was redirected to.
+          GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0="http.$FORGE_URL/.extraHeader" GIT_CONFIG_VALUE_0="Authorization: Basic $auth" \
+            GIT_CONFIG_KEY_1=http.followRedirects GIT_CONFIG_VALUE_1=false \
             git -C .ci fetch -q --depth 1 "$FORGE_URL/euhedral/ci.git" refs/tags/v4
           git -C .ci checkout -q --detach FETCH_HEAD
 

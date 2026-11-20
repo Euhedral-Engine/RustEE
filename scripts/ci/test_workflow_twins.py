@@ -317,6 +317,9 @@ class Gitea(unittest.TestCase):
         # The token is this command's environment: not in argv or a URL, not echoed, not stored in `.ci/.git/config`.
         self.assertIn('GIT_CONFIG_KEY_0="http.$FORGE_URL/.extraHeader"', run)
         self.assertLess(run.index("rm -rf .ci"), run.index("git init -q .ci"))
+        # No redirect is followed: after one, git would send the header to the host it was redirected to.
+        self.assertIn("GIT_CONFIG_COUNT=2 ", run)
+        self.assertIn("GIT_CONFIG_KEY_1=http.followRedirects GIT_CONFIG_VALUE_1=false", run)
         self.assertNotIn("@", run.replace("$FORGE_URL", ""))
         self.assertNotIn("echo", run.replace('echo "the variable FORGE_URL is unset"', ""))
         self.assertNotIn("git config", run)
