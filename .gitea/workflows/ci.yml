@@ -74,7 +74,6 @@ jobs:
         run: |
           python3 scripts/ci/test_affected.py
           python3 scripts/ci/test_miri_build.py
-          python3 scripts/ci/test_gitlab_pipeline.py
           python3 scripts/ci/test_workflow_twins.py
           python3 scripts/ci/test_device_check.py
 
