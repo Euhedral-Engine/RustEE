@@ -18,6 +18,22 @@ semantics and the tests that pin it.
 
 **Tests.** The three tests above. A wait that returned before the flag was set or after fewer than 1,000 checks fails the wait test; a finalizer inside the timed span makes the first timed frame's finalizer see 0 instead of 1.
 
+## The resource monitor's dispatcher takes no lock and waits for nothing on the offer path (`euhedral-hardware-utils`) (2026-11-19)
+
+**What.** The monitor's dispatcher no longer uses a mutex and condvar. The pending value is one pointer cell: `offer` swaps its box in, drops the value it replaced and unparks the dispatch thread; the dispatch thread swaps the cell empty and owns what it took. The listener list is the dispatch thread's own: `add_listener` and `remove_listener` edit a master list under a lifecycle lock (cold) and hand the new list over through a second pointer cell, which the dispatch thread takes before each delivery. `closing` and `closed` are atomics, and the close hook sits in the cold lock. An idle dispatch thread parks.
+
+**Why.** The poller offered a value every tick through a lock the dispatch thread also took, and the thread slept on a condvar.
+
+**How to use.** Nothing changes: the API and the documented behaviour (latest value only, one listener's panic isolated, a delivery in progress may still reach a removed listener once, the hook runs after the last delivery) are as before.
+
+**Semantics.**
+- A listener added or removed during a delivery takes effect from the next value.
+- An offer racing a close is delivered or dropped, never both; values left in the cell at close are dropped by the dispatch thread or when the monitor is dropped.
+- A removed listener is released on the dispatch thread as soon as it takes the new list (an idle thread is woken for it), not at the next value.
+- Registered listeners, including ones removed while the close runs, are released on the dispatch thread at close, as before.
+
+**Tests.** `offers_racing_close_deliver_the_latest_or_nothing_after_close`, `a_burst_of_offers_delivers_the_last` (each replaced value dropped once), `listeners_added_during_dispatch_see_the_next_value`, `a_removed_listener_is_gone_for_the_next_value_and_the_list_is_freed`, `a_listener_removed_while_idle_is_freed_at_once`, `a_listener_destructor_that_eats_the_park_token_does_not_stall_the_thread`, `a_remove_racing_the_close_tail_leaves_nothing_behind`, `a_superseded_list_is_freed`, `an_offer_takes_no_lock`; the H5 row of the ratchet is gone. The module runs under Miri in its own shard.
+
 ## Give-back orders, move completions and deferred calls reach the lattice at the next worker `request` (`euhedral-memory`) (2026-11-19)
 
 **What.** `GiveBacks`, `Moves` and `DeferredCalls` no longer push to their downstream from a producer's thread. A claim that orders a give-back, a finished move and a `defer` or `drain_soon` only enqueue (or set a flag). Delivery happens when a worker serving the source hands items out in `pull` (orders and completions, within the `pull`'s own demand) or pushes them in `request` (within the demand it banked). A `pull` never pushes and never changes the bank. `DeferredCalls::poll` and `Deferral::poll` are removed: `request` evaluates the conditions. A stop-matched order or completion stays at the head of its source and is the first handed out next time, where it used to be re-queued at the tail. The `HOT-FIX` marks S1 and S2 are gone.
