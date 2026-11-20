@@ -46,6 +46,18 @@ semantics and the tests that pin it.
 
 **Tests.** `the_credit_graph_with_a_fast_pack`, `the_credit_graph_with_a_slow_pack`, and `a_pack_slower_than_the_consumer_makes_items_late` (a 16 ms pack, slower than the consumer: pins 63 late while every other check holds), which shows the stepped scenario counts a real lateness. Each pins its numbers exactly; sixteen runs of the test binary, eight alone and eight with a second copy running beside them, gave the same numbers every time.
 
+## The stream-drop-after-pool device test holds its callbacks back instead of racing them (`euhedral-gpu`, tests only) (2026-11-19)
+
+**What.** `a_stream_dropped_after_its_pool_is_safe_with_callbacks_still_to_come` no longer relies on a 125M-cycle `spin` kernel still running when the stream is dropped. The stream under test starts with a host callback that the test holds, and the four retirements and a last callback follow it in the stream. The fault is made on a second lane, whose stream is dropped (and so waited for) after the arming. `CudaStream::raw_stream_for_tests` is added under the `test-hooks` feature; no behaviour changed.
+
+**Why.** On a slow test thread the driver delivered the callbacks before `drop(stream)`, nothing was pending and the exact assertion on `leaked_shared_sides()` saw 0 where it expects 1.
+
+**How to use.** Nothing: a test change.
+
+**Semantics.** A host callback blocks the later work of its stream until it returns, so the four retirements cannot be delivered while the test holds the first callback, and the fault comes from another lane after they are armed. The test lets the hold go after the drop and waits, bounded only by a 60 s fail-fast guard, for the last callback queued behind the retirements. A drop guard releases the hold if the test panics.
+
+**Tests.** The same test; with a 1 s sleep before the retirements are armed and another before `drop(pool)` it passes every run, where the old test, with a 1 s delay before the arming, armed after the fault and panicked with error 700.
+
 ## Give-back orders, move completions and deferred calls reach the lattice at the next worker `request` (`euhedral-memory`) (2026-11-19)
 
 **What.** `GiveBacks`, `Moves` and `DeferredCalls` no longer push to their downstream from a producer's thread. A claim that orders a give-back, a finished move and a `defer` or `drain_soon` only enqueue (or set a flag). Delivery happens when a worker serving the source hands items out in `pull` (orders and completions, within the `pull`'s own demand) or pushes them in `request` (within the demand it banked). A `pull` never pushes and never changes the bank. `DeferredCalls::poll` and `Deferral::poll` are removed: `request` evaluates the conditions. A stop-matched order or completion stays at the head of its source and is the first handed out next time, where it used to be re-queued at the tail. The `HOT-FIX` marks S1 and S2 are gone.
