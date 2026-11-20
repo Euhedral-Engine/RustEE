@@ -89,6 +89,7 @@ jobs:
           python3 scripts/ci/test_affected.py
           python3 scripts/ci/test_miri_build.py
           python3 scripts/ci/test_gitlab_pipeline.py
+          python3 scripts/ci/test_workflow_twins.py
           python3 scripts/ci/test_device_check.py
 
       - name: Compute the affected crates
@@ -97,10 +98,18 @@ jobs:
           EVENT: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}
           BASE_INPUT: ${{ inputs.base_ref }}
+          BEFORE: ${{ github.event.before }}
         run: |
           case "$EVENT" in
             # Against the merge base with the PR's base branch, which is not always main (stacked PRs).
             pull_request) python3 scripts/ci/affected.py --base "origin/$BASE_REF" --head HEAD --merge-base --github-output "$GITHUB_OUTPUT" ;;
+            # A push to main (Gitea's twin of this file runs on it): against the commit main was at before the push.
+            push)
+              if [ -n "$BEFORE" ] && [ "${BEFORE#0000}" = "$BEFORE" ]; then
+                python3 scripts/ci/affected.py --base "$BEFORE" --head HEAD --github-output "$GITHUB_OUTPUT"
+              else
+                python3 scripts/ci/affected.py --all --github-output "$GITHUB_OUTPUT"
+              fi ;;
             *)
               if [ -n "$BASE_INPUT" ]; then
                 python3 scripts/ci/affected.py --base "origin/$BASE_INPUT" --head HEAD --merge-base --github-output "$GITHUB_OUTPUT"
@@ -127,7 +136,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install the toolchain pinned in mise.toml
+      - name: Install the toolchain pinned in mise.toml (github)
         run: |
           version=$(sed -n 's/^rust = .*version = "\([^"]*\)".*/\1/p' mise.toml)
           rustup toolchain install "$version" --profile minimal --component rustfmt --component clippy
@@ -138,7 +147,7 @@ jobs:
       # Restored from the caches the push to main saved (cache-warm.yml); this run saves nothing.
       # The preinstalled stable is not used, and its hash changes with the runner image: drop it before the cache key
       # is computed.
-      - name: Drop the preinstalled stable toolchain
+      - name: Drop the preinstalled stable toolchain (github)
         run: rustup toolchain uninstall stable || true
 
       - uses: Swatinem/rust-cache@v2
@@ -204,7 +213,7 @@ jobs:
         run: cargo test -p euhedral-gpu --release --lib --features fake -- graph_cache::shared_tests::a_hit_replayed_as_recorded
 
       # Built and linted on Linux and Windows; the tests skip with no device (no driver library is the skip). GitHub's
-      # runners have no card, so only the GitLab pipeline's `device` job runs them on one, and fails on a skip.
+      # runners have no card, so only the Gitea pipeline's `device` job runs them on one, and fails on a skip.
       - name: CUDA backend (euhedral-memory)
         if: needs.changes.outputs.euhedral_memory == 'true'
         run: |
@@ -252,7 +261,7 @@ jobs:
           rustup toolchain install "$toolchain" --profile minimal --component miri --component rust-src
           echo "RUSTUP_TOOLCHAIN=$toolchain" >> "$GITHUB_ENV"
 
-      - name: Drop the preinstalled stable toolchain
+      - name: Drop the preinstalled stable toolchain (github)
         run: rustup toolchain uninstall stable || true
 
       - uses: Swatinem/rust-cache@v2
