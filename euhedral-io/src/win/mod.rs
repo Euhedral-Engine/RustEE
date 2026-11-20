@@ -384,6 +384,7 @@ enum Call {
 struct Ring {
     sys: Arc<dyn Sys>,
     /// Its place in the engine's rings.
+    #[allow(dead_code, reason = "names the ring in an operation's state word")]
     index: usize,
     handle: Handle,
     /// Building entries and submitting: one thread at a time, and a thread that finds it taken

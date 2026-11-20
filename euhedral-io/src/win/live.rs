@@ -616,7 +616,10 @@ fn threads_submit_to_their_own_rings_and_every_read_ends_once() {
         for handle in handles {
             handle.join().unwrap();
         }
-        let rings = io.engine.rings.lock().unwrap().len();
+        let rings = io
+            .engine
+            .ring_count
+            .load(std::sync::atomic::Ordering::Acquire);
         assert_eq!(
             rings,
             if io.engine.ring_use().0 { 8 } else { 0 },
@@ -691,7 +694,9 @@ fn a_file_joined_to_a_port_is_served_by_the_port_not_a_ring() {
         assert_eq!(done.buf.bytes, data[i * 4096..(i + 1) * 4096]);
     }
     assert_eq!(
-        io.engine.rings.lock().unwrap().len(),
+        io.engine
+            .ring_count
+            .load(std::sync::atomic::Ordering::Acquire),
         0,
         "no ring was made for it"
     );
