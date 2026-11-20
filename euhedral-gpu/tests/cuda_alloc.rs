@@ -7,6 +7,9 @@
     reason = "the test thread is not a lattice worker: it polls for the callbacks"
 )]
 
+#[path = "common/skip.rs"]
+mod skip;
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -66,7 +69,7 @@ fn round(stream: &mut CudaStream, queue: &Arc<dyn DeviceQueue>, batch: usize) {
 #[test]
 fn the_retirement_path_allocates_nothing_in_steady_state() {
     let Ok(gpu) = CudaGpu::open(0) else {
-        eprintln!("no CUDA device: skipped");
+        skip::skip(format_args!("no CUDA device: skipped"));
         return;
     };
     // The counter sees allocations at all.

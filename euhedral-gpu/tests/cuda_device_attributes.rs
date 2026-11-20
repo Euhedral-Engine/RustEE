@@ -2,6 +2,9 @@
 //! has. Skips, passing, with no driver or device.
 #![cfg(feature = "cuda")]
 
+#[path = "common/skip.rs"]
+mod skip;
+
 use euhedral_gpu::Gpu;
 use euhedral_gpu::cuda::CudaGpu;
 
@@ -10,7 +13,7 @@ fn a_card_reports_its_multiprocessors_and_shared_memory_optin() {
     let gpu = match CudaGpu::open(0) {
         Ok(gpu) => gpu,
         Err(e) => {
-            eprintln!("no CUDA device: skipped ({e})");
+            skip::skip(format_args!("no CUDA device: skipped ({e})"));
             return;
         }
     };

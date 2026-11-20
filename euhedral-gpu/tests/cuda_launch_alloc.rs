@@ -7,6 +7,9 @@
     reason = "the test thread is not a lattice worker: it polls and sleeps"
 )]
 
+#[path = "common/skip.rs"]
+mod skip;
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -49,9 +52,18 @@ const OPS_PTX: &[u8] = include_bytes!("kernels/ops.ptx");
 
 fn module(gpu: &std::sync::Arc<CudaGpu>) -> Option<CudaModule> {
     if gpu.driver_version() >= 13010 {
-        CudaModule::from_image(gpu, OPS_PTX).ok()
+        Some(
+            CudaModule::from_image(gpu, OPS_PTX)
+                .expect("the prebuilt test kernels load on a 13.1 driver"),
+        )
     } else {
-        CudaModule::from_source(gpu, OPS, &Default::default()).ok()
+        match CudaModule::from_source(gpu, OPS, &Default::default()) {
+            Ok(module) => Some(module),
+            Err(e) => {
+                skip::skip(format_args!("no way to compile the test kernels ({e})"));
+                None
+            }
+        }
     }
 }
 
@@ -62,11 +74,11 @@ fn allocations() -> usize {
 #[test]
 fn warm_launches_updates_and_replays_allocate_nothing_and_a_span_reads_without_waiting() {
     let Ok(gpu) = CudaGpu::open(0) else {
-        eprintln!("no CUDA device: skipped");
+        skip::skip(format_args!("no CUDA device: skipped"));
         return;
     };
     let Some(module) = module(&gpu) else {
-        eprintln!("no kernel module: skipped");
+        skip::skip(format_args!("no kernel module: skipped"));
         return;
     };
     let (pool, mut streams) = gpu

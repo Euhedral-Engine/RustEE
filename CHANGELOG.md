@@ -19,6 +19,75 @@ semantics and the tests that pin it.
 
 **Tests.** `win::slab` and `win::handles` unit tests (also run under Miri), `failures_from_4_submitters_are_each_delivered_once`, `pool_results_from_many_threads_are_each_polled_once`, `one_poll_walks_the_ring_of_every_submitting_thread`, `a_packet_for_a_slot_with_a_cancel_in_the_call_waits_for_the_next_poll`, `limits_begun_on_8_threads_each_expire_once`, `a_ring_that_breaks_while_another_thread_submits_hands_nothing_to_the_kernel` and `a_handle_value_the_system_gave_again_joins_the_port_again`.
 
+## Three load-sensitive core tests judge the code, not the scheduler (`euhedral-core`) (2026-11-19)
+
+**What.** Test changes only; no product code changed. `PublishedFlow`'s sequence lock was checked against its reader and is correct (writer: odd sequence, release fence, fields, even sequence with release; reader: acquire load, fields, acquire fence, sequence compared): a torn publish cannot be returned.
+
+**Why.** `readers_never_see_a_torn_publish` asserted that 20,000 reads returned at least one value. A read returns nothing when it meets a publish in progress for 64 attempts, so a publisher descheduled between its stores on a loaded runner made every read return nothing and the test failed, although nothing was torn. `waits_for_another_thread` asserted that 20 ms of wall time had passed, which a stalled releaser thread or a coarse clock can break either way. `run_times_execute_alone_on_a_thread_with_a_sink` bounded two 100 us executes at 2 ms, which a preempted thread exceeds.
+
+**How to use.** Nothing to change.
+
+**Semantics.**
+- The torn-read test publishes once before the publisher thread starts, no longer counts successful reads, asserts every read that succeeds is whole, and stops the publisher from a drop guard so a failed assertion does not hang. A new test stops a publish after each of 0 to 5 fields and asserts the read returns nothing, then the whole new value once the publish ends (it runs under Miri).
+- The wait test orders events: the releaser sets the flag only after the waiter has checked 1,000 times (through its spins, yields and parks); the waiter must return because the flag was set, with at least 1,000 checks made. Both waits also end at a 30 s deadline, so a wait that never returns fails instead of hanging.
+- The run-time test no longer measures time. Each frame's finalizer records how many executes the metrics had timed when it began: 0 with no sink, 1 and 2 for the two timed frames (a frame's own execute is counted before its finalizer starts), and 2 for the dead frame and the frame after the sink. Count 2 and a sum of at least 200 us are kept.
+
+**Tests.** The three tests above. A wait that returned before the flag was set or after fewer than 1,000 checks fails the wait test; a finalizer inside the timed span makes the first timed frame's finalizer see 0 instead of 1.
+
+## The resource monitor's dispatcher takes no lock and waits for nothing on the offer path (`euhedral-hardware-utils`) (2026-11-19)
+
+**What.** The monitor's dispatcher no longer uses a mutex and condvar. The pending value is one pointer cell: `offer` swaps its box in, drops the value it replaced and unparks the dispatch thread; the dispatch thread swaps the cell empty and owns what it took. The listener list is the dispatch thread's own: `add_listener` and `remove_listener` edit a master list under a lifecycle lock (cold) and hand the new list over through a second pointer cell, which the dispatch thread takes before each delivery. `closing` and `closed` are atomics, and the close hook sits in the cold lock. An idle dispatch thread parks.
+
+**Why.** The poller offered a value every tick through a lock the dispatch thread also took, and the thread slept on a condvar.
+
+**How to use.** Nothing changes: the API and the documented behaviour (latest value only, one listener's panic isolated, a delivery in progress may still reach a removed listener once, the hook runs after the last delivery) are as before.
+
+**Semantics.**
+- A listener added or removed during a delivery takes effect from the next value.
+- An offer racing a close is delivered or dropped, never both; values left in the cell at close are dropped by the dispatch thread or when the monitor is dropped.
+- A removed listener is released on the dispatch thread as soon as it takes the new list (an idle thread is woken for it), not at the next value.
+- Registered listeners, including ones removed while the close runs, are released on the dispatch thread at close, as before.
+
+**Tests.** `offers_racing_close_deliver_the_latest_or_nothing_after_close`, `a_burst_of_offers_delivers_the_last` (each replaced value dropped once), `listeners_added_during_dispatch_see_the_next_value`, `a_removed_listener_is_gone_for_the_next_value_and_the_list_is_freed`, `a_listener_removed_while_idle_is_freed_at_once`, `a_listener_destructor_that_eats_the_park_token_does_not_stall_the_thread`, `a_remove_racing_the_close_tail_leaves_nothing_behind`, `a_superseded_list_is_freed`, `an_offer_takes_no_lock`; the H5 row of the ratchet is gone. The module runs under Miri in its own shard.
+
+## The credit-graph scenario runs on a clock the test steps (`euhedral-graph` tests and `testing`) (2026-11-19)
+
+**What.** `testing::StepClock` is a clock a test owns, and `FakeDevice::pool_stepped(names, &clock)` builds a pool whose submissions complete when that clock reaches them (`FakeDevice::pool` keeps the wall clock). `FakeDevice::next_done_after_ns` gives the next time a submission on the pool completes. In `tests/credit_graph.rs` the fake consumer's schedule (the 0.5 s buffer, 120 items a second, the seek, the pause, the credit) and the device's completions read that one clock. The test counts what the graph still owes (a ledger of its own callbacks and timers, nothing read from the lattice) and moves the clock to the next event only when nothing is owed, so a late item is one the graph delivered after the consumer's frame, whatever the machine's speed, and the numbers of each scenario are the same on every run.
+
+**Why.** The scenario ran on wall-clock time: with the 7 ms pack the margin over the consumer's rate is about 19 %, so a loaded machine could make an item late (or hit the 30 s and 5 s deadlines) although the graph was correct.
+
+**How to use.** `StepClock::new()`, `FakeDevice::pool_stepped`, then `advance_to` when the code under test has gone quiet. Nothing changes for users of `FakeDevice::pool`. The test's `EUHEDRAL_TEST_TIMING` checks (callbacks over 200 µs, shutdown under 100 ms) stay: they time real frames on the real clock, which a stepped clock does not replace, and stay printed unless the variable is set. The completions' wall-clock lateness line is no longer printed (on a stepped clock it measures only the harness).
+
+**Semantics.** Asserted always, on the stepped clock: the exact numbers of each scenario (shown, late, made, sent, dropped, the start and seek latencies in scenario time), no timeout (the stream finishes within 30 s of scenario time and at most a million steps), nothing left after the drain (which steps time until the pool and the graph are empty), no order break at any hop, nothing beyond credit, made = sent + dropped, every quantum retired once, in flight <= pool. The ledger: every stage run, sequencer release, pack, dispatch, send, control frame and retirement the graph owes is counted by the test when it is created and paid when it ends; a marker that releases one is a timer at the marker's completion; an item's retirement timer is the latest marker of each lane it used (the rule `stage_graph.rs` states), killed or not; a seek makes the dispatch entries of the old generation owed at once, as the lattice ends them at its next visit. Real time decides only how long the harness waits for the count to reach zero, and a 60 s guard: a ledger that disagrees with the graph hangs into it and fails (a retirement timer one marker early did, on all three scenarios). No assertion is on a real-time bound.
+
+**Tests.** `the_credit_graph_with_a_fast_pack`, `the_credit_graph_with_a_slow_pack`, and `a_pack_slower_than_the_consumer_makes_items_late` (a 16 ms pack, slower than the consumer: pins 63 late while every other check holds), which shows the stepped scenario counts a real lateness. Each pins its numbers exactly; sixteen runs of the test binary, eight alone and eight with a second copy running beside them, gave the same numbers every time.
+
+## The device tests run on the card in CI, and a skip fails the job (CI) (2026-11-19)
+
+**What.** The GitLab pipeline has a `device` job that runs `cargo test --features cuda` of `euhedral-memory` and `euhedral-gpu` on the machine's card, under a shared grant of card memory, with the card's device nodes, the host's driver libraries and NVRTC in its container. Every device test that cannot run prints a `DEVICE-TEST-SKIPPED` line through one helper per crate, and `scripts/ci/device_check.py` fails the job on such a line or on a `tests/cuda*.rs` binary that did not run. A skip for a feature this card lacks prints `DEVICE-TEST-SKIPPED-HARDWARE` and is listed and accepted.
+
+**Why.** A device test with no driver or card returned early and passed, so a green pipeline said nothing about the device code. The cuda test steps also made the workspace job wait for the card.
+
+**How to use.** Nothing for callers. A device test that must skip calls `skip::skip(..)` (`skip_hardware` for a missing card feature), never a bare `return`. The project variable `EUHEDRAL_NVRTC_DIR` names the NVRTC library directory on the runner's host. GitHub's runners have no card: the job is GitLab-only.
+
+**Semantics.**
+- The job runs the tests with `--nocapture` so the skip lines reach the log.
+- `an_allocation_that_runs_out_of_memory_makes_the_deferred_frees_and_tries_again` asks for more than the card has, so it holds one 64 MiB block instead of most of the free memory; it proves the deferred free is made on the out-of-memory, not that the retried allocation succeeds.
+
+**Tests.** `scripts/ci/test_device_check.py` (a skip fails, a hardware skip is accepted, a binary that did not run fails) and `test_gitlab_pipeline.py` (the job, its grant and its steps). On a pipeline without the card the job fails with the skip lines.
+
+## The stream-drop-after-pool device test holds its callbacks back instead of racing them (`euhedral-gpu`, tests only) (2026-11-19)
+
+**What.** `a_stream_dropped_after_its_pool_is_safe_with_callbacks_still_to_come` no longer relies on a 125M-cycle `spin` kernel still running when the stream is dropped. The stream under test starts with a host callback that the test holds, and the four retirements and a last callback follow it in the stream. The fault is made on a second lane, whose stream is dropped (and so waited for) after the arming. `CudaStream::raw_stream_for_tests` is added under the `test-hooks` feature; no behaviour changed.
+
+**Why.** On a slow test thread the driver delivered the callbacks before `drop(stream)`, nothing was pending and the exact assertion on `leaked_shared_sides()` saw 0 where it expects 1.
+
+**How to use.** Nothing: a test change.
+
+**Semantics.** A host callback blocks the later work of its stream until it returns, so the four retirements cannot be delivered while the test holds the first callback, and the fault comes from another lane after they are armed. The test lets the hold go after the drop and waits, bounded only by a 60 s fail-fast guard, for the last callback queued behind the retirements. A drop guard releases the hold if the test panics.
+
+**Tests.** The same test; with a 1 s sleep before the retirements are armed and another before `drop(pool)` it passes every run, where the old test, with a 1 s delay before the arming, armed after the fault and panicked with error 700.
+
 ## Give-back orders, move completions and deferred calls reach the lattice at the next worker `request` (`euhedral-memory`) (2026-11-19)
 
 **What.** `GiveBacks`, `Moves` and `DeferredCalls` no longer push to their downstream from a producer's thread. A claim that orders a give-back, a finished move and a `defer` or `drain_soon` only enqueue (or set a flag). Delivery happens when a worker serving the source hands items out in `pull` (orders and completions, within the `pull`'s own demand) or pushes them in `request` (within the demand it banked). A `pull` never pushes and never changes the bank. `DeferredCalls::poll` and `Deferral::poll` are removed: `request` evaluates the conditions. A stop-matched order or completion stays at the head of its source and is the first handed out next time, where it used to be re-queued at the tail. The `HOT-FIX` marks S1 and S2 are gone.
@@ -117,6 +186,19 @@ semantics and the tests that pin it.
 - Positional: a write open of a FIFO with no reader, and an open of a regular file refused with `EWOULDBLOCK` (a lease held elsewhere) when the caller did not ask for `O_NONBLOCK`, are retried with growing gaps of 1, 2, 4 ... 64 visits, until they open, are cancelled or pass their limit (both end them at the next visit). There is no signal for "a reader appeared" or "the lease broke", so the wait is the longest gap at most. A lease breaks after `/proc/sys/fs/lease-break-time` seconds (45 by default); a caller with a limit shorter than that gets `LimitPassed`, as a blocking open would not.
 
 **Tests.** `win::tests`: a socket from `socket_for`, an accepted socket and an opened file that reuse a closed value (one that had joined the port) behave as fresh without any call, and so do caller-made ones after `forget` (all fail without it). `uring::tests`: a lone long read moves 12 pieces in one reap and two share 4 each; a FIFO open with no reader makes at most 10 attempts in 100 visits and opens once a reader is there; an open of a file leased with `F_SETLEASE` waits and succeeds after `F_UNLCK` (these three fail on the old code); a cancelled operation in the same visit as a long read leaves the read 4 pieces and ends in that visit (fails on the old code, where the read took the whole visit).
+
+## A frame placed again is judged on its owner's policy, not on the picker's mark (`euhedral-core`) (2026-11-19)
+
+**What.** `PlacementPicker::pick` remembers the routing policy and origin the owner had set and, on the next placement of the same header, puts back each one the owner has not written since, before it calls the predicate. `FrameHeader::set_routing_policy` and `set_origin` mark their field as the owner's (any call, whatever the value); the picker writes through private setters that keep its mark. The mark is the owner's policy (one byte), the owner's origin as a CPU index (`u16`) and two flags, in the header's padding: the header stays 64 bytes.
+
+**Why.** The picker marks every frame it places `CacheLocal` with the chosen CPU. A key frame (Completions, AsyncIo, Moves) is pushed again with its header kept, so it arrived already `CacheLocal` and a predicate such as `policy == CacheLocal` sent it to set A on its second push, behind a long call. A pooled frame had the same fault: `FrameFactory::replace` stamps its own origin and leaves the policy.
+
+**How to use.** Nothing to change. The predicate's contract is on `PlacementPicker::new`: it sees the frame as its owner left it, on a first and on every later placement.
+
+**Semantics.** A field the owner wrote after a placement (even with the value the picker wrote) is judged as written; a field it did not write is restored. `FrameFactory::replace` and `create` write the origin through the public setter, so a recycled frame is judged on the factory's origin and the owner's policy. A frame that cannot be placed on a later push keeps the owner's fields. An owner origin that is not one of the picker's topology CPUs cannot be given back, so a later placement sees the picker's origin in its place.
+
+**Tests.** `an_untouched_frame_pushed_again_stays_out_of_the_set_for_long_calls`, `an_owner_policy_survives_a_placement_and_the_origin_comes_back_too` and `a_recycled_frame_is_judged_on_the_policy_its_owner_left` (each fails on the code without the restore). `an_owner_that_marks_a_placed_frame_as_long_sends_it_to_set_a` and `the_header_does_not_grow` (64 bytes) are guards: they pass on the old code and pin the owner's own re-mark and the header size.
+
 
 ## A panic in `AsyncIo`'s completion and refusal paths neither stalls a ring nor skews the counts (`euhedral-io`) (2026-11-19)
 

@@ -8,6 +8,8 @@
     reason = "test threads stand in for workers"
 )]
 
+pub mod skip;
+
 use std::convert::Infallible;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};

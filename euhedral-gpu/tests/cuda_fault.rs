@@ -10,6 +10,9 @@
     reason = "the test thread is not a lattice worker: it polls and sleeps"
 )]
 
+#[path = "common/skip.rs"]
+mod skip;
+
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -47,7 +50,7 @@ fn wait_until(limit: Duration, mut condition: impl FnMut() -> bool) -> bool {
 #[test]
 fn a_device_fault_surfaces_through_confirm_retired_and_poisons_the_device() {
     let Ok(gpu) = CudaGpu::open(0) else {
-        eprintln!("no CUDA device: skipped");
+        skip::skip(format_args!("no CUDA device: skipped"));
         return;
     };
     let module = if gpu.driver_version() >= 13010 {
@@ -56,7 +59,7 @@ fn a_device_fault_surfaces_through_confirm_retired_and_poisons_the_device() {
         CudaModule::from_source(&gpu, OPS, &CompileOptions::default())
     };
     let Ok(module) = module else {
-        eprintln!("no way to load the test kernels: skipped");
+        skip::skip(format_args!("no way to load the test kernels: skipped"));
         return;
     };
     let (spin, poke) = (

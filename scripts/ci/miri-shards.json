@@ -33,6 +33,14 @@
   "canary": true
  },
  {
+  "name": "hardware-utils: monitor dispatcher",
+  "crate": "euhedral-hardware-utils",
+  "seeds": 4,
+  "commands": [
+   "cargo miri test -p euhedral-hardware-utils --lib -- monitor::dispatcher"
+  ]
+ },
+ {
   "name": "core: single-threaded (1)",
   "crate": "euhedral-core",
   "seeds": 1,
@@ -86,7 +94,7 @@
   "seeds": 16,
   "commands": [
    "cargo miri test -p euhedral-core --lib -- --exact ingest::single_use::tests::a_frame_is_delivered_or_cancelled_exactly_once ingest::single_use::tests::a_pull_that_stops_gives_the_frame_back_and_a_racing_complete_still_cancels_it",
-   "cargo miri test -p euhedral-core --lib -- --exact metrics::histogram::tests::a_reader_alongside_an_owner_sees_a_consistent_prefix flow_control::placement::tests::a_policy_set_before_the_threads_start_runs_on_every_thread_with_the_published_cpus flow_control::views::tests::a_thread_that_exits_withdraws_its_mailbox flow_control::views::tests::readers_see_every_generation_in_order_and_each_is_dropped_once"
+   "cargo miri test -p euhedral-core --lib -- --exact metrics::flow::tests::a_read_during_a_publish_returns_nothing_not_a_mix metrics::histogram::tests::a_reader_alongside_an_owner_sees_a_consistent_prefix flow_control::placement::tests::a_policy_set_before_the_threads_start_runs_on_every_thread_with_the_published_cpus flow_control::views::tests::a_thread_that_exits_withdraws_its_mailbox flow_control::views::tests::readers_see_every_generation_in_order_and_each_is_dropped_once"
   ]
  },
  {
