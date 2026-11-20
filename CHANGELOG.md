@@ -3,6 +3,33 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## Give-back orders, move completions and deferred calls reach the lattice at the next worker `request` (`euhedral-memory`) (2026-11-19)
+
+**What.** `GiveBacks`, `Moves` and `DeferredCalls` no longer push to their downstream from a producer's thread. A claim that orders a give-back, a finished move and a `defer` or `drain_soon` only enqueue (or set a flag). Delivery happens when a worker serving the source hands items out in `pull` (orders and completions, within the `pull`'s own demand) or pushes them in `request` (within the demand it banked). A `pull` never pushes and never changes the bank. `DeferredCalls::poll` and `Deferral::poll` are removed: `request` evaluates the conditions. A stop-matched order or completion stays at the head of its source and is the first handed out next time, where it used to be re-queued at the tail. The `HOT-FIX` marks S1 and S2 are gone.
+
+**Why.** A push outside `request` ran a source's hand-out on arbitrary threads: two emitters could push more than the demand, and the re-queue at the tail reordered one owner's orders.
+
+**How to use.** Nothing changes for the callers of `claim_or_reclaim`, `Mover` or `Deferral::defer`. `Deferral::poll` is gone: nothing but a worker's visit to the source delivers. The receiver of a source must be a vertex of the lattice whose workers visit the source: a receiver that requests once (such as an executor terminal's `add_upstream`, which calls `request(u64::MAX)` once) and is never visited again never gets a later call, so for `DeferredCalls` frees never drain and `drain_soon` and the bounds do nothing. Latency: an order, a completion or a drain frame waits for the next visit of a worker to the source (an idle worker asks again on every cycle), not for the next instruction of the thread that produced it. A lattice with no running worker delivers nothing. `DeferredCalls::drain` and the out-of-memory retry's direct paths are unchanged, so `drain_soon` is for the thread that must not block and `drain`, `run_through` or `reclaim` for the one that may.
+
+**Semantics.**
+- The source's plain state (banked demand, the held head) lives in a `SourceCell`; a `request` or `pull` that finds the cell entered returns without effect.
+- `request` banks demand and pushes up to it; `pull` hands out at most its own demand to its consumer, pushes nothing and banks nothing. The pump frame of `Moves` is pushed only by `request`.
+- `Planner::orders_pending` still counts an order the source holds at its head.
+
+**Tests.** `an_order_enqueued_after_demand_was_banked_is_delivered_by_the_next_request`, `a_stop_matched_order_stays_first_for_its_owner`, `a_completion_finished_after_demand_was_banked_is_delivered_by_the_next_request`, `a_stop_matched_completion_stays_first` and `defer_and_drain_soon_from_another_thread_push_nothing_until_a_request` (fail before), `orders_are_pushed_only_within_the_demand_asked_for` and `completions_are_pushed_only_within_the_demand_asked_for` (guards), `a_pull_pushes_nothing_and_leaves_the_banked_demand_to_the_next_request` (orders and completions) and `a_pull_pushes_nothing_even_when_a_frame_is_due` (deferred calls). `orders_are_pushed_only_within_the_demand_asked_for` and `completions_are_pushed_one_request_at_a_time` fail when `request` stops subtracting what it pushed from the bank, and `an_order_a_pull_refused_is_pushed_first_by_the_next_request` and `a_completion_a_pull_refused_is_pushed_first_by_the_next_request` are the refused-first twins; the latter fails when `Moves::request` ignores the held head.
+
+## `Reaper` frees the retired prefix of its queue in order and never waits (`euhedral-memory`) (2026-11-19)
+
+**What.** `Reaper::reap` has one consumer at a time (a `ClaimCell` holds the queue's single consumer). It drops items from the front while their work has retired and stops at the first unretired one, which stays at the front. A `reap` that finds another running returns 0 at once. The per-call keep-`Vec` and the re-offer of unretired items behind newer ones are gone, and so is the `HOT-FIX` marker M1.
+
+**Why.** The old `reap` drained the queue, kept unretired items in a `Vec` (an allocation per call) and offered them back behind newer ones, which reordered the queue.
+
+**How to use.** Nothing changes in the calls. Keep one stream's frees in one `Reaper`. A long free (`cuMemFree`, `cuMemFreeHost`) still runs on the worker that calls `reap`, as service time of that work; attach a `DeferredCalls` (`Device::attach_deferral`) to keep frees off busy moments.
+
+**Semantics.** Behaviour change: a retired item behind an unretired one now waits for it (head-of-line) instead of being freed first and the unretired one moved to the back. An item whose work never retires (a marker of another queue, or of a queue that faulted and never reaches it) now holds every item behind it until `reap_all` or the drop of the `Reaper`; before, only that one item stayed queued. Items are freed in push order. Producers push from any thread.
+
+**Tests.** `reap_frees_the_retired_prefix_and_allocates_nothing` and `an_unretired_head_is_kept_at_the_front` (fail before), `a_reap_from_inside_a_reap_returns_at_once` (a guard) and `a_panicking_free_releases_the_claim`.
+
 ## A quantum retires on a lane it used (`euhedral-graph`) (2026-11-19)
 
 **What.** A `StageGraph` quantum arms its retirement on a lane it used, not always on its run's home lane. With one lane used, that lane; with several, its home lane when it is one of them, else the lowest of them that has control. The other lanes it used join that lane first, as before.
