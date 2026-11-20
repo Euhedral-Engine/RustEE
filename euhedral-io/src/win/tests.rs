@@ -2211,7 +2211,8 @@ fn a_ring_that_breaks_while_a_slot_is_being_made_ends_what_is_in_flight() {
 #[should_panic(expected = "two polls are inside one engine")]
 fn a_poll_inside_a_poll_is_refused_in_debug() {
     let h = Harness::new();
-    // SAFETY: deliberately not: this is the second entry the check must refuse.
+    // SAFETY: no poll runs in this test.
     let _first = unsafe { h.engine.poller.enter() };
+    // SAFETY: deliberately not sound: this is the second entry the debug check must refuse.
     let _second = unsafe { h.engine.poller.enter() };
 }
