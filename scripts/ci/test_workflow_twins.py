@@ -45,6 +45,13 @@ CHANGES_OUTPUT = re.compile(r"needs\.changes\.outputs\.(\w+)")
 CALLS = {"windows": "euhedral/ci/.gitea/workflows/bazel-windows.yml@refs/tags/v5"}
 APP_SECRETS = ["GH_APP_ID", "GH_APP_INSTALLATION_ID", "GH_APP_PRIVATE_KEY_B64"]
 BAZEL_WINDOWS = "bazel test //... --config=ci --platforms=@euhedral_build//platforms:windows_x86_64"
+SHORT_PATHS = """{
+  echo "startup --output_base=C:/b"
+  echo "common --experimental_platform_in_output_dir"
+  echo "common --experimental_override_platform_cpu_name=@euhedral_build//platforms:windows_x86_64=w"
+  echo "common --compilation_mode=dbg"
+} > user.bazelrc
+"""
 
 
 def steps(doc, job):
@@ -344,10 +351,10 @@ class Gitea(unittest.TestCase):
         self.assertEqual(job["needs"], "changes")
         self.assertEqual(job["if"], "needs.changes.outputs.any == 'true' && inputs.only_os != 'ubuntu-latest'")
         self.assertEqual(job["defaults"], {"run": {"shell": "bash"}})
-        # The output base is short so that link.exe can open the doc tests' inputs (it takes no path over 260 characters).
+        # The output paths are short so that link.exe can open the doc tests' inputs (it takes no path of 260 characters).
         self.assertEqual(steps(GITHUB, "bazel-windows")[1:], [
             step(GITHUB, "bazel", "Bazel is the version in .bazelversion (github)"),
-            {"name": "A short output base (github)", "run": 'echo "startup --output_base=C:/b" > user.bazelrc'},
+            {"name": "Short output paths (github)", "run": SHORT_PATHS},
             {"name": "Bazel test on the Windows platform", "env": {"MSYS_NO_PATHCONV": "1"}, "run": BAZEL_WINDOWS},
             {"name": "Stop the Bazel server", "if": "always()", "run": "bazel shutdown"},
         ])
