@@ -2,9 +2,10 @@
 //!
 //! A [`Station`] is the part of a [`LatticeSource`] that every such source repeats. Anything may push an event
 //! into its inbox (an MPSC queue) from any thread and returns at once: the frame an I/O continuation returns
-//! (see [`Post`]), a `Responder`, the stop. The source's `request`, which only a worker calls, pushes the station's one *key frame* to the lattice
-//! while the inbox holds something and the key is home. The key's `execute` drains the inbox and hands each event
-//! to the owner's [`Drive::run`]; its `recycle` sends it home. So **at most one worker is ever inside an owner's
+//! (see [`Post`]), a `Responder`, the stop. The source's `request`, which only a worker calls, pushes the
+//! station's one *key frame* to the lattice while the inbox holds something and the key is home. The key's
+//! `execute` drains the inbox and hands each event to the owner's [`Drive::run`]; its `recycle` sends it home.
+//! So **at most one worker is ever inside an owner's
 //! `run`**, the owner's state can be plain (a `SourceCell` that only `run` enters), and two owners are two sources
 //! that run in parallel. This is how `AsyncIo` is built (`euhedral-io`, `ReapFrame` and its `key`), and the
 //! rules in the `LatticeSource` documentation hold: `pull` hands out nothing, the key leaves only through

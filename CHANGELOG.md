@@ -3,6 +3,20 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## The listener stops re-arming its retry when the caller completed the timers early (`euhedral-net`) (2026-11-24)
+
+**What.** When an accept fails and the server's `timers` were completed before the server was stopped, the listener no longer schedules the retry: it treats the accept as ended. The retry frame the timers cancel still posts its event (a frame dropped unrun delivers it, as for every operation's frame); that event no longer arms anything.
+
+**Why.** Completing `timers` early is a misuse, but it made the retry frame cancel at once, post `Retry`, fail the accept again and schedule another retry, and the listener's key, which runs events until its inbox is empty, never returned: a worker spun.
+
+**How to use.** Complete `timers` only after the server is stopped. A server whose timers are complete while it runs begins its stop at the next failed accept: the listener closes, its stop completes, a later stop is reported at once, and no later event arms an accept.
+
+**Semantics.**
+- `accept_failed` counts the error and, when the timers are complete, begins the stop (as a lost lattice does) instead of setting `retrying` or posting a frame.
+- The dropped-frame delivery of the I/O operations' frames is unchanged.
+
+**Tests.** `timers_completed_early_end_the_listener_at_a_failed_accept` (`euhedral-net/src/server.rs`; on the old code it fails in release with "the listener kept re-arming the retry", and in debug at the `debug_assert` in `Completions` (`euhedral-graph/src/completions.rs`) that refuses a completion registered after `complete`; it also fails there without a Stop, as the listener is left unfinished). The hand-driven server tests now fail with "the accept's frame was never handed out" instead of spinning.
+
 ## Device tests run under Bazel and fail when they skip (build) (2026-11-24)
 
 **What.** `bazel test --config=gpu //...` runs every `gpu`-tagged target against the card. `--config=gpu` selects only the `gpu` targets, passes `EUHEDRAL_NVRTC`, `CUDA_HOME`, `CUDA_PATH` and `LD_LIBRARY_PATH` through, sets `EUHEDRAL_DEVICE_REQUIRED=1` and passes `--nocapture` to the tests. Both `skip` helpers (`euhedral-gpu/tests/common/skip.rs`, `euhedral-memory/tests/cuda.rs`) panic when `EUHEDRAL_DEVICE_REQUIRED` is set. Four silent early exits in `euhedral-gpu/tests/cuda.rs` now say they skipped: a driver older than 13.1 in `missing_kernels_are_not_found` and `arguments_that_do_not_fit_are_refused_before_launch`, and both halves of `axpb_from_source_and_from_ptx_match_the_cpu_bit_for_bit` (NVRTC missing, driver older than 13.1).
