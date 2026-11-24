@@ -3,6 +3,18 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## The crate lock docs and checks say what is enforced (build) (2026-11-24)
+
+**What.** `MODULE.bazel`, `.bazelrc` and `docs/design/bazel.md` no longer say a stale `cargo-bazel-lock.json` fails every Bazel command: with `lockfile` set, rules_rust treats the `crate` extension as reproducible and leaves it out of `MODULE.bazel.lock`, so a local Bazel build does not notice a stale crate lock. bazel-gen's stale test now compares every `Cargo.lock` package that is not a workspace member with the crates of `cargo-bazel-lock.json` (it compared registry packages only, so a git, sparse or out-of-workspace path dependency could never match). The CI step "The crate lock is current" also compares `Cargo.lock`, which a repin can rewrite. The consumer section says rules_rust takes the Rust toolchain from the root module only; stale text about SHA-256 and the lock check is fixed.
+
+**Why.** A stated guarantee that nothing enforces misleads: the checks that hold are the CI step (feature and requirement changes included) and the stale test (packages and versions only).
+
+**How to use.** Nothing changes for a developer: after `cargo update` or an edit of a `Cargo.toml` or `MODULE.bazel`, run `CARGO_BAZEL_REPIN=1 bazel mod deps --lockfile_mode=update` and commit the locks (and `Cargo.lock` if the repin changed it).
+
+**Semantics.** The stale test's failure message is unchanged; it now names any non-member package either lock lacks. The CI step fails when the repin changes `Cargo.lock` as well as the two lock files. No library source changes.
+
+**Tests.** `a_git_sparse_or_path_package_is_compared_like_a_registry_one` in `tools/bazel-gen` (fails on the registry-only filter); the workflow twins test pins the step text in both workflow files.
+
 ## Two threads' first operations on one Windows handle both succeed (`euhedral-io`) (2026-11-24)
 
 **What.** On Windows, two threads that make the first operation on one handle at the same time no longer refuse one of them with "the handle already belongs to another completion port". The engine records a handle's route (joining the port, on the port, or served by a ring) with one compare-and-set before it makes the system call, and the first claim decides for every thread. A thread that meets a join still in flight cannot tell a handle that is ours from another port's (the OS refuses both with the same error), and does not wait: its operation is accepted and held, and the next poll launches it once the join succeeded, or ends it with the refusal if the handle belongs to another port. A file for which one thread took a ring route and another, with no ring, was about to join the port is likewise decided once: the thread without a ring has its operation taken and ended with the ring-served error.

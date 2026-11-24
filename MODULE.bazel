@@ -39,9 +39,11 @@ use_repo(rust_host_tools, "rust_host_tools_pinned")
 
 register_toolchains("@rust_toolchains//:all")
 
-# crate_universe reads the workspace's Cargo.toml and Cargo.lock; Cargo owns Cargo.lock (cargo update), Bazel never rewrites it.
-# cargo-bazel-lock.json is crate_universe's own lock, derived from them and checked by digest: a stale one fails every Bazel
-# command. After `cargo update` or any Cargo.toml edit, one command refreshes it and MODULE.bazel.lock:
+# crate_universe reads the workspace's Cargo.toml and Cargo.lock; Cargo owns Cargo.lock (cargo update); the repin below can rewrite it, and CI fails if it does.
+# cargo-bazel-lock.json is crate_universe's own lock, derived from them. A local Bazel build does not notice a stale one (with
+# `lockfile` set, rules_rust treats the extension as reproducible and keeps it out of MODULE.bazel.lock); the CI step "The crate
+# lock is current" and the stale test of tools/bazel-gen (packages and versions only) do. After `cargo update` or any
+# Cargo.toml edit, one command refreshes it, MODULE.bazel.lock and Cargo.lock:
 #   CARGO_BAZEL_REPIN=1 bazel mod deps --lockfile_mode=update
 crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
 crate.from_cargo(

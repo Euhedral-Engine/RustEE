@@ -1,4 +1,4 @@
-# Bazel reads these on every platform, and the module lock records the hashes of Cargo.toml and Cargo.lock: LF everywhere.
+# Bazel and CI's crate lock check read these byte for byte on every platform: LF everywhere.
 *.bazel text eol=lf
 *.bzl text eol=lf
 *.bazelrc text eol=lf

@@ -1,8 +1,10 @@
 # Project flags only (forge build/CONTRACTS.md C3); cache paths are the machine layer's.
 common --enable_platform_specific_config
 
-# The lock of the module is checked, not re-resolved: a change to MODULE.bazel or to any Cargo.toml or Cargo.lock fails every
-# Bazel command until `CARGO_BAZEL_REPIN=1 bazel mod deps --lockfile_mode=update` is run and MODULE.bazel.lock (and cargo-bazel-lock.json) committed.
+# MODULE.bazel.lock is checked, not re-resolved: a change to MODULE.bazel fails every Bazel command until
+# `CARGO_BAZEL_REPIN=1 bazel mod deps --lockfile_mode=update` is run and the lock committed. This does not cover the crates:
+# a change to a member's Cargo.toml or to Cargo.lock builds without a word; the CI step "The crate lock is current" catches a stale
+# cargo-bazel-lock.json, and the stale test of tools/bazel-gen a stale package set.
 common --lockfile_mode=error
 
 # Windows has no symlinks without developer mode; tests and tools find their data through runfiles directories.
