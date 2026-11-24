@@ -4,6 +4,7 @@ self-hosted-runner:
   labels:
     - arbiter-docker
     - arbiter-docker-unconfined
+    - arbiter-docker-bazel
     - arbiter-gpu
 
 # Gitea's artifact backend takes the v3 actions, which actionlint flags as too old for GitHub. Only this message, only in

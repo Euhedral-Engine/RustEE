@@ -23,7 +23,7 @@
 name: ci
 
 # A manual run takes optional inputs, which a caller that is not GitHub (a pipeline elsewhere that runs the parts GitHub
-# is needed for) uses to select what runs: `only_os` limits the workspace job to one runner and skips Miri,
+# is needed for) uses to select what runs: `only_os` limits the workspace job to one runner and skips Miri and Bazel,
 # `base_ref` selects the affected crates against that branch as a pull request does (empty:
 # everything), and `proxy_id` is an identifier shown in the name of the run, so the caller can find the run it started.
 on:
@@ -341,10 +341,46 @@ jobs:
       - name: Miri
         run: bash -ex -c "$COMMANDS"
 
+  # `bazel test //... --config=ci` on Linux (the stale test of the BUILD files included), the twin of Gitea's `bazel` job.
+  # The runner image's `bazel` is Bazelisk, which runs the version in .bazelversion (checked first); `euhedral_build`
+  # resolves from the vendored copy, the rest from the BCR. Not on a run limited to one OS.
+  bazel:
+    needs: changes
+    if: needs.changes.outputs.any == 'true' && (!inputs.only_os || inputs.only_os == 'all')
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bazel is the version in .bazelversion (github)
+        run: |
+          have=$(bazel --version)
+          test "$have" = "bazel $(cat .bazelversion)" || { echo "bazel is '$have', .bazelversion says $(cat .bazelversion)"; exit 1; }
+
+      - name: Bazel test
+        run: bazel test //... --config=ci
+
+      # forge's C7, the query of build/scripts/check-repo.sh (the `check-repo` job skips it): every target tagged gpu is also
+      # tagged external, so no configuration caches a device result. A failed query fails the step.
+      - name: Every gpu target is also external (C7)
+        run: |
+          untagged=$(bazel query 'attr(tags, "(\[|, )gpu(,|\])", //...) except attr(tags, "(\[|, )external(,|\])", //...)')
+          if [ -n "$untagged" ]; then
+            printf 'tagged gpu but not external:\n%s\n' "$untagged"
+            exit 1
+          fi
+
+      - name: Stop the Bazel server
+        if: always()
+        run: bazel shutdown
+
   # Always runs, and fails only if a job failed or was cancelled: a job skipped because no crate it covers
   # was affected counts as success. This is the one check to require on a branch.
   ci-ok:
-    needs: [changes, workspace, miri-build, miri]
+    needs: [changes, workspace, bazel, miri-build, miri]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5

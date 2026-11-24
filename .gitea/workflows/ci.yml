@@ -1,7 +1,7 @@
 # The pipeline on Gitea's runners: the twin of .github/workflows/ci.yml (scripts/ci/test_workflow_twins.py pins the two
 # together). The steps shared with it are identical; a step whose name ends in `(gitea)` exists only here, and one that
 # ends in `(github)` only there. What this file has and the GitHub one lacks: the `device` job (the machine's card), the
-# `windows` job (GitHub's runner builds and tests Windows, through the proxy action of euhedral/ci), and a run on a push
+# `check-repo` job (forge's conformance check, fetched from forge's main), the `windows` job (GitHub's runner builds and tests Windows, through the proxy action of euhedral/ci), and a run on a push
 # to main. What the GitHub one has and this lacks: the Windows matrix leg, rust-cache, and the manual run's `only_os`.
 #
 # `changes` runs scripts/ci/affected.py and publishes the affected crates; every other job is gated on its outputs, so a
@@ -11,8 +11,9 @@
 #
 # Labels (the runners' contract): `arbiter-docker` is a container job under the arbiter; `arbiter-docker-unconfined` is
 # the same with seccomp unconfined, which io_uring (euhedral-io) needs; `arbiter-gpu` is the same with the card attached
-# (the device nodes, the driver libraries and NVRTC come from that runner's configuration, not from this file). The
-# lease of a job is its `ARBITER_ARGS` and `ARBITER_EST` (seconds, at most 600). A docker job sets no `timeout-minutes`:
+# (the device nodes, the driver libraries and NVRTC come from that runner's configuration, not from this file);
+# `arbiter-docker-bazel` runs Bazel 9.3.3 with a CI-only Bazel store, gets the commit at /checkout and no token or
+# secret (the runner enforces all three). The lease of a job is its `ARBITER_ARGS` and `ARBITER_EST` (seconds, at most 600). A docker job sets no `timeout-minutes`:
 # the runner holds it to its lease.
 name: ci
 
@@ -392,6 +393,104 @@ jobs:
       - name: Miri
         run: bash -ex -c "$COMMANDS"
 
+  # forge's conformance check of the build contracts (build/CONTRACTS.md), from forge's main, never from this checkout: the
+  # code under test does not supply its own checker. The bazel label's jobs get no token, so this job, which has one,
+  # fetches forge and runs every check but C7 (the gpu/external tags need Bazel); the `bazel` job runs C7. A fetch that
+  # fails fails the job: there is no fallback to a copy in this repository.
+  check-repo:
+    needs: changes
+    if: needs.changes.outputs.any == 'true'
+    runs-on: arbiter-docker
+    defaults:
+      run:
+        shell: bash
+    env:
+      ARBITER_ARGS: "--threads 1 --mem 1G"
+      ARBITER_EST: "60"
+    steps:
+      # The token stays out of the clone's configuration; nothing after this step reads it from there.
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # Outside the workspace, so the checked tree is this repository's alone. The job's own token reaches git for this
+      # one command as a header, as in the `windows` job: not written to any git configuration, not printed, no redirect
+      # followed. Every step that runs forge's code or holds the token takes its tools from the image's system
+      # directories only: /cache comes first on the image's PATH and an earlier pull request's job can write it.
+      - name: Fetch forge's main (gitea)
+        env:
+          FORGE_URL: ${{ vars.FORGE_URL }}
+          FORGE_TOKEN: ${{ github.token }}
+          PATH: /usr/bin:/bin
+        run: |
+          test -n "$FORGE_URL" || { echo "the variable FORGE_URL is unset"; exit 1; }
+          auth=$(printf 'x-access-token:%s' "$FORGE_TOKEN" | base64 -w0)
+          rm -rf "$RUNNER_TEMP/forge"
+          git init -q "$RUNNER_TEMP/forge"
+          # main by its full ref: a tag named main would win a plain name.
+          GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0="http.$FORGE_URL/.extraHeader" GIT_CONFIG_VALUE_0="Authorization: Basic $auth" \
+            GIT_CONFIG_KEY_1=http.followRedirects GIT_CONFIG_VALUE_1=false \
+            git -C "$RUNNER_TEMP/forge" fetch -q --depth 1 "$FORGE_URL/euhedral/forge.git" refs/heads/main
+          git -C "$RUNNER_TEMP/forge" checkout -q --detach FETCH_HEAD
+          test -f "$RUNNER_TEMP/forge/build/scripts/check-repo.sh" || { echo "forge's main has no repo check script"; exit 1; }
+          echo "forge main at $(git -C "$RUNNER_TEMP/forge" rev-parse HEAD)"
+
+      # The `bazel` job runs C7 from its own copy of the query, so forge's script must still build exactly that query: these
+      # are its two lines that do (the tag pattern and the query; test_workflow_twins.py checks that they render to the
+      # `bazel` job's query). When forge changes C7, this fails until both are updated.
+      - name: forge's C7 is the query the bazel job runs (gitea)
+        env:
+          PATH: /usr/bin:/bin
+        run: |
+          while IFS= read -r line; do
+            grep -qF -- "$line" "$RUNNER_TEMP/forge/build/scripts/check-repo.sh" || { printf "forge's C7 no longer has: %s\n" "$line"; exit 1; }
+          done <<'C7'
+          tag() { printf '(\\[|, )%s(,|\\])' "$1"; }
+          query "attr(tags, \"$(tag gpu)\", //...) except attr(tags, \"$(tag external)\", //...)"
+          C7
+
+      - name: forge's repo check, C7 aside (gitea)
+        env:
+          PATH: /usr/bin:/bin
+        run: bash "$RUNNER_TEMP/forge/build/scripts/check-repo.sh" --skip-c7 .
+
+  # `bazel test //... --config=ci` (the stale test of the BUILD files included) on the bazel label: Bazel 9.3.3 from the
+  # image, the CI-only Bazel store at /bazel and the container rc at /etc/bazel.bazelrc. The runner checks the commit out
+  # and binds it read-only at /checkout; the job gets no token and no secret (enforced by the runner), so it copies the
+  # tree instead of running actions/checkout. The rc's `--local_resources=memory=5734` is 70 % of an 8G lease: a lease of
+  # another size passes its own on every Bazel command. The server is shut down last, so the caches are collected and
+  # the lease released.
+  bazel:
+    needs: changes
+    if: needs.changes.outputs.any == 'true'
+    runs-on: arbiter-docker-bazel
+    defaults:
+      run:
+        shell: bash
+    env:
+      ARBITER_ARGS: "--threads 8 --mem 8G"
+      ARBITER_EST: "600"
+    steps:
+      - name: Copy the runner's checkout (gitea)
+        run: cp -a /checkout/. .
+
+      - name: Bazel test
+        run: bazel test //... --config=ci
+
+      # forge's C7, the query of build/scripts/check-repo.sh (the `check-repo` job skips it): every target tagged gpu is also
+      # tagged external, so no configuration caches a device result. A failed query fails the step.
+      - name: Every gpu target is also external (C7)
+        run: |
+          untagged=$(bazel query 'attr(tags, "(\[|, )gpu(,|\])", //...) except attr(tags, "(\[|, )external(,|\])", //...)')
+          if [ -n "$untagged" ]; then
+            printf 'tagged gpu but not external:\n%s\n' "$untagged"
+            exit 1
+          fi
+
+      - name: Stop the Bazel server
+        if: always()
+        run: bazel shutdown
+
   # Windows is built and tested by GitHub's runner: the action pushes the pull request's commit to a temporary branch of
   # the GitHub repository, runs ci.yml there with `only_os=windows-2025`, waits for the result and removes the branch. Pull
   # requests only. The job waits and holds nothing, so it is not under the arbiter. It is the only job that reads a secret:
@@ -448,7 +547,7 @@ jobs:
   # Always runs, and fails only if a job failed or was cancelled: a job skipped because no crate it covers was affected
   # counts as success. This is the one check to require on a branch.
   ci-ok:
-    needs: [changes, workflows, workspace, device, miri-build, miri, windows]
+    needs: [changes, workflows, workspace, check-repo, bazel, device, miri-build, miri, windows]
     if: always()
     runs-on: arbiter-docker
     env:
