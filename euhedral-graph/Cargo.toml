@@ -35,6 +35,17 @@ euhedral-hashing = { path = "../euhedral-hashing" }
 [target.'cfg(loom)'.dependencies]
 loom = "0.7"
 
+# Bazel-only settings, which Cargo ignores (tools/bazel-gen/README.md): the lattice tests start workers on four CPUs
+# (EUHEDRAL_TEST_CPUS, default 0,1,2,3), so Bazel reserves four cores for each.
+[package.metadata.bazel.test.credit_graph]
+cpus = 4
+
+[package.metadata.bazel.test.lane_source_lattice]
+cpus = 4
+
+[package.metadata.bazel.test.lane_source_liveness]
+cpus = 4
+
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
