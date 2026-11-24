@@ -22,8 +22,8 @@ TLS, HTTP/2, chunked request bodies (answered 411), compression, routing and JSO
 
 ## The parser
 
-A parser is a state machine owned by the one consumer that reads a connection (a connection's frames are ordered,
-so it needs no synchronisation). `feed(bytes)` consumes the bytes of the message being read, never more, and
+A parser is a state machine owned by the one consumer that reads a connection (a connection's events run one at a
+time in the station's key, so it needs no synchronisation). `feed(bytes)` consumes the bytes of the message being read, never more, and
 returns how many it used with a `Progress`: `NeedMore`, `HeadComplete` (the headers are in and a body is pending;
 the place to answer `100 Continue`) or `Complete(message)`. The caller keeps the rest of its slice for the next
 call, so pipelined requests are never lost and the parser never buffers beyond its [`Limits`](src/parse.rs). A
