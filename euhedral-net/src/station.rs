@@ -1,8 +1,8 @@
 //! A source of the lattice that is driven by an inbox: the shape of one connection and of the listener.
 //!
 //! A [`Station`] is the part of a [`LatticeSource`] that every such source repeats. Anything may push an event
-//! into its inbox (an MPSC queue) from any thread and returns at once: an I/O continuation, a `Responder`, the
-//! stop. The source's `request`, which only a worker calls, pushes the station's one *key frame* to the lattice
+//! into its inbox (an MPSC queue) from any thread and returns at once: the frame an I/O continuation returns
+//! (see [`Post`]), a `Responder`, the stop. The source's `request`, which only a worker calls, pushes the station's one *key frame* to the lattice
 //! while the inbox holds something and the key is home. The key's `execute` drains the inbox and hands each event
 //! to the owner's [`Drive::run`]; its `recycle` sends it home. So **at most one worker is ever inside an owner's
 //! `run`**, the owner's state can be plain (a `SourceCell` that only `run` enters), and two owners are two sources
@@ -100,6 +100,18 @@ impl<T: Drive> Station<T> {
     pub(crate) fn is_complete(&self) -> bool {
         self.downstream.is_complete()
     }
+
+    /// The next event of the inbox, taken by the test that stands in for the key.
+    #[cfg(test)]
+    pub(crate) fn take_event(&self) -> Option<T::Event> {
+        self.inbox.enter().poll()
+    }
+
+    /// Whether the inbox holds an event.
+    #[cfg(test)]
+    pub(crate) fn has_event(&self) -> bool {
+        !self.producer.is_empty()
+    }
 }
 
 /// The key frame of a station: its `execute` runs the owner's events.
@@ -165,7 +177,10 @@ impl<T: Drive> Drop for Key<T> {
 }
 
 /// A frame that pushes an event into an owner's inbox when it runs: what a timer or an I/O continuation hands the
-/// lattice for an event of a station.
+/// lattice for an event of a station. An I/O continuation posts nothing itself: the owner hears that the
+/// operation ended only when this frame runs, which is after the `AsyncIo` handed it out and stopped counting the
+/// operation as pending. A frame dropped without having run (a lattice that discarded it) posts its event as it
+/// goes, so that the operation's end is never lost.
 pub(crate) struct Post<T: Drive> {
     header: FrameHeader,
     owner: Arc<T>,
@@ -179,6 +194,14 @@ impl<T: Drive> Post<T> {
             owner,
             event: Some(event),
         })
+    }
+}
+
+impl<T: Drive> Drop for Post<T> {
+    fn drop(&mut self) {
+        if let Some(event) = self.event.take() {
+            self.owner.station().post(event);
+        }
     }
 }
 
