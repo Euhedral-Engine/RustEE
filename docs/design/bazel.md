@@ -312,13 +312,16 @@ Rejected:
     `--test_arg=--nocapture`.
   - **Skips fail the run:**
     - A device test that finds no driver, card or NVRTC returns early and reports `ok`.
-    - Every such early return, and every half of a test that a capability check leaves out, goes through one of two
-      helpers (after step 5 fixes three tests in `euhedral-gpu/tests/cuda.rs` that skip without one), which print
-      `DEVICE-TEST-SKIPPED:`:
-      `euhedral-gpu/tests/common/skip.rs` `skip` and `euhedral-memory/tests/cuda.rs` `skip`. The unit tests under
-      `src/cuda` have no silent skip.
-    - `test:gpu --test_env=EUHEDRAL_DEVICE_REQUIRED=1` makes both helpers panic instead, so the test fails where it
-      skipped. `skip_hardware` (the card lacks a feature) stays a listed, non-failing skip.
+    - Every such early return, and every half of a test that a capability check leaves out, goes through a helper
+      (after step 5 fixes three tests in `euhedral-gpu/tests/cuda.rs` that skip without one):
+      - `skip` (`euhedral-gpu/tests/common/skip.rs` and `euhedral-memory/tests/cuda.rs`) prints
+        `DEVICE-TEST-SKIPPED:` when a driver, card or NVRTC is missing;
+      - `skip_hardware` (`euhedral-gpu/tests/common/skip.rs`) prints `DEVICE-TEST-SKIPPED-HARDWARE:` when the card
+        or driver lacks the feature under test. Two of step 5's three fixes go through it.
+
+      The unit tests under `src/cuda` have no silent skip.
+    - `test:gpu --test_env=EUHEDRAL_DEVICE_REQUIRED=1` makes both `skip` helpers panic instead, so the test fails
+      where it skipped. `skip_hardware` stays a listed, non-failing skip.
     - Under Bazel this replaces `scripts/ci/device_check.py`, which reads Cargo's output. Its other check, that every
       `tests/cuda*.rs` binary ran, holds by construction, since every test target is generated. Cargo's device job
       keeps `device_check.py` unchanged.
@@ -438,6 +441,9 @@ merges before it.
      to write if the testing world resolves that feature, so `bazel test //...` never opens the card without a grant;
    - `[package.metadata.bazel]` for `hot_fix_ratchet` and `layering` and the `cpus` of the lattice tests, and the root
      `workspace_sources` filegroup;
+   - in the root `BUILD.bazel`, `exports_files(["Cargo.toml", "Cargo.lock", "MODULE.bazel", "MODULE.bazel.lock",
+     "mise.toml", "rust-toolchain.toml"])`, so the stale and pin tests in `//tools/bazel-gen` can name those root
+     files in their `data`;
    - the root README's line on regenerating.
 
    The pull request carries the one-time proofs:
@@ -446,9 +452,17 @@ merges before it.
 
    *Done:*
    - `bazel build //...` and `bazel test //...` pass on Linux;
-   - `bazel query 'kind(test, rdeps(//..., //euhedral-memory:euhedral_memory_cuda_testing)) except attr(tags, gpu, //...)'`
-     is empty: no test that links the cuda build of `euhedral-memory` lacks the tag. Listing only the tagged tests
-     would not show an untagged one;
+   - this query is empty:
+
+     ```
+     bazel query 'kind(test, rdeps(//..., attr(crate_features, "\bcuda\b", kind(rust_library, //...))))
+       except (attr(tags, "\bgpu\b", //...) intersect attr(tags, "\bexternal\b", //...))'
+     ```
+
+     It selects every test that links any library built with `cuda` in its `crate_features` (the generator writes
+     the feature there on every cuda-world target), whatever the target is named, and lists those lacking either
+     tag. It does not rely on the refusal rule or on a target name. Listing only the tagged tests would not show an
+     untagged one;
    - the counts are equal;
    - check-repo passes C6;
    - Cargo commands are unchanged.
