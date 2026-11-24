@@ -425,11 +425,16 @@ impl Shared {
         if ls.stopping || ls.retrying {
             return;
         }
-        // Timers the caller completed early run no frame, but a cancelled retry frame still posts its event, which
-        // would fail the accept and arm the retry again without end: the accept is then ended for good.
-        let Some(timers) = ls.timers.as_ref().filter(|timers| !timers.is_complete()) else {
+        let Some(timers) = ls.timers.as_ref() else {
             return;
         };
+        if timers.is_complete() {
+            // Timers completed before the stop run no frame, and a cancelled retry frame still posts its event, which
+            // would fail the accept and arm the retry again without end. No retry can come, so the server ends as
+            // a stop does: the socket closes and the stop is reported, and no later event arms an accept.
+            self.begin_stop(ls);
+            return;
+        }
         ls.retrying = true;
         let frame = Post::new(self.clone(), ListenerEvent::Retry);
         timers.at(Instant::now() + self.config.accept_backoff, frame);
@@ -582,7 +587,8 @@ impl ServerHandle {
 /// Starts serving: takes `listener` (a bound, listening socket), accepts connections on `io` and answers
 /// their requests with `handler`. Work runs as frames offered to `sink`, which `lattice` drains; `io` must be
 /// attached to the lattice too (its continuations are frames), and so must `timers`, a [`Completions`] the server
-/// uses for the back-off after a failed accept (the lattice's own timer: the server keeps none).
+/// uses for the back-off after a failed accept (the lattice's own timer: the server keeps none). Complete `timers` only after the server's stop: timers that
+/// are complete while the server runs end it at the next failed accept, as a stop does.
 ///
 /// The listener, and each connection when it is accepted, becomes a source of `lattice`. The server holds the
 /// lattice and `io` weakly: the caller keeps them alive while the server runs, and stops the server before it drops
@@ -802,10 +808,10 @@ mod tests {
         assert!(hand.finished(), "the stop is reported after the drop");
     }
 
-    /// Timers the caller completed early cancel the retry frame, which still posts its event. With an accept that
-    /// fails at once, the listener must not arm the retry again: the events run end, and the stop is reported.
+    /// Timers completed with no stop sent end the listener at the first failed accept: its socket is closed, the
+    /// stop is reported, and a later event arms no accept.
     #[test]
-    fn timers_completed_early_do_not_keep_the_listener_retrying() {
+    fn timers_completed_early_end_the_listener_at_a_failed_accept() {
         let io = AsyncIo::open().unwrap();
         let timers = Completions::without_lanes();
         let shared = new_shared(
@@ -827,12 +833,17 @@ mod tests {
             assert!(run <= 100, "the listener kept re-arming the retry");
             shared.run_event(event);
         }
-        shared.post_listener(ListenerEvent::Stop(no_work()));
+        {
+            let ls = shared.listener.enter();
+            assert!(ls.finished, "the failed accept did not end the listener");
+            assert!(ls.listener.is_none(), "the socket was left open");
+        }
+        shared.post_listener(ListenerEvent::Closed(0));
         while let Some(event) = shared.station.take_event() {
-            run += 1;
-            assert!(run <= 100, "the listener kept re-arming the retry");
             shared.run_event(event);
         }
-        assert!(shared.listener.enter().finished, "the stop is reported");
+        let ls = shared.listener.enter();
+        assert!(ls.accepting.is_none(), "a later event armed an accept");
+        assert!(!ls.retrying, "a later event armed a retry");
     }
 }
