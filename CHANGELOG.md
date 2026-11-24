@@ -15,6 +15,18 @@ semantics and the tests that pin it.
 
 **Tests.** The new step fails on the old tree (15 errors in `euhedral-gpu`) and passes now; the existing clippy and test steps cover every feature combination.
 
+## The Rust toolchain is pinned in `rust-toolchain.toml` (build) (2026-11-24)
+
+**What.** `rust-toolchain.toml` names the toolchain `mise.toml` already pins (1.99.1, profile default). A new workspace member, `tools/bazel-gen` (`euhedral-bazel-gen`, not published), holds a test that compares the two pins.
+
+**Why.** Plain `cargo` outside `mise` now picks the same compiler, and the Bazel build that follows needs one pin file it can read.
+
+**How to use.** Change the version in both files together; the test names the one that differs.
+
+**Semantics.** No library code changed. Miri and the other jobs that set `RUSTUP_TOOLCHAIN` keep their own toolchain.
+
+**Tests.** `tools/bazel-gen/tests/toolchain_pin.rs`.
+
 ## The GitLab pipeline is removed (CI) (2026-11-20)
 
 **What.** `.gitlab-ci.yml`, its generator `scripts/ci/gitlab_pipeline.py` and that script's test are gone. CI is the Gitea workflow (`.gitea/workflows/ci.yml`) and its twin, the GitHub workflow (`.github/workflows/ci.yml`); the `Test the scripts` step of both no longer runs the removed test. The README's merge request section is now about pull requests.
