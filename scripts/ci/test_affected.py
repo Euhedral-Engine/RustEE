@@ -73,9 +73,11 @@ class Affected(unittest.TestCase):
             self.assertEqual(sorted(crates), sorted(NAMES), f)
             self.assertIn("root build file", A.affected(G, [f])[2], f)  # not merely a file that belongs to no crate
 
-    def test_a_crates_build_file_affects_that_crate_only(self):
-        self.assertEqual(run("euhedral-io/BUILD.bazel"), (["io"], False))
-        self.assertEqual(run("euhedral-gpu/BUILD.bazel"), (["gpu"], False))
+    def test_a_crates_build_file_affects_that_crate_and_the_stale_check(self):
+        # A hand edit to a generated file makes it stale: the generator crate's stale test must run.
+        self.assertEqual(run("euhedral-io/BUILD.bazel"), (["bazelgen", "io"], False))
+        self.assertEqual(run("euhedral-gpu/BUILD.bazel"), (["bazelgen", "gpu"], False))
+        self.assertEqual(run("euhedral-gpu/kernels/BUILD.bazel"), (["bazelgen", "gpu"], False))
 
     def test_the_inputs_of_the_stale_check_affect_the_generator_crate(self):
         for f in [
@@ -88,7 +90,7 @@ class Affected(unittest.TestCase):
         self.assertEqual(run("euhedral-io/src/x.rs"), (["bazelgen", "io"], False))
 
     def test_other_files_of_a_crate_do_not_affect_the_generator_crate(self):
-        for f in ["euhedral-gpu/README.md", "euhedral-gpu/BUILD.bazel", "euhedral-gpu/kernels/k.cu", "euhedral-gpu/Cargo.lock"]:
+        for f in ["euhedral-gpu/README.md", "euhedral-gpu/kernels/k.cu", "euhedral-gpu/Cargo.lock"]:
             self.assertNotIn("bazelgen", run(f)[0], f)
 
     def test_the_workflow_runs_the_workspace_jobs_in_full(self):

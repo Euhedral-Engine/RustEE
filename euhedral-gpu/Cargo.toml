@@ -47,6 +47,10 @@ required-features = ["cuda"]
 [target.'cfg(loom)'.dependencies]
 loom = "0.7"
 
+# Bazel-only settings, which Cargo ignores (tools/bazel-gen/README.md): the layering test reads every member's manifest.
+[package.metadata.bazel.test.layering]
+workspace_sources = true
+
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }

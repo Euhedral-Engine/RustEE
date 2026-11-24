@@ -14,3 +14,9 @@ log = "0.4.29"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
+
+# Bazel-only settings, which Cargo ignores (tools/bazel-gen/README.md): the ratchet reads every member's sources and
+# the audit its ids are findings of.
+[package.metadata.bazel.test.hot_fix_ratchet]
+workspace_sources = true
+data = ["//:docs/superpowers/specs/2026-10-28-lock-free-hot-path-audit.md"]

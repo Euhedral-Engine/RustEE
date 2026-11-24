@@ -8,3 +8,18 @@ license = "Apache-2.0"
 publish = false
 
 [dependencies]
+
+# Bazel-only settings of this crate's targets, which Cargo ignores (README, "[package.metadata.bazel]").
+# `bazel run //:gazelle` is this binary; it runs the toolchain's cargo.
+[package.metadata.bazel.bin.euhedral-bazel-gen]
+cargo = true
+root_alias = "gazelle"
+
+# The stale test runs the toolchain's cargo over a copy of every member's manifest and target files.
+[package.metadata.bazel.test.stale]
+cargo = true
+workspace_sources = true
+data = ["//:Cargo.lock", "//:MODULE.bazel.lock"]
+
+[package.metadata.bazel.test.toolchain_pin]
+data = ["//:MODULE.bazel", "//:mise.toml", "//:rust-toolchain.toml"]
