@@ -786,6 +786,10 @@ fn at_the_cap_a_connection_waits_in_the_backlog_until_one_closes() {
     server.finish();
 }
 
+/// The most connects a stop test has open that the server may not have taken: far below the listen backlog (128
+/// for a `TcpListener` of the standard library), so the backlog never fills.
+const STOP_BATCH: usize = 32;
+
 #[test]
 fn a_stopped_server_refuses_new_connections_while_a_request_drains() {
     let (handler, parked) = parking();
@@ -795,46 +799,65 @@ fn a_stopped_server_refuses_new_connections_while_a_request_drains() {
     let (_, reply) = parked.recv_timeout(PATIENCE).unwrap();
     server.begin_stop();
     // The listener is closed once the cancelled accept has ended: a connect is refused from then on. A connect
-    // that lands before that is only in the backlog and is dropped by the server's close.
+    // that lands before that is taken in and closed by the server, or waits in the backlog and is reset by the
+    // listener's close. The connects go in batches far below the listen backlog, and each batch is read to its end
+    // before the next starts, so the backlog never fills: at a full backlog the kernel may drop the last step of a
+    // handshake that the peer already saw complete, and then neither the server (which never had the connection)
+    // nor the close of the listener sends that peer anything.
     let limit = Instant::now() + PATIENCE;
     let never =
         "the listening socket was never closed: new connections are still accepted after the stop";
-    let mut early = Vec::new();
-    loop {
-        let remaining = limit.saturating_duration_since(Instant::now());
-        assert!(!remaining.is_zero(), "{never}");
-        match TcpStream::connect_timeout(&server.addr, remaining) {
-            Ok(stream) => early.push(stream),
-            Err(error) if error.kind() == ErrorKind::TimedOut => panic!("{never}"),
-            // A connect still in flight when the socket closes is reset; the next one is refused.
-            Err(error) if error.kind() == ErrorKind::ConnectionReset => {}
-            Err(error) => {
-                assert_eq!(error.kind(), ErrorKind::ConnectionRefused);
-                break;
+    let mut refused = false;
+    while !refused {
+        let mut batch = Vec::new();
+        while batch.len() < STOP_BATCH {
+            let remaining = limit.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "{never}");
+            match TcpStream::connect_timeout(&server.addr, remaining) {
+                Ok(stream) => batch.push(stream),
+                Err(error) if error.kind() == ErrorKind::TimedOut => panic!("{never}"),
+                // A connect still in flight when the socket closes is reset; the next one is refused.
+                Err(error) if error.kind() == ErrorKind::ConnectionReset => {}
+                Err(error) => {
+                    assert_eq!(error.kind(), ErrorKind::ConnectionRefused);
+                    refused = true;
+                    break;
+                }
             }
+            yield_now();
         }
-        yield_now();
-    }
-    // A refusal alone could come from a full backlog: every connect that got in was closed by the server.
-    for stream in &mut early {
-        let remaining = limit.saturating_duration_since(Instant::now());
-        assert!(
-            !remaining.is_zero(),
-            "a queued connection was never closed by the server"
-        );
-        stream.set_read_timeout(Some(remaining)).unwrap();
-        let mut byte = [0u8; 1];
-        match read_on(stream, &mut byte) {
-            Ok(0) => {}
-            Err(error) if error.kind() == ErrorKind::ConnectionReset => {}
-            other => panic!("a queued connection was not closed by the server: {other:?}"),
+        // A refusal alone could come from a full backlog: every connect that got in was closed.
+        for stream in &mut batch {
+            let remaining = limit.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "a connection that got in before the stop was never closed"
+            );
+            stream.set_read_timeout(Some(remaining)).unwrap();
+            let mut byte = [0u8; 1];
+            match read_on(stream, &mut byte) {
+                Ok(0) => {}
+                Err(error) if error.kind() == ErrorKind::ConnectionReset => {}
+                other => {
+                    let counters = server.handle.counters();
+                    panic!(
+                        "a connection that got in before the stop was neither closed by the server nor reset \
+                         by the listener's close: {other:?} (refused yet: {refused}; server accepted {}, open {}; \
+                         {:?} to {:?})",
+                        counters.accepted,
+                        counters.open,
+                        stream.local_addr(),
+                        stream.peer_addr(),
+                    );
+                }
+            }
         }
     }
     // The request in flight is answered, and its connection closes.
     reply.send(Response::with_status(200));
     assert_eq!(held.read_response(false).status, 200);
     held.expect_closed();
-    drop((held, early));
+    drop(held);
     server
         .stopped
         .recv_timeout(PATIENCE)

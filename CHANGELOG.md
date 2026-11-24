@@ -3,6 +3,21 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## The net stop test keeps its connects below the listen backlog (`euhedral-net`, test) (2026-11-24)
+
+**What.** `a_stopped_server_refuses_new_connections_while_a_request_drains` connects in batches of at most 32 after the stop, and reads every connection of a batch to its end (closed or reset) before it starts the next, until a connect is refused. Its failure message now names the server's `accepted` and `open` counts, whether a refusal was seen, and the connection's addresses. The server is unchanged.
+
+**Why.** The test connected without bound until the listener refused, and under load (every test target at once) the listener closed late enough for the connects to fill the listen backlog (128 for a standard-library `TcpListener`; alone the test makes 5 to 45 connects). At a full backlog Linux drops the last ACK of a handshake that the client already saw complete (`tcp_abort_on_overflow` is 0 by default) and keeps only a request socket; when the listener closes, that request is dropped with nothing sent, so the client's socket stays established with no peer and its read only times out. The server never had that connection, so it cannot close it. One parallel run failed this way after its full 20 s. A scratch run of 32 concurrent connects against a never-accepting listener with backlog 8 left one of ten clients in exactly that state after the close.
+
+**How to use.** Nothing changes for callers. A program that must not leave a client hanging at a stop keeps its listen backlog above the connects that can arrive while the stop closes the listener; that is the kernel's behaviour, not the server's.
+
+**Semantics.**
+- A connection the server accepted before or after the stop is closed by it at once (it carries no request).
+- A connection still in the backlog when the listener closes is reset by the kernel.
+- A handshake the kernel dropped at a full backlog is neither: no socket of the server ever held it.
+
+**Tests.** The test itself; it cannot fail on the old code deterministically, as the drop needs the kernel to process one connect's last ACK after the next connect's SYN at the backlog's edge.
+
 ## The Bazel generator sees harness in a multi-line target array, skips every `target/` and names an unreadable directory (build) (2026-11-24)
 
 **What.** `euhedral-bazel-gen` refuses a `harness` key inside a target array written over several lines (`test = [\n { name = "t", harness = false },\n]`), as it already did on one line. The disk walk for stray BUILD files skips every directory called `target`, not only the root one, and its error for an unreadable directory names the directory. `scripts/ci/affected.py` treats a BUILD or BUILD.bazel file under `docs/` as a BUILD file outside every member (everything), not as documentation.
