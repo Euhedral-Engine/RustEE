@@ -81,12 +81,14 @@ EVERYTHING = [
 ]
 
 # The crate whose test reads every member's manifest and target files to see whether the generated BUILD files are stale
-# (docs/design/bazel.md). It is affected by any member's Cargo.toml and by anything under a member's STALE_INPUT_DIRS or
+# (docs/design/bazel.md). It is affected by any member's Cargo.toml, by anything under a member's STALE_INPUT_DIRS or
 # its build.rs: `git diff --name-only` cannot tell an added file from an edited one, and only an added or removed one can
-# make a BUILD file stale, so every change there counts.
+# make a BUILD file stale, so every change there counts. A BUILD file anywhere in a member is its output: a hand edit to
+# one makes it stale.
 BAZEL_GEN = "euhedral-bazel-gen"
 STALE_INPUT_DIRS = ("src/", "tests/", "examples/", "benches/")
 STALE_INPUT_FILES = ("Cargo.toml", "build.rs")
+BUILD_FILES = ("BUILD.bazel", "BUILD")
 
 # CI files that select less (see the module docstring); they are looked at before EVERYTHING.
 CI_WORKFLOWS = [".github/workflows/ci.yml", ".gitea/workflows/ci.yml"]
@@ -183,7 +185,11 @@ def affected(graph, files, workflow_is_everything=True):
                 continue
             seed.add(crate)
             inside = f[len(graph.dirs[crate]) + 1:]
-            if BAZEL_GEN in graph.dirs and (inside in STALE_INPUT_FILES or inside.startswith(STALE_INPUT_DIRS)):
+            if BAZEL_GEN in graph.dirs and (
+                inside in STALE_INPUT_FILES
+                or inside.startswith(STALE_INPUT_DIRS)
+                or os.path.basename(inside) in BUILD_FILES
+            ):
                 seed.add(BAZEL_GEN)
         elif matches(f, EVERYTHING):
             return set(graph.dirs), True, f"{f} is a root build file"
