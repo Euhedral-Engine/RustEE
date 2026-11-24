@@ -3,6 +3,21 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## The net stop test makes a connection whose server half the kernel lost say so (`euhedral-net`, test) (2026-11-24)
+
+**What.** `a_stopped_server_refuses_new_connections_while_a_request_drains` sends one byte (`G`, the start of a request) on each connection that got in after the stop before it reads it, connects in batches of at most 32, and reads every connection of a batch to its end (closed, reset or aborted) before it starts the next, until a connect is refused. Its failure message names the server's `accepted` and `open` counts, whether a refusal was seen, and the connection's addresses. The server is unchanged.
+
+**Why.** The test failed about once in 200 runs of the whole `server` test binary on a loaded machine (and once under `bazel test //...`): a connection that got in before the listener closed was neither closed nor reset within 20 s. A run caught with the kernel's socket table at the failure showed the client's socket established and no socket at all on the server's side for that pair of ports: not held by the process, not in the accept queue, not a pending handshake. The server had accepted only the connection with the request in flight. So the kernel lost the server half of a handshake it was completing as the listener closed, sent the client nothing, and a client that sends nothing never learns. The server never had that connection and cannot close it. The same happens at a full listen backlog (128 for a standard-library `TcpListener`), where Linux drops the last ACK of a handshake the client saw complete (`tcp_abort_on_overflow` is 0): a scratch run with backlog 8 and 32 concurrent connects left one client in that state after the close. A byte sent on such a connection is answered with a reset, since no socket owns its ports; on a connection the server holds it is the start of a request, which the stop must close as it closes an idle connection, so a server that kept either open still fails the test.
+
+**How to use.** Nothing changes for callers. A client of a stopping server that sends nothing may not learn that a connection racing the close is gone; that is the kernel's behaviour, not the server's.
+
+**Semantics.**
+- A connection the server accepted before or after the stop is closed by it at once (it carries no request).
+- A connection in the backlog when the listener closes is reset by the kernel.
+- A handshake the kernel was completing as the listener closed (or dropped at a full backlog) has no server socket; its client hears of it only when it sends.
+
+**Tests.** The test itself. It cannot fail on the old code on demand: the loss needs the client's last ACK to meet the listener's close. Counted runs of the whole binary: old test 1 failure in 200; the batches alone 1 in 200 (the case above); with the byte, no failure in about 420 runs (stopped there).
+
 ## The Bazel generator sees harness in a multi-line target array, skips every `target/` and names an unreadable directory (build) (2026-11-24)
 
 **What.** `euhedral-bazel-gen` refuses a `harness` key inside a target array written over several lines (`test = [\n { name = "t", harness = false },\n]`), as it already did on one line. The disk walk for stray BUILD files skips every directory called `target`, not only the root one, and its error for an unreadable directory names the directory. `scripts/ci/affected.py` treats a BUILD or BUILD.bazel file under `docs/` as a BUILD file outside every member (everything), not as documentation.
