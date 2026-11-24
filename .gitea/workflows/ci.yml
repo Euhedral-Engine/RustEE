@@ -117,6 +117,7 @@ jobs:
         run: |
           mise install shellcheck@0.11.0
           SC="$(mise where shellcheck@0.11.0)/shellcheck-v0.11.0/shellcheck"
+          test -x "$SC" || { echo "shellcheck not found at $SC" >&2; exit 1; }
           mise exec actionlint@1.7.12 -- actionlint -shellcheck "$SC" .github/workflows/*.yml .gitea/workflows/*.yml
 
   workspace:
