@@ -142,22 +142,33 @@ second Cargo workspace uses it.
   `bazel test //...`. It runs `cargo metadata --no-deps --offline` with the cargo in `CARGO` and then the generator in
   check mode:
   - Under Bazel, `CARGO` is the toolchain's cargo (`@rules_rust//rust/toolchain:current_cargo_files` as `data`) and
-    `CARGO_HOME` is under `TEST_TMPDIR`. Its `data` is every `Cargo.toml`, every `BUILD.bazel` and every file that
-    target discovery scans (`src/`, `tests/`, `examples/`, `benches/`, `build.rs`).
+    `CARGO_HOME` is under `TEST_TMPDIR`. Its `data` is every `Cargo.toml`, `Cargo.lock`, `MODULE.bazel.lock` (both
+    read by the lock check below), every `BUILD.bazel` and every file that target discovery scans (`src/`, `tests/`,
+    `examples/`, `benches/`, `build.rs`). Without them in `data` the sandbox has no copy to read.
   - Under `cargo test`, Cargo sets `CARGO` itself, so the same test also fails the Cargo gate on a stale file.
-    `affected.py` marks `euhedral-bazel-gen` affected by any member's `Cargo.toml` and by any added or removed file
-    under a member's `src/`, `tests/`, `examples/` or `benches/` (step 3). That way the Cargo side runs the test on
-    exactly the pull requests that can make BUILD files stale.
+    `affected.py` marks `euhedral-bazel-gen` affected by any member's `Cargo.toml` and by any change at all under a
+    member's `src/`, `tests/`, `examples/` or `benches/` (step 3). Only an added or removed target file can make a
+    BUILD file stale, but `affected.py` cannot tell one from an edit: `changed_files` runs
+    `git diff --name-only --no-renames`, and `--files` takes plain paths. Counting every change there keeps both
+    inputs as they are. The alternative, `--name-status` with a status per path, would change `--files` (its callers
+    pass no status) and every function that takes the file list, to save a test that takes seconds. Over-selecting
+    only runs a cheap test; under-selecting would let a stale file through, so the Cargo side runs the test on every
+    pull request that can make BUILD files stale, and some that cannot.
   - **The module lock:** any edit to a member's `Cargo.toml`, including `[package.metadata.bazel]`, changes the
     sha256 that `MODULE.bazel.lock` records for it, and `--lockfile_mode=error` then fails every Bazel command. The
     stale test also compares the sha256 values that the lock records for `Cargo.toml` and `Cargo.lock` with the files,
     so the Cargo side catches a stale lock too, even before the Bazel CI job exists. The fix is one `bazel mod deps`
     (or any Bazel command without `--lockfile_mode=error`).
+  - **A `MODULE.bazel` edit** (a toolchain bump, a new `crate.annotation`) also makes the lock stale, and the lock
+    records no sha256 of `MODULE.bazel` for the stale test to compare. Nothing on the Cargo side catches it; the Bazel
+    CI job (step 6) is the first to fail. The common case, a toolchain bump, goes through the pin test, so the pin
+    test's failure message says to run `bazel mod deps` after editing `MODULE.bazel`.
 
   Its failure message names the stale files and the command that fixes them. Regenerating is the duty of whoever
   changes a `Cargo.toml` or adds a target file. The root `README.md` says so in one line, and the stale test enforces
   it.
-- **The pin check** (toolchain, below) is a second test of the same crate, so it also runs under both tools.
+- **The pin check** (toolchain, below) is a second test of the same crate, so it also runs under both tools. Its
+  `data` is `rust-toolchain.toml`, `mise.toml` and `MODULE.bazel`.
 - **Line endings:** `.gitattributes` sets `BUILD.bazel`, `*.bzl`, `MODULE.bazel`, `MODULE.bazel.lock`, `Cargo.toml`
   and `Cargo.lock` to `eol=lf`. Otherwise a Windows checkout with CRLF fails the byte comparison of the stale check and
   the lock's sha256 values.
@@ -283,18 +294,27 @@ Rejected:
 | fmt, clippy | no | `cargo fmt`, `cargo clippy -D warnings` | the gate's lint stays one tool |
 | Windows | `bazel test //... --config=ci` on `windows_x86_64` | GitHub Windows job | C8 |
 
-- **GPU (C7):** every cuda-world test is tagged `gpu` and `external` by the generator (step 4). `external` keeps Bazel from caching the result in
-  any configuration: a device result depends on the card and the driver, which are not inputs. `--config=gpu` runs
-  both crates' unit, integration and doc tests with `cuda`, with the testing world's features. That is a superset, in
-  features, of the device job's `cargo test -p <crate> --features cuda` (see Features). The cuda library targets are
-  never `bazel test`ed without the grant.
+- **GPU (C7):** the generator tags `gpu` and `external` every test whose resolved features include
+  `euhedral-memory/cuda`, the feature that loads the driver (step 4). It decides this per test, from the features
+  the test's graph resolves to, not from the world the test was generated in. So a test that reaches `cuda` through any
+  path is tagged.
+  - The generator refuses to write when the testing world resolves `euhedral-memory/cuda`. That would happen if a
+    member's dev-dependency asked for it (say `euhedral-memory = { ..., features = ["cuda"] }`): Cargo would then
+    merge the cuda world into the testing world, and untagged tests would open the card. The testing world is proved
+    equal to `cargo metadata`'s resolve, where the same fact shows as `cuda` in `euhedral-memory`'s `features`.
+  - `external` keeps Bazel from caching the result in any configuration: a device result depends on the card and the
+    driver, which are not inputs.
+  - `--config=gpu` runs both crates' unit, integration and doc tests with `cuda`, with the testing world's features.
+    That is a superset, in features, of the device job's `cargo test -p <crate> --features cuda` (see Features). The
+    cuda library targets are never `bazel test`ed without the grant.
   - The repository's `.bazelrc` passes the CUDA lookup environment through:
     `test:gpu --test_env=EUHEDRAL_NVRTC --test_env=CUDA_HOME --test_env=CUDA_PATH --test_env=LD_LIBRARY_PATH`, plus
     `--test_arg=--nocapture`.
   - **Skips fail the run:**
     - A device test that finds no driver, card or NVRTC returns early and reports `ok`.
-    - Every such early return goes through one of two helpers (after step 5 fixes three tests in
-      `euhedral-gpu/tests/cuda.rs` that return without one), which print `DEVICE-TEST-SKIPPED:`:
+    - Every such early return, and every half of a test that a capability check leaves out, goes through one of two
+      helpers (after step 5 fixes three tests in `euhedral-gpu/tests/cuda.rs` that skip without one), which print
+      `DEVICE-TEST-SKIPPED:`:
       `euhedral-gpu/tests/common/skip.rs` `skip` and `euhedral-memory/tests/cuda.rs` `skip`. The unit tests under
       `src/cuda` have no silent skip.
     - `test:gpu --test_env=EUHEDRAL_DEVICE_REQUIRED=1` makes both helpers panic instead, so the test fails where it
@@ -401,19 +421,21 @@ merges before it.
    - `.bazelignore` with `target` and `.claude`. Without `.claude`, `//...` descends into agent worktrees, even ones
      with their own `MODULE.bazel`.
    - In `.gitignore`: `/bazel-*` and `user.bazelrc`.
-   - `.gitattributes` (LF for the Bazel files and `Cargo.toml`) and `MODULE.bazel.lock`. The pin test is extended to
-     `MODULE.bazel`.
+   - `.gitattributes` (LF for the Bazel files, `Cargo.toml` and `Cargo.lock`) and `MODULE.bazel.lock`. The pin test
+     is extended to `MODULE.bazel`, and its failure message names `bazel mod deps`.
    - `scripts/ci/affected.py` and its tests: the root Bazel files (`MODULE.bazel`, `MODULE.bazel.lock`, `.bazelrc`,
      `.bazelversion`, `.bazelignore`, the root `BUILD.bazel`) affect everything (the full Cargo run and every Miri
-     shard). A crate's `BUILD.bazel` affects that crate. Any member's `Cargo.toml`, and any added or removed target
-     or source file, also affects `euhedral-bazel-gen` (its stale test).
+     shard). A crate's `BUILD.bazel` affects that crate. Any member's `Cargo.toml`, and any change under a member's
+     `src/`, `tests/`, `examples/` or `benches/`, also affects `euhedral-bazel-gen` (its stale test). `--name-only`
+     cannot tell an added file from an edited one, so every change there counts (see the stale check).
 
    *Done:* `bazel query @crates//...` resolves, forge's `check-repo.sh .` passes C1 to C4, and the affected-file tests
    cover the new files. *After 1.*
 4. **The generator, the BUILD files and the stale check.** Add:
    - the generator in `tools/bazel-gen`, `//:gazelle`, the stale test with its lock check, and the generated
-     `BUILD.bazel` of every crate in the three worlds. Every cuda-world test is tagged `gpu` and `external` from the
-     first generated file, so `bazel test //...` never opens the card without a grant;
+     `BUILD.bazel` of every crate in the three worlds. Every test whose resolved features include
+     `euhedral-memory/cuda` is tagged `gpu` and `external` from the first generated file, and the generator refuses
+     to write if the testing world resolves that feature, so `bazel test //...` never opens the card without a grant;
    - `[package.metadata.bazel]` for `hot_fix_ratchet` and `layering` and the `cpus` of the lattice tests, and the root
      `workspace_sources` filegroup;
    - the root README's line on regenerating.
@@ -423,8 +445,10 @@ merges before it.
    - the name-by-name test count, workspace and per crate.
 
    *Done:*
-   - `bazel build //...` and `bazel test //...` pass on Linux, and `bazel query 'attr(tags, gpu, tests(//...))'` lists
-     every cuda-world test;
+   - `bazel build //...` and `bazel test //...` pass on Linux;
+   - `bazel query 'kind(test, rdeps(//..., //euhedral-memory:euhedral_memory_cuda_testing)) except attr(tags, gpu, //...)'`
+     is empty: no test that links the cuda build of `euhedral-memory` lacks the tag. Listing only the tagged tests
+     would not show an untagged one;
    - the counts are equal;
    - check-repo passes C6;
    - Cargo commands are unchanged.
@@ -435,12 +459,21 @@ merges before it.
    - add `test:gpu` (the CUDA `--test_env` lines, `EUHEDRAL_DEVICE_REQUIRED=1`, `--nocapture`);
    - make the two skip helpers panic when `EUHEDRAL_DEVICE_REQUIRED` is set;
    - route the silent early returns in `euhedral-gpu/tests/cuda.rs` through the helpers:
-     - `missing_kernels_are_not_found` and `arguments_that_do_not_fit_are_refused_before_launch` return with no line
-       when the driver is older than 13.1. That is `skip_hardware`.
-     - `axpb_from_source_and_from_ptx_match_the_cpu_bit_for_bit` drops its NVRTC half silently when NVRTC is missing.
-       That is `skip`.
+     - `missing_kernels_are_not_found` (line 494) and `arguments_that_do_not_fit_are_refused_before_launch` (line 727)
+       return with no line when the driver is older than 13.1. That is `skip_hardware`.
+     - `axpb_from_source_and_from_ptx_match_the_cpu_bit_for_bit` (line 570) drops its NVRTC half silently when NVRTC
+       is missing (`skip`), and its image half silently when the driver is older than 13.1 (line 573,
+       `skip_hardware`). It skips loudly only when both are missing.
 
-     A search for `return` in each `cuda*.rs` test confirms no other silent early return remains.
+     A dropped half returns nothing, so a search for `return` cannot find it. Silent skips are found by searching the
+     capability checks instead: `driver_version()`, `Nvrtc::shared`, `arch()` and `Driver::load`/`Driver::shared`
+     under `euhedral-gpu/tests` and `euhedral-memory/tests`, and reading each branch that leaves work out. That search,
+     at the time of writing, finds only the four sites above. The other checks either pick one of two ways to load the
+     kernels and skip loudly when both fail (`cuda_graph.rs`, `cuda_fault.rs`, `cuda_fault_drop.rs`,
+     `cuda_launch_alloc.rs`, `cuda_lane_graph_alloc.rs`, `cuda_stage_alloc.rs`, `cuda_reopen.rs`,
+     `common/cuda_support.rs`, `cuda.rs:768`), or already call a helper (`cuda.rs:449` and `:473`, the
+     NVRTC-only tests, `cuda_programmatic.rs`, `cuda_tensor_map*.rs`, `euhedral-memory/tests/cuda.rs`). Step 5
+     repeats the search on its own head.
 
    *Done:* `system-run --gpu ... bazel test --config=gpu //...` runs every `gpu` target and none skipped, and a rerun
    is not served from the cache. *After 4; parallel with 6 and 7.*
@@ -496,7 +529,8 @@ them cached; a `<crate>_cuda` production target when a consumer module needs one
 - **The lock:** `MODULE.bazel.lock` records a sha256 of every member's `Cargo.toml` and of `Cargo.lock`. Any edit to
   them, `[package.metadata.bazel]` included, makes it stale, and `--lockfile_mode=error` fails every Bazel command. The
   stale test's lock check catches this on the Cargo side from step 4 on, before the Bazel CI job exists (step 6). Both
-  messages name the fix.
+  messages name the fix. A `MODULE.bazel` edit also makes the lock stale and has no sha256 to compare, so only the
+  Bazel job catches it; the pin test's message covers the usual cause, a toolchain bump.
 
 ## Proposed changes to forge's CONTRACTS.md
 
