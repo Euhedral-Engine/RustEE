@@ -276,16 +276,30 @@ pub fn resolve_world(ws: &Workspace, world: World) -> Result<Resolved, String> {
         ));
     }
     if world == World::Production {
-        // One consistent world: what each member gets alone must be what it gets in the union.
+        // One consistent world: every member a member reaches when built alone must have the features it has with all of
+        // them built, since both link the same target. An empty `default` turns on nothing, so it may differ.
+        let effective = |package: &str, resolved: &Resolved| -> Vec<String> {
+            let empty_default = ws
+                .package(package)
+                .and_then(|p| p.features.get("default"))
+                .is_some_and(Vec::is_empty);
+            resolved
+                .features_of(package)
+                .into_iter()
+                .filter(|f| !(empty_default && f == "default"))
+                .collect()
+        };
         for member in &members {
             let alone = resolve(ws, &[member], &|_| Vec::new(), false)?;
-            if alone.features.get(*member) != resolved.features.get(*member) {
-                return Err(format!(
-                    "{member}'s production features differ with the other members built ({:?}) and alone ({:?}): a \
-                     member's normal dependency turns on a feature of another; not modelled",
-                    resolved.features_of(member),
-                    alone.features_of(member),
-                ));
+            for reached in alone.features.keys() {
+                if effective(reached, &alone) != effective(reached, &resolved) {
+                    return Err(format!(
+                        "{reached}'s production features differ with every member built ({:?}) and with {member} \
+                         built alone ({:?}): a member's normal dependency turns on a feature of another; not modelled",
+                        resolved.features_of(reached),
+                        alone.features_of(reached),
+                    ));
+                }
             }
         }
     }

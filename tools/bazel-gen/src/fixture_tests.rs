@@ -8,7 +8,7 @@ use crate::json;
 use crate::model::{Workspace, load};
 use crate::worlds::{World, resolve_world};
 
-/// One dependency of the fixture: (name, dev, path member, features).
+/// One dependency of the fixture: (name, dev, path member, features); the feature `!default` is `default-features = false`.
 type FixtureDep<'a> = (&'a str, bool, Option<&'a str>, &'a [&'a str]);
 
 struct Fixture<'a> {
@@ -69,11 +69,13 @@ fn metadata(members: &[Fixture], root: &str, sep: &str) -> String {
             .deps
             .iter()
             .map(|(name, dev, member, features)| {
+                let defaults = !features.contains(&"!default");
+                let features: Vec<&str> = features.iter().copied().filter(|f| *f != "!default").collect();
                 format!(
-                    r#"{{"name":{},"kind":{},"rename":null,"target":null,"optional":false,"uses_default_features":true,"features":{}{}}}"#,
+                    r#"{{"name":{},"kind":{},"rename":null,"target":null,"optional":false,"uses_default_features":{defaults},"features":{}{}}}"#,
                     json_str(name),
                     if *dev { "\"dev\"" } else { "null" },
-                    list(features),
+                    list(&features),
                     member.map(|d| format!(",\"path\":{}", path(&[root, d]))).unwrap_or_default()
                 )
             })
@@ -183,6 +185,38 @@ fn a_testing_world_with_the_device_feature_is_refused() {
         error.contains("testing world resolves euhedral-memory/cuda"),
         "{error}"
     );
+}
+
+#[test]
+fn a_production_feature_one_member_turns_on_for_another_is_refused() {
+    // user's normal dependency turns on plain's `testing`: plain's one production target cannot serve both.
+    let mut on = members();
+    on[1]
+        .deps
+        .push(("plain", false, Some("plain"), &["testing"]));
+    // user takes plain without its defaults, which turn on `x`: user alone would link a plain without `x`.
+    let mut off = members();
+    off[1]
+        .deps
+        .push(("plain", false, Some("plain"), &["!default"]));
+    for members in [on, off] {
+        let ws = workspace(&members, "/w", "/").expect("the fixture loads");
+        let error = generate(&ws).expect_err("the generator refuses");
+        assert!(
+            error.contains("plain's production features differ"),
+            "{error}"
+        );
+    }
+    // An empty `default` turns on nothing: euhedral-memory without it is the same library.
+    let mut empty = members();
+    empty[2].deps.push((
+        "euhedral-memory",
+        false,
+        Some("euhedral-memory"),
+        &["!default"],
+    ));
+    generate(&workspace(&empty, "/w", "/").expect("the fixture loads"))
+        .expect("an empty default may differ");
 }
 
 #[test]
