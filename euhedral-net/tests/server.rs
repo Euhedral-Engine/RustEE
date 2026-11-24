@@ -787,6 +787,46 @@ fn at_the_cap_a_connection_waits_in_the_backlog_until_one_closes() {
 }
 
 #[test]
+fn a_stopped_server_refuses_new_connections_while_a_request_drains() {
+    let (handler, parked) = parking();
+    let server = Fixture::start(config(), handler);
+    let mut held = server.connect();
+    held.send(b"GET /held HTTP/1.1\r\nHost: t\r\n\r\n");
+    let (_, reply) = parked.recv_timeout(PATIENCE).unwrap();
+    server.begin_stop();
+    // The listener is closed once the cancelled accept has ended: a connect is refused from then on. A connect
+    // that lands before that is only in the backlog and is dropped by the server's close.
+    let limit = Instant::now() + PATIENCE;
+    let mut early = Vec::new();
+    loop {
+        match TcpStream::connect(server.addr) {
+            Ok(stream) => early.push(stream),
+            // A connect still in flight when the socket closes is reset; the next one is refused.
+            Err(error) if error.kind() == ErrorKind::ConnectionReset => {}
+            Err(error) => {
+                assert_eq!(error.kind(), ErrorKind::ConnectionRefused);
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < limit,
+            "the listening socket was never closed: new connections are still accepted after the stop"
+        );
+        yield_now();
+    }
+    // The request in flight is answered, and its connection closes.
+    reply.send(Response::with_status(200));
+    assert_eq!(held.read_response(false).status, 200);
+    held.expect_closed();
+    drop((held, early));
+    server
+        .stopped
+        .recv_timeout(PATIENCE)
+        .expect("the server did not finish after its last connection closed");
+    server.finish();
+}
+
+#[test]
 fn a_request_that_is_too_slow_to_arrive_is_answered_408_and_closed() {
     let limit = Duration::from_millis(150);
     let server = Fixture::start(

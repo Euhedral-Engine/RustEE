@@ -3,6 +3,20 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## The server closes its listener at stop (`euhedral-net`) (2026-11-23)
+
+**What.** `ServerHandle::stop` closes the listening socket as soon as the cancelled accept has ended, not when the last connection has ended.
+
+**Why.** A client that connected after the stop was completed by the kernel into the backlog and then waited, unanswered, for as long as other connections drained. Draining means no new work is taken.
+
+**How to use.** Nothing changes for callers. After `stop`, the port is free and a new connect is refused.
+
+**Semantics.**
+- A socket the in-flight accept returns after the stop began is dropped; the peer sees it close.
+- Open connections are served and drained as before; the stop frame is still offered when the last one has ended.
+
+**Tests.** `a_stopped_server_refuses_new_connections_while_a_request_drains` (a request held in the handler, a stop, connects refused, the held request answered and closed).
+
 ## The GitLab pipeline is removed (CI) (2026-11-20)
 
 **What.** `.gitlab-ci.yml`, its generator `scripts/ci/gitlab_pipeline.py` and that script's test are gone. CI is the Gitea workflow (`.gitea/workflows/ci.yml`) and its twin, the GitHub workflow (`.github/workflows/ci.yml`); the `Test the scripts` step of both no longer runs the removed test. The README's merge request section is now about pull requests.

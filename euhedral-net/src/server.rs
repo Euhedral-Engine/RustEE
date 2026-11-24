@@ -367,6 +367,7 @@ impl Shared {
             }
             ListenerEvent::Released => ls.released = true,
         }
+        self.close_listener(ls);
         self.check_finished(ls);
     }
 
@@ -477,19 +478,29 @@ impl Shared {
         self.arm_accept(ls);
     }
 
+    /// Closes the listening socket once the server is stopping and no accept is in flight on it: the port is
+    /// released and a new connection is refused, while the open connections drain. The accept in flight is
+    /// cancelled by the stop and ends first (a socket it accepted meanwhile is dropped), so the close never
+    /// lands under an operation.
+    fn close_listener(&self, ls: &mut ListenerState) {
+        if !ls.stopping || ls.accepting.is_some() {
+            return;
+        }
+        if let (Some(listener), Some(io)) = (
+            &ls.listener,
+            ls.ctx.as_ref().and_then(|ctx| ctx.io.upgrade()),
+        ) {
+            io.forget_socket(raw_listener(listener));
+        }
+        ls.listener = None;
+    }
+
     /// When the server is stopping and nothing is left, lets go of everything of the caller's but the sink, and
     /// then offers the stop frames: the last thing the server does. The listener's source ends when the last
     /// handle is gone too.
     fn check_finished(self: &Arc<Self>, ls: &mut ListenerState) {
         if ls.stopping && !ls.finished && ls.open == 0 && ls.accepting.is_none() && !ls.retrying {
             ls.finished = true;
-            if let (Some(listener), Some(io)) = (
-                &ls.listener,
-                ls.ctx.as_ref().and_then(|ctx| ctx.io.upgrade()),
-            ) {
-                io.forget_socket(raw_listener(listener));
-            }
-            ls.listener = None;
             ls.timers = None;
             ls.ctx = None;
             if let Some(sink) = &ls.sink {
@@ -541,8 +552,9 @@ impl ServerHandle {
         self.core.shared.counters.snapshot()
     }
 
-    /// Stops the server and returns at once. The accept in flight is cancelled and no more connections are
-    /// taken; connections that wait for a request (idle, or part-way through reading one, or lingering after
+    /// Stops the server and returns at once. The accept in flight is cancelled, the listening socket is closed
+    /// as soon as that accept has ended (the port is released and a new connection is refused, not left in the
+    /// backlog) and no more connections are taken; connections that wait for a request (idle, or part-way through reading one, or lingering after
     /// their last reply) are closed; a request being handled is answered, with `Connection: close`, and its
     /// connection closes after the reply. When the last connection is gone and the accept has ended, `stopped`
     /// is offered to the sink, once. A second `stop` adds another frame, offered at the same time (or at
@@ -551,7 +563,7 @@ impl ServerHandle {
     /// The notification is the last thing the server does. Before it: every connection is gone and its source
     /// has ended, no accept or retry is pending, every `Responder` handed to a handler has been used or dropped
     /// and its reply has been through its connection's order (sent, or discarded and counted), and the server
-    /// has let go of the listener socket, the handler, the `AsyncIo`, the timers and the lattice. So a handler
+    /// has let go of the handler, the `AsyncIo`, the timers and the lattice. So a handler
     /// that never answers (and keeps its `Responder`) keeps the server from finishing, even when its peer is
     /// gone. What can still run afterwards is only the server's own bookkeeping, which touches nothing of the
     /// caller's, and the frames the handler returned (which are the handler's). A reply after the stop started
