@@ -155,13 +155,33 @@ fn library_part(text: &str) -> String {
     kept
 }
 
-/// Every library source: `<workspace>/*/src/**/*.rs` except the modules declared for test builds, as (path from the
+/// The member paths the workspace manifest's `members = [...]` lists, as written (`tools/<name>` included).
+fn member_dirs(manifest: &str) -> Vec<String> {
+    let start = manifest.find("members").expect("a members list");
+    let open = start + manifest[start..].find('[').expect("a members list");
+    let close = open + manifest[open..].find(']').expect("a closed members list");
+    manifest[open + 1..close]
+        .split(',')
+        .map(|m| m.trim().trim_matches('"').to_owned())
+        .filter(|m| !m.is_empty())
+        .collect()
+}
+
+/// The `src` directory of every workspace member under `root`.
+fn member_src_dirs(root: &Path, manifest: &str) -> Vec<PathBuf> {
+    member_dirs(manifest)
+        .into_iter()
+        .map(|member| root.join(member).join("src"))
+        .collect()
+}
+
+/// Every library source: `<member>/src/**/*.rs` except the modules declared for test builds, as (path from the
 /// workspace root, text without its inline test modules).
 fn sources() -> Vec<(String, String)> {
-    let mut crates: Vec<PathBuf> = fs::read_dir(workspace())
-        .expect("the workspace directory")
-        .flatten()
-        .map(|entry| entry.path().join("src"))
+    let manifest =
+        fs::read_to_string(workspace().join("Cargo.toml")).expect("the workspace manifest");
+    let mut crates: Vec<PathBuf> = member_src_dirs(&workspace(), &manifest)
+        .into_iter()
         .filter(|src| src.is_dir())
         .collect();
     crates.sort();
@@ -344,6 +364,18 @@ fn is_a_finding(audit: &str, id: &str) -> bool {
 
 fn audit() -> String {
     fs::read_to_string(workspace().join(AUDIT)).expect("the audit")
+}
+
+#[test]
+fn a_member_under_tools_is_walked() {
+    let manifest =
+        "[workspace]\nmembers = [\"euhedral-core\", \"tools/bazel-gen\"]\nresolver = \"3\"\n";
+    assert_eq!(member_dirs(manifest), ["euhedral-core", "tools/bazel-gen"]);
+    let srcs = member_src_dirs(Path::new("ws"), manifest);
+    assert!(
+        srcs.contains(&Path::new("ws").join("tools").join("bazel-gen").join("src")),
+        "the member walk does not reach tools/bazel-gen/src: {srcs:?}"
+    );
 }
 
 #[test]
