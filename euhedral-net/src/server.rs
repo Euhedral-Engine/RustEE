@@ -594,8 +594,8 @@ impl ServerHandle {
 /// The listener, and each connection when it is accepted, becomes a source of `lattice`. The server holds the
 /// lattice and `io` weakly: the caller keeps them alive while the server runs, and stops the server before it drops
 /// either (a server dropped without a stop does not leak through a reference cycle, but nothing then runs its
-/// frames, so its listening socket is closed only when the lattice lets go of the server). If the lattice is gone or closed
-/// when a connection is accepted, the connection is refused and the server ends as if stopped.
+/// frames, so its listening socket is closed only when the lattice lets go of the server). If the lattice is gone
+/// or closed when a connection is accepted, the connection is refused and the server ends as if stopped.
 ///
 /// Returns an error if the lattice refuses the listener's source (it is closed). The server then does nothing.
 ///
