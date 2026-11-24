@@ -425,9 +425,16 @@ impl Shared {
         if ls.stopping || ls.retrying {
             return;
         }
-        let Some(timers) = &ls.timers else {
+        let Some(timers) = ls.timers.as_ref() else {
             return;
         };
+        if timers.is_complete() {
+            // Timers completed before the stop run no frame, and a cancelled retry frame still posts its event, which
+            // would fail the accept and arm the retry again without end. No retry can come, so the server ends as
+            // a stop does: the socket closes, a later stop is reported at once, and no later event arms an accept.
+            self.begin_stop(ls);
+            return;
+        }
         ls.retrying = true;
         let frame = Post::new(self.clone(), ListenerEvent::Retry);
         timers.at(Instant::now() + self.config.accept_backoff, frame);
@@ -581,12 +588,14 @@ impl ServerHandle {
 /// their requests with `handler`. Work runs as frames offered to `sink`, which `lattice` drains; `io` must be
 /// attached to the lattice too (its continuations are frames), and so must `timers`, a [`Completions`] the server
 /// uses for the back-off after a failed accept (the lattice's own timer: the server keeps none).
+/// Complete `timers` only after the server's stop: timers that are complete while the server runs end it at the
+/// next failed accept, as a stop does.
 ///
 /// The listener, and each connection when it is accepted, becomes a source of `lattice`. The server holds the
 /// lattice and `io` weakly: the caller keeps them alive while the server runs, and stops the server before it drops
 /// either (a server dropped without a stop does not leak through a reference cycle, but nothing then runs its
-/// frames, so its listening socket is closed only when the lattice lets go of the server). If the lattice is gone or closed when a
-/// connection is accepted, the connection is refused and the server ends as if stopped.
+/// frames, so its listening socket is closed only when the lattice lets go of the server). If the lattice is gone
+/// or closed when a connection is accepted, the connection is refused and the server ends as if stopped.
 ///
 /// Returns an error if the lattice refuses the listener's source (it is closed). The server then does nothing.
 ///
@@ -750,7 +759,13 @@ mod tests {
             self.post(ListenerEvent::Stop(no_work()));
             self.run_inbox();
             let mut frames = Vec::new();
+            // A hang guard only: it decides nothing but a hang.
+            let deadline = Instant::now() + Duration::from_secs(30);
             while frames.is_empty() {
+                assert!(
+                    Instant::now() < deadline,
+                    "the accept's frame was never handed out"
+                );
                 self.io.reap();
                 self.io
                     .pull(&mut |frame| frames.push(frame), &mut |_| false, u64::MAX);
@@ -792,5 +807,44 @@ mod tests {
         drop(hand.stop_and_hand_out());
         hand.run_inbox();
         assert!(hand.finished(), "the stop is reported after the drop");
+    }
+
+    /// Timers completed with no stop sent end the listener at the first failed accept: its socket is closed, a
+    /// later stop is reported at once, and a later event arms no accept.
+    #[test]
+    fn timers_completed_early_end_the_listener_at_a_failed_accept() {
+        let io = AsyncIo::open().unwrap();
+        let timers = Completions::without_lanes();
+        let shared = new_shared(
+            Weak::new(),
+            &io,
+            Arc::new(QueueIngestSink::new()),
+            TcpListener::bind("127.0.0.1:0").unwrap(),
+            ServerConfig::default(),
+            Arc::new(|_: Request, _: Responder| no_work()),
+            timers.clone(),
+        );
+        // The accept cannot start: the `AsyncIo` is gone.
+        drop(io);
+        timers.complete();
+        shared.post_listener(ListenerEvent::Start);
+        let mut run = 0;
+        while let Some(event) = shared.station.take_event() {
+            run += 1;
+            assert!(run <= 100, "the listener kept re-arming the retry");
+            shared.run_event(event);
+        }
+        {
+            let ls = shared.listener.enter();
+            assert!(ls.finished, "the failed accept did not end the listener");
+            assert!(ls.listener.is_none(), "the socket was left open");
+        }
+        shared.post_listener(ListenerEvent::Closed(0));
+        while let Some(event) = shared.station.take_event() {
+            shared.run_event(event);
+        }
+        let ls = shared.listener.enter();
+        assert!(ls.accepting.is_none(), "a later event armed an accept");
+        assert!(!ls.retrying, "a later event armed a retry");
     }
 }
