@@ -58,8 +58,21 @@ pub fn generate(ws: &Workspace) -> Result<BTreeMap<String, String>, String> {
 
 fn root(ws: &Workspace, aliases: &[(String, String)]) -> String {
     let mut out = HEADER.to_owned();
-    out.push_str("\n# The root files crate_universe and the generator's tests read.\n");
-    let exports: Vec<String> = ROOT_EXPORTS.iter().map(|s| (*s).to_owned()).collect();
+    out.push_str("\n# The root files crate_universe reads, and the root files a test or binary names in its `data`.\n");
+    let mut exports: Vec<String> = ROOT_EXPORTS.iter().map(|s| (*s).to_owned()).collect();
+    for package in &ws.packages {
+        for extras in package.extras.values() {
+            exports.extend(
+                extras
+                    .data
+                    .iter()
+                    .filter_map(|label| label.strip_prefix("//:"))
+                    .map(str::to_owned),
+            );
+        }
+    }
+    exports.sort();
+    exports.dedup();
     out.push_str(&format!("exports_files({})\n", list(&exports, 0)));
     for (name, actual) in aliases {
         out.push('\n');

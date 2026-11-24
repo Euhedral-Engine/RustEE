@@ -102,7 +102,10 @@ rust_test(
     ),
     crate_name = "hot_fix_ratchet",
     crate_root = "tests/hot_fix_ratchet.rs",
-    data = ["//:workspace_sources"],
+    data = [
+        "//:docs/superpowers/specs/2026-10-28-lock-free-hot-path-audit.md",
+        "//:workspace_sources",
+    ],
     deps = [
         "//euhedral-data-structures:euhedral_data_structures",
         "//euhedral-hardware-utils:euhedral_hardware_utils",

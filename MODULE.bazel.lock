@@ -507,7 +507,7 @@
           "FILE:@@//euhedral-hashing/Cargo.toml fceb8d65d6433afa7d76854c843b79f2ea2f791666c5d37289d3fd97c6111c61",
           "FILE:@@//euhedral-data-structures/Cargo.toml 71ae745459b5c5eb7aa2f920235f126400180f1afa496956464d65a6472116aa",
           "FILE:@@//euhedral-hardware-utils/Cargo.toml 6c78ff45b4d1a6f6ae2ebe2e6981c33649757b33bfe715c305c958e07ab730aa",
-          "FILE:@@//euhedral-core/Cargo.toml 737af22aa66c8b5b3f9a5abb72287ffd4e6fd5baf75029ad9350c56682625e4b",
+          "FILE:@@//euhedral-core/Cargo.toml b64150a336654766f4f589ba552f36ca963218979ec4fcb634b6f2bf7da49762",
           "FILE:@@//euhedral-graph/Cargo.toml 7bc1a863e0cbe680096ebb3eb25e0157120b1ad74426af6012abe3deedc4aac1",
           "FILE:@@//euhedral-io/Cargo.toml 529f6afab7a62ad2fd1750d0c47b0ecd3f56a2d86573097ed0e6d7152d3e174b",
           "FILE:@@//euhedral-net/Cargo.toml 8f89e25a7586fb8d6ae1580d83d12ee941f5b65fa5ea1a00c2b0630a478a790c",

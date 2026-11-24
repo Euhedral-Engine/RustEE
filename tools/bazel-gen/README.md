@@ -54,7 +54,7 @@ Bazel-only settings of one test or binary, which Cargo ignores:
 ```toml
 [package.metadata.bazel.test.<name>]   # or .bin.<name>
 workspace_sources = true   # data: //:workspace_sources; CARGO_MANIFEST_DIR relative to the runfiles root
-data = ["//:Cargo.lock"]   # more data labels; also sets the relative CARGO_MANIFEST_DIR
+data = ["//:Cargo.lock"]   # more data labels (a root file is exported); also sets the relative CARGO_MANIFEST_DIR
 cpus = 4                   # tags: cpu:4 (the test pins that many workers)
 cargo = true               # the toolchain's cargo as data, its path in CARGO
 root_alias = "gazelle"     # (bin) an alias of this binary in the root package
