@@ -8,6 +8,9 @@ the actions differ (checkout, caches, artifacts). The `ci-ok` needs list may dif
 (which jobs a change runs, the leases, the device job, the one place a secret is read) is pinned for the Gitea file below.
 The Bazel jobs are pinned in `Bazel`: `bazel test //... --config=ci` and forge's C7 in both files, on the bazel label with no
 token on Gitea, forge's repo check fetched from forge's main, all of it in `ci-ok`, and every Bazel input running them.
+Gitea's `windows` job is the one job that calls a reusable workflow (`CALLS`): euhedral/ci's Windows workflow at the tag v5,
+which checks out with the system git and runs no `actions/checkout`; it gets the GitHub App's three secrets by name, and on
+GitHub its dispatch runs the workspace job's Windows leg and `bazel-windows`, the Bazel test on windows_x86_64.
 """
 
 import json
@@ -38,10 +41,19 @@ TWIN_JOBS = ["changes", "workspace", "bazel", "miri-build", "miri", "ci-ok"]
 DOCKER_LABELS = {"arbiter-docker", "arbiter-docker-unconfined", "arbiter-docker-bazel", "arbiter-gpu"}
 SECRETS = re.compile(r"\bsecrets\b")  # `secrets.X`, `toJSON(secrets)` and `secrets[...]` alike
 CHANGES_OUTPUT = re.compile(r"needs\.changes\.outputs\.(\w+)")
+# The Gitea jobs that call a reusable workflow, and the workflow each calls: every other job has its own steps.
+CALLS = {"windows": "euhedral/ci/.gitea/workflows/bazel-windows.yml@refs/tags/v5"}
+APP_SECRETS = ["GH_APP_ID", "GH_APP_INSTALLATION_ID", "GH_APP_PRIVATE_KEY_B64"]
+BAZEL_WINDOWS = "bazel test //... --config=ci --platforms=@euhedral_build//platforms:windows_x86_64"
 
 
 def steps(doc, job):
     return doc["jobs"][job]["steps"]
+
+
+def local_jobs(doc):
+    """The jobs with steps of their own: all of them but the calls of a reusable workflow `CALLS` pins."""
+    return {job: body for job, body in doc["jobs"].items() if job not in CALLS or doc is not GITEA}
 
 
 def forge_only(step):
@@ -79,11 +91,11 @@ class Twins(unittest.TestCase):
 
     def test_the_jobs_that_exist_in_one_file_only(self):
         self.assertEqual(set(GITEA["jobs"]) - set(GITHUB["jobs"]), {"workflows", "check-repo", "device", "windows"})
-        self.assertEqual(set(GITHUB["jobs"]) - set(GITEA["jobs"]), set())
+        self.assertEqual(set(GITHUB["jobs"]) - set(GITEA["jobs"]), {"bazel-windows"})
 
     def test_a_forge_only_step_is_in_its_own_forge(self):
         for doc, other in ((GITEA, "(github)"), (GITHUB, "(gitea)")):
-            for job, body in doc["jobs"].items():
+            for job, body in local_jobs(doc).items():
                 for s in body["steps"]:
                     self.assertFalse(s.get("name", "").endswith(other), f"{job}: {s.get('name')}")
 
@@ -138,7 +150,7 @@ class Twins(unittest.TestCase):
         # A shard's commands can hold an apostrophe: interpolated into a script it would end a quote.
         for doc in (GITEA, GITHUB):
             self.assertEqual(doc["jobs"]["miri-build"]["env"]["MATRIX"], "${{ needs.changes.outputs.miri_matrix }}")
-            for job, body in doc["jobs"].items():
+            for job, body in local_jobs(doc).items():
                 for s in body["steps"]:
                     self.assertNotIn("miri_matrix", s.get("run", ""), job)
 
@@ -179,7 +191,7 @@ class Gitea(unittest.TestCase):
             "device": {"needs", "if", "runs-on", "defaults", "env", "steps"},
             "miri-build": {"needs", "if", "runs-on", "env", "steps"},
             "miri": {"name", "needs", "if", "strategy", "runs-on", "env", "steps"},
-            "windows": {"needs", "if", "runs-on", "timeout-minutes", "env", "steps"},
+            "windows": {"needs", "if", "uses", "with", "secrets"},
             "ci-ok": {"needs", "if", "runs-on", "env", "steps"},
         }
         self.assertEqual({j: set(b) for j, b in GITEA["jobs"].items()}, keys)
@@ -254,7 +266,7 @@ class Gitea(unittest.TestCase):
         self.assertNotIn("&&", condition)
 
     def test_every_docker_job_asks_for_what_it_uses(self):
-        for job, body in GITEA["jobs"].items():
+        for job, body in local_jobs(GITEA).items():
             if body["runs-on"] not in DOCKER_LABELS:
                 self.fail(f"{job} runs on {body['runs-on']}, not one of the project's labels")
             if body.get("env", {}).get("ARBITER") == "off":
@@ -267,11 +279,11 @@ class Gitea(unittest.TestCase):
         # io_uring needs seccomp unconfined: the jobs that build and run the tests are on the unconfined label.
         expected = {
             "changes": "arbiter-docker", "workflows": "arbiter-docker", "ci-ok": "arbiter-docker",
-            "windows": "arbiter-docker", "workspace": "arbiter-docker-unconfined",
+            "workspace": "arbiter-docker-unconfined",
             "miri-build": "arbiter-docker-unconfined", "miri": "arbiter-docker-unconfined", "device": "arbiter-gpu",
             "check-repo": "arbiter-docker", "bazel": "arbiter-docker-bazel",
         }
-        self.assertEqual({j: b["runs-on"] for j, b in GITEA["jobs"].items()}, expected)
+        self.assertEqual({j: b["runs-on"] for j, b in local_jobs(GITEA).items()}, expected)
 
     def test_the_shard_lease_covers_the_largest_shard(self):
         # The lease is the job's, set before the matrix expands, so it cannot follow a shard: it is the largest one's.
@@ -288,50 +300,57 @@ class Gitea(unittest.TestCase):
         self.assertNotIn("matrix.", GITEA["jobs"]["miri"]["env"]["ARBITER_EST"])
 
     def test_a_docker_job_has_no_timeout_of_its_own(self):
-        # The runner holds a docker job to its lease; only the proxy job, which waits outside the arbiter, has one.
-        for job, body in GITEA["jobs"].items():
-            if job == "windows":
-                self.assertEqual(body["timeout-minutes"], 100)
-            else:
-                self.assertNotIn("timeout-minutes", body, job)
+        # The runner holds a docker job to its lease; the proxy job, which waits outside it, is the called workflow's.
+        for job, body in local_jobs(GITEA).items():
+            self.assertNotIn("timeout-minutes", body, job)
 
-    def test_the_windows_job_waits_outside_the_arbiter(self):
+    def test_only_the_windows_job_calls_a_workflow_and_it_is_the_shared_one_at_v5(self):
+        # The tag by its full ref: a branch named v5 would win a plain name.
+        self.assertEqual({j: b["uses"] for j, b in GITEA["jobs"].items() if "uses" in b}, CALLS)
+        for job, body in local_jobs(GITEA).items():
+            self.assertIn("steps", body, job)
+            self.assertIn("runs-on", body, job)
+
+    def test_the_windows_job_runs_no_checkout_and_reads_no_forge_variable(self):
+        # The called workflow checks out with the system git and takes the forge's address from the run: nothing of the
+        # job runs `actions/checkout` (it starts `node` from the image's PATH) or reads FORGE_URL.
         windows = GITEA["jobs"]["windows"]
-        self.assertEqual(windows["env"]["ARBITER"], "off")
-        self.assertEqual(windows["runs-on"], "arbiter-docker")
+        self.assertNotIn("steps", windows)
+        text = json.dumps(windows)
+        for banned in ("actions/checkout", "vars.FORGE_URL", "FORGE_URL", "refs/tags/v4", "github-actions-proxy"):
+            self.assertNotIn(banned, text)
+
+    def test_the_windows_job_dispatches_ci_yml_for_pull_requests(self):
+        windows = GITEA["jobs"]["windows"]
+        self.assertEqual(windows["needs"], "changes")
         self.assertEqual(
             windows["if"], "github.event_name == 'pull_request' && needs.changes.outputs.any == 'true'"
         )
-        proxy = next(s for s in windows["steps"] if s.get("uses") == "./.ci/github-actions-proxy")
-        self.assertEqual(proxy["with"]["inputs"], "only_os=windows-2025\nbase_ref=${{ github.base_ref }}\n")
-        self.assertEqual(proxy["with"]["workflow"], "ci.yml")
+        # The called workflow sets `only_os=windows-2025` and `base_ref`; the branch it pushes carries the pull request's
+        # workflow files, which a push may change only with `workflows:write`.
+        self.assertEqual(windows["with"], {
+            "repo": "Euhedral-Engine/RustEE",
+            "workflow": "ci.yml",
+            "permissions": "contents:write,actions:write,workflows:write",
+        })
+        self.assertIn("windows", GITEA["jobs"]["ci-ok"]["needs"])
 
-    def test_the_proxy_action_is_cloned_from_the_forge_at_its_tag(self):
-        windows = GITEA["jobs"]["windows"]["steps"]
-        names = [s.get("name") for s in windows]
-        fetch = windows[names.index("Fetch the proxy action (gitea)")]
-        self.assertLess(windows.index(fetch), next(i for i, s in enumerate(windows) if s.get("uses") == "./.ci/github-actions-proxy"))
-        self.assertEqual(fetch["env"]["FORGE_URL"], "${{ vars.FORGE_URL }}")
-        self.assertEqual(fetch["env"]["FORGE_TOKEN"], "${{ github.token }}")
-        run = fetch["run"]
-        self.assertIn('"$FORGE_URL/euhedral/ci.git" refs/tags/v4', run)
-        self.assertNotRegex(run, r"refs/tags/v4\w")  # exactly the tag v4, by its full ref (a branch v4 must not win)
-        self.assertIn("git init -q .ci", run)
-        self.assertIn("git -C .ci fetch -q --depth 1", run)
-        self.assertIn("git -C .ci checkout -q --detach FETCH_HEAD", run)
-        self.assertNotIn("clone", run)
-        self.assertNotIn("--branch", run)
-        # The token is this command's environment: not in argv or a URL, not echoed, not stored in `.ci/.git/config`.
-        self.assertIn('GIT_CONFIG_KEY_0="http.$FORGE_URL/.extraHeader"', run)
-        self.assertLess(run.index("rm -rf .ci"), run.index("git init -q .ci"))
-        # No redirect is followed: after one, git would send the header to the host it was redirected to.
-        self.assertIn("GIT_CONFIG_COUNT=2 ", run)
-        self.assertIn("GIT_CONFIG_KEY_1=http.followRedirects GIT_CONFIG_VALUE_1=false", run)
-        self.assertNotIn("@", run.replace("$FORGE_URL", ""))
-        self.assertNotIn("echo", run.replace('echo "the variable FORGE_URL is unset"', ""))
-        self.assertNotIn("git config", run)
-        self.assertNotIn("config --", run)
-        self.assertIsNone(SECRETS.search(json.dumps(fetch)))
+    def test_the_github_dispatch_runs_cargo_and_bazel_on_windows(self):
+        # `only_os=windows-2025` keeps the workspace job's Windows leg and runs the Bazel test on the Windows platform.
+        matrix = GITHUB["jobs"]["workspace"]["strategy"]["matrix"]["os"]
+        self.assertIn("inputs.only_os", matrix)
+        job = GITHUB["jobs"]["bazel-windows"]
+        self.assertEqual(job["runs-on"], "windows-2025")
+        self.assertEqual(job["needs"], "changes")
+        self.assertEqual(job["if"], "needs.changes.outputs.any == 'true' && inputs.only_os != 'ubuntu-latest'")
+        self.assertEqual(job["defaults"], {"run": {"shell": "bash"}})
+        test = step(GITHUB, "bazel-windows", "Bazel test on the Windows platform")
+        self.assertEqual(test, {
+            "name": "Bazel test on the Windows platform",
+            "env": {"MSYS_NO_PATHCONV": "1"},
+            "run": BAZEL_WINDOWS,
+        })
+        self.assertIn("bazel-windows", GITHUB["jobs"]["ci-ok"]["needs"])
 
     def test_no_host_or_port_is_written_in_either_workflow(self):
         for path in (".gitea/workflows/ci.yml", ".github/workflows/ci.yml"):
@@ -355,19 +374,18 @@ class Gitea(unittest.TestCase):
             self.assertIsNone(SECRETS.search(json.dumps(top)), name)
             for job, body in doc["jobs"].items():
                 if name == "gitea" and job == "windows":
-                    self.assertIn("secrets.GH_APP_PRIVATE_KEY_B64", json.dumps(body))
-                    for step in body["steps"]:
-                        has = SECRETS.search(json.dumps(step)) is not None
-                        self.assertEqual(has, step.get("uses") == "./.ci/github-actions-proxy", step.get("name"))
+                    # By name, each its own: `secrets: inherit` would give the called workflow every secret.
+                    self.assertEqual(body["secrets"], {k: f"${{{{ secrets.{k} }}}}" for k in APP_SECRETS})
+                    rest = {k: v for k, v in body.items() if k != "secrets"}
+                    self.assertIsNone(SECRETS.search(json.dumps(rest)))
                 else:
                     self.assertIsNone(SECRETS.search(json.dumps(body)), f"{name}: {job}")
 
     def test_every_action_is_one_the_forge_can_run(self):
         allowed = {
             "actions/checkout@v4", "actions/upload-artifact@v3", "actions/download-artifact@v3",
-            "./.ci/github-actions-proxy",
         }
-        used = {s["uses"] for body in GITEA["jobs"].values() for s in body["steps"] if "uses" in s}
+        used = {s["uses"] for body in local_jobs(GITEA).values() for s in body["steps"] if "uses" in s}
         self.assertLessEqual(used, allowed)
 
     def test_the_toolchain_steps_export_mise_to_the_later_steps(self):
@@ -505,7 +523,7 @@ class Bazel(unittest.TestCase):
     def test_no_job_runs_a_check_repo_script_of_the_checkout(self):
         # The code under test must not supply its own checker: every check-repo.sh named is the one fetched from forge.
         for doc, name in ((GITEA, "gitea"), (GITHUB, "github")):
-            for job, body in doc["jobs"].items():
+            for job, body in local_jobs(doc).items():
                 for s in body["steps"]:
                     run = s.get("run", "")
                     self.assertEqual(run.count("check-repo.sh"), run.count(FORGE_CHECK), f"{name}: {job}")

@@ -23,15 +23,15 @@
 name: ci
 
 # A manual run takes optional inputs, which a caller that is not GitHub (a pipeline elsewhere that runs the parts GitHub
-# is needed for) uses to select what runs: `only_os` limits the workspace job to one runner and skips Miri and Bazel,
-# `base_ref` selects the affected crates against that branch as a pull request does (empty:
-# everything), and `proxy_id` is an identifier shown in the name of the run, so the caller can find the run it started.
+# is needed for) uses to select what runs: `only_os` limits the workspace job to one runner and skips Miri and the
+# Linux Bazel job (`windows-2025` keeps the Windows Bazel job), `base_ref` selects the affected crates against that
+# branch as a pull request does (empty: everything), and `proxy_id` is an identifier shown in the name of the run, so the caller can find the run it started.
 on:
   pull_request:
   workflow_dispatch:
     inputs:
       only_os:
-        description: Run the workspace job on this runner only, and nothing else
+        description: Run the workspace job on this runner only (and, on windows-2025, the Windows Bazel job)
         type: choice
         options: [all, ubuntu-latest, windows-2025]
         default: all
@@ -377,10 +377,38 @@ jobs:
         if: always()
         run: bazel shutdown
 
+  # `bazel test //... --config=ci` on the Windows platform (euhedral/ci's examples/github-windows-bazel.yml): the job
+  # Gitea's `windows` job runs here with `only_os=windows-2025`, next to the workspace job's Windows leg. Every target is
+  # built on windows_x86_64; none is marked incompatible. Not on a run limited to ubuntu-latest.
+  bazel-windows:
+    needs: changes
+    if: needs.changes.outputs.any == 'true' && inputs.only_os != 'ubuntu-latest'
+    runs-on: windows-2025
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bazel is the version in .bazelversion (github)
+        run: |
+          have=$(bazel --version)
+          test "$have" = "bazel $(cat .bazelversion)" || { echo "bazel is '$have', .bazelversion says $(cat .bazelversion)"; exit 1; }
+
+      - name: Bazel test on the Windows platform
+        env:
+          MSYS_NO_PATHCONV: "1" # Git Bash would rewrite the // in the labels as a path
+        run: bazel test //... --config=ci --platforms=@euhedral_build//platforms:windows_x86_64
+
+      - name: Stop the Bazel server
+        if: always()
+        run: bazel shutdown
+
   # Always runs, and fails only if a job failed or was cancelled: a job skipped because no crate it covers
   # was affected counts as success. This is the one check to require on a branch.
   ci-ok:
-    needs: [changes, workspace, bazel, miri-build, miri]
+    needs: [changes, workspace, bazel, bazel-windows, miri-build, miri]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
