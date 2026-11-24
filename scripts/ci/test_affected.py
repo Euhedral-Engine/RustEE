@@ -25,6 +25,7 @@ DEPS = {
 }  # as the real workspace: benchmarks does not depend on graph, io, memory or gpu
 DIRS = {n: f"euhedral-{n}" for n in NAMES} | {"bazelgen": "tools/bazel-gen"}
 G = A.Graph(DIRS, DEPS)
+REAL_BAZEL_GEN = A.BAZEL_GEN
 A.BAZEL_GEN = "bazelgen"  # the synthetic graph names the generator crate this way
 
 
@@ -253,6 +254,10 @@ class Miri(unittest.TestCase):
             self.assertTrue(all(f"-p {s['crate']} " in c for c in s["commands"]), s)
         self.assertEqual(A.shard_problems(shards), [])
         self.assertEqual([s["name"] for s in shards if s.get("canary")], ["hardware-utils: CPU sets"])
+
+    def test_the_generator_crate_is_in_the_real_workspace(self):
+        root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
+        self.assertIn(REAL_BAZEL_GEN, A.Graph.load(root).dirs)
 
     def test_seeds_are_split_into_jobs_that_cover_the_range_once(self):
         self.assertEqual(A.seed_ranges(1), [(0, 1)])

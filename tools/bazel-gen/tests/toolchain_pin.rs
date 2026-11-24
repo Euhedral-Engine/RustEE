@@ -32,24 +32,52 @@ fn read(name: &str) -> String {
     std::fs::read_to_string(root.join(name)).unwrap_or_else(|e| panic!("read {name}: {e}"))
 }
 
-/// The versions `MODULE.bazel` pins: the `versions = [...]` of `rust.toolchain` and the `version` of `host_tools`.
+/// The text inside the parentheses of the first call that starts with `opener` (for example `rust.toolchain(`).
+fn call<'a>(module: &'a str, opener: &str) -> Option<&'a str> {
+    module.split_once(opener)?.1.split(')').next()
+}
+
+/// The quoted value of the line in `call` that starts with `key`.
+fn quoted(call: &str, key: &str) -> Option<String> {
+    call.lines().find_map(|l| {
+        let rest = l.trim().strip_prefix(key)?;
+        Some(rest.split('"').nth(1)?.to_owned())
+    })
+}
+
+/// The versions `MODULE.bazel` pins: the one entry of `versions = [...]` in `rust.toolchain(` and the `version` of
+/// `host_tools(`, which `from_cargo` must name through `host_tools = "@rust_host_tools_pinned"`.
 fn module_versions(module: &str) -> Result<(String, String), String> {
-    let toolchain = module
-        .lines()
-        .find_map(|l| {
-            let rest = l.trim().strip_prefix("versions")?;
-            Some(rest.split('"').nth(1)?.to_owned())
-        })
-        .ok_or("MODULE.bazel has no rust.toolchain versions = [\"...\"] line")?;
-    let host = module
-        .split_once(".host_tools(")
-        .and_then(|(_, call)| {
-            call.split(')').next()?.lines().find_map(|l| {
-                let rest = l.trim().strip_prefix("version")?;
-                Some(rest.split('"').nth(1)?.to_owned())
-            })
-        })
+    let toolchain_call =
+        call(module, "rust.toolchain(").ok_or("MODULE.bazel has no rust.toolchain( call")?;
+    let list = toolchain_call
+        .split_once("versions")
+        .and_then(|(_, rest)| rest.split_once('[')?.1.split_once(']'))
+        .ok_or("MODULE.bazel rust.toolchain has no versions = [\"...\"] line")?
+        .0;
+    let entries: Vec<&str> = list
+        .split(',')
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .collect();
+    let [entry] = entries.as_slice() else {
+        return Err(format!(
+            "MODULE.bazel rust.toolchain versions must hold exactly one version, found {}",
+            entries.len()
+        ));
+    };
+    let toolchain = entry.trim_matches('"').to_owned();
+    let host_call = call(module, ".host_tools(").ok_or("MODULE.bazel has no host_tools( call")?;
+    let host = quoted(host_call, "version")
         .ok_or("MODULE.bazel has no host_tools version = \"...\" line")?;
+    let name = quoted(host_call, "name").ok_or("MODULE.bazel host_tools has no name")?;
+    let from_cargo =
+        call(module, "crate.from_cargo(").ok_or("MODULE.bazel has no crate.from_cargo( call")?;
+    if quoted(from_cargo, "host_tools") != Some(format!("@{name}")) {
+        return Err(format!(
+            "MODULE.bazel crate.from_cargo must set host_tools = \"@{name}\", the pinned host tools repo"
+        ));
+    }
     Ok((toolchain, host))
 }
 
@@ -102,7 +130,8 @@ fn the_toolchain_pins_agree() {
 const MISE: &str = "[tools]\nrust = { version = \"1.99.1\", profile = \"default\" }\n";
 const TOOLCHAIN: &str = "[toolchain]\nchannel = \"1.99.1\"\nprofile = \"default\"\n";
 const MODULE: &str = "rust.toolchain(\n    edition = \"2024\",\n    versions = [\"1.99.1\"],\n)\n\
-    rust_host_tools.host_tools(\n    name = \"x\",\n    version = \"1.99.1\",\n)\n";
+    rust_host_tools.host_tools(\n    name = \"x\",\n    version = \"1.99.1\",\n)\n\
+    crate.from_cargo(\n    host_tools = \"@x\",\n)\n";
 
 #[test]
 fn a_differing_pin_is_reported() {
@@ -122,4 +151,20 @@ fn a_differing_module_line_is_reported_with_the_fix() {
         assert!(err.contains("bazel mod deps"), "{err}");
     }
     assert!(check(MISE, TOOLCHAIN, Some("")).is_err());
+    // Only the entry inside rust.toolchain counts, and there is exactly one.
+    let outside = format!("versions = [\"9.9.9\"]\n{MODULE}");
+    assert_eq!(check(MISE, TOOLCHAIN, Some(&outside)), Ok(()));
+    let two = MODULE.replace("[\"1.99.1\"]", "[\"1.99.1\", \"1.99.2\"]");
+    assert!(
+        check(MISE, TOOLCHAIN, Some(&two))
+            .unwrap_err()
+            .contains("exactly one")
+    );
+    // from_cargo must use the pinned host tools repo.
+    let unpinned = MODULE.replace("@x", "@rust_host_tools");
+    assert!(
+        check(MISE, TOOLCHAIN, Some(&unpinned))
+            .unwrap_err()
+            .contains("host_tools")
+    );
 }
