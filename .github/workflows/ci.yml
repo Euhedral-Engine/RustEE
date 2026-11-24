@@ -401,6 +401,25 @@ jobs:
           MSYS_NO_PATHCONV: "1" # Git Bash would rewrite the // in the labels as a path
         run: bazel test //... --config=ci --platforms=@euhedral_build//platforms:windows_x86_64
 
+      - name: Diagnose the doc test runfiles (github)
+        if: failure()
+        env:
+          MSYS_NO_PATHCONV: "1"
+        run: |
+          set -x
+          bin=$(bazel info --config=ci --platforms=@euhedral_build//platforms:windows_x86_64 bazel-bin)
+          rf="$bin/euhedral-hashing/doc_test.rustdoc_test.bat.runfiles"
+          cat "$bin/euhedral-hashing/doc_test.rustdoc_test.bat" | cut -c1-3000 || true
+          ls -la "$rf" "$rf/_main" || true
+          found=("$rf"/rules_rust++rust+rw-*_tools)
+          tools=${found[0]}
+          ls -la "$tools" "$tools/rust_toolchain" "$tools/rust_toolchain/lib/rustlib/x86_64-pc-windows-msvc/lib" || true
+          cmd //c "dir /AL \"$(cygpath -w "$rf")\"" || true
+          cmd //c "dir /AL \"$(cygpath -w "$rf/_main")\"" || true
+          powershell -c "Get-Item '$(cygpath -w "$rf/_main/external")' | Format-List *" || true
+          powershell -c "Get-ChildItem '$(cygpath -w "$tools/rust_toolchain/lib/rustlib/x86_64-pc-windows-msvc/lib")' -Filter 'libstd-*' | Format-List FullName,LinkType,Target,Length" || true
+          (cd "$rf/_main" && ls -la external/ && ls -la external/rules_rust++rust+rw-*_tools/rust_toolchain/lib/rustlib/x86_64-pc-windows-msvc/lib/libstd-*) || true
+
       - name: Stop the Bazel server
         if: always()
         run: bazel shutdown
