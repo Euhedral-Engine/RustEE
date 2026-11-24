@@ -499,12 +499,24 @@ merges before it.
    - the Cargo jobs are unchanged.
 
    As built: on Gitea the job runs on `arbiter-docker-bazel`, which gives it no token or secret and the commit at
-   `/checkout` (copied in, since `actions/checkout` has no token), and it runs forge's C7 query itself. A Gitea-only
-   `check-repo` job on `arbiter-docker` fetches forge's `main` with the job token (forge is private) and runs its
-   `build/scripts/check-repo.sh --skip-c7 .`; a failed fetch fails the job, and no job runs a copy from this repository.
-   GitHub's twin runs the same steps on `ubuntu-latest` (Bazelisk, checked against `.bazelversion`), except on a run
-   limited to one OS. Both run when `changes` reports any crate affected, which every Rust, Cargo, BUILD, MODULE,
-   `.bazel*` and generator file does; `test_workflow_twins.py` pins all of it.
+   `/checkout` (copied in, since `actions/checkout` has no token), and it runs forge's C7 query itself, with
+   `build:ci --local_resources=cpu=8` holding Bazel to the lease's threads. A Gitea-only `check-repo` job on
+   `arbiter-docker` fetches forge's `main` with the job token (forge's repository is public, but the organisation's
+   visibility is limited, so anonymous git is refused) and runs its `build/scripts/check-repo.sh --skip-c7 .`. A failed
+   fetch fails the job, and no job runs a copy from this repository. The same job fails when forge's script no longer
+   builds the C7 query the `bazel` job runs. Its steps that hold the token or run forge's code use only `/usr/bin:/bin`,
+   since `/cache` comes first on the image's PATH and earlier pull requests' jobs can write it. GitHub's twin runs the
+   same steps on `ubuntu-latest` (Bazelisk, checked against `.bazelversion`), except on a run limited to one OS. Both
+   jobs run when `changes` reports any crate affected. Every Rust, Cargo, BUILD, MODULE, `.bazel*` and generator file
+   does that, as does a file that a member's BUILD file names by label (the audit doc that `hot_fix_ratchet` reads).
+   `test_workflow_twins.py` pins all of it.
+
+   A pull request's `bazel` job uses the shared `ci-bazel` store, where an earlier pull request can have planted
+   cached action and test results, so its green result is not a trust signal on its own. The enforced gate is the run
+   on each push to `main`. The runner gives that run RustEE's own main stores (`ci-bazel-main-<id>`,
+   `ci-cache-main-<id>`), which only jobs of protected refs write, that is merged code; the runner chooses the store
+   from Gitea's task context, never from the workflow. Test results stay cached (`--cache_test_results` is not turned
+   off): the main store is what makes them trustworthy there.
 
    *After 4; parallel with 5.*
 7. **The Windows job runs Bazel.** The GitHub proxy runs `bazel test //... --config=ci` on

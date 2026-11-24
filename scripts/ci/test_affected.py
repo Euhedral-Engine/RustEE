@@ -4,6 +4,7 @@
 import json
 import os
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -127,6 +128,34 @@ class Affected(unittest.TestCase):
     def test_crate_readme_counts_but_other_md_does_not(self):
         self.assertEqual(run("euhedral-ds/README.md")[0], sorted(set(NAMES) - {"hash", "net", "bazelgen"}))
         self.assertEqual(run("euhedral-ds/GLOSSARY.md"), ([], False))
+
+    def test_a_md_under_a_crates_target_directories_counts(self):
+        # The BUILD globs take it as compile data (`src/**`, `tests/**`), so it is an input of the crate's targets.
+        for d in ("src", "tests", "examples", "benches"):
+            self.assertEqual(run(f"euhedral-net/{d}/notes.md"), (["bazelgen", "net"], False), d)
+
+    def test_a_doc_that_a_crates_target_reads_affects_that_crate(self):
+        # hot_fix_ratchet reads the audit doc: it is in the test's `data`, so a docs-only change to it still runs it.
+        audit = "docs/specs/audit.md"
+        g = A.Graph(DIRS, DEPS, {audit: {"net"}})
+        crates, everything, _ = A.affected(g, [audit])
+        self.assertEqual((sorted(crates), everything), (["net"], False))
+        self.assertEqual(run(audit), ([], False))  # without the label it is documentation
+
+    def test_the_data_labels_are_read_from_the_build_files(self):
+        with tempfile.TemporaryDirectory() as root:
+            for path, text in {
+                "docs/audit.md": "",
+                "build/module/x.txt": "",
+                "c/BUILD.bazel": 'data = ["//:docs/audit.md", "//:workspace_sources", "//build/module:x.txt"]',
+                "d/BUILD.bazel": 'data = ["//:docs/audit.md"]',
+            }.items():
+                os.makedirs(os.path.join(root, os.path.dirname(path)), exist_ok=True)
+                with open(os.path.join(root, path), "w") as f:
+                    f.write(text)
+            data = A.data_inputs(root, {"c": "c", "d": "d", "e": "e"})  # e has no BUILD file
+        # A target's label (`//:workspace_sources`) is no file and is left out.
+        self.assertEqual(data, {"docs/audit.md": {"c", "d"}, "build/module/x.txt": {"c"}})
 
     def test_docs_plus_one_crate(self):
         self.assertEqual(run("README.md", "euhedral-gpu/src/a.rs"), (["bazelgen", "gpu"], False))

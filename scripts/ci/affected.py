@@ -8,8 +8,10 @@ build path dependency) on an affected crate. Layers below a change are not affec
 Everything is affected when a root build file changed (see EVERYTHING), when a file belongs to no crate and is not
 documentation or a known CI file (so an unknown file is never silently skipped), or when `--all` is given or the
 diff cannot be computed. Nothing is affected when only documentation changed: `*.md`, `docs/**` (except BUILD files
-under it, which are Bazel packages), `LICENSE*`, `.gitignore`. A crate's own `README.md` is the exception: the
-crates include it as their crate documentation, so its doctests are part of the crate.
+under it, which are Bazel packages), `LICENSE*`, `.gitignore`. Two exceptions: a crate's own `README.md` (the crates
+include it as their crate documentation, so its doctests are part of the crate) and any `.md` under a member's src/,
+tests/, examples/ or benches/ (compile data there) count for their crate. A file that a member's BUILD.bazel names by
+label (`//:docs/x.md` in a test's `data`) affects that member whatever it is, documentation included: the test reads it.
 
 The root Bazel files (MODULE.bazel, MODULE.bazel.lock, .bazelrc, .bazelversion, .bazelignore and the root
 BUILD.bazel) are root build files. A crate's own BUILD.bazel affects that crate; the generator crate's stale test
@@ -54,6 +56,7 @@ import argparse
 import fnmatch
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -107,11 +110,13 @@ def matches(path, patterns):
 
 
 class Graph:
-    """The workspace's crates: name -> directory (repo-relative, `` for the root) and name -> dependencies."""
+    """The workspace's crates: name -> directory (repo-relative, `` for the root), name -> dependencies, and the files
+    outside a crate that a crate's targets read (repo-relative path -> the crates whose BUILD file names it)."""
 
-    def __init__(self, dirs, deps):
+    def __init__(self, dirs, deps, data=None):
         self.dirs = dirs
         self.deps = deps  # name -> set of workspace crates it depends on
+        self.data = data or {}
 
     @classmethod
     def from_metadata(cls, metadata):
@@ -144,7 +149,9 @@ class Graph:
             capture_output=True,
             text=True,
         ).stdout
-        return cls.from_metadata(json.loads(out))
+        graph = cls.from_metadata(json.loads(out))
+        graph.data = data_inputs(root, graph.dirs)
+        return graph
 
     def crate_of(self, path):
         """The crate whose directory holds `path`, the longest directory winning."""
@@ -168,12 +175,34 @@ class Graph:
         return out
 
 
+# A label of a file in a BUILD file: `//:docs/x.md` (the root package) or `//pkg:file`.
+LABEL = re.compile(r'"//([\w./-]*):([^"]+)"')
+
+
+def data_inputs(root, dirs):
+    """{path: crates} for every file a member's BUILD.bazel names by label (a test's `data`, say) that is a file of the
+    repository; a label of a target (`//:workspace_sources`) is no file and is left out."""
+    out = {}
+    for name, d in dirs.items():
+        try:
+            with open(os.path.join(root, d, "BUILD.bazel")) as f:
+                text = f.read()
+        except FileNotFoundError:
+            continue
+        for package, target in LABEL.findall(text):
+            path = f"{package}/{target}" if package else target
+            if os.path.isfile(os.path.join(root, path)):
+                out.setdefault(path, set()).add(name)
+    return out
+
+
 def affected(graph, files, workflow_is_everything=True):
     """(set of affected crates, everything?, reason) for the changed repo-relative `files`.
 
     `ci.yml` is everything for the workspace jobs and, with `workflow_is_everything` false, nothing for Miri."""
     seed = set()
     for f in files:
+        seed |= graph.data.get(f, set())  # read by a crate's target, whatever else the file is
         if matches(f, CI_NO_CRATES):
             continue
         if f in CI_WORKFLOWS:
@@ -182,10 +211,10 @@ def affected(graph, files, workflow_is_everything=True):
             continue
         crate = graph.crate_of(f)
         if crate is not None:
-            if f.endswith(".md") and os.path.basename(f) != "README.md":
+            inside = f[len(graph.dirs[crate]) + 1:]
+            if f.endswith(".md") and os.path.basename(f) != "README.md" and not inside.startswith(STALE_INPUT_DIRS):
                 continue
             seed.add(crate)
-            inside = f[len(graph.dirs[crate]) + 1:]
             if BAZEL_GEN in graph.dirs and (
                 inside in STALE_INPUT_FILES
                 or inside.startswith(STALE_INPUT_DIRS)

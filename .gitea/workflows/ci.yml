@@ -408,14 +408,20 @@ jobs:
       ARBITER_ARGS: "--threads 1 --mem 1G"
       ARBITER_EST: "60"
     steps:
+      # The token stays out of the clone's configuration; nothing after this step reads it from there.
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       # Outside the workspace, so the checked tree is this repository's alone. The job's own token reaches git for this
-      # one command as a header, as in the `windows` job: not stored, not printed, no redirect followed.
+      # one command as a header, as in the `windows` job: not written to any git configuration, not printed, no redirect
+      # followed. Every step that runs forge's code or holds the token takes its tools from the image's system
+      # directories only: /cache comes first on the image's PATH and an earlier pull request's job can write it.
       - name: Fetch forge's main (gitea)
         env:
           FORGE_URL: ${{ vars.FORGE_URL }}
           FORGE_TOKEN: ${{ github.token }}
+          PATH: /usr/bin:/bin
         run: |
           test -n "$FORGE_URL" || { echo "the variable FORGE_URL is unset"; exit 1; }
           auth=$(printf 'x-access-token:%s' "$FORGE_TOKEN" | base64 -w0)
@@ -429,7 +435,23 @@ jobs:
           test -f "$RUNNER_TEMP/forge/build/scripts/check-repo.sh" || { echo "forge's main has no repo check script"; exit 1; }
           echo "forge main at $(git -C "$RUNNER_TEMP/forge" rev-parse HEAD)"
 
+      # The `bazel` job runs C7 from its own copy of the query, so forge's script must still build exactly that query: these
+      # are its two lines that do (the tag pattern and the query; test_workflow_twins.py checks that they render to the
+      # `bazel` job's query). When forge changes C7, this fails until both are updated.
+      - name: forge's C7 is the query the bazel job runs (gitea)
+        env:
+          PATH: /usr/bin:/bin
+        run: |
+          while IFS= read -r line; do
+            grep -qF -- "$line" "$RUNNER_TEMP/forge/build/scripts/check-repo.sh" || { printf "forge's C7 no longer has: %s\n" "$line"; exit 1; }
+          done <<'C7'
+          tag() { printf '(\\[|, )%s(,|\\])' "$1"; }
+          query "attr(tags, \"$(tag gpu)\", //...) except attr(tags, \"$(tag external)\", //...)"
+          C7
+
       - name: forge's repo check, C7 aside (gitea)
+        env:
+          PATH: /usr/bin:/bin
         run: bash "$RUNNER_TEMP/forge/build/scripts/check-repo.sh" --skip-c7 .
 
   # `bazel test //... --config=ci` (the stale test of the BUILD files included) on the bazel label: Bazel 9.3.3 from the

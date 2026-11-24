@@ -381,30 +381,55 @@ class Gitea(unittest.TestCase):
 
 
 # forge's C7 (build/scripts/check-repo.sh), copied: the bazel label has no token to fetch the script, so the `bazel` job runs
-# this query itself and the `check-repo` job runs the rest with --skip-c7.
+# this query itself and the `check-repo` job runs the rest with --skip-c7, after checking that forge's script still builds
+# this query.
 FORGE_C7 = 'attr(tags, "(\\[|, )gpu(,|\\])", //...) except attr(tags, "(\\[|, )external(,|\\])", //...)'
 FORGE_CHECK = '"$RUNNER_TEMP/forge/build/scripts/check-repo.sh"'
+SYSTEM_PATH = {"PATH": "/usr/bin:/bin"}  # the image's own tools: /cache, first on its PATH, is writable by earlier jobs
+C7_RUN = (
+    f"untagged=$(bazel query '{FORGE_C7}')\n"  # its own line, so a failed query fails the step (bash -e)
+    'if [ -n "$untagged" ]; then\n'
+    "  printf 'tagged gpu but not external:\\n%s\\n' \"$untagged\"\n"
+    "  exit 1\n"
+    "fi\n"
+)
+# The last three steps of both files' `bazel` job, exactly: a step-level `if`, an extra key or an edited line is a change.
+BAZEL_STEPS = [
+    {"name": "Bazel test", "run": "bazel test //... --config=ci"},
+    {"name": "Every gpu target is also external (C7)", "run": C7_RUN},
+    # Whatever failed: the caches are collected only in an idle server, and a running one holds the lease.
+    {"name": "Stop the Bazel server", "if": "always()", "run": "bazel shutdown"},
+]
 
 
 def step(doc, job, name):
     return next(s for s in steps(doc, job) if s.get("name") == name)
 
 
+def render_forge_c7(lines):
+    """The query that forge's two C7 lines (the tag pattern and the query) build, as bash would."""
+    tag_line, query_line = lines
+    pattern = re.fullmatch(r"""tag\(\) \{ printf '(.*)' "\$1"; \}""", tag_line).group(1).replace("\\\\", "\\")
+    query = re.fullmatch(r'query "(.*)"', query_line).group(1).replace('\\"', '"')
+    return re.sub(r"\$\(tag (\w+)\)", lambda m: pattern.replace("%s", m.group(1)), query)
+
+
 class Bazel(unittest.TestCase):
-    def test_both_files_run_the_bazel_tests_and_c7_and_shut_the_server_down(self):
+    def test_both_files_run_exactly_the_bazel_tests_c7_and_the_shutdown(self):
+        gitea = [{"name": "Copy the runner's checkout (gitea)", "run": "cp -a /checkout/. ."}] + BAZEL_STEPS
+        github = [
+            {"uses": "actions/checkout@v4"},
+            {
+                "name": "Bazel is the version in .bazelversion (github)",
+                "run": 'have=$(bazel --version)\n'
+                'test "$have" = "bazel $(cat .bazelversion)" || '
+                '{ echo "bazel is \'$have\', .bazelversion says $(cat .bazelversion)"; exit 1; }\n',
+            },
+        ] + BAZEL_STEPS
+        self.assertEqual(steps(GITEA, "bazel"), gitea)
+        self.assertEqual(steps(GITHUB, "bazel"), github)
         for doc, name in ((GITEA, "gitea"), (GITHUB, "github")):
-            job = doc["jobs"]["bazel"]
-            self.assertEqual(job["defaults"], {"run": {"shell": "bash"}}, name)
-            self.assertEqual(step(doc, "bazel", "Bazel test")["run"], "bazel test //... --config=ci", name)
-            c7 = step(doc, "bazel", "Every gpu target is also external (C7)")["run"]
-            # The query's own line, so a failed query fails the step (bash -e); a target it lists fails it too.
-            self.assertIn(f"untagged=$(bazel query '{FORGE_C7}')\n", c7, name)
-            self.assertIn('if [ -n "$untagged" ]; then', c7, name)
-            self.assertIn("exit 1", c7, name)
-            # The last step, whatever failed: the caches are collected only in an idle server, and a running one holds
-            # the lease.
-            last = steps(doc, "bazel")[-1]
-            self.assertEqual((last["run"], last["if"]), ("bazel shutdown", "always()"), name)
+            self.assertEqual(doc["jobs"]["bazel"]["defaults"], {"run": {"shell": "bash"}}, name)
             self.assertIn("bazel", doc["jobs"]["ci-ok"]["needs"], name)
 
     def test_the_gitea_bazel_job_is_on_the_bazel_label_and_reads_no_token(self):
@@ -412,7 +437,6 @@ class Bazel(unittest.TestCase):
         self.assertEqual(job["runs-on"], "arbiter-docker-bazel")
         # The runner gives the job no token, so actions/checkout cannot work: the job copies the runner's checkout.
         self.assertEqual([s for s in job["steps"] if "uses" in s], [])
-        self.assertEqual(job["steps"][0]["run"], "cp -a /checkout/. .")
         text = json.dumps(job)
         self.assertIsNone(SECRETS.search(text))
         for token in ("github.token", "GITEA_TOKEN", "GITHUB_TOKEN", "vars."):
@@ -421,13 +445,18 @@ class Bazel(unittest.TestCase):
         self.assertEqual(job["env"]["ARBITER_ARGS"], "--threads 8 --mem 8G")
         self.assertNotIn("--local_resources", text)
 
-    def test_the_github_bazel_job_runs_the_pinned_bazel_and_not_on_a_one_os_run(self):
+    def test_bazel_in_ci_is_held_to_the_leases_threads(self):
+        with open(os.path.join(ROOT, ".bazelrc")) as f:
+            lines = [line.split() for line in f if line.strip() and not line.startswith("#")]
+        cpu = [flag for line in lines if line[0] in ("build:ci", "test:ci", "common:ci") for flag in line[1:]
+               if flag.startswith("--local_resources=cpu=")]
+        threads = re.fullmatch(r"--threads (\d+) --mem \d+G", GITEA["jobs"]["bazel"]["env"]["ARBITER_ARGS"]).group(1)
+        self.assertEqual(cpu, [f"--local_resources=cpu={threads}"])
+
+    def test_the_github_bazel_job_does_not_run_on_a_one_os_run(self):
         job = GITHUB["jobs"]["bazel"]
         self.assertEqual(job["runs-on"], "ubuntu-latest")
         self.assertEqual(job["if"], "needs.changes.outputs.any == 'true' && (!inputs.only_os || inputs.only_os == 'all')")
-        version = step(GITHUB, "bazel", "Bazel is the version in .bazelversion (github)")
-        self.assertLess(job["steps"].index(version), job["steps"].index(step(GITHUB, "bazel", "Bazel test")))
-        self.assertIn('test "$have" = "bazel $(cat .bazelversion)"', version["run"])
 
     def test_the_repo_check_is_forges_main_and_fails_when_it_cannot_be_fetched(self):
         job = GITEA["jobs"]["check-repo"]
@@ -435,10 +464,18 @@ class Bazel(unittest.TestCase):
         self.assertEqual(job["defaults"], {"run": {"shell": "bash"}})
         self.assertIn("check-repo", GITEA["jobs"]["ci-ok"]["needs"])
         self.assertNotIn("check-repo", GITHUB["jobs"])
-        fetch = step(GITEA, "check-repo", "Fetch forge's main (gitea)")
-        check = step(GITEA, "check-repo", "forge's repo check, C7 aside (gitea)")
-        self.assertLess(job["steps"].index(fetch), job["steps"].index(check))
-        self.assertEqual(fetch["env"], {"FORGE_URL": "${{ vars.FORGE_URL }}", "FORGE_TOKEN": "${{ github.token }}"})
+        names = ["Fetch forge's main (gitea)", "forge's C7 is the query the bazel job runs (gitea)",
+                 "forge's repo check, C7 aside (gitea)"]
+        # The token is not left in the clone's .git/config.
+        self.assertEqual(job["steps"][0], {"uses": "actions/checkout@v4", "with": {"persist-credentials": False}})
+        self.assertEqual([s.get("name") for s in job["steps"][1:]], names)
+        fetch, c7, check = job["steps"][1:]
+        for s in (fetch, c7, check):
+            self.assertEqual(set(s), {"name", "env", "run"}, s["name"])  # no `if`, no `continue-on-error`
+        self.assertEqual(fetch["env"], {"FORGE_URL": "${{ vars.FORGE_URL }}", "FORGE_TOKEN": "${{ github.token }}"} | SYSTEM_PATH)
+        self.assertEqual(c7["env"], SYSTEM_PATH)
+        self.assertEqual(check["env"], SYSTEM_PATH)  # the token is the fetch's alone
+        self.assertEqual(check["run"], f"bash {FORGE_CHECK} --skip-c7 .")
         run = fetch["run"]
         self.assertIn('"$FORGE_URL/euhedral/forge.git" refs/heads/main\n', run)  # main by its full ref, nothing else
         self.assertIn('git -C "$RUNNER_TEMP/forge" checkout -q --detach FETCH_HEAD', run)
@@ -449,8 +486,21 @@ class Bazel(unittest.TestCase):
         self.assertIn("GIT_CONFIG_KEY_1=http.followRedirects GIT_CONFIG_VALUE_1=false", run)
         self.assertNotIn("git config", run)
         self.assertEqual(run.count("$FORGE_TOKEN"), 1)  # only into the header, never echoed
-        self.assertEqual(check["run"], f"bash {FORGE_CHECK} --skip-c7 .")
-        self.assertNotIn("env", check)  # the token is the fetch's alone
+
+    def test_forges_c7_lines_build_the_query_the_bazel_job_runs(self):
+        lines = [
+            """tag() { printf '(\\\\[|, )%s(,|\\\\])' "$1"; }""",
+            '''query "attr(tags, \\"$(tag gpu)\\", //...) except attr(tags, \\"$(tag external)\\", //...)"''',
+        ]
+        c7 = step(GITEA, "check-repo", "forge's C7 is the query the bazel job runs (gitea)")["run"]
+        self.assertEqual(
+            c7,
+            "while IFS= read -r line; do\n"
+            f'  grep -qF -- "$line" {FORGE_CHECK} || '
+            '{ printf "forge\'s C7 no longer has: %s\\n" "$line"; exit 1; }\n'
+            "done <<'C7'\n" + "\n".join(lines) + "\nC7\n",
+        )
+        self.assertEqual(render_forge_c7(lines), FORGE_C7)
 
     def test_no_job_runs_a_check_repo_script_of_the_checkout(self):
         # The code under test must not supply its own checker: every check-repo.sh named is the one fetched from forge.
@@ -461,18 +511,21 @@ class Bazel(unittest.TestCase):
                     self.assertEqual(run.count("check-repo.sh"), run.count(FORGE_CHECK), f"{name}: {job}")
 
     def test_every_bazel_input_runs_the_bazel_jobs(self):
-        # The jobs run when `any` is set: every Rust, Cargo, BUILD, MODULE, .bazel* and generator file sets it.
+        # The jobs run when `any` is set: every Rust, Cargo, BUILD, MODULE, .bazel* and generator file sets it, and so
+        # does a document that a crate's target reads (its BUILD file names it in `data`).
+        audit = "docs/specs/audit.md"
         graph = affected.Graph(
             {"euhedral-core": "euhedral-core", "euhedral-bazel-gen": "tools/bazel-gen"},
             {"euhedral-core": set(), "euhedral-bazel-gen": set()},
+            {audit: {"euhedral-core"}},
         )
         inputs = [
             "euhedral-core/src/lib.rs", "euhedral-core/tests/new_test.rs", "euhedral-core/examples/e.rs",
             "euhedral-core/benches/b.rs", "euhedral-core/build.rs", "euhedral-core/Cargo.toml", "euhedral-core/README.md",
-            "euhedral-core/BUILD.bazel", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "mise.toml", "BUILD.bazel",
-            "MODULE.bazel", "MODULE.bazel.lock", ".bazelrc", ".bazelversion", ".bazelignore", ".gitattributes",
-            "build/module/MODULE.bazel", "build/module/platforms/BUILD.bazel", "docs/x/BUILD.bazel",
-            "tools/bazel-gen/src/main.rs", "tools/bazel-gen/BUILD.bazel", ".gitea/workflows/ci.yml",
+            "euhedral-core/src/notes.md", "euhedral-core/BUILD.bazel", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml",
+            "mise.toml", "BUILD.bazel", "MODULE.bazel", "MODULE.bazel.lock", ".bazelrc", ".bazelversion", ".bazelignore",
+            ".gitattributes", "build/module/MODULE.bazel", "build/module/platforms/BUILD.bazel", "docs/x/BUILD.bazel",
+            "tools/bazel-gen/src/main.rs", "tools/bazel-gen/BUILD.bazel", ".gitea/workflows/ci.yml", audit,
         ]
         for f in inputs:
             crates, everything, reason = affected.affected(graph, [f])
@@ -480,7 +533,6 @@ class Bazel(unittest.TestCase):
         for doc in (GITEA, GITHUB):
             self.assertTrue(doc["jobs"]["bazel"]["if"].startswith("needs.changes.outputs.any == 'true'"))
         self.assertEqual(GITEA["jobs"]["check-repo"]["if"], "needs.changes.outputs.any == 'true'")
-
 
 if __name__ == "__main__":
     unittest.main()
