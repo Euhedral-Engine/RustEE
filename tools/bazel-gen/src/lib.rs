@@ -166,35 +166,32 @@ pub fn build_files_on_disk(root: &Path) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
-/// The `name version` of every package in `Cargo.lock` that comes from a registry.
-pub fn registry_packages(cargo_lock: &str) -> Vec<String> {
+/// The `name version` of every package in `Cargo.lock`, whatever its source (registry, sparse registry, git or a path
+/// outside the workspace). The workspace members are the caller's to drop: the lock file knows them.
+pub fn locked_packages(cargo_lock: &str) -> Vec<String> {
     let mut found = Vec::new();
-    let (mut name, mut version, mut registry) = (None, None, false);
-    let mut close =
-        |name: &mut Option<String>, version: &mut Option<String>, registry: &mut bool| {
-            if let (Some(n), Some(v), true) = (name.take(), version.take(), *registry) {
-                found.push(format!("{n} {v}"));
-            }
-            *registry = false;
-        };
+    let (mut name, mut version) = (None, None);
+    let mut close = |name: &mut Option<String>, version: &mut Option<String>| {
+        if let (Some(n), Some(v)) = (name.take(), version.take()) {
+            found.push(format!("{n} {v}"));
+        }
+    };
     for line in cargo_lock.lines() {
         if line.starts_with("[[package]]") {
-            close(&mut name, &mut version, &mut registry);
+            close(&mut name, &mut version);
         } else if let Some(v) = line.strip_prefix("name = ") {
             name = Some(v.trim_matches('"').to_owned());
         } else if let Some(v) = line.strip_prefix("version = ") {
             version = Some(v.trim_matches('"').to_owned());
-        } else if line.starts_with("source = \"registry+") {
-            registry = true;
         }
     }
-    close(&mut name, &mut version, &mut registry);
+    close(&mut name, &mut version);
     found.sort();
     found
 }
 
-/// What is wrong with `cargo-bazel-lock.json` next to `Cargo.lock`: a registry package of `Cargo.lock` the lock has no
-/// crate for, or a crate of the lock (a workspace member aside) that `Cargo.lock` lacks. crate_universe's own digest does
+/// What is wrong with `cargo-bazel-lock.json` next to `Cargo.lock`: a package of `Cargo.lock` that is not a workspace member and
+/// the lock has no crate for, or a crate of the lock (a workspace member aside) that `Cargo.lock` lacks. crate_universe's own digest does
 /// not cover `Cargo.lock`, so a `cargo update` without a repin would otherwise build the old versions without a word.
 /// Empty when they agree.
 pub fn lock_problems(cargo_lock: &str, bazel_lock: &str) -> Result<Vec<String>, String> {
@@ -211,7 +208,10 @@ pub fn lock_problems(cargo_lock: &str, bazel_lock: &str) -> Result<Vec<String>, 
         .into_iter()
         .filter(|key| !members.contains(key))
         .collect();
-    let wanted = registry_packages(cargo_lock);
+    let wanted: Vec<String> = locked_packages(cargo_lock)
+        .into_iter()
+        .filter(|package| !members.contains(package))
+        .collect();
     let mut problems = Vec::new();
     for package in wanted.iter().filter(|p| !locked.contains(p)) {
         problems.push(format!(
@@ -283,5 +283,28 @@ mod tests {
             ])
         );
         assert!(lock_problems(cargo_lock, "{}").is_err());
+    }
+
+    #[test]
+    fn a_git_sparse_or_path_package_is_compared_like_a_registry_one() {
+        let cargo_lock = "[[package]]\nname = \"a\"\nversion = \"1.0.0\"\nsource = \"registry+x\"\n\n\
+            [[package]]\nname = \"g\"\nversion = \"0.2.0\"\nsource = \"git+https://example.invalid/g#abc\"\n\n\
+            [[package]]\nname = \"s\"\nversion = \"0.3.0\"\nsource = \"sparse+https://example.invalid/\"\n\n\
+            [[package]]\nname = \"p\"\nversion = \"0.4.0\"\n\n\
+            [[package]]\nname = \"me\"\nversion = \"0.1.0\"\n";
+        let members = r#""workspace_members":{"me 0.1.0":"."}"#;
+        let all = format!(
+            r#"{{{members},"crates":{{"a 1.0.0":{{}},"g 0.2.0":{{}},"s 0.3.0":{{}},"p 0.4.0":{{}},"me 0.1.0":{{}}}}}}"#
+        );
+        assert_eq!(lock_problems(cargo_lock, &all), Ok(vec![]));
+        let missing = format!(r#"{{{members},"crates":{{"a 1.0.0":{{}},"me 0.1.0":{{}}}}}}"#);
+        assert_eq!(
+            lock_problems(cargo_lock, &missing),
+            Ok(vec![
+                "g 0.2.0 is in Cargo.lock but not in cargo-bazel-lock.json".to_owned(),
+                "p 0.4.0 is in Cargo.lock but not in cargo-bazel-lock.json".to_owned(),
+                "s 0.3.0 is in Cargo.lock but not in cargo-bazel-lock.json".to_owned(),
+            ])
+        );
     }
 }

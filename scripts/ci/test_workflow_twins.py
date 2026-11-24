@@ -393,14 +393,14 @@ C7_RUN = (
     "  exit 1\n"
     "fi\n"
 )
-# The last three steps of both files' `bazel` job, exactly: a step-level `if`, an extra key or an edited line is a change.
+# The last four steps of both files' `bazel` job, exactly: a step-level `if`, an extra key or an edited line is a change.
 BAZEL_STEPS = [
     {
         "name": "The crate lock is current",
         "run": 'kept=$(mktemp -d)\n'
-        'cp cargo-bazel-lock.json MODULE.bazel.lock "$kept"\n'
+        'cp cargo-bazel-lock.json MODULE.bazel.lock Cargo.lock "$kept"\n'
         'CARGO_BAZEL_REPIN=1 bazel mod deps --lockfile_mode=update\n'
-        'for lock in cargo-bazel-lock.json MODULE.bazel.lock; do\n'
+        'for lock in cargo-bazel-lock.json MODULE.bazel.lock Cargo.lock; do\n'
         '  cmp "$kept/$lock" "$lock" || { echo "$lock is stale: run CARGO_BAZEL_REPIN=1 bazel mod deps '
         '--lockfile_mode=update and commit it"; exit 1; }\n'
         'done\n',

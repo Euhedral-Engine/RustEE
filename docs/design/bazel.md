@@ -156,18 +156,20 @@ second Cargo workspace uses it.
     pull request that can make BUILD files stale, and some that cannot.
   - **The locks:** `crate.from_cargo` sets `lockfile = "//:cargo-bazel-lock.json"`, because Bazel refuses a
     non-root module's crate_universe repository without one (a downstream module could not depend on this one).
-    crate_universe's own check of that file hashes the lock, the config, the splicing manifest and the cargo and
-    rustc versions, but not `Cargo.lock` and not the contents of a manifest (verified on rules_rust 0.75.0: a
-    `cargo update --precise` and a changed requirement in a member's `Cargo.toml` both build without a word). So the
-    lock is enforced twice, by ours. The stale test compares the registry packages of `Cargo.lock` (`name version`)
-    with the crates of `cargo-bazel-lock.json` (workspace members aside), both ways, and names the packages that
-    differ; it runs under Cargo and Bazel. The `bazel` CI job also repins a copy before `bazel test` and fails when
-    either lock changes, which catches everything the digest and the package comparison do not (a feature or
-    requirement change, a toolchain bump). The repin is deterministic (two runs give identical files). One command
-    refreshes both locks after `cargo update`, an edit of a `Cargo.toml` or of `MODULE.bazel`:
-    `CARGO_BAZEL_REPIN=1 bazel mod deps --lockfile_mode=update`. `MODULE.bazel.lock` is still checked by
-    `--lockfile_mode=error`: any edit to a member's `Cargo.toml` or `MODULE.bazel` fails every Bazel command until it
-    is regenerated.
+    With `lockfile` set, rules_rust 0.75.0 treats the `crate` extension as reproducible (`extensions.bzl`), so it
+    leaves `MODULE.bazel.lock` (no `%crate`, `FILE:@@//...Cargo.toml` or `ENV:` lines remain), and crate_universe's own
+    digest of `cargo-bazel-lock.json` hashes the lock, the config, the splicing manifest and the cargo and rustc
+    versions, but not `Cargo.lock` and not the contents of a manifest. **A local Bazel build therefore does not notice a
+    stale crate lock**: a `cargo update --precise`, a changed requirement or a feature change in a member's
+    `Cargo.toml` all build without a word. Two checks of ours enforce it. The stale test compares every package of
+    `Cargo.lock` that is not a workspace member (`name version`, whatever its source) with the crates of
+    `cargo-bazel-lock.json`, both ways, and names the packages that differ; it compares packages and versions only, not
+    features, and runs under Cargo and Bazel. The `bazel` CI job's step "The crate lock is current" repins a copy before
+    `bazel test` and fails when `cargo-bazel-lock.json`, `MODULE.bazel.lock` or `Cargo.lock` changes, which catches
+    what the package comparison does not (a feature or requirement change, a toolchain bump). The repin is
+    deterministic (two runs give identical files). One command refreshes the locks after `cargo update`, an edit of a
+    `Cargo.toml` or of `MODULE.bazel`: `CARGO_BAZEL_REPIN=1 bazel mod deps --lockfile_mode=update`. Only an edit of
+    `MODULE.bazel` itself fails a local Bazel command (`--lockfile_mode=error` on `MODULE.bazel.lock`).
 
   Its failure message names the stale files and the command that fixes them. Regenerating is the duty of whoever
   changes a `Cargo.toml` or adds a target file. The root `README.md` says so in one line, and the stale test enforces
@@ -429,7 +431,7 @@ merges before it.
    - `.bazelignore` with `target` and `.claude`. Without `.claude`, `//...` descends into agent worktrees, even ones
      with their own `MODULE.bazel`.
    - In `.gitignore`: `/bazel-*` and `user.bazelrc`.
-   - `.gitattributes` (LF for the Bazel files, `Cargo.toml` and `Cargo.lock`) and `MODULE.bazel.lock`. The pin test
+   - `.gitattributes` (LF for the Bazel files, `Cargo.toml` and `Cargo.lock`) `MODULE.bazel.lock` and `cargo-bazel-lock.json`. The pin test
      is extended to `MODULE.bazel`, and its failure message names `bazel mod deps`.
    - `scripts/ci/affected.py` and its tests: the root Bazel files (`MODULE.bazel`, `MODULE.bazel.lock`, `.bazelrc`,
      `.bazelversion`, `.bazelignore`, the root `BUILD.bazel`) affect everything (the full Cargo run and every Miri
@@ -446,7 +448,7 @@ merges before it.
      to write if the testing world resolves that feature, so `bazel test //...` never opens the card without a grant;
    - `[package.metadata.bazel]` for `hot_fix_ratchet` and `layering` and the `cpus` of the lattice tests, and the root
      `workspace_sources` filegroup;
-   - in the root `BUILD.bazel`, `exports_files(["Cargo.toml", "Cargo.lock", "MODULE.bazel", "MODULE.bazel.lock",
+   - in the root `BUILD.bazel`, `exports_files(["Cargo.toml", "Cargo.lock", "MODULE.bazel", "cargo-bazel-lock.json",
      "mise.toml", "rust-toolchain.toml"])`, so the stale and pin tests in `//tools/bazel-gen` can name those root
      files in their `data`;
    - the root README's line on regenerating.
@@ -581,6 +583,8 @@ Three things follow from how Bazel loads a non-root module:
   with "Unable to load package for //:MODULE.bazel" without it.
 - Targets are named with underscores: `@euhedral_rustee//euhedral-core:euhedral_core`. The consumer's build resolves the
   third-party crates from this repository's `cargo-bazel-lock.json`; it does not run crate_universe's repin.
+- rules_rust takes the Rust toolchain from the root module only: the consumer's build uses the toolchain its own
+  `MODULE.bazel` registers, not RustEE's pin (1.99.1). A consumer that needs RustEE's compiler registers the same version.
 
 ## Proposed changes to forge's CONTRACTS.md
 

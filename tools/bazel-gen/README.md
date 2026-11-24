@@ -67,13 +67,12 @@ An unknown key, or a name that is not a target of the package, is refused.
 
 ## Dependencies
 
-None. The lock holds no JSON, TOML or SHA-256 crate, and adding `cargo_metadata`, `serde` or `toml` would bring a dozen
-crates into every RustEE build for one tool. The crate carries a small JSON reader, the subset of TOML `[lints]` uses, and
-SHA-256 for the lock check.
+None. The lock holds no JSON or TOML crate, and adding `cargo_metadata`, `serde` or `toml` would bring a dozen
+crates into every RustEE build for one tool. The crate carries a small JSON reader, the subset of TOML `[lints]` uses.
 
 ## Tests
 
-- The unit tests cover the JSON reader, the cfg evaluator, the `[lints]` reader, SHA-256, the rule writer, the stale
+- The unit tests cover the JSON reader, the cfg evaluator, the `[lints]` reader, the rule writer, the stale
   comparison and the lock check, and, on a small workspace (`src/fixture_tests.rs`), the feature worlds, the tags, the
   refusals and Windows paths.
 - `tests/stale.rs` regenerates from the workspace and fails when a BUILD file differs, when a BUILD file on disk is

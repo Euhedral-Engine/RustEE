@@ -3,6 +3,18 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## The crate lock docs and checks say what is enforced (build) (2026-11-24)
+
+**What.** `MODULE.bazel`, `.bazelrc` and `docs/design/bazel.md` no longer say a stale `cargo-bazel-lock.json` fails every Bazel command: with `lockfile` set, rules_rust treats the `crate` extension as reproducible and leaves it out of `MODULE.bazel.lock`, so a local Bazel build does not notice a stale crate lock. bazel-gen's stale test now compares every `Cargo.lock` package that is not a workspace member with the crates of `cargo-bazel-lock.json` (it compared registry packages only, so a git, sparse or out-of-workspace path dependency could never match). The CI step "The crate lock is current" also compares `Cargo.lock`, which a repin can rewrite. The consumer section says rules_rust takes the Rust toolchain from the root module only; stale text about SHA-256 and the lock check is fixed.
+
+**Why.** A stated guarantee that nothing enforces misleads: the checks that hold are the CI step (feature and requirement changes included) and the stale test (packages and versions only).
+
+**How to use.** Nothing changes for a developer: after `cargo update` or an edit of a `Cargo.toml` or `MODULE.bazel`, run `CARGO_BAZEL_REPIN=1 bazel mod deps --lockfile_mode=update` and commit the locks (and `Cargo.lock` if the repin changed it).
+
+**Semantics.** The stale test's failure message is unchanged; it now names any non-member package either lock lacks. The CI step fails when the repin changes `Cargo.lock` as well as the two lock files. No library source changes.
+
+**Tests.** `a_git_sparse_or_path_package_is_compared_like_a_registry_one` in `tools/bazel-gen` (fails on the registry-only filter); the workflow twins test pins the step text in both workflow files.
+
 ## Another Bazel module can depend on RustEE (build) (2026-11-24)
 
 **What.** `crate.from_cargo` sets `lockfile = "//:cargo-bazel-lock.json"` and the file is committed, so a module that depends on `euhedral_rustee` resolves (Bazel refused a non-root crate_universe repository without a lock). `cargo-bazel-lock.json` has the same `eol=lf` entry as `MODULE.bazel.lock`. The stale test's check of `MODULE.bazel.lock`'s manifest digests (which the lock no longer records) is replaced by a comparison of `Cargo.lock`'s registry packages with the crates of `cargo-bazel-lock.json`, and the `bazel` CI job repins a copy of the tree and fails when either lock changes.

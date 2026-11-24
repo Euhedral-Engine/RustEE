@@ -365,9 +365,9 @@ jobs:
       - name: The crate lock is current
         run: |
           kept=$(mktemp -d)
-          cp cargo-bazel-lock.json MODULE.bazel.lock "$kept"
+          cp cargo-bazel-lock.json MODULE.bazel.lock Cargo.lock "$kept"
           CARGO_BAZEL_REPIN=1 bazel mod deps --lockfile_mode=update
-          for lock in cargo-bazel-lock.json MODULE.bazel.lock; do
+          for lock in cargo-bazel-lock.json MODULE.bazel.lock Cargo.lock; do
             cmp "$kept/$lock" "$lock" || { echo "$lock is stale: run CARGO_BAZEL_REPIN=1 bazel mod deps --lockfile_mode=update and commit it"; exit 1; }
           done
 
