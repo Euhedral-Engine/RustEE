@@ -86,7 +86,7 @@ fn content(len: usize) -> Vec<u8> {
 
 /// A file of `bytes` in cargo's scratch directory for these tests, opened through `io`.
 fn open_file(io: &AsyncIo, name: &str, bytes: &[u8]) -> (Scratch, OwnedFile) {
-    let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+    let path = common::scratch::test_scratch_dir(|| PathBuf::from(env!("CARGO_TARGET_TMPDIR")))
         .join(format!("io-owned-{name}-{}", std::process::id()));
     std::fs::write(&path, bytes).unwrap();
     let scratch = Scratch(path.clone());
