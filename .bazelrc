@@ -24,6 +24,9 @@ test:system --cache_test_results=no
 
 # C8
 build:ci --keep_going
+# The CI lease's threads (the `bazel` job's ARBITER_ARGS; test_workflow_twins.py checks they match): Bazel would size
+# its actions from every core of the host.
+build:ci --local_resources=cpu=8
 test:ci --keep_going
 test:ci --test_output=errors
 common:ci --color=no

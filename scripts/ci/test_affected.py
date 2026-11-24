@@ -4,6 +4,7 @@
 import json
 import os
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -127,6 +128,77 @@ class Affected(unittest.TestCase):
     def test_crate_readme_counts_but_other_md_does_not(self):
         self.assertEqual(run("euhedral-ds/README.md")[0], sorted(set(NAMES) - {"hash", "net", "bazelgen"}))
         self.assertEqual(run("euhedral-ds/GLOSSARY.md"), ([], False))
+
+    def test_a_md_under_a_crates_target_directories_counts(self):
+        # The BUILD globs take it as compile data (`src/**`, `tests/**`), so it is an input of the crate's targets.
+        for d in ("src", "tests", "examples", "benches"):
+            self.assertEqual(run(f"euhedral-net/{d}/notes.md"), (["bazelgen", "net"], False), d)
+
+    def test_a_doc_that_a_crates_target_reads_affects_that_crate(self):
+        # hot_fix_ratchet reads the audit doc: it is in the test's `data`, so a docs-only change to it still runs it.
+        audit = "docs/specs/audit.md"
+        g = A.Graph(DIRS, DEPS, {audit: {"net"}})
+        crates, everything, _ = A.affected(g, [audit])
+        self.assertEqual((sorted(crates), everything), (["net"], False))
+        self.assertEqual(run(audit), ([], False))  # without the label it is documentation
+
+    def data(self, files, dirs):
+        """data_inputs over a temporary tree holding `files` ({path: text}) and nothing else."""
+        with tempfile.TemporaryDirectory() as root:
+            for path, text in files.items():
+                os.makedirs(os.path.join(root, os.path.dirname(path)), exist_ok=True)
+                with open(os.path.join(root, path), "w") as f:
+                    f.write(text)
+            return A.data_inputs(root, dirs)
+
+    def crates_of(self, data, f):
+        crates, everything, _ = A.affected(A.Graph({n: n for n in "cde"}, {n: set() for n in "cde"}, data), [f])
+        return sorted(crates), everything
+
+    def test_the_data_labels_are_read_from_the_build_files(self):
+        data = self.data(
+            {
+                "c/BUILD.bazel": 'data = ["//:docs/audit.md", "//:workspace_sources", "//build/module:x.txt"]',
+                "d/BUILD.bazel": 'data = ["//:docs/audit.md", "@rules_rust//rust:defs.bzl", "../up.txt"]',
+            },
+            {"c": "c", "d": "d", "e": "e"},  # e has no BUILD file
+        )
+        self.assertEqual(data["docs/audit.md"], {"c", "d"})
+        self.assertEqual(data["build/module/x.txt"], {"c"})
+        # Another repository's label and a path out of the repository name no file of this one.
+        self.assertFalse([p for p in data if p.startswith(("rules_rust", "..", "/"))])
+
+    def test_a_deleted_or_renamed_data_file_still_affects_its_crate(self):
+        # The tree is the head's: the labelled doc is gone (deleted, or renamed: CI diffs with --no-renames).
+        data = self.data({"c/BUILD.bazel": 'data = ["//:docs/audit.md"]'}, {"c": "c"})
+        self.assertEqual(self.crates_of(data, "docs/audit.md"), (["c"], False))
+
+    def test_a_package_relative_data_path_is_resolved_in_its_package(self):
+        data = self.data({"c/BUILD.bazel": 'data = ["docs/x.md", ":docs/y.md"]'}, {"c": "c"})
+        self.assertEqual(self.crates_of(data, "c/docs/x.md"), (["c"], False))
+        self.assertEqual(self.crates_of(data, "c/docs/y.md"), (["c"], False))
+
+    def test_a_change_under_a_data_directory_affects_its_crate(self):
+        data = self.data({"c/BUILD.bazel": 'data = ["//:docs/specs", "//docs/more"]'}, {"c": "c"})
+        self.assertEqual(self.crates_of(data, "docs/specs/new.md"), (["c"], False))
+        self.assertEqual(self.crates_of(data, "docs/more/deep/a.txt"), (["c"], False))
+        self.assertEqual(self.crates_of(data, "docs/specs-other.md"), ([], False))  # a directory, not a prefix
+
+    def test_a_glob_names_every_file_under_its_literal_directory(self):
+        data = self.data({"c/BUILD.bazel": 'data = glob(["docs/**"])', "d/BUILD.bazel": 'data = glob(["**/*.md"])'}, {"c": "c", "d": "d"})
+        self.assertEqual(self.crates_of(data, "c/docs/notes.md"), (["c"], False))
+        self.assertEqual(self.crates_of(data, "c/GUIDE.md"), ([], False))  # outside the glob's directory
+        self.assertEqual(self.crates_of(data, "d/GUIDE.md"), (["d"], False))  # a leading wildcard: the whole package
+
+    def test_a_quoted_path_with_spaces_is_a_path(self):
+        data = self.data({"c/BUILD.bazel": 'data = ["//:docs/release notes.md", "my notes.md", ""]'}, {"c": "c"})
+        self.assertEqual(self.crates_of(data, "docs/release notes.md"), (["c"], False))
+        self.assertEqual(self.crates_of(data, "c/my notes.md"), (["c"], False))
+        self.assertEqual(self.crates_of(data, "c/OTHER.md"), ([], False))  # the empty string names no path
+
+    def test_a_crates_BUILD_file_is_read_like_its_BUILD_bazel(self):
+        data = self.data({"c/BUILD": 'data = ["//:docs/a.md"]', "d/BUILD.bazel": 'data = ["//:docs/a.md"]'}, {"c": "c", "d": "d"})
+        self.assertEqual(self.crates_of(data, "docs/a.md"), (["c", "d"], False))
 
     def test_docs_plus_one_crate(self):
         self.assertEqual(run("README.md", "euhedral-gpu/src/a.rs"), (["bazelgen", "gpu"], False))
