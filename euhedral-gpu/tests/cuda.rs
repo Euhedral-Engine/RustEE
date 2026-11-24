@@ -9,6 +9,8 @@
     reason = "the test thread is not a lattice worker: it polls and sleeps, and test fixtures use files"
 )]
 
+#[path = "common/scratch.rs"]
+mod scratch;
 #[path = "common/skip.rs"]
 mod skip;
 
@@ -455,7 +457,7 @@ mod modules {
 
     /// A fresh cache directory under the build's temporary directory.
     fn cache_dir(name: &str) -> PathBuf {
-        let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        let dir = scratch::test_scratch_dir(|| PathBuf::from(env!("CARGO_TARGET_TMPDIR")))
             .join(format!("{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
