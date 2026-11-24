@@ -1583,8 +1583,8 @@ impl AsyncIo {
     /// value is not taken for the old one. Sockets and files the engine made itself ([`socket_for`](Self::socket_for),
     /// accepted sockets, [`open_path`](Self::open_path)) need no call (on the engine that made them: used with a different `AsyncIo` they count as the caller's there, and the caller forgets them on it). A handle forgotten while it is still open
     /// is not harmed beyond this: its next join is refused by the system, the engine no longer takes that for its
-    /// own, and every later operation on it fails with `InvalidInput` ("belongs to another completion port"); none
-    /// hangs. Does nothing off Windows.
+    /// own, and every later operation on it is taken and ends in its completion with `InvalidInput` ("belongs to
+    /// another completion port"); none hangs. Does nothing off Windows.
     pub fn forget_socket(&self, socket: RawSock) {
         #[cfg(windows)]
         self.engine.forget(raw_sock(socket));

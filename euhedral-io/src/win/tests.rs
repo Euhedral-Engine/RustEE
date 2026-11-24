@@ -5,18 +5,19 @@ use std::cell::Cell;
 use std::io;
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use euhedral_core::frames::{Frame, FrameHeader};
 
+use super::handles::RouteState;
 use super::sim::{Op, Sim};
 use super::sys::{
     Handle, IORING_VERSION_3, RingProbe, SockAddr, hresult_error, socket_status_error,
     verbatim_path,
 };
-use super::{Engine, MAX_PIECE};
+use super::{Engine, Join, MAX_PIECE};
 use crate::{
     AsyncIoOptions, Buf, Cancelled, Create, Engine as EngineTrait, Front, IoBuf, IoDone,
     IoDoneOwned, LimitPassed, OpId, OpenSpec, Region, Request, Then,
@@ -734,7 +735,7 @@ fn a_file_keeps_its_route() {
         .sys
         .associate(h.engine.port.handle, joined)
         .unwrap();
-    h.engine.associated.insert(joined);
+    h.engine.mark_joined(joined);
     h.read(joined, 0, 10, 1).unwrap();
     assert_eq!(ended(h.one()).result.unwrap(), 10);
     assert_eq!(h.sim.rings_made(), 0, "no ring for a file on the port");
@@ -750,6 +751,197 @@ fn a_file_keeps_its_route() {
             .iter()
             .any(|l| l == &format!("associate {ringed:#x}")),
         "a ring-served file never joins the port"
+    );
+}
+
+/// What the second operation answered, once it ran.
+type Seen = Arc<Mutex<Option<io::Result<()>>>>;
+
+/// Runs `first` (the first operation on `handle`) with `second` made inside the first's
+/// `associate`, after the OS has decided it and before it returns: the moment another thread's
+/// first operation on the same handle meets the first one's claim.
+fn with_second_operation_inside_associate(
+    h: &Harness,
+    first: impl FnOnce() -> io::Result<()>,
+    second: impl Fn() -> io::Result<()> + Send + Sync + 'static,
+) -> (io::Result<()>, Seen) {
+    let entered = Arc::new(AtomicBool::new(false));
+    let seen = Arc::new(Mutex::new(None));
+    {
+        let seen = seen.clone();
+        h.sim.on_associate(Arc::new(move || {
+            if !entered.swap(true, Ordering::AcqRel) {
+                *seen.lock().unwrap() = Some(second());
+            }
+        }));
+    }
+    (first(), seen)
+}
+
+#[test]
+fn a_second_first_operation_during_a_join_is_held_until_it_ends_and_then_runs() {
+    let h = Harness::new();
+    let file = h.sim.file(&content(100));
+    let (engine, front) = (h.engine.clone(), h.front.clone());
+    let (first, second) = with_second_operation_inside_associate(
+        &h,
+        || h.read(file, 0, 10, 1),
+        move || {
+            front.pending.fetch_add(1, Ordering::AcqRel);
+            engine
+                .submit(
+                    Request::Read { file, offset: 10 },
+                    IoBuf {
+                        bytes: vec![0; 10],
+                        filled: 0,
+                    }
+                    .into(),
+                    io_then(2),
+                    None,
+                    &Cell::new(false),
+                )
+                .map(|_| ())
+        },
+    );
+    first.unwrap();
+    second.lock().unwrap().take().unwrap().unwrap();
+    let done = h.drain(2);
+    assert_eq!(
+        done.iter().map(|d| d.header.id_hash()).collect::<Vec<_>>(),
+        tag_ids([1, 2])
+    );
+    for done in done {
+        assert_eq!(ended(done).result.unwrap(), 10);
+    }
+    let joins = h
+        .sim
+        .log()
+        .iter()
+        .filter(|l| l.starts_with("associate"))
+        .count();
+    assert_eq!(joins, 1, "the handle joined the port once");
+    assert!(h.pull_with(&mut |_| false).is_empty(), "each only once");
+    assert_eq!(h.pending(), 0);
+}
+
+#[test]
+fn a_handle_on_another_port_is_refused_to_both_threads_and_leaves_no_claim() {
+    let h = Harness::new();
+    let file = h.sim.file(&content(100));
+    h.sim.joined_elsewhere(file);
+    let (engine, front) = (h.engine.clone(), h.front.clone());
+    let (first, second) = with_second_operation_inside_associate(
+        &h,
+        || h.read(file, 0, 10, 1),
+        move || {
+            front.pending.fetch_add(1, Ordering::AcqRel);
+            engine
+                .submit(
+                    Request::Read { file, offset: 10 },
+                    IoBuf {
+                        bytes: vec![0; 10],
+                        filled: 0,
+                    }
+                    .into(),
+                    io_then(2),
+                    None,
+                    &Cell::new(false),
+                )
+                .map(|_| ())
+        },
+    );
+    // Both operations are taken. The second could not tell, while the first call was in flight.
+    first.unwrap();
+    second.lock().unwrap().take().unwrap().unwrap();
+    for done in h.drain(2) {
+        let error = ended(done).result.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+    assert_eq!(h.engine.routes.get(file), None, "no claim is left");
+    assert!(
+        !h.sim.log().iter().any(|l| l.starts_with("associate")),
+        "nothing joined the port"
+    );
+    assert!(h.pull_with(&mut |_| false).is_empty(), "each only once");
+    assert_eq!(h.pending(), 0);
+    // The next operation is taken too, and ends with the same refusal.
+    h.read(file, 0, 10, 3).unwrap();
+    let error = ended(h.one()).result.unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+}
+
+#[test]
+fn a_thread_without_a_ring_never_joins_a_file_a_ring_serves() {
+    let h = Harness::with(Some(full_probe()), true, MAX_PIECE);
+    let file = h.sim.file(&content(100));
+    // This thread claims the file for its ring.
+    h.read(file, 0, 10, 1).unwrap();
+    // Another thread can make no ring: it is refused, and does not join the file to the port.
+    h.sim.fail_ring_create(true);
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| h.read(file, 10, 10, 2))
+            .join()
+            .unwrap()
+            .unwrap();
+    });
+    h.sim.fail_ring_create(false);
+    assert!(!h.sim.log().iter().any(|l| l.starts_with("associate")));
+    // Sorted by tag: the ring's read ends well, the other thread's ends with the refusal.
+    let mut done = h.drain(2).into_iter();
+    assert_eq!(ended(done.next().unwrap()).result.unwrap(), 10);
+    let error = ended(done.next().unwrap()).result.unwrap_err();
+    assert!(error.to_string().contains("IoRing"), "{error}");
+}
+
+#[test]
+fn a_file_one_thread_joins_while_another_makes_its_ring_goes_to_the_port_for_both() {
+    let h = Harness::with(Some(full_probe()), true, MAX_PIECE);
+    let file = h.sim.file(&content(100));
+    // While this thread makes its ring (before it claims the file's route), another thread,
+    // which can make none, takes the file to the port.
+    let (engine, front, sim) = (h.engine.clone(), h.front.clone(), h.sim.clone());
+    let entered = Arc::new(AtomicBool::new(false));
+    h.sim.on_ring_create(Arc::new(move || {
+        if entered.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        sim.fail_ring_create(true);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                front.pending.fetch_add(1, Ordering::AcqRel);
+                engine
+                    .submit(
+                        Request::Read { file, offset: 10 },
+                        IoBuf {
+                            bytes: vec![0; 10],
+                            filled: 0,
+                        }
+                        .into(),
+                        io_then(2),
+                        None,
+                        &Cell::new(false),
+                    )
+                    .unwrap();
+            });
+        });
+        sim.fail_ring_create(false);
+    }));
+    h.read(file, 0, 10, 1).unwrap();
+    for done in h.drain(2) {
+        assert_eq!(ended(done).result.unwrap(), 10);
+    }
+    assert_eq!(
+        h.sim
+            .log()
+            .iter()
+            .filter(|l| l.starts_with("associate"))
+            .count(),
+        1
+    );
+    assert!(
+        h.sim.submit_sizes().is_empty(),
+        "no ring serves a file that joined the port"
     );
 }
 
@@ -972,10 +1164,12 @@ fn a_pool_job_that_panics_or_is_dropped_still_ends_its_operation() {
 fn a_new_socket_of_a_closed_ones_value_that_sits_on_another_port_is_refused() {
     let h = Harness::new();
     let sock = h.sim.sock();
-    h.engine.join_port(sock).unwrap();
+    assert!(matches!(h.engine.join_port(sock, true), Join::Ready));
     h.engine.forget(sock);
     h.sim.reuse(sock, true);
-    let error = h.engine.join_port(sock).unwrap_err();
+    let Join::Refused(error) = h.engine.join_port(sock, true) else {
+        panic!("a refusal");
+    };
     assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
 }
 
@@ -984,7 +1178,7 @@ fn a_new_file_of_a_closed_ones_value_is_offered_a_ring() {
     let h = Harness::with(Some(full_probe()), true, MAX_PIECE);
     let file = h.sim.file(&content(100));
     // The old file joined the port, and closed.
-    h.engine.join_port(file).unwrap();
+    assert!(matches!(h.engine.join_port(file, false), Join::Ready));
     h.engine.forget(file);
     h.sim.reuse(file, false);
     h.read(file, 0, 10, 1).unwrap();
@@ -996,14 +1190,16 @@ fn a_new_file_of_a_closed_ones_value_is_offered_a_ring() {
 fn a_socket_the_engine_makes_of_a_closed_ones_value_is_not_taken_for_it() {
     let h = Harness::new();
     let old = h.sim.sock();
-    h.engine.join_port(old).unwrap();
+    assert!(matches!(h.engine.join_port(old, true), Join::Ready));
     // It closes, and the system gives its value to the engine's new socket, which sits on another port.
     h.sim.reuse(old, true);
     h.sim.mint_next(old);
     let to = std::net::SocketAddr::from(([127, 0, 0, 1], 80));
     let new = h.engine.new_socket(to).unwrap();
     assert_eq!(new, old);
-    let error = h.engine.join_port(new).unwrap_err();
+    let Join::Refused(error) = h.engine.join_port(new, true) else {
+        panic!("a refusal");
+    };
     assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
 }
 
@@ -1011,7 +1207,7 @@ fn a_socket_the_engine_makes_of_a_closed_ones_value_is_not_taken_for_it() {
 fn an_accepted_socket_of_a_closed_ones_value_is_not_taken_for_it() {
     let h = Harness::new();
     let old = h.sim.sock();
-    h.engine.join_port(old).unwrap();
+    assert!(matches!(h.engine.join_port(old, true), Join::Ready));
     let listener = h.sim.sock();
     h.sim.reuse(old, true);
     h.sim.mint_next(old);
@@ -1019,7 +1215,9 @@ fn an_accepted_socket_of_a_closed_ones_value_is_not_taken_for_it() {
         .unwrap();
     let accepted = h.one().raw.unwrap().unwrap();
     assert_eq!(accepted, old);
-    let error = h.engine.join_port(accepted).unwrap_err();
+    let Join::Refused(error) = h.engine.join_port(accepted, true) else {
+        panic!("a refusal");
+    };
     assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
 }
 
@@ -1028,7 +1226,7 @@ fn a_file_the_engine_opens_of_a_closed_ones_value_is_offered_a_ring() {
     let h = Harness::with(Some(full_probe()), true, MAX_PIECE);
     let old = h.sim.file(&content(100));
     // The old file joined the port, and closed; the system gives its value to the engine's open.
-    h.engine.join_port(old).unwrap();
+    assert!(matches!(h.engine.join_port(old, true), Join::Ready));
     h.sim.reuse(old, false);
     h.sim.mint_next(old);
     let path = Path::new("scratch").join("reused");
@@ -1050,11 +1248,12 @@ fn a_file_the_engine_opens_of_a_closed_ones_value_is_offered_a_ring() {
 }
 
 #[test]
-fn a_handle_that_belongs_to_another_port_is_refused() {
+fn a_handle_that_belongs_to_another_port_is_taken_and_ends_with_the_refusal() {
     let h = Harness::new();
     let file = h.sim.file(&content(100));
     h.sim.joined_elsewhere(file);
-    let error = h.read(file, 0, 10, 1).unwrap_err();
+    h.read(file, 0, 10, 1).unwrap();
+    let error = ended(h.one()).result.unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     assert!(error.to_string().contains("another completion port"));
     assert_eq!(h.pending(), 0);
@@ -2215,4 +2414,79 @@ fn a_poll_inside_a_poll_is_refused_in_debug() {
     let _first = unsafe { h.engine.poller.enter() };
     // SAFETY: deliberately not sound: this is the second entry the debug check must refuse.
     let _second = unsafe { h.engine.poller.enter() };
+}
+
+#[test]
+fn a_file_a_ring_serves_is_taken_by_the_port_route_and_ends_with_the_refusal() {
+    // Where the claim says a ring serves the file and this thread reaches the port route, the
+    // operation is taken and ends with the error.
+    let h = Harness::new();
+    let file = h.sim.file(&content(100));
+    h.engine.routes.claim(file, RouteState::Ring);
+    h.read(file, 0, 10, 1).unwrap();
+    let error = ended(h.one()).result.unwrap_err();
+    assert!(error.to_string().contains("IoRing"), "{error}");
+    assert!(!h.sim.log().iter().any(|l| l.starts_with("associate")));
+    assert_eq!(h.pending(), 0);
+}
+
+#[test]
+fn a_handle_the_set_cannot_hold_is_taken_and_ends_with_an_error() {
+    let h = Harness::new();
+    h.sim.mint_next(usize::MAX - 1);
+    let to = std::net::SocketAddr::from(([127, 0, 0, 1], 80));
+    let sock = h.engine.new_socket(to).unwrap();
+    assert_eq!(sock, usize::MAX - 1);
+    h.submit(
+        Request::Recv { sock },
+        IoBuf {
+            bytes: vec![0; 4],
+            filled: 0,
+        },
+        io_then(1),
+    )
+    .unwrap();
+    let error = ended(h.one()).result.unwrap_err();
+    assert!(error.to_string().contains("too many handles"), "{error}");
+    assert_eq!(h.pending(), 0);
+}
+
+#[test]
+fn a_handle_of_a_closed_engine_made_one_that_was_not_forgotten_is_joined_again() {
+    let h = Harness::new();
+    let sock = h.sim.sock();
+    assert!(matches!(h.engine.join_port(sock, true), Join::Ready));
+    // The engine's socket closes without `forget`, and the system gives its value to the
+    // caller's new socket, which is on no port.
+    h.sim.reuse(sock, false);
+    h.sim.feed(sock, b"abcd");
+    h.submit(
+        Request::Recv { sock },
+        IoBuf {
+            bytes: vec![0; 4],
+            filled: 0,
+        },
+        io_then(1),
+    )
+    .unwrap();
+    assert_eq!(
+        h.sim
+            .log()
+            .iter()
+            .filter(|l| l.starts_with("associate"))
+            .count(),
+        2,
+        "the new handle joined the port"
+    );
+    assert_eq!(ended(h.one()).result.unwrap(), 4);
+}
+
+#[test]
+fn a_socket_of_a_value_a_ring_once_served_joins_the_port() {
+    let h = Harness::new();
+    let sock = h.sim.sock();
+    // An earlier file of this value was served by a ring and closed.
+    h.engine.routes.claim(sock, RouteState::Ring);
+    assert!(matches!(h.engine.join_port(sock, true), Join::Ready));
+    assert_eq!(h.engine.routes.get(sock), Some(RouteState::Joined));
 }

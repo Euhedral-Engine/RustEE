@@ -15,6 +15,22 @@ semantics and the tests that pin it.
 
 **Tests.** `a_git_sparse_or_path_package_is_compared_like_a_registry_one` in `tools/bazel-gen` (fails on the registry-only filter); the workflow twins test pins the step text in both workflow files.
 
+## Two threads' first operations on one Windows handle both succeed (`euhedral-io`) (2026-11-24)
+
+**What.** On Windows, two threads that make the first operation on one handle at the same time no longer refuse one of them with "the handle already belongs to another completion port". The engine records a handle's route (joining the port, on the port, or served by a ring) with one compare-and-set before it makes the system call, and the first claim decides for every thread. A thread that meets a join still in flight cannot tell a handle that is ours from another port's (the OS refuses both with the same error), and does not wait: its operation is accepted and held, and the next poll launches it once the join succeeded, or ends it with the refusal if the handle belongs to another port. A file for which one thread took a ring route and another, with no ring, was about to join the port is likewise decided once: the thread without a ring has its operation taken and ended with the ring-served error.
+
+**Why.** The engine called `associate` and recorded the handle after it returned. A second thread whose own call was refused (the handle was ours by then) looked the handle up before the first had recorded it, and failed a correct operation (seen in CI on a runner that served the file through the port). The route check of a file had the same gap between the ring decision and its record.
+
+**How to use.** Submit never refuses a handle on Windows. A handle of another port (the claimer's `associate` answers 87), a ring-served file used by a thread with no ring, and a handle the engine cannot hold are all taken like any operation and end in their completion with the error (`InvalidInput`, the ring-served error, "too many handles"), through the failed-operations path of the next poll. A first operation on a handle that another thread is joining may end a poll later than usual. Submit returns an error only for what it cannot take (a handle that would block or skip the port, a full operation table). Code that matched on a submit-time `InvalidInput` for these handles reads the completion instead.
+
+**Semantics.**
+- Exactly one thread calls `associate` for a handle; a refusal or an error removes its claim, so no mark is left behind.
+- A refusal ends the operation in its completion once, whether it was decided by this thread's call, by another thread's, or at once.
+- An operation held for a join is launched on the first poll after the join succeeded, or ended once with `InvalidInput` if it was refused; a cancel or a time limit meanwhile ends it as for any operation that is being issued.
+- `forget` clears the handle's route, as before.
+
+**Tests.** `win::tests`: `a_second_first_operation_during_a_join_is_held_until_it_ends_and_then_runs` and `a_file_one_thread_joins_while_another_makes_its_ring_goes_to_the_port_for_both` fail on the old code; `a_handle_that_belongs_to_another_port_is_taken_and_ends_with_the_refusal`, `a_file_a_ring_serves_is_taken_by_the_port_route_and_ends_with_the_refusal` and `a_handle_the_set_cannot_hold_is_taken_and_ends_with_an_error` fail on the old code (submit refused); `a_handle_on_another_port_is_refused_to_both_threads_and_leaves_no_claim` and `a_thread_without_a_ring_never_joins_a_file_a_ring_serves` pin the refusals in the race. `win::handles::tests`: one claimer wins of racing threads.
+
 ## Another Bazel module can depend on RustEE (build) (2026-11-24)
 
 **What.** `crate.from_cargo` sets `lockfile = "//:cargo-bazel-lock.json"` and the file is committed, so a module that depends on `euhedral_rustee` resolves (Bazel refused a non-root crate_universe repository without a lock). `cargo-bazel-lock.json` has the same `eol=lf` entry as `MODULE.bazel.lock`. The stale test's check of `MODULE.bazel.lock`'s manifest digests (which the lock no longer records) is replaced by a comparison of `Cargo.lock`'s registry packages with the crates of `cargo-bazel-lock.json`, and the `bazel` CI job repins a copy of the tree and fails when either lock changes.
