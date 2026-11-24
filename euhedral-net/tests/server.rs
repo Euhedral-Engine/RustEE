@@ -787,6 +787,62 @@ fn at_the_cap_a_connection_waits_in_the_backlog_until_one_closes() {
 }
 
 #[test]
+fn a_stopped_server_refuses_new_connections_while_a_request_drains() {
+    let (handler, parked) = parking();
+    let server = Fixture::start(config(), handler);
+    let mut held = server.connect();
+    held.send(b"GET /held HTTP/1.1\r\nHost: t\r\n\r\n");
+    let (_, reply) = parked.recv_timeout(PATIENCE).unwrap();
+    server.begin_stop();
+    // The listener is closed once the cancelled accept has ended: a connect is refused from then on. A connect
+    // that lands before that is only in the backlog and is dropped by the server's close.
+    let limit = Instant::now() + PATIENCE;
+    let never =
+        "the listening socket was never closed: new connections are still accepted after the stop";
+    let mut early = Vec::new();
+    loop {
+        let remaining = limit.saturating_duration_since(Instant::now());
+        assert!(!remaining.is_zero(), "{never}");
+        match TcpStream::connect_timeout(&server.addr, remaining) {
+            Ok(stream) => early.push(stream),
+            Err(error) if error.kind() == ErrorKind::TimedOut => panic!("{never}"),
+            // A connect still in flight when the socket closes is reset; the next one is refused.
+            Err(error) if error.kind() == ErrorKind::ConnectionReset => {}
+            Err(error) => {
+                assert_eq!(error.kind(), ErrorKind::ConnectionRefused);
+                break;
+            }
+        }
+        yield_now();
+    }
+    // A refusal alone could come from a full backlog: every connect that got in was closed by the server.
+    for stream in &mut early {
+        let remaining = limit.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "a queued connection was never closed by the server"
+        );
+        stream.set_read_timeout(Some(remaining)).unwrap();
+        let mut byte = [0u8; 1];
+        match read_on(stream, &mut byte) {
+            Ok(0) => {}
+            Err(error) if error.kind() == ErrorKind::ConnectionReset => {}
+            other => panic!("a queued connection was not closed by the server: {other:?}"),
+        }
+    }
+    // The request in flight is answered, and its connection closes.
+    reply.send(Response::with_status(200));
+    assert_eq!(held.read_response(false).status, 200);
+    held.expect_closed();
+    drop((held, early));
+    server
+        .stopped
+        .recv_timeout(PATIENCE)
+        .expect("the server did not finish after its last connection closed");
+    server.finish();
+}
+
+#[test]
 fn a_request_that_is_too_slow_to_arrive_is_answered_408_and_closed() {
     let limit = Duration::from_millis(150);
     let server = Fixture::start(
