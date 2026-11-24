@@ -11,6 +11,10 @@ diff cannot be computed. Nothing is affected when only documentation changed: `*
 `.gitignore`. A crate's own `README.md` is the exception: the crates include it as their crate documentation, so its
 doctests are part of the crate.
 
+The root Bazel files (MODULE.bazel, MODULE.bazel.lock, .bazelrc, .bazelversion, .bazelignore and the root BUILD.bazel) are
+root build files. A crate's own BUILD.bazel affects that crate; the generator crate's stale test (BAZEL_GEN) is also
+affected by any member's Cargo.toml and by any file under a member's src/, tests/, examples/ or benches/ or its build.rs.
+
 The CI files select less than a root build file does:
   .github/workflows/ci.yml, .gitea/workflows/ci.yml   the workspace jobs run in full (they validate the workflow);
                                   Miri runs what the crate changes select, and the canary shard (the fastest
@@ -63,12 +67,26 @@ EVERYTHING = [
     ".rustfmt.toml",
     "rust-toolchain",
     "rust-toolchain.toml",
+    "MODULE.bazel",
+    "MODULE.bazel.lock",
+    ".bazelrc",
+    ".bazelversion",
+    ".bazelignore",
+    "BUILD.bazel",
     "build.rs",
     ".cargo/*",
     ".github/*",
     ".gitea/*",
     "scripts/ci/*",
 ]
+
+# The crate whose test reads every member's manifest and target files to see whether the generated BUILD files are stale
+# (docs/design/bazel.md). It is affected by any member's Cargo.toml and by anything under a member's STALE_INPUT_DIRS or
+# its build.rs: `git diff --name-only` cannot tell an added file from an edited one, and only an added or removed one can
+# make a BUILD file stale, so every change there counts.
+BAZEL_GEN = "euhedral-bazel-gen"
+STALE_INPUT_DIRS = ("src/", "tests/", "examples/", "benches/")
+STALE_INPUT_FILES = ("Cargo.toml", "build.rs")
 
 # CI files that select less (see the module docstring); they are looked at before EVERYTHING.
 CI_WORKFLOWS = [".github/workflows/ci.yml", ".gitea/workflows/ci.yml"]
@@ -164,6 +182,9 @@ def affected(graph, files, workflow_is_everything=True):
             if f.endswith(".md") and os.path.basename(f) != "README.md":
                 continue
             seed.add(crate)
+            inside = f[len(graph.dirs[crate]) + 1:]
+            if BAZEL_GEN in graph.dirs and (inside in STALE_INPUT_FILES or inside.startswith(STALE_INPUT_DIRS)):
+                seed.add(BAZEL_GEN)
         elif matches(f, EVERYTHING):
             return set(graph.dirs), True, f"{f} is a root build file"
         elif matches(f, DOCS):

@@ -1,0 +1,25 @@
+# Project flags only (forge build/CONTRACTS.md C3); cache paths are the machine layer's.
+common --enable_platform_specific_config
+
+# The lock of the module is checked, not re-resolved: a change to MODULE.bazel or to any Cargo.toml or Cargo.lock fails every
+# Bazel command until `bazel mod deps --lockfile_mode=update` is run and MODULE.bazel.lock committed.
+common --lockfile_mode=error
+
+# Windows has no symlinks without developer mode; tests and tools find their data through runfiles directories.
+common:windows --enable_runfiles
+
+# C7
+test --test_tag_filters=-gpu,-exclusive
+test --test_output=errors
+test:gpu --test_tag_filters=gpu
+test:gpu --test_env=CUDA_VISIBLE_DEVICES
+test:system --test_tag_filters=exclusive
+test:system --cache_test_results=no
+
+# C8
+build:ci --keep_going
+test:ci --keep_going
+test:ci --test_output=errors
+common:ci --color=no
+
+try-import %workspace%/user.bazelrc

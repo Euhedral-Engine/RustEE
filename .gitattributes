@@ -1,0 +1,10 @@
+# Bazel reads these on every platform, and the module lock records the hashes of Cargo.toml and Cargo.lock: LF everywhere.
+*.bazel text eol=lf
+*.bzl text eol=lf
+*.bazelrc text eol=lf
+.bazelrc text eol=lf
+.bazelversion text eol=lf
+.bazelignore text eol=lf
+MODULE.bazel.lock text eol=lf
+Cargo.toml text eol=lf
+Cargo.lock text eol=lf
