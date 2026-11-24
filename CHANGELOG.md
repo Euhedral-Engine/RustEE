@@ -3,6 +3,20 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## The server closes its listener at stop (`euhedral-net`) (2026-11-23)
+
+**What.** `ServerHandle::stop` closes the listening socket as soon as the cancelled accept has ended, not when the last connection has ended.
+
+**Why.** A client that connected after the stop was completed by the kernel into the backlog and then waited, unanswered, for as long as other connections drained. Draining means no new work is taken.
+
+**How to use.** Nothing changes for callers. After `stop`, the listening socket is closed and a new connect is refused.
+
+**Semantics.**
+- A socket the in-flight accept returns after the stop began is dropped; the peer sees it close.
+- Open connections are served and drained as before; the stop frame is still offered when the last one has ended.
+
+**Tests.** `a_stopped_server_refuses_new_connections_while_a_request_drains` (a request held in the handler, a stop, connects refused, the held request answered and closed).
+
 ## The Rust toolchain is pinned in `rust-toolchain.toml` (build) (2026-11-24)
 
 **What.** `rust-toolchain.toml` names the toolchain `mise.toml` already pins (1.99.1, profile default). A new workspace member, `tools/bazel-gen` (`euhedral-bazel-gen`, not published), holds a test that compares the two pins.
