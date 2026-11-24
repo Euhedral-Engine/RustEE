@@ -3,6 +3,20 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## Net `Post` frames are unordered (2026-11-24)
+
+**What.** The frame an I/O end or a timer hands the lattice for an event of a connection or the listener (`Post`) is unordered and carries a routing hash of its own, as the station's key already did. It had an ordered header with id 0.
+
+**Why.** Every `Post` of every server and connection rode one ordered chain, so the I/O ends and timer events of unrelated connections queued behind each other. The events are independent: running a `Post` only pushes into the owner's inbox, and the key runs them one at a time in push order.
+
+**How to use.** Nothing changes for callers.
+
+**Semantics.**
+- The routing hash mixes the owner's address and the station's push counter (the one the key uses), so frames of one owner and of different owners spread over the workers.
+- A `Post` dropped without having run still delivers its event.
+
+**Tests.** `station::tests::posts_are_unordered_and_routed_by_hashes_of_their_own` (fails on the old code: the header was ordered and the hashes equal).
+
 ## Device tests run under Bazel and fail when they skip (build) (2026-11-24)
 
 **What.** `bazel test --config=gpu //...` runs every `gpu`-tagged target against the card. `--config=gpu` selects only the `gpu` targets, passes `EUHEDRAL_NVRTC`, `CUDA_HOME`, `CUDA_PATH` and `LD_LIBRARY_PATH` through, sets `EUHEDRAL_DEVICE_REQUIRED=1` and passes `--nocapture` to the tests. Both `skip` helpers (`euhedral-gpu/tests/common/skip.rs`, `euhedral-memory/tests/cuda.rs`) panic when `EUHEDRAL_DEVICE_REQUIRED` is set. Four silent early exits in `euhedral-gpu/tests/cuda.rs` now say they skipped: a driver older than 13.1 in `missing_kernels_are_not_found` and `arguments_that_do_not_fit_are_refused_before_launch`, and both halves of `axpb_from_source_and_from_ptx_match_the_cpu_bit_for_bit` (NVRTC missing, driver older than 13.1).
