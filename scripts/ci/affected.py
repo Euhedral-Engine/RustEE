@@ -176,24 +176,53 @@ class Graph:
 
 
 # A label of a file in a BUILD file: `//:docs/x.md` (the root package) or `//pkg:file`.
-LABEL = re.compile(r'"//([\w./-]*):([^"]+)"')
+STRING = re.compile(r'"([^"\s*?\[\]{}$]+)"')  # a quoted word that is no glob pattern
+BUILD_FILES = ("BUILD.bazel", "BUILD")
+
+
+def label_path(package, text):
+    """The repo-relative path a label or a package-relative path in `package`'s BUILD file names, or None for a label
+    of an external repository or one outside the repository. A target's name (`//:workspace_sources`) comes out as a
+    path that no change ever matches, so it costs nothing."""
+    if text.startswith("@"):
+        return None
+    if text.startswith("//"):
+        pkg, _, target = text[2:].partition(":")
+        path = os.path.join(pkg, target)  # `//pkg` alone is the package's own directory
+    else:
+        path = os.path.join(package, text[1:] if text.startswith(":") else text)
+    path = os.path.normpath(path) if path else "."
+    if path == "." or path == ".." or path.startswith("../") or os.path.isabs(path):
+        return None
+    return path
 
 
 def data_inputs(root, dirs):
-    """{path: crates} for every file a member's BUILD.bazel names by label (a test's `data`, say) that is a file of the
-    repository; a label of a target (`//:workspace_sources`) is no file and is left out."""
+    """{path: crates} for every path a member's BUILD file names (a test's `data`, say), as a label or relative to the
+    member's package. Whether the path exists is not asked: a change that deletes or renames the file still affects the
+    crate that names it. A path may be a directory, whose every file then affects the crate."""
     out = {}
     for name, d in dirs.items():
-        try:
-            with open(os.path.join(root, d, "BUILD.bazel")) as f:
-                text = f.read()
-        except FileNotFoundError:
-            continue
-        for package, target in LABEL.findall(text):
-            path = f"{package}/{target}" if package else target
-            if os.path.isfile(os.path.join(root, path)):
-                out.setdefault(path, set()).add(name)
+        for build in BUILD_FILES:
+            try:
+                with open(os.path.join(root, d, build)) as f:
+                    text = f.read()
+            except FileNotFoundError:
+                continue
+            for word in STRING.findall(text):
+                path = label_path(d, word)
+                if path is not None:
+                    out.setdefault(path, set()).add(name)
     return out
+
+
+def data_crates(graph, f):
+    """The crates whose BUILD files name `f` or a directory above it."""
+    found = set()
+    for path, crates in graph.data.items():
+        if f == path or f.startswith(path + "/"):
+            found |= crates
+    return found
 
 
 def affected(graph, files, workflow_is_everything=True):
@@ -202,7 +231,7 @@ def affected(graph, files, workflow_is_everything=True):
     `ci.yml` is everything for the workspace jobs and, with `workflow_is_everything` false, nothing for Miri."""
     seed = set()
     for f in files:
-        seed |= graph.data.get(f, set())  # read by a crate's target, whatever else the file is
+        seed |= data_crates(graph, f)  # read by a crate's target, whatever else the file is
         if matches(f, CI_NO_CRATES):
             continue
         if f in CI_WORKFLOWS:

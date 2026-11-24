@@ -534,5 +534,6 @@ class Bazel(unittest.TestCase):
             self.assertTrue(doc["jobs"]["bazel"]["if"].startswith("needs.changes.outputs.any == 'true'"))
         self.assertEqual(GITEA["jobs"]["check-repo"]["if"], "needs.changes.outputs.any == 'true'")
 
+
 if __name__ == "__main__":
     unittest.main()
