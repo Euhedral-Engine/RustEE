@@ -67,8 +67,8 @@ use crate::message::{
     ConnectionMode, Method, ParseError, Request, Response, Version, WriteError, status_has_no_body,
 };
 use crate::parse::{Progress, RequestParser};
-use crate::server::{Ctx, ListenerEvent, Shared, no_work};
-use crate::station::{Drive, Station};
+use crate::server::{Ctx, ListenerEvent, Shared};
+use crate::station::{Drive, Post, Station};
 use crate::write::{
     write_chunk, write_chunked_head, write_continue, write_last_chunk, write_response,
     write_response_head,
@@ -389,10 +389,7 @@ impl Conn {
                 raw_stream(stream),
                 IoBuf { bytes, filled: 0 },
                 OpOptions { limit },
-                Box::new(move |done| {
-                    conn.post(Event::Recv(done));
-                    no_work()
-                }),
+                Box::new(move |done| Post::new(conn, Event::Recv(done))),
             ),
             None => Err(Error::from(ErrorKind::NotConnected)),
         };
@@ -440,10 +437,7 @@ impl Conn {
                 raw_stream(stream),
                 IoBuf { bytes, filled },
                 OpOptions { limit },
-                Box::new(move |done| {
-                    conn.post(Event::Sent(done));
-                    no_work()
-                }),
+                Box::new(move |done| Post::new(conn, Event::Sent(done))),
             ),
             None => Err(Error::from(ErrorKind::NotConnected)),
         };

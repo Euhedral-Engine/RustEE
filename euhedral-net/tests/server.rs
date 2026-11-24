@@ -753,12 +753,12 @@ fn a_body_over_the_limit_is_refused_before_it_is_read() {
     server.finish();
 }
 
-/// The server reports its stop from the listener's event for the accept's end, which the accept's continuation
-/// posts when the reap runs it. The continuation's frame is still to be handed out to the lattice, and
-/// `pending` counts it until then. Here the reap runs by hand and nothing is pulled, so the interleaving is
-/// fixed: the continuation ran and its event was heard, the frame was not handed out.
+/// The end of an operation reaches the server through the frame its continuation returns, so the stop cannot be
+/// reported before that frame was handed out and run. The reap and the hand-out run by hand: the accept ends
+/// (the stop cancels it), its frame is handed out and held without running, and the stop is not reported; once
+/// the frame runs, the stop is reported and the `AsyncIo` counts nothing.
 #[test]
-fn a_stop_is_not_reported_while_an_operations_frame_is_still_to_be_handed_out() {
+fn a_stop_is_not_reported_before_an_operations_frame_has_run() {
     let server = Fixture::start_with(
         TcpListener::bind("127.0.0.1:0").unwrap(),
         config(),
@@ -767,24 +767,37 @@ fn a_stop_is_not_reported_while_an_operations_frame_is_still_to_be_handed_out() 
     );
     server.begin_stop();
     let deadline = Instant::now() + PATIENCE;
-    loop {
+    let mut held: Vec<Box<dyn Frame>> = Vec::new();
+    while held.is_empty() {
         server.io.reap();
-        if server.stopped.try_recv().is_ok() {
-            break;
-        }
+        assert!(
+            server.stopped.try_recv().is_err(),
+            "the stop was reported before the accept's frame was handed out"
+        );
+        server
+            .io
+            .pull(&mut |frame| held.push(frame), &mut |_| false, u64::MAX);
         assert!(
             Instant::now() < deadline,
-            "the server never reported that it stopped"
+            "the accept's frame was never handed out"
         );
     }
-    assert_eq!(
-        server.io.pending(),
-        0,
-        "the stop was reported while a continuation's frame was not yet handed out"
+    // The wait ends at the first message or at its end; a stop reported now was reported before the frame ran.
+    assert!(
+        server
+            .stopped
+            .recv_timeout(Duration::from_millis(500))
+            .is_err(),
+        "the stop was reported before the accept's frame ran"
     );
+    for mut frame in held {
+        frame.execute().unwrap();
+    }
     server
-        .io
-        .pull(&mut |frame| drop(frame), &mut |_| false, u64::MAX);
+        .stopped
+        .recv_timeout(PATIENCE)
+        .expect("the server did not report that it stopped");
+    assert_eq!(server.io.pending(), 0);
     server.sink.complete_gracefully();
     server.lattice.close();
 }

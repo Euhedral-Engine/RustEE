@@ -405,10 +405,7 @@ impl Shared {
             Some(io) => io.accept_with(
                 raw_listener(listener),
                 OpOptions::default(),
-                Box::new(move |result| {
-                    shared.post_listener(ListenerEvent::Accepted(result));
-                    no_work()
-                }),
+                Box::new(move |result| Post::new(shared, ListenerEvent::Accepted(result))),
             ),
             None => Err(io::Error::from(io::ErrorKind::NotConnected)),
         };
@@ -560,7 +557,10 @@ impl ServerHandle {
     /// ended, `stopped` is offered to the sink, once. A second `stop` adds another frame, offered at the same
     /// time (or at once if the server is already stopped).
     ///
-    /// The notification is the last thing the server does. Before it: every connection is gone and its source
+    /// The notification is the last thing the server does. Before it, every operation the server issued has ended
+    /// and its frame has been handed out by the `AsyncIo`, so `AsyncIo::pending` counts none of the server's
+    /// (an operation's end reaches the server through the frame its continuation returns, which the lattice runs
+    /// after the hand-out). Also before it: every connection is gone and its source
     /// has ended, no accept or retry is pending, every `Responder` handed to a handler has been used or dropped
     /// and its reply has been through its connection's order (sent, or discarded and counted), and the server
     /// has let go of the handler, the `AsyncIo`, the timers and the lattice. So a handler

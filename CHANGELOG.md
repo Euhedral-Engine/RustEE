@@ -3,6 +3,20 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## The server's stop is reported after its operations' frames are handed out (`euhedral-net`) (2026-11-24)
+
+**What.** The continuations of the server's accept, and of a connection's recv and send, no longer post the end of the operation to the listener or the connection themselves. Each returns a frame that posts it when the lattice runs the frame.
+
+**Why.** `AsyncIo::pending` drops when a continuation's frame is handed out, not when the continuation runs. The old continuations posted from inside the reap, so the listener could hear that the last operation had ended and report the stop while that frame was still to be handed out: `pending` was then 1 after the stop was reported.
+
+**How to use.** Nothing changes for callers. When the stop is reported, `AsyncIo::pending` counts none of the server's operations, so the `AsyncIo` can be dropped after it.
+
+**Semantics.**
+- An operation's end is an event of its owner only after its frame was handed out and run; stop, drain and listener close are otherwise as before.
+- The events of an owner reach it in the order the frames run, which is the order the lattice gives them.
+
+**Tests.** `a_stop_is_not_reported_before_an_operations_frame_has_run` (the `AsyncIo` reaped and pulled by hand, the frame held unrun: the stop is not reported until it runs).
+
 ## The Bazel skeleton (build) (2026-11-24)
 
 **What.** `MODULE.bazel` (rules_rust, platforms and skylib at the shared version table, the toolchain at 1.99.1, `crate_universe` over the workspace's `Cargo.toml` and `Cargo.lock` for the Linux and Windows triples), `MODULE.bazel.lock`, `.bazelversion`, `.bazelrc`, `.bazelignore`, a root `BUILD.bazel`, `.gitattributes` (LF for the Bazel files and the Cargo manifests) and a copy of the shared `euhedral_build` module under `build/module`. `bazel query @crates//...` lists the third-party crates. No crate has a `BUILD.bazel` yet, and no CI job runs Bazel.
