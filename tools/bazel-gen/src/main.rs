@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use euhedral_bazel_gen::{emit, load_workspace, stale};
+use euhedral_bazel_gen::{build_files_on_disk, emit, extra_build_files, load_workspace, stale};
 
 fn main() -> ExitCode {
     match run() {
@@ -46,8 +46,12 @@ fn run() -> Result<ExitCode, String> {
     let files = emit::generate(&ws)?;
     let read = |path: &str| std::fs::read_to_string(root.join(path)).ok();
     let stale = stale(&files, &read);
+    let extra = extra_build_files(&files, &build_files_on_disk(&root)?);
+    for path in &extra {
+        eprintln!("not generated: {path} (remove it: a removed member's, or a hand-added package)");
+    }
     if diff {
-        if stale.is_empty() {
+        if stale.is_empty() && extra.is_empty() {
             return Ok(ExitCode::SUCCESS);
         }
         for path in &stale {
@@ -61,5 +65,9 @@ fn run() -> Result<ExitCode, String> {
             .map_err(|e| format!("writing {path}: {e}"))?;
         println!("wrote {path}");
     }
-    Ok(ExitCode::SUCCESS)
+    Ok(if extra.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
 }

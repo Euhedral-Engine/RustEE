@@ -106,6 +106,59 @@ pub fn stale(
         .collect()
 }
 
+/// The BUILD files on disk that the generator does not write: one left by a removed member, or a hand-added one, which
+/// would cut its parent package's globs. Sorted.
+pub fn extra_build_files(expected: &BTreeMap<String, String>, on_disk: &[String]) -> Vec<String> {
+    let mut extra: Vec<String> = on_disk
+        .iter()
+        .filter(|path| !expected.contains_key(*path))
+        .cloned()
+        .collect();
+    extra.sort();
+    extra
+}
+
+/// Every `BUILD.bazel` or `BUILD` file under `root` (root-relative, `/`-separated) that Bazel would read as a package:
+/// the paths `.bazelignore` names, `.git` and symlinked directories (the `bazel-*` output links) are skipped.
+pub fn build_files_on_disk(root: &Path) -> Result<Vec<String>, String> {
+    let ignored: Vec<String> = match std::fs::read_to_string(root.join(".bazelignore")) {
+        Ok(text) => text
+            .lines()
+            .map(|line| line.trim().trim_end_matches('/').to_owned())
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .collect(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(format!("reading .bazelignore: {e}")),
+    };
+    let mut out = Vec::new();
+    let mut dirs = vec![String::new()];
+    while let Some(dir) = dirs.pop() {
+        let entries =
+            std::fs::read_dir(root.join(&dir)).map_err(|e| format!("listing {dir}: {e}"))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let path = if dir.is_empty() {
+                name.clone()
+            } else {
+                format!("{dir}/{name}")
+            };
+            let kind = entry.file_type().map_err(|e| format!("{path}: {e}"))?;
+            if kind.is_dir() {
+                if name != ".git" && !ignored.contains(&path) {
+                    dirs.push(path);
+                }
+            } else if (name == "BUILD.bazel" || name == "BUILD")
+                && (kind.is_file() || std::fs::metadata(entry.path()).is_ok_and(|m| m.is_file()))
+            {
+                out.push(path);
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
 /// The manifest files `MODULE.bazel.lock` records a digest of: the root's `Cargo.toml` and `Cargo.lock` and every
 /// member's `Cargo.toml`.
 pub fn locked_inputs(ws: &Workspace) -> Vec<String> {
@@ -174,6 +227,24 @@ mod tests {
         };
         assert_eq!(stale(&expected, &on_disk), ["BUILD.bazel", "b/BUILD.bazel"]);
         assert!(stale(&expected, &|p| expected.get(p).cloned()).is_empty());
+    }
+
+    #[test]
+    fn a_build_file_the_generator_does_not_write_is_extra() {
+        let expected: BTreeMap<String, String> = [("BUILD.bazel", ""), ("a/BUILD.bazel", "")]
+            .into_iter()
+            .map(|(p, c)| (p.to_owned(), c.to_owned()))
+            .collect();
+        let on_disk = [
+            "BUILD.bazel".to_owned(),
+            "removed/BUILD.bazel".to_owned(),
+            "a/src/BUILD".to_owned(),
+            "a/BUILD.bazel".to_owned(),
+        ];
+        assert_eq!(
+            extra_build_files(&expected, &on_disk),
+            ["a/src/BUILD", "removed/BUILD.bazel"]
+        );
     }
 
     #[test]
