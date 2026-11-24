@@ -8,6 +8,9 @@ pub mod sha256;
 pub mod starlark;
 pub mod worlds;
 
+#[cfg(test)]
+mod fixture_tests;
+
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
@@ -46,9 +49,49 @@ pub fn load_workspace(
     let text =
         String::from_utf8(output.stdout).map_err(|_| "cargo metadata printed invalid UTF-8")?;
     let metadata = json::parse(&text)?;
-    model::load(&metadata, &|path| {
+    let mut ws = model::load(&metadata, &|path| {
         std::fs::read_to_string(root.join(path)).map_err(|e| format!("reading {path}: {e}"))
-    })
+    })?;
+    for package in &mut ws.packages {
+        let mut found = Vec::new();
+        let mut files = Vec::new();
+        rust_files(&root.join(&package.dir), "src", &mut files)?;
+        for file in files {
+            let text = std::fs::read_to_string(root.join(&package.dir).join(&file))
+                .map_err(|e| format!("reading {}/{file}: {e}", package.dir))?;
+            found.extend(
+                model::path_attributes(&file, &text)?
+                    .into_iter()
+                    .filter(|p| !p.starts_with("src/")),
+            );
+        }
+        found.sort();
+        found.dedup();
+        package.path_modules = found;
+    }
+    Ok(ws)
+}
+
+/// Every `.rs` file under `dir` (package-relative, `/`-separated), in `out`.
+fn rust_files(package: &Path, dir: &str, out: &mut Vec<String>) -> Result<(), String> {
+    let entries = match std::fs::read_dir(package.join(dir)) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("listing {dir}: {e}")),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let path = format!("{dir}/{name}");
+        // Runfiles trees hold symlinks: follow them.
+        let meta = std::fs::metadata(entry.path()).map_err(|e| format!("{path}: {e}"))?;
+        if meta.is_dir() {
+            rust_files(package, &path, out)?;
+        } else if name.ends_with(".rs") {
+            out.push(path);
+        }
+    }
+    Ok(())
 }
 
 /// The generated files that differ from what `read` returns for their path (a missing file differs), sorted.

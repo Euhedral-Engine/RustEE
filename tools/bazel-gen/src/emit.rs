@@ -423,7 +423,7 @@ impl Gen<'_> {
                         },
                     )
                     .attr("crate_root", Value::Str(lib_src.clone()))
-                    .attr("compile_data", compile_data("src"))
+                    .attr("compile_data", compile_data("src", &package.path_modules))
                     .attr(
                         "crate_features",
                         Value::List(self.resolved(world).features_of(&package.name)),
@@ -452,7 +452,7 @@ impl Gen<'_> {
             rule.attr("crate_name", Value::Str(bin.name.replace('-', "_")))
                 .attr("srcs", bin_srcs(package, bin)?)
                 .attr("crate_root", Value::Str(bin.src.clone()))
-                .attr("compile_data", compile_data("src"))
+                .attr("compile_data", compile_data("src", &package.path_modules))
                 .attr(
                     "crate_features",
                     Value::List(self.resolved(world).features_of(&package.name)),
@@ -558,11 +558,18 @@ impl Gen<'_> {
                             .attr("crate_root", Value::Str(target.src.clone()))
                             .attr(
                                 "compile_data",
-                                compile_data(if target.kind == TargetKind::Test {
-                                    "tests"
-                                } else {
-                                    "src"
-                                }),
+                                compile_data(
+                                    if target.kind == TargetKind::Test {
+                                        "tests"
+                                    } else {
+                                        "src"
+                                    },
+                                    if target.kind == TargetKind::Test {
+                                        &[]
+                                    } else {
+                                        &package.path_modules
+                                    },
+                                ),
                             )
                             .attr("crate_features", features.clone())
                             .attr("deps", with_lib.value())
@@ -578,7 +585,7 @@ impl Gen<'_> {
                         rule.attr("crate_name", Value::Str(target.name.replace('-', "_")))
                             .attr("srcs", example_srcs(package, target)?)
                             .attr("crate_root", Value::Str(target.src.clone()))
-                            .attr("compile_data", compile_data("examples"))
+                            .attr("compile_data", compile_data("examples", &[]))
                             .attr("crate_features", features.clone())
                             .attr("deps", with_lib.value());
                         common(&mut rule, package, target);
@@ -689,19 +696,14 @@ fn run_extras(
         .attr("rustc_env", Value::Dict(rustc_env));
 }
 
-fn compile_data(dir: &str) -> Value {
-    Value::Glob {
-        include: vec!["README.md".to_owned(), format!("{dir}/**")],
-        exclude: vec![format!("{dir}/**/*.rs")],
-        allow_empty: true,
-    }
-}
-
-fn glob(include: Vec<String>) -> Value {
+/// The non-Rust files of `dir` and the README, with `extra` (module files outside `src/` the sources name by path).
+fn compile_data(dir: &str, extra: &[String]) -> Value {
+    let mut include = vec!["README.md".to_owned(), format!("{dir}/**")];
+    include.extend(extra.iter().cloned());
     Value::Glob {
         include,
-        exclude: Vec::new(),
-        allow_empty: false,
+        exclude: vec![format!("{dir}/**/*.rs")],
+        allow_empty: true,
     }
 }
 
@@ -751,7 +753,12 @@ fn test_srcs(package: &Package, test: &Target) -> Result<Value, String> {
     include.retain(|p| !p.ends_with("/**/*.rs"));
     include.push("tests/*/**/*.rs".to_owned());
     include.dedup();
-    Ok(glob(include))
+    // Bazel checks each pattern: most crates have no shared test modules.
+    Ok(Value::Glob {
+        include,
+        exclude: Vec::new(),
+        allow_empty: true,
+    })
 }
 
 fn example_srcs(package: &Package, example: &Target) -> Result<Value, String> {

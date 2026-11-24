@@ -80,6 +80,9 @@ pub struct Package {
     pub lints: Vec<Lint>,
     /// The names `[lints.rust] unexpected_cfgs`'s `check-cfg` declares (`cfg(loom)` gives `loom`).
     pub check_cfg: Vec<String>,
+    /// Package-relative files outside `src/` that a `#[path = "..."]` in `src/` names (`tests/common/scratch.rs`), filled
+    /// by [`crate::load_workspace`].
+    pub path_modules: Vec<String>,
     /// By (`test` or `bin`, target name).
     pub extras: BTreeMap<(String, String), Extras>,
 }
@@ -335,6 +338,7 @@ fn load_package(
         targets,
         lints,
         check_cfg,
+        path_modules: Vec::new(),
         extras,
     })
 }
@@ -528,6 +532,40 @@ pub fn parse_lints(text: &str) -> Result<(Vec<Lint>, Vec<String>), String> {
     Ok((lints, check_cfg))
 }
 
+/// The module files a source file's `#[path = "..."]` attributes name, relative to the package: `file` is the package-relative
+/// path of the source, and each path is relative to the file's directory. A path that leaves the package is an error.
+pub fn path_attributes(file: &str, text: &str) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let Some(rest) = line.trim().strip_prefix("#[path") else {
+            continue;
+        };
+        let target = rest
+            .trim_start()
+            .strip_prefix('=')
+            .and_then(|r| r.split_once(']').map(|(inside, _)| inside))
+            .and_then(|r| r.trim().strip_prefix('"'))
+            .and_then(|r| r.strip_suffix('"'))
+            .ok_or_else(|| format!("{file}: unreadable path attribute `{}`", line.trim()))?;
+        let mut parts: Vec<&str> = file.split('/').collect();
+        parts.pop();
+        let target = target.replace('\\', "/");
+        for part in target.split('/') {
+            match part {
+                "" | "." => {}
+                ".." => {
+                    parts
+                        .pop()
+                        .ok_or_else(|| format!("{file}: path `{target}` leaves the package"))?;
+                }
+                other => parts.push(other),
+            }
+        }
+        out.push(parts.join("/"));
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -570,6 +608,19 @@ mod tests {
         ] {
             assert!(parse_lints(text).is_err(), "{text} was accepted");
         }
+    }
+
+    #[test]
+    fn path_attributes_resolve_from_the_file() {
+        let text = "#[cfg(test)]\n#[path = \"../tests/common/scratch.rs\"]\nmod scratch;\n  #[path=\"x/y.rs\"] mod y;\n";
+        assert_eq!(
+            path_attributes("src/lib.rs", text),
+            Ok(vec![
+                "tests/common/scratch.rs".to_owned(),
+                "src/x/y.rs".to_owned()
+            ])
+        );
+        assert!(path_attributes("src/lib.rs", "#[path = \"../../other/x.rs\"]\n").is_err());
     }
 
     #[test]
