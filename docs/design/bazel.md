@@ -531,6 +531,13 @@ merges before it.
 8. **Cache measurement.** Measure a warm rerun of `bazel test //...` and a run in a second worktree served from the
    shared disk cache. The numbers go in this document, and the step ends the build's acceptance criteria. *After 7.*
 
+**Measured (2026-11-24, commit `5ecb1d8`, Bazel 9.3.3 under Bazelisk v1.28.1, this desktop, each run under a `system-run --system` grant).** Each run is `bazel test //...` over the 112 non-device tests, all passing; the times are Bazel's own `Elapsed time`. A wall clock around the call is not a cache number here: it was dominated by the wait for the whole-machine grant behind CI jobs. The second-worktree runs start from an empty output base (a new worktree, then `bazel clean --expunge` before the second and third run) and take every action from the shared disk cache.
+
+| Run | `Elapsed time` (s), 3 runs | Actions | Tests |
+|---|---|---|---|
+| Warm rerun in the same worktree | 2.275, 2.009, 1.991 | none run | 0 of 112 executed, all cached |
+| Second worktree, empty output base | 2.350, 2.442, 2.570 | 1286 processes: 508 disk cache hit, 890 internal | 0 of 112 executed, all cached |
+
 Later, outside the build: `exclusive` benchmark and timing targets; release stress or loom under Bazel if the gate wants
 them cached; a `<crate>_cuda` production target when a consumer module needs one (C5).
 
