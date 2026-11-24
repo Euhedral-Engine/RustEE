@@ -1202,15 +1202,16 @@ mod tests {
 
     /// A file of `content` in the crate's scratch directory under the target directory.
     fn temp_file(name: &str, content: &[u8]) -> (TempFile, std::fs::File) {
-        let exe = std::env::current_exe().expect("the test binary's path");
-        // The test binary is `target/<profile>/deps/<name>`: scratch goes beside it, never /tmp or
-        // $HOME.
-        let dir = exe
-            .parent()
-            .and_then(std::path::Path::parent)
-            .expect("a target directory")
-            .join("euhedral-graph-scratch");
-        std::fs::create_dir_all(&dir).unwrap();
+        // Without `TEST_TMPDIR`, scratch goes beside the test binary (`target/<profile>/deps/<name>`),
+        // never /tmp or $HOME.
+        let dir = crate::test_scratch::test_scratch_dir(|| {
+            std::env::current_exe()
+                .expect("the test binary's path")
+                .parent()
+                .and_then(std::path::Path::parent)
+                .expect("a target directory")
+                .join("euhedral-graph-scratch")
+        });
         let path = dir.join(format!(
             "{name}-{}-{:?}",
             std::process::id(),
