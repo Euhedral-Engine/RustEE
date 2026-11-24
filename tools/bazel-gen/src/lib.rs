@@ -119,7 +119,9 @@ pub fn extra_build_files(expected: &BTreeMap<String, String>, on_disk: &[String]
 }
 
 /// Every `BUILD.bazel` or `BUILD` file under `root` (root-relative, `/`-separated) that Bazel would read as a package:
-/// the paths `.bazelignore` names, `.git` and symlinked directories (the `bazel-*` output links) are skipped.
+/// the paths `.bazelignore` names, `.git`, every `target` directory next to a `Cargo.toml` (Cargo's output; a
+/// `target` source directory is a package) and symlinked directories (the `bazel-*` output links) are skipped. A
+/// directory that cannot be listed is an error naming it: skipping it could hide a BUILD file the generator should own.
 pub fn build_files_on_disk(root: &Path) -> Result<Vec<String>, String> {
     let ignored: Vec<String> = match std::fs::read_to_string(root.join(".bazelignore")) {
         Ok(text) => text
@@ -134,7 +136,12 @@ pub fn build_files_on_disk(root: &Path) -> Result<Vec<String>, String> {
     let mut dirs = vec![String::new()];
     while let Some(dir) = dirs.pop() {
         let entries =
-            std::fs::read_dir(root.join(&dir)).map_err(|e| format!("listing {dir}: {e}"))?;
+            std::fs::read_dir(root.join(&dir)).map_err(|e| {
+                let shown = if dir.is_empty() { "." } else { dir.as_str() };
+                format!(
+                    "cannot read directory `{shown}` ({e}): fix its permissions or list it in .bazelignore, since a BUILD file inside it could not be checked"
+                )
+            })?;
         for entry in entries {
             let entry = entry.map_err(|e| e.to_string())?;
             let name = entry.file_name().to_string_lossy().into_owned();
@@ -145,7 +152,8 @@ pub fn build_files_on_disk(root: &Path) -> Result<Vec<String>, String> {
             };
             let kind = entry.file_type().map_err(|e| format!("{path}: {e}"))?;
             if kind.is_dir() {
-                if name != ".git" && !ignored.contains(&path) {
+                let cargo_output = name == "target" && root.join(&dir).join("Cargo.toml").is_file();
+                if name != ".git" && !cargo_output && !ignored.contains(&path) {
                     dirs.push(path);
                 }
             } else if (name == "BUILD.bazel" || name == "BUILD")
