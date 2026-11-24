@@ -3,6 +3,21 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## The generated BUILD files (build) (2026-11-24)
+
+**What.** `tools/bazel-gen` now generates every member's `BUILD.bazel` and the root's from the Cargo manifests, and `bazel build //...` and `bazel test //...` build and test every crate on Linux. `bazel run //:gazelle` writes the files (`-- -mode=diff` checks them); `cargo run -p euhedral-bazel-gen` does the same without Bazel. The root `BUILD.bazel` exports `Cargo.toml`, `Cargo.lock`, `MODULE.bazel`, `MODULE.bazel.lock`, `mise.toml` and `rust-toolchain.toml`, aliases `//:gazelle` and gathers `//:workspace_sources`. `[package.metadata.bazel]` in four manifests gives the tests that read the workspace (`hot_fix_ratchet`, `layering`, the generator's own) their files, and the lattice tests (`credit_graph`, `lane_source_lattice`, `lane_source_liveness`) a `cpu:4` tag.
+
+**Why.** Bazel caches test results across runs and machines; generating its files from Cargo's keeps one source of truth, and the stale test catches a manifest or target change committed without regenerating.
+
+**How to use.** After changing a manifest or adding, removing or renaming a target, run `bazel run //:gazelle` and commit the BUILD files; after editing a `Cargo.toml` or `Cargo.lock`, also `bazel mod deps --lockfile_mode=update`. Device tests are tagged `gpu` and `external` and run only with `--config=gpu`.
+
+**Semantics.**
+- Three feature worlds: production (each crate's defaults, no dev-dependencies), testing (`cargo test --workspace`'s features) and cuda testing (testing plus `cuda` on `euhedral-memory` and `euhedral-gpu`). Only `euhedral-graph`, `euhedral-gpu`, `euhedral-memory` and `euhedral-net` have a testing library of their own, and `euhedral-memory` and `euhedral-gpu` a cuda one; the others are aliases.
+- Every test that links `euhedral-memory` with `cuda` is tagged `gpu` and `external`; the generator refuses to write when the testing world resolves that feature, and when a manifest uses a form it does not model (the generator's README lists them).
+- Cargo, its features and CI are unchanged; no library code changed. The generator adds no dependency.
+
+**Tests.** The generator's unit tests (feature worlds, tags, refusals, stale comparison, lock check, Windows paths) each fail on a planted fault. `tools/bazel-gen/tests/stale.rs` fails when a BUILD file is stale or `MODULE.bazel.lock` does not record the current manifests. Bazel lists the same tests as Cargo, name by name: 2295 in 100 test binaries and 39 doctests in the testing world, 376 in the 42 cuda-world binaries of `euhedral-gpu` and `euhedral-memory`.
+
 ## The Bazel skeleton (build) (2026-11-24)
 
 **What.** `MODULE.bazel` (rules_rust, platforms and skylib at the shared version table, the toolchain at 1.99.1, `crate_universe` over the workspace's `Cargo.toml` and `Cargo.lock` for the Linux and Windows triples), `MODULE.bazel.lock`, `.bazelversion`, `.bazelrc`, `.bazelignore`, a root `BUILD.bazel`, `.gitattributes` (LF for the Bazel files and the Cargo manifests) and a copy of the shared `euhedral_build` module under `build/module`. `bazel query @crates//...` lists the third-party crates. No crate has a `BUILD.bazel` yet, and no CI job runs Bazel.
