@@ -405,10 +405,7 @@ impl Shared {
             Some(io) => io.accept_with(
                 raw_listener(listener),
                 OpOptions::default(),
-                Box::new(move |result| {
-                    shared.post_listener(ListenerEvent::Accepted(result));
-                    no_work()
-                }),
+                Box::new(move |result| Post::new(shared, ListenerEvent::Accepted(result))),
             ),
             None => Err(io::Error::from(io::ErrorKind::NotConnected)),
         };
@@ -560,7 +557,10 @@ impl ServerHandle {
     /// ended, `stopped` is offered to the sink, once. A second `stop` adds another frame, offered at the same
     /// time (or at once if the server is already stopped).
     ///
-    /// The notification is the last thing the server does. Before it: every connection is gone and its source
+    /// The notification is the last thing the server does. Before it, every operation the server issued has ended
+    /// and its frame has been handed out by the `AsyncIo`, so `AsyncIo::pending` counts none of the server's
+    /// (an operation's end reaches the server through the frame its continuation returns, which the lattice runs
+    /// after the hand-out). Also before it: every connection is gone and its source
     /// has ended, no accept or retry is pending, every `Responder` handed to a handler has been used or dropped
     /// and its reply has been through its connection's order (sent, or discarded and counted), and the server
     /// has let go of the handler, the `AsyncIo`, the timers and the lattice. So a handler
@@ -600,6 +600,34 @@ pub fn serve(
     handler: Arc<dyn Handler>,
     timers: Arc<Completions>,
 ) -> io::Result<ServerHandle> {
+    let shared = new_shared(
+        Arc::downgrade(&lattice),
+        &io,
+        sink,
+        listener,
+        config,
+        handler,
+        timers,
+    );
+    lattice
+        .add_upstream(shared.clone())
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    shared.post_listener(ListenerEvent::Start);
+    Ok(ServerHandle {
+        core: Arc::new(HandleCore { shared }),
+    })
+}
+
+/// The listener's state and its source, not yet attached to a lattice.
+fn new_shared(
+    lattice: Weak<ControlPlaneLattice>,
+    io: &Arc<AsyncIo>,
+    sink: Arc<QueueIngestSink>,
+    listener: TcpListener,
+    config: ServerConfig,
+    handler: Arc<dyn Handler>,
+    timers: Arc<Completions>,
+) -> Arc<Shared> {
     let limits = Limits {
         max_header_bytes: config.max_header_bytes,
         max_body: config.max_body_bytes,
@@ -608,13 +636,13 @@ pub fn serve(
     let state = ListenerState {
         listener: Some(listener),
         ctx: Some(Arc::new(Ctx {
-            io: Arc::downgrade(&io),
+            io: Arc::downgrade(io),
             sink: sink.clone(),
             handler,
         })),
         sink: Some(sink),
         timers: Some(timers),
-        lattice: Arc::downgrade(&lattice),
+        lattice,
         accepting: None,
         conns: Vec::new(),
         free: Vec::new(),
@@ -626,20 +654,13 @@ pub fn serve(
         completed: false,
         stops: Vec::new(),
     };
-    let shared = Arc::new_cyclic(|me| Shared {
+    Arc::new_cyclic(|me| Shared {
         config,
         limits,
         counters: CounterCells::default(),
         stop_requested: AtomicBool::new(false),
         listener: SourceCell::new(state),
         station: Station::new(me.clone()),
-    });
-    lattice
-        .add_upstream(shared.clone())
-        .map_err(|error| io::Error::other(error.to_string()))?;
-    shared.post_listener(ListenerEvent::Start);
-    Ok(ServerHandle {
-        core: Arc::new(HandleCore { shared }),
     })
 }
 
@@ -681,5 +702,95 @@ impl LatticeSource for Shared {
 
     fn is_complete(&self) -> bool {
         self.station.is_complete()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A listener driven by hand: no lattice, the `AsyncIo` reaped and pulled by the test, the listener's events
+    /// run by the test in the order its inbox holds them.
+    struct Hand {
+        io: Arc<AsyncIo>,
+        shared: Arc<Shared>,
+    }
+
+    impl Hand {
+        fn start() -> Hand {
+            let io = AsyncIo::open().unwrap();
+            let shared = new_shared(
+                Weak::new(),
+                &io,
+                Arc::new(QueueIngestSink::new()),
+                TcpListener::bind("127.0.0.1:0").unwrap(),
+                ServerConfig::default(),
+                Arc::new(|_: Request, _: Responder| no_work()),
+                Completions::without_lanes(),
+            );
+            let hand = Hand { io, shared };
+            hand.post(ListenerEvent::Start);
+            hand.run_inbox();
+            assert_eq!(hand.io.pending(), 1, "the accept is in flight");
+            hand
+        }
+
+        fn post(&self, event: ListenerEvent) {
+            self.shared.post_listener(event);
+        }
+
+        fn run_inbox(&self) {
+            while let Some(event) = self.shared.station.take_event() {
+                self.shared.run_event(event);
+            }
+        }
+
+        /// Stops the server, which cancels the accept, and reaps and pulls until the accept's frame comes out.
+        fn stop_and_hand_out(&self) -> Vec<Box<dyn Frame>> {
+            self.post(ListenerEvent::Stop(no_work()));
+            self.run_inbox();
+            let mut frames = Vec::new();
+            while frames.is_empty() {
+                self.io.reap();
+                self.io
+                    .pull(&mut |frame| frames.push(frame), &mut |_| false, u64::MAX);
+            }
+            frames
+        }
+
+        fn finished(&self) -> bool {
+            self.shared.listener.enter().finished
+        }
+    }
+
+    /// The end of the accept reaches the listener when the frame its continuation returned runs, and not when the
+    /// continuation ran: until then the listener has heard nothing, the stop is not reported, and the
+    /// `AsyncIo` has stopped counting the operation.
+    #[test]
+    fn the_accepts_end_reaches_the_listener_when_its_frame_runs() {
+        let hand = Hand::start();
+        let frames = hand.stop_and_hand_out();
+        assert_eq!(hand.io.pending(), 0, "the frame was handed out");
+        assert!(
+            !hand.shared.station.has_event(),
+            "the continuation posted the end of the accept itself"
+        );
+        assert!(!hand.finished());
+        for mut frame in frames {
+            frame.execute().unwrap();
+        }
+        assert!(hand.shared.station.has_event());
+        hand.run_inbox();
+        assert!(hand.finished(), "the stop is reported after the frame ran");
+    }
+
+    /// A frame dropped without having run (a lattice that discarded it) still delivers the end of the accept, so
+    /// the stop is reported.
+    #[test]
+    fn a_dropped_frame_still_delivers_the_accepts_end() {
+        let hand = Hand::start();
+        drop(hand.stop_and_hand_out());
+        hand.run_inbox();
+        assert!(hand.finished(), "the stop is reported after the drop");
     }
 }

@@ -126,7 +126,7 @@ items finished in:
 
 ```rust
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use euhedral_core::frames::{Frame, RunnableFrame};
 use euhedral_core::generics::LatticeSource;
@@ -143,37 +143,40 @@ let sequencer = Sequencer::ordered({
     move |seq: u32| released.lock().unwrap().push(seq)
 });
 
-// Items 0, 1, 2 are admitted in that order; their timers fire in the order 1, 2, 0.
+// Items 0, 1, 2 are admitted in that order, so the sequencer expects them concluded in that order.
 let fired = Arc::new(Mutex::new(Vec::new()));
-let now = Instant::now();
-for (seq, after_ms) in [(0u32, 6), (1, 0), (2, 3)] {
+let mut tasks: Vec<Arc<dyn Fn() + Send + Sync>> = Vec::new();
+for seq in 0u32..3 {
     let slot = Mutex::new(Some(sequencer.register()));
     let fired = fired.clone();
-    let task = Arc::new(move || {
+    tasks.push(Arc::new(move || {
         fired.lock().unwrap().push(seq);
         if let Some(slot) = slot.lock().unwrap().take() {
             slot.complete(seq); // the sequencer concludes it once every earlier entry did
         }
-    });
-    // One chain for each item (the id): frames of one chain come out in registration order, so items that may
-    // finish in any order are not one chain.
-    let continuation = Box::new(RunnableFrame::new(7 + u64::from(seq), task));
-    completions.at(now + Duration::from_millis(after_ms), continuation);
+    }));
 }
 
+// The items finish in the order 1, 2, 0. Each timer is armed at an instant already past, and the loop below runs
+// until that item has fired before the next is armed, so the order comes from these steps and not from elapsed time.
 // A lattice worker runs the source's poll frame and takes what it found with `request` and `pull`; here the loop is
 // the worker, and `reap` is what the poll frame does.
-while completions.pending() > 0 {
-    completions.reap();
-    completions.pull(
-        &mut |mut frame| {
-            frame.execute().unwrap();
-            frame.do_finally();
-        },
-        &mut |_| false, // never stop before a frame
-        u64::MAX,
-    );
-    std::thread::sleep(Duration::from_millis(1));
+for seq in [1u32, 2, 0] {
+    // One chain for each item (the id): frames of one chain come out in registration order, so items that may
+    // finish in any order are not one chain.
+    let continuation = Box::new(RunnableFrame::new(7 + u64::from(seq), tasks[seq as usize].clone()));
+    completions.at(Instant::now(), continuation);
+    while completions.pending() > 0 {
+        completions.reap();
+        completions.pull(
+            &mut |mut frame| {
+                frame.execute().unwrap();
+                frame.do_finally();
+            },
+            &mut |_| false, // never stop before a frame
+            u64::MAX,
+        );
+    }
 }
 
 assert_eq!(*fired.lock().unwrap(), [1, 2, 0]); // finished out of order
