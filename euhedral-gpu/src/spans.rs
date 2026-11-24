@@ -8,6 +8,7 @@
 
 use euhedral_graph::QueueId;
 
+#[cfg(any(test, feature = "fake", feature = "cuda"))]
 use crate::GpuError;
 
 /// A timed span of a stream's work: opened by `span_begin`, closed by `span_end`, read by `span_poll`.
@@ -25,6 +26,7 @@ impl Span {
     }
 }
 
+#[cfg(any(test, feature = "fake", feature = "cuda"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum State {
     Free,
@@ -33,6 +35,7 @@ enum State {
 }
 
 /// The slots of one stream's spans.
+#[cfg(any(test, feature = "fake", feature = "cuda"))]
 #[derive(Debug)]
 pub(crate) struct SpanBook {
     stream: QueueId,
@@ -41,6 +44,7 @@ pub(crate) struct SpanBook {
     cursor: usize,
 }
 
+#[cfg(any(test, feature = "fake", feature = "cuda"))]
 impl SpanBook {
     pub(crate) fn new(stream: QueueId, slots: u32) -> Self {
         SpanBook {
