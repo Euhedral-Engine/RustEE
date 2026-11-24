@@ -339,6 +339,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # mise installs the toolchain; the later steps get its environment (rustup's directories, its toolchain) and its
+      # directories on PATH through the files the runner reads between steps.
+      - name: Install the toolchain pinned in mise.toml (gitea)
+        run: |
+          mise install rust >/dev/null
+          mise env --json | python3 -c '
+          import json, os, sys
+          env = json.load(sys.stdin)
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+              for key in ("CARGO_HOME", "RUSTUP_HOME", "RUSTUP_TOOLCHAIN"):
+                  if key in env:
+                      f.write(key + "=" + env[key] + "\n")
+          have = os.environ["PATH"].split(":")
+          with open(os.environ["GITHUB_PATH"], "a") as f:
+              for entry in env.get("PATH", "").split(":"):
+                  if entry and entry not in have:
+                      f.write(entry + "\n")
+          '
+          eval "$(mise env -s bash)"
+          rustc --version
+          cargo --version
+
       - name: Install the pinned nightly toolchain with Miri
         run: |
           toolchain=$(cat scripts/ci/miri-toolchain)
@@ -388,6 +410,28 @@ jobs:
       COMMANDS: ${{ matrix.commands }}
     steps:
       - uses: actions/checkout@v4
+
+      # mise installs the toolchain; the later steps get its environment (rustup's directories, its toolchain) and its
+      # directories on PATH through the files the runner reads between steps.
+      - name: Install the toolchain pinned in mise.toml (gitea)
+        run: |
+          mise install rust >/dev/null
+          mise env --json | python3 -c '
+          import json, os, sys
+          env = json.load(sys.stdin)
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+              for key in ("CARGO_HOME", "RUSTUP_HOME", "RUSTUP_TOOLCHAIN"):
+                  if key in env:
+                      f.write(key + "=" + env[key] + "\n")
+          have = os.environ["PATH"].split(":")
+          with open(os.environ["GITHUB_PATH"], "a") as f:
+              for entry in env.get("PATH", "").split(":"):
+                  if entry and entry not in have:
+                      f.write(entry + "\n")
+          '
+          eval "$(mise env -s bash)"
+          rustc --version
+          cargo --version
 
       - name: Install the pinned nightly toolchain with Miri
         run: |
