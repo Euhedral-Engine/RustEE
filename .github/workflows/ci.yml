@@ -407,18 +407,25 @@ jobs:
           MSYS_NO_PATHCONV: "1"
         run: |
           set -x
-          bin=$(bazel info --config=ci --platforms=@euhedral_build//platforms:windows_x86_64 bazel-bin)
-          rf="$bin/euhedral-hashing/doc_test.rustdoc_test.bat.runfiles"
-          cat "$bin/euhedral-hashing/doc_test.rustdoc_test.bat" | cut -c1-3000 || true
+          bin="$(bazel info execution_root)/bazel-out/x64_windows-fastbuild/bin"
+          bat="$bin/euhedral-hashing/doc_test.rustdoc_test.bat"
+          rf="$bat.runfiles"
+          cut -c1-3000 "$bat" || true
           ls -la "$rf" "$rf/_main" || true
           found=("$rf"/rules_rust++rust+rw-*_tools)
           tools=${found[0]}
-          ls -la "$tools" "$tools/rust_toolchain" "$tools/rust_toolchain/lib/rustlib/x86_64-pc-windows-msvc/lib" || true
+          lib="$tools/rust_toolchain/lib/rustlib/x86_64-pc-windows-msvc/lib"
+          ls -la "$tools" "$tools/rust_toolchain" || true
+          ls -la "$lib"/libstd-* || true
           cmd //c "dir /AL \"$(cygpath -w "$rf")\"" || true
           cmd //c "dir /AL \"$(cygpath -w "$rf/_main")\"" || true
-          powershell -c "Get-Item '$(cygpath -w "$rf/_main/external")' | Format-List *" || true
-          powershell -c "Get-ChildItem '$(cygpath -w "$tools/rust_toolchain/lib/rustlib/x86_64-pc-windows-msvc/lib")' -Filter 'libstd-*' | Format-List FullName,LinkType,Target,Length" || true
+          powershell -c "Get-Item '$(cygpath -w "$rf/_main/external")' | Format-List FullName,LinkType,Target,Attributes" || true
+          powershell -c "Get-ChildItem '$(cygpath -w "$lib")' -Filter 'libstd-*' | Format-List FullName,LinkType,Target,Length" || true
           (cd "$rf/_main" && ls -la external/ && ls -la external/rules_rust++rust+rw-*_tools/rust_toolchain/lib/rustlib/x86_64-pc-windows-msvc/lib/libstd-*) || true
+          # The same runner with `external` as a junction instead of the runner's symbolic link.
+          tmp=$(mktemp -d)
+          (cd "$rf/_main" && cmd //c "rmdir external" && cmd //c "mklink /J external \"$(cygpath -w "$rf")\"" &&
+            TEST_TMPDIR="$(cygpath -w "$tmp")" cmd //c "$(cygpath -w "$bat")") || true
 
       - name: Stop the Bazel server
         if: always()
