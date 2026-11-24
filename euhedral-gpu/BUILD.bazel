@@ -1648,6 +1648,47 @@ rust_test(
     version = "0.1.0",
 )
 
+rust_test(
+    name = "skip_helpers_test",
+    compile_data = glob(
+        [
+            "README.md",
+            "tests/**",
+        ],
+        exclude = ["tests/**/*.rs"],
+        allow_empty = True,
+    ),
+    crate_features = [
+        "default",
+        "fake",
+        "test-hooks",
+    ],
+    crate_name = "skip_helpers",
+    crate_root = "tests/skip_helpers.rs",
+    deps = [
+        "//euhedral-core:euhedral_core",
+        "//euhedral-data-structures:euhedral_data_structures",
+        "//euhedral-graph:euhedral_graph_testing",
+        "//euhedral-hardware-utils:euhedral_hardware_utils",
+        "//euhedral-hashing:euhedral_hashing",
+        "//euhedral-memory:euhedral_memory_testing",
+        ":euhedral_gpu_testing",
+    ],
+    edition = "2024",
+    lint_config = ":lints",
+    rustc_env = {
+        "CARGO_TARGET_TMPDIR": "unused-under-bazel",
+    },
+    srcs = glob(
+        [
+            "tests/skip_helpers.rs",
+            "tests/*/**/*.rs",
+        ],
+        allow_empty = True,
+    ),
+    version = "0.1.0",
+)
+
 # The library's unit tests (#[cfg(test)]).
 rust_test(
     name = "unit_cuda_test",
@@ -3330,6 +3371,52 @@ rust_test(
     srcs = glob(
         [
             "tests/ownership.rs",
+            "tests/*/**/*.rs",
+        ],
+        allow_empty = True,
+    ),
+    tags = [
+        "external",
+        "gpu",
+    ],
+    version = "0.1.0",
+)
+
+rust_test(
+    name = "skip_helpers_cuda_test",
+    compile_data = glob(
+        [
+            "README.md",
+            "tests/**",
+        ],
+        exclude = ["tests/**/*.rs"],
+        allow_empty = True,
+    ),
+    crate_features = [
+        "cuda",
+        "default",
+        "fake",
+        "test-hooks",
+    ],
+    crate_name = "skip_helpers",
+    crate_root = "tests/skip_helpers.rs",
+    deps = [
+        "//euhedral-core:euhedral_core",
+        "//euhedral-data-structures:euhedral_data_structures",
+        "//euhedral-graph:euhedral_graph_testing",
+        "//euhedral-hardware-utils:euhedral_hardware_utils",
+        "//euhedral-hashing:euhedral_hashing",
+        "//euhedral-memory:euhedral_memory_cuda_testing",
+        ":euhedral_gpu_cuda_testing",
+    ],
+    edition = "2024",
+    lint_config = ":lints",
+    rustc_env = {
+        "CARGO_TARGET_TMPDIR": "unused-under-bazel",
+    },
+    srcs = glob(
+        [
+            "tests/skip_helpers.rs",
             "tests/*/**/*.rs",
         ],
         allow_empty = True,

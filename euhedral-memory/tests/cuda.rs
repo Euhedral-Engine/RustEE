@@ -10,8 +10,13 @@ use euhedral_memory::{Backend, LocationId};
 
 /// How a device test says it did not run: CI reads the test output for this line (`scripts/ci/device_check.py`) and
 /// fails the device job, because a test that skipped for want of a driver or a card proved nothing.
+/// With `EUHEDRAL_DEVICE_REQUIRED` set (`bazel test --config=gpu` sets it) a skip panics, so the test fails instead.
 fn skip(reason: &str) {
     eprintln!("DEVICE-TEST-SKIPPED: {reason}");
+    assert!(
+        std::env::var_os("EUHEDRAL_DEVICE_REQUIRED").is_none(),
+        "EUHEDRAL_DEVICE_REQUIRED is set and the test would have skipped: {reason}"
+    );
 }
 
 fn device() -> Option<std::sync::Arc<Device>> {

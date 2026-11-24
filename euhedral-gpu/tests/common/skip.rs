@@ -7,8 +7,20 @@
 use std::fmt::Display;
 
 /// The test did not run for want of a driver, a card, NVRTC or a compiled kernel.
+///
+/// With `EUHEDRAL_DEVICE_REQUIRED` set (`bazel test --config=gpu` sets it) this panics, so the test fails where it
+/// would have skipped.
 pub fn skip(reason: impl Display) {
     eprintln!("DEVICE-TEST-SKIPPED: {reason}");
+    assert!(
+        !device_required(),
+        "EUHEDRAL_DEVICE_REQUIRED is set and the test would have skipped: {reason}"
+    );
+}
+
+/// Whether a skip for want of a driver, a card or NVRTC must fail the test.
+fn device_required() -> bool {
+    std::env::var_os("EUHEDRAL_DEVICE_REQUIRED").is_some()
 }
 
 /// The test did not run because this card or driver lacks the feature it tests (listed, not a failure).
