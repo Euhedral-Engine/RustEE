@@ -1,6 +1,6 @@
 # Building and testing RustEE with Bazel (design)
 
-Date: 2026-11-24. Status: proposed, for review before the build starts.
+Date: 2026-11-23. Status: proposed, for review before the build starts.
 
 ## Why
 
@@ -57,7 +57,12 @@ treats every crate the same way.
 
 - **Generator:** a Python script, about 300 lines, that reads `cargo metadata --no-deps` and writes one `BUILD.bazel`
   per crate. `bazel build //...` succeeds, with no warnings once two problems listed below were fixed. That is 1129
-  actions, covering both feature worlds and the CUDA examples, with a peak of 5.5 GB.
+  actions, covering the testing and cuda testing worlds and the CUDA examples, with a peak of 5.5 GB. The production
+  world (below) was designed after the prototype and not built under Bazel; see the next item.
+- **Production world, checked with Cargo:** `cargo clippy --workspace --lib -- -D warnings` builds every library with
+  only its own defaults, as the production world does. Nine crates are clean. `euhedral-gpu` is not: with neither
+  `fake` nor `cuda` it has no device backend, and 15 items are dead code (`api.rs`, `hold.rs`, `lanes.rs`, `spans.rs`,
+  `tensor_map.rs`). No gate run builds that combination today. It is a lint state, not a fault, and step 2 covers it.
 - **Tests:** `bazel test //...` passes all non-`gpu` targets. Six failed before two kinds of fixes:
   - the scratch-directory edits (step 2 below);
   - for the two source-reading tests, `rustc_env` and `data` (below).
@@ -216,7 +221,8 @@ Rejected:
 
 - **Documenting an exception to C10:** keeping `mise.toml` as the only source would make RustEE the one Rust repository
   whose IDE toolchain and CI toolchain come from different files, and it gains nothing. The file costs one line in each
-  of the two workflows' "root build file" lists, which already name `rust-toolchain`.
+  of the two workflows' "root build file" lists. `scripts/ci/affected.py` already treats `rust-toolchain.toml` as a
+  root build file, so CI needs no change to see it.
 
 ### What runs where
 
@@ -278,8 +284,22 @@ Each lib, each integration file, each bin and each crate's doctests is one binar
    lines and normalised to `file:line`.
    - For the cuda world, run each `gpu`-tagged binary from `bazel-bin` with `--list`, which opens no card. The cuda
      doctests are compared under the grant.
-3. Compare the sets per (crate, binary). The prototype's result was 2307 = 2307 (default world) and 376 = 376
-   (cuda-world unit and integration tests), with every set equal.
+3. Compare the sets per (crate, binary). The prototype's result was 2307 = 2307 (testing world) and 376 = 376
+   (cuda-world unit and integration tests), with every set equal. Per crate, testing world (Cargo = Bazel):
+
+   | crate | tests |
+   |---|---|
+   | euhedral-benchmarks | 29 |
+   | euhedral-core | 804 |
+   | euhedral-data-structures | 331 |
+   | euhedral-gpu | 208 |
+   | euhedral-graph | 342 |
+   | euhedral-hardware-utils | 171 |
+   | euhedral-hashing | 43 |
+   | euhedral-io | 193 |
+   | euhedral-memory | 69 |
+   | euhedral-net | 117 |
+   | total | 2307 |
 
 This runs once, in the generator's pull request (command and table in its description), and the script is then
 deleted. What keeps the counts equal afterwards is structural: every target comes from `cargo metadata`, every test
@@ -292,14 +312,18 @@ Each step is one pull request for one agent. Steps 1 and 2 touch only Cargo-side
 phase 3. Whether they may is the user's decision, since the Bazel build itself waits for phase 3.
 
 1. **`rust-toolchain.toml` and the pin check.** Add the file (version from `mise.toml`) and a check of the two (a
-   Python test in `scripts/ci`, run by CI's script-test step). Add `rust-toolchain.toml` to both workflows' root-file
-   lists if it is not matched yet. *Done:* the gate is green and unchanged in what it runs. *Parallel with 2.*
+   Python test in `scripts/ci`, run by CI's script-test step). `affected.py` already counts the file as a root build
+   file; the workflows' header comments name it. *Done:* the gate is green and unchanged in what it runs. *Parallel with 2.*
 2. **Tests write scratch files under `TEST_TMPDIR` when it is set.** The six sites:
    - `euhedral-io`: `src/uring.rs`, `src/win/live.rs`, `tests/key_frame.rs`, `tests/io_owned.rs`;
    - `euhedral-gpu`: `src/module_cache.rs`, `tests/cuda.rs`.
 
    Use one small helper per crate's tests, as in forge's crate. With the variable unset, behaviour under Cargo is
-   unchanged. *Done:* `cargo test` of both crates green (cuda `--no-run`), the Windows job green. *Parallel with 1.*
+   unchanged. In the same pull request, or a second one beside it: `euhedral-gpu` built with neither `fake` nor
+   `cuda` compiles without dead-code warnings (gate the backend-only items on
+   `any(feature = "fake", feature = "cuda")`, or give the crate no production target until a backend is chosen), so
+   the production world is warning-free. *Done:* `cargo test` of both crates green (cuda `--no-run`),
+   `cargo clippy --workspace --lib -- -D warnings` clean, the Windows job green. *Parallel with 1.*
 3. **The Bazel skeleton.** Add:
    - `.bazelversion` (9.3.3) and `MODULE.bazel`: rules_rust, rules_python, rules_shell, platforms and skylib at the
      table's versions; `rust.toolchain` and `rust.host_tools` at the toolchain file's version;
@@ -350,6 +374,14 @@ Later, outside the build: `exclusive` benchmark and timing targets; release stre
 them cached; a `<crate>_cuda` production target when a consumer module needs one (C5).
 
 ## Risks
+
+- **The production world is built by no Cargo gate run.** Workspace clippy and `cargo test` unify dev-dependency
+  features, so a library compiled with only its defaults is checked by nobody today (it is how `euhedral-gpu`'s dead
+  code went unseen). Under Bazel `bazel build //...` compiles it on every run, which is a new check, not a new risk to
+  the gate; until step 2's fix lands it prints warnings.
+- **`exclusive` already means something in Bazel:** the built-in tag runs the test alone, with no other test in
+  parallel. C7's meaning (needs the quiet machine) agrees with it, but the arbiter's `--system` grant, not the tag,
+  is what keeps other jobs off the machine; the tag alone only serialises within one Bazel invocation.
 
 - **Bazel runs test binaries in parallel; Cargo runs them one at a time.** The prototype's single run passed, including
   the lattice and `credit_graph` tests, but tests that size their thread counts from the CPUs the process may use now
