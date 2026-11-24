@@ -99,10 +99,11 @@ fn the_disk_walk_skips_what_bazel_ignores() {
 }
 
 #[test]
-fn the_disk_walk_skips_a_members_target_directory() {
+fn the_disk_walk_skips_only_the_target_directory_next_to_a_manifest() {
     let dir = scratch().join("build-walk-member-target");
     let _ = std::fs::remove_dir_all(&dir);
     for path in [
+        "a/Cargo.toml",
         "a/BUILD.bazel",
         "a/target/debug/BUILD.bazel",
         "a/src/target/BUILD",
@@ -111,7 +112,11 @@ fn the_disk_walk_skips_a_members_target_directory() {
         std::fs::create_dir_all(file.parent().expect("a parent")).expect("mkdir");
         std::fs::write(file, "").expect("write");
     }
-    assert_eq!(build_files_on_disk(&dir).expect("walks"), ["a/BUILD.bazel"]);
+    // Cargo's output sits next to a manifest; a `target` source directory is a Bazel package.
+    assert_eq!(
+        build_files_on_disk(&dir).expect("walks"),
+        ["a/BUILD.bazel", "a/src/target/BUILD"]
+    );
 }
 
 #[cfg(unix)]

@@ -7,9 +7,9 @@ build path dependency) on an affected crate. Layers below a change are not affec
 
 Everything is affected when a root build file changed (see EVERYTHING), when a file belongs to no crate and is not
 documentation or a known CI file (so an unknown file is never silently skipped), or when `--all` is given or the
-diff cannot be computed. Nothing is affected when only documentation changed: `*.md`, `docs/**`, `LICENSE*`,
-`.gitignore`. A crate's own `README.md` is the exception: the crates include it as their crate documentation, so its
-doctests are part of the crate.
+diff cannot be computed. Nothing is affected when only documentation changed: `*.md`, `docs/**` (except BUILD files
+under it, which are Bazel packages), `LICENSE*`, `.gitignore`. A crate's own `README.md` is the exception: the crates include it as their crate
+documentation, so its doctests are part of the crate.
 
 The root Bazel files (MODULE.bazel, MODULE.bazel.lock, .bazelrc, .bazelversion, .bazelignore and the root BUILD.bazel) are
 root build files. A crate's own BUILD.bazel affects that crate; the generator crate's stale test (BAZEL_GEN) is also

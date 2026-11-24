@@ -119,7 +119,7 @@ pub fn extra_build_files(expected: &BTreeMap<String, String>, on_disk: &[String]
 }
 
 /// Every `BUILD.bazel` or `BUILD` file under `root` (root-relative, `/`-separated) that Bazel would read as a package:
-/// the paths `.bazelignore` names, `.git`, every directory named `target` (Cargo's output, also inside a member) and
+/// the paths `.bazelignore` names, `.git`, every `target` directory next to a `Cargo.toml` (Cargo's output; a `target` source directory is a package) and
 /// symlinked directories (the `bazel-*` output links) are skipped. A directory that cannot be listed is an error naming
 /// it: skipping it could hide a BUILD file the generator should own.
 pub fn build_files_on_disk(root: &Path) -> Result<Vec<String>, String> {
@@ -152,7 +152,8 @@ pub fn build_files_on_disk(root: &Path) -> Result<Vec<String>, String> {
             };
             let kind = entry.file_type().map_err(|e| format!("{path}: {e}"))?;
             if kind.is_dir() {
-                if name != ".git" && name != "target" && !ignored.contains(&path) {
+                let cargo_output = name == "target" && root.join(&dir).join("Cargo.toml").is_file();
+                if name != ".git" && !cargo_output && !ignored.contains(&path) {
                     dirs.push(path);
                 }
             } else if (name == "BUILD.bazel" || name == "BUILD")

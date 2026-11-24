@@ -412,42 +412,94 @@ fn parse_extras(
     Ok(out)
 }
 
-/// Whether a target table of the manifest (`[lib]`, `[[bin]]`, `[[test]]`, `[[bench]]`, `[[example]]`) has a `harness`
-/// key, on its own line or in an inline table of a target array.
-fn sets_harness(text: &str) -> bool {
-    fn has_harness(text: &str) -> bool {
-        text.split(['{', ',', '}']).any(|part| {
-            part.split_once('=')
-                .is_some_and(|(k, _)| k.trim().trim_matches('"') == "harness")
-        })
+/// A piece of one manifest line: a quoted string (its content), a bare word, or one punctuation character.
+#[derive(PartialEq)]
+enum Tok {
+    Text(String),
+    Punct(char),
+}
+
+/// Splits one manifest line into tokens. Basic (`"..."`, with `\` escapes) and literal (`'...'`) strings are single
+/// tokens, so brackets and `#` inside them mean nothing; a `#` outside a string starts a comment.
+fn tokens(line: &str) -> Vec<Tok> {
+    let mut out = Vec::new();
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '#' => break,
+            '"' | '\'' => {
+                let mut text = String::new();
+                while let Some(d) = chars.next() {
+                    if d == c {
+                        break;
+                    }
+                    if d == '\\' && c == '"' {
+                        text.extend(chars.next());
+                    } else {
+                        text.push(d);
+                    }
+                }
+                out.push(Tok::Text(text));
+            }
+            '=' | '[' | ']' | '{' | '}' | ',' => out.push(Tok::Punct(c)),
+            c if c.is_whitespace() => {}
+            _ => {
+                let mut text = c.to_string();
+                while let Some(&d) = chars.peek() {
+                    if d.is_whitespace() || "=[]{},\"'#".contains(d) {
+                        break;
+                    }
+                    text.push(d);
+                    chars.next();
+                }
+                out.push(Tok::Text(text));
+            }
+        }
     }
-    fn depth(text: &str) -> i32 {
-        text.matches('[').count() as i32 - text.matches(']').count() as i32
+    out
+}
+
+/// Whether a target table of the manifest (`[lib]`, `[[bin]]`, `[[test]]`, `[[bench]]`, `[[example]]`) has a `harness`
+/// key (bare, `"harness"` or `'harness'`), on its own line or in an inline table of a target array.
+fn sets_harness(text: &str) -> bool {
+    fn has_harness(toks: &[Tok]) -> bool {
+        toks.windows(2)
+            .any(|w| matches!((&w[0], &w[1]), (Tok::Text(k), Tok::Punct('=')) if k == "harness"))
+    }
+    fn depth(toks: &[Tok]) -> i32 {
+        let count = |c| toks.iter().filter(|t| **t == Tok::Punct(c)).count() as i32;
+        count('[') - count(']')
     }
     let mut in_target = false;
     // Open brackets of a target array that continues on the next lines.
     let mut open = 0;
     for line in text.lines() {
-        let line = line.split('#').next().unwrap_or("").trim();
+        let toks = tokens(line);
+        if toks.is_empty() {
+            continue;
+        }
         if open > 0 {
-            if has_harness(line) {
+            if has_harness(&toks) {
                 return true;
             }
-            open += depth(line);
+            open += depth(&toks);
             continue;
         }
-        if line.starts_with('[') {
-            let header = line.trim_matches(|c| c == '[' || c == ']').trim();
-            in_target = matches!(header, "lib" | "bin" | "test" | "bench" | "example");
+        if toks[0] == Tok::Punct('[') {
+            let names: Vec<&Tok> = toks
+                .iter()
+                .filter(|t| !matches!(t, Tok::Punct('[' | ']')))
+                .collect();
+            in_target = matches!(names.as_slice(), [Tok::Text(h)]
+                if matches!(h.as_str(), "lib" | "bin" | "test" | "bench" | "example"));
             continue;
         }
-        if let Some((key, value)) = line.split_once('=') {
-            let key = key.trim().trim_matches('"');
+        if let [Tok::Text(key), Tok::Punct('='), value @ ..] = toks.as_slice() {
             if in_target && key == "harness" {
                 return true;
             }
             // `test = [{ name = "t", harness = false }]` and the like, also over several lines.
-            if matches!(key, "bin" | "test" | "bench" | "example") {
+            if matches!(key.as_str(), "bin" | "test" | "bench" | "example") {
                 if has_harness(value) {
                     return true;
                 }
@@ -677,6 +729,9 @@ mod tests {
             "[lib]\nharness = false\n",
             "test = [{ name = \"t\", harness = false }]\n",
             "test = [\n  { name = \"a\" },\n  {\n    name = \"t\",\n    harness = false,\n  },\n]\n",
+            "test = [\n  { name = \"a]b\" },\n  { name = \"t\", harness = false },\n]\n",
+            "[[test]]\nname = \"t\"\n'harness' = false\n",
+            "[[test]]\nname = \"t\"\n\"harness\" = false\n",
         ] {
             assert!(sets_harness(text), "{text} was accepted");
         }
@@ -684,6 +739,7 @@ mod tests {
             "[features]\nharness = []\n",
             "[package]\n# harness = false is not used here\nname = \"x\"\n",
             "[dependencies]\nharness = \"1\"\n",
+            "test = [\n  { name = \"a#b\" },\n]\n[features]\nharness = []\n",
         ] {
             assert!(!sets_harness(text), "{text} was refused");
         }
