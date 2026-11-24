@@ -169,6 +169,26 @@ fn strip_comment(line: &str) -> &str {
     line
 }
 
+/// The entries of an array body: a comma splits entries only outside quoted strings.
+fn split_entries(body: &str) -> Vec<&str> {
+    let mut entries = Vec::new();
+    let mut quote = None;
+    let mut start = 0;
+    for (at, character) in body.char_indices() {
+        match (quote, character) {
+            (None, '"' | '\'') => quote = Some(character),
+            (Some(open), close) if open == close => quote = None,
+            (None, ',') => {
+                entries.push(&body[start..at]);
+                start = at + 1;
+            }
+            _ => {}
+        }
+    }
+    entries.push(&body[start..]);
+    entries
+}
+
 /// The entries of the workspace manifest's `members = [...]` array, as written. Only a line that begins with the key
 /// `members` starts the array (`default-members` does not); comments are dropped; an entry is a `"..."` or `'...'`
 /// string. Globs are refused, not expanded: an entry with `*`, an absolute path, a `..` part or a backslash is an
@@ -208,7 +228,7 @@ fn parse_members(manifest: &str) -> Result<Vec<String>, String> {
         .ok_or("the `members` array is not closed")?
         + open;
     let mut members = Vec::new();
-    for entry in text[open + 1..close].split(',') {
+    for entry in split_entries(&text[open + 1..close]) {
         let entry = entry.trim();
         if entry.is_empty() {
             continue;
@@ -505,7 +525,8 @@ fn the_member_parser_reads_every_spelling_it_accepts_and_refuses_the_rest() {
     refused("members = [\"tools/*\"]", "tools/*");
     refused("members = [\"/abs\"]", "/abs");
     refused("members = [\"../x\"]", "../x");
-    refused("members = [a]", "a");
+    assert_eq!(parsed("members = [\"a,b\"]"), ["a,b"]);
+    refused("members = [unquoted_member]", "unquoted_member");
     refused("default-members = [\"x\"]", "no `members` array");
 }
 
