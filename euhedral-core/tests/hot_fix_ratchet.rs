@@ -20,7 +20,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// The `HOT-FIX(<id>)` ids that the library sources carry today, one per finding of the audit, and the number of
 /// places each is used (its field, each use the lint reports, its marker comment).
@@ -155,15 +155,136 @@ fn library_part(text: &str) -> String {
     kept
 }
 
-/// Every library source: `<workspace>/*/src/**/*.rs` except the modules declared for test builds, as (path from the
+/// Removes a `#` comment from a manifest line, keeping any `#` inside a quoted string.
+fn strip_comment(line: &str) -> &str {
+    let mut quote = None;
+    for (at, character) in line.char_indices() {
+        match (quote, character) {
+            (None, '"' | '\'') => quote = Some(character),
+            (Some(open), close) if open == close => quote = None,
+            (None, '#') => return &line[..at],
+            _ => {}
+        }
+    }
+    line
+}
+
+/// The entries of an array body: a comma splits entries only outside quoted strings.
+fn split_entries(body: &str) -> Vec<&str> {
+    let mut entries = Vec::new();
+    let mut quote = None;
+    let mut start = 0;
+    for (at, character) in body.char_indices() {
+        match (quote, character) {
+            (None, '"' | '\'') => quote = Some(character),
+            (Some(open), close) if open == close => quote = None,
+            (None, ',') => {
+                entries.push(&body[start..at]);
+                start = at + 1;
+            }
+            _ => {}
+        }
+    }
+    entries.push(&body[start..]);
+    entries
+}
+
+/// The entries of the workspace manifest's `members = [...]` array, as written. Only a line that begins with the key
+/// `members` starts the array (`default-members` does not); comments are dropped; an entry is a `"..."` or `'...'`
+/// string. Globs are refused, not expanded: an entry with `*`, an absolute path, a `..` part or a backslash is an
+/// error, as is an entry that is not quoted. An error names the entry.
+fn parse_members(manifest: &str) -> Result<Vec<String>, String> {
+    let mut text = String::new();
+    let mut found = false;
+    for line in manifest.lines().map(strip_comment) {
+        if !found {
+            let rest = line
+                .trim_start()
+                .strip_prefix("members")
+                .and_then(|rest| rest.trim_start().strip_prefix('='));
+            match rest {
+                Some(rest) => {
+                    found = true;
+                    text.push_str(rest);
+                }
+                None => continue,
+            }
+        } else {
+            text.push_str(line);
+        }
+        text.push('\n');
+        if text.contains(']') {
+            break;
+        }
+    }
+    if !found {
+        return Err("the workspace manifest has no `members` array".to_owned());
+    }
+    let open = text
+        .find('[')
+        .ok_or("the `members` value is not an array")?;
+    let close = text[open..]
+        .find(']')
+        .ok_or("the `members` array is not closed")?
+        + open;
+    let mut members = Vec::new();
+    for entry in split_entries(&text[open + 1..close]) {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let quoted =
+            |quote: char| entry.len() >= 2 && entry.starts_with(quote) && entry.ends_with(quote);
+        if !(quoted('"') || quoted('\'')) {
+            return Err(format!("member entry `{entry}` is not a quoted string"));
+        }
+        let name = &entry[1..entry.len() - 1];
+        if name.contains('*') {
+            return Err(format!(
+                "member `{name}` is a glob: globs are refused, list each member"
+            ));
+        }
+        let plain = !name.is_empty()
+            && !name.contains('\\')
+            && Path::new(name)
+                .components()
+                .all(|part| matches!(part, Component::Normal(_)));
+        if !plain {
+            return Err(format!("member `{name}` is not a plain relative path"));
+        }
+        members.push(name.to_owned());
+    }
+    Ok(members)
+}
+
+/// The `src` directory of every workspace member under `root`. The member's `Cargo.toml` is checked by the caller.
+fn member_src_dirs(root: &Path, manifest: &str) -> Result<Vec<PathBuf>, String> {
+    Ok(parse_members(manifest)?
+        .into_iter()
+        .map(|member| root.join(member).join("src"))
+        .collect())
+}
+
+/// Every library source: `<member>/src/**/*.rs` except the modules declared for test builds, as (path from the
 /// workspace root, text without its inline test modules).
 fn sources() -> Vec<(String, String)> {
-    let mut crates: Vec<PathBuf> = fs::read_dir(workspace())
-        .expect("the workspace directory")
-        .flatten()
-        .map(|entry| entry.path().join("src"))
-        .filter(|src| src.is_dir())
-        .collect();
+    let manifest =
+        fs::read_to_string(workspace().join("Cargo.toml")).expect("the workspace manifest");
+    let srcs = member_src_dirs(&workspace(), &manifest)
+        .unwrap_or_else(|error| panic!("the workspace manifest: {error}"));
+    let mut crates: Vec<PathBuf> = Vec::new();
+    for src in srcs {
+        let member = src.parent().expect("a member directory");
+        assert!(
+            member.join("Cargo.toml").is_file(),
+            "member `{}` has no Cargo.toml",
+            member.display()
+        );
+        // A member without a `src` directory has no library source to count.
+        if src.is_dir() {
+            crates.push(src);
+        }
+    }
     crates.sort();
     let mut files = Vec::new();
     for src in &crates {
@@ -344,6 +465,69 @@ fn is_a_finding(audit: &str, id: &str) -> bool {
 
 fn audit() -> String {
     fs::read_to_string(workspace().join(AUDIT)).expect("the audit")
+}
+
+#[test]
+fn a_member_under_tools_is_walked() {
+    let manifest =
+        "[workspace]\nmembers = [\"euhedral-core\", \"tools/bazel-gen\"]\nresolver = \"3\"\n";
+    assert_eq!(
+        parse_members(manifest).expect("a plain member list"),
+        ["euhedral-core", "tools/bazel-gen"]
+    );
+    let srcs = member_src_dirs(Path::new("ws"), manifest).expect("a plain member list");
+    assert!(
+        srcs.contains(&Path::new("ws").join("tools").join("bazel-gen").join("src")),
+        "the member walk does not reach tools/bazel-gen/src: {srcs:?}"
+    );
+}
+
+#[test]
+fn every_member_with_a_src_directory_is_scanned_in_the_real_manifest() {
+    let manifest =
+        fs::read_to_string(workspace().join("Cargo.toml")).expect("the workspace manifest");
+    let members = parse_members(&manifest).expect("a plain member list");
+    let scanned: Vec<String> = sources().into_iter().map(|(path, _)| path).collect();
+    for member in members {
+        if !workspace().join(&member).join("src").is_dir() {
+            continue;
+        }
+        let prefix = format!("{member}/src/");
+        assert!(
+            scanned.iter().any(|path| path.starts_with(&prefix)),
+            "no library source under `{prefix}` is scanned"
+        );
+    }
+}
+
+#[test]
+fn the_member_parser_reads_every_spelling_it_accepts_and_refuses_the_rest() {
+    let parsed = |manifest: &str| parse_members(manifest).expect("a plain member list");
+    let refused = |manifest: &str, entry: &str| {
+        let error = parse_members(manifest).expect_err("a refused member list");
+        assert!(
+            error.contains(entry),
+            "the error `{error}` does not name `{entry}`"
+        );
+    };
+    let comment_line =
+        "[workspace]\nmembers = [\n  \"a\", # first\n  # \"x\",\n  \"tools/b\",\n]\n";
+    assert_eq!(parsed(comment_line), ["a", "tools/b"]);
+    assert_eq!(parsed("members = ['a', 'tools/b']"), ["a", "tools/b"]);
+    assert_eq!(
+        parsed("members = [\"a\", # keep ] going\n \"b\"]"),
+        ["a", "b"]
+    );
+    assert_eq!(
+        parsed("default-members = [\"x\"]\nmembers = [\"a\"]"),
+        ["a"]
+    );
+    refused("members = [\"tools/*\"]", "tools/*");
+    refused("members = [\"/abs\"]", "/abs");
+    refused("members = [\"../x\"]", "../x");
+    assert_eq!(parsed("members = [\"a,b\"]"), ["a,b"]);
+    refused("members = [unquoted_member]", "unquoted_member");
+    refused("default-members = [\"x\"]", "no `members` array");
 }
 
 #[test]
