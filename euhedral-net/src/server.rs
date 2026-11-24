@@ -425,7 +425,9 @@ impl Shared {
         if ls.stopping || ls.retrying {
             return;
         }
-        let Some(timers) = &ls.timers else {
+        // Timers the caller completed early run no frame, but a cancelled retry frame still posts its event, which
+        // would fail the accept and arm the retry again without end: the accept is then ended for good.
+        let Some(timers) = ls.timers.as_ref().filter(|timers| !timers.is_complete()) else {
             return;
         };
         ls.retrying = true;
@@ -750,7 +752,13 @@ mod tests {
             self.post(ListenerEvent::Stop(no_work()));
             self.run_inbox();
             let mut frames = Vec::new();
+            // A hang guard only: it decides nothing but a hang.
+            let deadline = Instant::now() + Duration::from_secs(30);
             while frames.is_empty() {
+                assert!(
+                    Instant::now() < deadline,
+                    "the accept's frame was never handed out"
+                );
                 self.io.reap();
                 self.io
                     .pull(&mut |frame| frames.push(frame), &mut |_| false, u64::MAX);
@@ -792,5 +800,39 @@ mod tests {
         drop(hand.stop_and_hand_out());
         hand.run_inbox();
         assert!(hand.finished(), "the stop is reported after the drop");
+    }
+
+    /// Timers the caller completed early cancel the retry frame, which still posts its event. With an accept that
+    /// fails at once, the listener must not arm the retry again: the events run end, and the stop is reported.
+    #[test]
+    fn timers_completed_early_do_not_keep_the_listener_retrying() {
+        let io = AsyncIo::open().unwrap();
+        let timers = Completions::without_lanes();
+        let shared = new_shared(
+            Weak::new(),
+            &io,
+            Arc::new(QueueIngestSink::new()),
+            TcpListener::bind("127.0.0.1:0").unwrap(),
+            ServerConfig::default(),
+            Arc::new(|_: Request, _: Responder| no_work()),
+            timers.clone(),
+        );
+        // The accept cannot start: the `AsyncIo` is gone.
+        drop(io);
+        timers.complete();
+        shared.post_listener(ListenerEvent::Start);
+        let mut run = 0;
+        while let Some(event) = shared.station.take_event() {
+            run += 1;
+            assert!(run <= 100, "the listener kept re-arming the retry");
+            shared.run_event(event);
+        }
+        shared.post_listener(ListenerEvent::Stop(no_work()));
+        while let Some(event) = shared.station.take_event() {
+            run += 1;
+            assert!(run <= 100, "the listener kept re-arming the retry");
+            shared.run_event(event);
+        }
+        assert!(shared.listener.enter().finished, "the stop is reported");
     }
 }
