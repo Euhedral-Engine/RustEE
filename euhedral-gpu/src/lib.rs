@@ -50,6 +50,9 @@ mod shape;
 mod spans;
 mod sync;
 mod tensor_map;
+#[cfg(test)]
+#[path = "../tests/common/scratch.rs"]
+mod test_scratch;
 
 pub use api::{
     CompileOptions, DeviceAttributes, Enqueue, Gpu, Graph, Kernel, KernelOptions, Lane,

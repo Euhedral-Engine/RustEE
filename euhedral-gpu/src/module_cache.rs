@@ -117,12 +117,11 @@ mod tests {
     /// A fresh directory in the build's target directory (never the system's temporary directory).
     #[allow(clippy::disallowed_methods, reason = "a test fixture")]
     fn scratch(name: &str) -> PathBuf {
-        let exe = std::env::current_exe().unwrap();
-        let dir = exe
-            .parent()
-            .unwrap()
-            .join("module-cache-tests")
-            .join(format!("{name}-{}", std::process::id()));
+        let dir = crate::test_scratch::test_scratch_dir(|| {
+            let exe = std::env::current_exe().unwrap();
+            exe.parent().unwrap().join("module-cache-tests")
+        })
+        .join(format!("{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
     }
