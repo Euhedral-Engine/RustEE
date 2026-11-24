@@ -99,6 +99,45 @@ fn the_disk_walk_skips_what_bazel_ignores() {
 }
 
 #[test]
+fn the_disk_walk_skips_a_members_target_directory() {
+    let dir = scratch().join("build-walk-member-target");
+    let _ = std::fs::remove_dir_all(&dir);
+    for path in [
+        "a/BUILD.bazel",
+        "a/target/debug/BUILD.bazel",
+        "a/src/target/BUILD",
+    ] {
+        let file = dir.join(path);
+        std::fs::create_dir_all(file.parent().expect("a parent")).expect("mkdir");
+        std::fs::write(file, "").expect("write");
+    }
+    assert_eq!(build_files_on_disk(&dir).expect("walks"), ["a/BUILD.bazel"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn the_disk_walk_names_a_directory_it_cannot_list() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = scratch().join("build-walk-unreadable");
+    let locked = dir.join("a/locked");
+    let _ = std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&locked).expect("mkdir");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+    let readable = std::fs::read_dir(&locked).is_ok();
+    let result = build_files_on_disk(&dir);
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).expect("chmod back");
+    if readable {
+        return; // running as root: permissions do not apply
+    }
+    let error = result.expect_err("an unreadable directory is an error");
+    assert!(
+        error.contains("a/locked"),
+        "the error names the directory: {error}"
+    );
+}
+
+#[test]
 fn the_module_lock_records_the_current_manifests() {
     let root = root();
     let ws = load_workspace(&root, &cargo(), cargo_home().as_deref()).expect("the workspace loads");

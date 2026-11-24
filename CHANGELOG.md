@@ -3,6 +3,21 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## The Bazel generator sees harness in a multi-line target array, skips every `target/` and names an unreadable directory (build) (2026-11-24)
+
+**What.** `euhedral-bazel-gen` refuses a `harness` key inside a target array written over several lines (`test = [\n { name = "t", harness = false },\n]`), as it already did on one line. The disk walk for stray BUILD files skips every directory called `target`, not only the root one, and its error for an unreadable directory names the directory. `scripts/ci/affected.py` treats a BUILD or BUILD.bazel file under `docs/` as a BUILD file outside every member (everything), not as documentation.
+
+**Why.** A multi-line inline target array lost `harness = false` silently, a member's `target/` (from a Cargo run inside it) was walked as packages, and a BUILD file under `docs/` was routed as documentation and so never checked.
+
+**How to use.** Nothing to do. An unreadable directory still stops the walk: skipping it could hide a BUILD file the generator should own; fix its permissions or list it in `.bazelignore`.
+
+**Semantics.**
+- Any `harness` key inside a `bin`, `test`, `bench` or `example` array value is refused, on one line or several.
+- A directory named `target` at any depth is not walked.
+- A BUILD file anywhere that no member owns runs every crate's checks.
+
+**Tests.** `scripts/ci/test_affected.py::test_a_build_file_under_docs_is_not_documentation`; `model.rs` `only_a_target_tables_harness_key_is_refused` (multi-line case); `tests/stale.rs` `the_disk_walk_skips_a_members_target_directory` and `the_disk_walk_names_a_directory_it_cannot_list` (the unreadable-directory test skips itself as root). The first three fail on the old code.
+
 ## Device tests run under Bazel and fail when they skip (build) (2026-11-24)
 
 **What.** `bazel test --config=gpu //...` runs every `gpu`-tagged target against the card. `--config=gpu` selects only the `gpu` targets, passes `EUHEDRAL_NVRTC`, `CUDA_HOME`, `CUDA_PATH` and `LD_LIBRARY_PATH` through, sets `EUHEDRAL_DEVICE_REQUIRED=1` and passes `--nocapture` to the tests. Both `skip` helpers (`euhedral-gpu/tests/common/skip.rs`, `euhedral-memory/tests/cuda.rs`) panic when `EUHEDRAL_DEVICE_REQUIRED` is set. Four silent early exits in `euhedral-gpu/tests/cuda.rs` now say they skipped: a driver older than 13.1 in `missing_kernels_are_not_found` and `arguments_that_do_not_fit_are_refused_before_launch`, and both halves of `axpb_from_source_and_from_ptx_match_the_cpu_bit_for_bit` (NVRTC missing, driver older than 13.1).

@@ -73,6 +73,12 @@ class Affected(unittest.TestCase):
             self.assertEqual(sorted(crates), sorted(NAMES), f)
             self.assertIn("root build file", A.affected(G, [f])[2], f)  # not merely a file that belongs to no crate
 
+    def test_a_build_file_under_docs_is_not_documentation(self):
+        for f in ["docs/x/BUILD.bazel", "docs/BUILD"]:
+            crates, everything = run(f)
+            self.assertTrue(everything, f)
+            self.assertEqual(sorted(crates), sorted(NAMES), f)
+
     def test_a_crates_build_file_affects_that_crate_and_the_stale_check(self):
         # A hand edit to a generated file makes it stale: the generator crate's stale test must run.
         self.assertEqual(run("euhedral-io/BUILD.bazel"), (["bazelgen", "io"], False))

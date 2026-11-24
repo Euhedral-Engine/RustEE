@@ -415,9 +415,27 @@ fn parse_extras(
 /// Whether a target table of the manifest (`[lib]`, `[[bin]]`, `[[test]]`, `[[bench]]`, `[[example]]`) has a `harness`
 /// key, on its own line or in an inline table of a target array.
 fn sets_harness(text: &str) -> bool {
+    fn has_harness(text: &str) -> bool {
+        text.split(['{', ',', '}']).any(|part| {
+            part.split_once('=')
+                .is_some_and(|(k, _)| k.trim().trim_matches('"') == "harness")
+        })
+    }
+    fn depth(text: &str) -> i32 {
+        text.matches('[').count() as i32 - text.matches(']').count() as i32
+    }
     let mut in_target = false;
+    // Open brackets of a target array that continues on the next lines.
+    let mut open = 0;
     for line in text.lines() {
         let line = line.split('#').next().unwrap_or("").trim();
+        if open > 0 {
+            if has_harness(line) {
+                return true;
+            }
+            open += depth(line);
+            continue;
+        }
         if line.starts_with('[') {
             let header = line.trim_matches(|c| c == '[' || c == ']').trim();
             in_target = matches!(header, "lib" | "bin" | "test" | "bench" | "example");
@@ -428,14 +446,12 @@ fn sets_harness(text: &str) -> bool {
             if in_target && key == "harness" {
                 return true;
             }
-            // `test = [{ name = "t", harness = false }]` and the like.
-            if matches!(key, "bin" | "test" | "bench" | "example")
-                && value.split(['{', ',', '}']).any(|part| {
-                    part.split_once('=')
-                        .is_some_and(|(k, _)| k.trim() == "harness")
-                })
-            {
-                return true;
+            // `test = [{ name = "t", harness = false }]` and the like, also over several lines.
+            if matches!(key, "bin" | "test" | "bench" | "example") {
+                if has_harness(value) {
+                    return true;
+                }
+                open = depth(value).max(0);
             }
         }
     }
@@ -660,6 +676,7 @@ mod tests {
             "[[test]]\nname = \"t\"\nharness = false\n",
             "[lib]\nharness = false\n",
             "test = [{ name = \"t\", harness = false }]\n",
+            "test = [\n  { name = \"a\" },\n  {\n    name = \"t\",\n    harness = false,\n  },\n]\n",
         ] {
             assert!(sets_harness(text), "{text} was accepted");
         }

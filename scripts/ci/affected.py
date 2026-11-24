@@ -193,6 +193,9 @@ def affected(graph, files, workflow_is_everything=True):
                 seed.add(BAZEL_GEN)
         elif matches(f, EVERYTHING):
             return set(graph.dirs), True, f"{f} is a root build file"
+        elif os.path.basename(f) in BUILD_FILES:
+            # Tested before DOCS: a BUILD file under docs/ is still a Bazel package outside every member.
+            return set(graph.dirs), True, f"{f} is a BUILD file outside every member"
         elif matches(f, DOCS):
             continue
         else:
