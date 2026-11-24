@@ -824,7 +824,7 @@ fn a_stopped_server_refuses_new_connections_while_a_request_drains() {
         );
         stream.set_read_timeout(Some(remaining)).unwrap();
         let mut byte = [0u8; 1];
-        match stream.read(&mut byte) {
+        match read_on(stream, &mut byte) {
             Ok(0) => {}
             Err(error) if error.kind() == ErrorKind::ConnectionReset => {}
             other => panic!("a queued connection was not closed by the server: {other:?}"),
