@@ -3,6 +3,32 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## The Bazel skeleton (build) (2026-11-24)
+
+**What.** `MODULE.bazel` (rules_rust, platforms and skylib at the shared version table, the toolchain at 1.99.1, `crate_universe` over the workspace's `Cargo.toml` and `Cargo.lock` for the Linux and Windows triples), `MODULE.bazel.lock`, `.bazelversion`, `.bazelrc`, `.bazelignore`, a root `BUILD.bazel`, `.gitattributes` (LF for the Bazel files and the Cargo manifests) and a copy of the shared `euhedral_build` module under `build/module`. `bazel query @crates//...` lists the third-party crates. No crate has a `BUILD.bazel` yet, and no CI job runs Bazel.
+
+**Why.** The step before the generated BUILD files: the dependency graph resolves and is locked, so the next step only adds targets.
+
+**How to use.** After editing `MODULE.bazel`, a `Cargo.toml` or `Cargo.lock`, run `bazel mod deps --lockfile_mode=update` and commit `MODULE.bazel.lock`. Cargo is unchanged and stays the owner of the lock.
+
+**Semantics.** No library code and no Cargo file changed. `scripts/ci/affected.py` treats the root Bazel files as root build files (the full Cargo run and every Miri shard), and a change to any member's `Cargo.toml`, `src/`, `tests/`, `examples/`, `benches/` or `build.rs` also affects `euhedral-bazel-gen`, whose later check reads those files.
+
+**Tests.** `tools/bazel-gen/tests/toolchain_pin.rs` now compares the two toolchain lines of `MODULE.bazel` with `rust-toolchain.toml`; `scripts/ci/test_affected.py` covers the new rules.
+
+## The server closes its listener at stop (`euhedral-net`) (2026-11-23)
+
+**What.** `ServerHandle::stop` closes the listening socket as soon as the cancelled accept has ended, not when the last connection has ended.
+
+**Why.** A client that connected after the stop was completed by the kernel into the backlog and then waited, unanswered, for as long as other connections drained. Draining means no new work is taken.
+
+**How to use.** Nothing changes for callers. After `stop`, the listening socket is closed and a new connect is refused.
+
+**Semantics.**
+- A socket the in-flight accept returns after the stop began is dropped; the peer sees it close.
+- Open connections are served and drained as before; the stop frame is still offered when the last one has ended.
+
+**Tests.** `a_stopped_server_refuses_new_connections_while_a_request_drains` (a request held in the handler, a stop, connects refused, the held request answered and closed).
+
 ## The production build is lint-clean (CI) (2026-11-24)
 
 **What.** `euhedral-gpu` built with neither `fake` nor `cuda` had 15 dead-code findings (backend-only items: the lane submit macro and `Retired` import, `check_pitched`, `over_shared_limit`, `RawStream::new`, `GraphHold::add_frozen`/`add_value`, `freeze`, the span book, the tensor map `code` methods). They are now behind `cfg(any(feature = "fake", feature = "cuda"))` (the span book, `freeze` and the hold methods also stay for `cfg(test)`, which exercises them). The clippy job of both workflows gains `cargo clippy --workspace --lib -- -D warnings`.

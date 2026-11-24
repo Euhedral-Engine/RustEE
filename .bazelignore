@@ -1,0 +1,6 @@
+# Cargo's output tree is not a set of packages.
+target
+# Agent worktrees live here, some with a MODULE.bazel of their own; //... must not descend into them.
+.claude
+# The euhedral_build module is loaded through local_path_override, not as packages of this module.
+build

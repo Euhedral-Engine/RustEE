@@ -1,0 +1,18 @@
+# euhedral_build: the shared module of the global build contracts (build/CONTRACTS.md, C4).
+# The bazel_dep lines below are THE version table. Every repo that uses one of these rule sets declares it with the
+# same version; build/scripts/check-repo.sh enforces that (bzlmod's minimal version selection alone only sets floors).
+# Only platforms is a real dependency (//platforms needs it). The rest are dev dependencies: they make the table
+# resolvable here (bazel mod graph) without pulling every rule set into a repo that only wants the platforms or tags.
+module(name = "euhedral_build", version = "0.1.0")
+
+bazel_dep(name = "platforms", version = "1.1.0")
+bazel_dep(name = "bazel_skylib", version = "1.9.2", dev_dependency = True)
+bazel_dep(name = "rules_cc", version = "0.2.28", dev_dependency = True)
+bazel_dep(name = "rules_shell", version = "0.10.0", dev_dependency = True)
+bazel_dep(name = "rules_go", version = "0.65.0", dev_dependency = True)
+bazel_dep(name = "gazelle", version = "0.54.0", dev_dependency = True)
+bazel_dep(name = "rules_rust", version = "0.75.0", dev_dependency = True)
+bazel_dep(name = "rules_python", version = "2.5.1", dev_dependency = True)
+bazel_dep(name = "rules_python_gazelle_plugin", version = "2.5.1", dev_dependency = True)
+bazel_dep(name = "aspect_rules_js", version = "3.6.1", dev_dependency = True)
+bazel_dep(name = "rules_java", version = "9.9.0", dev_dependency = True)
