@@ -108,8 +108,8 @@ second Cargo workspace uses it.
 - **Targets come from Cargo, not from globs:** one `rust_library` per lib, one `rust_test` for the lib's unit tests, one
   `rust_doc_test`, one `rust_test` per `[[test]]` target, one `rust_binary` per bin (plus a `rust_test` for its unit
   tests) and per example. The generator stops with a message on anything it does not model: a `custom-build` or
-  `bench` target, a renamed dependency, a weak `dep?/feature` entry, a first-party dependency under `[target.*]`, or a
-  target `cfg` it does not know. None of these exists today. A new kind is a generator change, never a silent omission.
+  `bench` target, a renamed dependency, a weak `dep?/feature` entry, a first-party dependency under `[target.*]`, a
+  target `cfg` it does not know, or `euhedral-memory/cuda` in the testing world. None of these exists today. A new kind is a generator change, never a silent omission.
 - **Sources within a target are globs:** `src/**/*.rs` minus the bins; `tests/<name>.rs` plus `tests/*/**/*.rs` (the
   `common` modules); `examples/<name>.rs` plus `examples/<name>/**`. Non-Rust files beside them (`README.md`, the
   kernels) are `compile_data`. A new module file therefore needs no new BUILD file. Only a `Cargo.toml` change or a new
@@ -147,7 +147,7 @@ second Cargo workspace uses it.
     `examples/`, `benches/`, `build.rs`). Without them in `data` the sandbox has no copy to read.
   - Under `cargo test`, Cargo sets `CARGO` itself, so the same test also fails the Cargo gate on a stale file.
     `affected.py` marks `euhedral-bazel-gen` affected by any member's `Cargo.toml` and by any change at all under a
-    member's `src/`, `tests/`, `examples/` or `benches/` (step 3). Only an added or removed target file can make a
+    member's `src/`, `tests/`, `examples/` or `benches/` or to its `build.rs` (step 3). Only an added or removed target file can make a
     BUILD file stale, but `affected.py` cannot tell one from an edit: `changed_files` runs
     `git diff --name-only --no-renames`, and `--files` takes plain paths. Counting every change there keeps both
     inputs as they are. The alternative, `--name-status` with a status per path, would change `--files` (its callers
@@ -212,7 +212,7 @@ with `testing`, one without), and their types would not match.
 |---|---|---|---|
 | production | each crate's defaults, no dev-dependencies (what a consumer of the crate gets) | `//<crate>:<crate>` | none |
 | testing | `cargo test --workspace`: defaults plus every member's dev-dependency features | `<crate>_testing` and every test | none |
-| cuda testing | testing plus `cuda` on `euhedral-memory` and `euhedral-gpu` | `<crate>_cuda_testing`, their tests, the CUDA examples | `gpu`, `external` |
+| cuda testing | testing plus `cuda` on `euhedral-memory` and `euhedral-gpu` | `<crate>_cuda_testing`, their tests, the CUDA examples | `gpu`, `external` on every test that resolves `euhedral-memory/cuda` (What runs where) |
 
 - A crate whose features and first-party dependencies are the same in two worlds gets one target, and the other
   world's name is an `alias`. Today the testing world has its own build of `euhedral-graph`, `euhedral-gpu`,
@@ -426,7 +426,7 @@ merges before it.
    - `scripts/ci/affected.py` and its tests: the root Bazel files (`MODULE.bazel`, `MODULE.bazel.lock`, `.bazelrc`,
      `.bazelversion`, `.bazelignore`, the root `BUILD.bazel`) affect everything (the full Cargo run and every Miri
      shard). A crate's `BUILD.bazel` affects that crate. Any member's `Cargo.toml`, and any change under a member's
-     `src/`, `tests/`, `examples/` or `benches/`, also affects `euhedral-bazel-gen` (its stale test). `--name-only`
+     `src/`, `tests/`, `examples/` or `benches/` or to its `build.rs`, also affects `euhedral-bazel-gen` (its stale test). `--name-only`
      cannot tell an added file from an edited one, so every change there counts (see the stale check).
 
    *Done:* `bazel query @crates//...` resolves, forge's `check-repo.sh .` passes C1 to C4, and the affected-file tests
@@ -466,13 +466,14 @@ merges before it.
        `skip_hardware`). It skips loudly only when both are missing.
 
      A dropped half returns nothing, so a search for `return` cannot find it. Silent skips are found by searching the
-     capability checks instead: `driver_version()`, `Nvrtc::shared`, `arch()` and `Driver::load`/`Driver::shared`
+     capability checks instead: `driver_version()`, `Nvrtc::shared`, `arch()`, `CudaGpu::open`, `Device::open` and `Driver::load`/`Driver::shared`
      under `euhedral-gpu/tests` and `euhedral-memory/tests`, and reading each branch that leaves work out. That search,
      at the time of writing, finds only the four sites above. The other checks either pick one of two ways to load the
      kernels and skip loudly when both fail (`cuda_graph.rs`, `cuda_fault.rs`, `cuda_fault_drop.rs`,
      `cuda_launch_alloc.rs`, `cuda_lane_graph_alloc.rs`, `cuda_stage_alloc.rs`, `cuda_reopen.rs`,
      `common/cuda_support.rs`, `cuda.rs:768`), or already call a helper (`cuda.rs:449` and `:473`, the
-     NVRTC-only tests, `cuda_programmatic.rs`, `cuda_tensor_map*.rs`, `euhedral-memory/tests/cuda.rs`). Step 5
+     NVRTC-only tests, every device open, `cuda_programmatic.rs`, `cuda_tensor_map*.rs`, `euhedral-memory/tests/cuda.rs`;
+     the bare `return` at `cuda.rs:701` follows the same check at line 691 and cannot be reached). Step 5
      repeats the search on its own head.
 
    *Done:* `system-run --gpu ... bazel test --config=gpu //...` runs every `gpu` target and none skipped, and a rerun
@@ -509,8 +510,8 @@ them cached; a `<crate>_cuda` production target when a consumer module needs one
   share the machine with each other. A test that fails only under Bazel is a test to fix (it assumes it has the machine
   to itself), not a reason to serialise the suite.
 - **Generator drift from Cargo's resolver:** a feature form the resolver does not model could produce a world with
-  fewer features. It stops on renamed dependencies, weak `?/` features, first-party dependencies under `[target.*]` and
-  unknown target `cfg`s, and the one-time proofs cover today's manifests. A new feature form is a generator change, proved
+  fewer features. It stops on renamed dependencies, weak `?/` features, first-party dependencies under `[target.*]`,
+  unknown target `cfg`s and `cuda` in the testing world, and the one-time proofs cover today's manifests. A new feature form is a generator change, proved
   again the same way.
 - **Third-party features per world:** crate_universe builds each third-party crate once, with the features of the
   default resolve. A dependency feature that only the cuda world needs would be missing. Today the `windows-sys`
