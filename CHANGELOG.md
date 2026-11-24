@@ -3,6 +3,49 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## Two threads' first operations on one Windows handle both succeed (`euhedral-io`) (2026-11-24)
+
+**What.** On Windows, two threads that make the first operation on one handle at the same time no longer refuse one of them with "the handle already belongs to another completion port". The engine records a handle's route (joining the port, on the port, or served by a ring) with one compare-and-set before it makes the system call, and the first claim decides for every thread. A thread that meets a join still in flight cannot tell a handle that is ours from another port's (the OS refuses both with the same error), and does not wait: its operation is accepted and held, and the next poll launches it once the join succeeded, or ends it with the refusal if the handle belongs to another port. A file for which one thread took a ring route and another, with no ring, was about to join the port is likewise decided once: the thread without a ring has its operation taken and ended with the ring-served error.
+
+**Why.** The engine called `associate` and recorded the handle after it returned. A second thread whose own call was refused (the handle was ours by then) looked the handle up before the first had recorded it, and failed a correct operation (seen in CI on a runner that served the file through the port). The route check of a file had the same gap between the ring decision and its record.
+
+**How to use.** Submit never refuses a handle on Windows. A handle of another port (the claimer's `associate` answers 87), a ring-served file used by a thread with no ring, and a handle the engine cannot hold are all taken like any operation and end in their completion with the error (`InvalidInput`, the ring-served error, "too many handles"), through the failed-operations path of the next poll. A first operation on a handle that another thread is joining may end a poll later than usual. Submit returns an error only for what it cannot take (a handle that would block or skip the port, a full operation table). Code that matched on a submit-time `InvalidInput` for these handles reads the completion instead.
+
+**Semantics.**
+- Exactly one thread calls `associate` for a handle; a refusal or an error removes its claim, so no mark is left behind.
+- A refusal ends the operation in its completion once, whether it was decided by this thread's call, by another thread's, or at once.
+- An operation held for a join is launched on the first poll after the join succeeded, or ended once with `InvalidInput` if it was refused; a cancel or a time limit meanwhile ends it as for any operation that is being issued.
+- `forget` clears the handle's route, as before.
+
+**Tests.** `win::tests`: `a_second_first_operation_during_a_join_is_held_until_it_ends_and_then_runs` and `a_file_one_thread_joins_while_another_makes_its_ring_goes_to_the_port_for_both` fail on the old code; `a_handle_that_belongs_to_another_port_is_taken_and_ends_with_the_refusal`, `a_file_a_ring_serves_is_taken_by_the_port_route_and_ends_with_the_refusal` and `a_handle_the_set_cannot_hold_is_taken_and_ends_with_an_error` fail on the old code (submit refused); `a_handle_on_another_port_is_refused_to_both_threads_and_leaves_no_claim` and `a_thread_without_a_ring_never_joins_a_file_a_ring_serves` pin the refusals in the race. `win::handles::tests`: one claimer wins of racing threads.
+
+## Another Bazel module can depend on RustEE (build) (2026-11-24)
+
+**What.** `crate.from_cargo` sets `lockfile = "//:cargo-bazel-lock.json"` and the file is committed, so a module that depends on `euhedral_rustee` resolves (Bazel refused a non-root crate_universe repository without a lock). `cargo-bazel-lock.json` has the same `eol=lf` entry as `MODULE.bazel.lock`. The stale test's check of `MODULE.bazel.lock`'s manifest digests (which the lock no longer records) is replaced by a comparison of `Cargo.lock`'s registry packages with the crates of `cargo-bazel-lock.json`, and the `bazel` CI job repins a copy of the tree and fails when either lock changes.
+
+**Why.** crate_universe's digest does not cover `Cargo.lock` or a manifest's contents (checked on rules_rust 0.75.0), so a `cargo update` without a repin would otherwise build the old crate versions without a word.
+
+**How to use.** After `cargo update`, or an edit of a `Cargo.toml` or `MODULE.bazel`, run `CARGO_BAZEL_REPIN=1 bazel mod deps --lockfile_mode=update` and commit `cargo-bazel-lock.json` and `MODULE.bazel.lock`. A consumer declares its own `euhedral_build` override and has a root `BUILD.bazel`; the target is `@euhedral_rustee//euhedral-core:euhedral_core` (docs/design/bazel.md, "Using RustEE from another Bazel module").
+
+**Semantics.** No library code, `Cargo.toml` or `Cargo.lock` changed. The repin is deterministic.
+
+**Tests.** `the_lock_check_names_a_package_only_one_lock_has` (a planted version mismatch) and `the_crate_lock_matches_cargo_lock` in `tools/bazel-gen`; with `cargo update -p cfg-if --precise 1.0.4` the second fails naming both versions.
+
+## The net stop test makes a connection whose server half the kernel lost say so (`euhedral-net`, test) (2026-11-24)
+
+**What.** `a_stopped_server_refuses_new_connections_while_a_request_drains` sends one byte (`G`, the start of a request) on each connection that got in after the stop before it reads it, connects in batches of at most 32, and reads every connection of a batch to its end (closed, reset or aborted) before it starts the next, until a connect is refused. Its failure message names the server's `accepted` and `open` counts, whether a refusal was seen, and the connection's addresses. The server is unchanged.
+
+**Why.** The test failed about once in 200 runs of the whole `server` test binary on a loaded machine (and once under `bazel test //...`): a connection that got in before the listener closed was neither closed nor reset within 20 s. A run caught with the kernel's socket table at the failure showed the client's socket established and no socket at all on the server's side for that pair of ports: not held by the process, not in the accept queue, not a pending handshake. The server had accepted only the connection with the request in flight. So the kernel lost the server half of a handshake it was completing as the listener closed, sent the client nothing, and a client that sends nothing never learns. The server never had that connection and cannot close it. The same happens at a full listen backlog (128 for a standard-library `TcpListener`), where Linux drops the last ACK of a handshake the client saw complete (`tcp_abort_on_overflow` is 0): a scratch run with backlog 8 and 32 concurrent connects left one client in that state after the close. A byte sent on such a connection is answered with a reset, since no socket owns its ports; on a connection the server holds it is the start of a request, which the stop must close as it closes an idle connection, so a server that kept either open still fails the test.
+
+**How to use.** Nothing changes for callers. A client of a stopping server that sends nothing may not learn that a connection racing the close is gone; that is the kernel's behaviour, not the server's.
+
+**Semantics.**
+- A connection the server accepted before or after the stop is closed by it at once (it carries no request).
+- A connection in the backlog when the listener closes is reset by the kernel.
+- A handshake the kernel was completing as the listener closed (or dropped at a full backlog) has no server socket; its client hears of it only when it sends.
+
+**Tests.** The test itself. It cannot fail on the old code on demand: the loss needs the client's last ACK to meet the listener's close. Counted runs of the whole binary: old test 1 failure in 200; the batches alone 1 in 200 (the case above); with the byte, no failure in about 420 runs (stopped there).
+
 ## The Bazel generator sees harness in a multi-line target array, skips every `target/` and names an unreadable directory (build) (2026-11-24)
 
 **What.** `euhedral-bazel-gen` refuses a `harness` key inside a target array written over several lines (`test = [\n { name = "t", harness = false },\n]`), as it already did on one line. The disk walk for stray BUILD files skips every directory called `target`, not only the root one, and its error for an unreadable directory names the directory. `scripts/ci/affected.py` treats a BUILD or BUILD.bazel file under `docs/` as a BUILD file outside every member (everything), not as documentation.

@@ -1,11 +1,10 @@
-//! Fails when a BUILD file or `MODULE.bazel.lock` is out of date with the Cargo manifests and target files: a manifest or a
-//! target was added, removed or changed without regenerating. Runs under Cargo and Bazel alike.
+//! Fails when a BUILD file or `cargo-bazel-lock.json` is out of date with the Cargo manifests and target files: a manifest or a
+//! target was added, removed or changed without regenerating, or Cargo.lock changed without a repin. Runs under Cargo and Bazel alike.
 
 use std::path::PathBuf;
 
 use euhedral_bazel_gen::{
-    build_files_on_disk, emit, extra_build_files, load_workspace, lock_problems, locked_inputs,
-    stale,
+    build_files_on_disk, emit, extra_build_files, load_workspace, lock_problems, stale,
 };
 
 /// The workspace root: under Bazel, the runfiles copy of `//:workspace_sources`.
@@ -143,17 +142,14 @@ fn the_disk_walk_names_a_directory_it_cannot_list() {
 }
 
 #[test]
-fn the_module_lock_records_the_current_manifests() {
+fn the_crate_lock_matches_cargo_lock() {
     let root = root();
-    let ws = load_workspace(&root, &cargo(), cargo_home().as_deref()).expect("the workspace loads");
-    let lock = std::fs::read_to_string(root.join("MODULE.bazel.lock")).expect("MODULE.bazel.lock");
-    let problems = lock_problems(
-        &lock,
-        &|path| std::fs::read(root.join(path)).ok(),
-        &locked_inputs(&ws),
-    );
+    let cargo_lock = std::fs::read_to_string(root.join("Cargo.lock")).expect("Cargo.lock");
+    let bazel_lock =
+        std::fs::read_to_string(root.join("cargo-bazel-lock.json")).expect("cargo-bazel-lock.json");
+    let problems = lock_problems(&cargo_lock, &bazel_lock).expect("cargo-bazel-lock.json parses");
     assert!(
         problems.is_empty(),
-        "MODULE.bazel.lock is out of date ({problems:?}): run `bazel mod deps --lockfile_mode=update`"
+        "cargo-bazel-lock.json is out of date ({problems:?}): run `CARGO_BAZEL_REPIN=1 bazel mod deps --lockfile_mode=update` and commit both locks"
     );
 }
