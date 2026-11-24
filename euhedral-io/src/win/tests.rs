@@ -1164,10 +1164,10 @@ fn a_pool_job_that_panics_or_is_dropped_still_ends_its_operation() {
 fn a_new_socket_of_a_closed_ones_value_that_sits_on_another_port_is_refused() {
     let h = Harness::new();
     let sock = h.sim.sock();
-    assert!(matches!(h.engine.join_port(sock), Join::Ready));
+    assert!(matches!(h.engine.join_port(sock, true), Join::Ready));
     h.engine.forget(sock);
     h.sim.reuse(sock, true);
-    let Join::Refused(error) = h.engine.join_port(sock) else {
+    let Join::Refused(error) = h.engine.join_port(sock, true) else {
         panic!("a refusal");
     };
     assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
@@ -1178,7 +1178,7 @@ fn a_new_file_of_a_closed_ones_value_is_offered_a_ring() {
     let h = Harness::with(Some(full_probe()), true, MAX_PIECE);
     let file = h.sim.file(&content(100));
     // The old file joined the port, and closed.
-    assert!(matches!(h.engine.join_port(file), Join::Ready));
+    assert!(matches!(h.engine.join_port(file, false), Join::Ready));
     h.engine.forget(file);
     h.sim.reuse(file, false);
     h.read(file, 0, 10, 1).unwrap();
@@ -1190,14 +1190,14 @@ fn a_new_file_of_a_closed_ones_value_is_offered_a_ring() {
 fn a_socket_the_engine_makes_of_a_closed_ones_value_is_not_taken_for_it() {
     let h = Harness::new();
     let old = h.sim.sock();
-    assert!(matches!(h.engine.join_port(old), Join::Ready));
+    assert!(matches!(h.engine.join_port(old, true), Join::Ready));
     // It closes, and the system gives its value to the engine's new socket, which sits on another port.
     h.sim.reuse(old, true);
     h.sim.mint_next(old);
     let to = std::net::SocketAddr::from(([127, 0, 0, 1], 80));
     let new = h.engine.new_socket(to).unwrap();
     assert_eq!(new, old);
-    let Join::Refused(error) = h.engine.join_port(new) else {
+    let Join::Refused(error) = h.engine.join_port(new, true) else {
         panic!("a refusal");
     };
     assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
@@ -1207,7 +1207,7 @@ fn a_socket_the_engine_makes_of_a_closed_ones_value_is_not_taken_for_it() {
 fn an_accepted_socket_of_a_closed_ones_value_is_not_taken_for_it() {
     let h = Harness::new();
     let old = h.sim.sock();
-    assert!(matches!(h.engine.join_port(old), Join::Ready));
+    assert!(matches!(h.engine.join_port(old, true), Join::Ready));
     let listener = h.sim.sock();
     h.sim.reuse(old, true);
     h.sim.mint_next(old);
@@ -1215,7 +1215,7 @@ fn an_accepted_socket_of_a_closed_ones_value_is_not_taken_for_it() {
         .unwrap();
     let accepted = h.one().raw.unwrap().unwrap();
     assert_eq!(accepted, old);
-    let Join::Refused(error) = h.engine.join_port(accepted) else {
+    let Join::Refused(error) = h.engine.join_port(accepted, true) else {
         panic!("a refusal");
     };
     assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
@@ -1226,7 +1226,7 @@ fn a_file_the_engine_opens_of_a_closed_ones_value_is_offered_a_ring() {
     let h = Harness::with(Some(full_probe()), true, MAX_PIECE);
     let old = h.sim.file(&content(100));
     // The old file joined the port, and closed; the system gives its value to the engine's open.
-    assert!(matches!(h.engine.join_port(old), Join::Ready));
+    assert!(matches!(h.engine.join_port(old, true), Join::Ready));
     h.sim.reuse(old, false);
     h.sim.mint_next(old);
     let path = Path::new("scratch").join("reused");
@@ -2449,4 +2449,44 @@ fn a_handle_the_set_cannot_hold_is_taken_and_ends_with_an_error() {
     let error = ended(h.one()).result.unwrap_err();
     assert!(error.to_string().contains("too many handles"), "{error}");
     assert_eq!(h.pending(), 0);
+}
+
+#[test]
+fn a_handle_of_a_closed_engine_made_one_that_was_not_forgotten_is_joined_again() {
+    let h = Harness::new();
+    let sock = h.sim.sock();
+    assert!(matches!(h.engine.join_port(sock, true), Join::Ready));
+    // The engine's socket closes without `forget`, and the system gives its value to the
+    // caller's new socket, which is on no port.
+    h.sim.reuse(sock, false);
+    h.sim.feed(sock, b"abcd");
+    h.submit(
+        Request::Recv { sock },
+        IoBuf {
+            bytes: vec![0; 4],
+            filled: 0,
+        },
+        io_then(1),
+    )
+    .unwrap();
+    assert_eq!(
+        h.sim
+            .log()
+            .iter()
+            .filter(|l| l.starts_with("associate"))
+            .count(),
+        2,
+        "the new handle joined the port"
+    );
+    assert_eq!(ended(h.one()).result.unwrap(), 4);
+}
+
+#[test]
+fn a_socket_of_a_value_a_ring_once_served_joins_the_port() {
+    let h = Harness::new();
+    let sock = h.sim.sock();
+    // An earlier file of this value was served by a ring and closed.
+    h.engine.routes.claim(sock, RouteState::Ring);
+    assert!(matches!(h.engine.join_port(sock, true), Join::Ready));
+    assert_eq!(h.engine.routes.get(sock), Some(RouteState::Joined));
 }

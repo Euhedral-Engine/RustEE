@@ -1153,7 +1153,7 @@ impl Engine {
     /// finds the claim made cannot tell a handle that is ours from one that is another port's
     /// (the OS refuses both alike) until the claimer's call ends, and it never waits for it: the
     /// operation is `Pending`, and the poller launches or ends it when the claim is settled.
-    fn join_port(&self, handle: Handle) -> Join {
+    fn join_port(&self, handle: Handle, socket: bool) -> Join {
         match self.routes.claim(handle, RouteState::Joining) {
             Claim::Won => {
                 // A refusal, an error or a panic in the call leaves no claim behind.
@@ -1171,8 +1171,19 @@ impl Engine {
                     Err(error) => Join::Refused(error),
                 }
             }
-            Claim::Held(RouteState::Joined) => Join::Ready,
+            // The record may be of an earlier handle of the same value, which closed without
+            // `forget`: the call tells (it is refused for a handle that is on our port already).
+            Claim::Held(RouteState::Joined) => match self.sys.associate(self.port.handle, handle) {
+                Ok(()) => Join::Ready,
+                Err(error) if error.raw_os_error() == Some(87) => Join::Ready,
+                Err(error) => Join::Refused(error),
+            },
             Claim::Held(RouteState::Joining) => Join::Pending,
+            // A socket is never served by a ring: the record is an earlier file's.
+            Claim::Held(RouteState::Ring) if socket => {
+                self.routes.clear_if(handle, RouteState::Ring);
+                self.join_port(handle, false)
+            }
             Claim::Held(RouteState::Ring) => Join::Refused(ring_served()),
             Claim::Full => Join::Refused(io::Error::other("too many handles")),
         }
@@ -1206,7 +1217,7 @@ impl Engine {
                 }
             }
         }
-        (Route::Port, self.join_port(handle))
+        (Route::Port, self.join_port(handle, false))
     }
 
     fn op(kind: Kind, route: Route, buf: Buf, then: Then) -> Op {
@@ -1703,7 +1714,13 @@ impl Engine {
                 Some(RouteState::Joined) => self.launch(held),
                 Some(RouteState::Ring) => self.fail(held, ring_served()),
                 // The claimer's call was refused, and cleared the claim.
-                _ => self.fail(held, another_port()),
+                // (the claimer's own error went to its operation; a held one cannot know it)
+                _ => self.fail(
+                    held,
+                    invalid(
+                        "the handle could not join the completion port: it belongs to another completion port, or the join failed",
+                    ),
+                ),
             }
         }
     }
@@ -1805,17 +1822,17 @@ impl EngineTrait for Engine {
             }
             Request::Send { sock } => {
                 self.check_handle(sock, true)?;
-                let join = self.join_port(sock);
+                let join = self.join_port(sock, true);
                 Self::op(Kind::Send { sock }, Route::Port, buf, then).after(join, sock)
             }
             Request::Recv { sock } => {
                 self.check_handle(sock, true)?;
-                let join = self.join_port(sock);
+                let join = self.join_port(sock, true);
                 Self::op(Kind::Recv { sock }, Route::Port, buf, then).after(join, sock)
             }
             Request::SendTo { sock, to } => {
                 self.check_handle(sock, true)?;
-                let join = self.join_port(sock);
+                let join = self.join_port(sock, true);
                 let mut op =
                     Self::op(Kind::SendTo { sock }, Route::Port, buf, then).after(join, sock);
                 op.addr = Some(Box::new(SockAddr::new(to)));
@@ -1823,7 +1840,7 @@ impl EngineTrait for Engine {
             }
             Request::Accept { listener } => {
                 self.check_handle(listener, true)?;
-                let join = self.join_port(listener);
+                let join = self.join_port(listener, true);
                 let socket = self.sys.accept_socket(listener)?;
                 self.forget(socket);
                 let mut op = Self::op(Kind::Accept { listener }, Route::Port, buf, then)
@@ -1836,7 +1853,7 @@ impl EngineTrait for Engine {
             }
             Request::Connect { sock, to } => {
                 self.check_handle(sock, true)?;
-                let join = self.join_port(sock);
+                let join = self.join_port(sock, true);
                 // `ConnectEx` needs a bound socket.
                 if !matches!(join, Join::Refused(_)) {
                     self.sys.bind_any(sock, &SockAddr::unspecified(to))?;
