@@ -176,11 +176,11 @@ impl<T: Drive> Drop for Key<T> {
     }
 }
 
-/// An unordered frame (like the station's key) that pushes an event into an owner's inbox when it runs: what a timer or an I/O continuation hands the
-/// lattice for an event of a station. An I/O continuation posts nothing itself: the owner hears that the
-/// operation ended only when this frame runs, which is after the `AsyncIo` handed it out and stopped counting the
-/// operation as pending. A frame dropped without having run (a lattice that discarded it) posts its event as it
-/// goes, so that the operation's end is never lost.
+/// An unordered frame (like the station's key) that pushes an event into an owner's inbox when it runs: what a
+/// timer or an I/O continuation hands the lattice for an event of a station. An I/O continuation posts nothing
+/// itself: the owner hears that the operation ended only when this frame runs, which is after the `AsyncIo` handed
+/// it out and stopped counting the operation as pending. A frame dropped without having run (a lattice that
+/// discarded it) posts its event as it goes, so that the operation's end is never lost.
 ///
 /// The frame is unordered, with a routing hash of its own, so that it may run on any worker: the events of different
 /// owners, and of one owner, are independent as far as the lattice is concerned. Running one only pushes into the
@@ -195,7 +195,7 @@ impl<T: Drive> Post<T> {
     pub(crate) fn new(owner: Arc<T>, event: T::Event) -> Box<Self> {
         let mut header = FrameHeader::new(0x5747_4154_494F_4E01);
         // The owner's address spreads the frames of different owners, its counter those of one owner.
-        let owner_bits = Arc::as_ptr(&owner) as *const () as usize as u64;
+        let owner_bits = Arc::as_ptr(&owner).cast::<()>().addr() as u64;
         let count = owner.station().seed.fetch_add(1, Ordering::Relaxed);
         header.randomize_hash(count.wrapping_add(owner_bits).wrapping_add(1));
         Box::new(Self {
