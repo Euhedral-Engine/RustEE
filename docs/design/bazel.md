@@ -531,14 +531,12 @@ merges before it.
 8. **Cache measurement.** Measure a warm rerun of `bazel test //...` and a run in a second worktree served from the
    shared disk cache. The numbers go in this document, and the step ends the build's acceptance criteria. *After 7.*
 
-**Measured (2026-11-24, commit `5ecb1d8`, Bazel 9.3.3 under Bazelisk v1.28.1, this desktop, every run through `system-run --system --mem 12G`).** Each run is `bazel test //...` over 112 tests, all passing. The wall time is `/usr/bin/time` around the whole `system-run` call, so it includes Bazel server startup. The second-worktree runs start from a fresh output base (`bazel clean --expunge` before each run but the first) and take their actions from the shared disk cache.
+**Measured (2026-11-24, commit `5ecb1d8`, Bazel 9.3.3 under Bazelisk v1.28.1, this desktop, each run under a `system-run --system` grant).** Each run is `bazel test //...` over the 112 non-device tests, all passing; the times are Bazel's own `Elapsed time`. A wall clock around the call is not a cache number here: it was dominated by the wait for the whole-machine grant behind CI jobs. The second-worktree runs start from an empty output base (a new worktree, then `bazel clean --expunge` before the second and third run) and take every action from the shared disk cache.
 
-| Run | Wall (s), 3 runs | Median wall | Bazel `Elapsed time` (s) | Process line | Tests |
-|---|---|---|---|---|---|
-| Warm rerun in the fill worktree | 231.20, 202.71, 285.79 | 231.20 s | 2.275, 2.009, 1.991 | none printed (no action ran) | 0 of 112 executed, all cached |
-| Second worktree (fresh output base) | 98.95, 122.08, 104.44 | 104.44 s | 2.350, 2.442, 2.570 | `1286 processes: 508 disk cache hit, 890 internal` in each run | 0 of 112 executed, all cached |
-
-Logs: the warm reruns are `warm-1.log` to `warm-3.log`, and the second-worktree runs are `second-1.log` to `second-3.log`, all in the bazel-cache-measure scratch directory.
+| Run | `Elapsed time` (s), 3 runs | Actions | Tests |
+|---|---|---|---|
+| Warm rerun in the same worktree | 2.275, 2.009, 1.991 | none run | 0 of 112 executed, all cached |
+| Second worktree, empty output base | 2.350, 2.442, 2.570 | 1286 processes: 508 disk cache hit, 890 internal | 0 of 112 executed, all cached |
 
 Later, outside the build: `exclusive` benchmark and timing targets; release stress or loom under Bazel if the gate wants
 them cached; a `<crate>_cuda` production target when a consumer module needs one (C5).
