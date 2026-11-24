@@ -137,15 +137,16 @@ fn buf(len: usize) -> IoBuf {
     }
 }
 
-/// A scratch path beside the test binary, under `target/`.
+/// A scratch path: `TEST_TMPDIR`, or beside the test binary, under `target/`.
 fn scratch(name: &str) -> PathBuf {
-    let exe = std::env::current_exe().expect("the test binary's path");
-    let dir = exe
-        .parent()
-        .and_then(std::path::Path::parent)
-        .expect("a target directory")
-        .join("euhedral-graph-scratch");
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = crate::test_scratch::test_scratch_dir(|| {
+        std::env::current_exe()
+            .expect("the test binary's path")
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("a target directory")
+            .join("euhedral-graph-scratch")
+    });
     dir.join(format!(
         "{name}-{}-{:?}",
         std::process::id(),
