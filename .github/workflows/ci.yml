@@ -159,13 +159,17 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Clippy
-        run: cargo clippy $AFFECTED --all-targets -- -D warnings
+        run: |
+          read -ra affected <<<"$AFFECTED"
+          cargo clippy "${affected[@]}" --all-targets -- -D warnings
 
       - name: Clippy (production libraries, no dev features)
         run: cargo clippy --workspace --lib -- -D warnings
 
       - name: Test
-        run: cargo test $AFFECTED
+        run: |
+          read -ra affected <<<"$AFFECTED"
+          cargo test "${affected[@]}"
 
       # The ratchet reads every crate's library sources; euhedral-core's tests run it when that crate is affected.
       - name: Hot-path lock ratchet
