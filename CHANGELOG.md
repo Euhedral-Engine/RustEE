@@ -3,6 +3,21 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## Device tests run under Bazel and fail when they skip (build) (2026-11-24)
+
+**What.** `bazel test --config=gpu //...` runs every `gpu`-tagged target against the card. `--config=gpu` selects only the `gpu` targets, passes `EUHEDRAL_NVRTC`, `CUDA_HOME`, `CUDA_PATH` and `LD_LIBRARY_PATH` through, sets `EUHEDRAL_DEVICE_REQUIRED=1` and passes `--nocapture` to the tests. Both `skip` helpers (`euhedral-gpu/tests/common/skip.rs`, `euhedral-memory/tests/cuda.rs`) panic when `EUHEDRAL_DEVICE_REQUIRED` is set. Four silent early exits in `euhedral-gpu/tests/cuda.rs` now say they skipped: a driver older than 13.1 in `missing_kernels_are_not_found` and `arguments_that_do_not_fit_are_refused_before_launch`, and both halves of `axpb_from_source_and_from_ptx_match_the_cpu_bit_for_bit` (NVRTC missing, driver older than 13.1).
+
+**Why.** A device test that finds no driver, card or NVRTC returned early and reported `ok`, so a Bazel run on a machine without them proved nothing. Cargo's device job catches this by reading the output (`scripts/ci/device_check.py`, unchanged); Bazel has no such reader, so the test itself fails.
+
+**How to use.** Run `system-run --gpu shared:4 --mem 16G -- bazel test --config=gpu //...`. The `gpu` targets are also tagged `external`, so no run is served from the cache. Without `EUHEDRAL_DEVICE_REQUIRED` (Cargo, a plain `cargo test`) a skip prints `DEVICE-TEST-SKIPPED:` and returns as before.
+
+**Semantics.**
+- `skip` (no driver, card, NVRTC or kernel) prints its line and then panics when `EUHEDRAL_DEVICE_REQUIRED` is set.
+- `skip_hardware` (the card or driver lacks the feature under test) prints `DEVICE-TEST-SKIPPED-HARDWARE:` and returns, set or not.
+- The Linux sandbox exposes the card, so the `gpu` targets need no `no-sandbox` tag.
+
+**Tests.** `euhedral-gpu/tests/skip_helpers.rs`: `a_skip_prints_its_line_and_returns_when_a_device_is_not_required` and `a_skip_fails_the_test_when_a_device_is_required` (a child process calls `skip`; the second fails on the old helper, which returned).
+
 ## The server's stop is reported after its operations' frames are handed out (`euhedral-net`) (2026-11-24)
 
 **What.** The continuations of the server's accept, and of a connection's recv and send, no longer post the end of the operation to the listener or the connection themselves. Each returns a frame that posts it when the lattice runs the frame.

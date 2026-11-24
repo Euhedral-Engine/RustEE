@@ -494,6 +494,7 @@ mod modules {
     fn missing_kernels_are_not_found() {
         let Some(gpu) = gpu() else { return };
         if gpu.driver_version() < 13010 {
+            skip::skip_hardware(format_args!("driver older than 13.1: skipped"));
             return;
         }
         let module = CudaModule::from_image(&gpu, OPS_PTX).unwrap();
@@ -571,9 +572,15 @@ mod launches {
         let mut modules = Vec::new();
         if Nvrtc::shared(None).is_ok() {
             modules.push(CudaModule::from_source(&gpu, OPS, &CompileOptions::default()).unwrap());
+        } else {
+            skip::skip(format_args!("no NVRTC: the source half is skipped"));
         }
         if gpu.driver_version() >= 13010 {
             modules.push(CudaModule::from_image(&gpu, OPS_PTX).unwrap());
+        } else {
+            skip::skip_hardware(format_args!(
+                "driver older than 13.1: the image half is skipped"
+            ));
         }
         if modules.is_empty() {
             skip::skip(format_args!("neither NVRTC nor a 13.1 driver: skipped"));
@@ -727,6 +734,7 @@ extern "C" __global__ void report(unsigned* out) {
     fn arguments_that_do_not_fit_are_refused_before_launch() {
         let Some(gpu) = gpu() else { return };
         if gpu.driver_version() < 13010 {
+            skip::skip_hardware(format_args!("driver older than 13.1: skipped"));
             return;
         }
         let module = CudaModule::from_image(&gpu, OPS_PTX).unwrap();
