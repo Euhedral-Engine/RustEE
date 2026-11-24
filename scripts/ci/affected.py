@@ -175,8 +175,15 @@ class Graph:
         return out
 
 
-# A label of a file in a BUILD file: `//:docs/x.md` (the root package) or `//pkg:file`.
-STRING = re.compile(r'"([^"\s*?\[\]{}$]+)"')  # a quoted word that is no glob pattern
+# Every quoted string of a BUILD file: a label (`//:docs/x.md`, `//pkg:file`), a package-relative path or a glob.
+STRING = re.compile(r'"([^"]*)"')
+GLOB_CHARS = re.compile(r"[*?\[{]")
+
+
+def glob_dir(pattern):
+    """The literal directory a glob pattern starts with: `docs/` of `docs/**`, "" (the package) of `**/*.md`."""
+    literal = pattern[: GLOB_CHARS.search(pattern).start()]
+    return literal[: literal.rfind("/") + 1].rstrip("/")
 BUILD_FILES = ("BUILD.bazel", "BUILD")
 
 
@@ -210,7 +217,14 @@ def data_inputs(root, dirs):
             except FileNotFoundError:
                 continue
             for word in STRING.findall(text):
-                path = label_path(d, word)
+                if not word.strip():
+                    continue  # names nothing (an empty string is no path of the package)
+                if GLOB_CHARS.search(word):
+                    # A glob names files under its literal directory (the package's own when it starts with one).
+                    path = os.path.normpath(os.path.join(d, glob_dir(word)))
+                    path = None if path == "." or path.startswith("..") else path
+                else:
+                    path = label_path(d, word)
                 if path is not None:
                     out.setdefault(path, set()).add(name)
     return out

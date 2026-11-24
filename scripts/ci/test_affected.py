@@ -184,6 +184,18 @@ class Affected(unittest.TestCase):
         self.assertEqual(self.crates_of(data, "docs/more/deep/a.txt"), (["c"], False))
         self.assertEqual(self.crates_of(data, "docs/specs-other.md"), ([], False))  # a directory, not a prefix
 
+    def test_a_glob_names_every_file_under_its_literal_directory(self):
+        data = self.data({"c/BUILD.bazel": 'data = glob(["docs/**"])', "d/BUILD.bazel": 'data = glob(["**/*.md"])'}, {"c": "c", "d": "d"})
+        self.assertEqual(self.crates_of(data, "c/docs/notes.md"), (["c"], False))
+        self.assertEqual(self.crates_of(data, "c/GUIDE.md"), ([], False))  # outside the glob's directory
+        self.assertEqual(self.crates_of(data, "d/GUIDE.md"), (["d"], False))  # a leading wildcard: the whole package
+
+    def test_a_quoted_path_with_spaces_is_a_path(self):
+        data = self.data({"c/BUILD.bazel": 'data = ["//:docs/release notes.md", "my notes.md", ""]'}, {"c": "c"})
+        self.assertEqual(self.crates_of(data, "docs/release notes.md"), (["c"], False))
+        self.assertEqual(self.crates_of(data, "c/my notes.md"), (["c"], False))
+        self.assertEqual(self.crates_of(data, "c/OTHER.md"), ([], False))  # the empty string names no path
+
     def test_a_crates_BUILD_file_is_read_like_its_BUILD_bazel(self):
         data = self.data({"c/BUILD": 'data = ["//:docs/a.md"]', "d/BUILD.bazel": 'data = ["//:docs/a.md"]'}, {"c": "c", "d": "d"})
         self.assertEqual(self.crates_of(data, "docs/a.md"), (["c", "d"], False))
