@@ -130,7 +130,9 @@ pub(crate) mod testing {
         pub(crate) fn new(name: &str) -> Self {
             static NEXT: AtomicUsize = AtomicUsize::new(0);
             let unique = NEXT.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
+            let base =
+                std::env::var_os("TEST_TMPDIR").map_or_else(std::env::temp_dir, PathBuf::from);
+            let path = base.join(format!(
                 "euhedral-hw-{name}-{}-{unique}",
                 std::process::id()
             ));

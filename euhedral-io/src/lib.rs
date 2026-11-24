@@ -72,6 +72,9 @@ pub use linux::IoBackend;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use linux::Platform;
 // Windows runs the engine; every other platform compiles it for its simulated tests.
+#[cfg(test)]
+#[path = "../tests/common/scratch.rs"]
+mod test_scratch;
 #[cfg(any(windows, test))]
 mod win;
 

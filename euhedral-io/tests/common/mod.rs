@@ -1,5 +1,7 @@
 //! What the integration tests share: the engines an `AsyncIo` can run on.
 
+pub mod scratch;
+
 use std::sync::Arc;
 
 use euhedral_io::AsyncIo;
