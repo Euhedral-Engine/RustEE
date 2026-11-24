@@ -498,6 +498,14 @@ merges before it.
    - a pull request that adds a test file without regenerating fails it;
    - the Cargo jobs are unchanged.
 
+   As built: on Gitea the job runs on `arbiter-docker-bazel`, which gives it no token or secret and the commit at
+   `/checkout` (copied in, since `actions/checkout` has no token), and it runs forge's C7 query itself. A Gitea-only
+   `check-repo` job on `arbiter-docker` fetches forge's `main` with the job token (forge is private) and runs its
+   `build/scripts/check-repo.sh --skip-c7 .`; a failed fetch fails the job, and no job runs a copy from this repository.
+   GitHub's twin runs the same steps on `ubuntu-latest` (Bazelisk, checked against `.bazelversion`), except on a run
+   limited to one OS. Both run when `changes` reports any crate affected, which every Rust, Cargo, BUILD, MODULE,
+   `.bazel*` and generator file does; `test_workflow_twins.py` pins all of it.
+
    *After 4; parallel with 5.*
 7. **The Windows job runs Bazel.** The GitHub proxy runs `bazel test //... --config=ci` on
    `@euhedral_build//platforms:windows_x86_64`, with the shared `euhedral/ci` Windows workflow. *Done:* that job is

@@ -6,6 +6,8 @@ The two files are twins: for the jobs both have, the steps that are not forge-on
 order. A forge-only step has a name that ends in `(gitea)` or `(github)`; a step that `uses` an action may differ, since
 the actions differ (checkout, caches, artifacts). The `ci-ok` needs list may differ. Everything else a job promises
 (which jobs a change runs, the leases, the device job, the one place a secret is read) is pinned for the Gitea file below.
+The Bazel jobs are pinned in `Bazel`: `bazel test //... --config=ci` and forge's C7 in both files, on the bazel label with no
+token on Gitea, forge's repo check fetched from forge's main, all of it in `ci-ok`, and every Bazel input running them.
 """
 
 import json
@@ -32,8 +34,8 @@ def load(path):
 
 GITEA = load(".gitea/workflows/ci.yml")
 GITHUB = load(".github/workflows/ci.yml")
-TWIN_JOBS = ["changes", "workspace", "miri-build", "miri", "ci-ok"]
-DOCKER_LABELS = {"arbiter-docker", "arbiter-docker-unconfined", "arbiter-gpu"}
+TWIN_JOBS = ["changes", "workspace", "bazel", "miri-build", "miri", "ci-ok"]
+DOCKER_LABELS = {"arbiter-docker", "arbiter-docker-unconfined", "arbiter-docker-bazel", "arbiter-gpu"}
 SECRETS = re.compile(r"\bsecrets\b")  # `secrets.X`, `toJSON(secrets)` and `secrets[...]` alike
 CHANGES_OUTPUT = re.compile(r"needs\.changes\.outputs\.(\w+)")
 
@@ -76,7 +78,7 @@ class Twins(unittest.TestCase):
             self.assertIn(job, GITHUB["jobs"])
 
     def test_the_jobs_that_exist_in_one_file_only(self):
-        self.assertEqual(set(GITEA["jobs"]) - set(GITHUB["jobs"]), {"workflows", "device", "windows"})
+        self.assertEqual(set(GITEA["jobs"]) - set(GITHUB["jobs"]), {"workflows", "check-repo", "device", "windows"})
         self.assertEqual(set(GITHUB["jobs"]) - set(GITEA["jobs"]), set())
 
     def test_a_forge_only_step_is_in_its_own_forge(self):
@@ -172,6 +174,8 @@ class Gitea(unittest.TestCase):
             "changes": {"runs-on", "env", "outputs", "steps"},
             "workflows": {"if", "runs-on", "env", "steps"},
             "workspace": {"needs", "if", "runs-on", "defaults", "env", "steps"},
+            "check-repo": {"needs", "if", "runs-on", "defaults", "env", "steps"},
+            "bazel": {"needs", "if", "runs-on", "defaults", "env", "steps"},
             "device": {"needs", "if", "runs-on", "defaults", "env", "steps"},
             "miri-build": {"needs", "if", "runs-on", "env", "steps"},
             "miri": {"name", "needs", "if", "strategy", "runs-on", "env", "steps"},
@@ -182,6 +186,8 @@ class Gitea(unittest.TestCase):
         conditions = {
             "workflows": "github.event_name == 'pull_request'",
             "workspace": "needs.changes.outputs.any == 'true'",
+            "check-repo": "needs.changes.outputs.any == 'true'",
+            "bazel": "needs.changes.outputs.any == 'true'",
             "device": "needs.changes.outputs.euhedral_memory == 'true' || needs.changes.outputs.euhedral_gpu == 'true'",
             "miri-build": "needs.changes.outputs.miri == 'true'",
             "miri": "needs.changes.outputs.miri == 'true'",
@@ -263,6 +269,7 @@ class Gitea(unittest.TestCase):
             "changes": "arbiter-docker", "workflows": "arbiter-docker", "ci-ok": "arbiter-docker",
             "windows": "arbiter-docker", "workspace": "arbiter-docker-unconfined",
             "miri-build": "arbiter-docker-unconfined", "miri": "arbiter-docker-unconfined", "device": "arbiter-gpu",
+            "check-repo": "arbiter-docker", "bazel": "arbiter-docker-bazel",
         }
         self.assertEqual({j: b["runs-on"] for j, b in GITEA["jobs"].items()}, expected)
 
@@ -371,6 +378,108 @@ class Gitea(unittest.TestCase):
         # And both copies are the same text.
         a, b = (next(s for s in steps(GITEA, j) if "mise.toml (gitea)" in s.get("name", "")) for j in ("workspace", "device"))
         self.assertEqual(a["run"], b["run"])
+
+
+# forge's C7 (build/scripts/check-repo.sh), copied: the bazel label has no token to fetch the script, so the `bazel` job runs
+# this query itself and the `check-repo` job runs the rest with --skip-c7.
+FORGE_C7 = 'attr(tags, "(\\[|, )gpu(,|\\])", //...) except attr(tags, "(\\[|, )external(,|\\])", //...)'
+FORGE_CHECK = '"$RUNNER_TEMP/forge/build/scripts/check-repo.sh"'
+
+
+def step(doc, job, name):
+    return next(s for s in steps(doc, job) if s.get("name") == name)
+
+
+class Bazel(unittest.TestCase):
+    def test_both_files_run_the_bazel_tests_and_c7_and_shut_the_server_down(self):
+        for doc, name in ((GITEA, "gitea"), (GITHUB, "github")):
+            job = doc["jobs"]["bazel"]
+            self.assertEqual(job["defaults"], {"run": {"shell": "bash"}}, name)
+            self.assertEqual(step(doc, "bazel", "Bazel test")["run"], "bazel test //... --config=ci", name)
+            c7 = step(doc, "bazel", "Every gpu target is also external (C7)")["run"]
+            # The query's own line, so a failed query fails the step (bash -e); a target it lists fails it too.
+            self.assertIn(f"untagged=$(bazel query '{FORGE_C7}')\n", c7, name)
+            self.assertIn('if [ -n "$untagged" ]; then', c7, name)
+            self.assertIn("exit 1", c7, name)
+            # The last step, whatever failed: the caches are collected only in an idle server, and a running one holds
+            # the lease.
+            last = steps(doc, "bazel")[-1]
+            self.assertEqual((last["run"], last["if"]), ("bazel shutdown", "always()"), name)
+            self.assertIn("bazel", doc["jobs"]["ci-ok"]["needs"], name)
+
+    def test_the_gitea_bazel_job_is_on_the_bazel_label_and_reads_no_token(self):
+        job = GITEA["jobs"]["bazel"]
+        self.assertEqual(job["runs-on"], "arbiter-docker-bazel")
+        # The runner gives the job no token, so actions/checkout cannot work: the job copies the runner's checkout.
+        self.assertEqual([s for s in job["steps"] if "uses" in s], [])
+        self.assertEqual(job["steps"][0]["run"], "cp -a /checkout/. .")
+        text = json.dumps(job)
+        self.assertIsNone(SECRETS.search(text))
+        for token in ("github.token", "GITEA_TOKEN", "GITHUB_TOKEN", "vars."):
+            self.assertNotIn(token, text)
+        # The container rc's --local_resources=memory=5734 is 70 % of an 8G lease; no command passes another.
+        self.assertEqual(job["env"]["ARBITER_ARGS"], "--threads 8 --mem 8G")
+        self.assertNotIn("--local_resources", text)
+
+    def test_the_github_bazel_job_runs_the_pinned_bazel_and_not_on_a_one_os_run(self):
+        job = GITHUB["jobs"]["bazel"]
+        self.assertEqual(job["runs-on"], "ubuntu-latest")
+        self.assertEqual(job["if"], "needs.changes.outputs.any == 'true' && (!inputs.only_os || inputs.only_os == 'all')")
+        version = step(GITHUB, "bazel", "Bazel is the version in .bazelversion (github)")
+        self.assertLess(job["steps"].index(version), job["steps"].index(step(GITHUB, "bazel", "Bazel test")))
+        self.assertIn('test "$have" = "bazel $(cat .bazelversion)"', version["run"])
+
+    def test_the_repo_check_is_forges_main_and_fails_when_it_cannot_be_fetched(self):
+        job = GITEA["jobs"]["check-repo"]
+        self.assertEqual(job["runs-on"], "arbiter-docker")
+        self.assertEqual(job["defaults"], {"run": {"shell": "bash"}})
+        self.assertIn("check-repo", GITEA["jobs"]["ci-ok"]["needs"])
+        self.assertNotIn("check-repo", GITHUB["jobs"])
+        fetch = step(GITEA, "check-repo", "Fetch forge's main (gitea)")
+        check = step(GITEA, "check-repo", "forge's repo check, C7 aside (gitea)")
+        self.assertLess(job["steps"].index(fetch), job["steps"].index(check))
+        self.assertEqual(fetch["env"], {"FORGE_URL": "${{ vars.FORGE_URL }}", "FORGE_TOKEN": "${{ github.token }}"})
+        run = fetch["run"]
+        self.assertIn('"$FORGE_URL/euhedral/forge.git" refs/heads/main\n', run)  # main by its full ref, nothing else
+        self.assertIn('git -C "$RUNNER_TEMP/forge" checkout -q --detach FETCH_HEAD', run)
+        self.assertLess(run.index('rm -rf "$RUNNER_TEMP/forge"'), run.index('git init -q "$RUNNER_TEMP/forge"'))
+        self.assertIn(f"test -f {FORGE_CHECK} ||", run)
+        # The token is a header of this one command, sent to the forge only.
+        self.assertIn('GIT_CONFIG_KEY_0="http.$FORGE_URL/.extraHeader"', run)
+        self.assertIn("GIT_CONFIG_KEY_1=http.followRedirects GIT_CONFIG_VALUE_1=false", run)
+        self.assertNotIn("git config", run)
+        self.assertEqual(run.count("$FORGE_TOKEN"), 1)  # only into the header, never echoed
+        self.assertEqual(check["run"], f"bash {FORGE_CHECK} --skip-c7 .")
+        self.assertNotIn("env", check)  # the token is the fetch's alone
+
+    def test_no_job_runs_a_check_repo_script_of_the_checkout(self):
+        # The code under test must not supply its own checker: every check-repo.sh named is the one fetched from forge.
+        for doc, name in ((GITEA, "gitea"), (GITHUB, "github")):
+            for job, body in doc["jobs"].items():
+                for s in body["steps"]:
+                    run = s.get("run", "")
+                    self.assertEqual(run.count("check-repo.sh"), run.count(FORGE_CHECK), f"{name}: {job}")
+
+    def test_every_bazel_input_runs_the_bazel_jobs(self):
+        # The jobs run when `any` is set: every Rust, Cargo, BUILD, MODULE, .bazel* and generator file sets it.
+        graph = affected.Graph(
+            {"euhedral-core": "euhedral-core", "euhedral-bazel-gen": "tools/bazel-gen"},
+            {"euhedral-core": set(), "euhedral-bazel-gen": set()},
+        )
+        inputs = [
+            "euhedral-core/src/lib.rs", "euhedral-core/tests/new_test.rs", "euhedral-core/examples/e.rs",
+            "euhedral-core/benches/b.rs", "euhedral-core/build.rs", "euhedral-core/Cargo.toml", "euhedral-core/README.md",
+            "euhedral-core/BUILD.bazel", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "mise.toml", "BUILD.bazel",
+            "MODULE.bazel", "MODULE.bazel.lock", ".bazelrc", ".bazelversion", ".bazelignore", ".gitattributes",
+            "build/module/MODULE.bazel", "build/module/platforms/BUILD.bazel", "docs/x/BUILD.bazel",
+            "tools/bazel-gen/src/main.rs", "tools/bazel-gen/BUILD.bazel", ".gitea/workflows/ci.yml",
+        ]
+        for f in inputs:
+            crates, everything, reason = affected.affected(graph, [f])
+            self.assertEqual(affected.outputs(graph, crates, everything, reason)["any"], "true", f)
+        for doc in (GITEA, GITHUB):
+            self.assertTrue(doc["jobs"]["bazel"]["if"].startswith("needs.changes.outputs.any == 'true'"))
+        self.assertEqual(GITEA["jobs"]["check-repo"]["if"], "needs.changes.outputs.any == 'true'")
 
 
 if __name__ == "__main__":
