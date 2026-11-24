@@ -5,7 +5,7 @@ use std::cell::Cell;
 use std::io;
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -734,7 +734,7 @@ fn a_file_keeps_its_route() {
         .sys
         .associate(h.engine.port.handle, joined)
         .unwrap();
-    h.engine.associated.insert(joined);
+    h.engine.mark_joined(joined);
     h.read(joined, 0, 10, 1).unwrap();
     assert_eq!(ended(h.one()).result.unwrap(), 10);
     assert_eq!(h.sim.rings_made(), 0, "no ring for a file on the port");
@@ -750,6 +750,194 @@ fn a_file_keeps_its_route() {
             .iter()
             .any(|l| l == &format!("associate {ringed:#x}")),
         "a ring-served file never joins the port"
+    );
+}
+
+/// What the second operation answered, once it ran.
+type Seen = Arc<Mutex<Option<io::Result<()>>>>;
+
+/// Runs `first` (the first operation on `handle`) with `second` made inside the first's
+/// `associate`, after the OS has decided it and before it returns: the moment another thread's
+/// first operation on the same handle meets the first one's claim.
+fn with_second_operation_inside_associate(
+    h: &Harness,
+    first: impl FnOnce() -> io::Result<()>,
+    second: impl Fn() -> io::Result<()> + Send + Sync + 'static,
+) -> (io::Result<()>, Seen) {
+    let entered = Arc::new(AtomicBool::new(false));
+    let seen = Arc::new(Mutex::new(None));
+    {
+        let seen = seen.clone();
+        h.sim.on_associate(Arc::new(move || {
+            if !entered.swap(true, Ordering::AcqRel) {
+                *seen.lock().unwrap() = Some(second());
+            }
+        }));
+    }
+    (first(), seen)
+}
+
+#[test]
+fn a_second_first_operation_during_a_join_is_held_until_it_ends_and_then_runs() {
+    let h = Harness::new();
+    let file = h.sim.file(&content(100));
+    let (engine, front) = (h.engine.clone(), h.front.clone());
+    let (first, second) = with_second_operation_inside_associate(
+        &h,
+        || h.read(file, 0, 10, 1),
+        move || {
+            front.pending.fetch_add(1, Ordering::AcqRel);
+            engine
+                .submit(
+                    Request::Read { file, offset: 10 },
+                    IoBuf {
+                        bytes: vec![0; 10],
+                        filled: 0,
+                    }
+                    .into(),
+                    io_then(2),
+                    None,
+                    &Cell::new(false),
+                )
+                .map(|_| ())
+        },
+    );
+    first.unwrap();
+    second.lock().unwrap().take().unwrap().unwrap();
+    let done = h.drain(2);
+    assert_eq!(
+        done.iter().map(|d| d.header.id_hash()).collect::<Vec<_>>(),
+        tag_ids([1, 2])
+    );
+    for done in done {
+        assert_eq!(ended(done).result.unwrap(), 10);
+    }
+    let joins = h
+        .sim
+        .log()
+        .iter()
+        .filter(|l| l.starts_with("associate"))
+        .count();
+    assert_eq!(joins, 1, "the handle joined the port once");
+    assert!(h.pull_with(&mut |_| false).is_empty(), "each only once");
+    assert_eq!(h.pending(), 0);
+}
+
+#[test]
+fn a_handle_on_another_port_is_refused_to_both_threads_and_leaves_no_claim() {
+    let h = Harness::new();
+    let file = h.sim.file(&content(100));
+    h.sim.joined_elsewhere(file);
+    let (engine, front) = (h.engine.clone(), h.front.clone());
+    let (first, second) = with_second_operation_inside_associate(
+        &h,
+        || h.read(file, 0, 10, 1),
+        move || {
+            front.pending.fetch_add(1, Ordering::AcqRel);
+            engine
+                .submit(
+                    Request::Read { file, offset: 10 },
+                    IoBuf {
+                        bytes: vec![0; 10],
+                        filled: 0,
+                    }
+                    .into(),
+                    io_then(2),
+                    None,
+                    &Cell::new(false),
+                )
+                .map(|_| ())
+        },
+    );
+    assert_eq!(first.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+    // The second thread could not tell, while the first call was in flight: its operation was
+    // taken and ends with the refusal.
+    second.lock().unwrap().take().unwrap().unwrap();
+    let error = ended(h.one()).result.unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(h.engine.routes.get(file), None, "no claim is left");
+    assert!(
+        !h.sim.log().iter().any(|l| l.starts_with("associate")),
+        "nothing joined the port"
+    );
+    assert!(h.pull_with(&mut |_| false).is_empty(), "each only once");
+    assert_eq!(h.pending(), 0);
+    // The next operation is refused at once, as before.
+    assert_eq!(
+        h.read(file, 0, 10, 3).unwrap_err().kind(),
+        io::ErrorKind::InvalidInput
+    );
+}
+
+#[test]
+fn a_thread_without_a_ring_never_joins_a_file_a_ring_serves() {
+    let h = Harness::with(Some(full_probe()), true, MAX_PIECE);
+    let file = h.sim.file(&content(100));
+    // This thread claims the file for its ring.
+    h.read(file, 0, 10, 1).unwrap();
+    // Another thread can make no ring: it is refused, and does not join the file to the port.
+    h.sim.fail_ring_create(true);
+    let refused = std::thread::scope(|scope| {
+        scope
+            .spawn(|| h.read(file, 10, 10, 2))
+            .join()
+            .unwrap()
+            .unwrap_err()
+    });
+    h.sim.fail_ring_create(false);
+    assert!(refused.to_string().contains("IoRing"), "{refused}");
+    assert!(!h.sim.log().iter().any(|l| l.starts_with("associate")));
+    assert_eq!(ended(h.one()).result.unwrap(), 10);
+}
+
+#[test]
+fn a_file_one_thread_joins_while_another_makes_its_ring_goes_to_the_port_for_both() {
+    let h = Harness::with(Some(full_probe()), true, MAX_PIECE);
+    let file = h.sim.file(&content(100));
+    // While this thread makes its ring (before it claims the file's route), another thread,
+    // which can make none, takes the file to the port.
+    let (engine, front, sim) = (h.engine.clone(), h.front.clone(), h.sim.clone());
+    let entered = Arc::new(AtomicBool::new(false));
+    h.sim.on_ring_create(Arc::new(move || {
+        if entered.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        sim.fail_ring_create(true);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                front.pending.fetch_add(1, Ordering::AcqRel);
+                engine
+                    .submit(
+                        Request::Read { file, offset: 10 },
+                        IoBuf {
+                            bytes: vec![0; 10],
+                            filled: 0,
+                        }
+                        .into(),
+                        io_then(2),
+                        None,
+                        &Cell::new(false),
+                    )
+                    .unwrap();
+            });
+        });
+        sim.fail_ring_create(false);
+    }));
+    h.read(file, 0, 10, 1).unwrap();
+    for done in h.drain(2) {
+        assert_eq!(ended(done).result.unwrap(), 10);
+    }
+    assert_eq!(
+        h.sim
+            .log()
+            .iter()
+            .filter(|l| l.starts_with("associate"))
+            .count(),
+        1
+    );
+    assert!(
+        h.sim.submit_sizes().is_empty(),
+        "no ring serves a file that joined the port"
     );
 }
 

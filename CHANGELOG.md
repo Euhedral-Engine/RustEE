@@ -3,6 +3,21 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## Two threads' first operations on one Windows handle both succeed (`euhedral-io`) (2026-11-24)
+
+**What.** On Windows, two threads that make the first operation on one handle at the same time no longer refuse one of them with "the handle already belongs to another completion port". The engine records a handle's route (joining the port, on the port, or served by a ring) with one compare-and-set before it makes the system call, and the first claim decides for every thread. A thread that meets a join still in flight cannot tell a handle that is ours from another port's (the OS refuses both with the same error), and does not wait: its operation is accepted and held, and the next poll launches it once the join succeeded, or ends it with the refusal if the handle belongs to another port. A file for which one thread took a ring route and another, with no ring, was about to join the port is likewise decided once: the thread without a ring is refused, as for any ring-served file.
+
+**Why.** The engine called `associate` and recorded the handle after it returned. A second thread whose own call was refused (the handle was ours by then) looked the handle up before the first had recorded it, and failed a correct operation (seen in CI on a runner that served the file through the port). The route check of a file had the same gap between the ring decision and its record.
+
+**How to use.** Nothing changes for callers. A first operation on a handle that another thread is joining at that moment may end with its completion a poll later than usual; a handle of another port, in that same window, is refused in the operation's completion (`InvalidInput`) rather than by the submit call. A handle opened by a single thread is refused by the submit call as before.
+
+**Semantics.**
+- Exactly one thread calls `associate` for a handle; a refusal or an error removes its claim, so no mark is left behind.
+- An operation held for a join is launched on the first poll after the join succeeded, or ended once with `InvalidInput` if it was refused; a cancel or a time limit meanwhile ends it as for any operation that is being issued.
+- `forget` clears the handle's route, as before.
+
+**Tests.** `win::tests`: `a_second_first_operation_during_a_join_is_held_until_it_ends_and_then_runs` and `a_file_one_thread_joins_while_another_makes_its_ring_goes_to_the_port_for_both` fail on the old code; `a_handle_on_another_port_is_refused_to_both_threads_and_leaves_no_claim` and `a_thread_without_a_ring_never_joins_a_file_a_ring_serves` pin the refusals. `win::handles::tests`: one claimer wins of racing threads.
+
 ## The net stop test makes a connection whose server half the kernel lost say so (`euhedral-net`, test) (2026-11-24)
 
 **What.** `a_stopped_server_refuses_new_connections_while_a_request_drains` sends one byte (`G`, the start of a request) on each connection that got in after the stop before it reads it, connects in batches of at most 32, and reads every connection of a batch to its end (closed, reset or aborted) before it starts the next, until a connect is refused. Its failure message names the server's `accepted` and `open` counts, whether a refusal was seen, and the connection's addresses. The server is unchanged.

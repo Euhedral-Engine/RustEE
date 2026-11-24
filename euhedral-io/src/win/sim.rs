@@ -88,6 +88,7 @@ struct State {
     /// Calls that report failure and also queue a packet (what a warning status does).
     fail_with_packet: VecDeque<(Op, i32)>,
     elsewhere: HashSet<Handle>,
+    fail_ring_create: bool,
     /// The value the next handle the system makes takes (a closed handle's, as the system reuses them).
     mint: Option<Handle>,
     pop_error: Option<i32>,
@@ -107,6 +108,11 @@ pub(super) struct Sim {
     hook: Mutex<Option<Hook>>,
     /// Runs at the start of every ring submit (before the entries are taken).
     submit_hook: Mutex<Option<Hook>>,
+    /// Runs at the end of every `associate`, after its result was decided (the moment another
+    /// thread's `associate` of the same handle is refused, and has not yet seen this one's end).
+    associate_hook: Mutex<Option<Hook>>,
+    /// Runs at the start of every `ring_create`.
+    ring_hook: Mutex<Option<Hook>>,
 }
 
 fn hresult_for(error: &io::Error) -> i32 {
@@ -126,6 +132,8 @@ impl Sim {
             }),
             hook: Mutex::new(None),
             submit_hook: Mutex::new(None),
+            associate_hook: Mutex::new(None),
+            ring_hook: Mutex::new(None),
         }
     }
 
@@ -222,6 +230,21 @@ impl Sim {
     /// `hook` runs inside every read call, after its completion was queued.
     pub(super) fn on_read(&self, hook: Hook) {
         *self.hook.lock().unwrap() = Some(hook);
+    }
+
+    /// `hook` runs at the end of every `associate`, before it returns.
+    pub(super) fn on_associate(&self, hook: Hook) {
+        *self.associate_hook.lock().unwrap() = Some(hook);
+    }
+
+    /// `hook` runs in every `ring_create`, before it answers.
+    pub(super) fn on_ring_create(&self, hook: Hook) {
+        *self.ring_hook.lock().unwrap() = Some(hook);
+    }
+
+    /// While set, `ring_create` fails.
+    pub(super) fn fail_ring_create(&self, fail: bool) {
+        self.s().fail_ring_create = fail;
     }
 
     /// `hook` runs at the start of every ring submit.
@@ -513,13 +536,21 @@ impl Sys for Sim {
     }
 
     fn associate(&self, _port: Handle, handle: Handle) -> io::Result<()> {
-        let mut s = self.s();
-        // As the OS: a handle that is already on a port (this one or another) is refused.
-        if s.elsewhere.contains(&handle) || !s.associated.insert(handle) {
-            return Err(io::Error::from_raw_os_error(87));
+        let result = {
+            let mut s = self.s();
+            // As the OS: a handle that is already on a port (this one or another) is refused.
+            if s.elsewhere.contains(&handle) || !s.associated.insert(handle) {
+                Err(io::Error::from_raw_os_error(87))
+            } else {
+                s.log.push(format!("associate {handle:#x}"));
+                Ok(())
+            }
+        };
+        let hook = self.associate_hook.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            hook();
         }
-        s.log.push(format!("associate {handle:#x}"));
-        Ok(())
+        result
     }
 
     fn dequeue(&self, _port: Handle, out: &mut Vec<Packet>, max: usize) -> io::Result<()> {
@@ -819,7 +850,14 @@ impl Sys for Sim {
     }
 
     fn ring_create(&self, entries: u32) -> io::Result<Handle> {
+        let hook = self.ring_hook.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            hook();
+        }
         let mut s = self.s();
+        if s.fail_ring_create {
+            return Err(io::Error::from_raw_os_error(5));
+        }
         let ring = Self::new_handle(&mut s);
         s.rings.insert(ring, SimRing::default());
         s.log.push(format!("ring {ring:#x} entries {entries}"));

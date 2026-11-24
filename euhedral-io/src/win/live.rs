@@ -684,7 +684,7 @@ fn a_file_joined_to_a_port_is_served_by_the_port_not_a_ring() {
     let (path, file) = overlapped_file("ring-vs-port", &data);
     let raw = file.as_raw_handle() as usize;
     io.engine.sys.associate(io.engine.port.handle, raw).unwrap();
-    io.engine.associated.insert(raw);
+    io.engine.mark_joined(raw);
     for i in 0..4u64 {
         io.read(file.as_raw_handle(), i * 4096, buf(4096), then(i))
             .unwrap();
