@@ -9,7 +9,7 @@ semantics and the tests that pin it.
 
 **Why.** A device test that finds no driver, card or NVRTC returned early and reported `ok`, so a Bazel run on a machine without them proved nothing. Cargo's device job catches this by reading the output (`scripts/ci/device_check.py`, unchanged); Bazel has no such reader, so the test itself fails.
 
-**How to use.** Run `system-run --gpu shared:4 --mem 16G -- bazel test --config=gpu //...`. The `gpu` targets are also tagged `external`, so no run is served from the cache. Without `EUHEDRAL_DEVICE_REQUIRED` (Cargo, a plain `cargo test`) a skip prints `DEVICE-TEST-SKIPPED:` and returns as before.
+**How to use.** Run `system-run --gpu shared:8 --mem 16G -- bazel test --config=gpu //...`. The `gpu` targets are also tagged `external`, so no run is served from the cache. Without `EUHEDRAL_DEVICE_REQUIRED` (Cargo, a plain `cargo test`) a skip prints `DEVICE-TEST-SKIPPED:` and returns as before.
 
 **Semantics.**
 - `skip` (no driver, card, NVRTC or kernel) prints its line and then panics when `EUHEDRAL_DEVICE_REQUIRED` is set.
