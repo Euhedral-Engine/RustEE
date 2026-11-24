@@ -9,13 +9,14 @@ semantics and the tests that pin it.
 
 **Why.** `AsyncIo::pending` drops when a continuation's frame is handed out, not when the continuation runs. The old continuations posted from inside the reap, so the listener could hear that the last operation had ended and report the stop while that frame was still to be handed out: `pending` was then 1 after the stop was reported.
 
-**How to use.** Nothing changes for callers. When the stop is reported, `AsyncIo::pending` counts none of the server's operations, so the `AsyncIo` can be dropped after it.
+**How to use.** Nothing changes for a caller whose lattice runs the `AsyncIo`. When the stop is reported, `AsyncIo::pending` counts none of the server's operations, so the `AsyncIo` can be dropped after it. An owner now hears an operation's end only when the frame the `AsyncIo` hands out for it runs, so a caller that drives the `AsyncIo` by hand or from another lattice must run (or drop) the frames it pulls.
 
 **Semantics.**
 - An operation's end is an event of its owner only after its frame was handed out and run; stop, drain and listener close are otherwise as before.
 - The events of an owner reach it in the order the frames run, which is the order the lattice gives them.
+- A frame dropped without having run (a lattice that discarded it) posts its event as it is dropped, so the end of an operation is never lost.
 
-**Tests.** `a_stop_is_not_reported_before_an_operations_frame_has_run` (the `AsyncIo` reaped and pulled by hand, the frame held unrun: the stop is not reported until it runs).
+**Tests.** In `server.rs`: `the_accepts_end_reaches_the_listener_when_its_frame_runs` (the listener driven by hand: the reaped continuation posts nothing, and the end of the accept is heard when its frame runs) and `a_dropped_frame_still_delivers_the_accepts_end` (the frame dropped: the stop is still reported).
 
 ## The Bazel skeleton (build) (2026-11-24)
 

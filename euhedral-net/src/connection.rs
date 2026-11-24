@@ -5,20 +5,21 @@
 //!
 //! A [`Conn`] is a source of the lattice of its own, attached when the connection is accepted and detached when it
 //! ends (see [`station`](crate::station)). Everything that changes lives in one [`ConnState`], which only the
-//! connection's *key frame* touches: producers (the continuation of a `recv` or a `send`, a `Responder`, the stop)
-//! push an [`Event`] into the connection's inbox and return; the key, which the lattice runs on some worker when
+//! connection's *key frame* touches: producers (the frame the continuation of a `recv` or a `send` returns, a `Responder`,
+//! the stop) push an [`Event`] into the connection's inbox and return; the key, which the lattice runs on some worker when
 //! the inbox holds something and which is never in two places, drains the inbox and runs the events one at a time.
 //! The state is plain: the parser, the bytes read and not yet parsed, the socket, the ids of the operations in
 //! flight and the phase need no lock and no atomic of their own. Two connections are two sources, so they run in
 //! parallel. The `SourceCell` that holds the state is *entered* by the key and by nothing else, and an entry that
 //! found it taken would break that and panic ([`SourceCell::enter`]).
 //!
-//! Operations of one connection that end in an order the code did not expect are still handled: the continuation
-//! of an `AsyncIo` operation and a `Responder` push from different places, so each event is handled in whatever
-//! phase the connection is in.
+//! Operations of one connection that end in an order the code did not expect are still handled: the frame of an
+//! `AsyncIo` operation and a `Responder` push from different places, so each event is handled in whatever phase
+//! the connection is in.
 //!
-//! What the continuation of an operation does is push the event and return a frame that does nothing (the engine
-//! wants a frame back): that frame is the cost of one completion on top of the key's own run.
+//! What the continuation of an operation does is return a [`Post`] frame that pushes the event when it runs (or is
+//! dropped), so the connection hears of the end only after the `AsyncIo` handed the frame out and stopped counting
+//! the operation as pending: that frame is the cost of one completion on top of the key's own run.
 //!
 //! # Phases
 //!

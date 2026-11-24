@@ -32,7 +32,6 @@ use std::time::{Duration, Instant};
 use euhedral_core::config::{FragmentConfig, IdlePolicy, LatticeConfig};
 use euhedral_core::control_plane::ControlPlaneLattice;
 use euhedral_core::frames::{Frame, FrameError, FrameHeader};
-use euhedral_core::generics::LatticeSource;
 use euhedral_core::impls::{BaseCloneableObject, DefaultExecutor};
 use euhedral_core::ingest::{IngestSink, QueueIngestSink};
 use euhedral_graph::Completions;
@@ -163,23 +162,11 @@ impl Fixture {
     }
 
     fn start_on(listener: TcpListener, config: ServerConfig, handler: impl Handler) -> Fixture {
-        Fixture::start_with(listener, config, handler, true)
-    }
-
-    /// `drive_io` false leaves the `AsyncIo` out of the lattice: the test reaps and pulls it by hand.
-    fn start_with(
-        listener: TcpListener,
-        config: ServerConfig,
-        handler: impl Handler,
-        drive_io: bool,
-    ) -> Fixture {
         let lattice = lattice();
         let io = AsyncIo::open().unwrap();
         let sink = Arc::new(QueueIngestSink::new());
         let timers = Completions::without_lanes();
-        if drive_io {
-            lattice.add_upstream(io.clone()).unwrap();
-        }
+        lattice.add_upstream(io.clone()).unwrap();
         lattice.add_upstream(sink.delegate()).unwrap();
         lattice.add_upstream(timers.clone()).unwrap();
         let addr = listener.local_addr().unwrap();
@@ -751,55 +738,6 @@ fn a_body_over_the_limit_is_refused_before_it_is_read() {
     assert_eq!(peer.read_response(false).status, 413);
     peer.expect_closed();
     server.finish();
-}
-
-/// The end of an operation reaches the server through the frame its continuation returns, so the stop cannot be
-/// reported before that frame was handed out and run. The reap and the hand-out run by hand: the accept ends
-/// (the stop cancels it), its frame is handed out and held without running, and the stop is not reported; once
-/// the frame runs, the stop is reported and the `AsyncIo` counts nothing.
-#[test]
-fn a_stop_is_not_reported_before_an_operations_frame_has_run() {
-    let server = Fixture::start_with(
-        TcpListener::bind("127.0.0.1:0").unwrap(),
-        config(),
-        echo_target,
-        false,
-    );
-    server.begin_stop();
-    let deadline = Instant::now() + PATIENCE;
-    let mut held: Vec<Box<dyn Frame>> = Vec::new();
-    while held.is_empty() {
-        server.io.reap();
-        assert!(
-            server.stopped.try_recv().is_err(),
-            "the stop was reported before the accept's frame was handed out"
-        );
-        server
-            .io
-            .pull(&mut |frame| held.push(frame), &mut |_| false, u64::MAX);
-        assert!(
-            Instant::now() < deadline,
-            "the accept's frame was never handed out"
-        );
-    }
-    // The wait ends at the first message or at its end; a stop reported now was reported before the frame ran.
-    assert!(
-        server
-            .stopped
-            .recv_timeout(Duration::from_millis(500))
-            .is_err(),
-        "the stop was reported before the accept's frame ran"
-    );
-    for mut frame in held {
-        frame.execute().unwrap();
-    }
-    server
-        .stopped
-        .recv_timeout(PATIENCE)
-        .expect("the server did not report that it stopped");
-    assert_eq!(server.io.pending(), 0);
-    server.sink.complete_gracefully();
-    server.lattice.close();
 }
 
 #[test]
