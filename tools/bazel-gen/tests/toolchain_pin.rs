@@ -1,5 +1,5 @@
-//! The Rust toolchain is pinned in `mise.toml` and `rust-toolchain.toml`; the two must name the same version and
-//! profile.
+//! The Rust toolchain is pinned in `mise.toml` and `rust-toolchain.toml`, which must name the same version and profile,
+//! and twice in `MODULE.bazel` (`rust.toolchain` and the host tools), which must name that version.
 
 #![allow(
     clippy::disallowed_methods,
@@ -32,7 +32,29 @@ fn read(name: &str) -> String {
     std::fs::read_to_string(root.join(name)).unwrap_or_else(|e| panic!("read {name}: {e}"))
 }
 
-fn check(mise: &str, toolchain: &str) -> Result<(), String> {
+/// The versions `MODULE.bazel` pins: the `versions = [...]` of `rust.toolchain` and the `version` of `host_tools`.
+fn module_versions(module: &str) -> Result<(String, String), String> {
+    let toolchain = module
+        .lines()
+        .find_map(|l| {
+            let rest = l.trim().strip_prefix("versions")?;
+            Some(rest.split('"').nth(1)?.to_owned())
+        })
+        .ok_or("MODULE.bazel has no rust.toolchain versions = [\"...\"] line")?;
+    let host = module
+        .split_once(".host_tools(")
+        .and_then(|(_, call)| {
+            call.split(')').next()?.lines().find_map(|l| {
+                let rest = l.trim().strip_prefix("version")?;
+                Some(rest.split('"').nth(1)?.to_owned())
+            })
+        })
+        .ok_or("MODULE.bazel has no host_tools version = \"...\" line")?;
+    Ok((toolchain, host))
+}
+
+/// Compares the three files; `module` is `None` while `MODULE.bazel` is absent.
+fn check(mise: &str, toolchain: &str, module: Option<&str>) -> Result<(), String> {
     for (mise_key, file_key) in [("version", "channel"), ("profile", "profile")] {
         let pinned =
             mise_field(mise, mise_key).ok_or(format!("mise.toml has no rust {mise_key}"))?;
@@ -44,22 +66,60 @@ fn check(mise: &str, toolchain: &str) -> Result<(), String> {
             ));
         }
     }
+    if let Some(module) = module {
+        let want = value_of(toolchain, "channel").ok_or("rust-toolchain.toml has no channel")?;
+        let (toolchain_version, host_version) = module_versions(module)?;
+        for (line, got) in [
+            ("rust.toolchain versions", toolchain_version),
+            ("host_tools version", host_version),
+        ] {
+            if got != want {
+                return Err(format!(
+                    "MODULE.bazel {line} {got} differs from rust-toolchain.toml channel {want}; \
+                     edit both MODULE.bazel lines, then run `bazel mod deps --lockfile_mode=update` and commit MODULE.bazel.lock"
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
 #[test]
 fn the_toolchain_pins_agree() {
-    if let Err(e) = check(&read("mise.toml"), &read("rust-toolchain.toml")) {
+    let module = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../MODULE.bazel")
+        .exists()
+        .then(|| read("MODULE.bazel"));
+    if let Err(e) = check(
+        &read("mise.toml"),
+        &read("rust-toolchain.toml"),
+        module.as_deref(),
+    ) {
         panic!("{e}");
     }
-    // The Bazel pin (`MODULE.bazel`) is compared here once that file exists; until then there is nothing to compare.
 }
+
+const MISE: &str = "[tools]\nrust = { version = \"1.99.1\", profile = \"default\" }\n";
+const TOOLCHAIN: &str = "[toolchain]\nchannel = \"1.99.1\"\nprofile = \"default\"\n";
+const MODULE: &str = "rust.toolchain(\n    edition = \"2024\",\n    versions = [\"1.99.1\"],\n)\n\
+    rust_host_tools.host_tools(\n    name = \"x\",\n    version = \"1.99.1\",\n)\n";
 
 #[test]
 fn a_differing_pin_is_reported() {
-    let mise = "[tools]\nrust = { version = \"1.99.1\", profile = \"default\" }\n";
-    let same = "[toolchain]\nchannel = \"1.99.1\"\nprofile = \"default\"\n";
-    assert_eq!(check(mise, same), Ok(()));
-    let other = same.replace("1.99.1", "1.99.2");
-    assert!(check(mise, &other).is_err());
+    assert_eq!(check(MISE, TOOLCHAIN, None), Ok(()));
+    let other = TOOLCHAIN.replace("1.99.1", "1.99.2");
+    assert!(check(MISE, &other, None).is_err());
+}
+
+#[test]
+fn a_differing_module_line_is_reported_with_the_fix() {
+    assert_eq!(check(MISE, TOOLCHAIN, Some(MODULE)), Ok(()));
+    for (from, to) in [
+        ("versions = [\"1.99.1\"]", "versions = [\"1.99.2\"]"),
+        ("    version = \"1.99.1\"", "    version = \"1.99.2\""),
+    ] {
+        let err = check(MISE, TOOLCHAIN, Some(&MODULE.replace(from, to))).unwrap_err();
+        assert!(err.contains("bazel mod deps"), "{err}");
+    }
+    assert!(check(MISE, TOOLCHAIN, Some("")).is_err());
 }

@@ -1,0 +1,20 @@
+# The target platforms of the contracts (build/CONTRACTS.md, C4).
+platform(
+    name = "linux_x86_64",
+    constraint_values = ["@platforms//os:linux", "@platforms//cpu:x86_64"],
+    visibility = ["//visibility:public"],
+)
+
+# The Windows proxy job (C8): every repo that ships on Windows builds and tests //... here.
+platform(
+    name = "windows_x86_64",
+    constraint_values = ["@platforms//os:windows", "@platforms//cpu:x86_64"],
+    visibility = ["//visibility:public"],
+)
+
+# The Quest headset (MySphereVR, phase 6).
+platform(
+    name = "android_arm64",
+    constraint_values = ["@platforms//os:android", "@platforms//cpu:arm64"],
+    visibility = ["//visibility:public"],
+)

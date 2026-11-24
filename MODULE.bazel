@@ -1,0 +1,52 @@
+# RustEE's Bazel build (docs/design/bazel.md). Versions are the table in build/module/MODULE.bazel (forge build/CONTRACTS.md C4).
+module(
+    name = "euhedral_rustee",
+    version = "0.0.0",
+)
+
+# The euhedral_build module (the version table and the shared platforms) is a copy of forge's build/module, loaded through a
+# local path until the private registry (C5) publishes it; build/ is in .bazelignore, so its files are not packages of this
+# module. Keep it identical to forge's; forge's check-repo.sh checks the bazel_dep versions below against the table.
+bazel_dep(name = "euhedral_build", version = "0.1.0")
+local_path_override(
+    module_name = "euhedral_build",
+    path = "build/module",
+)
+
+bazel_dep(name = "platforms", version = "1.1.0")
+bazel_dep(name = "bazel_skylib", version = "1.9.2")
+bazel_dep(name = "rules_rust", version = "0.75.0")
+
+# The toolchain is rust-toolchain.toml's version (and mise.toml's). rules_rust takes only a literal, so the version is written
+# twice: tools/bazel-gen/tests/toolchain_pin.rs fails when either differs from the toolchain file. host_tools is the cargo that
+# crate_universe splices with; rules_rust declares its own at its own version, which moves when rules_rust is bumped, so this
+# one has another name and from_cargo is pointed at it.
+rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
+rust.toolchain(
+    edition = "2024",
+    versions = ["1.99.1"],
+)
+use_repo(rust, "rust_toolchains")
+
+rust_host_tools = use_extension("@rules_rust//rust:extensions.bzl", "rust_host_tools")
+rust_host_tools.host_tools(
+    name = "rust_host_tools_pinned",
+    version = "1.99.1",
+)
+use_repo(rust_host_tools, "rust_host_tools_pinned")
+
+register_toolchains("@rust_toolchains//:all")
+
+# crate_universe reads the workspace's Cargo.toml and Cargo.lock; Cargo owns the lock (cargo update), Bazel never rewrites it.
+crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
+crate.from_cargo(
+    name = "crates",
+    cargo_lockfile = "//:Cargo.lock",
+    host_tools = "@rust_host_tools_pinned",
+    manifests = ["//:Cargo.toml"],
+    supported_platform_triples = [
+        "x86_64-unknown-linux-gnu",
+        "x86_64-pc-windows-msvc",
+    ],
+)
+use_repo(crate, "crates")

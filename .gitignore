@@ -1,2 +1,6 @@
 /target/
 __pycache__/
+
+# Bazel
+/bazel-*
+user.bazelrc

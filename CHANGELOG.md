@@ -3,6 +3,18 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## The Bazel skeleton (build) (2026-11-24)
+
+**What.** `MODULE.bazel` (rules_rust, platforms and skylib at the shared version table, the toolchain at 1.99.1, `crate_universe` over the workspace's `Cargo.toml` and `Cargo.lock` for the Linux and Windows triples), `MODULE.bazel.lock`, `.bazelversion`, `.bazelrc`, `.bazelignore`, a root `BUILD.bazel`, `.gitattributes` (LF for the Bazel files and the Cargo manifests) and a copy of the shared `euhedral_build` module under `build/module`. `bazel query @crates//...` lists the third-party crates. No crate has a `BUILD.bazel` yet, and no CI job runs Bazel.
+
+**Why.** The step before the generated BUILD files: the dependency graph resolves and is locked, so the next step only adds targets.
+
+**How to use.** After editing `MODULE.bazel`, a `Cargo.toml` or `Cargo.lock`, run `bazel mod deps --lockfile_mode=update` and commit `MODULE.bazel.lock`. Cargo is unchanged and stays the owner of the lock.
+
+**Semantics.** No library code and no Cargo file changed. `scripts/ci/affected.py` treats the root Bazel files as root build files (the full Cargo run and every Miri shard), and a change to any member's `Cargo.toml`, `src/`, `tests/`, `examples/`, `benches/` or `build.rs` also affects `euhedral-bazel-gen`, whose later check reads those files.
+
+**Tests.** `tools/bazel-gen/tests/toolchain_pin.rs` now compares the two toolchain lines of `MODULE.bazel` with `rust-toolchain.toml`; `scripts/ci/test_affected.py` covers the new rules.
+
 ## The Rust toolchain is pinned in `rust-toolchain.toml` (build) (2026-11-24)
 
 **What.** `rust-toolchain.toml` names the toolchain `mise.toml` already pins (1.99.1, profile default). A new workspace member, `tools/bazel-gen` (`euhedral-bazel-gen`, not published), holds a test that compares the two pins.

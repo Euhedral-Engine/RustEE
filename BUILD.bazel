@@ -1,0 +1,8 @@
+# The root package exists so that //:Cargo.toml, //:Cargo.lock (crate_universe's inputs) and the pin files are labels.
+exports_files([
+    "Cargo.lock",
+    "Cargo.toml",
+    "MODULE.bazel",
+    "mise.toml",
+    "rust-toolchain.toml",
+])
