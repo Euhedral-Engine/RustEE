@@ -9,7 +9,7 @@ semantics and the tests that pin it.
 
 **Why.** A client that connected after the stop was completed by the kernel into the backlog and then waited, unanswered, for as long as other connections drained. Draining means no new work is taken.
 
-**How to use.** Nothing changes for callers. After `stop`, the port is free and a new connect is refused.
+**How to use.** Nothing changes for callers. After `stop`, the listening socket is closed and a new connect is refused.
 
 **Semantics.**
 - A socket the in-flight accept returns after the stop began is dropped; the peer sees it close.

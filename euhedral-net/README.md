@@ -211,8 +211,8 @@ fn start(
   server stops), whatever the peer sends and whatever `write_limit` is.
 - **Accept errors** are counted (`accept_errors`) and the accept is tried again after `accept_backoff`.
 - **Cap.** At `max_connections` no accept is pending; the kernel's backlog holds the rest.
-- **Stop.** The accept in flight is cancelled and the listening socket is closed as soon as it has ended: the port
-  is released and a new connection is refused (not left in the backlog) while the open connections drain. Waiting connections close (also one that waits for a body after `100 Continue`, and a request that
+- **Stop.** The accept in flight is cancelled and the listening socket is closed as soon as it has ended: a new
+  connection is refused (not left in the backlog) while the open connections drain. Waiting connections close (also one that waits for a body after `100 Continue`, and a request that
   completes after the stop is not handed to the handler); a request in flight is answered, with `Connection:
   close`. The frame given to `stop` is offered to the sink as the last thing the server does: when every connection
   is gone and its source has ended, no accept is pending and every `Responder` has been used or dropped, and after

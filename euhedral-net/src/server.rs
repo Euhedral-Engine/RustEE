@@ -478,8 +478,8 @@ impl Shared {
         self.arm_accept(ls);
     }
 
-    /// Closes the listening socket once the server is stopping and no accept is in flight on it: the port is
-    /// released and a new connection is refused, while the open connections drain. The accept in flight is
+    /// Closes the listening socket once the server is stopping and no accept is in flight on it: a new
+    /// connection is refused, while the open connections drain. The accept in flight is
     /// cancelled by the stop and ends first (a socket it accepted meanwhile is dropped), so the close never
     /// lands under an operation.
     fn close_listener(&self, ls: &mut ListenerState) {
@@ -553,12 +553,12 @@ impl ServerHandle {
     }
 
     /// Stops the server and returns at once. The accept in flight is cancelled, the listening socket is closed
-    /// as soon as that accept has ended (the port is released and a new connection is refused, not left in the
-    /// backlog) and no more connections are taken; connections that wait for a request (idle, or part-way through reading one, or lingering after
-    /// their last reply) are closed; a request being handled is answered, with `Connection: close`, and its
-    /// connection closes after the reply. When the last connection is gone and the accept has ended, `stopped`
-    /// is offered to the sink, once. A second `stop` adds another frame, offered at the same time (or at
-    /// once if the server is already stopped).
+    /// as soon as that accept has ended (a new connection is refused, not left in the backlog) and no more
+    /// connections are taken; connections that wait for a request (idle, or part-way through reading one, or
+    /// lingering after their last reply) are closed; a request being handled is answered, with `Connection:
+    /// close`, and its connection closes after the reply. When the last connection is gone and the accept has
+    /// ended, `stopped` is offered to the sink, once. A second `stop` adds another frame, offered at the same
+    /// time (or at once if the server is already stopped).
     ///
     /// The notification is the last thing the server does. Before it: every connection is gone and its source
     /// has ended, no accept or retry is pending, every `Responder` handed to a handler has been used or dropped

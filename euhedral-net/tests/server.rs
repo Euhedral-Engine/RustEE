@@ -797,10 +797,15 @@ fn a_stopped_server_refuses_new_connections_while_a_request_drains() {
     // The listener is closed once the cancelled accept has ended: a connect is refused from then on. A connect
     // that lands before that is only in the backlog and is dropped by the server's close.
     let limit = Instant::now() + PATIENCE;
+    let never =
+        "the listening socket was never closed: new connections are still accepted after the stop";
     let mut early = Vec::new();
     loop {
-        match TcpStream::connect(server.addr) {
+        let remaining = limit.saturating_duration_since(Instant::now());
+        assert!(!remaining.is_zero(), "{never}");
+        match TcpStream::connect_timeout(&server.addr, remaining) {
             Ok(stream) => early.push(stream),
+            Err(error) if error.kind() == ErrorKind::TimedOut => panic!("{never}"),
             // A connect still in flight when the socket closes is reset; the next one is refused.
             Err(error) if error.kind() == ErrorKind::ConnectionReset => {}
             Err(error) => {
@@ -808,11 +813,22 @@ fn a_stopped_server_refuses_new_connections_while_a_request_drains() {
                 break;
             }
         }
-        assert!(
-            Instant::now() < limit,
-            "the listening socket was never closed: new connections are still accepted after the stop"
-        );
         yield_now();
+    }
+    // A refusal alone could come from a full backlog: every connect that got in was closed by the server.
+    for stream in &mut early {
+        let remaining = limit.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "a queued connection was never closed by the server"
+        );
+        stream.set_read_timeout(Some(remaining)).unwrap();
+        let mut byte = [0u8; 1];
+        match stream.read(&mut byte) {
+            Ok(0) => {}
+            Err(error) if error.kind() == ErrorKind::ConnectionReset => {}
+            other => panic!("a queued connection was not closed by the server: {other:?}"),
+        }
     }
     // The request in flight is answered, and its connection closes.
     reply.send(Response::with_status(200));
