@@ -47,7 +47,7 @@ pub(crate) struct Station<T: Drive> {
     inbox: SourceCell<Consumer<T::Event, Single>>,
     key: KeySlot<Key<T>>,
     downstream: DownstreamSlot,
-    /// Counts the pushes of the key, so that each is routed by a hash of its own.
+    /// Counts the pushes of the key and the frames of [`Post`], so that each is routed by a hash of its own.
     seed: AtomicU64,
 }
 
@@ -177,11 +177,15 @@ impl<T: Drive> Drop for Key<T> {
     }
 }
 
-/// A frame that pushes an event into an owner's inbox when it runs: what a timer or an I/O continuation hands the
-/// lattice for an event of a station. An I/O continuation posts nothing itself: the owner hears that the
-/// operation ended only when this frame runs, which is after the `AsyncIo` handed it out and stopped counting the
-/// operation as pending. A frame dropped without having run (a lattice that discarded it) posts its event as it
-/// goes, so that the operation's end is never lost.
+/// An unordered frame (like the station's key) that pushes an event into an owner's inbox when it runs: what a
+/// timer or an I/O continuation hands the lattice for an event of a station. An I/O continuation posts nothing
+/// itself: the owner hears that the operation ended only when this frame runs, which is after the `AsyncIo` handed
+/// it out and stopped counting the operation as pending. A frame dropped without having run (a lattice that
+/// discarded it) posts its event as it goes, so that the operation's end is never lost.
+///
+/// The frame is unordered, with a routing hash of its own, so that it may run on any worker: the events of different
+/// owners, and of one owner, are independent as far as the lattice is concerned. Running one only pushes into the
+/// inbox; the inbox keeps the order of the pushes and the key runs the events one at a time.
 pub(crate) struct Post<T: Drive> {
     header: FrameHeader,
     owner: Arc<T>,
@@ -190,8 +194,13 @@ pub(crate) struct Post<T: Drive> {
 
 impl<T: Drive> Post<T> {
     pub(crate) fn new(owner: Arc<T>, event: T::Event) -> Box<Self> {
+        let mut header = FrameHeader::new(0x5747_4154_494F_4E01);
+        // The owner's address spreads the frames of different owners, its counter those of one owner.
+        let owner_bits = Arc::as_ptr(&owner).cast::<()>().addr() as u64;
+        let count = owner.station().seed.fetch_add(1, Ordering::Relaxed);
+        header.randomize_hash(count.wrapping_add(owner_bits).wrapping_add(1));
         Box::new(Self {
-            header: FrameHeader::new(0),
+            header,
             owner,
             event: Some(event),
         })
@@ -220,5 +229,40 @@ impl<T: Drive> Frame for Post<T> {
             self.owner.station().post(event);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Owner {
+        station: Station<Owner>,
+    }
+
+    impl Drive for Owner {
+        type Event = u32;
+
+        fn station(&self) -> &Station<Self> {
+            &self.station
+        }
+
+        fn run(self: &Arc<Self>, _event: u32) {}
+    }
+
+    #[test]
+    fn posts_are_unordered_and_routed_by_hashes_of_their_own() {
+        let owner = Arc::new_cyclic(|me| Owner {
+            station: Station::new(me.clone()),
+        });
+        let first = Post::new(owner.clone(), 1);
+        let second = Post::new(owner.clone(), 2);
+        assert!(!first.header().is_ordered(), "a post must be unordered");
+        assert!(!second.header().is_ordered(), "a post must be unordered");
+        assert_ne!(
+            first.header().routing_hash(),
+            second.header().routing_hash(),
+            "two posts must not share a routing hash"
+        );
     }
 }

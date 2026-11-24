@@ -3,6 +3,20 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## Net `Post` frames are unordered (2026-11-24)
+
+**What.** The frame an I/O end or a timer hands the lattice for an event of a connection or the listener (`Post`) is unordered and carries a routing hash of its own, as the station's key already did. It had an ordered header with id 0.
+
+**Why.** Every `Post` of every server and connection rode one ordered chain, so the I/O ends and timer events of unrelated connections queued behind each other. The events are independent: running a `Post` only pushes into the owner's inbox, and the key runs them one at a time in push order.
+
+**How to use.** Nothing changes for callers.
+
+**Semantics.**
+- The routing hash mixes the owner's address and the station's push counter (the one the key uses), so frames of one owner and of different owners spread over the workers.
+- A `Post` dropped without having run still delivers its event.
+
+**Tests.** `station::tests::posts_are_unordered_and_routed_by_hashes_of_their_own` (fails on the old code: the header was ordered and the hashes equal).
+
 ## The listener stops re-arming its retry when the caller completed the timers early (`euhedral-net`) (2026-11-24)
 
 **What.** When an accept fails and the server's `timers` were completed before the server was stopped, the listener no longer schedules the retry: it treats the accept as ended. The retry frame the timers cancel still posts its event (a frame dropped unrun delivers it, as for every operation's frame); that event no longer arms anything.
