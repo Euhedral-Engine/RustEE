@@ -157,8 +157,10 @@ for seq in 0u32..3 {
     }));
 }
 
-// The items finish in the order 1, 2, 0. Each timer is armed at an instant already past, and the loop below runs
-// until that item has fired before the next is armed, so the order comes from these steps and not from elapsed time.
+// The items finish in the order 1, 2, 0. Each timer is armed at the current instant, so it is due at the next reap,
+// and the loop below runs until that item has fired before the next is armed, so the order comes from these steps
+// and not from elapsed time.
+//
 // A lattice worker runs the source's poll frame and takes what it found with `request` and `pull`; here the loop is
 // the worker, and `reap` is what the poll frame does.
 for seq in [1u32, 2, 0] {
