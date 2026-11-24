@@ -800,10 +800,12 @@ fn a_stopped_server_refuses_new_connections_while_a_request_drains() {
     server.begin_stop();
     // The listener is closed once the cancelled accept has ended: a connect is refused from then on. A connect
     // that lands before that is taken in and closed by the server, or waits in the backlog and is reset by the
-    // listener's close. The connects go in batches far below the listen backlog, and each batch is read to its end
-    // before the next starts, so the backlog never fills: at a full backlog the kernel may drop the last step of a
-    // handshake that the peer already saw complete, and then neither the server (which never had the connection)
-    // nor the close of the listener sends that peer anything.
+    // listener's close. But a handshake the kernel is completing as the listener closes can lose its server half
+    // with nothing sent to the peer, whose socket then stays established: the server never had that connection.
+    // So each connection sends one byte (the start of a request, which the server must close as it closes an idle
+    // one) before it is read: a lost half answers it with a reset. The connects go in batches far below the listen
+    // backlog, each read to its end before the next starts, so the backlog never fills (at a full backlog the
+    // kernel drops the last step of a handshake in the same way).
     let limit = Instant::now() + PATIENCE;
     let never =
         "the listening socket was never closed: new connections are still accepted after the stop";
@@ -826,7 +828,7 @@ fn a_stopped_server_refuses_new_connections_while_a_request_drains() {
             }
             yield_now();
         }
-        // A refusal alone could come from a full backlog: every connect that got in was closed.
+        // A refusal alone could come from a full backlog: every connect that got in was closed or reset.
         for stream in &mut batch {
             let remaining = limit.saturating_duration_since(Instant::now());
             assert!(
@@ -834,10 +836,16 @@ fn a_stopped_server_refuses_new_connections_while_a_request_drains() {
                 "a connection that got in before the stop was never closed"
             );
             stream.set_read_timeout(Some(remaining)).unwrap();
+            // A write that fails found the connection already reset; the read says so too.
+            let _ = stream.write_all(b"G");
             let mut byte = [0u8; 1];
             match read_on(stream, &mut byte) {
                 Ok(0) => {}
-                Err(error) if error.kind() == ErrorKind::ConnectionReset => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted
+                    ) => {}
                 other => {
                     let counters = server.handle.counters();
                     panic!(

@@ -3,20 +3,20 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
-## The net stop test keeps its connects below the listen backlog (`euhedral-net`, test) (2026-11-24)
+## The net stop test makes a connection whose server half the kernel lost say so (`euhedral-net`, test) (2026-11-24)
 
-**What.** `a_stopped_server_refuses_new_connections_while_a_request_drains` connects in batches of at most 32 after the stop, and reads every connection of a batch to its end (closed or reset) before it starts the next, until a connect is refused. Its failure message now names the server's `accepted` and `open` counts, whether a refusal was seen, and the connection's addresses. The server is unchanged.
+**What.** `a_stopped_server_refuses_new_connections_while_a_request_drains` sends one byte (`G`, the start of a request) on each connection that got in after the stop before it reads it, connects in batches of at most 32, and reads every connection of a batch to its end (closed, reset or aborted) before it starts the next, until a connect is refused. Its failure message names the server's `accepted` and `open` counts, whether a refusal was seen, and the connection's addresses. The server is unchanged.
 
-**Why.** The test connected without bound until the listener refused, and under load (every test target at once) the listener closed late enough for the connects to fill the listen backlog (128 for a standard-library `TcpListener`; alone the test makes 5 to 45 connects). At a full backlog Linux drops the last ACK of a handshake that the client already saw complete (`tcp_abort_on_overflow` is 0 by default) and keeps only a request socket; when the listener closes, that request is dropped with nothing sent, so the client's socket stays established with no peer and its read only times out. The server never had that connection, so it cannot close it. One parallel run failed this way after its full 20 s. A scratch run of 32 concurrent connects against a never-accepting listener with backlog 8 left one of ten clients in exactly that state after the close.
+**Why.** The test failed about once in 200 runs of the whole `server` test binary on a loaded machine (and once under `bazel test //...`): a connection that got in before the listener closed was neither closed nor reset within 20 s. A run caught with the kernel's socket table at the failure showed the client's socket established and no socket at all on the server's side for that pair of ports: not held by the process, not in the accept queue, not a pending handshake. The server had accepted only the connection with the request in flight. So the kernel lost the server half of a handshake it was completing as the listener closed, sent the client nothing, and a client that sends nothing never learns. The server never had that connection and cannot close it. The same happens at a full listen backlog (128 for a standard-library `TcpListener`), where Linux drops the last ACK of a handshake the client saw complete (`tcp_abort_on_overflow` is 0): a scratch run with backlog 8 and 32 concurrent connects left one client in that state after the close. A byte sent on such a connection is answered with a reset, since no socket owns its ports; on a connection the server holds it is the start of a request, which the stop must close as it closes an idle connection, so a server that kept either open still fails the test.
 
-**How to use.** Nothing changes for callers. A program that must not leave a client hanging at a stop keeps its listen backlog above the connects that can arrive while the stop closes the listener; that is the kernel's behaviour, not the server's.
+**How to use.** Nothing changes for callers. A client of a stopping server that sends nothing may not learn that a connection racing the close is gone; that is the kernel's behaviour, not the server's.
 
 **Semantics.**
 - A connection the server accepted before or after the stop is closed by it at once (it carries no request).
-- A connection still in the backlog when the listener closes is reset by the kernel.
-- A handshake the kernel dropped at a full backlog is neither: no socket of the server ever held it.
+- A connection in the backlog when the listener closes is reset by the kernel.
+- A handshake the kernel was completing as the listener closed (or dropped at a full backlog) has no server socket; its client hears of it only when it sends.
 
-**Tests.** The test itself; it cannot fail on the old code deterministically, as the drop needs the kernel to process one connect's last ACK after the next connect's SYN at the backlog's edge.
+**Tests.** The test itself. It cannot fail on the old code on demand: the loss needs the client's last ACK to meet the listener's close. Counted runs of the whole binary: old test 1 failure in 200; the batches alone 1 in 200 (the case above); with the byte, no failure in about 420 runs (stopped there).
 
 ## The Bazel generator sees harness in a multi-line target array, skips every `target/` and names an unreadable directory (build) (2026-11-24)
 
