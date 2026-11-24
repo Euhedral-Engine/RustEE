@@ -1,0 +1,4 @@
+# Keep in step with `mise.toml`; `tools/bazel-gen/tests/toolchain_pin.rs` checks that they agree.
+[toolchain]
+channel = "1.99.1"
+profile = "default"
