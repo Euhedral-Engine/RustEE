@@ -4,7 +4,6 @@ pub mod cfg;
 pub mod emit;
 pub mod json;
 pub mod model;
-pub mod sha256;
 pub mod starlark;
 pub mod worlds;
 
@@ -167,51 +166,64 @@ pub fn build_files_on_disk(root: &Path) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
-/// The manifest files `MODULE.bazel.lock` records a digest of: the root's `Cargo.toml` and `Cargo.lock` and every
-/// member's `Cargo.toml`.
-pub fn locked_inputs(ws: &Workspace) -> Vec<String> {
-    let mut paths = vec!["Cargo.lock".to_owned(), "Cargo.toml".to_owned()];
-    paths.extend(ws.packages.iter().map(|p| format!("{}/Cargo.toml", p.dir)));
-    paths
+/// The `name version` of every package in `Cargo.lock` that comes from a registry.
+pub fn registry_packages(cargo_lock: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let (mut name, mut version, mut registry) = (None, None, false);
+    let mut close =
+        |name: &mut Option<String>, version: &mut Option<String>, registry: &mut bool| {
+            if let (Some(n), Some(v), true) = (name.take(), version.take(), *registry) {
+                found.push(format!("{n} {v}"));
+            }
+            *registry = false;
+        };
+    for line in cargo_lock.lines() {
+        if line.starts_with("[[package]]") {
+            close(&mut name, &mut version, &mut registry);
+        } else if let Some(v) = line.strip_prefix("name = ") {
+            name = Some(v.trim_matches('"').to_owned());
+        } else if let Some(v) = line.strip_prefix("version = ") {
+            version = Some(v.trim_matches('"').to_owned());
+        } else if line.starts_with("source = \"registry+") {
+            registry = true;
+        }
+    }
+    close(&mut name, &mut version, &mut registry);
+    found.sort();
+    found
 }
 
-/// What is wrong with `MODULE.bazel.lock`'s record of the workspace manifests: a recorded digest that differs from the file
-/// `read` returns, or a path in `required` with no record. Empty when the lock is current.
-pub fn lock_problems(
-    lock: &str,
-    read: &dyn Fn(&str) -> Option<Vec<u8>>,
-    required: &[String],
-) -> Vec<String> {
-    let mut recorded = BTreeMap::new();
-    for line in lock.lines() {
-        let Some(rest) = line
-            .trim()
-            .trim_start_matches('"')
-            .strip_prefix("FILE:@@//")
-        else {
-            continue;
-        };
-        let rest = rest.trim_end_matches(',').trim_end_matches('"');
-        if let Some((path, digest)) = rest.split_once(' ') {
-            recorded.insert(path.to_owned(), digest.to_owned());
-        }
-    }
+/// What is wrong with `cargo-bazel-lock.json` next to `Cargo.lock`: a registry package of `Cargo.lock` the lock has no
+/// crate for, or a crate of the lock (a workspace member aside) that `Cargo.lock` lacks. crate_universe's own digest does
+/// not cover `Cargo.lock`, so a `cargo update` without a repin would otherwise build the old versions without a word.
+/// Empty when they agree.
+pub fn lock_problems(cargo_lock: &str, bazel_lock: &str) -> Result<Vec<String>, String> {
+    let bazel = json::parse(bazel_lock)?;
+    let keys = |field: &str| -> Result<Vec<String>, String> {
+        let object = bazel
+            .get(field)
+            .and_then(json::Json::as_object)
+            .ok_or_else(|| format!("cargo-bazel-lock.json has no `{field}` object"))?;
+        Ok(object.keys().cloned().collect())
+    };
+    let members = keys("workspace_members")?;
+    let locked: Vec<String> = keys("crates")?
+        .into_iter()
+        .filter(|key| !members.contains(key))
+        .collect();
+    let wanted = registry_packages(cargo_lock);
     let mut problems = Vec::new();
-    for (path, digest) in &recorded {
-        match read(path) {
-            None => problems.push(format!("{path} is recorded but missing")),
-            Some(bytes) if sha256::hex_digest(&bytes) != *digest => {
-                problems.push(format!("{path} changed since the lock was written"))
-            }
-            Some(_) => {}
-        }
+    for package in wanted.iter().filter(|p| !locked.contains(p)) {
+        problems.push(format!(
+            "{package} is in Cargo.lock but not in cargo-bazel-lock.json"
+        ));
     }
-    for path in required {
-        if !recorded.contains_key(path) {
-            problems.push(format!("{path} is not recorded"));
-        }
+    for package in locked.iter().filter(|p| !wanted.contains(p)) {
+        problems.push(format!(
+            "{package} is in cargo-bazel-lock.json but not in Cargo.lock"
+        ));
     }
-    problems
+    Ok(problems)
 }
 
 #[cfg(test)]
@@ -256,26 +268,20 @@ mod tests {
     }
 
     #[test]
-    fn the_lock_check_names_changed_and_unrecorded_manifests() {
-        let digest = sha256::hex_digest(b"[package]\n");
-        let lock = format!(
-            "  \"FILE:@@//a/Cargo.toml {digest}\",\n  \"FILE:@@//b/Cargo.toml {digest}\"\n  \"FILE:@@rules_rust+//MODULE.bazel 00\"\n"
-        );
-        let files = |path: &str| match path {
-            "a/Cargo.toml" => Some(b"[package]\n".to_vec()),
-            "b/Cargo.toml" => Some(b"[package]\nname = \"b\"\n".to_vec()),
-            _ => None,
-        };
-        let required = ["a/Cargo.toml".to_owned(), "c/Cargo.toml".to_owned()];
+    fn the_lock_check_names_a_package_only_one_lock_has() {
+        let cargo_lock = "[[package]]\nname = \"a\"\nversion = \"1.0.0\"\nsource = \"registry+x\"\n\n\
+            [[package]]\nname = \"b\"\nversion = \"2.0.0\"\nsource = \"registry+x\"\n\n\
+            [[package]]\nname = \"me\"\nversion = \"0.1.0\"\n";
+        let current = r#"{"workspace_members":{"me 0.1.0":"."},"crates":{"a 1.0.0":{},"b 2.0.0":{},"me 0.1.0":{}}}"#;
+        assert_eq!(lock_problems(cargo_lock, current), Ok(vec![]));
+        let stale = r#"{"workspace_members":{"me 0.1.0":"."},"crates":{"a 1.0.0":{},"b 1.9.0":{},"me 0.1.0":{}}}"#;
         assert_eq!(
-            lock_problems(&lock, &files, &required),
-            [
-                "b/Cargo.toml changed since the lock was written",
-                "c/Cargo.toml is not recorded"
-            ]
+            lock_problems(cargo_lock, stale),
+            Ok(vec![
+                "b 2.0.0 is in Cargo.lock but not in cargo-bazel-lock.json".to_owned(),
+                "b 1.9.0 is in cargo-bazel-lock.json but not in Cargo.lock".to_owned(),
+            ])
         );
-        assert!(
-            lock_problems(&lock, &|_| Some(b"[package]\n".to_vec()), &required[..1]).is_empty()
-        );
+        assert!(lock_problems(cargo_lock, "{}").is_err());
     }
 }

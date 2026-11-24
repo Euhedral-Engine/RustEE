@@ -146,7 +146,7 @@ rust_test(
     crate_root = "tests/stale.rs",
     data = [
         "//:Cargo.lock",
-        "//:MODULE.bazel.lock",
+        "//:cargo-bazel-lock.json",
         "//:workspace_sources",
         "@rules_rust//cargo:current_cargo_toolchain",
     ],

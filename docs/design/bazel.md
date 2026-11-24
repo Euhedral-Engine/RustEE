@@ -142,7 +142,7 @@ second Cargo workspace uses it.
   `bazel test //...`. It runs `cargo metadata --no-deps --offline` with the cargo in `CARGO` and then the generator in
   check mode:
   - Under Bazel, `CARGO` is the toolchain's cargo (`@rules_rust//rust/toolchain:current_cargo_files` as `data`) and
-    `CARGO_HOME` is under `TEST_TMPDIR`. Its `data` is every `Cargo.toml`, `Cargo.lock`, `MODULE.bazel.lock` (both
+    `CARGO_HOME` is under `TEST_TMPDIR`. Its `data` is every `Cargo.toml`, `Cargo.lock` and `cargo-bazel-lock.json` (both
     read by the lock check below), every `BUILD.bazel` and every file that target discovery scans (`src/`, `tests/`,
     `examples/`, `benches/`, `build.rs`). Without them in `data` the sandbox has no copy to read.
   - Under `cargo test`, Cargo sets `CARGO` itself, so the same test also fails the Cargo gate on a stale file.
@@ -154,24 +154,29 @@ second Cargo workspace uses it.
     pass no status) and every function that takes the file list, to save a test that takes seconds. Over-selecting
     only runs a cheap test; under-selecting would let a stale file through, so the Cargo side runs the test on every
     pull request that can make BUILD files stale, and some that cannot.
-  - **The module lock:** any edit to a member's `Cargo.toml`, including `[package.metadata.bazel]`, changes the
-    sha256 that `MODULE.bazel.lock` records for it, and `--lockfile_mode=error` then fails every Bazel command. The
-    stale test also compares the sha256 values that the lock records for `Cargo.toml` and `Cargo.lock` with the files,
-    so the Cargo side catches a stale lock too, even before the Bazel CI job exists. The fix is one `bazel mod deps`
-    (or any Bazel command without `--lockfile_mode=error`).
-  - **A `MODULE.bazel` edit** (a toolchain bump, a new `crate.annotation`) also makes the lock stale, and the lock
-    records no sha256 of `MODULE.bazel` for the stale test to compare. Nothing on the Cargo side catches it; the Bazel
-    CI job (step 6) is the first to fail. The common case, a toolchain bump, goes through the pin test, so the pin
-    test's failure message says to run `bazel mod deps` after editing `MODULE.bazel`.
+  - **The locks:** `crate.from_cargo` sets `lockfile = "//:cargo-bazel-lock.json"`, because Bazel refuses a
+    non-root module's crate_universe repository without one (a downstream module could not depend on this one).
+    crate_universe's own check of that file hashes the lock, the config, the splicing manifest and the cargo and
+    rustc versions, but not `Cargo.lock` and not the contents of a manifest (verified on rules_rust 0.75.0: a
+    `cargo update --precise` and a changed requirement in a member's `Cargo.toml` both build without a word). So the
+    lock is enforced twice, by ours. The stale test compares the registry packages of `Cargo.lock` (`name version`)
+    with the crates of `cargo-bazel-lock.json` (workspace members aside), both ways, and names the packages that
+    differ; it runs under Cargo and Bazel. The `bazel` CI job also repins a copy before `bazel test` and fails when
+    either lock changes, which catches everything the digest and the package comparison do not (a feature or
+    requirement change, a toolchain bump). The repin is deterministic (two runs give identical files). One command
+    refreshes both locks after `cargo update`, an edit of a `Cargo.toml` or of `MODULE.bazel`:
+    `CARGO_BAZEL_REPIN=1 bazel mod deps --lockfile_mode=update`. `MODULE.bazel.lock` is still checked by
+    `--lockfile_mode=error`: any edit to a member's `Cargo.toml` or `MODULE.bazel` fails every Bazel command until it
+    is regenerated.
 
   Its failure message names the stale files and the command that fixes them. Regenerating is the duty of whoever
   changes a `Cargo.toml` or adds a target file. The root `README.md` says so in one line, and the stale test enforces
   it.
 - **The pin check** (toolchain, below) is a second test of the same crate, so it also runs under both tools. Its
   `data` is `rust-toolchain.toml`, `mise.toml` and `MODULE.bazel`.
-- **Line endings:** `.gitattributes` sets `BUILD.bazel`, `*.bzl`, `MODULE.bazel`, `MODULE.bazel.lock`, `Cargo.toml`
+- **Line endings:** `.gitattributes` sets `BUILD.bazel`, `*.bzl`, `MODULE.bazel`, `MODULE.bazel.lock`, `cargo-bazel-lock.json`, `Cargo.toml`
   and `Cargo.lock` to `eol=lf`. Otherwise a Windows checkout with CRLF fails the byte comparison of the stale check and
-  the lock's sha256 values.
+  the locks' digests.
 - **The feature resolver** (below) is the generator's own, for workspace crates only. It is proved once per world in
   the generator's pull request, with the command and the output in its description, and the comparison is then
   deleted:
@@ -561,11 +566,21 @@ them cached; a `<crate>_cuda` production target when a consumer module needs one
 
   If the runner lacks symlink rights, those tests read their files through the runfiles manifest instead, a
   test-only change.
-- **The lock:** `MODULE.bazel.lock` records a sha256 of every member's `Cargo.toml` and of `Cargo.lock`. Any edit to
-  them, `[package.metadata.bazel]` included, makes it stale, and `--lockfile_mode=error` fails every Bazel command. The
-  stale test's lock check catches this on the Cargo side from step 4 on, before the Bazel CI job exists (step 6). Both
-  messages name the fix. A `MODULE.bazel` edit also makes the lock stale and has no sha256 to compare, so only the
-  Bazel job catches it; the pin test's message covers the usual cause, a toolchain bump.
+- **The lock:** see "The locks" above: one repin command refreshes `cargo-bazel-lock.json` and `MODULE.bazel.lock`; the
+  stale test and the `bazel` CI job's repin step fail on a stale one.
+
+## Using RustEE from another Bazel module
+
+A module depends on RustEE with `bazel_dep(name = "euhedral_rustee")` and a `git_override` (or `local_path_override`).
+Three things follow from how Bazel loads a non-root module:
+
+- `euhedral_build` is a `local_path_override` in RustEE's `MODULE.bazel` (container CI has no registry), and Bazel ignores
+  overrides outside the root module. The consumer declares `bazel_dep(name = "euhedral_build", version = "0.1.0")` and its
+  own override (`build/module` of this repository, or the registry once it publishes the module).
+- The consumer's root needs a `BUILD.bazel`, even an empty one: crate_universe reads `//:MODULE.bazel` of the root and fails
+  with "Unable to load package for //:MODULE.bazel" without it.
+- Targets are named with underscores: `@euhedral_rustee//euhedral-core:euhedral_core`. The consumer's build resolves the
+  third-party crates from this repository's `cargo-bazel-lock.json`; it does not run crate_universe's repin.
 
 ## Proposed changes to forge's CONTRACTS.md
 

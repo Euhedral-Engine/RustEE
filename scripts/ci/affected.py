@@ -73,6 +73,7 @@ EVERYTHING = [
     "rust-toolchain.toml",
     "MODULE.bazel",
     "MODULE.bazel.lock",
+    "cargo-bazel-lock.json",
     ".bazelrc",
     ".bazelversion",
     ".bazelignore",

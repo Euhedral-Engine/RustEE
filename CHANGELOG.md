@@ -3,6 +3,18 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## Another Bazel module can depend on RustEE (build) (2026-11-24)
+
+**What.** `crate.from_cargo` sets `lockfile = "//:cargo-bazel-lock.json"` and the file is committed, so a module that depends on `euhedral_rustee` resolves (Bazel refused a non-root crate_universe repository without a lock). `cargo-bazel-lock.json` has the same `eol=lf` entry as `MODULE.bazel.lock`. The stale test's check of `MODULE.bazel.lock`'s manifest digests (which the lock no longer records) is replaced by a comparison of `Cargo.lock`'s registry packages with the crates of `cargo-bazel-lock.json`, and the `bazel` CI job repins a copy of the tree and fails when either lock changes.
+
+**Why.** crate_universe's digest does not cover `Cargo.lock` or a manifest's contents (checked on rules_rust 0.75.0), so a `cargo update` without a repin would otherwise build the old crate versions without a word.
+
+**How to use.** After `cargo update`, or an edit of a `Cargo.toml` or `MODULE.bazel`, run `CARGO_BAZEL_REPIN=1 bazel mod deps --lockfile_mode=update` and commit `cargo-bazel-lock.json` and `MODULE.bazel.lock`. A consumer declares its own `euhedral_build` override and has a root `BUILD.bazel`; the target is `@euhedral_rustee//euhedral-core:euhedral_core` (docs/design/bazel.md, "Using RustEE from another Bazel module").
+
+**Semantics.** No library code, `Cargo.toml` or `Cargo.lock` changed. The repin is deterministic.
+
+**Tests.** `the_lock_check_names_a_package_only_one_lock_has` (a planted version mismatch) and `the_crate_lock_matches_cargo_lock` in `tools/bazel-gen`; with `cargo update -p cfg-if --precise 1.0.4` the second fails naming both versions.
+
 ## The net stop test makes a connection whose server half the kernel lost say so (`euhedral-net`, test) (2026-11-24)
 
 **What.** `a_stopped_server_refuses_new_connections_while_a_request_drains` sends one byte (`G`, the start of a request) on each connection that got in after the stop before it reads it, connects in batches of at most 32, and reads every connection of a batch to its end (closed, reset or aborted) before it starts the next, until a connect is refused. Its failure message names the server's `accepted` and `open` counts, whether a refusal was seen, and the connection's addresses. The server is unchanged.

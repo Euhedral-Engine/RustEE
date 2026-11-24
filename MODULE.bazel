@@ -4,6 +4,8 @@ module(
     version = "0.0.0",
 )
 
+# Bazel ignores this override when RustEE is not the root module: a consumer supplies euhedral_build itself. It stays a path
+# because container CI has no registry (C8).
 # The euhedral_build module (the version table and the shared platforms) is a copy of forge's build/module, loaded through a
 # local path until the private registry (C5) publishes it; build/ is in .bazelignore, so its files are not packages of this
 # module. It matches forge's except one comment in platforms/BUILD.bazel (it names a program that uses the build). Keep it so; forge's check-repo.sh checks the bazel_dep versions below against the table.
@@ -37,11 +39,16 @@ use_repo(rust_host_tools, "rust_host_tools_pinned")
 
 register_toolchains("@rust_toolchains//:all")
 
-# crate_universe reads the workspace's Cargo.toml and Cargo.lock; Cargo owns the lock (cargo update), Bazel never rewrites it.
+# crate_universe reads the workspace's Cargo.toml and Cargo.lock; Cargo owns Cargo.lock (cargo update), Bazel never rewrites it.
+# cargo-bazel-lock.json is crate_universe's own lock, derived from them and checked by digest: a stale one fails every Bazel
+# command. After `cargo update` or any Cargo.toml edit, one command refreshes it and MODULE.bazel.lock:
+#   CARGO_BAZEL_REPIN=1 bazel mod deps --lockfile_mode=update
 crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
 crate.from_cargo(
     name = "crates",
     cargo_lockfile = "//:Cargo.lock",
+    # Required for a consumer: Bazel refuses a non-root module's crate_universe repository without one.
+    lockfile = "//:cargo-bazel-lock.json",
     host_tools = "@rust_host_tools_pinned",
     manifests = ["//:Cargo.toml"],
     supported_platform_triples = [
