@@ -420,14 +420,48 @@ enum Tok {
 }
 
 /// Splits one manifest line into tokens. Basic (`"..."`, with `\` escapes) and literal (`'...'`) strings are single
-/// tokens, so brackets and `#` inside them mean nothing; a `#` outside a string starts a comment.
-fn tokens(line: &str) -> Vec<Tok> {
+/// tokens, so brackets and `#` inside them mean nothing; a `#` outside a string starts a comment. `multiline` carries
+/// the quote of a `"""` or `'''` string that is still open at the end of the line into the next call.
+fn tokens(line: &str, multiline: &mut Option<char>) -> Vec<Tok> {
     let mut out = Vec::new();
     let mut chars = line.chars().peekable();
+    // Skips to the end of a multi-line string; false when the line ends first.
+    fn close(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, q: char) -> bool {
+        while let Some(d) = chars.next() {
+            if d == '\\' && q == '"' {
+                chars.next();
+            } else if d == q {
+                let mut rest = chars.clone();
+                if rest.next() == Some(q) && rest.next() == Some(q) {
+                    chars.next();
+                    chars.next();
+                    return true;
+                }
+            }
+        }
+        false
+    }
+    if let Some(q) = *multiline {
+        if !close(&mut chars, q) {
+            return out;
+        }
+        *multiline = None;
+        out.push(Tok::Text(String::new()));
+    }
     while let Some(c) = chars.next() {
         match c {
             '#' => break,
             '"' | '\'' => {
+                let mut rest = chars.clone();
+                if rest.next() == Some(c) && rest.next() == Some(c) {
+                    chars.next();
+                    chars.next();
+                    if !close(&mut chars, c) {
+                        *multiline = Some(c);
+                    }
+                    out.push(Tok::Text(String::new()));
+                    continue;
+                }
                 let mut text = String::new();
                 while let Some(d) = chars.next() {
                     if d == c {
@@ -466,15 +500,19 @@ fn sets_harness(text: &str) -> bool {
         toks.windows(2)
             .any(|w| matches!((&w[0], &w[1]), (Tok::Text(k), Tok::Punct('=')) if k == "harness"))
     }
+    fn is_target(name: &str) -> bool {
+        matches!(name, "lib" | "bin" | "test" | "bench" | "example")
+    }
     fn depth(toks: &[Tok]) -> i32 {
         let count = |c| toks.iter().filter(|t| **t == Tok::Punct(c)).count() as i32;
         count('[') - count(']')
     }
     let mut in_target = false;
+    let mut multiline = None;
     // Open brackets of a target array that continues on the next lines.
     let mut open = 0;
     for line in text.lines() {
-        let toks = tokens(line);
+        let toks = tokens(line, &mut multiline);
         if toks.is_empty() {
             continue;
         }
@@ -491,15 +529,19 @@ fn sets_harness(text: &str) -> bool {
                 .filter(|t| !matches!(t, Tok::Punct('[' | ']')))
                 .collect();
             in_target = matches!(names.as_slice(), [Tok::Text(h)]
-                if matches!(h.as_str(), "lib" | "bin" | "test" | "bench" | "example"));
+                if is_target(h));
             continue;
         }
         if let [Tok::Text(key), Tok::Punct('='), value @ ..] = toks.as_slice() {
-            if in_target && key == "harness" {
+            // `harness = false` in a target table, or the dotted `lib.harness = false`.
+            let dotted = key
+                .split_once('.')
+                .is_some_and(|(t, k)| is_target(t) && k == "harness");
+            if (in_target && key == "harness") || dotted {
                 return true;
             }
             // `test = [{ name = "t", harness = false }]` and the like, also over several lines.
-            if matches!(key.as_str(), "bin" | "test" | "bench" | "example") {
+            if is_target(key) {
                 if has_harness(value) {
                     return true;
                 }
@@ -732,6 +774,10 @@ mod tests {
             "test = [\n  { name = \"a]b\" },\n  { name = \"t\", harness = false },\n]\n",
             "[[test]]\nname = \"t\"\n'harness' = false\n",
             "[[test]]\nname = \"t\"\n\"harness\" = false\n",
+            "lib = { harness = false }\n",
+            "lib.harness = false\n",
+            "test.harness = false\n",
+            "bench.harness = false\n",
         ] {
             assert!(sets_harness(text), "{text} was accepted");
         }
@@ -740,6 +786,9 @@ mod tests {
             "[package]\n# harness = false is not used here\nname = \"x\"\n",
             "[dependencies]\nharness = \"1\"\n",
             "test = [\n  { name = \"a#b\" },\n]\n[features]\nharness = []\n",
+            "test = [\"a#]b\"]\n[dependencies]\nharness = \"1\"\n",
+            "[package]\ndescription = \"\"\"\n[lib]\nharness = false\n\"\"\"\n",
+            "[package]\ndescription = \'\'\'\n[lib]\nharness = false\n\'\'\'\n",
         ] {
             assert!(!sets_harness(text), "{text} was refused");
         }

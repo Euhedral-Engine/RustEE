@@ -8,12 +8,13 @@ build path dependency) on an affected crate. Layers below a change are not affec
 Everything is affected when a root build file changed (see EVERYTHING), when a file belongs to no crate and is not
 documentation or a known CI file (so an unknown file is never silently skipped), or when `--all` is given or the
 diff cannot be computed. Nothing is affected when only documentation changed: `*.md`, `docs/**` (except BUILD files
-under it, which are Bazel packages), `LICENSE*`, `.gitignore`. A crate's own `README.md` is the exception: the crates include it as their crate
-documentation, so its doctests are part of the crate.
+under it, which are Bazel packages), `LICENSE*`, `.gitignore`. A crate's own `README.md` is the exception: the
+crates include it as their crate documentation, so its doctests are part of the crate.
 
-The root Bazel files (MODULE.bazel, MODULE.bazel.lock, .bazelrc, .bazelversion, .bazelignore and the root BUILD.bazel) are
-root build files. A crate's own BUILD.bazel affects that crate; the generator crate's stale test (BAZEL_GEN) is also
-affected by any member's Cargo.toml and by any file under a member's src/, tests/, examples/ or benches/ or its build.rs.
+The root Bazel files (MODULE.bazel, MODULE.bazel.lock, .bazelrc, .bazelversion, .bazelignore and the root
+BUILD.bazel) are root build files. A crate's own BUILD.bazel affects that crate; the generator crate's stale test
+(BAZEL_GEN) is also affected by any member's Cargo.toml and by any file under a member's src/, tests/, examples/ or
+benches/ or its build.rs.
 
 The CI files select less than a root build file does:
   .github/workflows/ci.yml, .gitea/workflows/ci.yml   the workspace jobs run in full (they validate the workflow);

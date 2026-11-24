@@ -119,9 +119,9 @@ pub fn extra_build_files(expected: &BTreeMap<String, String>, on_disk: &[String]
 }
 
 /// Every `BUILD.bazel` or `BUILD` file under `root` (root-relative, `/`-separated) that Bazel would read as a package:
-/// the paths `.bazelignore` names, `.git`, every `target` directory next to a `Cargo.toml` (Cargo's output; a `target` source directory is a package) and
-/// symlinked directories (the `bazel-*` output links) are skipped. A directory that cannot be listed is an error naming
-/// it: skipping it could hide a BUILD file the generator should own.
+/// the paths `.bazelignore` names, `.git`, every `target` directory next to a `Cargo.toml` (Cargo's output; a
+/// `target` source directory is a package) and symlinked directories (the `bazel-*` output links) are skipped. A
+/// directory that cannot be listed is an error naming it: skipping it could hide a BUILD file the generator should own.
 pub fn build_files_on_disk(root: &Path) -> Result<Vec<String>, String> {
     let ignored: Vec<String> = match std::fs::read_to_string(root.join(".bazelignore")) {
         Ok(text) => text
