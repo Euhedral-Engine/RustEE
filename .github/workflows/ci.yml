@@ -396,35 +396,16 @@ jobs:
           have=$(bazel --version)
           test "$have" = "bazel $(cat .bazelversion)" || { echo "bazel is '$have', .bazelversion says $(cat .bazelversion)"; exit 1; }
 
+      # MSVC's link.exe opens no path longer than 260 characters. A doc test links from its runfiles directory, and under
+      # the default output base (in the user's profile) the standard library's path there is about 290 long; under C:/b it
+      # is at most about 250 (euhedral-data-structures, the longest package name). user.bazelrc is the machine's layer.
+      - name: A short output base (github)
+        run: echo "startup --output_base=C:/b" > user.bazelrc
+
       - name: Bazel test on the Windows platform
         env:
           MSYS_NO_PATHCONV: "1" # Git Bash would rewrite the // in the labels as a path
         run: bazel test //... --config=ci --platforms=@euhedral_build//platforms:windows_x86_64
-
-      - name: Diagnose the doc test runfiles (github)
-        if: failure()
-        env:
-          MSYS_NO_PATHCONV: "1"
-        run: |
-          set -x
-          bin="$(bazel info execution_root)/bazel-out/x64_windows-fastbuild/bin"
-          bat="$bin/euhedral-hashing/doc_test.rustdoc_test.bat"
-          rf="$bat.runfiles"
-          winbat=$(cygpath -w "$bat")
-          tmp=$(mktemp -d)
-          export TEST_TMPDIR
-          TEST_TMPDIR=$(cygpath -w "$tmp")
-          cd "$rf/_main"
-          echo "A: the runner as it is, its symbolic link in place"
-          cmd /c "$winbat" 2>&1 | tail -15 || true
-          echo "B: external as a junction"
-          cmd /c "rmdir external" || true
-          cmd /c "mklink /J external $(cygpath -w "$rf")" || true
-          powershell -c "Get-Item external | Format-List LinkType,Target" || true
-          cmd /c "$winbat" 2>&1 | tail -15 || true
-          cd -
-          echo "C: the test with runfiles off"
-          bazel test //euhedral-hashing:doc_test --config=ci --platforms=@euhedral_build//platforms:windows_x86_64 --noenable_runfiles 2>&1 | tail -40 || true
 
       - name: Stop the Bazel server
         if: always()

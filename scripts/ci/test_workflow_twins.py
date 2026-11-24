@@ -344,12 +344,14 @@ class Gitea(unittest.TestCase):
         self.assertEqual(job["needs"], "changes")
         self.assertEqual(job["if"], "needs.changes.outputs.any == 'true' && inputs.only_os != 'ubuntu-latest'")
         self.assertEqual(job["defaults"], {"run": {"shell": "bash"}})
-        test = step(GITHUB, "bazel-windows", "Bazel test on the Windows platform")
-        self.assertEqual(test, {
-            "name": "Bazel test on the Windows platform",
-            "env": {"MSYS_NO_PATHCONV": "1"},
-            "run": BAZEL_WINDOWS,
-        })
+        # The output base is short so that link.exe can open the doc tests' inputs (it takes no path over 260 characters).
+        self.assertEqual(steps(GITHUB, "bazel-windows")[1:], [
+            step(GITHUB, "bazel", "Bazel is the version in .bazelversion (github)"),
+            {"name": "A short output base (github)", "run": 'echo "startup --output_base=C:/b" > user.bazelrc'},
+            {"name": "Bazel test on the Windows platform", "env": {"MSYS_NO_PATHCONV": "1"}, "run": BAZEL_WINDOWS},
+            {"name": "Stop the Bazel server", "if": "always()", "run": "bazel shutdown"},
+        ])
+        self.assertEqual(steps(GITHUB, "bazel-windows")[0], {"uses": "actions/checkout@v4"})
         self.assertIn("bazel-windows", GITHUB["jobs"]["ci-ok"]["needs"])
 
     def test_no_host_or_port_is_written_in_either_workflow(self):
