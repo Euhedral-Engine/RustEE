@@ -34,6 +34,7 @@ impl std::fmt::Debug for Held {
 pub(crate) type Frozen = Option<Arc<[Held]>>;
 
 /// Freezes the values a recording collected: `None` for none, which allocates nothing.
+#[cfg(any(test, feature = "fake", feature = "cuda"))]
 pub(crate) fn freeze(values: Vec<Box<dyn Any + Send>>) -> Frozen {
     if values.is_empty() {
         return None;
@@ -69,6 +70,7 @@ impl GraphHold {
     }
 
     /// Adds a handle to a recording's frozen values.
+    #[cfg(any(test, feature = "fake", feature = "cuda"))]
     pub(crate) fn add_frozen(&mut self, frozen: &Frozen) {
         let Some(frozen) = frozen else { return };
         if self.first.is_none() {
@@ -79,6 +81,7 @@ impl GraphHold {
     }
 
     /// Adds a value a direct run kept.
+    #[cfg(any(test, feature = "fake", feature = "cuda"))]
     pub(crate) fn add_value(&mut self, value: Box<dyn Any + Send>) {
         self.direct.push(Held(value));
     }

@@ -163,6 +163,9 @@ jobs:
           read -ra affected <<<"$AFFECTED"
           cargo clippy "${affected[@]}" --all-targets -- -D warnings
 
+      - name: Clippy (production libraries, no dev features)
+        run: cargo clippy --workspace --lib -- -D warnings
+
       - name: Test
         run: |
           read -ra affected <<<"$AFFECTED"

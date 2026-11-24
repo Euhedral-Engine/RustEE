@@ -29,6 +29,18 @@ semantics and the tests that pin it.
 
 **Tests.** `a_stopped_server_refuses_new_connections_while_a_request_drains` (a request held in the handler, a stop, connects refused, the held request answered and closed).
 
+## The production build is lint-clean (CI) (2026-11-24)
+
+**What.** `euhedral-gpu` built with neither `fake` nor `cuda` had 15 dead-code findings (backend-only items: the lane submit macro and `Retired` import, `check_pitched`, `over_shared_limit`, `RawStream::new`, `GraphHold::add_frozen`/`add_value`, `freeze`, the span book, the tensor map `code` methods). They are now behind `cfg(any(feature = "fake", feature = "cuda"))` (the span book, `freeze` and the hold methods also stay for `cfg(test)`, which exercises them). The clippy job of both workflows gains `cargo clippy --workspace --lib -- -D warnings`.
+
+**Why.** A build with no dev features is what a Bazel build compiles, and Bazel never fails on a warning; this step keeps that build clean.
+
+**How to use.** Run `cargo clippy --workspace --lib -- -D warnings` before pushing. Gate an item only a backend uses the same way.
+
+**Semantics.** Attributes only: no item changed meaning, and no feature's contents changed.
+
+**Tests.** The new step fails on the old tree (15 errors in `euhedral-gpu`) and passes now; the existing clippy and test steps cover every feature combination.
+
 ## The Rust toolchain is pinned in `rust-toolchain.toml` (build) (2026-11-24)
 
 **What.** `rust-toolchain.toml` names the toolchain `mise.toml` already pins (1.99.1, profile default). A new workspace member, `tools/bazel-gen` (`euhedral-bazel-gen`, not published), holds a test that compares the two pins.
