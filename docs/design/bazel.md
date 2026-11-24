@@ -431,7 +431,7 @@ merges before it.
    - `.bazelignore` with `target` and `.claude`. Without `.claude`, `//...` descends into agent worktrees, even ones
      with their own `MODULE.bazel`.
    - In `.gitignore`: `/bazel-*` and `user.bazelrc`.
-   - `.gitattributes` (LF for the Bazel files, `Cargo.toml` and `Cargo.lock`) `MODULE.bazel.lock` and `cargo-bazel-lock.json`. The pin test
+   - `.gitattributes` (LF for the Bazel files, `Cargo.toml` and `Cargo.lock`), `MODULE.bazel.lock` and `cargo-bazel-lock.json`. The pin test
      is extended to `MODULE.bazel`, and its failure message names `bazel mod deps`.
    - `scripts/ci/affected.py` and its tests: the root Bazel files (`MODULE.bazel`, `MODULE.bazel.lock`, `.bazelrc`,
      `.bazelversion`, `.bazelignore`, the root `BUILD.bazel`) affect everything (the full Cargo run and every Miri
@@ -575,8 +575,8 @@ them cached; a `<crate>_cuda` production target when a consumer module needs one
 
   If the runner lacks symlink rights, those tests read their files through the runfiles manifest instead, a
   test-only change.
-- **The lock:** see "The locks" above: one repin command refreshes `cargo-bazel-lock.json` and `MODULE.bazel.lock`; the
-  stale test and the `bazel` CI job's repin step fail on a stale one.
+- **The lock:** see "The locks" above: one repin command refreshes `cargo-bazel-lock.json`, `MODULE.bazel.lock` and `Cargo.lock`;
+  the stale test and the `bazel` CI job's repin step fail on a stale one.
 
 ## Using RustEE from another Bazel module
 

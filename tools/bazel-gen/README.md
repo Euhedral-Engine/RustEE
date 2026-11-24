@@ -14,7 +14,7 @@ cargo run -p euhedral-bazel-gen      # the same without Bazel (`-- -mode=diff` t
 ```
 
 Run it after adding, removing or renaming a crate, a target, a dependency or a feature, and commit the BUILD files. After
-editing a `Cargo.toml` or `Cargo.lock`, also run `CARGO_BAZEL_REPIN=1 bazel mod deps --lockfile_mode=update` and commit `cargo-bazel-lock.json` and `MODULE.bazel.lock`.
+editing a `Cargo.toml` or `Cargo.lock`, also run `CARGO_BAZEL_REPIN=1 bazel mod deps --lockfile_mode=update` and commit `cargo-bazel-lock.json`, `MODULE.bazel.lock` and `Cargo.lock`.
 Never edit a generated file by hand, and add no BUILD file of your own inside the workspace: the stale test fails on
 either.
 
@@ -79,6 +79,6 @@ crates into every RustEE build for one tool. The crate carries a small JSON read
   one the generator does not write (outside what `.bazelignore` names and every `target`
   directory next to a `Cargo.toml`, which is Cargo's output; an unreadable directory is an error that names it, because a
   BUILD file inside could not be checked; under Bazel it sees only the workspace sources),
-  or when a registry package of `Cargo.lock` is missing from `cargo-bazel-lock.json` or the reverse (crate_universe's own digest does not cover `Cargo.lock`). It runs under Cargo and Bazel alike.
+  or when a package of `Cargo.lock` that is not a workspace member is missing from `cargo-bazel-lock.json` or the reverse (crate_universe's own digest does not cover `Cargo.lock`). It runs under Cargo and Bazel alike.
 - `tests/toolchain_pin.rs` fails when the Rust version in `rust-toolchain.toml` differs from the ones in `mise.toml` and
   `MODULE.bazel`, or when the profile differs.
