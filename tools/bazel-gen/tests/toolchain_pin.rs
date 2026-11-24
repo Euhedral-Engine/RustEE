@@ -104,7 +104,7 @@ fn check(mise: &str, toolchain: &str, module: Option<&str>) -> Result<(), String
             if got != want {
                 return Err(format!(
                     "MODULE.bazel {line} {got} differs from rust-toolchain.toml channel {want}; \
-                     edit both MODULE.bazel lines, then run `bazel mod deps --lockfile_mode=update` and commit MODULE.bazel.lock"
+                     edit both MODULE.bazel lines, then run `CARGO_BAZEL_REPIN=1 bazel mod deps --lockfile_mode=update` and commit cargo-bazel-lock.json and MODULE.bazel.lock"
                 ));
             }
         }

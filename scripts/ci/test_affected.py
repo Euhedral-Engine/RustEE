@@ -67,7 +67,7 @@ class Affected(unittest.TestCase):
         for f in [
             "Cargo.lock", "Cargo.toml", "mise.toml", "clippy.toml", ".clippy.toml", "rustfmt.toml", ".rustfmt.toml",
             "rust-toolchain", "rust-toolchain.toml", ".cargo/config.toml", "build.rs",
-            "MODULE.bazel", "MODULE.bazel.lock", ".bazelrc", ".bazelversion", ".bazelignore", "BUILD.bazel",
+            "MODULE.bazel", "MODULE.bazel.lock", "cargo-bazel-lock.json", ".bazelrc", ".bazelversion", ".bazelignore", "BUILD.bazel",
         ]:
             crates, everything = run(f)
             self.assertTrue(everything, f)

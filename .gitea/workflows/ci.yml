@@ -474,6 +474,17 @@ jobs:
       - name: Copy the runner's checkout (gitea)
         run: cp -a /checkout/. .
 
+      # crate_universe's own digest does not cover Cargo.lock or the manifests' contents, so a stale cargo-bazel-lock.json would
+      # build silently: a repin on the copy must leave both locks as committed.
+      - name: The crate lock is current
+        run: |
+          kept=$(mktemp -d)
+          cp cargo-bazel-lock.json MODULE.bazel.lock "$kept"
+          CARGO_BAZEL_REPIN=1 bazel mod deps --lockfile_mode=update
+          for lock in cargo-bazel-lock.json MODULE.bazel.lock; do
+            cmp "$kept/$lock" "$lock" || { echo "$lock is stale: run CARGO_BAZEL_REPIN=1 bazel mod deps --lockfile_mode=update and commit it"; exit 1; }
+          done
+
       - name: Bazel test
         run: bazel test //... --config=ci
 

@@ -395,6 +395,16 @@ C7_RUN = (
 )
 # The last three steps of both files' `bazel` job, exactly: a step-level `if`, an extra key or an edited line is a change.
 BAZEL_STEPS = [
+    {
+        "name": "The crate lock is current",
+        "run": 'kept=$(mktemp -d)\n'
+        'cp cargo-bazel-lock.json MODULE.bazel.lock "$kept"\n'
+        'CARGO_BAZEL_REPIN=1 bazel mod deps --lockfile_mode=update\n'
+        'for lock in cargo-bazel-lock.json MODULE.bazel.lock; do\n'
+        '  cmp "$kept/$lock" "$lock" || { echo "$lock is stale: run CARGO_BAZEL_REPIN=1 bazel mod deps '
+        '--lockfile_mode=update and commit it"; exit 1; }\n'
+        'done\n',
+    },
     {"name": "Bazel test", "run": "bazel test //... --config=ci"},
     {"name": "Every gpu target is also external (C7)", "run": C7_RUN},
     # Whatever failed: the caches are collected only in an idle server, and a running one holds the lease.
@@ -523,7 +533,7 @@ class Bazel(unittest.TestCase):
             "euhedral-core/src/lib.rs", "euhedral-core/tests/new_test.rs", "euhedral-core/examples/e.rs",
             "euhedral-core/benches/b.rs", "euhedral-core/build.rs", "euhedral-core/Cargo.toml", "euhedral-core/README.md",
             "euhedral-core/src/notes.md", "euhedral-core/BUILD.bazel", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml",
-            "mise.toml", "BUILD.bazel", "MODULE.bazel", "MODULE.bazel.lock", ".bazelrc", ".bazelversion", ".bazelignore",
+            "mise.toml", "BUILD.bazel", "MODULE.bazel", "MODULE.bazel.lock", "cargo-bazel-lock.json", ".bazelrc", ".bazelversion", ".bazelignore",
             ".gitattributes", "build/module/MODULE.bazel", "build/module/platforms/BUILD.bazel", "docs/x/BUILD.bazel",
             "tools/bazel-gen/src/main.rs", "tools/bazel-gen/BUILD.bazel", ".gitea/workflows/ci.yml", audit,
         ]

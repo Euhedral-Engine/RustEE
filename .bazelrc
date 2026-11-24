@@ -2,7 +2,7 @@
 common --enable_platform_specific_config
 
 # The lock of the module is checked, not re-resolved: a change to MODULE.bazel or to any Cargo.toml or Cargo.lock fails every
-# Bazel command until `bazel mod deps --lockfile_mode=update` is run and MODULE.bazel.lock committed.
+# Bazel command until `CARGO_BAZEL_REPIN=1 bazel mod deps --lockfile_mode=update` is run and MODULE.bazel.lock (and cargo-bazel-lock.json) committed.
 common --lockfile_mode=error
 
 # Windows has no symlinks without developer mode; tests and tools find their data through runfiles directories.

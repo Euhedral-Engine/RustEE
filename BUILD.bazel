@@ -5,7 +5,7 @@ exports_files([
     "Cargo.lock",
     "Cargo.toml",
     "MODULE.bazel",
-    "MODULE.bazel.lock",
+    "cargo-bazel-lock.json",
     "docs/superpowers/specs/2026-10-28-lock-free-hot-path-audit.md",
     "mise.toml",
     "rust-toolchain.toml",
