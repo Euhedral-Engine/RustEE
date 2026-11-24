@@ -162,8 +162,10 @@ The Windows engine remembers which handle values it joined to its completion por
 handle's value to the next handle made. Sockets and files the engine makes itself (`socket_for`, accepted sockets,
 `open_path`) need nothing. For a socket or file you made, call `io.forget_socket(raw)` or `io.forget_file(raw)` before
 you close it, with nothing in flight on it (both do nothing elsewhere). A handle forgotten while it is still open is
-refused by the system at its next join and no longer taken for ours: every later operation on it fails with
-`InvalidInput` ("belongs to another completion port"); none hangs. A handle one `AsyncIo` made and a different
+refused by the system at its next join and no longer taken for ours: every later operation on it is taken, as
+any operation is, and ends in its completion with `InvalidInput` ("belongs to another completion port"); none
+hangs and no call refuses it. The same holds for a handle of another port, for a file a ring serves used by a thread
+with no ring, and for a handle the engine cannot hold: submit returns an error only for an operation it cannot take. A handle one `AsyncIo` made and a different
 `AsyncIo` uses counts as caller-made for that other one: forget it there before closing it.
 
 ### Time limits and cancel

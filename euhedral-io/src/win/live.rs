@@ -518,11 +518,10 @@ fn a_socket_forgotten_while_open_is_refused_afterwards_and_nothing_hangs() {
         let mut got = [0u8; 4];
         peer.read_exact(&mut got).unwrap();
         // Forgotten while still open: the system refuses its next join, and the engine no longer takes that for
-        // its own. The refusal is at the call (no operation is in flight, so nothing can hang).
+        // its own. The operation is taken and ends with the refusal (nothing is in flight, so nothing can hang).
         io.forget_socket(stream.as_raw_socket());
-        let error = io
-            .send(stream.as_raw_socket(), sent(2), then(2))
-            .unwrap_err();
+        io.send(stream.as_raw_socket(), sent(2), then(2)).unwrap();
+        let error = one(io).done.unwrap().result.unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{error}");
         assert_eq!(io.pending(), 0);
     });

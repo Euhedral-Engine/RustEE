@@ -164,13 +164,17 @@ struct Op {
     deadline: Option<u64>,
     /// The handle whose join to the port the operation waits for, until it is launched.
     awaiting: Option<Handle>,
+    /// Why the operation ends at once, without a call: its handle cannot be used.
+    refused: Option<io::Error>,
 }
 
 impl Op {
     /// The operation waits for `handle` to join the port, if `join` says it is not there yet.
     fn after(mut self, join: Join, handle: Handle) -> Self {
-        if join == Join::Pending {
-            self.awaiting = Some(handle);
+        match join {
+            Join::Ready => {}
+            Join::Pending => self.awaiting = Some(handle),
+            Join::Refused(error) => self.refused = Some(error),
         }
         self
     }
@@ -248,12 +252,14 @@ struct Awaiting {
 }
 
 /// What a request found when it needed the port to have its handle.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 enum Join {
     /// The handle is on the port.
     Ready,
     /// Another thread is joining it; its result is not known yet.
     Pending,
+    /// The handle cannot be used: the operation is taken and ends with this error.
+    Refused(io::Error),
 }
 
 /// What the pool left for an open, a rename or a file length.
@@ -1147,7 +1153,7 @@ impl Engine {
     /// finds the claim made cannot tell a handle that is ours from one that is another port's
     /// (the OS refuses both alike) until the claimer's call ends, and it never waits for it: the
     /// operation is `Pending`, and the poller launches or ends it when the claim is settled.
-    fn join_port(&self, handle: Handle) -> io::Result<Join> {
+    fn join_port(&self, handle: Handle) -> Join {
         match self.routes.claim(handle, RouteState::Joining) {
             Claim::Won => {
                 // A refusal, an error or a panic in the call leaves no claim behind.
@@ -1159,18 +1165,16 @@ impl Engine {
                     Ok(()) => {
                         self.routes
                             .advance(handle, RouteState::Joining, RouteState::Joined);
-                        Ok(Join::Ready)
+                        Join::Ready
                     }
-                    Err(error) if error.raw_os_error() == Some(87) => Err(invalid(
-                        "the handle already belongs to another completion port (a handle serves one AsyncIo, ever)",
-                    )),
-                    Err(error) => Err(error),
+                    Err(error) if error.raw_os_error() == Some(87) => Join::Refused(another_port()),
+                    Err(error) => Join::Refused(error),
                 }
             }
-            Claim::Held(RouteState::Joined) => Ok(Join::Ready),
-            Claim::Held(RouteState::Joining) => Ok(Join::Pending),
-            Claim::Held(RouteState::Ring) => Err(ring_served()),
-            Claim::Full => Err(io::Error::other("too many handles")),
+            Claim::Held(RouteState::Joined) => Join::Ready,
+            Claim::Held(RouteState::Joining) => Join::Pending,
+            Claim::Held(RouteState::Ring) => Join::Refused(ring_served()),
+            Claim::Full => Join::Refused(io::Error::other("too many handles")),
         }
     }
 
@@ -1179,13 +1183,13 @@ impl Engine {
     /// handle that belongs to a port (`ERROR_INVALID_PARAMETER`), so a handle that joined the
     /// port stays on it, and one a ring serves is never joined. Whichever thread claims the
     /// handle first decides, and the others follow that route.
-    fn file_route(&self, handle: Handle) -> io::Result<(Route, Join)> {
+    fn file_route(&self, handle: Handle) -> (Route, Join) {
         if self.ring_files {
             match self.routes.get(handle) {
                 Some(RouteState::Ring) => {
                     return match self.ring() {
-                        Some(ring) => Ok((Route::Ring(ring), Join::Ready)),
-                        None => Err(ring_served()),
+                        Some(ring) => (Route::Ring(ring), Join::Ready),
+                        None => (Route::Port, Join::Refused(ring_served())),
                     };
                 }
                 Some(_) => {}
@@ -1193,7 +1197,7 @@ impl Engine {
                     if let Some(ring) = self.ring() {
                         match self.routes.claim(handle, RouteState::Ring) {
                             Claim::Won | Claim::Held(RouteState::Ring) => {
-                                return Ok((Route::Ring(ring), Join::Ready));
+                                return (Route::Ring(ring), Join::Ready);
                             }
                             // Another thread's claim of the port came first.
                             Claim::Held(_) | Claim::Full => {}
@@ -1202,8 +1206,7 @@ impl Engine {
                 }
             }
         }
-        let join = self.join_port(handle)?;
-        Ok((Route::Port, join))
+        (Route::Port, self.join_port(handle))
     }
 
     fn op(kind: Kind, route: Route, buf: Buf, then: Then) -> Op {
@@ -1217,19 +1220,26 @@ impl Engine {
             accepting: None,
             deadline: None,
             awaiting: None,
+            refused: None,
         }
     }
 
     /// Starts the operation: its slot, then its call. The slot stays `Issuing` until the call is
     /// made (or, on a ring or the pool, until the entry or the job is handed over), so nothing
     /// that completes or fails operations touches the record while it is being filled.
-    fn start(&self, op: Op, taken: &Cell<bool>) -> io::Result<OpId> {
+    fn start(&self, mut op: Op, taken: &Cell<bool>) -> io::Result<OpId> {
         let awaiting = op.awaiting;
+        let refused = op.refused.take();
         let held = self.begin(op, State::Issuing)?;
         // The table has the operation: from here on a panic is not a refusal.
         taken.set(true);
         let id = OpId::new(self.id as u64, held.slot, held.serial);
         match awaiting {
+            _ if refused.is_some() => {
+                if let Some(error) = refused {
+                    self.fail(held, error);
+                }
+            }
             // Its slot stays `Issuing`, as it is until the call is made.
             Some(handle) => {
                 let queued = self.joining.offer(Awaiting {
@@ -1693,12 +1703,7 @@ impl Engine {
                 Some(RouteState::Joined) => self.launch(held),
                 Some(RouteState::Ring) => self.fail(held, ring_served()),
                 // The claimer's call was refused, and cleared the claim.
-                _ => self.fail(
-                    held,
-                    invalid(
-                        "the handle already belongs to another completion port (a handle serves one AsyncIo, ever)",
-                    ),
-                ),
+                _ => self.fail(held, another_port()),
             }
         }
     }
@@ -1739,6 +1744,12 @@ impl Drop for JoinClaim<'_> {
     fn drop(&mut self) {
         self.routes.clear_if(self.handle, RouteState::Joining);
     }
+}
+
+fn another_port() -> io::Error {
+    invalid(
+        "the handle already belongs to another completion port (a handle serves one AsyncIo, ever)",
+    )
 }
 
 fn ring_served() -> io::Error {
@@ -1784,27 +1795,27 @@ impl EngineTrait for Engine {
         let mut op = match request {
             Request::Read { file, offset } => {
                 self.check_handle(file, false)?;
-                let (route, join) = self.file_route(file)?;
+                let (route, join) = self.file_route(file);
                 Self::op(Kind::Read { file, offset }, route, buf, then).after(join, file)
             }
             Request::Write { file, offset } => {
                 self.check_handle(file, false)?;
-                let (route, join) = self.file_route(file)?;
+                let (route, join) = self.file_route(file);
                 Self::op(Kind::Write { file, offset }, route, buf, then).after(join, file)
             }
             Request::Send { sock } => {
                 self.check_handle(sock, true)?;
-                let join = self.join_port(sock)?;
+                let join = self.join_port(sock);
                 Self::op(Kind::Send { sock }, Route::Port, buf, then).after(join, sock)
             }
             Request::Recv { sock } => {
                 self.check_handle(sock, true)?;
-                let join = self.join_port(sock)?;
+                let join = self.join_port(sock);
                 Self::op(Kind::Recv { sock }, Route::Port, buf, then).after(join, sock)
             }
             Request::SendTo { sock, to } => {
                 self.check_handle(sock, true)?;
-                let join = self.join_port(sock)?;
+                let join = self.join_port(sock);
                 let mut op =
                     Self::op(Kind::SendTo { sock }, Route::Port, buf, then).after(join, sock);
                 op.addr = Some(Box::new(SockAddr::new(to)));
@@ -1812,7 +1823,7 @@ impl EngineTrait for Engine {
             }
             Request::Accept { listener } => {
                 self.check_handle(listener, true)?;
-                let join = self.join_port(listener)?;
+                let join = self.join_port(listener);
                 let socket = self.sys.accept_socket(listener)?;
                 self.forget(socket);
                 let mut op = Self::op(Kind::Accept { listener }, Route::Port, buf, then)
@@ -1825,9 +1836,11 @@ impl EngineTrait for Engine {
             }
             Request::Connect { sock, to } => {
                 self.check_handle(sock, true)?;
-                let join = self.join_port(sock)?;
+                let join = self.join_port(sock);
                 // `ConnectEx` needs a bound socket.
-                self.sys.bind_any(sock, &SockAddr::unspecified(to))?;
+                if !matches!(join, Join::Refused(_)) {
+                    self.sys.bind_any(sock, &SockAddr::unspecified(to))?;
+                }
                 let mut op =
                     Self::op(Kind::Connect { sock }, Route::Port, buf, then).after(join, sock);
                 op.addr = Some(Box::new(SockAddr::new(to)));
