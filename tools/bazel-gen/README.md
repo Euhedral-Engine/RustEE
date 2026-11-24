@@ -15,7 +15,8 @@ cargo run -p euhedral-bazel-gen      # the same without Bazel (`-- -mode=diff` t
 
 Run it after adding, removing or renaming a crate, a target, a dependency or a feature, and commit the BUILD files. After
 editing a `Cargo.toml` or `Cargo.lock`, also run `bazel mod deps --lockfile_mode=update` and commit `MODULE.bazel.lock`.
-Never edit a generated file by hand: the stale test fails on it.
+Never edit a generated file by hand, and add no BUILD file of your own inside the workspace: the stale test fails on
+either.
 
 ## What it writes
 
@@ -37,12 +38,14 @@ It reads `cargo metadata --no-deps` and each member's `[lints]` (which the metad
 `external`, so a plain `bazel test //...` skips it and `--config=gpu` runs it.
 
 **Refusals.** The generator writes nothing and names the cause when:
+- no member `euhedral-memory` declares `cuda` (the tags and the next check find the device backend by that name);
 - the testing world resolves `euhedral-memory/cuda` (a dependency would make `cargo test --workspace` open the card);
 - a member built alone would link another member with other features than the production world gives it (an empty
   `default` excepted, which turns on nothing);
 - a manifest uses what it does not model: build scripts and build-dependencies, renamed dependencies, weak (`x?/f`) or
   third-party (`crate/f`) feature entries, first-party dependencies under `[target.*]`, target triples or unknown cfg
-  names, `harness = false`, target layouts other than Cargo's defaults, required features no world has, or two targets
+  names (`loom` is known, and false: Bazel never sets it), a `harness` key, a `[lib] name` other than the package's, a
+  dotted key in a `[lints.<tool>]` table, target layouts other than Cargo's defaults, required features no world has, or two targets
   with one Bazel name.
 
 Paths in the metadata may use either separator; nothing written contains an absolute path.
@@ -73,7 +76,8 @@ SHA-256 for the lock check.
 - The unit tests cover the JSON reader, the cfg evaluator, the `[lints]` reader, SHA-256, the rule writer, the stale
   comparison and the lock check, and, on a small workspace (`src/fixture_tests.rs`), the feature worlds, the tags, the
   refusals and Windows paths.
-- `tests/stale.rs` regenerates from the workspace and fails when a BUILD file differs, or when `MODULE.bazel.lock`'s
-  record of a manifest is missing or out of date. It runs under Cargo and Bazel alike.
+- `tests/stale.rs` regenerates from the workspace and fails when a BUILD file differs, when a BUILD file on disk is
+  one the generator does not write (outside what `.bazelignore` names; under Bazel it sees only the workspace sources),
+  or when `MODULE.bazel.lock`'s record of a manifest is missing or out of date. It runs under Cargo and Bazel alike.
 - `tests/toolchain_pin.rs` fails when the Rust version in `rust-toolchain.toml` differs from the ones in `mise.toml` and
   `MODULE.bazel`, or when the profile differs.

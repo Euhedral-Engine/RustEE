@@ -8,7 +8,8 @@ use crate::json;
 use crate::model::{Workspace, load};
 use crate::worlds::{World, resolve_world};
 
-/// One dependency of the fixture: (name, dev, path member, features); the feature `!default` is `default-features = false`.
+/// One dependency of the fixture: (name, dev, path member, features); the feature `!default` is `default-features = false`
+/// and `?optional` is `optional = true`.
 type FixtureDep<'a> = (&'a str, bool, Option<&'a str>, &'a [&'a str]);
 
 struct Fixture<'a> {
@@ -70,9 +71,14 @@ fn metadata(members: &[Fixture], root: &str, sep: &str) -> String {
             .iter()
             .map(|(name, dev, member, features)| {
                 let defaults = !features.contains(&"!default");
-                let features: Vec<&str> = features.iter().copied().filter(|f| *f != "!default").collect();
+                let optional = features.contains(&"?optional");
+                let features: Vec<&str> = features
+                    .iter()
+                    .copied()
+                    .filter(|f| *f != "!default" && *f != "?optional")
+                    .collect();
                 format!(
-                    r#"{{"name":{},"kind":{},"rename":null,"target":null,"optional":false,"uses_default_features":{defaults},"features":{}{}}}"#,
+                    r#"{{"name":{},"kind":{},"rename":null,"target":null,"optional":{optional},"uses_default_features":{defaults},"features":{}{}}}"#,
                     json_str(name),
                     if *dev { "\"dev\"" } else { "null" },
                     list(&features),
@@ -249,4 +255,72 @@ fn unmodelled_manifests_are_refused() {
 fn windows_paths_generate_the_same_files() {
     let windows = workspace(&members(), r"C:\w", r"\").expect("the Windows fixture loads");
     assert_eq!(generate(&windows).expect("generates"), files(&members()));
+}
+
+#[test]
+fn a_dependency_feature_turns_on_the_feature_named_after_an_optional_dependency() {
+    // user's `extra` asks for plain/testing through an optional plain, and user declares a feature `plain` for it: Cargo
+    // turns that feature on too, so the code under cfg(feature = "plain") is built.
+    let mut members = members();
+    members[1].features = &[
+        ("cuda", &["euhedral-memory/cuda"]),
+        ("default", &["extra"]),
+        ("extra", &["plain/testing"]),
+        ("plain", &["dep:plain"]),
+    ];
+    members[1]
+        .deps
+        .push(("plain", false, Some("plain"), &["?optional"]));
+    let ws = workspace(&members, "/w", "/").expect("the fixture loads");
+    let resolved = resolve_world(&ws, World::Testing).expect("resolves");
+    assert_eq!(resolved.features_of("user"), ["default", "extra", "plain"]);
+    assert!(resolved.has("plain", "testing"));
+}
+
+#[test]
+fn a_workspace_without_the_device_feature_is_refused() {
+    // Renamed away, the device feature would leave every cuda test untagged and the testing world unchecked.
+    let mut members = members();
+    members[0].features = &[("gpu", &[]), ("default", &[])];
+    members[1].features = &[("cuda", &["euhedral-memory/gpu"])];
+    let ws = workspace(&members, "/w", "/").expect("the fixture loads");
+    let error = generate(&ws).expect_err("the generator refuses");
+    assert!(
+        error.contains("euhedral-memory with the feature `cuda`"),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_library_named_other_than_its_package_is_refused() {
+    let metadata = metadata(&members(), "/w", "/").replace(
+        r#"{"name":"user","kind":["lib"]"#,
+        r#"{"name":"other","kind":["lib"]"#,
+    );
+    let error = load(&json::parse(&metadata).expect("json"), &|_| {
+        Ok("[package]\n".to_owned())
+    })
+    .expect_err("a renamed library");
+    assert!(error.contains("names its library `other`"), "{error}");
+}
+
+#[test]
+fn a_dev_dependency_wider_than_a_target_specific_normal_one_reaches_the_unit_tests() {
+    // plain needs libc on Unix only, and its tests on every OS: the unit tests take it on Windows.
+    let mut members = members();
+    members[2].deps.push(("libc", false, None, &[]));
+    members[2].deps.push(("libc", true, None, &[]));
+    let metadata = metadata(&members, "/w", "/").replacen(
+        r#""name":"libc","kind":null,"rename":null,"target":null"#,
+        r#""name":"libc","kind":null,"rename":null,"target":"cfg(unix)""#,
+        1,
+    );
+    let ws = load(&json::parse(&metadata).expect("json"), &|_| {
+        Ok("[package]\n".to_owned())
+    })
+    .expect("the fixture loads");
+    let files = generate(&ws).expect("generates");
+    let unit = rule(&files["plain/BUILD.bazel"], "unit_test").expect("plain's unit tests");
+    assert!(unit.contains("windows"), "{unit}");
+    assert!(unit.contains("@crates//:libc"), "{unit}");
 }

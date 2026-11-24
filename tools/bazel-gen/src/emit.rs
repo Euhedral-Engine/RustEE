@@ -111,7 +111,6 @@ impl DepSet {
     fn add(&mut self, label: String, applies: &Applies) {
         let oses: Vec<Os> = match applies {
             Applies::Always => Os::ALL.to_vec(),
-            Applies::Loom => return,
             Applies::On(oses) => oses.clone(),
         };
         if oses.is_empty() {
@@ -120,13 +119,19 @@ impl DepSet {
         self.labels.entry(label).or_default().extend(oses);
     }
 
+    /// The entries of `self` on the OSes `other` does not have them on.
     fn without(&self, other: &DepSet) -> DepSet {
         DepSet {
             labels: self
                 .labels
                 .iter()
-                .filter(|(label, _)| !other.labels.contains_key(*label))
-                .map(|(l, o)| (l.clone(), o.clone()))
+                .filter_map(|(label, oses)| {
+                    let left: BTreeSet<Os> = match other.labels.get(label) {
+                        Some(theirs) => oses.difference(theirs).copied().collect(),
+                        None => oses.clone(),
+                    };
+                    (!left.is_empty()).then(|| (label.clone(), left))
+                })
                 .collect(),
         }
     }

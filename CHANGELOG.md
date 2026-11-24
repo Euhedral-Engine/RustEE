@@ -13,10 +13,10 @@ semantics and the tests that pin it.
 
 **Semantics.**
 - Three feature worlds: production (each crate's defaults, no dev-dependencies), testing (`cargo test --workspace`'s features) and cuda testing (testing plus `cuda` on `euhedral-memory` and `euhedral-gpu`). Only `euhedral-graph`, `euhedral-gpu`, `euhedral-memory` and `euhedral-net` have a testing library of their own, and `euhedral-memory` and `euhedral-gpu` a cuda one; the others are aliases.
-- Every test that links `euhedral-memory` with `cuda` is tagged `gpu` and `external`; the generator refuses to write when the testing world resolves that feature, and when a manifest uses a form it does not model (the generator's README lists them).
+- Every test that links `euhedral-memory` with `cuda` is tagged `gpu` and `external`; the generator refuses to write when no `euhedral-memory` declares it, when the testing world resolves it, and when a manifest uses a form it does not model (the generator's README lists them).
 - Cargo, its features and CI are unchanged; no library code changed. The generator adds no dependency.
 
-**Tests.** The generator's unit tests (feature worlds, tags, refusals, stale comparison, lock check, Windows paths) each fail on a planted fault. `tools/bazel-gen/tests/stale.rs` fails when a BUILD file is stale or `MODULE.bazel.lock` does not record the current manifests. Bazel lists the same tests as Cargo, name by name: 2295 in 100 test binaries and 39 doctests in the testing world, 376 in the 42 cuda-world binaries of `euhedral-gpu` and `euhedral-memory`.
+**Tests.** The generator's unit tests (feature worlds, tags, refusals, stale comparison, lock check, Windows paths) each fail on a planted fault. `tools/bazel-gen/tests/stale.rs` fails when a BUILD file is stale, when one on disk is not the generator's, or when `MODULE.bazel.lock` does not record the current manifests; `scripts/ci/affected.py` runs it for a change to any member's BUILD file. Bazel lists the same tests as Cargo, name by name: 2295 in 100 test binaries and 39 doctests in the testing world, 376 in the 42 cuda-world binaries of `euhedral-gpu` and `euhedral-memory`.
 
 ## The Bazel skeleton (build) (2026-11-24)
 

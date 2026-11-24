@@ -38,8 +38,6 @@ impl Os {
 pub enum Applies {
     /// On every OS.
     Always,
-    /// Under `cfg(loom)` only, which stays on Cargo: the dependency is left out.
-    Loom,
     /// On these OSes only (possibly none).
     On(Vec<Os>),
 }
@@ -72,10 +70,6 @@ pub fn applies(target: Option<&str>) -> Result<Applies, String> {
     if !tokens.is_empty() {
         return Err(format!("target `{target}`: trailing text"));
     }
-    if mentions_loom(&expr) {
-        // Every `cfg(loom)` form is Cargo's: loom never runs under Bazel.
-        return Ok(Applies::Loom);
-    }
     let mut on = Vec::new();
     for os in Os::ALL {
         if eval(&expr, os).map_err(|e| format!("target `{target}`: {e}"))? {
@@ -87,15 +81,6 @@ pub fn applies(target: Option<&str>) -> Result<Applies, String> {
     } else {
         Applies::On(on)
     })
-}
-
-fn mentions_loom(expr: &Expr) -> bool {
-    match expr {
-        Expr::Any(items) | Expr::All(items) => items.iter().any(mentions_loom),
-        Expr::Not(item) => mentions_loom(item),
-        Expr::Name(name) => name == "loom",
-        Expr::KeyValue(..) => false,
-    }
 }
 
 fn eval(expr: &Expr, os: Os) -> Result<bool, String> {
@@ -117,6 +102,8 @@ fn eval(expr: &Expr, os: Os) -> Result<bool, String> {
         Expr::Not(item) => !eval(item, os)?,
         Expr::Name(name) => match name.as_str() {
             "unix" | "windows" => name == os.family(),
+            // `--cfg loom` is set only by hand for Cargo's model-checking runs: Bazel never builds with it.
+            "loom" => false,
             other => return Err(format!("unknown cfg name `{other}`")),
         },
         Expr::KeyValue(key, value) => match key.as_str() {
@@ -263,7 +250,13 @@ mod tests {
             applies(Some(r#"cfg(all(unix, target_os = "macos"))"#)),
             Ok(Applies::On(vec![]))
         );
-        assert_eq!(applies(Some("cfg(loom)")), Ok(Applies::Loom));
+        // loom is never set under Bazel: a dependency only it needs is nowhere, and one it excludes is everywhere.
+        assert_eq!(applies(Some("cfg(loom)")), Ok(Applies::On(vec![])));
+        assert_eq!(applies(Some("cfg(not(loom))")), Ok(Applies::Always));
+        assert_eq!(
+            applies(Some("cfg(any(loom, unix))")),
+            Ok(Applies::On(vec![Os::Linux]))
+        );
         assert_eq!(
             applies(Some("cfg(any(unix, windows))")),
             Ok(Applies::Always)

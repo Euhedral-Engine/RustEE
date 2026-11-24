@@ -110,10 +110,9 @@ impl Resolver<'_> {
         package: &'b crate::model::Package,
     ) -> impl Iterator<Item = &'b Dep> + use<'b> {
         let dev = self.out.dev && self.out.roots.contains(&package.name);
-        package
-            .deps
-            .iter()
-            .filter(move |d| (d.kind == DepKind::Normal || dev) && d.applies != Applies::Loom)
+        package.deps.iter().filter(move |d| {
+            (d.kind == DepKind::Normal || dev) && d.applies != Applies::On(Vec::new())
+        })
     }
 
     fn activate(&mut self, name: &str) -> Result<(), String> {
@@ -214,6 +213,10 @@ impl Resolver<'_> {
                     };
                     if dep.optional {
                         self.optional(package, dep_name)?;
+                        // As in Cargo, `x/f` also turns on a feature named `x`, the implicit one or a declared one.
+                        if self.package(package)?.features.contains_key(dep_name) {
+                            self.feature(package, dep_name, false)?;
+                        }
                     }
                     self.feature(member, dep_feature, false)?;
                 }
@@ -255,6 +258,17 @@ pub fn resolve(
 
 /// The features of every member in `world`.
 pub fn resolve_world(ws: &Workspace, world: World) -> Result<Resolved, String> {
+    let (device_crate, device_feature) = DEVICE_FEATURE;
+    if !ws
+        .package(device_crate)
+        .is_some_and(|p| p.features.contains_key(device_feature))
+    {
+        // The tags and the testing-world refusal look for this feature by name: without it they would pass silently.
+        return Err(format!(
+            "no member {device_crate} with the feature `{device_feature}`: the generator finds the device backend by \
+             that name (DEVICE_FEATURE in tools/bazel-gen/src/worlds.rs); update it with the rename"
+        ));
+    }
     let members: Vec<&str> = ws.packages.iter().map(|p| p.name.as_str()).collect();
     let cuda = |name: &str| -> Vec<String> {
         let has = ws
@@ -267,7 +281,6 @@ pub fn resolve_world(ws: &Workspace, world: World) -> Result<Resolved, String> {
         }
     };
     let resolved = resolve(ws, &members, &cuda, world.builds_tests())?;
-    let (device_crate, device_feature) = DEVICE_FEATURE;
     if world == World::Testing && resolved.has(device_crate, device_feature) {
         return Err(format!(
             "the testing world resolves {device_crate}/{device_feature}: a member's dependency turns on the device \

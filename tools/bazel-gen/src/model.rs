@@ -317,13 +317,18 @@ fn load_package(
         });
     }
     targets.sort_by(|a, b| (a.kind, &a.name).cmp(&(b.kind, &b.name)));
+    if let Some(lib) = targets.iter().find(|t| t.kind == TargetKind::Lib)
+        && lib.name != name.replace('-', "_")
+    {
+        return Err(format!(
+            "{dir}/Cargo.toml names its library `{}`: a `[lib] name` other than the package's is not modelled",
+            lib.name
+        ));
+    }
 
     let text = manifest(&format!("{dir}/Cargo.toml"))?;
     let (lints, check_cfg) = parse_lints(&text).map_err(|e| format!("{dir}/Cargo.toml: {e}"))?;
-    if text
-        .lines()
-        .any(|l| l.trim_start().starts_with("harness") && l.contains('='))
-    {
+    if sets_harness(&text) {
         return Err(format!(
             "{dir}/Cargo.toml sets `harness`: targets without the test harness are not modelled"
         ));
@@ -407,6 +412,36 @@ fn parse_extras(
     Ok(out)
 }
 
+/// Whether a target table of the manifest (`[lib]`, `[[bin]]`, `[[test]]`, `[[bench]]`, `[[example]]`) has a `harness`
+/// key, on its own line or in an inline table of a target array.
+fn sets_harness(text: &str) -> bool {
+    let mut in_target = false;
+    for line in text.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if line.starts_with('[') {
+            let header = line.trim_matches(|c| c == '[' || c == ']').trim();
+            in_target = matches!(header, "lib" | "bin" | "test" | "bench" | "example");
+            continue;
+        }
+        if let Some((key, value)) = line.split_once('=') {
+            let key = key.trim().trim_matches('"');
+            if in_target && key == "harness" {
+                return true;
+            }
+            // `test = [{ name = "t", harness = false }]` and the like.
+            if matches!(key, "bin" | "test" | "bench" | "example")
+                && value.split(['{', ',', '}']).any(|part| {
+                    part.split_once('=')
+                        .is_some_and(|(k, _)| k.trim() == "harness")
+                })
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// The quoted strings of a TOML inline array, `['cfg(loom)', "cfg(x)"]`.
 fn quoted_strings(text: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -453,6 +488,14 @@ pub fn parse_lints(text: &str) -> Result<(Vec<Lint>, Vec<String>), String> {
             .split_once('=')
             .ok_or_else(|| format!("[lints.{tool}]: cannot read `{line}`"))?;
         let name = name.trim().trim_matches('"').to_owned();
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            // A dotted key (`x.level = "warn"`) is a table, not a lint.
+            return Err(format!("[lints.{tool}]: `{name}` is not a lint name"));
+        }
         let value = value.trim();
         let (level, priority) = if let Some(table) =
             value.strip_prefix('{').and_then(|v| v.strip_suffix('}'))
@@ -605,8 +648,27 @@ mod tests {
             "[lints.rust]\nunexpected_cfgs = { level = \"warn\", check-cfg = ['cfg(x, values(\"a\"))'] }\n",
             "[lints.rust]\nx = \"loud\"\n",
             "[lints.rust.unexpected_cfgs]\nlevel = \"warn\"\n",
+            "[lints.rust]\nunexpected_cfgs.level = \"warn\"\n",
         ] {
             assert!(parse_lints(text).is_err(), "{text} was accepted");
+        }
+    }
+
+    #[test]
+    fn only_a_target_tables_harness_key_is_refused() {
+        for text in [
+            "[[test]]\nname = \"t\"\nharness = false\n",
+            "[lib]\nharness = false\n",
+            "test = [{ name = \"t\", harness = false }]\n",
+        ] {
+            assert!(sets_harness(text), "{text} was accepted");
+        }
+        for text in [
+            "[features]\nharness = []\n",
+            "[package]\n# harness = false is not used here\nname = \"x\"\n",
+            "[dependencies]\nharness = \"1\"\n",
+        ] {
+            assert!(!sets_harness(text), "{text} was refused");
         }
     }
 
