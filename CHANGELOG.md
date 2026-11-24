@@ -9,13 +9,13 @@ semantics and the tests that pin it.
 
 **Why.** Completing `timers` early is a misuse, but it made the retry frame cancel at once, post `Retry`, fail the accept again and schedule another retry, and the listener's key, which runs events until its inbox is empty, never returned: a worker spun.
 
-**How to use.** Complete `timers` only after the server is stopped. A server whose timers are complete while it runs begins its stop at the next failed accept: the listener closes, its stop completes and the report says so, and no later event arms an accept.
+**How to use.** Complete `timers` only after the server is stopped. A server whose timers are complete while it runs begins its stop at the next failed accept: the listener closes, its stop completes, a later stop is reported at once, and no later event arms an accept.
 
 **Semantics.**
 - `accept_failed` counts the error and, when the timers are complete, begins the stop (as a lost lattice does) instead of setting `retrying` or posting a frame.
 - The dropped-frame delivery of the I/O operations' frames is unchanged.
 
-**Tests.** `timers_completed_early_end_the_listener_at_a_failed_accept` (`euhedral-net/src/server.rs`; on the old code it fails in release with "the listener kept re-arming the retry", and in debug at the `debug_assert` in `euhedral-graph/src/completions.rs:605`; it also fails there without a Stop, as the listener is left unfinished). The hand-driven server tests now fail with "the accept's frame was never handed out" instead of spinning.
+**Tests.** `timers_completed_early_end_the_listener_at_a_failed_accept` (`euhedral-net/src/server.rs`; on the old code it fails in release with "the listener kept re-arming the retry", and in debug at the `debug_assert` in `Completions` (`euhedral-graph/src/completions.rs`) that refuses a completion registered after `complete`; it also fails there without a Stop, as the listener is left unfinished). The hand-driven server tests now fail with "the accept's frame was never handed out" instead of spinning.
 
 ## Device tests run under Bazel and fail when they skip (build) (2026-11-24)
 

@@ -431,7 +431,7 @@ impl Shared {
         if timers.is_complete() {
             // Timers completed before the stop run no frame, and a cancelled retry frame still posts its event, which
             // would fail the accept and arm the retry again without end. No retry can come, so the server ends as
-            // a stop does: the socket closes and the stop is reported, and no later event arms an accept.
+            // a stop does: the socket closes, a later stop is reported at once, and no later event arms an accept.
             self.begin_stop(ls);
             return;
         }
@@ -587,14 +587,15 @@ impl ServerHandle {
 /// Starts serving: takes `listener` (a bound, listening socket), accepts connections on `io` and answers
 /// their requests with `handler`. Work runs as frames offered to `sink`, which `lattice` drains; `io` must be
 /// attached to the lattice too (its continuations are frames), and so must `timers`, a [`Completions`] the server
-/// uses for the back-off after a failed accept (the lattice's own timer: the server keeps none). Complete `timers` only after the server's stop: timers that
-/// are complete while the server runs end it at the next failed accept, as a stop does.
+/// uses for the back-off after a failed accept (the lattice's own timer: the server keeps none).
+/// Complete `timers` only after the server's stop: timers that are complete while the server runs end it at the
+/// next failed accept, as a stop does.
 ///
 /// The listener, and each connection when it is accepted, becomes a source of `lattice`. The server holds the
 /// lattice and `io` weakly: the caller keeps them alive while the server runs, and stops the server before it drops
 /// either (a server dropped without a stop does not leak through a reference cycle, but nothing then runs its
-/// frames, so its listening socket is closed only when the lattice lets go of the server). If the lattice is gone or closed when a
-/// connection is accepted, the connection is refused and the server ends as if stopped.
+/// frames, so its listening socket is closed only when the lattice lets go of the server). If the lattice is gone or closed
+/// when a connection is accepted, the connection is refused and the server ends as if stopped.
 ///
 /// Returns an error if the lattice refuses the listener's source (it is closed). The server then does nothing.
 ///
@@ -808,8 +809,8 @@ mod tests {
         assert!(hand.finished(), "the stop is reported after the drop");
     }
 
-    /// Timers completed with no stop sent end the listener at the first failed accept: its socket is closed, the
-    /// stop is reported, and a later event arms no accept.
+    /// Timers completed with no stop sent end the listener at the first failed accept: its socket is closed, a
+    /// later stop is reported at once, and a later event arms no accept.
     #[test]
     fn timers_completed_early_end_the_listener_at_a_failed_accept() {
         let io = AsyncIo::open().unwrap();
