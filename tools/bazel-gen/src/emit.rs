@@ -16,7 +16,7 @@ const ROOT_EXPORTS: [&str; 6] = [
     "Cargo.lock",
     "Cargo.toml",
     "MODULE.bazel",
-    "MODULE.bazel.lock",
+    "cargo-bazel-lock.json",
     "mise.toml",
     "rust-toolchain.toml",
 ];
