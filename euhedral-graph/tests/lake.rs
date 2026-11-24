@@ -449,7 +449,10 @@ fn offers_from_8_threads_racing_complete_finish_every_admitted_unit() {
                 })
             })
             .collect();
-        std::thread::sleep(Duration::from_millis(5));
+        // Complete once a unit is in: the threads go on admitting and offering while the lake drains.
+        eventually("a unit to be admitted", || {
+            units.load(Ordering::Acquire) > 0
+        });
         lake.complete_gracefully();
         for thread in threads {
             thread.join().unwrap();
