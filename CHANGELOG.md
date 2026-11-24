@@ -3,6 +3,18 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## The production build is lint-clean (CI) (2026-11-24)
+
+**What.** `euhedral-gpu` built with neither `fake` nor `cuda` had 15 dead-code findings (backend-only items: the lane submit macro and `Retired` import, `check_pitched`, `over_shared_limit`, `RawStream::new`, `GraphHold::add_frozen`/`add_value`, `freeze`, the span book, the tensor map `code` methods). They are now behind `cfg(any(feature = "fake", feature = "cuda"))` (the span book, `freeze` and the hold methods also stay for `cfg(test)`, which exercises them). The clippy job of both workflows gains `cargo clippy --workspace --lib -- -D warnings`.
+
+**Why.** A build with no dev features is what a Bazel build compiles, and Bazel never fails on a warning; this step keeps that build clean.
+
+**How to use.** Run `cargo clippy --workspace --lib -- -D warnings` before pushing. Gate an item only a backend uses the same way.
+
+**Semantics.** Attributes only: no item changed meaning, and no feature's contents changed.
+
+**Tests.** The new step fails on the old tree (15 errors in `euhedral-gpu`) and passes now; the existing clippy and test steps cover every feature combination.
+
 ## The GitLab pipeline is removed (CI) (2026-11-20)
 
 **What.** `.gitlab-ci.yml`, its generator `scripts/ci/gitlab_pipeline.py` and that script's test are gone. CI is the Gitea workflow (`.gitea/workflows/ci.yml`) and its twin, the GitHub workflow (`.github/workflows/ci.yml`); the `Test the scripts` step of both no longer runs the removed test. The README's merge request section is now about pull requests.

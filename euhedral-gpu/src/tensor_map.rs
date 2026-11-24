@@ -48,6 +48,7 @@ pub enum MapDataType {
 
 impl MapDataType {
     /// `CUtensorMapDataType`'s value.
+    #[cfg(any(feature = "fake", feature = "cuda"))]
     pub(crate) fn code(self) -> u32 {
         match self {
             MapDataType::U8 => 0,
@@ -102,6 +103,7 @@ pub enum Interleave {
 }
 
 impl Interleave {
+    #[cfg(any(feature = "fake", feature = "cuda"))]
     pub(crate) fn code(self) -> u32 {
         match self {
             Interleave::None => 0,
@@ -131,6 +133,7 @@ pub enum Swizzle {
 }
 
 impl Swizzle {
+    #[cfg(any(feature = "fake", feature = "cuda"))]
     pub(crate) fn code(self) -> u32 {
         match self {
             Swizzle::None => 0,
@@ -155,6 +158,7 @@ pub enum L2Promotion {
 }
 
 impl L2Promotion {
+    #[cfg(any(feature = "fake", feature = "cuda"))]
     pub(crate) fn code(self) -> u32 {
         match self {
             L2Promotion::None => 0,
@@ -176,6 +180,7 @@ pub enum OobFill {
 }
 
 impl OobFill {
+    #[cfg(any(feature = "fake", feature = "cuda"))]
     pub(crate) fn code(self) -> u32 {
         match self {
             OobFill::Zero => 0,

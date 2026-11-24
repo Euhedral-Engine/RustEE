@@ -423,6 +423,7 @@ pub trait LaneEnqueue {
 /// Checks the arguments of [`LaneEnqueue::copy_pitched_on_device`] and returns the bytes of one side's range, which
 /// ends at the last row's last byte (`pitch * (rows - 1) + row_bytes`), as `(dst_span, src_span)`. Zero for both when
 /// there is nothing to copy.
+#[cfg(any(feature = "fake", feature = "cuda"))]
 pub(crate) fn check_pitched(
     dst_pitch: usize,
     src_pitch: usize,
@@ -488,6 +489,7 @@ pub struct RawStream<'a, R> {
 }
 
 impl<R: Copy> RawStream<'_, R> {
+    #[cfg(any(feature = "fake", feature = "cuda"))]
     pub(crate) fn new(raw: R) -> Self {
         Self {
             raw,
@@ -617,6 +619,7 @@ pub struct KernelOptions {
 }
 
 /// The error of a launch that asks for more dynamic shared memory than its kernel is opted in to.
+#[cfg(any(feature = "fake", feature = "cuda"))]
 pub(crate) fn over_shared_limit(kernel: &str, asked: u32, limit: u32) -> GpuError {
     GpuError::Invalid(format!(
         "{kernel}: a launch asks for {asked} bytes of dynamic shared memory, the kernel allows {limit} \

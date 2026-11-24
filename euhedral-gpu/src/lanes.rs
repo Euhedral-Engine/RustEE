@@ -7,9 +7,10 @@
 
 use std::sync::Arc;
 
+#[cfg(any(feature = "fake", feature = "cuda"))]
+use euhedral_graph::Retired;
 use euhedral_graph::{
     LaneId, LaneIntakes, LanePool, LanePoolBuilder, LaneSource, LaneState, LaneSubmit, LaneWork,
-    Retired,
 };
 
 use crate::{Gpu, GpuError, Lane, Stream, StreamOptions};
@@ -156,6 +157,7 @@ pub fn open_shared_lanes<G: Gpu>(
 }
 
 /// `LaneSubmit` for a backend's stream: the methods delegate to the stream's own, with fully qualified calls.
+#[cfg(any(feature = "fake", feature = "cuda"))]
 macro_rules! lane_submit {
     ($stream:ty, $raw:ty, |$s:ident| $raw_of:expr) => {
         impl LaneSubmit for $stream {

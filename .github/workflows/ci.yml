@@ -161,6 +161,9 @@ jobs:
       - name: Clippy
         run: cargo clippy $AFFECTED --all-targets -- -D warnings
 
+      - name: Clippy (production libraries, no dev features)
+        run: cargo clippy --workspace --lib -- -D warnings
+
       - name: Test
         run: cargo test $AFFECTED
 
