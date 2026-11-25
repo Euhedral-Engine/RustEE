@@ -3,6 +3,18 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## euhedral-hashing's package leaves out the workspace toolchain pin test (build) (2026-11-24)
+
+**What.** `euhedral-hashing/Cargo.toml` excludes `tests/toolchain_pin.rs` from the published crate. The test still runs in the workspace under Cargo and under Bazel.
+
+**Why.** The test reads `mise.toml`, `rust-toolchain.toml` and `MODULE.bazel` from the workspace root, which a packaged copy does not have, so it panicked outside the workspace.
+
+**How to use.** Nothing changes for a developer: `cargo test -p euhedral-hashing --test toolchain_pin` and `bazel test //euhedral-hashing:toolchain_pin_test` run it as before. `cargo package -p euhedral-hashing --list` no longer lists it.
+
+**Semantics.** Only the packaged file list changes. The crate has no `publish = false`, so it stays publishable. The Bazel target and the BUILD file are unchanged.
+
+**Tests.** `cargo package -p euhedral-hashing --list` omits `tests/toolchain_pin.rs` and keeps the other test files; `cargo test -p euhedral-hashing --test toolchain_pin` runs its three tests and passes; `bazel run //:gazelle -- -mode=diff` exits 0 and `bazel test //euhedral-hashing:toolchain_pin_test //:bazel_gen_stale_test` passes.
+
 ## The Windows path flags are the repository's, the output base is the machine's (build) (2026-11-24)
 
 **What.** `--experimental_platform_in_output_dir`, `--experimental_override_platform_cpu_name=...=w` and `--compilation_mode=dbg` move from the GitHub Windows job's `user.bazelrc` into the repository's `.bazelrc` as `common:windows` lines. The job writes only `startup --output_base=C:/b`. The design document and the README give the path budget.

@@ -5,6 +5,8 @@ edition = "2024"
 description = "xxHash64-based hashing for Euhedral routing keys and vectors"
 readme = "README.md"
 license = "Apache-2.0"
+# The test checks the workspace's pin files, so it is not shipped with the crate.
+exclude = ["tests/toolchain_pin.rs"]
 
 [dependencies]
 
