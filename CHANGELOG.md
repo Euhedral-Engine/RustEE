@@ -5,7 +5,7 @@ semantics and the tests that pin it.
 
 ## euhedral_build is a published version, and a check keeps the vendored copy equal to it (build) (2026-11-24)
 
-**What.** `MODULE.bazel` names `euhedral_build` at the registry version `0.0.0-20261124231802`. `build/module` is that version's source byte for byte, except one comment in `platforms/BUILD.bazel`. `scripts/ci/check_vendored_module.py` compares the two, and the Gitea `bazel` job runs it.
+**What.** `MODULE.bazel` names `euhedral_build` at the registry version `0.0.0-20261125011133`. `build/module` is that version's source byte for byte, except one comment in `platforms/BUILD.bazel`. `scripts/ci/check_vendored_module.py` compares the two, and the Gitea `bazel` job runs it.
 
 **Why.** A published `euhedral_rustee` must name a dependency its consumers can resolve: Bazel ignores the root's path override in a consumer, which then resolves the declared version from the registry. The root keeps the copy because GitHub-hosted jobs cannot reach the registry.
 
