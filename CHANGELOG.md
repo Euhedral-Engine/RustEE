@@ -3,6 +3,18 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## euhedral-hashing's package leaves out the workspace toolchain pin test (build) (2026-11-24)
+
+**What.** `euhedral-hashing/Cargo.toml` excludes `tests/toolchain_pin.rs` from the published crate. The test still runs in the workspace under Cargo and under Bazel.
+
+**Why.** The test reads `mise.toml`, `rust-toolchain.toml` and `MODULE.bazel` from the workspace root, which a packaged copy does not have, so it panicked outside the workspace (euhedral/RustEE#1112).
+
+**How to use.** Nothing changes for a developer: `cargo test -p euhedral-hashing --test toolchain_pin` and `bazel test //euhedral-hashing:toolchain_pin_test` run it as before. `cargo package -p euhedral-hashing --list` no longer lists it.
+
+**Semantics.** Only the packaged file list changes. The crate has no `publish = false`, so it stays publishable. The Bazel target and the BUILD file are unchanged.
+
+**Tests.** `cargo package -p euhedral-hashing --list` omits `tests/toolchain_pin.rs` and keeps the other test files; `cargo test -p euhedral-hashing --test toolchain_pin` runs its three tests and passes; `bazel run //:gazelle -- -mode=diff` exits 0 and `bazel test //euhedral-hashing:toolchain_pin_test //:bazel_gen_stale_test` passes.
+
 ## RustEE's BUILD files come from the shared generator (build)
 
 **What.** `tools/bazel-gen` (the `euhedral-bazel-gen` workspace member) is gone. `bazel run //:gazelle` and the stale test are forge's shared generator, `@euhedral_build//bazel-gen`, in the vendored `build/module`, configured by the new root `bazel_gen.toml`. The toolchain pin test moved to `euhedral-hashing/tests/toolchain_pin.rs`. The `bazel` CI job has a step "The BUILD files are generated" (`bazel run //:gazelle --config=ci -- -mode=diff`).
