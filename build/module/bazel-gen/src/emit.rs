@@ -22,7 +22,7 @@ struct Gen<'a> {
     owners: BTreeMap<(World, String), World>,
 }
 
-/// Every BUILD file of the workspace, by path relative to the root (`BUILD.bazel`, `euhedral-core/BUILD.bazel`).
+/// Every BUILD file of the workspace, by path relative to the root (`BUILD.bazel`, `example-core/BUILD.bazel`).
 pub fn generate(ws: &Workspace) -> Result<BTreeMap<String, String>, String> {
     let mut worlds = BTreeMap::new();
     for world in World::built(&ws.config) {
@@ -43,6 +43,7 @@ pub fn generate(ws: &Workspace) -> Result<BTreeMap<String, String>, String> {
         worlds,
         owners: BTreeMap::new(),
     };
+    generator.check_card_tests(&World::built(&ws.config))?;
     let mut files = BTreeMap::new();
     let mut aliases = Vec::new();
     for package in &ws.packages {
@@ -545,36 +546,67 @@ impl Gen<'_> {
         Ok(set)
     }
 
-    /// Whether a test of `package` in `world` links the device feature through any path: the device member with the
-    /// feature, or (in the device world) a crate of another module that `[device] external` names.
-    fn opens_the_card(&self, world: World, package: &Package) -> bool {
-        let Some(device) = &self.ws.config.device else {
-            return false;
-        };
+    /// What a test of `package` in `world` links that opens the card: `(firm, soft)`. Firm: the device member with a device
+    /// feature, or (in the device world) a crate of another module, which `card_tests = false` does not undo. Soft: any
+    /// other crate resolved with a device feature (a member, or a third-party crate directly or through the crates it
+    /// links) or a package marked `card_tests = true`.
+    fn card_links(&self, world: World, package: &Package) -> (bool, bool) {
+        let config = &self.ws.config;
+        let marked = |name: &str| config.package(name).card_tests == Some(true);
         let resolved = self.resolved(world);
-        let member_on = device
-            .member
-            .as_deref()
-            .filter(|m| resolved.has(m, &device.feature));
+        let device = config.device.as_ref();
+        let opens_with = |features: &BTreeSet<String>| {
+            device.is_some_and(|d| d.all_features().any(|f| features.contains(f)))
+        };
         // In the device world every crate of another module is its device build, which may open the card: a test that
         // links one is tagged, whether or not `device.external` names the crate.
-        let externals = &self.ws.config.external;
-        let external_on =
-            world == World::CudaTesting && (!device.external.is_empty() || !externals.is_empty());
-        if member_on.is_none() && !external_on {
-            return false;
-        }
+        let external_on = world == World::CudaTesting
+            && device.is_some_and(|d| !d.external.is_empty() || !config.external.is_empty());
+        // A third-party crate opens the card when it, or a crate it links (the crate hub's lock), is resolved with a
+        // device feature: by the lock, or by a member's dependency asking for it.
+        let third_on = |dep: &Dep| {
+            if dep.member.is_some() || device.is_none() {
+                return false;
+            }
+            let mut seen = BTreeSet::new();
+            let mut stack = vec![dep.name.clone()];
+            while let Some(name) = stack.pop() {
+                if !seen.insert(name.clone()) {
+                    continue;
+                }
+                let asked = resolved.third_party.get(&name).is_some_and(&opens_with);
+                let locked = self.ws.locked.as_ref();
+                if asked
+                    || locked
+                        .and_then(|l| l.features.get(&name))
+                        .is_some_and(&opens_with)
+                {
+                    return true;
+                }
+                stack.extend(
+                    locked
+                        .and_then(|l| l.deps.get(&name))
+                        .into_iter()
+                        .flatten()
+                        .cloned(),
+                );
+            }
+            false
+        };
+        let (mut firm, mut soft) = (false, false);
         let mut seen = BTreeSet::new();
         let mut stack = vec![package.name.clone()];
-        let mut opens = false;
         let mut visit = |dep: &Dep, stack: &mut Vec<String>| {
             stack.extend(dep.member.clone());
             if external_on
                 && dep.member.is_none()
-                && (device.external.contains(&dep.name)
-                    || self.ws.config.external_key(dep).is_some())
+                && (device.is_some_and(|d| d.external.contains(&dep.name))
+                    || config.external_key(dep).is_some())
             {
-                opens = true;
+                firm = true;
+            }
+            if third_on(dep) {
+                soft = true;
             }
         };
         // The test's own dev-dependencies, then every library's normal dependencies.
@@ -595,7 +627,49 @@ impl Gen<'_> {
                 }
             }
         }
-        opens || member_on.is_some_and(|m| seen.contains(m))
+        for name in &seen {
+            let on = resolved.features.get(name).is_some_and(&opens_with);
+            if on && device.is_some_and(|d| d.member.as_deref() == Some(name.as_str())) {
+                firm = true;
+            } else if on || marked(name) {
+                soft = true;
+            }
+        }
+        (firm, soft)
+    }
+
+    /// Whether a test of `package` in `world` opens the card (`gpu` and `external`); `card_tests = false` on the package
+    /// undoes only what `card_links` calls soft.
+    fn opens_the_card(&self, world: World, package: &Package) -> bool {
+        let (firm, soft) = self.card_links(world, package);
+        firm || (soft && self.ws.config.package(&package.name).card_tests != Some(false))
+    }
+
+    /// Refuses a `card_tests` that cannot do what it says: on a name that is no member, or a `false` on a package whose
+    /// tests nothing would tag in any world (it would hide nothing).
+    fn check_card_tests(&self, worlds: &[World]) -> Result<(), String> {
+        for (name, settings) in &self.ws.config.packages {
+            let Some(answer) = settings.card_tests else {
+                continue;
+            };
+            let Some(package) = self.ws.package(name) else {
+                return Err(format!(
+                    "packages.{name}.card_tests: {name} is not a workspace member"
+                ));
+            };
+            if !answer
+                && !worlds
+                    .iter()
+                    .filter(|w| w.builds_tests())
+                    .any(|w| matches!(self.card_links(*w, package), (false, true)))
+            {
+                return Err(format!(
+                    "packages.{name}.card_tests = false: no test of {name} links a crate resolved with a device feature, \
+                     or the device world tags it regardless; the key changes nothing (remove it)"
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// What decides whether a world needs its own test targets: the package's features and every member target its tests

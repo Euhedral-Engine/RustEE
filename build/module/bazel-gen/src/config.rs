@@ -20,12 +20,21 @@ pub struct Device {
     /// on for them. (A device-world test that links any crate of [`Config::external`] is tagged like one that links
     /// `member`.)
     pub external: Vec<String>,
+    /// More device features (`vulkan`): a crate resolved with any of them, like one with `feature`, opens the card.
+    pub also: Vec<String>,
+}
+
+impl Device {
+    /// `feature` and `also`: every feature that opens the card.
+    pub fn all_features(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.feature.as_str()).chain(self.also.iter().map(String::as_str))
+    }
 }
 
 /// A dependency that is a library of another Bazel module.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct External {
-    /// The label of its package (`@euhedral_rustee//euhedral-gpu`); the target is the crate name with the world's suffix.
+    /// The label of its package (`@euhedral_example//example-gpu`); the target is the crate name with the world's suffix.
     pub package: String,
     /// This crate's own suffix for a world (production, testing, device), over [`Config::external_worlds`].
     pub worlds: [Option<String>; 3],
@@ -44,6 +53,9 @@ pub struct PackageConfig {
     pub build_script_env: Vec<(String, String)>,
     /// Tags of the build script target only (`gpu`; `external` follows from it): its library and tests do not inherit them.
     pub build_script_tags: Vec<String>,
+    /// `Some(true)`: the package's tests (and those of every package that links it) open the card, whatever its features;
+    /// `Some(false)`: its own tests never do, though they link a crate with a device feature on. `None`: derived.
+    pub card_tests: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -178,12 +190,14 @@ impl Config {
                 "crates" => config.crates = string(value, "crates")?,
                 "device" => {
                     let (mut member, mut feature, mut external) = (None, None, Vec::new());
+                    let mut also = Vec::new();
                     for (key, value) in table(value, "device")? {
                         let here = format!("device.{key}");
                         match key.as_str() {
                             "member" => member = Some(string(value, &here)?),
                             "feature" => feature = Some(string(value, &here)?),
                             "external" => external = strings(value, &here)?,
+                            "also" => also = strings(value, &here)?,
                             other => return Err(format!("device: unknown key `{other}`")),
                         }
                     }
@@ -191,6 +205,7 @@ impl Config {
                         member,
                         feature: feature.ok_or("device: no `feature`")?,
                         external,
+                        also,
                     });
                 }
                 "external" => {
@@ -263,6 +278,7 @@ impl Config {
                                 "build_script_data" => {
                                     package.build_script_data = strings(value, &here)?
                                 }
+                                "card_tests" => package.card_tests = Some(boolean(value, &here)?),
                                 "build_script_tags" => {
                                     package.build_script_tags = strings(value, &here)?
                                 }
@@ -284,14 +300,6 @@ impl Config {
                 }
                 other => return Err(format!("unknown key `{other}`")),
             }
-        }
-        if let Some(device) = &config.device
-            && device.member.is_none()
-            && config.external.is_empty()
-        {
-            return Err(
-                "device: no `member` and no [external.crates]: nothing opens the card".to_owned(),
-            );
         }
         if let Some(device) = &config.device
             && let Some(name) = device
@@ -623,7 +631,7 @@ mod tests {
     fn the_toml_subset_reads_tables_arrays_and_inline_tables() {
         let doc = toml(
             "# c\nheader = \"# x\" # trailing\n[root]\nexports = [\n  \"a\", # one\n  'b',\n]\n\
-             gazelle = false\n[external.crates]\n\"euhedral-gpu\" = '@m//euhedral-gpu'\n\
+             gazelle = false\n[external.crates]\n\"example-gpu\" = '@m//example-gpu'\n\
              [packages.p]\ncompile_data = []\nx = { a = 1, b.c = true }\n",
         )
         .unwrap();
@@ -642,8 +650,8 @@ mod tests {
                 .unwrap()
                 .get("crates")
                 .unwrap()
-                .get("euhedral-gpu"),
-            Some(&Json::String("@m//euhedral-gpu".into()))
+                .get("example-gpu"),
+            Some(&Json::String("@m//example-gpu".into()))
         );
         let x = doc
             .get("packages")
@@ -676,9 +684,9 @@ mod tests {
     fn the_configuration_is_read_and_unknown_keys_are_refused() {
         let config = Config::parse(
             "header = \"# gen\"\n[root]\nexports = [\"Cargo.toml\"]\ncrate_lock = \"l.json\"\nfilegroups = { testdata = [\"testdata/**\"] }\n\
-             [device]\nmember = \"engine\"\nfeature = \"cuda\"\nexternal = [\"euhedral-memory\"]\n\
-             [external.crates]\neuhedral-gpu = \"@euhedral_rustee//euhedral-gpu\"\n\
-             euhedral-memory = { package = \"@euhedral_rustee//euhedral-memory\", worlds = { testing = \"\" } }\n\
+             [device]\nmember = \"engine\"\nfeature = \"cuda\"\nexternal = [\"example-memory\"]\n\
+             [external.crates]\nexample-gpu = \"@euhedral_example//example-gpu\"\n\
+             example-memory = { package = \"@euhedral_example//example-memory\", worlds = { testing = \"\" } }\n\
              [external.worlds]\ndevice = \"_cuda_testing\"\n\
              [packages.engine]\ncompile_data = [\"kernels/**\"]\ntest_data = [\"//:testdata\"]\n",
         )
@@ -692,16 +700,17 @@ mod tests {
             Some(Device {
                 member: Some("engine".into()),
                 feature: "cuda".into(),
-                external: vec!["euhedral-memory".into()],
+                external: vec!["example-memory".into()],
+                also: Vec::new(),
             })
         );
         assert_eq!(
-            config.external_label("euhedral-gpu", 1).as_deref(),
-            Some("@euhedral_rustee//euhedral-gpu:euhedral_gpu_testing")
+            config.external_label("example-gpu", 1).as_deref(),
+            Some("@euhedral_example//example-gpu:example_gpu_testing")
         );
         assert_eq!(
-            config.external_label("euhedral-memory", 1).as_deref(),
-            Some("@euhedral_rustee//euhedral-memory:euhedral_memory")
+            config.external_label("example-memory", 1).as_deref(),
+            Some("@euhedral_example//example-memory:example_memory")
         );
         assert_eq!(config.external_label("serde", 1), None);
         assert_eq!(config.external_worlds, ["", "_testing", "_cuda_testing"]);
@@ -712,7 +721,7 @@ mod tests {
             "header = \"x\"\n",
             "[root]\nexport = []\n",
             "[device]\nmember = \"m\"\n",
-            "[device]\nfeature = \"cuda\"\n",
+            "[packages.p]\ncard_tests = \"yes\"\n",
             "[device]\nfeature = \"cuda\"\nexternal = [\"x\"]\n",
             "[external.crates]\nx = \"@m//x:x\"\n",
             "[external.crates]\nx = \"//x\"\n",

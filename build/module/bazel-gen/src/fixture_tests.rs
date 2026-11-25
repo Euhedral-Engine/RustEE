@@ -21,21 +21,21 @@ struct Fixture<'a> {
 }
 
 /// A workspace of:
-/// - `euhedral-memory`, with `cuda`;
-/// - `user`, whose `cuda` turns on `euhedral-memory/cuda`, with the test `t`;
+/// - `example-memory`, with `cuda`;
+/// - `user`, whose `cuda` turns on `example-memory/cuda`, with the test `t`;
 /// - `plain`, which has a `testing` feature its own dev-dependency on itself turns on, with the test `p`, linking neither.
 fn members<'a>() -> Vec<Fixture<'a>> {
     vec![
         Fixture {
-            name: "euhedral-memory",
+            name: "example-memory",
             features: &[("cuda", &[]), ("default", &[])],
             deps: vec![],
             tests: &[],
         },
         Fixture {
             name: "user",
-            features: &[("cuda", &["euhedral-memory/cuda"])],
-            deps: vec![("euhedral-memory", false, Some("euhedral-memory"), &[])],
+            features: &[("cuda", &["example-memory/cuda"])],
+            deps: vec![("example-memory", false, Some("example-memory"), &[])],
             tests: &["t"],
         },
         Fixture {
@@ -118,13 +118,14 @@ fn metadata(members: &[Fixture], root: &str, sep: &str) -> String {
     )
 }
 
-/// RustEE's device: `euhedral-memory/cuda` opens the card.
+/// The producer's device: `example-memory/cuda` opens the card.
 fn config() -> Config {
     Config {
         device: Some(Device {
-            member: Some("euhedral-memory".to_owned()),
+            member: Some("example-memory".to_owned()),
             feature: "cuda".to_owned(),
             external: Vec::new(),
+            also: Vec::new(),
         }),
         ..Config::default()
     }
@@ -165,10 +166,10 @@ fn each_world_resolves_its_features() {
         features(World::Testing, "plain"),
         ["default", "testing", "x"]
     );
-    assert_eq!(features(World::Testing, "euhedral-memory"), ["default"]);
+    assert_eq!(features(World::Testing, "example-memory"), ["default"]);
     assert_eq!(features(World::CudaTesting, "user"), ["cuda"]);
     assert_eq!(
-        features(World::CudaTesting, "euhedral-memory"),
+        features(World::CudaTesting, "example-memory"),
         ["cuda", "default"]
     );
 }
@@ -192,16 +193,16 @@ fn only_tests_that_link_the_device_feature_are_tagged() {
 }
 
 #[test]
-fn a_testing_world_with_the_device_feature_is_refused() {
+fn a_testing_world_that_builds_the_device_member_with_its_feature_is_refused() {
     let mut members = members();
-    // A dev-dependency asks for euhedral-memory/cuda: `cargo test --workspace` would open the card.
+    // A dev-dependency asks for example-memory/cuda: `cargo test --workspace` would open the card.
     members[2]
         .deps
-        .push(("euhedral-memory", true, Some("euhedral-memory"), &["cuda"]));
+        .push(("example-memory", true, Some("example-memory"), &["cuda"]));
     let ws = workspace(&members, "/w", "/").expect("the fixture loads");
     let error = generate(&ws).expect_err("the generator refuses");
     assert!(
-        error.contains("testing world resolves euhedral-memory/cuda"),
+        error.contains("testing world resolves example-memory"),
         "{error}"
     );
 }
@@ -226,12 +227,12 @@ fn a_production_feature_one_member_turns_on_for_another_is_refused() {
             "{error}"
         );
     }
-    // An empty `default` turns on nothing: euhedral-memory without it is the same library.
+    // An empty `default` turns on nothing: example-memory without it is the same library.
     let mut empty = members();
     empty[2].deps.push((
-        "euhedral-memory",
+        "example-memory",
         false,
-        Some("euhedral-memory"),
+        Some("example-memory"),
         &["!default"],
     ));
     generate(&workspace(&empty, "/w", "/").expect("the fixture loads"))
@@ -241,7 +242,7 @@ fn a_production_feature_one_member_turns_on_for_another_is_refused() {
 #[test]
 fn unmodelled_manifests_are_refused() {
     let mut weak = members();
-    weak[1].features = &[("cuda", &["euhedral-memory?/cuda"])];
+    weak[1].features = &[("cuda", &["example-memory?/cuda"])];
     let ws = workspace(&weak, "/w", "/").expect("the fixture loads");
     assert!(generate(&ws).expect_err("weak features").contains("weak"));
 
@@ -268,7 +269,7 @@ fn a_dependency_feature_turns_on_the_feature_named_after_an_optional_dependency(
     // turns that feature on too, so the code under cfg(feature = "plain") is built.
     let mut members = members();
     members[1].features = &[
-        ("cuda", &["euhedral-memory/cuda"]),
+        ("cuda", &["example-memory/cuda"]),
         ("default", &["extra"]),
         ("extra", &["plain/testing"]),
         ("plain", &["dep:plain"]),
@@ -287,11 +288,11 @@ fn a_workspace_without_the_device_feature_is_refused() {
     // Renamed away, the device feature would leave every cuda test untagged and the testing world unchecked.
     let mut members = members();
     members[0].features = &[("gpu", &[]), ("default", &[])];
-    members[1].features = &[("cuda", &["euhedral-memory/gpu"])];
+    members[1].features = &[("cuda", &["example-memory/gpu"])];
     let ws = workspace(&members, "/w", "/").expect("the fixture loads");
     let error = generate(&ws).expect_err("the generator refuses");
     assert!(
-        error.contains("euhedral-memory with the feature `cuda`"),
+        error.contains("example-memory with the feature `cuda`"),
         "{error}"
     );
 }
@@ -324,8 +325,18 @@ fn a_dev_dependency_wider_than_a_target_specific_normal_one_reaches_the_unit_tes
     );
     let ws = load(
         &json::parse(&metadata).expect("json"),
-        &|_| Ok("[package]\n".to_owned()),
-        config(),
+        &|path| {
+            Ok(if path == "l.json" {
+                "{\"crates\":{}}"
+            } else {
+                "[package]\n"
+            }
+            .to_owned())
+        },
+        Config {
+            crate_lock: Some("l.json".to_owned()),
+            ..config()
+        },
     )
     .expect("the fixture loads");
     let files = generate(&ws).expect("generates");
@@ -484,4 +495,290 @@ fn in_the_device_world_any_mapped_external_crate_opens_the_card() {
     assert!(!test.contains("gpu"), "{test}");
     let cuda = rule(app, "t_cuda_test").expect("the device world's test");
     assert!(cuda.contains("\"external\",\n        \"gpu\",\n"), "{cuda}");
+}
+
+/// A consumer whose workspace dependencies turn `cuda` on for the third-party crate `gpu` (no member declares it):
+/// - `lib` depends on `gpu` with `cuda`, with the test `l`;
+/// - `app` depends only on `lib`, with the test `a`;
+/// - `quiet` depends on `lib` and never opens the card, with the test `q`;
+/// - `plain` reaches no `gpu`, with the test `p`.
+fn third_party_workspace<'a>() -> Vec<Fixture<'a>> {
+    vec![
+        Fixture {
+            name: "lib",
+            features: &[],
+            deps: vec![("gpu", false, None, &["cuda"])],
+            tests: &["l"],
+        },
+        Fixture {
+            name: "app",
+            features: &[],
+            deps: vec![("lib", false, Some("lib"), &[])],
+            tests: &["a"],
+        },
+        Fixture {
+            name: "quiet",
+            features: &[],
+            deps: vec![("lib", false, Some("lib"), &[])],
+            tests: &["q"],
+        },
+        Fixture {
+            name: "plain",
+            features: &[],
+            deps: vec![],
+            tests: &["p"],
+        },
+    ]
+}
+
+const DEVICE_ONLY: &str = "[device]\nfeature = \"cuda\"\n[root]\ncrate_lock = \"l.json\"\n";
+
+fn try_generate(members: &[Fixture], config: &str) -> Result<BTreeMap<String, String>, String> {
+    let metadata = json::parse(&metadata(members, "/w", "/")).expect("json");
+    let config = Config::parse(config).expect("the configuration parses");
+    let read = |path: &str| {
+        Ok(if path == "l.json" {
+            "{\"crates\":{}}"
+        } else {
+            "[package]\n"
+        }
+        .to_owned())
+    };
+    generate(&load(&metadata, &read, config)?)
+}
+
+fn tagged(files: &BTreeMap<String, String>, package: &str, test: &str) -> bool {
+    let text = &files[&format!("{package}/BUILD.bazel")];
+    rule(text, test)
+        .expect("a test")
+        .contains("\"external\",\n        \"gpu\",\n")
+}
+
+#[test]
+fn tests_linking_a_third_party_crate_with_the_device_feature_are_tagged_without_naming_it() {
+    let files = try_generate(&third_party_workspace(), DEVICE_ONLY).expect("generates");
+    for (package, test) in [
+        ("lib", "l_test"),
+        ("lib", "unit_test"),
+        ("lib", "doc_test"),
+        ("app", "a_test"),
+        ("app", "unit_test"),
+        ("quiet", "q_test"),
+    ] {
+        assert!(tagged(&files, package, test), "{package}/{test}");
+    }
+    for test in ["p_test", "unit_test", "doc_test"] {
+        assert!(!tagged(&files, "plain", test), "plain/{test}");
+    }
+    // The feature is on in every world already: there is no device world.
+    assert!(!files["lib/BUILD.bazel"].contains("cuda"));
+}
+
+#[test]
+fn card_tests_overrides_the_derived_tag_in_both_directions() {
+    let config = format!(
+        "{DEVICE_ONLY}[packages.quiet]\ncard_tests = false\n[packages.plain]\ncard_tests = true\n"
+    );
+    let files = try_generate(&third_party_workspace(), &config).expect("generates");
+    assert!(!tagged(&files, "quiet", "q_test"));
+    assert!(!tagged(&files, "quiet", "unit_test"));
+    assert!(tagged(&files, "plain", "p_test"));
+    assert!(tagged(&files, "app", "a_test"));
+}
+
+#[test]
+fn a_package_marked_card_tests_without_any_device_feature_tags_its_dependents_too() {
+    let files = try_generate(
+        &third_party_workspace(),
+        "[packages.lib]\ncard_tests = true\n",
+    )
+    .expect("generates");
+    assert!(tagged(&files, "lib", "l_test"));
+    assert!(tagged(&files, "app", "a_test"));
+    assert!(!tagged(&files, "plain", "p_test"));
+}
+
+#[test]
+fn a_second_device_feature_opens_the_card_too_and_each_declared_feature_must_be_resolved() {
+    let mut members = third_party_workspace();
+    members[0].deps = vec![("gpu", false, None, &["vulkan"])];
+    members[3].deps = vec![("other", false, None, &["cuda"])];
+    let config =
+        "[device]\nfeature = \"cuda\"\nalso = [\"vulkan\"]\n[root]\ncrate_lock = \"l.json\"\n";
+    let files = try_generate(&members, config).expect("generates");
+    assert!(tagged(&files, "app", "a_test"));
+    let error = try_generate(
+        &members,
+        &config.replace("[\"vulkan\"]", "[\"vulkan\", \"dead\"]"),
+    )
+    .expect_err("a dead `also` entry");
+    assert!(error.contains("`dead`"), "{error}");
+}
+
+#[test]
+fn a_device_feature_no_crate_resolves_is_refused() {
+    let mut members = third_party_workspace();
+    members[0].deps = vec![("gpu", false, None, &[])];
+    let error = try_generate(&members, DEVICE_ONLY).expect_err("a stale declaration");
+    assert!(error.contains("[device] declares"), "{error}");
+}
+
+#[test]
+fn a_member_other_than_the_device_member_that_resolves_a_device_feature_opens_the_card() {
+    // `engine` has `cuda`; `app` asks for it in a dev-dependency, and `eng2` turns it on by default.
+    let members = vec![
+        Fixture {
+            name: "engine",
+            features: &[("cuda", &[])],
+            deps: vec![],
+            tests: &["e"],
+        },
+        Fixture {
+            name: "app",
+            features: &[],
+            deps: vec![("engine", true, Some("engine"), &["cuda"])],
+            tests: &["a"],
+        },
+        Fixture {
+            name: "eng2",
+            features: &[("default", &["cuda"]), ("cuda", &[])],
+            deps: vec![],
+            tests: &["d"],
+        },
+        Fixture {
+            name: "plain",
+            features: &[],
+            deps: vec![],
+            tests: &["p"],
+        },
+    ];
+    let files = try_generate(&members, DEVICE_ONLY).expect("generates");
+    assert!(tagged(&files, "engine", "e_test"));
+    assert!(tagged(&files, "app", "a_test"));
+    assert!(tagged(&files, "eng2", "d_test"));
+    assert!(!tagged(&files, "plain", "p_test"));
+}
+
+fn locked_workspace<'a>() -> Vec<Fixture<'a>> {
+    // via_chain -> a -> b (cuda); via_default -> c (cuda: the lock's resolved features hold what a default or another
+    // feature turned on); clean -> d.
+    let on = |name: &'static str, krate: &'static str| Fixture {
+        name,
+        features: &[],
+        deps: vec![(krate, false, None, &[])],
+        tests: &["t"],
+    };
+    vec![
+        on("via_chain", "a"),
+        on("via_default", "c"),
+        on("clean", "d"),
+    ]
+}
+
+const LOCK: &str = r#"{"crates":{
+  "a 1.0.0":{"name":"a","common_attrs":{"crate_features":{"common":["std"],"selects":{}},
+     "deps":{"common":[],"selects":{"x86_64-unknown-linux-gnu":[{"id":"b 1.0.0","target":"b"}]}}}},
+  "b 1.0.0":{"name":"b","common_attrs":{"crate_features":{"common":[],"selects":{"x86_64-unknown-linux-gnu":["cuda"]}}}},
+  "c 2.0.0":{"name":"c","common_attrs":{"crate_features":{"common":["default","gpu-accel","cuda"],"selects":{}}}},
+  "d 1.0.0":{"name":"d","common_attrs":{"crate_features":{"common":["default"],"selects":{}},"deps":{"common":[{"id":"a 1.0.0"}]}}}
+}}"#;
+
+#[test]
+fn the_crate_lock_gives_the_features_and_links_third_party_crates_resolve_to() {
+    let config = DEVICE_ONLY.to_owned();
+    let metadata = json::parse(&metadata(&locked_workspace(), "/w", "/")).expect("json");
+    let load_with = |config: &str, lock: &str| {
+        let lock = lock.to_owned();
+        let read = move |path: &str| {
+            if path == "l.json" {
+                Ok(lock.clone())
+            } else {
+                Ok("[package]\n".to_owned())
+            }
+        };
+        load(&metadata, &read, Config::parse(config).expect("config"))
+    };
+    let files = generate(&load_with(&config, LOCK).expect("loads")).expect("generates");
+    assert!(tagged(&files, "via_chain", "t_test"), "a transitive chain");
+    assert!(
+        tagged(&files, "via_default", "t_test"),
+        "a resolved feature"
+    );
+    // `d` links `a`, which links `b`: the chain reaches it too.
+    assert!(tagged(&files, "clean", "t_test"));
+    let no_chain = LOCK.replace("\"id\":\"b 1.0.0\"", "\"id\":\"z 1.0.0\"");
+    let files = generate(&load_with(&config, &no_chain).expect("loads")).expect("generates");
+    assert!(!tagged(&files, "via_chain", "t_test"));
+    assert!(tagged(&files, "via_default", "t_test"));
+    assert!(!tagged(&files, "clean", "t_test"));
+    // The lock is part of the input: missing, it is an error naming it, not a silent loss of tags.
+    let missing = |path: &str| -> Result<String, String> {
+        if path == "l.json" {
+            Err("reading l.json: gone".to_owned())
+        } else {
+            Ok("[package]\n".to_owned())
+        }
+    };
+    let error = load(&metadata, &missing, Config::parse(&config).expect("config"))
+        .expect_err("a missing crate lock");
+    assert!(error.contains("l.json"), "{error}");
+}
+
+#[test]
+fn card_tests_on_a_non_member_or_that_changes_nothing_is_refused() {
+    let error = try_generate(
+        &third_party_workspace(),
+        &format!("{DEVICE_ONLY}[packages.ghost]\ncard_tests = true\n"),
+    )
+    .expect_err("not a member");
+    assert!(
+        error.contains("ghost") && error.contains("not a workspace member"),
+        "{error}"
+    );
+    let error = try_generate(
+        &third_party_workspace(),
+        &format!("{DEVICE_ONLY}[packages.plain]\ncard_tests = false\n"),
+    )
+    .expect_err("hides nothing");
+    assert!(
+        error.contains("plain") && error.contains("changes nothing"),
+        "{error}"
+    );
+}
+
+#[test]
+fn card_tests_false_does_not_untag_what_the_device_member_tags() {
+    // The producer's shape: `user`'s device-world tests link the device member and stay tagged; a `false` on it is refused as
+    // changing nothing in the world where nothing else tags it.
+    let config = "[device]\nmember = \"example-memory\"\nfeature = \"cuda\"\n[packages.user]\ncard_tests = false\n";
+    let ws = workspace(&members(), "/w", "/").expect("loads");
+    let mut ws = ws;
+    ws.config = Config::parse(config).expect("config");
+    let error = generate(&ws).expect_err("hides nothing");
+    assert!(error.contains("changes nothing"), "{error}");
+}
+
+#[test]
+fn a_device_workspace_with_third_party_dependencies_needs_the_crate_lock() {
+    let metadata = json::parse(&metadata(&third_party_workspace(), "/w", "/")).expect("json");
+    let read = |_: &str| Ok("[package]\n".to_owned());
+    let config = Config::parse("[device]\nfeature = \"cuda\"\n").expect("config");
+    let error = load(&metadata, &read, config).expect_err("no crate lock");
+    assert!(
+        error.contains("lib")
+            && error.contains("gpu")
+            && error.contains("lockfile")
+            && error.contains("crate_lock"),
+        "{error}"
+    );
+    // Without third-party dependencies there is nothing to resolve: no lock needed.
+    let own = vec![Fixture {
+        name: "solo",
+        features: &[("cuda", &[])],
+        deps: vec![],
+        tests: &["t"],
+    }];
+    let metadata = json::parse(&self::metadata(&own, "/w", "/")).expect("json");
+    let config = Config::parse("[device]\nfeature = \"cuda\"\n").expect("config");
+    load(&metadata, &read, config).expect("loads without a crate lock");
 }

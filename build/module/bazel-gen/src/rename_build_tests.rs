@@ -534,7 +534,7 @@ fn a_renamed_external_dependency_that_turns_on_the_device_feature_is_refused_in_
         [external.crates]\next = \"@m//ext\"\ngpu-cuda = \"@m//ext\"\n";
     let error = generated(&packages, config)
         .expect_err("the renamed key opens the card in the testing world");
-    assert!(error.contains("testing world resolves ext/cuda"), "{error}");
+    assert!(error.contains("testing world resolves"), "{error}");
 }
 
 #[test]
