@@ -15,6 +15,18 @@ semantics and the tests that pin it.
 
 **Tests.** `cargo package -p euhedral-hashing --list` omits `tests/toolchain_pin.rs` and keeps the other test files; `cargo test -p euhedral-hashing --test toolchain_pin` runs its three tests and passes; `bazel run //:gazelle -- -mode=diff` exits 0 and `bazel test //euhedral-hashing:toolchain_pin_test //:bazel_gen_stale_test` passes.
 
+## The Windows path flags are the repository's, the output base is the machine's (build) (2026-11-24)
+
+**What.** `--experimental_platform_in_output_dir`, `--experimental_override_platform_cpu_name=...=w` and `--compilation_mode=dbg` move from the GitHub Windows job's `user.bazelrc` into the repository's `.bazelrc` as `common:windows` lines. The job writes only `startup --output_base=C:/b`. The design document and the README give the path budget.
+
+**Why.** MSVC's linker opens no path of 260 characters or more; with the four settings the longest path (a doc test's input in `euhedral-data-structures`) is 256. Only the output base is a machine path, so only it belongs in the machine layer; the rest are project flags (with `--platforms` set to the platform the cpu-name override names, so a plain local `bazel test //...` gets the short directory too) a Windows developer should not have to know.
+
+**How to use.** On Windows, set a short output base in `user.bazelrc` (`startup --output_base=C:/b`; the personal layer, until forge's machine layer can set it). Linux and macOS read nothing new.
+
+**Semantics.** The three lines apply only on a Windows host (`--enable_platform_specific_config`). A Windows build with a long output base still fails at link time (`LNK1181`). No source changes.
+
+**Tests.** The workflow twins test pins the job's step and that the three lines are in `.bazelrc` (a deleted line fails only on Windows otherwise); forge's repository check accepts the file.
+
 ## RustEE's BUILD files come from the shared generator (build)
 
 **What.** `tools/bazel-gen` (the `euhedral-bazel-gen` workspace member) is gone. `bazel run //:gazelle` and the stale test are forge's shared generator, `@euhedral_build//bazel-gen`, in the vendored `build/module`, configured by the new root `bazel_gen.toml`. The toolchain pin test moved to `euhedral-hashing/tests/toolchain_pin.rs`. The `bazel` CI job has a step "The BUILD files are generated" (`bazel run //:gazelle --config=ci -- -mode=diff`).
