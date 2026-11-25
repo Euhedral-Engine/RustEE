@@ -407,20 +407,12 @@ jobs:
           have=$(bazel --version)
           test "$have" = "bazel $(cat .bazelversion)" || { echo "bazel is '$have', .bazelversion says $(cat .bazelversion)"; exit 1; }
 
-      # MSVC's link.exe opens no path of 260 characters or more. A doc test links the standard library's rlibs from its
-      # runfiles directory, at <output base>/execroot/_main/bazel-out/<cpu>-<mode>/bin/<package>/doc_test.rustdoc_test.bat
-      # .runfiles/_main/external/<toolchain>/lib/rustlib/x86_64-pc-windows-msvc/lib/<rlib>: under the output base in the
-      # runner's profile that is about 300 long. A short output base, the platform's output directory named `w` instead of
-      # `x64_windows` and `dbg` (debug info, the same code as fastbuild) instead of `fastbuild` bring the longest
-      # (euhedral-data-structures, librustc_std_workspace_alloc) to 256. user.bazelrc is the machine's layer.
-      - name: Short output paths (github)
-        run: |
-          {
-            echo "startup --output_base=C:/b"
-            echo "common --experimental_platform_in_output_dir"
-            echo "common --experimental_override_platform_cpu_name=@euhedral_build//platforms:windows_x86_64=w"
-            echo "common --compilation_mode=dbg"
-          } > user.bazelrc
+      # MSVC's link.exe opens no path of 260 characters or more, and a doc test links the toolchain's rlibs from its
+      # runfiles directory (docs/design/bazel.md, "Windows path budget"). The repository's .bazelrc holds the project's
+      # flags for that (`common:windows`); the output base is a machine path, so it goes in user.bazelrc, the machine's layer:
+      # a short one, not the runner's profile directory.
+      - name: Short output base (github)
+        run: echo "startup --output_base=C:/b" > user.bazelrc
 
       - name: Bazel test on the Windows platform
         env:

@@ -10,6 +10,15 @@ common --lockfile_mode=error
 # Windows has no symlinks without developer mode; tests and tools find their data through runfiles directories.
 common:windows --enable_runfiles
 
+# Windows path budget: MSVC's link.exe opens no path of 260 characters or more, and a doc test links the toolchain's rlibs
+# from inside its runfiles tree (docs/design/bazel.md, "Windows path budget"). These three lines cut the longest path to
+# 256 once the machine's output base is short (the machine layer sets that one, not this file).
+# The platform's directory under bazel-out is named by the platform, so the cpu name there is `w` rather than `x64_windows`.
+common:windows --experimental_platform_in_output_dir
+common:windows --experimental_override_platform_cpu_name=@euhedral_build//platforms:windows_x86_64=w
+# `dbg` builds the same code as fastbuild (same opt-level) with debug info, and its directory name is 6 characters shorter.
+common:windows --compilation_mode=dbg
+
 # C7
 test --test_tag_filters=-gpu,-exclusive
 test --test_output=errors

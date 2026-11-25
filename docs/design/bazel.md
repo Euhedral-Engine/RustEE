@@ -343,6 +343,20 @@ Rejected:
     repository's `.bazelrc` sets `common:windows --enable_runfiles`. That line only applies with
     `common --enable_platform_specific_config`, which is off by default in Bazel 9.3.3, so the `.bazelrc` sets that
     too.
+  - **Windows path budget.** MSVC's `link.exe` opens no path of 260 characters or more. A doc test links the
+    toolchain's rlibs from inside its runfiles tree, so the longest input path is
+    `<output base>/execroot/_main/bazel-out/<cpu>-<mode>/bin/<package>/doc_test.rustdoc_test.bat.runfiles/_main/external/rules_rust++rust+rw-1704990954_tools/rust_toolchain/lib/rustlib/x86_64-pc-windows-msvc/lib/librustc_std_workspace_alloc-<hash>.rlib`.
+    With `C:/b` as the output base, `w` as the cpu name, `dbg` as the mode and `euhedral-data-structures` as the package
+    (the longest name) that is 256 of 260 characters. Each character of a longer package name costs one, so a package
+    name 4 or more characters longer than `euhedral-data-structures` breaks the Windows build with `LNK1181`; so does
+    `fastbuild` for `dbg` (6 more, 262). Three of the four settings are project flags and live in the repository's
+    `.bazelrc` as `common:windows` lines: `--experimental_platform_in_output_dir` with
+    `--experimental_override_platform_cpu_name=@euhedral_build//platforms:windows_x86_64=w` (the directory under
+    `bazel-out` is `w-dbg` instead of `x64_windows-fastbuild`), and `--compilation_mode=dbg` (the same opt-level as
+    fastbuild, plus debug info). The fourth, a short output base such as `startup --output_base=C:/b`, is a machine
+    path: it belongs in the machine layer (`~/.bazelrc` or `user.bazelrc`, forge's C3), and the repository's `.bazelrc`
+    may not hold it. The GitHub job writes it to `user.bazelrc`. A Windows machine with the default output base (under
+    the user's profile) fails at link time. forge's machine layer has no setting for it yet.
   - crate_universe resolves for `x86_64-unknown-linux-gnu` and `x86_64-pc-windows-msvc` (`supported_platform_triples`).
 - **Benchmarks (C7 `exclusive`):** the gate runs no benchmark today. The bins are built and their unit tests run. A
   later change may add `exclusive`-tagged targets for the throughput binaries and for the `credit_graph` timing test

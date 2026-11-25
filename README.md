@@ -64,6 +64,8 @@ Bazel builds and tests the same crates on Linux (`bazel build //...`, `bazel tes
 then fails instead of skipping). The `BUILD.bazel` files are generated from the Cargo manifests: after changing a
 crate's manifest or adding, removing or renaming a target, regenerate them with `bazel run //:gazelle` (or
 `cargo run -p euhedral-bazel-gen`) and commit them; see [`tools/bazel-gen`](tools/bazel-gen/README.md).
+On Windows, set a short output base (`startup --output_base=C:/b` in `user.bazelrc` or `~/.bazelrc`): the linker opens no
+path of 260 characters, and the budget is in the [Bazel design](docs/design/bazel.md).
 
 ## Pull requests
 

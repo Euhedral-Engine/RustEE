@@ -3,6 +3,18 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## The Windows path flags are the repository's, the output base is the machine's (build) (2026-11-24)
+
+**What.** `--experimental_platform_in_output_dir`, `--experimental_override_platform_cpu_name=...=w` and `--compilation_mode=dbg` move from the GitHub Windows job's `user.bazelrc` into the repository's `.bazelrc` as `common:windows` lines. The job writes only `startup --output_base=C:/b`. The design document and the README give the path budget.
+
+**Why.** MSVC's linker opens no path of 260 characters or more; with the four settings the longest path (a doc test's input in `euhedral-data-structures`) is 256. Only the output base is a machine path, so only it belongs in the machine layer; the rest are project flags a Windows developer should not have to know.
+
+**How to use.** On Windows, set a short output base in `user.bazelrc` or `~/.bazelrc` (`startup --output_base=C:/b`). Linux and macOS read nothing new.
+
+**Semantics.** The three lines apply only on a Windows host (`--enable_platform_specific_config`). A Windows build with a long output base still fails at link time (`LNK1181`). No source changes.
+
+**Tests.** The workflow twins test pins the job's step and that the three lines are in `.bazelrc` (a deleted line fails only on Windows otherwise); forge's repository check accepts the file.
+
 ## The crate lock docs and checks say what is enforced (build) (2026-11-24)
 
 **What.** `MODULE.bazel`, `.bazelrc` and `docs/design/bazel.md` no longer say a stale `cargo-bazel-lock.json` fails every Bazel command: with `lockfile` set, rules_rust treats the `crate` extension as reproducible and leaves it out of `MODULE.bazel.lock`, so a local Bazel build does not notice a stale crate lock. bazel-gen's stale test now compares every `Cargo.lock` package that is not a workspace member with the crates of `cargo-bazel-lock.json` (it compared registry packages only, so a git, sparse or out-of-workspace path dependency could never match). The CI step "The crate lock is current" also compares `Cargo.lock`, which a repin can rewrite. The consumer section says rules_rust takes the Rust toolchain from the root module only; stale text about SHA-256 and the lock check is fixed.
