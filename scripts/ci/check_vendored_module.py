@@ -105,9 +105,10 @@ def registry_module_differences(registry, version, root):
     path = os.path.join(registry, "modules", MODULE, version, "MODULE.bazel")
     if not os.path.isfile(path):
         raise SystemExit("the registry has no MODULE.bazel for %s %s" % (MODULE, version))
-    with open(path, encoding="utf-8") as f:
+    # newline="" keeps \r and \r\n as they are: the files must match byte for byte outside the version.
+    with open(path, encoding="utf-8", newline="") as f:
         published = f.read()
-    with open(os.path.join(root, "build", "module", "MODULE.bazel"), encoding="utf-8") as f:
+    with open(os.path.join(root, "build", "module", "MODULE.bazel"), encoding="utf-8", newline="") as f:
         vendored = f.read()
     if without_module_version(published, "the registry's MODULE.bazel") != without_module_version(vendored, "build/module/MODULE.bazel"):
         return ["the registry's MODULE.bazel differs from build/module/MODULE.bazel beyond the module() version"]

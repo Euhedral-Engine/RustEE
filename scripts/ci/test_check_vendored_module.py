@@ -227,6 +227,26 @@ class CheckVendoredModule(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("not in metadata.json's versions", said)
 
+    def test_a_registry_module_with_crlf_line_ends_fails(self):
+        def crlf(root, registry):
+            path = self.registry_file(registry, VERSION, "MODULE.bazel")
+            with open(path, "rb") as f:
+                data = f.read()
+            write(path, data.replace(b"\n", b"\r\n"))
+        code, said = self.check(crlf)
+        self.assertEqual(code, 1)
+        self.assertIn("beyond the module() version", said)
+
+    def test_a_registry_module_with_a_lone_cr_fails(self):
+        def lone(root, registry):
+            path = self.registry_file(registry, VERSION, "MODULE.bazel")
+            with open(path, "rb") as f:
+                data = f.read()
+            write(path, data.replace(b"\n", b"\r", 1))
+        code, said = self.check(lone)
+        self.assertEqual(code, 1)
+        self.assertIn("beyond the module() version", said)
+
 
 if __name__ == "__main__":
     unittest.main()
