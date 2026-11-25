@@ -99,7 +99,7 @@ Two rules_rust behaviours the prototype found, which the generator must handle:
 
 The shared generator, `@euhedral_build//bazel-gen` (forge's `build/module/bazel-gen`, vendored here with the rest of
 `build/module`, the source forge publishes in its registry; `scripts/ci/check_vendored_module.py` checks the copy against the
-published archive in the Gitea job), reads `cargo metadata --no-deps --format-version 1` and writes every crate's `BUILD.bazel`. The file
+published archive in the Gitea job: the archive's files, its `source.json` (only `url`, `integrity` and `strip_prefix`, so no patches or overlay), the registry's `MODULE.bazel` apart from the `module()` version, and `metadata.json` (not yanked, listed)), reads `cargo metadata --no-deps --format-version 1` and writes every crate's `BUILD.bazel`. The file
 starts with an `@generated` line, and nobody edits it by hand. It is Rust because new tools here are Rust by default
 (Python is for throwaway scripts) and Bazel needs no Python toolchain; it has no dependencies of its own, so it adds no
 crate to RustEE's lock. One generator serves every repo on the forge, configured by the repo's `bazel_gen.toml`
