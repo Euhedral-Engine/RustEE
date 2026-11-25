@@ -16,11 +16,11 @@ import sys
 import tarfile
 
 MODULE = "euhedral_build"
-# path -> (line in the published file, line in the vendored copy). The published comment names a program that uses
-# the build, which RustEE's files never do.
+# path -> (sha256 hex of the published line, line in the vendored copy). The published comment names a program that
+# uses the build, which RustEE's files never do, so only its hash is kept here.
 EXCEPTIONS = {
     "platforms/BUILD.bazel": (
-        b"# The Quest headset (MySphereVR, phase 6).",
+        "ab352d9a05a7b54396d0a6a0d2f6525b023ea3e52c4ace1e6a76e6730d4809cf",
         b"# The Quest headset (a later repo's phase).",
     ),
 }
@@ -76,12 +76,15 @@ def vendored_tree(root):
 
 def differences(published, vendored):
     published = dict(published)
-    for path, (old, new) in EXCEPTIONS.items():
+    for path, (digest, new) in EXCEPTIONS.items():
         data = published.get(path)
         if data is not None:
-            if old not in data.splitlines():
+            lines = data.split(b"\n")
+            hits = [n for n, line in enumerate(lines) if hashlib.sha256(line).hexdigest() == digest]
+            if len(hits) != 1:
                 raise SystemExit("%s: the published file lacks the line the exception replaces" % path)
-            published[path] = data.replace(old, new)
+            lines[hits[0]] = new
+            published[path] = b"\n".join(lines)
     out = ["only in the published module: %s" % p for p in sorted(set(published) - set(vendored))]
     out += ["only in build/module: %s" % p for p in sorted(set(vendored) - set(published))]
     out += ["differs: %s" % p for p in sorted(set(published) & set(vendored)) if published[p] != vendored[p]]
