@@ -464,15 +464,17 @@ jobs:
 
   # forge's conformance check of the build contracts (build/CONTRACTS.md), from forge's main, never from this checkout: the
   # code under test does not supply its own checker. The bazel label's jobs get no token, so this job, which has one,
-  # fetches forge and runs every check but C7 (the gpu/external tags need Bazel); the `bazel` job runs C7. A fetch that
-  # fails fails the job: there is no fallback to a copy in this repository.
+  # fetches forge and runs every check but C7 (the gpu/external tags need Bazel); the `bazel` job runs C7. That includes
+  # the pin alignment (C5) and the vendored copy of a published module (C13), which the last step requires to have run.
+  # The checkout step receives the token through the action's default input; the fetch and the last step (for C5's and
+  # C13's registry fetches) are the only ones that put it in their environment. Every run step uses the absolute shell. A fetch that fails fails the job: there is no fallback to a copy in this repository.
   check-repo:
     needs: changes
     if: needs.changes.outputs.any == 'true'
     runs-on: arbiter-docker
     defaults:
       run:
-        shell: bash
+        shell: /usr/bin/bash --noprofile --norc -eo pipefail {0}
     env:
       ARBITER_ARGS: "--threads 1 --mem 1G"
       ARBITER_EST: "60"
@@ -518,10 +520,21 @@ jobs:
           query "attr(tags, \"$(tag gpu)\", //...) except attr(tags, \"$(tag external)\", //...)"
           C7
 
+      # C5 and C13 fetch forge's registry and the euhedral repositories this one pins, with the job token as
+      # FORGE_READ_TOKEN: it is in this step's environment and the fetch step's only. The output is kept (pipefail: a failed
+      # check still fails the step) and must carry both pass lines, so a forge change that skips either fails here.
       - name: forge's repo check, C7 aside (gitea)
         env:
           PATH: /usr/bin:/bin
-        run: bash "$RUNNER_TEMP/forge/build/scripts/check-repo.sh" --skip-c7 .
+          GITHUB_SERVER_URL: ${{ github.server_url }}
+          CHECK_PINS_BASE: ${{ github.server_url }}
+          GIT_CONFIG_NOSYSTEM: "1"
+          GIT_CONFIG_GLOBAL: /dev/null
+          FORGE_READ_TOKEN: ${{ github.token }}
+        run: |
+          bash "$RUNNER_TEMP/forge/build/scripts/check-repo.sh" --skip-c7 --pins . | tee "$RUNNER_TEMP/check-repo.out"
+          grep -qE '^check-repo: \.: C5 pins ok \(' "$RUNNER_TEMP/check-repo.out" || { echo "forge's check did not report the pin alignment (C5)"; exit 1; }
+          grep -qE '^check-repo: \.: C13 vendored copies ok \([1-9][0-9]* compared' "$RUNNER_TEMP/check-repo.out" || { echo "forge's check did not compare a vendored copy (C13)"; exit 1; }
 
   # `bazel test //... --config=ci` (the stale test of the BUILD files included) on the bazel label: Bazel 9.3.3 from the
   # image, the CI-only Bazel store at /bazel and the container rc at /etc/bazel.bazelrc. The runner checks the commit out
