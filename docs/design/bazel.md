@@ -98,7 +98,8 @@ Two rules_rust behaviours the prototype found, which the generator must handle:
 ### First-party BUILD files: a checked-in generator driven by `cargo metadata`
 
 The shared generator, `@euhedral_build//bazel-gen` (forge's `build/module/bazel-gen`, vendored here with the rest of
-`build/module`), reads `cargo metadata --no-deps --format-version 1` and writes every crate's `BUILD.bazel`. The file
+`build/module`, the source forge publishes in its registry; `scripts/ci/check_vendored_module.py` checks the copy against the
+published archive in the Gitea job), reads `cargo metadata --no-deps --format-version 1` and writes every crate's `BUILD.bazel`. The file
 starts with an `@generated` line, and nobody edits it by hand. It is Rust because new tools here are Rust by default
 (Python is for throwaway scripts) and Bazel needs no Python toolchain; it has no dependencies of its own, so it adds no
 crate to RustEE's lock. One generator serves every repo on the forge, configured by the repo's `bazel_gen.toml`
@@ -600,9 +601,10 @@ them cached; a `<crate>_cuda` production target when a consumer module needs one
 A module depends on RustEE with `bazel_dep(name = "euhedral_rustee")` and a `git_override` (or `local_path_override`).
 Three things follow from how Bazel loads a non-root module:
 
-- `euhedral_build` is a `local_path_override` in RustEE's `MODULE.bazel` (container CI has no registry), and Bazel ignores
-  overrides outside the root module. The consumer declares `bazel_dep(name = "euhedral_build", version = "0.1.0")` and its
-  own override (`build/module` of this repository, or the registry once it publishes the module).
+- `euhedral_build` is a `local_path_override` in RustEE's `MODULE.bazel` (the GitHub Windows job cannot reach forge's
+  registry), and Bazel ignores overrides outside the root module. The consumer declares
+  `bazel_dep(name = "euhedral_build", version = "<a published version>")` and gets that version from the private registry; the
+  override is not needed.
 - The consumer's root needs a `BUILD.bazel`, even an empty one: crate_universe reads `//:MODULE.bazel` of the root and fails
   with "Unable to load package for //:MODULE.bazel" without it.
 - Targets are named with underscores: `@euhedral_rustee//euhedral-core:euhedral_core`. The consumer's build resolves the

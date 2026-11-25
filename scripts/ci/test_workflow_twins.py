@@ -125,7 +125,8 @@ class Twins(unittest.TestCase):
     def test_the_script_tests_run_in_both_files(self):
         for doc in (GITEA, GITHUB):
             text = "\n".join(runs(doc, "changes"))
-            for test in ["test_affected", "test_miri_build", "test_workflow_twins", "test_device_check"]:
+            for test in ["test_affected", "test_miri_build", "test_workflow_twins", "test_device_check",
+                         "test_check_vendored_module"]:
                 self.assertIn(f"scripts/ci/{test}.py", text)
 
     def test_a_push_diffs_against_the_commit_before_it(self):
@@ -468,7 +469,16 @@ def render_forge_c7(lines):
 
 class Bazel(unittest.TestCase):
     def test_both_files_run_exactly_the_bazel_tests_c7_and_the_shutdown(self):
-        gitea = [{"name": "Copy the runner's checkout (gitea)", "run": "cp -a /checkout/. ."}] + BAZEL_STEPS
+        # The registry copy is mounted only in the container job, so the vendored-module check is Gitea-only.
+        gitea = [
+            {"name": "Copy the runner's checkout (gitea)", "run": "cp -a /checkout/. ."},
+            {
+                "name": "The vendored euhedral_build is the published one (gitea)",
+                "run": 'test -d /registry/modules/euhedral_build || '
+                '{ echo "the registry copy is not mounted at /registry"; exit 1; }\n'
+                'python3 -I scripts/ci/check_vendored_module.py /registry .\n',
+            },
+        ] + BAZEL_STEPS
         github = [
             {"uses": "actions/checkout@v4"},
             {

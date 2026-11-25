@@ -3,6 +3,18 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## euhedral_build is a published version, and a check keeps the vendored copy equal to it (build) (2026-11-24)
+
+**What.** `MODULE.bazel` names `euhedral_build` at the registry version `0.0.0-20261124231802`. `build/module` is that version's source byte for byte, except one comment in `platforms/BUILD.bazel`. `scripts/ci/check_vendored_module.py` compares the two, and the Gitea `bazel` job runs it.
+
+**Why.** A published `euhedral_rustee` must name a dependency its consumers can resolve: Bazel ignores the root's path override in a consumer, which then resolves the declared version from the registry. The root keeps the copy because GitHub-hosted jobs cannot reach the registry.
+
+**How to use.** To bump, change the version in `MODULE.bazel`, replace `build/module` with the new archive's tree, and refresh the locks. `python3 scripts/ci/check_vendored_module.py <registry dir>` reports what differs.
+
+**Semantics.** The check reads the version from `MODULE.bazel`, verifies the archive's sha256 against its `source.json`, and fails on any added, missing or changed file. It fails when the registry copy is missing. The generated BUILD files and the platforms are unchanged.
+
+**Tests.** `scripts/ci/test_check_vendored_module.py`: a matching copy passes; one byte of drift, a tampered archive and an unpublished version fail. The workflow twin test knows the Gitea-only step.
+
 ## euhedral-hashing's package leaves out the workspace toolchain pin test (build) (2026-11-24)
 
 **What.** `euhedral-hashing/Cargo.toml` excludes `tests/toolchain_pin.rs` from the published crate. The test still runs in the workspace under Cargo and under Bazel.
