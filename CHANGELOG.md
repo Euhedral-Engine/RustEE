@@ -5,15 +5,15 @@ semantics and the tests that pin it.
 
 ## The Gitea repo check runs the pin alignment and the vendored-copy check (build) (2026-11-25)
 
-**What.** The Gitea `check-repo` job runs forge's checker with `--pins`, so C5 (pin alignment) and C13 (a vendored copy of a published module is byte for byte that version's archive) run on every pull request. The step fails unless the output has both pass lines. Every step of the job runs under an absolute shell.
+**What.** The Gitea `check-repo` job runs forge's checker with `--pins`, so C5 (pin alignment) and C13 (a vendored copy of a published module is byte for byte that version's archive) run on every pull request. The step fails unless the output has the C5 pass line and a C13 line that compared at least one copy. Every step of the job runs under an absolute shell.
 
 **Why.** Both checks were skipped, so a drifted vendored copy was caught only by the `bazel` job's own script, and a later forge change that dropped either check would have gone unseen.
 
-**How to use.** Nothing to do. The job token reaches the checker as `FORGE_READ_TOKEN`, in that one step and the fetch step only, with `PATH=/usr/bin:/bin`.
+**How to use.** Nothing to do. The job token reaches the checker as `FORGE_READ_TOKEN`. The checkout step receives the token through the action's default input; the fetch step and this step are the only ones that put it in their environment, and this one has `PATH=/usr/bin:/bin`.
 
 **Semantics.** forge's registry branch is fetched with the token; a failed fetch fails the step. `scripts/ci/check_vendored_module.py` and the `bazel` job are unchanged.
 
-**Tests.** `scripts/ci/test_workflow_twins.py` pins `--pins`, the two required pass lines, the token holders, the step's `PATH` and the absolute shell; it fails on the previous workflow.
+**Tests.** `scripts/ci/test_workflow_twins.py` pins `--pins`, the exact script of the step (fail closed), the job's env and defaults, the token holders, the step's `PATH` and the absolute shell; it fails on the previous workflow.
 
 ## euhedral_build is a published version, and a check keeps the vendored copy equal to it (build) (2026-11-24)
 

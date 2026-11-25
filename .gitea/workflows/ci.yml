@@ -466,8 +466,8 @@ jobs:
   # code under test does not supply its own checker. The bazel label's jobs get no token, so this job, which has one,
   # fetches forge and runs every check but C7 (the gpu/external tags need Bazel); the `bazel` job runs C7. That includes
   # the pin alignment (C5) and the vendored copy of a published module (C13), which the last step requires to have run.
-  # Two steps hold the job's token, the fetch and the last one (for C5's and C13's registry fetches); every step runs
-  # under the absolute shell. A fetch that fails fails the job: there is no fallback to a copy in this repository.
+  # The checkout step receives the token through the action's default input; the fetch and the last step (for C5's and
+  # C13's registry fetches) are the only ones that put it in their environment. Every run step uses the absolute shell. A fetch that fails fails the job: there is no fallback to a copy in this repository.
   check-repo:
     needs: changes
     if: needs.changes.outputs.any == 'true'
@@ -533,8 +533,8 @@ jobs:
           FORGE_READ_TOKEN: ${{ github.token }}
         run: |
           bash "$RUNNER_TEMP/forge/build/scripts/check-repo.sh" --skip-c7 --pins . | tee "$RUNNER_TEMP/check-repo.out"
-          grep -qF 'C5 pins ok (' "$RUNNER_TEMP/check-repo.out" || { echo "forge's check did not report the pin alignment (C5)"; exit 1; }
-          grep -qF 'C13 vendored copies ok (' "$RUNNER_TEMP/check-repo.out" || { echo "forge's check did not report the vendored copies (C13)"; exit 1; }
+          grep -qE '^check-repo: \.: C5 pins ok \(' "$RUNNER_TEMP/check-repo.out" || { echo "forge's check did not report the pin alignment (C5)"; exit 1; }
+          grep -qE '^check-repo: \.: C13 vendored copies ok \([1-9][0-9]* compared' "$RUNNER_TEMP/check-repo.out" || { echo "forge's check did not compare a vendored copy (C13)"; exit 1; }
 
   # `bazel test //... --config=ci` (the stale test of the BUILD files included) on the bazel label: Bazel 9.3.3 from the
   # image, the CI-only Bazel store at /bazel and the container rc at /etc/bazel.bazelrc. The runner checks the commit out
