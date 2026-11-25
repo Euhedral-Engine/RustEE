@@ -135,3 +135,37 @@ rust_test(
     ),
     version = "0.1.0",
 )
+
+rust_test(
+    name = "toolchain_pin_test",
+    compile_data = glob(
+        [
+            "README.md",
+            "tests/**",
+        ],
+        exclude = ["tests/**/*.rs"],
+        allow_empty = True,
+    ),
+    crate_name = "toolchain_pin",
+    crate_root = "tests/toolchain_pin.rs",
+    data = [
+        "//:MODULE.bazel",
+        "//:mise.toml",
+        "//:rust-toolchain.toml",
+    ],
+    deps = [":euhedral_hashing"],
+    edition = "2024",
+    lint_config = ":lints",
+    rustc_env = {
+        "CARGO_MANIFEST_DIR": "euhedral-hashing",
+        "CARGO_TARGET_TMPDIR": "unused-under-bazel",
+    },
+    srcs = glob(
+        [
+            "tests/toolchain_pin.rs",
+            "tests/*/**/*.rs",
+        ],
+        allow_empty = True,
+    ),
+    version = "0.1.0",
+)

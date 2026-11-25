@@ -1,5 +1,5 @@
 {
-  "checksum": "90a2327806772afc3079a69da912aedabbb8a90f08fa96a9b3c460dbfe60aa03",
+  "checksum": "fe70ae0f878c8e37d8b894a1bfeb06afa5c46f8f9c83450c5181a91de7cdc9da",
   "conditions": {
     "cfg(any(target_os = \"linux\", target_os = \"android\"))": [
       "x86_64-unknown-linux-gnu"
@@ -196,27 +196,6 @@
         }
       ],
       "version": "1.0.5"
-    },
-    "euhedral-bazel-gen 0.1.0": {
-      "common_attrs": {
-        "edition": "2024"
-      },
-      "library_target_name": "euhedral_bazel_gen",
-      "license": "Apache-2.0",
-      "license_ids": [
-        "Apache-2.0"
-      ],
-      "name": "euhedral-bazel-gen",
-      "repository": null,
-      "targets": [
-        {
-          "Library": {
-            "crate_name": "euhedral_bazel_gen",
-            "crate_root": "src/lib.rs"
-          }
-        }
-      ],
-      "version": "0.1.0"
     },
     "euhedral-benchmarks 0.1.0": {
       "common_attrs": {
@@ -1636,7 +1615,6 @@
     "ash 0.38.0+1.3.281"
   ],
   "workspace_members": {
-    "euhedral-bazel-gen 0.1.0": "tools/bazel-gen",
     "euhedral-benchmarks 0.1.0": "euhedral-benchmarks",
     "euhedral-core 0.1.0": "euhedral-core",
     "euhedral-data-structures 0.1.0": "euhedral-data-structures",

@@ -10,7 +10,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import affected as A  # noqa: E402
 
-NAMES = ["ds", "hash", "hw", "core", "graph", "io", "mem", "net", "gpu", "bench", "bazelgen"]
+NAMES = ["ds", "hash", "hw", "core", "graph", "io", "mem", "net", "gpu", "bench"]
 DEPS = {
     "ds": set(),
     "hash": set(),
@@ -22,12 +22,9 @@ DEPS = {
     "net": set(),
     "gpu": {"core", "graph", "mem", "ds", "hash", "hw"},
     "bench": {"core", "ds", "hw"},
-    "bazelgen": set(),
-}  # as the real workspace: benchmarks does not depend on graph, io, memory or gpu
-DIRS = {n: f"euhedral-{n}" for n in NAMES} | {"bazelgen": "tools/bazel-gen"}
+    }  # as the real workspace: benchmarks does not depend on graph, io, memory or gpu
+DIRS = {n: f"euhedral-{n}" for n in NAMES}
 G = A.Graph(DIRS, DEPS)
-REAL_BAZEL_GEN = A.BAZEL_GEN
-A.BAZEL_GEN = "bazelgen"  # the synthetic graph names the generator crate this way
 
 
 def run(*files):
@@ -45,17 +42,17 @@ class Affected(unittest.TestCase):
 
     def test_core_change(self):
         self.assertEqual(
-            run("euhedral-core/src/lib.rs"), (["bazelgen", "bench", "core", "gpu", "graph", "io", "mem"], False)
+            run("euhedral-core/src/lib.rs"), (["bench", "core", "gpu", "graph", "io", "mem"], False)
         )
 
     def test_gpu_change(self):
         # Nothing depends on gpu (benchmarks sits above it by layer but does not depend on it).
-        self.assertEqual(run("euhedral-gpu/src/x.rs"), (["bazelgen", "gpu"], False))
+        self.assertEqual(run("euhedral-gpu/src/x.rs"), (["gpu"], False))
 
     def test_leaf_and_layers_below_are_unrelated(self):
-        self.assertEqual(run("euhedral-io/src/a.rs"), (["bazelgen", "io"], False))
+        self.assertEqual(run("euhedral-io/src/a.rs"), (["io"], False))
         # The net crate has no dependency yet: nothing below it is affected by it, and it by nothing below.
-        self.assertEqual(run("euhedral-net/src/a.rs"), (["bazelgen", "net"], False))
+        self.assertEqual(run("euhedral-net/src/a.rs"), (["net"], False))
         self.assertEqual(run("euhedral-hash/src/a.rs")[0], sorted(set(NAMES) - {"ds", "hw", "net"}))
 
     def test_lowest_layer_change_is_everything_above(self):
@@ -82,23 +79,9 @@ class Affected(unittest.TestCase):
 
     def test_a_crates_build_file_affects_that_crate_and_the_stale_check(self):
         # A hand edit to a generated file makes it stale: the generator crate's stale test must run.
-        self.assertEqual(run("euhedral-io/BUILD.bazel"), (["bazelgen", "io"], False))
-        self.assertEqual(run("euhedral-gpu/BUILD.bazel"), (["bazelgen", "gpu"], False))
-        self.assertEqual(run("euhedral-gpu/kernels/BUILD.bazel"), (["bazelgen", "gpu"], False))
-
-    def test_the_inputs_of_the_stale_check_affect_the_generator_crate(self):
-        for f in [
-            "euhedral-gpu/Cargo.toml", "euhedral-gpu/src/a/b.rs", "euhedral-gpu/tests/t.rs", "euhedral-gpu/examples/e.rs",
-            "euhedral-gpu/benches/b.rs", "euhedral-gpu/build.rs",
-        ]:
-            self.assertEqual(run(f), (["bazelgen", "gpu"], False), f)
-        # Below a crate others depend on, the dependents come as before, with the generator crate added.
-        self.assertEqual(run("euhedral-ds/Cargo.toml")[0], sorted(set(NAMES) - {"hash", "net"}))
-        self.assertEqual(run("euhedral-io/src/x.rs"), (["bazelgen", "io"], False))
-
-    def test_other_files_of_a_crate_do_not_affect_the_generator_crate(self):
-        for f in ["euhedral-gpu/README.md", "euhedral-gpu/kernels/k.cu", "euhedral-gpu/Cargo.lock"]:
-            self.assertNotIn("bazelgen", run(f)[0], f)
+        self.assertEqual(run("euhedral-io/BUILD.bazel"), (["io"], False))
+        self.assertEqual(run("euhedral-gpu/BUILD.bazel"), (["gpu"], False))
+        self.assertEqual(run("euhedral-gpu/kernels/BUILD.bazel"), (["gpu"], False))
 
     def test_the_workflow_runs_the_workspace_jobs_in_full(self):
         for f in [".github/workflows/ci.yml", ".gitea/workflows/ci.yml"]:
@@ -120,19 +103,19 @@ class Affected(unittest.TestCase):
             self.assertEqual(run(f), (sorted(NAMES), True), f)
 
     def test_a_ci_file_beside_a_crate_change_adds_nothing(self):
-        self.assertEqual(run("scripts/ci/miri-toolchain", "euhedral-gpu/src/a.rs"), (["bazelgen", "gpu"], False))
+        self.assertEqual(run("scripts/ci/miri-toolchain", "euhedral-gpu/src/a.rs"), (["gpu"], False))
 
     def test_unknown_file_is_everything(self):
         self.assertTrue(run("tools/new.sh")[1])
 
     def test_crate_readme_counts_but_other_md_does_not(self):
-        self.assertEqual(run("euhedral-ds/README.md")[0], sorted(set(NAMES) - {"hash", "net", "bazelgen"}))
+        self.assertEqual(run("euhedral-ds/README.md")[0], sorted(set(NAMES) - {"hash", "net"}))
         self.assertEqual(run("euhedral-ds/GLOSSARY.md"), ([], False))
 
     def test_a_md_under_a_crates_target_directories_counts(self):
         # The BUILD globs take it as compile data (`src/**`, `tests/**`), so it is an input of the crate's targets.
         for d in ("src", "tests", "examples", "benches"):
-            self.assertEqual(run(f"euhedral-net/{d}/notes.md"), (["bazelgen", "net"], False), d)
+            self.assertEqual(run(f"euhedral-net/{d}/notes.md"), (["net"], False), d)
 
     def test_a_doc_that_a_crates_target_reads_affects_that_crate(self):
         # hot_fix_ratchet reads the audit doc: it is in the test's `data`, so a docs-only change to it still runs it.
@@ -201,7 +184,7 @@ class Affected(unittest.TestCase):
         self.assertEqual(self.crates_of(data, "docs/a.md"), (["c", "d"], False))
 
     def test_docs_plus_one_crate(self):
-        self.assertEqual(run("README.md", "euhedral-gpu/src/a.rs"), (["bazelgen", "gpu"], False))
+        self.assertEqual(run("README.md", "euhedral-gpu/src/a.rs"), (["gpu"], False))
 
     def test_nested_directories_map_to_the_longest_prefix(self):
         g = A.Graph({"a": "a", "b": "a/b"}, {"a": set(), "b": set()})
@@ -212,7 +195,7 @@ class Affected(unittest.TestCase):
         crates, everything, reason = A.affected(G, ["euhedral-gpu/src/a.rs"])
         out = A.outputs(G, crates, everything, reason)
         self.assertEqual(out["any"], "true")
-        self.assertEqual(out["args"], "-p bazelgen -p gpu")
+        self.assertEqual(out["args"], "-p gpu")
         self.assertEqual(out["gpu"], "true")
         self.assertEqual(out["core"], "false")
         crates, everything, reason = A.affected(G, ["Cargo.lock"])
@@ -334,10 +317,6 @@ class Miri(unittest.TestCase):
             self.assertTrue(all(f"-p {s['crate']} " in c for c in s["commands"]), s)
         self.assertEqual(A.shard_problems(shards), [])
         self.assertEqual([s["name"] for s in shards if s.get("canary")], ["hardware-utils: CPU sets"])
-
-    def test_the_generator_crate_is_in_the_real_workspace(self):
-        root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
-        self.assertIn(REAL_BAZEL_GEN, A.Graph.load(root).dirs)
 
     def test_seeds_are_split_into_jobs_that_cover_the_range_once(self):
         self.assertEqual(A.seed_ranges(1), [(0, 1)])

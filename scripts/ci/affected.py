@@ -14,9 +14,8 @@ tests/, examples/ or benches/ (compile data there) count for their crate. A file
 label (`//:docs/x.md` in a test's `data`) affects that member whatever it is, documentation included: the test reads it.
 
 The root Bazel files (MODULE.bazel, MODULE.bazel.lock, .bazelrc, .bazelversion, .bazelignore and the root
-BUILD.bazel) are root build files. A crate's own BUILD.bazel affects that crate; the generator crate's stale test
-(BAZEL_GEN) is also affected by any member's Cargo.toml and by any file under a member's src/, tests/, examples/ or
-benches/ or its build.rs.
+BUILD.bazel) are root build files. A crate's own BUILD.bazel affects that crate. The stale test of the BUILD files is
+a Bazel test of the root package, not a crate's: any change that affects a crate runs the Bazel job, which runs it.
 
 The CI files select less than a root build file does:
   .github/workflows/ci.yml, .gitea/workflows/ci.yml   the workspace jobs run in full (they validate the workflow);
@@ -85,14 +84,9 @@ EVERYTHING = [
     "scripts/ci/*",
 ]
 
-# The crate whose test reads every member's manifest and target files to see whether the generated BUILD files are stale
-# (docs/design/bazel.md). It is affected by any member's Cargo.toml, by anything under a member's STALE_INPUT_DIRS or
-# its build.rs: `git diff --name-only` cannot tell an added file from an edited one, and only an added or removed one can
-# make a BUILD file stale, so every change there counts. A BUILD file anywhere in a member is its output: a hand edit to
-# one makes it stale.
-BAZEL_GEN = "euhedral-bazel-gen"
+# A member's directories whose files are compile data or targets: a `.md` there counts for its crate (the stale test of
+# the BUILD files reads them too: docs/design/bazel.md). A BUILD file anywhere in a member is the generator's output.
 STALE_INPUT_DIRS = ("src/", "tests/", "examples/", "benches/")
-STALE_INPUT_FILES = ("Cargo.toml", "build.rs")
 BUILD_FILES = ("BUILD.bazel", "BUILD")
 
 # CI files that select less (see the module docstring); they are looked at before EVERYTHING.
@@ -259,12 +253,6 @@ def affected(graph, files, workflow_is_everything=True):
             if f.endswith(".md") and os.path.basename(f) != "README.md" and not inside.startswith(STALE_INPUT_DIRS):
                 continue
             seed.add(crate)
-            if BAZEL_GEN in graph.dirs and (
-                inside in STALE_INPUT_FILES
-                or inside.startswith(STALE_INPUT_DIRS)
-                or os.path.basename(inside) in BUILD_FILES
-            ):
-                seed.add(BAZEL_GEN)
         elif matches(f, EVERYTHING):
             return set(graph.dirs), True, f"{f} is a root build file"
         elif os.path.basename(f) in BUILD_FILES:

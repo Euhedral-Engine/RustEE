@@ -7,3 +7,8 @@ readme = "README.md"
 license = "Apache-2.0"
 
 [dependencies]
+
+# Bazel-only settings, which Cargo ignores (docs/design/bazel.md): the toolchain pin test reads the files that pin the
+# Rust version. It lives here, in a crate with no dependencies, because the shared generator has no test for it.
+[package.metadata.bazel.test.toolchain_pin]
+data = ["//:MODULE.bazel", "//:mise.toml", "//:rust-toolchain.toml"]

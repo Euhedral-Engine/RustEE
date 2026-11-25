@@ -62,8 +62,8 @@ Bazel builds and tests the same crates on Linux (`bazel build //...`, `bazel tes
 `gpu` and run with `bazel test --config=gpu //...` inside a card grant, e.g.
 `system-run --gpu shared:8 --mem 16G -- bazel test --config=gpu //...`; a test that finds no driver, card or NVRTC
 then fails instead of skipping). The `BUILD.bazel` files are generated from the Cargo manifests: after changing a
-crate's manifest or adding, removing or renaming a target, regenerate them with `bazel run //:gazelle` (or
-`cargo run -p euhedral-bazel-gen`) and commit them; see [`tools/bazel-gen`](tools/bazel-gen/README.md).
+crate's manifest or adding, removing or renaming a target, regenerate them with `bazel run //:gazelle` and commit them. The generator is the shared one in the `euhedral_build`
+module ([`build/module/bazel-gen`](build/module/bazel-gen/README.md)), configured by [`bazel_gen.toml`](bazel_gen.toml).
 
 ## Pull requests
 

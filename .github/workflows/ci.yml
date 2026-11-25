@@ -371,6 +371,11 @@ jobs:
             cmp "$kept/$lock" "$lock" || { echo "$lock is stale: run CARGO_BAZEL_REPIN=1 bazel mod deps --lockfile_mode=update and commit it"; exit 1; }
           done
 
+      # The stale test sees only the files the BUILD files gather (a runfiles copy), so a BUILD file added by hand outside them
+      # is found by the generator run in diff mode over the real tree: it fails naming every file that differs or is not written.
+      - name: The BUILD files are generated
+        run: bazel run //:gazelle --config=ci -- -mode=diff
+
       - name: Bazel test
         run: bazel test //... --config=ci
 

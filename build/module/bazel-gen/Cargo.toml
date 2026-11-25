@@ -1,0 +1,13 @@
+[package]
+name = "euhedral-bazel-gen"
+version = "0.2.0"
+edition = "2024"
+description = "Generates a Cargo workspace's Bazel BUILD files from its manifests (forge build/CONTRACTS.md C6)"
+readme = "README.md"
+license = "Apache-2.0"
+publish = false
+
+# Its own workspace: forge has no Cargo workspace around it.
+[workspace]
+
+[dependencies]
