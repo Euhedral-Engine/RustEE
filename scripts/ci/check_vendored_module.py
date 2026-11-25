@@ -72,7 +72,7 @@ def published_tree(registry, version):
 
 
 def without_module_version(text, where):
-    """`text` with the version string of its one module(...) call replaced by a fixed one."""
+    """(`text` with the version string of its one module(...) call blanked, that version or None)."""
     calls = list(re.finditer(r"^module\(", text, re.M))
     if len(calls) != 1:
         raise SystemExit("%s must have exactly one module( call at the start of a line" % where)
@@ -97,8 +97,9 @@ def without_module_version(text, where):
     args = text[start:i]
     if len(re.findall(r"\bversion\s*=", args)) > 1:
         raise SystemExit("%s: the module( call has more than one version" % where)
+    found = re.search(r'\bversion\s*=\s*"([^"]*)"', args)
     args = re.sub(r'\bversion\s*=\s*"[^"]*"', 'version = ""', args)
-    return text[:start] + args + text[i:]
+    return text[:start] + args + text[i:], found.group(1) if found else None
 
 
 def registry_module_differences(registry, version, root):
@@ -110,9 +111,15 @@ def registry_module_differences(registry, version, root):
         published = f.read()
     with open(os.path.join(root, "build", "module", "MODULE.bazel"), encoding="utf-8", newline="") as f:
         vendored = f.read()
-    if without_module_version(published, "the registry's MODULE.bazel") != without_module_version(vendored, "build/module/MODULE.bazel"):
-        return ["the registry's MODULE.bazel differs from build/module/MODULE.bazel beyond the module() version"]
-    return []
+    published, declared = without_module_version(published, "the registry's MODULE.bazel")
+    vendored, _ = without_module_version(vendored, "build/module/MODULE.bazel")
+    out = []
+    # The registry may append "+<build metadata>" to the pinned version; the part before the "+" must equal the pin exactly.
+    if declared is None or (declared != version and declared.partition("+")[0] != version):
+        out.append("the registry's MODULE.bazel declares module version %s, not the pinned %s" % (declared, version))
+    if published != vendored:
+        out.append("the registry's MODULE.bazel differs from build/module/MODULE.bazel beyond the module() version")
+    return out
 
 
 def check_metadata(registry, version):

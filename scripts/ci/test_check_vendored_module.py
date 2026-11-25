@@ -13,7 +13,7 @@ import check_vendored_module as cvm
 
 VERSION = "0.0.0-20260101000000"
 FILES = {
-    "MODULE.bazel": b'module(name = "euhedral_build")\n',
+    "MODULE.bazel": b'module(name = "euhedral_build", version = "0.1.0")\n',
     "platforms/BUILD.bazel": b"a\nb\n",
 }
 
@@ -47,7 +47,7 @@ def make_world(tmp, extra_members=()):
           b'bazel_dep(name = "euhedral_build", version = "%s")\n' % VERSION.encode())
     for name, data in FILES.items():
         write(os.path.join(root, "build", "module", name), data)
-    write(os.path.join(vdir, "MODULE.bazel"), FILES["MODULE.bazel"])
+    write(os.path.join(vdir, "MODULE.bazel"), FILES["MODULE.bazel"].replace(b"0.1.0", VERSION.encode()))
     write(os.path.join(registry, "modules", "euhedral_build", "metadata.json"),
           json.dumps({"versions": [VERSION], "yanked_versions": {}}).encode())
     return registry, root
@@ -190,7 +190,7 @@ class CheckVendoredModule(unittest.TestCase):
             # build/module's own MODULE.bazel is the archive's too, so only the registry's copy and the tree move together.
             body = b'# note\nmodule(name = "euhedral_build", version = "%s")\n\nbazel_dep(name = "platforms", version = "1.1.0")\n'
             write(self.module(root, "MODULE.bazel"), body % b"0.1.0")
-            write(self.registry_file(registry, VERSION, "MODULE.bazel"), body % b"0.0.0-x+abc")
+            write(self.registry_file(registry, VERSION, "MODULE.bazel"), body % (VERSION.encode() + b"+abc"))
             archive = self.registry_file(registry, VERSION, "source.tar.gz")
             with tarfile.open(archive) as tar:
                 members = [(m, tar.extractfile(m).read() if m.isfile() else None) for m in tar]
@@ -276,6 +276,48 @@ class CheckVendoredModule(unittest.TestCase):
     def test_yanked_versions_as_an_empty_string_fails(self):
         self.assert_bad_metadata(json.dumps({"versions": [VERSION], "yanked_versions": ""}),
                                  "yanked_versions is not an object")
+
+    def registry_module(self, data):
+        def edit(root, registry):
+            write(self.registry_file(registry, VERSION, "MODULE.bazel"), data)
+        return edit
+
+    def test_a_registry_module_version_other_than_the_pin_fails(self):
+        code, said = self.check(self.registry_module(b'module(name = "euhedral_build", version = "9.9.9")\n'))
+        self.assertEqual(code, 1)
+        self.assertIn("declares module version 9.9.9, not the pinned", said)
+
+    def test_a_registry_module_version_with_a_longer_prefix_fails(self):
+        data = b'module(name = "euhedral_build", version = "%sX+abc")\n' % VERSION.encode()
+        code, said = self.check(self.registry_module(data))
+        self.assertEqual(code, 1)
+        self.assertIn("declares module version", said)
+
+    def test_a_registry_module_without_a_version_fails(self):
+        code, said = self.check(self.registry_module(b'module(name = "euhedral_build")\n'))
+        self.assertEqual(code, 1)
+        self.assertIn("declares module version None", said)
+
+    def test_a_registry_module_with_no_module_call_fails(self):
+        code, said = self.check(self.registry_module(b'bazel_dep(name = "a", version = "1")\n'))
+        self.assertEqual(code, 1)
+        self.assertIn("exactly one module( call", said)
+
+    def test_a_registry_module_with_two_module_calls_fails(self):
+        one = b'module(name = "euhedral_build", version = "%s")\n' % VERSION.encode()
+        code, said = self.check(self.registry_module(one + one))
+        self.assertEqual(code, 1)
+        self.assertIn("exactly one module( call", said)
+
+    def test_a_registry_module_with_an_unclosed_call_fails(self):
+        code, said = self.check(self.registry_module(b'module(name = "euhedral_build", version = "1"\n'))
+        self.assertEqual(code, 1)
+        self.assertIn("is not closed", said)
+
+    def test_a_registry_module_with_the_version_twice_fails(self):
+        code, said = self.check(self.registry_module(b'module(name = "euhedral_build", version = "1", version = "2")\n'))
+        self.assertEqual(code, 1)
+        self.assertIn("more than one version", said)
 
 
 if __name__ == "__main__":
