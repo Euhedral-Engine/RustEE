@@ -470,15 +470,15 @@ fn audit() -> String {
 #[test]
 fn a_member_under_tools_is_walked() {
     let manifest =
-        "[workspace]\nmembers = [\"euhedral-core\", \"tools/bazel-gen\"]\nresolver = \"3\"\n";
+        "[workspace]\nmembers = [\"euhedral-core\", \"tools/build-tool\"]\nresolver = \"3\"\n";
     assert_eq!(
         parse_members(manifest).expect("a plain member list"),
-        ["euhedral-core", "tools/bazel-gen"]
+        ["euhedral-core", "tools/build-tool"]
     );
     let srcs = member_src_dirs(Path::new("ws"), manifest).expect("a plain member list");
     assert!(
-        srcs.contains(&Path::new("ws").join("tools").join("bazel-gen").join("src")),
-        "the member walk does not reach tools/bazel-gen/src: {srcs:?}"
+        srcs.contains(&Path::new("ws").join("tools").join("build-tool").join("src")),
+        "the member walk does not reach tools/build-tool/src: {srcs:?}"
     );
 }
 
