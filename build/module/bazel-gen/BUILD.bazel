@@ -1,0 +1,27 @@
+# The shared Rust BUILD generator (README.md; build/CONTRACTS.md C6). A workspace runs it through defs.bzl's rules; its
+# tests are forge's (//build/bazel-gen), so a consumer builds only the binary.
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library")
+
+exports_files(["defs.bzl"])
+
+rust_library(
+    name = "euhedral_bazel_gen",
+    srcs = glob(
+        ["src/**/*.rs"],
+        exclude = ["src/main.rs"],
+    ),
+    compile_data = ["README.md"],
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    version = "0.2.0",
+    visibility = ["//visibility:public"],
+)
+
+rust_binary(
+    name = "euhedral-bazel-gen",
+    srcs = ["src/main.rs"],
+    edition = "2024",
+    version = "0.2.0",
+    visibility = ["//visibility:public"],
+    deps = [":euhedral_bazel_gen"],
+)

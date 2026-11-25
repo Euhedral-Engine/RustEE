@@ -9,13 +9,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::cfg::Applies;
+use crate::config::Config;
 use crate::model::{Dep, DepKind, Workspace};
-
-/// The feature that loads the CUDA driver: a test whose graph has it opens the card.
-pub const DEVICE_FEATURE: (&str, &str) = ("euhedral-memory", "cuda");
-
-/// The feature the cuda testing world adds to every member that declares it.
-pub const CUDA: &str = "cuda";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum World {
@@ -23,7 +18,7 @@ pub enum World {
     Production = 0,
     /// `cargo test --workspace`: defaults plus every member's dev-dependency features.
     Testing = 1,
-    /// Testing plus `cuda` on every member that has it.
+    /// Testing plus the device feature (`[device] feature`, `cuda`) on every member that has it.
     CudaTesting = 2,
 }
 
@@ -34,22 +29,36 @@ impl World {
         self != World::Production
     }
 
-    /// The suffix of the world's library targets.
-    pub fn lib_suffix(self) -> &'static str {
+    /// The worlds the configuration builds: the device world only with a `[device]`.
+    pub fn built(config: &Config) -> Vec<World> {
+        let count = if config.device.is_some() { 3 } else { 2 };
+        World::ALL[..count].to_vec()
+    }
+
+    /// The suffix of the world's library targets (`_testing`, `_cuda_testing`).
+    pub fn lib_suffix(self, config: &Config) -> String {
         match self {
-            World::Production => "",
-            World::Testing => "_testing",
-            World::CudaTesting => "_cuda_testing",
+            World::Production => String::new(),
+            World::Testing => "_testing".to_owned(),
+            World::CudaTesting => format!("_{}_testing", device_feature(config)),
         }
     }
 
     /// The infix of the world's test targets (`unit_test`, `unit_cuda_test`).
-    pub fn test_infix(self) -> &'static str {
+    pub fn test_infix(self, config: &Config) -> String {
         match self {
-            World::Production | World::Testing => "",
-            World::CudaTesting => "_cuda",
+            World::Production | World::Testing => String::new(),
+            World::CudaTesting => format!("_{}", device_feature(config)),
         }
     }
+}
+
+fn device_feature(config: &Config) -> &str {
+    config
+        .device
+        .as_ref()
+        .map(|d| d.feature.as_str())
+        .expect("the device world exists only with a [device]")
 }
 
 /// The features and optional dependencies one resolution turned on.
@@ -59,6 +68,9 @@ pub struct Resolved {
     pub features: BTreeMap<String, BTreeSet<String>>,
     /// The optional dependencies turned on, by package.
     pub optional: BTreeMap<String, BTreeSet<String>>,
+    /// The features requested of crates of other modules (`[external.crates]`), by crate: the world those crates are
+    /// taken from has to have them. A renamed dependency is under its key and under its package name.
+    pub external: BTreeMap<String, BTreeSet<String>>,
     roots: BTreeSet<String>,
     dev: bool,
 }
@@ -81,7 +93,7 @@ impl Resolved {
     /// dev-dependency is on only for a selected member in a world that builds tests.
     pub fn dep_on(&self, package: &str, dep: &Dep) -> bool {
         let kind_on = match dep.kind {
-            DepKind::Normal => true,
+            DepKind::Normal | DepKind::Build => true,
             DepKind::Dev => self.dev && self.roots.contains(package),
         };
         kind_on
@@ -89,7 +101,7 @@ impl Resolved {
                 || self
                     .optional
                     .get(package)
-                    .is_some_and(|o| o.contains(&dep.name)))
+                    .is_some_and(|o| o.contains(dep.key())))
     }
 }
 
@@ -111,7 +123,7 @@ impl Resolver<'_> {
     ) -> impl Iterator<Item = &'b Dep> + use<'b> {
         let dev = self.out.dev && self.out.roots.contains(&package.name);
         package.deps.iter().filter(move |d| {
-            (d.kind == DepKind::Normal || dev) && d.applies != Applies::On(Vec::new())
+            (d.kind != DepKind::Dev || dev) && d.applies != Applies::On(Vec::new())
         })
     }
 
@@ -135,6 +147,16 @@ impl Resolver<'_> {
     /// An active dependency edge: a member gets the edge's features.
     fn edge(&mut self, dep: &Dep) -> Result<(), String> {
         let Some(member) = &dep.member else {
+            if let Some(key) = self.ws.config.external_key(dep) {
+                // Under the entry's key and under the package: `[device] external` names either.
+                for name in [key, dep.name.as_str()] {
+                    self.out
+                        .external
+                        .entry(name.to_owned())
+                        .or_default()
+                        .extend(dep.features.iter().cloned());
+                }
+            }
             return Ok(());
         };
         self.activate(member)?;
@@ -160,10 +182,10 @@ impl Resolver<'_> {
         let pkg = self.package(package)?;
         let deps: Vec<Dep> = self
             .deps_in_build(pkg)
-            .filter(|d| d.optional && d.name == dep_name)
+            .filter(|d| d.optional && d.key() == dep_name)
             .cloned()
             .collect();
-        if deps.is_empty() && !pkg.deps.iter().any(|d| d.optional && d.name == dep_name) {
+        if deps.is_empty() && !pkg.deps.iter().any(|d| d.optional && d.key() == dep_name) {
             return Err(format!("{package} has no optional dependency {dep_name}"));
         }
         for dep in deps {
@@ -196,19 +218,35 @@ impl Resolver<'_> {
                 let pkg = self.package(package)?;
                 let deps: Vec<Dep> = self
                     .deps_in_build(pkg)
-                    .filter(|d| d.name == dep_name)
+                    .filter(|d| d.key() == dep_name)
                     .cloned()
                     .collect();
-                if !pkg.deps.iter().any(|d| d.name == dep_name) {
+                if !pkg.deps.iter().any(|d| d.key() == dep_name) {
                     return Err(format!(
                         "{package} feature `{feature}` names `{entry}`, but {package} has no dependency {dep_name}"
                     ));
                 }
                 for dep in deps {
+                    if dep.member.is_none()
+                        && let Some(key) = self.ws.config.external_key(&dep)
+                    {
+                        if dep.optional {
+                            self.optional(package, dep_name)?;
+                        }
+                        for name in [key, dep.name.as_str()] {
+                            self.out
+                                .external
+                                .entry(name.to_owned())
+                                .or_default()
+                                .insert(dep_feature.to_owned());
+                        }
+                        continue;
+                    }
                     let Some(member) = &dep.member else {
                         return Err(format!(
                             "{package} feature `{feature}` sets the third-party feature `{entry}`: not modelled \
-                             (it needs a crate.annotation in MODULE.bazel and a generator change)"
+                             (it needs a crate.annotation in MODULE.bazel and a generator change; a crate of another \
+                             Bazel module goes in [external.crates] of bazel_gen.toml)"
                         ));
                     };
                     if dep.optional {
@@ -258,35 +296,56 @@ pub fn resolve(
 
 /// The features of every member in `world`.
 pub fn resolve_world(ws: &Workspace, world: World) -> Result<Resolved, String> {
-    let (device_crate, device_feature) = DEVICE_FEATURE;
-    if !ws
-        .package(device_crate)
-        .is_some_and(|p| p.features.contains_key(device_feature))
-    {
-        // The tags and the testing-world refusal look for this feature by name: without it they would pass silently.
-        return Err(format!(
-            "no member {device_crate} with the feature `{device_feature}`: the generator finds the device backend by \
-             that name (DEVICE_FEATURE in tools/bazel-gen/src/worlds.rs); update it with the rename"
-        ));
+    let device = ws.config.device.as_ref();
+    if let Some(member) = device.and_then(|d| d.member.as_deref()) {
+        let feature = &device.expect("a member is a device's").feature;
+        if !ws
+            .package(member)
+            .is_some_and(|p| p.features.contains_key(feature.as_str()))
+        {
+            // The tags and the testing-world refusal look for this feature by name: without it they would pass silently.
+            return Err(format!(
+                "no member {member} with the feature `{feature}`: the generator finds the device backend by that name \
+                 ([device] in bazel_gen.toml); update it with the rename"
+            ));
+        }
     }
     let members: Vec<&str> = ws.packages.iter().map(|p| p.name.as_str()).collect();
-    let cuda = |name: &str| -> Vec<String> {
-        let has = ws
-            .package(name)
-            .is_some_and(|p| p.features.contains_key(CUDA));
-        if world == World::CudaTesting && has {
-            vec![CUDA.to_owned()]
-        } else {
-            Vec::new()
+    let extras = |name: &str| -> Vec<String> {
+        match device {
+            Some(device)
+                if world == World::CudaTesting
+                    && ws
+                        .package(name)
+                        .is_some_and(|p| p.features.contains_key(device.feature.as_str())) =>
+            {
+                vec![device.feature.clone()]
+            }
+            _ => Vec::new(),
         }
     };
-    let resolved = resolve(ws, &members, &cuda, world.builds_tests())?;
-    if world == World::Testing && resolved.has(device_crate, device_feature) {
-        return Err(format!(
-            "the testing world resolves {device_crate}/{device_feature}: a member's dependency turns on the device \
-             backend, so its tests would open the card untagged. Remove that feature request; the cuda testing world \
-             builds those tests"
-        ));
+    let resolved = resolve(ws, &members, &extras, world.builds_tests())?;
+    if world == World::Testing
+        && let Some(device) = device
+    {
+        let opened = device
+            .member
+            .iter()
+            .filter(|m| resolved.has(m, &device.feature))
+            .chain(device.external.iter().filter(|c| {
+                resolved
+                    .external
+                    .get(*c)
+                    .is_some_and(|f| f.contains(&device.feature))
+            }))
+            .next();
+        if let Some(opened) = opened {
+            return Err(format!(
+                "the testing world resolves {opened}/{}: a member's dependency turns on the device backend, so its \
+                 tests would open the card untagged. Remove that feature request; the {} testing world builds those tests",
+                device.feature, device.feature
+            ));
+        }
     }
     if world == World::Production {
         // One consistent world: every member a member reaches when built alone must have the features it has with all of

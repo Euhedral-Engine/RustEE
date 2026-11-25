@@ -28,7 +28,7 @@ fn mise_field(mise: &str, field: &str) -> Option<String> {
 }
 
 fn read(name: &str) -> String {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
     std::fs::read_to_string(root.join(name)).unwrap_or_else(|e| panic!("read {name}: {e}"))
 }
 
@@ -115,7 +115,7 @@ fn check(mise: &str, toolchain: &str, module: Option<&str>) -> Result<(), String
 #[test]
 fn the_toolchain_pins_agree() {
     let module = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../MODULE.bazel")
+        .join("../MODULE.bazel")
         .exists()
         .then(|| read("MODULE.bazel"));
     if let Err(e) = check(
