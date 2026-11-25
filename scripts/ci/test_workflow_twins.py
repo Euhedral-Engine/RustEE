@@ -45,13 +45,7 @@ CHANGES_OUTPUT = re.compile(r"needs\.changes\.outputs\.(\w+)")
 CALLS = {"windows": "euhedral/ci/.gitea/workflows/bazel-windows.yml@refs/tags/v5"}
 APP_SECRETS = ["GH_APP_ID", "GH_APP_INSTALLATION_ID", "GH_APP_PRIVATE_KEY_B64"]
 BAZEL_WINDOWS = "bazel test //... --config=ci --platforms=@euhedral_build//platforms:windows_x86_64"
-SHORT_PATHS = """{
-  echo "startup --output_base=C:/b"
-  echo "common --experimental_platform_in_output_dir"
-  echo "common --experimental_override_platform_cpu_name=@euhedral_build//platforms:windows_x86_64=w"
-  echo "common --compilation_mode=dbg"
-} > user.bazelrc
-"""
+SHORT_OUTPUT_BASE = 'echo "startup --output_base=C:/b" > user.bazelrc'
 
 
 def steps(doc, job):
@@ -351,15 +345,35 @@ class Gitea(unittest.TestCase):
         self.assertEqual(job["needs"], "changes")
         self.assertEqual(job["if"], "needs.changes.outputs.any == 'true' && inputs.only_os != 'ubuntu-latest'")
         self.assertEqual(job["defaults"], {"run": {"shell": "bash"}})
-        # The output paths are short so that link.exe can open the doc tests' inputs (it takes no path of 260 characters).
+        # The output base is short so that link.exe can open the doc tests' inputs (it takes no path of 260 characters); the
+        # other path flags are the repository's .bazelrc (test_the_windows_path_flags_are_in_bazelrc).
         self.assertEqual(steps(GITHUB, "bazel-windows")[1:], [
             step(GITHUB, "bazel", "Bazel is the version in .bazelversion (github)"),
-            {"name": "Short output paths (github)", "run": SHORT_PATHS},
+            {"name": "Short output base (github)", "run": SHORT_OUTPUT_BASE},
             {"name": "Bazel test on the Windows platform", "env": {"MSYS_NO_PATHCONV": "1"}, "run": BAZEL_WINDOWS},
             {"name": "Stop the Bazel server", "if": "always()", "run": "bazel shutdown"},
         ])
         self.assertEqual(steps(GITHUB, "bazel-windows")[0], {"uses": "actions/checkout@v4"})
         self.assertIn("bazel-windows", GITHUB["jobs"]["ci-ok"]["needs"])
+
+    def test_the_windows_path_flags_are_in_bazelrc(self):
+        # The Windows job's only machine-layer line is the output base; the rest of the path budget is the repository's.
+        with open(os.path.join(ROOT, ".bazelrc")) as f:
+            lines = [re.sub(r"#.*", "", l).strip() for l in f]
+        last = {}
+        for line in lines:
+            m = re.match(r"common:windows\s+(--[\w]+)(?:=(\S*))?$", line)
+            if m:
+                last[m.group(1)] = line
+        for flag, line in {
+            "--platforms": "common:windows --platforms=@euhedral_build//platforms:windows_x86_64",
+            "--experimental_platform_in_output_dir": "common:windows --experimental_platform_in_output_dir",
+            "--experimental_override_platform_cpu_name":
+                "common:windows --experimental_override_platform_cpu_name=@euhedral_build//platforms:windows_x86_64=w",
+            "--compilation_mode": "common:windows --compilation_mode=dbg",
+        }.items():
+            # The last line decides: a later line for the same flag would override it.
+            self.assertEqual(last.get(flag), line)
 
     def test_no_host_or_port_is_written_in_either_workflow(self):
         for path in (".gitea/workflows/ci.yml", ".github/workflows/ci.yml"):
