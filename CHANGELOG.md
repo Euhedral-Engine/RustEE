@@ -11,9 +11,9 @@ semantics and the tests that pin it.
 
 **How to use.** To bump, change the version in `MODULE.bazel`, replace `build/module` with the new archive's tree, and refresh the locks. `python3 scripts/ci/check_vendored_module.py <registry dir>` reports what differs.
 
-**Semantics.** The check reads the version from `MODULE.bazel`, verifies the archive's sha256 against its `source.json`, and fails on any added, missing or changed file. It fails when the registry copy is missing. The generated BUILD files and the platforms are unchanged.
+**Semantics.** The check reads the version from `MODULE.bazel`, verifies the archive's sha256 against its `source.json`, and fails on any added, missing or changed file. It also fails on any `source.json` key besides `url`, `integrity` and `strip_prefix` (patches, overlay and the like change what Bazel builds) and on a `strip_prefix` other than `euhedral_build`; on a registry `MODULE.bazel` (the file Bazel resolves dependencies from) that differs from `build/module/MODULE.bazel` in anything but the `version` of the `module()` call, or is missing; and on a version that `metadata.json` yanks (the message carries the reason) or does not list. It fails when the registry copy is missing. The generated BUILD files and the platforms are unchanged.
 
-**Tests.** `scripts/ci/test_check_vendored_module.py`: a matching copy passes; one byte of drift, a tampered archive and an unpublished version fail. The workflow twin test knows the Gitea-only step.
+**Tests.** `scripts/ci/test_check_vendored_module.py`: a matching copy passes, as does one whose registry `MODULE.bazel` differs only in the `module()` version; one byte of drift, a tampered archive, an unpublished version, `patches`, `overlay`, an unknown `source.json` key, a changed `strip_prefix`, a registry `MODULE.bazel` with an added dependency or missing, a yanked version and a version absent from `metadata.json` fail. The workflow twin test knows the Gitea-only step.
 
 ## euhedral-hashing's package leaves out the workspace toolchain pin test (build) (2026-11-24)
 

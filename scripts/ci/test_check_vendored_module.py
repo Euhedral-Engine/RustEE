@@ -47,6 +47,9 @@ def make_world(tmp, extra_members=()):
           b'bazel_dep(name = "euhedral_build", version = "%s")\n' % VERSION.encode())
     for name, data in FILES.items():
         write(os.path.join(root, "build", "module", name), data)
+    write(os.path.join(vdir, "MODULE.bazel"), FILES["MODULE.bazel"])
+    write(os.path.join(registry, "modules", "euhedral_build", "metadata.json"),
+          json.dumps({"versions": [VERSION], "yanked_versions": {}}).encode())
     return registry, root
 
 
@@ -132,6 +135,97 @@ class CheckVendoredModule(unittest.TestCase):
         code, said = self.check(lambda root, registry: shutil.rmtree(registry))
         self.assertEqual(code, 1)
         self.assertIn("is not in the registry", said)
+
+    def registry_file(self, registry, *parts):
+        return os.path.join(registry, "modules", "euhedral_build", *parts)
+
+    def edit_source(self, **changes):
+        def edit(root, registry):
+            path = self.registry_file(registry, VERSION, "source.json")
+            with open(path, encoding="utf-8") as f:
+                source = json.load(f)
+            source.update(changes)
+            write(path, json.dumps(source).encode())
+        return edit
+
+    def test_patches_in_source_json_fail(self):
+        code, said = self.check(self.edit_source(patches={"a.patch": "sha256-x"}, patch_strip=1))
+        self.assertEqual(code, 1)
+        self.assertIn("patch_strip, patches", said)
+
+    def test_an_overlay_in_source_json_fails(self):
+        code, said = self.check(self.edit_source(overlay={"BUILD": "sha256-x"}))
+        self.assertEqual(code, 1)
+        self.assertIn("overlay", said)
+
+    def test_an_unknown_key_in_source_json_fails(self):
+        code, said = self.check(self.edit_source(archive_type="zip"))
+        self.assertEqual(code, 1)
+        self.assertIn("archive_type", said)
+
+    def test_a_different_strip_prefix_fails(self):
+        code, said = self.check(self.edit_source(strip_prefix="other"))
+        self.assertEqual(code, 1)
+        self.assertIn("strip_prefix", said)
+
+    def test_a_registry_module_with_an_added_dependency_fails(self):
+        def add(root, registry):
+            with open(self.registry_file(registry, VERSION, "MODULE.bazel"), "ab") as f:
+                f.write(b'bazel_dep(name = "extra", version = "1.0")\n')
+        code, said = self.check(add)
+        self.assertEqual(code, 1)
+        self.assertIn("beyond the module() version", said)
+
+    def test_a_registry_module_that_differs_in_another_module_argument_fails(self):
+        def rename(root, registry):
+            write(self.registry_file(registry, VERSION, "MODULE.bazel"),
+                  b'module(name = "euhedral_build", version = "1", compatibility_level = 2)\n')
+            write(self.module(root, "MODULE.bazel"), b'module(name = "euhedral_build", version = "2")\n')
+        code, said = self.check(rename)
+        self.assertEqual(code, 1)
+        self.assertIn("beyond the module() version", said)
+
+    def test_a_registry_module_differing_only_in_the_module_version_passes(self):
+        def versions(root, registry):
+            # build/module's own MODULE.bazel is the archive's too, so only the registry's copy and the tree move together.
+            body = b'# note\nmodule(name = "euhedral_build", version = "%s")\n\nbazel_dep(name = "platforms", version = "1.1.0")\n'
+            write(self.module(root, "MODULE.bazel"), body % b"0.1.0")
+            write(self.registry_file(registry, VERSION, "MODULE.bazel"), body % b"0.0.0-x+abc")
+            archive = self.registry_file(registry, VERSION, "source.tar.gz")
+            with tarfile.open(archive) as tar:
+                members = [(m, tar.extractfile(m).read() if m.isfile() else None) for m in tar]
+            buf = io.BytesIO()
+            with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+                for m, data in members:
+                    if m.name == "euhedral_build/MODULE.bazel":
+                        data, m.size = body % b"0.1.0", len(body % b"0.1.0")
+                    tar.addfile(m, io.BytesIO(data) if data is not None else None)
+            blob = buf.getvalue()
+            write(archive, blob)
+            integrity = "sha256-" + base64.b64encode(hashlib.sha256(blob).digest()).decode()
+            write(self.registry_file(registry, VERSION, "source.json"),
+                  json.dumps({"integrity": integrity, "strip_prefix": "euhedral_build"}).encode())
+        self.assertEqual(self.check(versions)[0], 0)
+
+    def test_a_missing_registry_module_fails(self):
+        code, said = self.check(lambda root, registry: os.remove(self.registry_file(registry, VERSION, "MODULE.bazel")))
+        self.assertEqual(code, 1)
+        self.assertIn("has no MODULE.bazel", said)
+
+    def test_a_yanked_version_fails(self):
+        def yank(root, registry):
+            write(self.registry_file(registry, "metadata.json"),
+                  json.dumps({"versions": [VERSION], "yanked_versions": {VERSION: "broken build"}}).encode())
+        code, said = self.check(yank)
+        self.assertEqual(code, 1)
+        self.assertIn("is yanked: broken build", said)
+
+    def test_a_version_missing_from_metadata_fails(self):
+        def drop(root, registry):
+            write(self.registry_file(registry, "metadata.json"), json.dumps({"versions": [], "yanked_versions": {}}).encode())
+        code, said = self.check(drop)
+        self.assertEqual(code, 1)
+        self.assertIn("not in metadata.json's versions", said)
 
 
 if __name__ == "__main__":
