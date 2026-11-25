@@ -3,7 +3,7 @@
 
 Reads the version from the bazel_dep of MODULE.bazel, finds that version's archive in the registry directory,
 checks the archive against the integrity in its source.json, and compares the archive's tree with build/module
-byte for byte.
+byte for byte (and the executable bit of each file). Symlinks and other special files fail.
 Usage: check_vendored_module.py [registry dir (default /registry)] [repo root (default: this repo)]
 """
 import base64
@@ -44,30 +44,39 @@ def published_tree(registry, version):
     files = {}
     with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as tar:
         for member in tar:
-            if not member.isfile():
+            if member.isdir():
                 continue
             name = member.name
+            if not member.isfile():
+                raise SystemExit("the archive entry %s is not a regular file or a directory" % name)
             if not name.startswith(prefix) or ".." in name.split("/"):
                 raise SystemExit("unexpected archive entry %s" % name)
-            files[name[len(prefix):]] = tar.extractfile(member).read()
+            files[name[len(prefix):]] = (tar.extractfile(member).read(), bool(member.mode & 0o111))
     return files
 
 
 def vendored_tree(root):
     base = os.path.join(root, "build", "module")
+    if os.path.islink(base):
+        raise SystemExit("build/module is a symlink")
     files = {}
-    for here, _, names in os.walk(base):
+    for here, dirs, names in os.walk(base):
+        for name in dirs + names:
+            if os.path.islink(os.path.join(here, name)):
+                raise SystemExit("%s is a symlink" % os.path.relpath(os.path.join(here, name), root))
         for name in names:
             path = os.path.join(here, name)
             with open(path, "rb") as f:
-                files[os.path.relpath(path, base).replace(os.sep, "/")] = f.read()
+                files[os.path.relpath(path, base).replace(os.sep, "/")] = (f.read(), bool(os.stat(path).st_mode & 0o111))
     return files
 
 
 def differences(published, vendored):
     out = ["only in the published module: %s" % p for p in sorted(set(published) - set(vendored))]
     out += ["only in build/module: %s" % p for p in sorted(set(vendored) - set(published))]
-    out += ["differs: %s" % p for p in sorted(set(published) & set(vendored)) if published[p] != vendored[p]]
+    both = sorted(set(published) & set(vendored))
+    out += ["differs: %s" % p for p in both if published[p][0] != vendored[p][0]]
+    out += ["executable bit differs: %s" % p for p in both if published[p][1] != vendored[p][1]]
     return out
 
 
