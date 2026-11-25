@@ -409,7 +409,8 @@ jobs:
 
       # MSVC's link.exe opens no path of 260 characters or more, and a doc test links the toolchain's rlibs from its
       # runfiles directory (docs/design/bazel.md, "Windows path budget"). The repository's .bazelrc holds the project's
-      # flags for that (`common:windows`); the output base is a machine path, so it goes in user.bazelrc, the machine's layer:
+      # flags for that (`common:windows`); the output base is a machine path, so it is not in that file. It goes in user.bazelrc, the personal layer, for now: forge's machine layer has no Windows
+      # output-base setting yet (euhedral/forge#249):
       # a short one, not the runner's profile directory.
       - name: Short output base (github)
         run: echo "startup --output_base=C:/b" > user.bazelrc

@@ -360,12 +360,20 @@ class Gitea(unittest.TestCase):
         # The Windows job's only machine-layer line is the output base; the rest of the path budget is the repository's.
         with open(os.path.join(ROOT, ".bazelrc")) as f:
             lines = [re.sub(r"#.*", "", l).strip() for l in f]
-        for flag in (
-            "common:windows --experimental_platform_in_output_dir",
-            "common:windows --experimental_override_platform_cpu_name=@euhedral_build//platforms:windows_x86_64=w",
-            "common:windows --compilation_mode=dbg",
-        ):
-            self.assertIn(flag, lines)
+        last = {}
+        for line in lines:
+            m = re.match(r"common:windows\s+(--[\w]+)(?:=(\S*))?$", line)
+            if m:
+                last[m.group(1)] = line
+        for flag, line in {
+            "--platforms": "common:windows --platforms=@euhedral_build//platforms:windows_x86_64",
+            "--experimental_platform_in_output_dir": "common:windows --experimental_platform_in_output_dir",
+            "--experimental_override_platform_cpu_name":
+                "common:windows --experimental_override_platform_cpu_name=@euhedral_build//platforms:windows_x86_64=w",
+            "--compilation_mode": "common:windows --compilation_mode=dbg",
+        }.items():
+            # The last line decides: a later line for the same flag would override it.
+            self.assertEqual(last.get(flag), line)
 
     def test_no_host_or_port_is_written_in_either_workflow(self):
         for path in (".gitea/workflows/ci.yml", ".github/workflows/ci.yml"):

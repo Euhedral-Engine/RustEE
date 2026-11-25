@@ -7,9 +7,9 @@ semantics and the tests that pin it.
 
 **What.** `--experimental_platform_in_output_dir`, `--experimental_override_platform_cpu_name=...=w` and `--compilation_mode=dbg` move from the GitHub Windows job's `user.bazelrc` into the repository's `.bazelrc` as `common:windows` lines. The job writes only `startup --output_base=C:/b`. The design document and the README give the path budget.
 
-**Why.** MSVC's linker opens no path of 260 characters or more; with the four settings the longest path (a doc test's input in `euhedral-data-structures`) is 256. Only the output base is a machine path, so only it belongs in the machine layer; the rest are project flags a Windows developer should not have to know.
+**Why.** MSVC's linker opens no path of 260 characters or more; with the four settings the longest path (a doc test's input in `euhedral-data-structures`) is 256. Only the output base is a machine path, so only it belongs in the machine layer; the rest are project flags (with `--platforms` set to the platform the cpu-name override names, so a plain local `bazel test //...` gets the short directory too) a Windows developer should not have to know.
 
-**How to use.** On Windows, set a short output base in `user.bazelrc` or `~/.bazelrc` (`startup --output_base=C:/b`). Linux and macOS read nothing new.
+**How to use.** On Windows, set a short output base in `user.bazelrc` (`startup --output_base=C:/b`; the personal layer, until forge's machine layer can set it). Linux and macOS read nothing new.
 
 **Semantics.** The three lines apply only on a Windows host (`--enable_platform_specific_config`). A Windows build with a long output base still fails at link time (`LNK1181`). No source changes.
 

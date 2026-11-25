@@ -354,8 +354,8 @@ Rejected:
     `--experimental_override_platform_cpu_name=@euhedral_build//platforms:windows_x86_64=w` (the directory under
     `bazel-out` is `w-dbg` instead of `x64_windows-fastbuild`), and `--compilation_mode=dbg` (the same opt-level as
     fastbuild, plus debug info). The fourth, a short output base such as `startup --output_base=C:/b`, is a machine
-    path: it belongs in the machine layer (`~/.bazelrc` or `user.bazelrc`, forge's C3), and the repository's `.bazelrc`
-    may not hold it. The GitHub job writes it to `user.bazelrc`. A Windows machine with the default output base (under
+    path: it belongs in the machine layer (forge's C3), and the repository's `.bazelrc`
+    may not hold it. For now it goes in `user.bazelrc`, the personal layer, because forge's machine layer has no Windows output-base setting yet (euhedral/forge#249); the GitHub job writes it there. A Windows machine with the default output base (under
     the user's profile) fails at link time. forge's machine layer has no setting for it yet.
   - crate_universe resolves for `x86_64-unknown-linux-gnu` and `x86_64-pc-windows-msvc` (`supported_platform_triples`).
 - **Benchmarks (C7 `exclusive`):** the gate runs no benchmark today. The bins are built and their unit tests run. A

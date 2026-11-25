@@ -12,8 +12,11 @@ common:windows --enable_runfiles
 
 # Windows path budget: MSVC's link.exe opens no path of 260 characters or more, and a doc test links the toolchain's rlibs
 # from inside its runfiles tree (docs/design/bazel.md, "Windows path budget"). These three lines cut the longest path to
-# 256 once the machine's output base is short (the machine layer sets that one, not this file).
+# 256 once the output base is short (a machine path, so not set in this file).
 # The platform's directory under bazel-out is named by the platform, so the cpu name there is `w` rather than `x64_windows`.
+# A Windows host would otherwise target the host platform, whose directory is not renamed (`x64_windows-dbg`, about 266
+# characters); CI passes the same platform explicitly.
+common:windows --platforms=@euhedral_build//platforms:windows_x86_64
 common:windows --experimental_platform_in_output_dir
 common:windows --experimental_override_platform_cpu_name=@euhedral_build//platforms:windows_x86_64=w
 # `dbg` builds the same code as fastbuild (same opt-level) with debug info, and its directory name is 6 characters shorter.
