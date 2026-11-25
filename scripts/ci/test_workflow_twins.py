@@ -39,6 +39,7 @@ GITEA = load(".gitea/workflows/ci.yml")
 GITHUB = load(".github/workflows/ci.yml")
 TWIN_JOBS = ["changes", "workspace", "bazel", "miri-build", "miri", "ci-ok"]
 DOCKER_LABELS = {"arbiter-docker", "arbiter-docker-unconfined", "arbiter-docker-bazel", "arbiter-gpu"}
+ABSOLUTE_SHELL = "/usr/bin/bash --noprofile --norc -eo pipefail {0}"
 SECRETS = re.compile(r"\bsecrets\b")  # `secrets.X`, `toJSON(secrets)` and `secrets[...]` alike
 CHANGES_OUTPUT = re.compile(r"needs\.changes\.outputs\.(\w+)")
 # The Gitea jobs that call a reusable workflow, and the workflow each calls: every other job has its own steps.
@@ -523,7 +524,7 @@ class Bazel(unittest.TestCase):
     def test_the_repo_check_is_forges_main_and_fails_when_it_cannot_be_fetched(self):
         job = GITEA["jobs"]["check-repo"]
         self.assertEqual(job["runs-on"], "arbiter-docker")
-        self.assertEqual(job["defaults"], {"run": {"shell": "bash"}})
+        self.assertEqual(job["defaults"], {"run": {"shell": ABSOLUTE_SHELL}})
         self.assertIn("check-repo", GITEA["jobs"]["ci-ok"]["needs"])
         self.assertNotIn("check-repo", GITHUB["jobs"])
         names = ["Fetch forge's main (gitea)", "forge's C7 is the query the bazel job runs (gitea)",
@@ -536,8 +537,18 @@ class Bazel(unittest.TestCase):
             self.assertEqual(set(s), {"name", "env", "run"}, s["name"])  # no `if`, no `continue-on-error`
         self.assertEqual(fetch["env"], {"FORGE_URL": "${{ vars.FORGE_URL }}", "FORGE_TOKEN": "${{ github.token }}"} | SYSTEM_PATH)
         self.assertEqual(c7["env"], SYSTEM_PATH)
-        self.assertEqual(check["env"], SYSTEM_PATH)  # the token is the fetch's alone
-        self.assertEqual(check["run"], f"bash {FORGE_CHECK} --skip-c7 .")
+        # The token is the fetch's and the check's alone: C5 and C13 read it as FORGE_READ_TOKEN.
+        self.assertEqual(check["env"], SYSTEM_PATH | {
+            "GITHUB_SERVER_URL": "${{ github.server_url }}", "CHECK_PINS_BASE": "${{ github.server_url }}",
+            "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null", "FORGE_READ_TOKEN": "${{ github.token }}"})
+        self.assertEqual(check["env"]["PATH"], "/usr/bin:/bin")
+        self.assertIn(f"bash {FORGE_CHECK} --skip-c7 --pins . | tee ", check["run"])
+        # The pass lines are required, so a forge change that skips C5 or C13 fails the step.
+        self.assertIn("grep -qF 'C5 pins ok (' ", check["run"])
+        self.assertIn("grep -qF 'C13 vendored copies ok (' ", check["run"])
+        holders = [(n, s["name"]) for n, j in GITEA["jobs"].items() if n not in CALLS
+                   for s in j.get("steps", []) if "github.token" in json.dumps(s)]
+        self.assertEqual([h for h in holders if h[0] == "check-repo"], [("check-repo", fetch["name"]), ("check-repo", check["name"])])
         run = fetch["run"]
         self.assertIn('"$FORGE_URL/euhedral/forge.git" refs/heads/main\n', run)  # main by its full ref, nothing else
         self.assertIn('git -C "$RUNNER_TEMP/forge" checkout -q --detach FETCH_HEAD', run)

@@ -3,6 +3,18 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## The Gitea repo check runs the pin alignment and the vendored-copy check (build) (2026-11-25)
+
+**What.** The Gitea `check-repo` job runs forge's checker with `--pins`, so C5 (pin alignment) and C13 (a vendored copy of a published module is byte for byte that version's archive) run on every pull request. The step fails unless the output has both pass lines. Every step of the job runs under an absolute shell.
+
+**Why.** Both checks were skipped, so a drifted vendored copy was caught only by the `bazel` job's own script, and a later forge change that dropped either check would have gone unseen.
+
+**How to use.** Nothing to do. The job token reaches the checker as `FORGE_READ_TOKEN`, in that one step and the fetch step only, with `PATH=/usr/bin:/bin`.
+
+**Semantics.** forge's registry branch is fetched with the token; a failed fetch fails the step. `scripts/ci/check_vendored_module.py` and the `bazel` job are unchanged.
+
+**Tests.** `scripts/ci/test_workflow_twins.py` pins `--pins`, the two required pass lines, the token holders, the step's `PATH` and the absolute shell; it fails on the previous workflow.
+
 ## euhedral_build is a published version, and a check keeps the vendored copy equal to it (build) (2026-11-24)
 
 **What.** `MODULE.bazel` names `euhedral_build` at the registry version `0.0.0-20261125015307`. `build/module` is that version's source. `scripts/ci/check_vendored_module.py` compares the two, and the Gitea `bazel` job runs it.
