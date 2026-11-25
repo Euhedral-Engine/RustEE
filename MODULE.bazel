@@ -6,7 +6,7 @@ module(
 
 # The euhedral_build module (the version table and the shared platforms) is the one forge publishes in its private registry
 # (build/CONTRACTS.md C5); the version below is one that registry holds. RustEE, as the root module, builds against its own
-# copy in build/module (the published source, byte for byte, but one comment in platforms/BUILD.bazel) because the GitHub
+# copy in build/module (the published source, byte for byte) because the GitHub
 # Windows job cannot reach the registry; scripts/ci/check_vendored_module.py checks the copy against the published archive
 # in the Gitea job. Bazel ignores the override when RustEE is not the root module, so a consumer gets the published
 # version. build/ is in .bazelignore, so its files are not packages of this module. To bump: change the version, run

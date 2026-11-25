@@ -10,11 +10,9 @@ import unittest
 import check_vendored_module as cvm
 
 VERSION = "0.0.0-20260101000000"
-OLD_LINE = b"# a made-up published line"
-cvm.EXCEPTIONS = {"platforms/BUILD.bazel": (hashlib.sha256(OLD_LINE).hexdigest(), b"# a made-up vendored line")}
 FILES = {
     "MODULE.bazel": b'module(name = "euhedral_build")\n',
-    "platforms/BUILD.bazel": b"a\n" + OLD_LINE + b"\nb\n",
+    "platforms/BUILD.bazel": b"a\nb\n",
 }
 
 
@@ -41,8 +39,6 @@ def make_world(tmp, files=FILES):
     write(os.path.join(root, "MODULE.bazel"),
           b'bazel_dep(name = "euhedral_build", version = "%s")\n' % VERSION.encode())
     for name, data in files.items():
-        if name == "platforms/BUILD.bazel":
-            data = data.replace(OLD_LINE, cvm.EXCEPTIONS[name][1])
         write(os.path.join(root, "build", "module", name), data)
     return registry, root
 
