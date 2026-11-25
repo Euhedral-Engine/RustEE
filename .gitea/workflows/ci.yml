@@ -101,6 +101,7 @@ jobs:
           python3 scripts/ci/test_miri_build.py
           python3 scripts/ci/test_workflow_twins.py
           python3 scripts/ci/test_device_check.py
+          python3 scripts/ci/test_check_vendored_module.py
 
       - name: Compute the affected crates
         id: affected
@@ -541,6 +542,14 @@ jobs:
     steps:
       - name: Copy the runner's checkout (gitea)
         run: cp -a /checkout/. .
+
+      # The vendored build/module must be the published euhedral_build the root MODULE.bazel names (forge build/CONTRACTS.md
+      # C5, C8): this job holds the registry copy read-only at /registry, which the GitHub job cannot reach. It fails when the
+      # copy is missing, so the check cannot silently skip.
+      - name: The vendored euhedral_build is the published one (gitea)
+        run: |
+          test -d /registry/modules/euhedral_build || { echo "the registry copy is not mounted at /registry"; exit 1; }
+          python3 -I scripts/ci/check_vendored_module.py /registry .
 
       # crate_universe's own digest does not cover Cargo.lock or the manifests' contents, so a stale cargo-bazel-lock.json would
       # build silently: a repin on the copy must leave both locks as committed.

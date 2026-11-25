@@ -46,7 +46,7 @@ Arguments, each also read from the environment: `-mode=fix|diff` (`BAZEL_GEN_MOD
 
 Optional; every key has a default, and an unknown key or a value of the wrong type is refused. The file is not called
 `bazel-gen.toml` because Bazel leaves the root's `bazel-*` entries out of the execroot, so the stale test could not read
-it. The examples are `build/bazel-gen/examples/` in forge (RustEE's and Qwenbed's).
+it. The examples are in forge's `build/bazel-gen/examples/`.
 
 ```toml
 header = "# @generated ..."    # the first line of every file
@@ -59,14 +59,15 @@ lock_check = true              # the stale test also checks the crate hub's lock
 crate_lock = "cargo-bazel-lock.json"  # the hub's `lockfile`, if it has one: check it instead of MODULE.bazel.lock
 filegroups = { testdata = ["testdata/**"] }  # root filegroups, for tests that name them
 
-[device]                       # the graphics-card feature; without this table there is no device world
-member = "euhedral-memory"     # the member whose feature opens the card (RustEE); a consumer of RustEE has none
-external = ["euhedral-memory"] # external crates the testing world may not turn the feature on for
+[device]                       # the graphics-card feature(s): tags derived from them; a device world only with member or [external.crates]
+member = "example-memory"     # the member whose feature opens the card (the producer); a consumer of it has none
+external = ["example-memory"] # external crates (checked against [external.crates]); kept for existing configurations
 feature = "cuda"
+also = ["vulkan"]              # more device features; a crate resolved with any of them opens the card
 
 [external.crates]              # git dependencies built by another Bazel module
-euhedral-core = "@euhedral_rustee//euhedral-core"   # -> @euhedral_rustee//euhedral-core:euhedral_core<suffix>
-euhedral-gpu = { package = "@euhedral_rustee//euhedral-gpu", worlds = { device = "_testing" } }  # per crate
+example-core = "@euhedral_example//example-core"   # -> @euhedral_example//example-core:example_core<suffix>
+example-gpu = { package = "@euhedral_example//example-gpu", worlds = { device = "_testing" } }  # per crate
 
 [external.worlds]              # the label suffix of each world's build of an external crate
 production = ""
@@ -79,12 +80,51 @@ test_data = ["//:testdata", "Cargo.toml"]  # labels for the tests' data and comp
 build_script_env = { CUDA_HOME = "/opt/cuda" }   # the build script's `build_script_env` (what it reads from the machine)
 build_script_data = ["kernels/**"]         # globs of package files the build script reads: its `data`
 build_script_tags = ["external", "gpu"]    # tags of the build script target only (a package without a build.rs refuses all three)
+card_tests = false                         # true: this package's tests (and its dependents') open the card; false: its own never do
 ```
 
 A renamed git dependency (`k = { workspace = true, features = [...] }` over a workspace `k = { package = "p", git = ... }`)
 picks its world through its own entry: an `[external.crates]` entry named by the key (`k = { package = "@m//p", worlds =
 { ... } }`), else the package's entry. That is how one package appears in two feature sets: the package's entry and the
 key's entry give two suffixes. The target is always the package's crate name, never the key's.
+
+**The graphics card.** `[device] feature` (and `also`) name the features that open it. The generator derives which tests do
+and tags them; the configuration names no crate. A test, binary test or doc test opens the card, in every world, when its
+resolved graph links a crate that is resolved with a device feature on: any member (its own `cuda`, a dependency's request,
+a `default` that includes it), a crate of another module, or a third-party crate:
+
+```toml
+[device]
+feature = "cuda"      # nothing else: a test that links any crate resolved with `cuda` is tagged gpu and external
+```
+
+**Third-party crates need the crate hub's lock.** When `[device]` is declared and any member depends on a third-party
+crate that `[external.crates]` does not map, `[root] crate_lock` must name crate_universe's own lock, or the generator
+refuses: Cargo.toml of a member says only what a member asks of a crate, not which features Cargo unified onto it
+(defaults, features that enable features) or which crates it links, so card tests would be left untagged. The recipe:
+1. in `MODULE.bazel`, `crate.from_cargo(..., lockfile = "//:cargo-bazel-lock.json")`;
+2. `CARGO_BAZEL_REPIN=1 bazel mod deps --lockfile_mode=update` writes the file (commit it; repin after every `Cargo.toml` or
+   `Cargo.lock` edit, as in Use);
+3. `[root] crate_lock = "cargo-bazel-lock.json"` in `bazel_gen.toml`, and `lock = "cargo-bazel-lock.json"` in the root's
+   `bazel_gen_stale_test` (the generator writes the call from `bazel_gen.toml`, but name the file in `data`/`lock` of any
+   hand-written one): the stale test reads it, and a missing file is an error naming it.
+
+The generator then reads each crate's resolved features (defaults and enabled features included) and the crates it links, so
+a test that links A is tagged when A links B that has the feature, together with the members' own requests. A workspace with
+`[device]` and no third-party dependencies needs no lock. Over-tagging is the safe error.
+
+With neither `member` nor `[external.crates]` there is no device world to build; with them the device world adds the
+features to every member that declares them. The testing world refuses the device member, or a crate of another module
+(its `_testing` label has no device build), resolved with a device feature. A declared feature that nothing resolves is
+refused (stale).
+
+Two per-package overrides, for what the generator cannot see; both name a workspace member:
+- `[packages.p] card_tests = true`: the package's tests, and those of every package whose graph links it, open the card
+  (a crate that loads the driver directly and declares no device feature).
+- `[packages.p] card_tests = false`: the package's own tests never do, though they link a crate resolved with a device
+  feature (a package that only names the type). It undoes only the tags derived from such crates: the device member's and
+  the device world's tags stay. It is an unchecked declaration: nothing stops such a test from opening the card, and a test
+  that skips when it finds no card passes. A `false` on a package nothing tags is refused.
 
 A consumer chooses the feature world of an external crate it takes with `default-features = false` and its own features
 by the suffix: the production world links `<label>`, the testing world `<label>_testing`, and the device world
@@ -145,13 +185,17 @@ directory or symlinks to it must make the path absolute first.
 `TEST_TMPDIR` at run time, not `env!("CARGO_TARGET_TMPDIR")`. `bazel_gen_stale_test` always carries the tag `stale-build`
 (set in `defs.bzl`), which the ci repo's bazel gate selects with `stale-build: tested`.
 
-**Tags.** A test whose graph links the device member with the device feature, or (in the device world) any crate of
+**Tags.** A test whose graph links a crate resolved with a device feature (any world), a package marked
+`card_tests = true`, or (in the device world) any crate of
 `[external.crates]` (its device build may open the card), opens the graphics card: it is tagged `gpu` and `external`, so a plain `bazel test //...` skips it
 and `--config=gpu` runs it.
 
 **Refusals.** The generator writes nothing and names the cause when:
 - `device.member` does not declare the device feature;
-- the testing world resolves the device feature (a dependency would make `cargo test --workspace` open the card);
+- `[device]` is declared, a member depends on a third-party crate, and `[root] crate_lock` is not set;
+- `[device]` declares a feature that no member or dependency is resolved with in the last world built (stale), or the
+  testing world resolves a device feature for the device member or a crate of another module;
+- `card_tests` on a name that is not a member, or `card_tests = false` on a package nothing would tag;
 - a member built alone would link another member with other features than the production world gives it (an empty
   `default` excepted, which turns on nothing);
 - a manifest uses what it does not model: a build script other than `build.rs`, weak (`x?/f`) or

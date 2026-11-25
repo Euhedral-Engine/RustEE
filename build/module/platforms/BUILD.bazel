@@ -12,7 +12,7 @@ platform(
     visibility = ["//visibility:public"],
 )
 
-# The Quest headset (a later repo's phase).
+# The Quest headset (Android arm64).
 platform(
     name = "android_arm64",
     constraint_values = ["@platforms//os:android", "@platforms//cpu:arm64"],

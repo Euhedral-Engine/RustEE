@@ -170,6 +170,70 @@ pub struct Workspace {
     /// The files other packages name in a `#[path]`: by owning Bazel package directory (`""` is the root), by file
     /// relative to it, the directories of the packages that need it.
     pub exports: BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
+    /// The crate hub's own lock (`[root] crate_lock`), read when `[device]` is set: what crate_universe resolved for each
+    /// third-party crate (the features Cargo unified, the crates it links).
+    pub locked: Option<Locked>,
+}
+
+/// The third-party crates of crate_universe's lock, by crate name (every version and target platform together: more
+/// features and edges than one build links, which only tags more).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Locked {
+    /// The resolved features of each crate.
+    pub features: BTreeMap<String, BTreeSet<String>>,
+    /// The crates each crate links (its normal dependencies).
+    pub deps: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl Locked {
+    /// Reads `cargo-bazel-lock.json`'s `crates`.
+    pub fn parse(text: &str) -> Result<Locked, String> {
+        let lock = crate::json::parse(text)?;
+        let crates = lock
+            .get("crates")
+            .and_then(Json::as_object)
+            .ok_or("the crate lock has no `crates` object")?;
+        // A list, or `{ common = [...], selects = { triple = [...] } }`.
+        fn flat(value: Option<&Json>) -> Vec<&Json> {
+            match value {
+                Some(Json::Array(items)) => items.iter().collect(),
+                Some(object) => {
+                    let mut out: Vec<&Json> = object
+                        .get("common")
+                        .and_then(Json::as_array)
+                        .map(|a| a.iter().collect())
+                        .unwrap_or_default();
+                    if let Some(selects) = object.get("selects").and_then(Json::as_object) {
+                        for list in selects.values() {
+                            out.extend(list.as_array().into_iter().flatten());
+                        }
+                    }
+                    out
+                }
+                None => Vec::new(),
+            }
+        }
+        let mut locked = Locked::default();
+        for (key, krate) in crates {
+            let name = krate
+                .get("name")
+                .and_then(Json::as_str)
+                .unwrap_or_else(|| key.split(' ').next().unwrap_or(key))
+                .to_owned();
+            let attrs = krate.get("common_attrs");
+            let features = locked.features.entry(name.clone()).or_default();
+            for feature in flat(attrs.and_then(|a| a.get("crate_features"))) {
+                features.extend(feature.as_str().map(str::to_owned));
+            }
+            let deps = locked.deps.entry(name).or_default();
+            for dep in flat(attrs.and_then(|a| a.get("deps"))) {
+                if let Some(id) = dep.get("id").and_then(Json::as_str) {
+                    deps.insert(id.split(' ').next().unwrap_or(id).to_owned());
+                }
+            }
+        }
+        Ok(locked)
+    }
 }
 
 impl Workspace {
@@ -217,7 +281,7 @@ fn str_list(value: Option<&Json>) -> Vec<String> {
 }
 
 /// Reads the workspace from `cargo metadata --no-deps --format-version 1` and each member's manifest text, which `manifest`
-/// returns for a path relative to the root (`euhedral-core/Cargo.toml`).
+/// returns for a path relative to the root (`example-core/Cargo.toml`).
 pub fn load(
     metadata: &Json,
     manifest: &dyn Fn(&str) -> Result<String, String>,
@@ -249,11 +313,38 @@ pub fn load(
         packages.push(load_package(root, package, &dirs, manifest)?);
     }
     packages.sort_by(|a, b| a.dir.cmp(&b.dir));
+    // The tags need what crate_universe resolved for the third-party crates: Cargo.toml of a member only says what a
+    // member asks for. Without the lock only those requests are seen.
+    if config.device.is_some()
+        && config.crate_lock.is_none()
+        && let Some((package, dep)) = packages.iter().find_map(|p| {
+            p.deps
+                .iter()
+                .find(|d| d.member.is_none() && config.external_key(d).is_none())
+                .map(|d| (&p.name, &d.name))
+        })
+    {
+        return Err(format!(
+            "[device] is declared and {package} depends on the third-party crate {dep}, but no crate lock is set: without \
+             crate_universe's own lock the generator cannot see which third-party crates resolve with a device feature or \
+             link one, and would leave card tests untagged. Give the crate hub a lockfile (`lockfile = \
+             \"//:cargo-bazel-lock.json\"` in `crate.from_cargo`), write it with `CARGO_BAZEL_REPIN=1 bazel mod deps \
+             --lockfile_mode=update`, set `crate_lock = \"cargo-bazel-lock.json\"` under `[root]` in bazel_gen.toml and pass \
+             the file as the stale test's `lock`"
+        ));
+    }
+    let locked = match (&config.device, &config.crate_lock) {
+        (Some(_), Some(path)) => Some(Locked::parse(&manifest(path)?).map_err(|e| {
+            format!("{path}: {e} (the device tags read it: give the stale test the file as `lock`)")
+        })?),
+        _ => None,
+    };
     Ok(Workspace {
         packages,
         config,
         config_file: None,
         exports: BTreeMap::new(),
+        locked,
     })
 }
 
@@ -1098,8 +1189,8 @@ mod tests {
     #[test]
     fn paths_are_relative_with_forward_slashes() {
         assert_eq!(
-            relative("/w/r", "/w/r/euhedral-core/src/lib.rs"),
-            Ok("euhedral-core/src/lib.rs".into())
+            relative("/w/r", "/w/r/example-core/src/lib.rs"),
+            Ok("example-core/src/lib.rs".into())
         );
         assert_eq!(
             relative(r"C:\w\r", r"C:\w\r\tools\bazel-gen\src\lib.rs"),

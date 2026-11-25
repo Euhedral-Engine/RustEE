@@ -98,6 +98,10 @@ class Affected(unittest.TestCase):
         ]:
             self.assertEqual(run(f), ([], False), f)
 
+    def test_the_vendored_build_module_and_its_check_run_the_workspace_jobs(self):
+        for f in ["build/module/bazel-gen/README.md", "build/module/tags.bzl", "scripts/ci/check_vendored_module.py"]:
+            self.assertEqual(run(f), (sorted(NAMES), True), f)
+
     def test_other_ci_files_are_still_root_build_files(self):
         for f in [".github/CODEOWNERS", ".github/workflows/other.yml", "scripts/ci/run.sh"]:
             self.assertEqual(run(f), (sorted(NAMES), True), f)

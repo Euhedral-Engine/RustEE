@@ -31,7 +31,13 @@ impl World {
 
     /// The worlds the configuration builds: the device world only with a `[device]`.
     pub fn built(config: &Config) -> Vec<World> {
-        let count = if config.device.is_some() { 3 } else { 2 };
+        // The device world turns a feature on for the members that declare it: it exists when a member or a crate of
+        // another module takes part. A `[device]` alone (a third-party crate resolved with the feature) builds none.
+        let device_world = config
+            .device
+            .as_ref()
+            .is_some_and(|d| d.member.is_some() || !config.external.is_empty());
+        let count = if device_world { 3 } else { 2 };
         World::ALL[..count].to_vec()
     }
 
@@ -71,6 +77,9 @@ pub struct Resolved {
     /// The features requested of crates of other modules (`[external.crates]`), by crate: the world those crates are
     /// taken from has to have them. A renamed dependency is under its key and under its package name.
     pub external: BTreeMap<String, BTreeSet<String>>,
+    /// The features requested of every third-party crate (not a member), by package name, on any active edge: Cargo
+    /// unifies them, so the crate links with all of them.
+    pub third_party: BTreeMap<String, BTreeSet<String>>,
     roots: BTreeSet<String>,
     dev: bool,
 }
@@ -81,6 +90,11 @@ impl Resolved {
             .get(package)
             .map(|f| f.iter().cloned().collect())
             .unwrap_or_default()
+    }
+
+    /// Whether any member resolves `feature`.
+    pub fn has_any(&self, feature: &str) -> bool {
+        self.features.values().any(|f| f.contains(feature))
     }
 
     pub fn has(&self, package: &str, feature: &str) -> bool {
@@ -147,6 +161,11 @@ impl Resolver<'_> {
     /// An active dependency edge: a member gets the edge's features.
     fn edge(&mut self, dep: &Dep) -> Result<(), String> {
         let Some(member) = &dep.member else {
+            self.out
+                .third_party
+                .entry(dep.name.clone())
+                .or_default()
+                .extend(dep.features.iter().cloned());
             if let Some(key) = self.ws.config.external_key(dep) {
                 // Under the entry's key and under the package: `[device] external` names either.
                 for name in [key, dep.name.as_str()] {
@@ -240,6 +259,11 @@ impl Resolver<'_> {
                                 .or_default()
                                 .insert(dep_feature.to_owned());
                         }
+                        self.out
+                            .third_party
+                            .entry(dep.name.clone())
+                            .or_default()
+                            .insert(dep_feature.to_owned());
                         continue;
                     }
                     let Some(member) = &dep.member else {
@@ -313,14 +337,14 @@ pub fn resolve_world(ws: &Workspace, world: World) -> Result<Resolved, String> {
     let members: Vec<&str> = ws.packages.iter().map(|p| p.name.as_str()).collect();
     let extras = |name: &str| -> Vec<String> {
         match device {
-            Some(device)
-                if world == World::CudaTesting
-                    && ws
-                        .package(name)
-                        .is_some_and(|p| p.features.contains_key(device.feature.as_str())) =>
-            {
-                vec![device.feature.clone()]
-            }
+            Some(device) if world == World::CudaTesting => device
+                .all_features()
+                .filter(|f| {
+                    ws.package(name)
+                        .is_some_and(|p| p.features.contains_key(*f))
+                })
+                .map(str::to_owned)
+                .collect(),
             _ => Vec::new(),
         }
     };
@@ -328,24 +352,52 @@ pub fn resolve_world(ws: &Workspace, world: World) -> Result<Resolved, String> {
     if world == World::Testing
         && let Some(device) = device
     {
+        // `cargo test --workspace` would link the device build of the device member, or of a crate of another module
+        // (taken here as its `_testing` label, which lacks the feature): the device world builds those tests.
         let opened = device
             .member
             .iter()
-            .filter(|m| resolved.has(m, &device.feature))
-            .chain(device.external.iter().filter(|c| {
-                resolved
-                    .external
-                    .get(*c)
-                    .is_some_and(|f| f.contains(&device.feature))
+            .filter(|m| device.all_features().any(|f| resolved.has(m, f)))
+            .chain(ws.config.external.keys().filter(|c| {
+                device.all_features().any(|f| {
+                    resolved
+                        .external
+                        .get(*c)
+                        .is_some_and(|features| features.contains(f))
+                })
             }))
             .next();
         if let Some(opened) = opened {
             return Err(format!(
-                "the testing world resolves {opened}/{}: a member's dependency turns on the device backend, so its \
-                 tests would open the card untagged. Remove that feature request; the {} testing world builds those tests",
-                device.feature, device.feature
+                "the testing world resolves {opened} with a device feature: a dependency would build it with the device \
+                 backend, but the testing world links its build without. Remove that feature request; the {} testing \
+                 world builds those tests",
+                device.feature
             ));
         }
+    }
+    // A declared device feature that nothing resolves is a stale declaration: the tags would never fire. The last world
+    // built is the one that has it (the device world, else the testing world).
+    if world == *World::built(&ws.config).last().expect("a world")
+        && let Some(device) = device
+        && let Some(dead) = device.all_features().find(|f| {
+            !(resolved.has_any(f)
+                || resolved.third_party.values().any(|t| t.contains(*f))
+                || ws
+                    .locked
+                    .as_ref()
+                    .is_some_and(|l| l.features.values().any(|t| t.contains(*f))))
+        })
+    {
+        return Err(format!(
+            "[device] declares the feature `{dead}`, but no crate of the workspace or of its dependencies is resolved with \
+             it in the {} world: the declaration is stale (remove it, or the dependency's feature was dropped)",
+            if world == World::CudaTesting {
+                "device"
+            } else {
+                "testing"
+            },
+        ));
     }
     if world == World::Production {
         // One consistent world: every member a member reaches when built alone must have the features it has with all of

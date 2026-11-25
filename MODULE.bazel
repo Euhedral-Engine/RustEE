@@ -4,12 +4,14 @@ module(
     version = "0.0.0",
 )
 
-# Bazel ignores this override when RustEE is not the root module: a consumer supplies euhedral_build itself. It stays a path
-# because container CI has no registry (C8).
-# The euhedral_build module (the version table and the shared platforms) is a copy of forge's build/module, loaded through a
-# local path until the private registry (C5) publishes it; build/ is in .bazelignore, so its files are not packages of this
-# module. It matches forge's except one comment in platforms/BUILD.bazel (it names a program that uses the build). Keep it so; forge's check-repo.sh checks the bazel_dep versions below against the table.
-bazel_dep(name = "euhedral_build", version = "0.1.0")
+# The euhedral_build module (the version table and the shared platforms) is the one forge publishes in its private registry
+# (build/CONTRACTS.md C5); the version below is one that registry holds. RustEE, as the root module, builds against its own
+# copy in build/module (the published source, byte for byte) because the GitHub-hosted jobs
+# cannot reach the registry; scripts/ci/check_vendored_module.py checks the copy against the published archive
+# in the Gitea job. Bazel ignores the override when RustEE is not the root module, so a consumer gets the published
+# version. build/ is in .bazelignore, so its files are not packages of this module. To bump: change the version, run
+# scripts/ci/check_vendored_module.py to see the drift, replace build/module, and refresh the locks.
+bazel_dep(name = "euhedral_build", version = "0.0.0-20261125015307")
 local_path_override(
     module_name = "euhedral_build",
     path = "build/module",
