@@ -119,12 +119,22 @@ def check_metadata(registry, version):
     path = os.path.join(registry, "modules", MODULE, "metadata.json")
     if not os.path.isfile(path):
         raise SystemExit("the registry has no metadata.json for %s" % MODULE)
-    with open(path, encoding="utf-8") as f:
-        meta = json.load(f)
-    yanked = meta.get("yanked_versions") or {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            meta = json.load(f)
+    except ValueError as e:
+        raise SystemExit("metadata.json for %s is not valid JSON: %s" % (MODULE, e))
+    if not isinstance(meta, dict):
+        raise SystemExit("metadata.json for %s is not a JSON object" % MODULE)
+    versions = meta.get("versions")
+    if not isinstance(versions, list) or not all(isinstance(v, str) for v in versions):
+        raise SystemExit("metadata.json's versions is not a list of strings")
+    yanked = meta.get("yanked_versions", {})
+    if not isinstance(yanked, dict):
+        raise SystemExit("metadata.json's yanked_versions is not an object")
     if version in yanked:
         raise SystemExit("%s %s is yanked: %s" % (MODULE, version, yanked[version]))
-    if version not in (meta.get("versions") or []):
+    if version not in versions:
         raise SystemExit("%s %s is not in metadata.json's versions" % (MODULE, version))
 
 

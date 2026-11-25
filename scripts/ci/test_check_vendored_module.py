@@ -247,6 +247,36 @@ class CheckVendoredModule(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("beyond the module() version", said)
 
+    def metadata(self, text):
+        def edit(root, registry):
+            write(self.registry_file(registry, "metadata.json"), text.encode())
+        return edit
+
+    def assert_bad_metadata(self, text, words):
+        code, said = self.check(self.metadata(text))
+        self.assertEqual(code, 1)
+        self.assertIn(words, said)
+
+    def test_malformed_metadata_json_fails(self):
+        self.assert_bad_metadata("{", "is not valid JSON")
+
+    def test_metadata_that_is_not_an_object_fails(self):
+        self.assert_bad_metadata(json.dumps([VERSION]), "not a JSON object")
+
+    def test_versions_as_a_string_fails(self):
+        self.assert_bad_metadata(json.dumps({"versions": "x " + VERSION}), "versions is not a list of strings")
+
+    def test_versions_as_an_object_fails(self):
+        self.assert_bad_metadata(json.dumps({"versions": {VERSION: 1}}), "versions is not a list of strings")
+
+    def test_yanked_versions_as_a_list_fails(self):
+        self.assert_bad_metadata(json.dumps({"versions": [VERSION], "yanked_versions": [VERSION]}),
+                                 "yanked_versions is not an object")
+
+    def test_yanked_versions_as_an_empty_string_fails(self):
+        self.assert_bad_metadata(json.dumps({"versions": [VERSION], "yanked_versions": ""}),
+                                 "yanked_versions is not an object")
+
 
 if __name__ == "__main__":
     unittest.main()
