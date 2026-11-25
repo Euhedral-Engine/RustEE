@@ -7,7 +7,7 @@ semantics and the tests that pin it.
 
 **What.** `euhedral-hashing/Cargo.toml` excludes `tests/toolchain_pin.rs` from the published crate. The test still runs in the workspace under Cargo and under Bazel.
 
-**Why.** The test reads `mise.toml`, `rust-toolchain.toml` and `MODULE.bazel` from the workspace root, which a packaged copy does not have, so it panicked outside the workspace (euhedral/RustEE#1112).
+**Why.** The test reads `mise.toml`, `rust-toolchain.toml` and `MODULE.bazel` from the workspace root, which a packaged copy does not have, so it panicked outside the workspace.
 
 **How to use.** Nothing changes for a developer: `cargo test -p euhedral-hashing --test toolchain_pin` and `bazel test //euhedral-hashing:toolchain_pin_test` run it as before. `cargo package -p euhedral-hashing --list` no longer lists it.
 
