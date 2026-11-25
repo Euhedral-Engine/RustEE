@@ -27,7 +27,9 @@ The CI files select less than a root build file does:
                                   by the `workflows` job, which is not a crate's)
   scripts/ci/miri-shards.json     no crate; Miri runs the shards that were added or changed against the base
   scripts/ci/miri-toolchain       no crate; the pinned nightly changes Miri's results, so Miri runs every shard
-Any other file under .github/, .gitea/ or scripts/ci/ is a root build file.
+Any other file under .github/, .gitea/ or scripts/ci/ is a root build file. build/module/** (the vendored build module,
+whatever the file) and scripts/ci/check_vendored_module.py run the workspace jobs in full: the Bazel job compares the copy
+with the published module.
 
 Usage:
   affected.py --base REV [--head REV] [--merge-base]   diff `REV..HEAD` (`REV...HEAD` with --merge-base)
@@ -94,6 +96,10 @@ CI_WORKFLOWS = [".github/workflows/ci.yml", ".gitea/workflows/ci.yml"]
 SHARDS_FILE = "scripts/ci/miri-shards.json"
 TOOLCHAIN_FILE = "scripts/ci/miri-toolchain"
 CI_NO_CRATES = [".github/workflows/cache-warm.yml", ".github/actionlint.yaml", "scripts/ci/*.py", SHARDS_FILE, TOOLCHAIN_FILE]
+
+# The vendored euhedral_build module and the script that compares it with the published one: the Bazel job runs that
+# comparison, so a change to either runs the workspace jobs in full, even for a file the lists above would skip.
+VENDORED_MODULE = ["build/module/*", "scripts/ci/check_vendored_module.py"]
 
 # A change to only these affects nothing.
 DOCS = ["*.md", "docs/*", "LICENSE*", ".gitignore"]
@@ -241,6 +247,8 @@ def affected(graph, files, workflow_is_everything=True):
     seed = set()
     for f in files:
         seed |= data_crates(graph, f)  # read by a crate's target, whatever else the file is
+        if matches(f, VENDORED_MODULE):
+            return set(graph.dirs), True, f"{f} is the vendored build module or its check"
         if matches(f, CI_NO_CRATES):
             continue
         if f in CI_WORKFLOWS:
