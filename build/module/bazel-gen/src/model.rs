@@ -1,20 +1,27 @@
 //! The workspace as the generator sees it: every member's targets, dependencies, features, lints and Bazel settings, read
 //! from `cargo metadata --no-deps` and from the members' `Cargo.toml` (`[lints]`, which the metadata does not carry).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::cfg::{self, Applies};
+use crate::config::Config;
 use crate::json::Json;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DepKind {
     Normal,
     Dev,
+    /// `[build-dependencies]`: linked into the package's build script only.
+    Build,
 }
 
 #[derive(Debug, Clone)]
 pub struct Dep {
+    /// The package's name, which names its target (`@crates//:name`, the member, the external crate).
     pub name: String,
+    /// The key the manifest gives it when that differs from the package name (`k = { package = "name" }`): features
+    /// (`dep:k`, `k/f`) and the crate's code (`k` with `-` as `_`) refer to it by this.
+    pub rename: Option<String>,
     pub kind: DepKind,
     pub applies: Applies,
     pub optional: bool,
@@ -22,6 +29,29 @@ pub struct Dep {
     pub features: Vec<String>,
     /// The member this path dependency names, by package name; `None` for a third-party crate.
     pub member: Option<String>,
+}
+
+impl Dep {
+    /// The dependency's key in the manifest: the rename, else the package name.
+    pub fn key(&self) -> &str {
+        self.rename.as_deref().unwrap_or(&self.name)
+    }
+
+    /// The name the crate's code uses for it (the key with `-` as `_`), when that differs from the package's crate name
+    /// (`None`: no alias is needed).
+    pub fn alias(&self) -> Option<String> {
+        let rename = self.rename.as_ref()?;
+        let alias = rename.replace('-', "_");
+        (alias != self.name.replace('-', "_")).then_some(alias)
+    }
+}
+
+/// A package's build script (`build.rs`).
+#[derive(Debug, Clone)]
+pub struct BuildScript {
+    /// The root file relative to the package directory, always `build.rs`.
+    pub src: String,
+    pub edition: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -77,17 +107,41 @@ pub struct Package {
     pub features: BTreeMap<String, Vec<String>>,
     pub deps: Vec<Dep>,
     pub targets: Vec<Target>,
+    /// The build script, when the package has one.
+    pub build_script: Option<BuildScript>,
+    /// The manifest's `links` key.
+    pub links: Option<String>,
     pub lints: Vec<Lint>,
     /// The names `[lints.rust] unexpected_cfgs`'s `check-cfg` declares (`cfg(loom)` gives `loom`).
     pub check_cfg: Vec<String>,
     /// Package-relative files outside `src/` that a `#[path = "..."]` in `src/` names (`tests/common/scratch.rs`), filled
     /// by [`crate::load_workspace`].
     pub path_modules: Vec<String>,
+    /// Labels of the files outside the package that a `#[path = "..."]` names (`//other:src/x.rs`), filled by
+    /// [`crate::load_workspace`]; every target of the package lists them in `srcs`.
+    pub foreign_srcs: Vec<String>,
+    /// Labels of the files outside the package that those files load with `include_str!` or `include_bytes!`, for
+    /// every target's `compile_data`.
+    pub foreign_data: Vec<String>,
+    /// Package-relative files of another directory that the files of `tests/` or `examples/` (the key) name in a
+    /// `#[path]` or `include!`: those targets' `srcs` glob only their own directory.
+    pub local_srcs: BTreeMap<String, Vec<String>>,
+    /// Package-relative files that the package's sources load with a literal `include_str!` or `include_bytes!` from
+    /// outside the directory their includer's targets already take as `compile_data`, by that directory (`src`,
+    /// `tests`, `examples` or `benches`).
+    pub local_data: BTreeMap<String, Vec<String>>,
+    /// What the build script loads that way: package-relative files, then labels of other packages' files.
+    pub build_data: Vec<String>,
     /// By (`test` or `bin`, target name).
     pub extras: BTreeMap<(String, String), Extras>,
 }
 
 impl Package {
+    /// The files `compile_data` of the targets built from `dir` (`src`, `tests`, ...) lists besides the directory itself.
+    pub fn local_data(&self, dir: &str) -> Vec<String> {
+        self.local_data.get(dir).cloned().unwrap_or_default()
+    }
+
     pub fn lib(&self) -> Option<&Target> {
         self.targets.iter().find(|t| t.kind == TargetKind::Lib)
     }
@@ -109,6 +163,13 @@ impl Package {
 pub struct Workspace {
     /// Sorted by directory.
     pub packages: Vec<Package>,
+    /// The workspace's `bazel_gen.toml`, or the defaults.
+    pub config: Config,
+    /// The configuration's root-relative path when it is a file in the workspace (the stale test reads it).
+    pub config_file: Option<String>,
+    /// The files other packages name in a `#[path]`: by owning Bazel package directory (`""` is the root), by file
+    /// relative to it, the directories of the packages that need it.
+    pub exports: BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
 }
 
 impl Workspace {
@@ -160,6 +221,7 @@ fn str_list(value: Option<&Json>) -> Vec<String> {
 pub fn load(
     metadata: &Json,
     manifest: &dyn Fn(&str) -> Result<String, String>,
+    config: Config,
 ) -> Result<Workspace, String> {
     let root = str_field(metadata, "workspace_root", "the workspace")?;
     let packages_json = metadata
@@ -187,7 +249,12 @@ pub fn load(
         packages.push(load_package(root, package, &dirs, manifest)?);
     }
     packages.sort_by(|a, b| a.dir.cmp(&b.dir));
-    Ok(Workspace { packages })
+    Ok(Workspace {
+        packages,
+        config,
+        config_file: None,
+        exports: BTreeMap::new(),
+    })
 }
 
 fn load_package(
@@ -221,17 +288,12 @@ fn load_package(
         let kind = match dep.get("kind").and_then(Json::as_str) {
             None => DepKind::Normal,
             Some("dev") => DepKind::Dev,
+            Some("build") => DepKind::Build,
             Some(other) => {
-                return Err(format!(
-                    "{what}: {other}-dependencies are not modelled (no build script exists)"
-                ));
+                return Err(format!("{what}: {other}-dependencies are not modelled"));
             }
         };
-        if dep.get("rename").is_some_and(|r| !r.is_null()) {
-            return Err(format!(
-                "{what} is renamed: renamed dependencies are not modelled"
-            ));
-        }
+        let rename = dep.get("rename").and_then(Json::as_str).map(str::to_owned);
         let target = dep.get("target").and_then(Json::as_str);
         let applies = cfg::applies(target).map_err(|e| format!("{what}: {e}"))?;
         let member = match dep.get("path").and_then(Json::as_str) {
@@ -250,6 +312,7 @@ fn load_package(
         }
         deps.push(Dep {
             name: dep_name,
+            rename,
             kind,
             applies,
             optional: dep.get("optional").and_then(Json::as_bool).unwrap_or(false),
@@ -263,6 +326,7 @@ fn load_package(
     }
 
     let mut targets = Vec::new();
+    let mut build_script = None;
     for target in package
         .get("targets")
         .and_then(Json::as_array)
@@ -277,6 +341,22 @@ fn load_package(
             .collect::<Vec<_>>()
             .as_slice()
         {
+            ["custom-build"] => {
+                let src = relative(
+                    &format!("{root}/{dir}"),
+                    str_field(target, "src_path", &what)?,
+                )?;
+                if src != "build.rs" {
+                    return Err(format!(
+                        "{dir}/Cargo.toml: the build script {src} is not `build.rs` (only that file is modelled)"
+                    ));
+                }
+                build_script = Some(BuildScript {
+                    src,
+                    edition: str_field(target, "edition", &what)?.to_owned(),
+                });
+                continue;
+            }
             ["lib"] => TargetKind::Lib,
             ["bin"] => TargetKind::Bin,
             ["test"] => TargetKind::Test,
@@ -284,7 +364,7 @@ fn load_package(
             other => {
                 return Err(format!(
                     "{what} has kind {other:?}: only lib, bin, test and example targets are modelled \
-                     (a build script, bench, proc-macro or other crate type is a generator change)"
+                     (a bench, proc-macro or other crate type is a generator change)"
                 ));
             }
         };
@@ -327,7 +407,13 @@ fn load_package(
     }
 
     let text = manifest(&format!("{dir}/Cargo.toml"))?;
-    let (lints, check_cfg) = parse_lints(&text).map_err(|e| format!("{dir}/Cargo.toml: {e}"))?;
+    let (mut lints, mut check_cfg, inherits) =
+        lint_tables(&text, "lints").map_err(|e| format!("{dir}/Cargo.toml: {e}"))?;
+    if inherits {
+        // `[lints] workspace = true`: the root manifest's `[workspace.lints.<tool>]` tables.
+        (lints, check_cfg, _) = lint_tables(&manifest("Cargo.toml")?, "workspace.lints")
+            .map_err(|e| format!("Cargo.toml: {e}"))?;
+    }
     if sets_harness(&text) {
         return Err(format!(
             "{dir}/Cargo.toml sets `harness`: targets without the test harness are not modelled"
@@ -341,9 +427,19 @@ fn load_package(
         features,
         deps,
         targets,
+        build_script,
+        links: package
+            .get("links")
+            .and_then(Json::as_str)
+            .map(str::to_owned),
         lints,
         check_cfg,
         path_modules: Vec::new(),
+        foreign_srcs: Vec::new(),
+        foreign_data: Vec::new(),
+        local_srcs: BTreeMap::new(),
+        local_data: BTreeMap::new(),
+        build_data: Vec::new(),
         extras,
     })
 }
@@ -569,8 +665,21 @@ fn quoted_strings(text: &str) -> Vec<String> {
 /// The `[lints.rust]`, `[lints.clippy]` and `[lints.rustdoc]` tables, one entry per line (`name = "level"` or
 /// `name = { level = "...", priority = N, check-cfg = [...] }`). Anything else in a lints table is an error.
 pub fn parse_lints(text: &str) -> Result<(Vec<Lint>, Vec<String>), String> {
+    let (lints, check_cfg, inherits) = lint_tables(text, "lints")?;
+    if inherits {
+        return Err("[lints] workspace = true names the root manifest's lints".to_owned());
+    }
+    Ok((lints, check_cfg))
+}
+
+/// The `[<prefix>.rust]`, `[<prefix>.clippy]` and `[<prefix>.rustdoc]` tables of a manifest (`prefix` is `lints` in a
+/// member, `workspace.lints` in the root), and whether a member's `[lints]` says `workspace = true` (which Cargo allows
+/// only alone).
+fn lint_tables(text: &str, prefix: &str) -> Result<(Vec<Lint>, Vec<String>, bool), String> {
     let mut lints = Vec::new();
     let mut check_cfg = Vec::new();
+    let mut inherits = false;
+    let mut in_lints = false;
     let mut tool: Option<String> = None;
     for line in text.lines() {
         let line = line.split(" #").next().unwrap_or("").trim();
@@ -580,23 +689,39 @@ pub fn parse_lints(text: &str) -> Result<(Vec<Lint>, Vec<String>), String> {
         if line.starts_with('[') {
             let header = line.trim_matches(|c| c == '[' || c == ']').trim();
             tool = None;
-            if header == "lints" || header == "workspace.lints" {
-                return Err(format!(
-                    "[{header}] is not modelled; use [lints.<tool>] tables"
-                ));
-            }
-            if let Some(name) = header.strip_prefix("lints.") {
+            in_lints = false;
+            if header == prefix {
+                if prefix != "lints" {
+                    return Err(format!(
+                        "[{header}] is not modelled; use [{header}.<tool>] tables"
+                    ));
+                }
+                in_lints = true;
+            } else if let Some(name) = header
+                .strip_prefix(prefix)
+                .and_then(|h| h.strip_prefix('.'))
+            {
                 match name {
                     "rust" | "clippy" | "rustdoc" => tool = Some(name.to_owned()),
-                    other => return Err(format!("[lints.{other}] is not modelled")),
+                    other => return Err(format!("[{prefix}.{other}] is not modelled")),
                 }
             }
+            continue;
+        }
+        if in_lints {
+            let setting: Vec<&str> = line.splitn(2, '=').map(str::trim).collect();
+            if setting != ["workspace", "true"] {
+                return Err(format!(
+                    "[lints]: `{line}` is not modelled (only `workspace = true`)"
+                ));
+            }
+            inherits = true;
             continue;
         }
         let Some(tool) = &tool else { continue };
         let (name, value) = line
             .split_once('=')
-            .ok_or_else(|| format!("[lints.{tool}]: cannot read `{line}`"))?;
+            .ok_or_else(|| format!("[{prefix}.{tool}]: cannot read `{line}`"))?;
         let name = name.trim().trim_matches('"').to_owned();
         if name.is_empty()
             || !name
@@ -604,73 +729,76 @@ pub fn parse_lints(text: &str) -> Result<(Vec<Lint>, Vec<String>), String> {
                 .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
         {
             // A dotted key (`x.level = "warn"`) is a table, not a lint.
-            return Err(format!("[lints.{tool}]: `{name}` is not a lint name"));
+            return Err(format!("[{prefix}.{tool}]: `{name}` is not a lint name"));
         }
         let value = value.trim();
-        let (level, priority) = if let Some(table) =
-            value.strip_prefix('{').and_then(|v| v.strip_suffix('}'))
-        {
-            let mut level = None;
-            let mut priority = 0;
-            // check-cfg holds commas inside its array: take it out first.
-            let (plain, cfgs) = match table.split_once("check-cfg") {
-                Some((before, after)) => {
-                    let array = after
-                        .split_once('[')
-                        .and_then(|(_, a)| a.split_once(']'))
-                        .ok_or_else(|| format!("[lints.{tool}] {name}: cannot read check-cfg"))?;
-                    (format!("{before}{}", array.1), Some(array.0.to_owned()))
-                }
-                None => (table.to_owned(), None),
-            };
-            if let Some(cfgs) = cfgs {
-                if name != "unexpected_cfgs" {
-                    return Err(format!(
-                        "[lints.{tool}] {name}: check-cfg outside unexpected_cfgs"
-                    ));
-                }
-                for cfg in quoted_strings(&cfgs) {
-                    let inner = cfg
-                        .strip_prefix("cfg(")
-                        .and_then(|c| c.strip_suffix(')'))
-                        .filter(|c| c.chars().all(|ch| ch.is_alphanumeric() || ch == '_'))
-                        .ok_or_else(|| {
-                            format!("check-cfg `{cfg}`: only names without values are modelled")
-                        })?;
-                    check_cfg.push(inner.to_owned());
-                }
-            }
-            for part in plain.split(',') {
-                let part = part.trim();
-                if part.is_empty() {
-                    continue;
-                }
-                let (key, value) = part
-                    .split_once('=')
-                    .ok_or_else(|| format!("[lints.{tool}] {name}: cannot read `{part}`"))?;
-                match key.trim() {
-                    "level" => level = Some(value.trim().trim_matches('"').to_owned()),
-                    "priority" => {
-                        priority = value
-                            .trim()
-                            .parse()
-                            .map_err(|_| format!("[lints.{tool}] {name}: bad priority"))?;
+        let (level, priority) =
+            if let Some(table) = value.strip_prefix('{').and_then(|v| v.strip_suffix('}')) {
+                let mut level = None;
+                let mut priority = 0;
+                // check-cfg holds commas inside its array: take it out first.
+                let (plain, cfgs) = match table.split_once("check-cfg") {
+                    Some((before, after)) => {
+                        let array = after
+                            .split_once('[')
+                            .and_then(|(_, a)| a.split_once(']'))
+                            .ok_or_else(|| {
+                                format!("[{prefix}.{tool}] {name}: cannot read check-cfg")
+                            })?;
+                        (format!("{before}{}", array.1), Some(array.0.to_owned()))
                     }
-                    other => return Err(format!("[lints.{tool}] {name}: unknown key `{other}`")),
+                    None => (table.to_owned(), None),
+                };
+                if let Some(cfgs) = cfgs {
+                    if name != "unexpected_cfgs" {
+                        return Err(format!(
+                            "[{prefix}.{tool}] {name}: check-cfg outside unexpected_cfgs"
+                        ));
+                    }
+                    for cfg in quoted_strings(&cfgs) {
+                        let inner = cfg
+                            .strip_prefix("cfg(")
+                            .and_then(|c| c.strip_suffix(')'))
+                            .filter(|c| c.chars().all(|ch| ch.is_alphanumeric() || ch == '_'))
+                            .ok_or_else(|| {
+                                format!("check-cfg `{cfg}`: only names without values are modelled")
+                            })?;
+                        check_cfg.push(inner.to_owned());
+                    }
                 }
-            }
-            (
-                level.ok_or_else(|| format!("[lints.{tool}] {name}: no level"))?,
-                priority,
-            )
-        } else {
-            (value.trim_matches('"').to_owned(), 0)
-        };
+                for part in plain.split(',') {
+                    let part = part.trim();
+                    if part.is_empty() {
+                        continue;
+                    }
+                    let (key, value) = part
+                        .split_once('=')
+                        .ok_or_else(|| format!("[{prefix}.{tool}] {name}: cannot read `{part}`"))?;
+                    match key.trim() {
+                        "level" => level = Some(value.trim().trim_matches('"').to_owned()),
+                        "priority" => {
+                            priority = value
+                                .trim()
+                                .parse()
+                                .map_err(|_| format!("[{prefix}.{tool}] {name}: bad priority"))?;
+                        }
+                        other => {
+                            return Err(format!("[{prefix}.{tool}] {name}: unknown key `{other}`"));
+                        }
+                    }
+                }
+                (
+                    level.ok_or_else(|| format!("[{prefix}.{tool}] {name}: no level"))?,
+                    priority,
+                )
+            } else {
+                (value.trim_matches('"').to_owned(), 0)
+            };
         if !matches!(
             level.as_str(),
             "allow" | "warn" | "deny" | "forbid" | "force-warn"
         ) {
-            return Err(format!("[lints.{tool}] {name}: unknown level `{level}`"));
+            return Err(format!("[{prefix}.{tool}] {name}: unknown level `{level}`"));
         }
         lints.push(Lint {
             tool: tool.clone(),
@@ -682,39 +810,155 @@ pub fn parse_lints(text: &str) -> Result<(Vec<Lint>, Vec<String>), String> {
     lints.sort_by(|a, b| (a.priority, &a.tool, &a.name).cmp(&(b.priority, &b.tool, &b.name)));
     check_cfg.sort();
     check_cfg.dedup();
-    Ok((lints, check_cfg))
+    if inherits && !lints.is_empty() {
+        return Err(
+            "[lints] workspace = true with [lints.<tool>] tables: Cargo allows one or the other"
+                .to_owned(),
+        );
+    }
+    Ok((lints, check_cfg, inherits))
 }
 
-/// The module files a source file's `#[path = "..."]` attributes name, relative to the package: `file` is the package-relative
-/// path of the source, and each path is relative to the file's directory. A path that leaves the package is an error.
+/// The module files a source file's `#[path = "..."]` attributes name, relative to the workspace root: `file` is the
+/// root-relative path of the source. Each path resolves the way rustc does: against the file's directory, plus, inside
+/// an inline `mod name { ... }`, the module's name (and, in a file that is not a crate root or `mod.rs`, the file's
+/// stem first). A path that leaves the workspace is an error naming the file.
 pub fn path_attributes(file: &str, text: &str) -> Result<Vec<String>, String> {
+    let mut dir: Vec<&str> = file.split('/').collect();
+    let name = dir.pop().unwrap_or("");
+    let mod_rs = matches!(name, "mod.rs" | "main.rs" | "lib.rs")
+        || matches!(
+            dir.last().copied(),
+            Some("tests" | "examples" | "benches" | "bin")
+        );
+    let stem = name.strip_suffix(".rs").unwrap_or(name);
     let mut out = Vec::new();
+    // The inline modules the scan is inside: (name, brace depth outside it).
+    let mut inline: Vec<(String, usize)> = Vec::new();
+    let mut depth = 0usize;
     for line in text.lines() {
-        let Some(rest) = line.trim().strip_prefix("#[path") else {
-            continue;
-        };
-        let target = rest
-            .trim_start()
-            .strip_prefix('=')
-            .and_then(|r| r.split_once(']').map(|(inside, _)| inside))
-            .and_then(|r| r.trim().strip_prefix('"'))
-            .and_then(|r| r.strip_suffix('"'))
-            .ok_or_else(|| format!("{file}: unreadable path attribute `{}`", line.trim()))?;
-        let mut parts: Vec<&str> = file.split('/').collect();
-        parts.pop();
-        let target = target.replace('\\', "/");
-        for part in target.split('/') {
-            match part {
-                "" | "." => {}
-                ".." => {
-                    parts
-                        .pop()
-                        .ok_or_else(|| format!("{file}: path `{target}` leaves the package"))?;
+        let code = line.split("//").next().unwrap_or("");
+        if let Some(rest) = code.trim().strip_prefix("#[path") {
+            let target = rest
+                .trim_start()
+                .strip_prefix('=')
+                .and_then(|r| r.split_once(']').map(|(inside, _)| inside))
+                .and_then(|r| r.trim().strip_prefix('"'))
+                .and_then(|r| r.strip_suffix('"'))
+                .ok_or_else(|| format!("{file}: unreadable path attribute `{}`", code.trim()))?;
+            let target = target.replace('\\', "/");
+            if target.starts_with('/') {
+                return Err(format!("{file}: path `{target}` is absolute"));
+            }
+            let mut parts = dir.clone();
+            if !mod_rs && !inline.is_empty() {
+                parts.push(stem);
+            }
+            parts.extend(inline.iter().map(|(n, _)| n.as_str()));
+            for part in target.split('/') {
+                match part {
+                    "" | "." => {}
+                    ".." => {
+                        parts.pop().ok_or_else(|| {
+                            format!("{file}: path `{target}` leaves the workspace")
+                        })?;
+                    }
+                    other => parts.push(other),
                 }
-                other => parts.push(other),
+            }
+            out.push(parts.join("/"));
+        }
+        // Track the inline modules: `mod name {` opens one, its closing brace ends it.
+        let mut words = code
+            .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .filter(|w| !w.is_empty());
+        let mut opening = None;
+        while let Some(word) = words.next() {
+            if word == "mod"
+                && let Some(name) = words.next()
+            {
+                let after = code
+                    .split_once(&format!("mod {name}"))
+                    .map_or("", |(_, r)| r);
+                if after.trim_start().starts_with('{') {
+                    opening = Some(name.to_owned());
+                }
             }
         }
-        out.push(parts.join("/"));
+        let mut in_string = false;
+        let mut prev = ' ';
+        for c in code.chars() {
+            if c == '"' && prev != '\\' {
+                in_string = !in_string;
+            } else if !in_string && c == '{' {
+                if let Some(name) = opening.take() {
+                    inline.push((name, depth));
+                }
+                depth += 1;
+            } else if !in_string && c == '}' {
+                depth = depth.saturating_sub(1);
+                if inline.last().is_some_and(|(_, d)| *d == depth) {
+                    inline.pop();
+                }
+            }
+            prev = c;
+        }
+    }
+    Ok(out)
+}
+
+/// The files a source file loads with `include_str!`, `include_bytes!` or `include!` whose argument is a string literal,
+/// or `concat!(env!("CARGO_MANIFEST_DIR"), "<literal>")`, relative to the workspace root, each with whether it is
+/// source (`include!`). `file` is the root-relative path of the source and `manifest_dir` that of the crate being
+/// built; a literal is relative to the file's directory, a `CARGO_MANIFEST_DIR` one to the crate's. Any other argument
+/// is not read.
+pub fn include_files(
+    file: &str,
+    manifest_dir: &str,
+    text: &str,
+) -> Result<Vec<(String, bool)>, String> {
+    const MANIFEST: &str = "concat!(env!(\"CARGO_MANIFEST_DIR\"),";
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let code = line.split("//").next().unwrap_or("");
+        for (macro_name, source) in [
+            ("include_str!(", false),
+            ("include_bytes!(", false),
+            ("include!(", true),
+        ] {
+            let mut rest = code;
+            while let Some((before, after)) = rest.split_once(macro_name) {
+                rest = after;
+                // `my_include!(` is another macro.
+                if before.ends_with(|c: char| c.is_alphanumeric() || c == '_') {
+                    continue;
+                }
+                let arg = after.trim_start();
+                let (base, arg) = match arg.strip_prefix(MANIFEST) {
+                    Some(r) => (manifest_dir, r.trim_start()),
+                    None => (file.rsplit_once('/').map_or("", |(d, _)| d), arg),
+                };
+                let Some(literal) = arg.strip_prefix('"') else {
+                    continue;
+                };
+                let Some((target, _)) = literal.split_once('"') else {
+                    continue;
+                };
+                let mut parts: Vec<&str> = base.split('/').filter(|p| !p.is_empty()).collect();
+                for part in target.split('/') {
+                    match part {
+                        "" | "." => {}
+                        ".." => {
+                            parts.pop().ok_or_else(|| {
+                                format!("{file}: path `{target}` leaves the workspace")
+                            })?;
+                        }
+                        other => parts.push(other),
+                    }
+                }
+                out.push((parts.join("/"), source));
+            }
+        }
     }
     Ok(out)
 }
@@ -798,13 +1042,57 @@ mod tests {
     fn path_attributes_resolve_from_the_file() {
         let text = "#[cfg(test)]\n#[path = \"../tests/common/scratch.rs\"]\nmod scratch;\n  #[path=\"x/y.rs\"] mod y;\n";
         assert_eq!(
-            path_attributes("src/lib.rs", text),
+            path_attributes("p/src/lib.rs", text),
             Ok(vec![
-                "tests/common/scratch.rs".to_owned(),
-                "src/x/y.rs".to_owned()
+                "p/tests/common/scratch.rs".to_owned(),
+                "p/src/x/y.rs".to_owned()
             ])
         );
-        assert!(path_attributes("src/lib.rs", "#[path = \"../../other/x.rs\"]\n").is_err());
+        assert_eq!(
+            path_attributes("p/src/lib.rs", "#[path = \"../../other/x.rs\"]\n"),
+            Ok(vec!["other/x.rs".to_owned()])
+        );
+        let err = path_attributes("p/src/lib.rs", "#[path = \"../../../x.rs\"]\n").unwrap_err();
+        assert!(err.contains("p/src/lib.rs") && err.contains("leaves the workspace"));
+    }
+
+    #[test]
+    fn path_attributes_follow_inline_modules() {
+        let text = "mod a {\n    mod b {\n        #[path = \"x.rs\"]\n        mod x;\n    }\n    #[path = \"y.rs\"]\n    mod y;\n}\n#[path = \"z.rs\"]\nmod z;\n";
+        // A crate root or mod.rs resolves against its directory plus the module names.
+        assert_eq!(
+            path_attributes("p/src/lib.rs", text),
+            Ok(vec![
+                "p/src/a/b/x.rs".to_owned(),
+                "p/src/a/y.rs".to_owned(),
+                "p/src/z.rs".to_owned()
+            ])
+        );
+        // Any other file adds its stem.
+        assert_eq!(
+            path_attributes("p/src/net.rs", text),
+            Ok(vec![
+                "p/src/net/a/b/x.rs".to_owned(),
+                "p/src/net/a/y.rs".to_owned(),
+                "p/src/z.rs".to_owned()
+            ])
+        );
+    }
+
+    #[test]
+    fn included_files_resolve_from_the_file() {
+        let text = "static A: &[u8] = include_bytes!(\"../data/a.bin\");\nconst B: &str = include_str!( \"b.txt\" ); // include_str!(\"c\")\nconst C: &str = include_str!(concat!(env!(\"OUT_DIR\"), \"/d\"));\ninclude!(\"gen.rs\");\nconst E: &str = include_str!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/data/e.txt\"));\nmy_include!(\"f\");\n";
+        let mut got = include_files("p/src/x.rs", "p", text).unwrap();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ("p/data/a.bin".to_owned(), false),
+                ("p/data/e.txt".to_owned(), false),
+                ("p/src/b.txt".to_owned(), false),
+                ("p/src/gen.rs".to_owned(), true),
+            ]
+        );
     }
 
     #[test]

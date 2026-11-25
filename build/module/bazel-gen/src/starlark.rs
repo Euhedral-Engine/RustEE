@@ -14,6 +14,8 @@ pub enum Value {
     },
     Dict(Vec<(String, String)>),
     ListDict(Vec<(String, Vec<String>)>),
+    /// A list of labels and another value (`["//:testdata"] + glob([...])`); just the value when there are no labels.
+    Plus(Vec<String>, Box<Value>),
     /// A dependency list: entries on every OS, then a `select` over the OSes for the rest (omitted when empty).
     Deps {
         always: Vec<String>,
@@ -43,7 +45,7 @@ impl Rule {
             Value::Deps { always, by_os } => {
                 always.is_empty() && by_os.iter().all(|(_, d)| d.is_empty())
             }
-            Value::Str(_) | Value::Glob { .. } => false,
+            Value::Str(_) | Value::Glob { .. } | Value::Plus(..) => false,
         };
         if !empty {
             self.attrs.push((key, value));
@@ -91,6 +93,8 @@ pub fn list(items: &[String], level: usize) -> String {
 fn render(value: &Value, level: usize) -> String {
     match value {
         Value::Str(text) => quote(text),
+        Value::Plus(labels, rest) if labels.is_empty() => render(rest, level),
+        Value::Plus(labels, rest) => format!("{} + {}", list(labels, level), render(rest, level)),
         Value::List(items) => list(items, level),
         Value::Glob {
             include,

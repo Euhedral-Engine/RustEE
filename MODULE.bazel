@@ -20,7 +20,7 @@ bazel_dep(name = "bazel_skylib", version = "1.9.2")
 bazel_dep(name = "rules_rust", version = "0.75.0")
 
 # The toolchain is rust-toolchain.toml's version (and mise.toml's). rules_rust takes only a literal, so the version is written
-# twice: tools/bazel-gen/tests/toolchain_pin.rs fails when either differs from the toolchain file. host_tools is the cargo that
+# twice: euhedral-hashing/tests/toolchain_pin.rs fails when either differs from the toolchain file. host_tools is the cargo that
 # crate_universe splices with; rules_rust declares its own at its own version, which moves when rules_rust is bumped, so this
 # one has another name and from_cargo is pointed at it.
 rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
@@ -42,7 +42,7 @@ register_toolchains("@rust_toolchains//:all")
 # crate_universe reads the workspace's Cargo.toml and Cargo.lock; Cargo owns Cargo.lock (cargo update); the repin below can rewrite it, and CI fails if it does.
 # cargo-bazel-lock.json is crate_universe's own lock, derived from them. A local Bazel build does not notice a stale one (with
 # `lockfile` set, rules_rust treats the extension as reproducible and keeps it out of MODULE.bazel.lock); the CI step "The crate
-# lock is current" and the stale test of tools/bazel-gen (packages and versions only) do. After `cargo update` or any
+# lock is current" and the shared generator's stale test (packages and versions only) do. After `cargo update` or any
 # Cargo.toml edit, one command refreshes it, MODULE.bazel.lock and Cargo.lock:
 #   CARGO_BAZEL_REPIN=1 bazel mod deps --lockfile_mode=update
 crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")

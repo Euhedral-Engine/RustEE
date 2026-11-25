@@ -13,7 +13,6 @@ use std::path::PathBuf;
 const LAYERS: &[(&str, u8)] = &[
     ("euhedral-data-structures", 0),
     ("euhedral-hashing", 0),
-    ("tools/bazel-gen", 0),
     ("euhedral-hardware-utils", 1),
     ("euhedral-core", 2),
     ("euhedral-graph", 3),

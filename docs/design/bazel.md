@@ -97,19 +97,22 @@ Two rules_rust behaviours the prototype found, which the generator must handle:
 
 ### First-party BUILD files: a checked-in generator driven by `cargo metadata`
 
-A Rust crate in the workspace, `tools/bazel-gen` (`euhedral-bazel-gen`, `publish = false`), reads
-`cargo metadata --no-deps --format-version 1` and writes every crate's `BUILD.bazel`. The file starts with an
-`@generated` line, and nobody edits it by hand. It is Rust because new tools here are Rust by default (Python is for
-throwaway scripts), so Cargo builds and tests it like every other member and Bazel needs no Python toolchain. Its
-dependencies are `cargo_metadata` (the metadata types), `cargo-platform` (parsing target `cfg` strings) and `toml`
-(`[lints]`, `mise.toml`, `rust-toolchain.toml`), pinned in `Cargo.lock` like every dependency. It moves to forge once a
-second Cargo workspace uses it.
+The shared generator, `@euhedral_build//bazel-gen` (forge's `build/module/bazel-gen`, vendored here with the rest of
+`build/module`), reads `cargo metadata --no-deps --format-version 1` and writes every crate's `BUILD.bazel`. The file
+starts with an `@generated` line, and nobody edits it by hand. It is Rust because new tools here are Rust by default
+(Python is for throwaway scripts) and Bazel needs no Python toolchain; it has no dependencies of its own, so it adds no
+crate to RustEE's lock. One generator serves every repo on the forge, configured by the repo's `bazel_gen.toml`
+(RustEE's names the device feature, the root exports and the crate lock). RustEE first had its own copy in
+`tools/bazel-gen`; it moved to forge when a second workspace used it. The generated files kept their bytes, except for
+the removed package, the root's generated rules, the pin test's target and `CARGO_BIN_EXE_*` on the benchmarks' smoke
+test (the shared generator gives an integration test its package's binaries). Its README in `build/module/bazel-gen/` is the reference for what it models and refuses.
 
 - **Targets come from Cargo, not from globs:** one `rust_library` per lib, one `rust_test` for the lib's unit tests, one
   `rust_doc_test`, one `rust_test` per `[[test]]` target, one `rust_binary` per bin (plus a `rust_test` for its unit
   tests) and per example. The generator stops with a message on anything it does not model: a `custom-build` or
   `bench` target, a renamed dependency, a weak `dep?/feature` entry, a first-party dependency under `[target.*]`, a
-  target `cfg` it does not know, or `euhedral-memory/cuda` in the testing world. None of these exists today. A new kind is a generator change, never a silent omission.
+  target `cfg` it does not know, or `euhedral-memory/cuda` in the testing world. None of these exists today. A new kind is a generator change in forge, never a silent omission. (The shared generator models more than RustEE
+  uses: renamed dependencies, build scripts and `#[path]` across packages.)
 - **Sources within a target are globs:** `src/**/*.rs` minus the bins; `tests/<name>.rs` plus `tests/*/**/*.rs` (the
   `common` modules); `examples/<name>.rs` plus `examples/<name>/**`. Non-Rust files beside them (`README.md`, the
   kernels) are `compile_data`. A new module file therefore needs no new BUILD file. Only a `Cargo.toml` change or a new
@@ -131,29 +134,28 @@ second Cargo workspace uses it.
     `lane_source_liveness`). The generator step sets them from what those tests start.
 - **Integration tests** get `CARGO_TARGET_TMPDIR` set to a path that does not exist (Cargo sets it and the code reads it
   at compile time). Under Bazel the tests use `TEST_TMPDIR` instead (step 2).
-- **`//:gazelle`** is the crate's `rust_binary`. Run as `bazel run //:gazelle`, it calls the toolchain's cargo and writes
-  into `BUILD_WORKSPACE_DIRECTORY`. `bazel run //:gazelle -- -mode=diff` prints the stale files and fails, as C6's
-  command does. `cargo run -p euhedral-bazel-gen` does the same without Bazel. That is how the first BUILD files
-  (including the generator's own) are written, and it is the recovery path when stale BUILD files keep `//:gazelle`
-  itself from building. Labels and paths in the output always use `/`, also when the generator runs on Windows, so
-  both systems write the same bytes. There are no Go or Python packages in RustEE for Gazelle itself to
-  manage.
-- **The stale check** is a `rust_test` of the crate (`//tools/bazel-gen:stale_test`), so it is inside
-  `bazel test //...`. It runs `cargo metadata --no-deps --offline` with the cargo in `CARGO` and then the generator in
-  check mode:
-  - Under Bazel, `CARGO` is the toolchain's cargo (`@rules_rust//rust/toolchain:current_cargo_files` as `data`) and
-    `CARGO_HOME` is under `TEST_TMPDIR`. Its `data` is every `Cargo.toml`, `Cargo.lock` and `cargo-bazel-lock.json` (both
-    read by the lock check below), every `BUILD.bazel` and every file that target discovery scans (`src/`, `tests/`,
-    `examples/`, `benches/`, `build.rs`). Without them in `data` the sandbox has no copy to read.
-  - Under `cargo test`, Cargo sets `CARGO` itself, so the same test also fails the Cargo gate on a stale file.
-    `affected.py` marks `euhedral-bazel-gen` affected by any member's `Cargo.toml` and by any change at all under a
-    member's `src/`, `tests/`, `examples/` or `benches/` or to its `build.rs` (step 3). Only an added or removed target file can make a
-    BUILD file stale, but `affected.py` cannot tell one from an edit: `changed_files` runs
-    `git diff --name-only --no-renames`, and `--files` takes plain paths. Counting every change there keeps both
-    inputs as they are. The alternative, `--name-status` with a status per path, would change `--files` (its callers
-    pass no status) and every function that takes the file list, to save a test that takes seconds. Over-selecting
-    only runs a cheap test; under-selecting would let a stale file through, so the Cargo side runs the test on every
-    pull request that can make BUILD files stale, and some that cannot.
+- **`//:gazelle`** is the generator's `bazel_gen` rule in the root `BUILD.bazel`. Run as `bazel run //:gazelle`, it
+  calls the toolchain's cargo and writes into `BUILD_WORKSPACE_DIRECTORY`. `bazel run //:gazelle -- -mode=diff` prints
+  the stale files and fails, as C6's command does. Only the root's first two lines are written by hand
+  (`load("@euhedral_build//bazel-gen:defs.bzl", "bazel_gen")` and `bazel_gen(name = "gazelle")`); the first run replaces
+  the file, and it is also the recovery path when stale BUILD files keep `//:gazelle` itself from building (the
+  generator does not depend on RustEE's BUILD files). Labels and paths in the output always use `/`, also when the
+  generator runs on Windows, so both systems write the same bytes. There are no Go or Python packages in RustEE for
+  Gazelle itself to manage.
+- **The stale check** is the shared `bazel_gen_stale_test` (`//:bazel_gen_stale_test`, written into the root BUILD file
+  with the tag `stale-build`), so it is inside `bazel test //...`. It runs `cargo metadata --no-deps --offline` with the
+  toolchain's cargo (`CARGO`, from `@rules_rust//cargo:current_cargo_toolchain` in `data`) and then the generator in
+  diff mode over the runfiles copy of `//:workspace_sources`:
+  - Its `data` is every `Cargo.toml`, `BUILD.bazel` and file that target discovery scans (`src/`, `tests/`, `examples/`,
+    `benches/`, `build.rs`), gathered at the root, plus `Cargo.lock`, `cargo-bazel-lock.json` and `bazel_gen.toml`.
+    Without them in `data` the sandbox has no copy to read.
+  - It runs under Bazel only: there is no generator crate in the Cargo workspace any more, so `cargo test` does not run
+    it. The `bazel` CI job runs whenever any crate is affected (`scripts/ci/affected.py`; a root build file affects
+    all), which covers every change that can make a BUILD file stale.
+  - The runfiles copy holds only the files the BUILD files gather, so it cannot see a BUILD file added by hand outside
+    them (the old test, under Bazel, could not either; under Cargo it walked the real tree). The `bazel` CI job's step
+    "The BUILD files are generated" runs `bazel run //:gazelle -- -mode=diff`, which walks the real tree and fails
+    naming any BUILD file the generator does not write.
   - **The locks:** `crate.from_cargo` sets `lockfile = "//:cargo-bazel-lock.json"`, because Bazel refuses a
     non-root module's crate_universe repository without one (a downstream module could not depend on this one).
     With `lockfile` set, rules_rust 0.75.0 treats the `crate` extension as reproducible (`extensions.bzl`), so it
@@ -164,7 +166,7 @@ second Cargo workspace uses it.
     `Cargo.toml` all build without a word. Two checks of ours enforce it. The stale test compares every package of
     `Cargo.lock` that is not a workspace member (`name version`, whatever its source) with the crates of
     `cargo-bazel-lock.json`, both ways, and names the packages that differ; it compares packages and versions only, not
-    features, and runs under Cargo and Bazel. The `bazel` CI job's step "The crate lock is current" repins a copy before
+    features. It is the shared test's crate-lock mode (`[root] crate_lock` in `bazel_gen.toml`). The `bazel` CI job's step "The crate lock is current" repins a copy before
     `bazel test` and fails when `cargo-bazel-lock.json`, `MODULE.bazel.lock` or `Cargo.lock` changes, which catches
     what the package comparison does not (a feature or requirement change, a toolchain bump). The repin is
     deterministic (two runs give identical files). One command refreshes the locks after `cargo update`, an edit of a
@@ -174,8 +176,9 @@ second Cargo workspace uses it.
   Its failure message names the stale files and the command that fixes them. Regenerating is the duty of whoever
   changes a `Cargo.toml` or adds a target file. The root `README.md` says so in one line, and the stale test enforces
   it.
-- **The pin check** (toolchain, below) is a second test of the same crate, so it also runs under both tools. Its
-  `data` is `rust-toolchain.toml`, `mise.toml` and `MODULE.bazel`.
+- **The pin check** (toolchain, below) is `euhedral-hashing/tests/toolchain_pin.rs`: the shared generator has no
+  equivalent, and the test must run under both Cargo and Bazel. It sits in the crate with no dependencies, with
+  `[package.metadata.bazel.test.toolchain_pin]` for its `data` (`rust-toolchain.toml`, `mise.toml`, `MODULE.bazel`).
 - **Line endings:** `.gitattributes` sets `BUILD.bazel`, `*.bzl`, `MODULE.bazel`, `MODULE.bazel.lock`, `cargo-bazel-lock.json`, `Cargo.toml`
   and `Cargo.lock` to `eol=lf`. Otherwise a Windows checkout with CRLF fails the byte comparison of the stale check and
   the locks' digests.
@@ -355,7 +358,7 @@ Rejected:
     `bazel-out` is `w-dbg` instead of `x64_windows-fastbuild`), and `--compilation_mode=dbg` (the same opt-level as
     fastbuild, plus debug info). The fourth, a short output base such as `startup --output_base=C:/b`, is a machine
     path: it belongs in the machine layer (forge's C3), and the repository's `.bazelrc`
-    may not hold it. For now it goes in `user.bazelrc`, the personal layer, because forge's machine layer has no Windows output-base setting yet (euhedral/forge#249); the GitHub job writes it there. A Windows machine with the default output base (under
+    may not hold it. For now it goes in `user.bazelrc`, the personal layer, because forge's machine layer has no Windows output-base setting yet; the GitHub job writes it there. A Windows machine with the default output base (under
     the user's profile) fails at link time. forge's machine layer has no setting for it yet.
   - crate_universe resolves for `x86_64-unknown-linux-gnu` and `x86_64-pc-windows-msvc` (`supported_platform_triples`).
 - **Benchmarks (C7 `exclusive`):** the gate runs no benchmark today. The bins are built and their unit tests run. A
@@ -413,9 +416,10 @@ A per-crate count is not a test to keep (it would only restate the generator).
 Each step is one pull request for one agent. The build starts after forge's rollover (phase 3) merges, and no step
 merges before it.
 
-1. **`rust-toolchain.toml` and the generator crate with the pin check.** This step adds:
+1. **`rust-toolchain.toml` and the pin check.** (Written when the generator was RustEE's own crate, `tools/bazel-gen`; the
+   pin test now lives in `euhedral-hashing/tests`, see the pin check above.) This step adds:
    - the toolchain file (version from `mise.toml`);
-   - `tools/bazel-gen` as a workspace member, with only its pin test for now. The test compares
+   - the pin test (first in `tools/bazel-gen`, now in `euhedral-hashing`). It compares
      `rust-toolchain.toml` with `mise.toml`, and with the two `MODULE.bazel` lines once they exist;
    - its layer in `euhedral-gpu/tests/layering.rs` (`LAYERS`), since `every_member_has_a_layer` fails for a new
      member. It depends on no workspace crate and none depends on it, so it gets layer 0.
@@ -450,21 +454,20 @@ merges before it.
    - `scripts/ci/affected.py` and its tests: the root Bazel files (`MODULE.bazel`, `MODULE.bazel.lock`, `.bazelrc`,
      `.bazelversion`, `.bazelignore`, the root `BUILD.bazel`) affect everything (the full Cargo run and every Miri
      shard). A crate's `BUILD.bazel` affects that crate. Any member's `Cargo.toml`, and any change under a member's
-     `src/`, `tests/`, `examples/` or `benches/` or to its `build.rs`, also affects `euhedral-bazel-gen` (its stale test). `--name-only`
-     cannot tell an added file from an edited one, so every change there counts (see the stale check).
+     `src/`, `tests/`, `examples/` or `benches/` or to its `build.rs`, affected the generator crate (its stale test under Cargo); with the shared generator the stale test is a Bazel test
+     of the root, so the rule is gone and the Bazel job runs for any affected crate (see the stale check).
 
    *Done:* `bazel query @crates//...` resolves, forge's `check-repo.sh .` passes C1 to C4, and the affected-file tests
    cover the new files. *After 1.*
 4. **The generator, the BUILD files and the stale check.** Add:
-   - the generator in `tools/bazel-gen`, `//:gazelle`, the stale test with its lock check, and the generated
+   - the generator (now the shared one, `bazel_gen.toml`), `//:gazelle`, the stale test with its lock check, and the generated
      `BUILD.bazel` of every crate in the three worlds. Every test whose resolved features include
      `euhedral-memory/cuda` is tagged `gpu` and `external` from the first generated file, and the generator refuses
      to write if the testing world resolves that feature, so `bazel test //...` never opens the card without a grant;
    - `[package.metadata.bazel]` for `hot_fix_ratchet` and `layering` and the `cpus` of the lattice tests, and the root
      `workspace_sources` filegroup;
    - in the root `BUILD.bazel`, `exports_files(["Cargo.toml", "Cargo.lock", "MODULE.bazel", "cargo-bazel-lock.json",
-     "mise.toml", "rust-toolchain.toml"])`, so the stale and pin tests in `//tools/bazel-gen` can name those root
-     files in their `data`;
+     "mise.toml", "rust-toolchain.toml"])`, so the pin test can name those root files in its `data`;
    - the root README's line on regenerating.
 
    The pull request carries the one-time proofs:
@@ -615,10 +618,9 @@ Text for the forge coordinator; RustEE does not edit forge.
 
   > Rust: single crates without features or dev-dependencies use hand-written globs and `all_crate_deps` with a layout
   > check (phase 3). A workspace with features, dev-dependencies or examples generates its BUILD files with a
-  > checked-in Rust generator crate driven by `cargo metadata --no-deps`. It is exposed as `//:gazelle`
-  > (`bazel run //:gazelle` writes, `-- -mode=diff` fails on stale files). Its stale-check `rust_test` runs in
-  > `bazel test //...` with the toolchain's cargo, and in `cargo test` (phase 4, RustEE). The generator moves to forge
-  > once a second workspace uses it.
+  > Rust generator driven by `cargo metadata --no-deps`, shared in forge's `euhedral_build` module. It is exposed as
+  > `//:gazelle` (`bazel run //:gazelle` writes, `-- -mode=diff` fails on stale files). Its stale-check test runs in
+  > `bazel test //...` with the toolchain's cargo (phase 4, RustEE).
 
   The check line adds "or a stale-check test in `//...`" next to the Gazelle diff.
 - **C3** (repository layout): `.bazelignore` lists `.claude` (agent worktrees), and `.gitignore` lists `/bazel-*`.

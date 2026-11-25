@@ -15,6 +15,18 @@ semantics and the tests that pin it.
 
 **Tests.** The workflow twins test pins the job's step and that the three lines are in `.bazelrc` (a deleted line fails only on Windows otherwise); forge's repository check accepts the file.
 
+## RustEE's BUILD files come from the shared generator (build)
+
+**What.** `tools/bazel-gen` (the `euhedral-bazel-gen` workspace member) is gone. `bazel run //:gazelle` and the stale test are forge's shared generator, `@euhedral_build//bazel-gen`, in the vendored `build/module`, configured by the new root `bazel_gen.toml`. The toolchain pin test moved to `euhedral-hashing/tests/toolchain_pin.rs`. The `bazel` CI job has a step "The BUILD files are generated" (`bazel run //:gazelle --config=ci -- -mode=diff`).
+
+**Why.** One generator serves every Rust repo on the forge, so a fix or a new feature there reaches RustEE without a second copy to keep equal, and the Cargo workspace loses a member that only Bazel needed.
+
+**How to use.** Nothing changes for a developer: `bazel run //:gazelle` writes the BUILD files, `-- -mode=diff` checks them, `bazel test //...` runs the stale test, and `CARGO_BAZEL_REPIN=1 bazel mod deps --lockfile_mode=update` refreshes the locks. `cargo run -p euhedral-bazel-gen` no longer exists.
+
+**Semantics.** The generated BUILD files are the same except for the removed package, the root's generated rules (`//:gazelle`, `//:bazel_gen_stale_test`, `bazel_gen.toml` in `workspace_sources`), the pin test's target in `euhedral-hashing`, and `CARGO_BIN_EXE_*` data for the benchmarks' smoke test (the shared generator gives an integration test its package's binaries). The stale test runs under Bazel only; a BUILD file added by hand outside the files the BUILD files gather is found by the diff-mode CI step. `Cargo.lock` and `cargo-bazel-lock.json` lose the generator's package. The Cargo build and every crate's dependencies and features are unchanged.
+
+**Tests.** Each check of the old stale test fails on a changed manifest, a crate in only one of the two locks, a stray BUILD file (diff mode) and a differing toolchain pin (`mise.toml` or `rust-toolchain.toml`); `scripts/ci` tests pin the new CI step in both workflow files and no longer name a generator crate.
+
 ## The crate lock docs and checks say what is enforced (build) (2026-11-24)
 
 **What.** `MODULE.bazel`, `.bazelrc` and `docs/design/bazel.md` no longer say a stale `cargo-bazel-lock.json` fails every Bazel command: with `lockfile` set, rules_rust treats the `crate` extension as reproducible and leaves it out of `MODULE.bazel.lock`, so a local Bazel build does not notice a stale crate lock. bazel-gen's stale test now compares every `Cargo.lock` package that is not a workspace member with the crates of `cargo-bazel-lock.json` (it compared registry packages only, so a git, sparse or out-of-workspace path dependency could never match). The CI step "The crate lock is current" also compares `Cargo.lock`, which a repin can rewrite. The consumer section says rules_rust takes the Rust toolchain from the root module only; stale text about SHA-256 and the lock check is fixed.

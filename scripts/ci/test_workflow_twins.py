@@ -446,6 +446,7 @@ BAZEL_STEPS = [
         '--lockfile_mode=update and commit it"; exit 1; }\n'
         'done\n',
     },
+    {"name": "The BUILD files are generated", "run": "bazel run //:gazelle --config=ci -- -mode=diff"},
     {"name": "Bazel test", "run": "bazel test //... --config=ci"},
     {"name": "Every gpu target is also external (C7)", "run": C7_RUN},
     # Whatever failed: the caches are collected only in an idle server, and a running one holds the lease.
@@ -566,8 +567,8 @@ class Bazel(unittest.TestCase):
         # does a document that a crate's target reads (its BUILD file names it in `data`).
         audit = "docs/specs/audit.md"
         graph = affected.Graph(
-            {"euhedral-core": "euhedral-core", "euhedral-bazel-gen": "tools/bazel-gen"},
-            {"euhedral-core": set(), "euhedral-bazel-gen": set()},
+            {"euhedral-core": "euhedral-core"},
+            {"euhedral-core": set()},
             {audit: {"euhedral-core"}},
         )
         inputs = [
@@ -576,7 +577,7 @@ class Bazel(unittest.TestCase):
             "euhedral-core/src/notes.md", "euhedral-core/BUILD.bazel", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml",
             "mise.toml", "BUILD.bazel", "MODULE.bazel", "MODULE.bazel.lock", "cargo-bazel-lock.json", ".bazelrc", ".bazelversion", ".bazelignore",
             ".gitattributes", "build/module/MODULE.bazel", "build/module/platforms/BUILD.bazel", "docs/x/BUILD.bazel",
-            "tools/bazel-gen/src/main.rs", "tools/bazel-gen/BUILD.bazel", ".gitea/workflows/ci.yml", audit,
+            "bazel_gen.toml", "build/module/bazel-gen/src/lib.rs", ".gitea/workflows/ci.yml", audit,
         ]
         for f in inputs:
             crates, everything, reason = affected.affected(graph, [f])
