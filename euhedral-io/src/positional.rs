@@ -847,7 +847,13 @@ impl Engine for Positional {
             let mut turn = 0;
             loop {
                 if budget == 0 || !room() {
-                    active.push_front(op);
+                    // One that has not had its turn this visit keeps its place; one that has goes behind the
+                    // others, so that none moves more than its turn while others wait.
+                    if turn == 0 {
+                        active.push_front(op);
+                    } else {
+                        active.push_back(op);
+                    }
                     return;
                 }
                 budget -= 1;

@@ -3193,6 +3193,29 @@ mod tests {
         assert_eq!(counts(&io).1, 3, "three attempts between both");
     }
 
+    /// A short read due beside a long one ends first, for any pair of attempts and pieces per turn.
+    #[test]
+    fn a_short_read_ends_before_a_long_one_for_any_attempts_and_turns() {
+        for (attempts_per_poll, pieces_per_turn) in [(1, 4), (3, 4), (4, 1), (64, 4)] {
+            let io = positional_with(AsyncIoOptions {
+                read_piece: 4096,
+                attempts_per_poll,
+                pieces_per_turn,
+                ..AsyncIoOptions::default()
+            });
+            let data = content(8 * 4096, 19);
+            let (_guard, file) = temp_file("order", &data);
+            io.read(file.as_raw_fd(), 0, buf(data.len()), then(1))
+                .unwrap();
+            io.read(file.as_raw_fd(), 0, buf(4096), then(2)).unwrap();
+            let first = poll(&io, 1)[0].0;
+            assert_eq!(
+                first, 2,
+                "the short read ends first at {attempts_per_poll} attempts, {pieces_per_turn} pieces"
+            );
+        }
+    }
+
     /// Two reads due share a visit by the options' pieces per turn.
     #[test]
     fn two_due_reads_take_turns_of_the_pieces_per_turn_of_the_options() {

@@ -435,7 +435,8 @@ pub struct AsyncIoOptions {
     /// Positional engine only: the most pieces of one read or write a visit moves in a row before
     /// the next operation's turn, while other operations are also due, at least 1. An operation
     /// that is alone in a visit is held to [`attempts_per_poll`](Self::attempts_per_poll)
-    /// instead. Default 4.
+    /// instead. When a visit's attempts run out inside a turn, the operation goes behind the others
+    /// due, so none moves more pieces than this in a row while another waits. Default 4.
     pub pieces_per_turn: usize,
 }
 
