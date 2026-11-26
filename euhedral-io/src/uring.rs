@@ -1118,6 +1118,18 @@ impl AsyncIo {
         )?)))
     }
 
+    /// As [`open_with`](Self::open_with), with the piece sizes of `options` (tests).
+    #[cfg(test)]
+    fn open_with_pieces(
+        enter: Box<Enter>,
+        options: crate::AsyncIoOptions,
+    ) -> io::Result<Arc<Self>> {
+        Ok(Self::from_engine_with(
+            Platform::Uring(Uring::with(enter, MAX_PIECE)?),
+            &options,
+        ))
+    }
+
     /// As [`open_with`](Self::open_with), with rings of `ring_entries` submission-queue entries
     /// (tests: a ring small enough to fill).
     #[cfg(test)]
@@ -2823,7 +2835,7 @@ mod tests {
     #[test]
     fn a_fifo_open_never_holds_the_reap_and_a_cancel_ends_the_open_that_has_no_reader() {
         let (guard, _path) = fifo_path("fifo");
-        let engine = crate::positional::Positional::new();
+        let engine = crate::positional::Positional::with_piece(MAX_PIECE);
         engine
             .submit(
                 open_request(&guard.0, false),
@@ -2879,7 +2891,7 @@ mod tests {
     #[test]
     fn a_fifo_open_with_no_reader_backs_off() {
         let (guard, _path) = fifo_path("fifo-backoff");
-        let engine = crate::positional::Positional::new();
+        let engine = crate::positional::Positional::with_piece(MAX_PIECE);
         engine
             .submit(
                 open_request(&guard.0, true),
@@ -2939,7 +2951,7 @@ mod tests {
             eprintln!("no lease on this file system: the test is skipped");
             return;
         }
-        let engine = crate::positional::Positional::new();
+        let engine = crate::positional::Positional::with_piece(MAX_PIECE);
         engine
             .submit(
                 open_request(&guard.0, true),
@@ -3084,6 +3096,241 @@ mod tests {
             assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
             assert!(error.to_string().contains(name), "{error}");
         }
+    }
+
+    fn positional_with(options: AsyncIoOptions) -> Arc<AsyncIo> {
+        AsyncIo::open_with_options(AsyncIoOptions {
+            positional_io: true,
+            ..options
+        })
+        .unwrap()
+    }
+
+    /// The send piece of the options sets what each attempt of a send moves.
+    #[test]
+    fn a_positional_send_goes_in_pieces_of_the_send_piece() {
+        let io = positional_with(AsyncIoOptions {
+            send_piece: 1000,
+            ..AsyncIoOptions::default()
+        });
+        let (ours, mut theirs) = socket_pair(1 << 20);
+        let data = content(4000, 12);
+        io.send(
+            ours.as_raw_fd(),
+            IoBuf {
+                filled: data.len(),
+                bytes: data.clone(),
+            },
+            then(1),
+        )
+        .unwrap();
+        let sent = poll(&io, 1).pop().unwrap().1.done.unwrap();
+        assert_eq!(sent.result.unwrap(), data.len());
+        assert_eq!(counts(&io).1, 4, "four pieces of a thousand bytes");
+        let mut got = vec![0; data.len()];
+        theirs.read_exact(&mut got).unwrap();
+        assert!(got == data, "the bytes arrive whole and in order");
+    }
+
+    /// The write piece of the options sets what each attempt of a write moves.
+    #[test]
+    fn a_positional_write_goes_in_pieces_of_the_write_piece() {
+        let io = positional_with(AsyncIoOptions {
+            write_piece: 4096,
+            ..AsyncIoOptions::default()
+        });
+        let (guard, file) = temp_file("write-piece", &[]);
+        let data = content(5 * 4096, 13);
+        io.write(
+            file.as_raw_fd(),
+            0,
+            IoBuf {
+                filled: data.len(),
+                bytes: data.clone(),
+            },
+            then(1),
+        )
+        .unwrap();
+        let done = poll(&io, 1).pop().unwrap().1.done.unwrap();
+        assert_eq!(done.result.unwrap(), data.len());
+        assert_eq!(counts(&io).1, 5, "five pieces of 4096 bytes");
+        assert_eq!(std::fs::read(&guard.0).unwrap(), data);
+    }
+
+    /// A lone read stops at the options' attempts for a visit, and the next visit goes on.
+    #[test]
+    fn a_visit_makes_at_most_the_attempts_per_poll_of_the_options() {
+        let io = positional_with(AsyncIoOptions {
+            read_piece: 4096,
+            attempts_per_poll: 3,
+            ..AsyncIoOptions::default()
+        });
+        let data = content(8 * 4096, 14);
+        let (_guard, file) = temp_file("attempts", &data);
+        io.read(file.as_raw_fd(), 0, buf(data.len()), then(1))
+            .unwrap();
+        assert_eq!(io.reap(), 0);
+        assert_eq!(counts(&io).1, 3, "three attempts in the first visit");
+        let done = poll(&io, 1).pop().unwrap().1.done.unwrap();
+        assert!(done.buf.bytes == data, "the later visits finish it");
+    }
+
+    /// Several due reads together stop at the options' attempts for a visit.
+    #[test]
+    fn the_attempts_per_poll_bound_a_visit_of_several_operations() {
+        let io = positional_with(AsyncIoOptions {
+            read_piece: 4096,
+            attempts_per_poll: 3,
+            ..AsyncIoOptions::default()
+        });
+        let data = content(8 * 4096, 18);
+        let (_guard, file) = temp_file("attempts-many", &data);
+        for tag in [1, 2] {
+            io.read(file.as_raw_fd(), 0, buf(data.len()), then(tag))
+                .unwrap();
+        }
+        assert_eq!(io.reap(), 0);
+        assert_eq!(counts(&io).1, 3, "three attempts between both");
+    }
+
+    /// Two reads due share a visit by the options' pieces per turn.
+    #[test]
+    fn two_due_reads_take_turns_of_the_pieces_per_turn_of_the_options() {
+        let io = positional_with(AsyncIoOptions {
+            read_piece: 4096,
+            pieces_per_turn: 2,
+            ..AsyncIoOptions::default()
+        });
+        let data = content(8 * 4096, 15);
+        let (_guard, file) = temp_file("turns", &data);
+        for tag in [1, 2] {
+            io.read(file.as_raw_fd(), 0, buf(data.len()), then(tag))
+                .unwrap();
+        }
+        assert_eq!(io.reap(), 0);
+        assert_eq!(counts(&io).1, 4, "two pieces each");
+    }
+
+    /// A count of 0 is refused where it is given, naming the value.
+    #[test]
+    fn a_count_of_zero_is_refused_naming_the_value() {
+        for (name, options) in [
+            (
+                "attempts_per_poll",
+                AsyncIoOptions {
+                    attempts_per_poll: 0,
+                    ..AsyncIoOptions::default()
+                },
+            ),
+            (
+                "pieces_per_turn",
+                AsyncIoOptions {
+                    pieces_per_turn: 0,
+                    ..AsyncIoOptions::default()
+                },
+            ),
+            (
+                "write_piece",
+                AsyncIoOptions {
+                    write_piece: MAX_PIECE + 1,
+                    ..AsyncIoOptions::default()
+                },
+            ),
+        ] {
+            let error = AsyncIo::open_with_options(options).err().unwrap();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            let said = error.to_string();
+            assert!(said.contains(name) && said.contains(" is "), "{said}");
+        }
+    }
+
+    /// The stand-in for `io_uring_enter` that counts its calls: one per piece of a lone operation.
+    fn counting_io() -> (Arc<AsyncIo>, Arc<std::sync::atomic::AtomicUsize>) {
+        let enters = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = enters.clone();
+        let io = AsyncIo::open_with(
+            Box::new(move |submitter: &Submitter<'_>| {
+                seen.fetch_add(1, Ordering::Relaxed);
+                submitter.submit()
+            }),
+            MAX_PIECE,
+        )
+        .unwrap();
+        (io, enters)
+    }
+
+    /// On io_uring a read goes in pieces of the size it names: one enter per piece.
+    #[test]
+    fn an_io_uring_read_goes_in_pieces_of_the_size_it_names() {
+        let data = content(DEFAULT_PIECE, 16);
+        let (_guard, file) = temp_file("ring-piece", &data);
+        let (io, enters) = counting_io();
+        let options = ReadOptions {
+            piece: Some(DEFAULT_PIECE / 4),
+        };
+        io.read_with(file.as_raw_fd(), 0, buf(data.len()), options, then(1))
+            .unwrap();
+        let done = poll(&io, 1).pop().unwrap().1.done.unwrap();
+        assert!(done.buf.bytes == data);
+        let small = enters.load(Ordering::Relaxed);
+
+        let (io, enters) = counting_io();
+        io.read_with(
+            file.as_raw_fd(),
+            0,
+            buf(data.len()),
+            ReadOptions::default(),
+            then(1),
+        )
+        .unwrap();
+        let done = poll(&io, 1).pop().unwrap().1.done.unwrap();
+        assert!(done.buf.bytes == data);
+        assert!(
+            small >= enters.load(Ordering::Relaxed) + 3,
+            "a quarter piece needs three more submissions than a whole one"
+        );
+    }
+
+    /// On io_uring a send goes in pieces of the `AsyncIo`'s send piece.
+    #[test]
+    fn an_io_uring_send_goes_in_pieces_of_the_send_piece() {
+        let data = content(4000, 17);
+        let mut counts = Vec::new();
+        for send_piece in [1000, MAX_PIECE] {
+            let enters = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let seen = enters.clone();
+            let io = AsyncIo::open_with_pieces(
+                Box::new(move |submitter: &Submitter<'_>| {
+                    seen.fetch_add(1, Ordering::Relaxed);
+                    submitter.submit()
+                }),
+                AsyncIoOptions {
+                    send_piece,
+                    ..AsyncIoOptions::default()
+                },
+            )
+            .unwrap();
+            let (ours, mut theirs) = socket_pair(1 << 20);
+            io.send(
+                ours.as_raw_fd(),
+                IoBuf {
+                    filled: data.len(),
+                    bytes: data.clone(),
+                },
+                then(1),
+            )
+            .unwrap();
+            let sent = poll(&io, 1).pop().unwrap().1.done.unwrap();
+            assert_eq!(sent.result.unwrap(), data.len());
+            let mut got = vec![0; data.len()];
+            theirs.read_exact(&mut got).unwrap();
+            assert!(got == data);
+            counts.push(enters.load(Ordering::Relaxed));
+        }
+        assert!(
+            counts[0] >= counts[1] + 3,
+            "pieces of a thousand need three more submissions than a whole send: {counts:?}"
+        );
     }
 
     /// A cancelled operation due in the same visit is a rival: the live read moves four pieces, not all the budget.

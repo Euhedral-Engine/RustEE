@@ -41,17 +41,27 @@ after another, each piece's completion submitting the next. The caller sets the 
 *Piece size*, below). The `AsyncIo` type is the same everywhere; an engine under it
 starts operations and finds their ends, and `src/lib.rs` does the rest.
 
-**Piece size.** `AsyncIoOptions::read_piece` and `send_piece` (each 1 to `MAX_PIECE`, 2 GiB less 4 KiB;
-`open_with_options` refuses anything else, naming the value) set how many bytes one piece of a read or a send
-moves, and `ReadOptions { piece: Some(n) }` on `read_with` and `read_into_with` sets it for one read, so one
-`AsyncIo` can hold buffered and direct files. The crate sets no policy: both default to `DEFAULT_PIECE`
-(256 KiB), a default the caller may change. Guidance: a read the page cache can serve is copied inside the
-submitting call, on the submitting worker, at about 0.2 ms per MB, so a buffered read is best kept in small
-pieces, which bound how long one call holds a worker. A read of a file opened for direct I/O copies nothing and
-each piece is a round trip to the device, so a large piece (up to `MAX_PIECE`) keeps the device busy with the
-whole read; for such a file the piece must be a multiple of the device's logical block size (a multiple of
-4096 is safe), which the crate cannot check and the kernel enforces. Writes keep their own piece (Windows: 256
-KiB, see below).
+**Piece size.** `AsyncIoOptions::read_piece`, `send_piece` and `write_piece` (each 1 to `MAX_PIECE`, 2 GiB less
+4 KiB; `open_with_options` refuses anything else, naming the value) set how many bytes one piece of a read, a
+send or a write moves, and `ReadOptions::with_piece(n)` on `read_with` and
+`read_into_with` sets it for one read, so one `AsyncIo` can hold buffered and direct files. `write_piece` applies
+to the positional engine and to Windows; io_uring does not cut writes below `MAX_PIECE`. The crate sets no
+policy: all three default to `DEFAULT_PIECE` (256 KiB), a default the caller may change. What a piece costs the
+worker depends on the engine:
+
+- **io_uring** (and Windows): a read the page cache can serve is copied inside the submitting call, on the
+  submitting worker, at about 0.2 ms per MB, so a buffered read is best kept in small pieces, which bound how long
+  one call holds a worker. A read of a file opened for direct I/O copies nothing and no worker waits for the
+  device; each piece is a round trip, so a large piece (up to `MAX_PIECE`) keeps the device busy with the whole
+  read.
+- **Positional engine:** every piece is a synchronous `pread` or `pwrite` made by the polling worker, buffered or
+  direct, and the worker waits for it. A visit makes up to `attempts_per_poll` of them (64 by default) for a
+  lone operation, and at most `pieces_per_turn` (4) in a row for each when several are due, so the worker is
+  held for about that many pieces' time: size the piece with that in mind (a piece of `MAX_PIECE` holds it for
+  the time of a 2 GiB read).
+
+For a direct file the piece must be a multiple of the device's logical block size (a multiple of 4096 is safe),
+which the crate cannot check and the kernel enforces.
 
 `file_len(file, then)` finds the length of an open file without blocking the caller, so a reader can size its
 buffers or plan its reads from it: `statx(2)` of the descriptor through the ring on Linux and Android
@@ -99,7 +109,7 @@ internally, each landing at its own offset. `read` stays as it was, for a `Vec`-
   result in a queue the poll drains: the one place the crate uses threads it did not create. Handles must be
   opened for overlapped I/O (`open_path` does, and so do Rust's sockets) and must not skip the port
   on success; a handle that would block or never complete is refused. A handle joins the engine's
-  port and can serve one `AsyncIo`, ever. Writes go in pieces of at most 256 KiB, since a write
+  port and can serve one `AsyncIo`, ever. Writes go in pieces of at most `write_piece` (256 KiB by default), since a write
   that extends a file is synchronous on NTFS. Tested on a real Windows by
   [CI](../.github/workflows/ci.yml) (its `workspace` job on `windows-2025`).
 - **macOS:** no engine yet.
@@ -137,11 +147,11 @@ assert_eq!(io.backend(), IoBackend::Positional);
   per visit and hands the ended ones on. A visit makes one `poll(2)` call with a zero timeout over the descriptors
   that operations wait for (sockets, accept, pipes), and attempts only the ones it reports ready; a socket that is
   not ready costs that one shared call and no attempt of its own. An attempt is one piece of a read or write
-  (`pread`, `pwrite`, at most 256 KiB), one non-blocking socket call, or the whole of an open, a rename or a length
-  (`fstat`). A visit makes at most 64 attempts, and every attempt counts against that. An operation that is the only
+  (`pread`, `pwrite`, at most the read, write or send piece, 256 KiB by default), one non-blocking socket call, or the whole of an open, a rename or a length
+  (`fstat`). A visit makes at most `attempts_per_poll` attempts (64 by default), and every attempt counts against that. An operation that is the only
   one due in a visit (the others wait for a descriptor that is not ready, back off or were cancelled) goes on until
-  the 64 are used, so a lone long read moves up to 16 MiB a visit; with two or more due, each moves at most 4 pieces
-  in a row.
+  the attempts are used, so a lone long read moves up to 64 pieces (16 MiB at the default size) a visit; with two or
+  more due, each moves at most `pieces_per_turn` (4) pieces in a row.
 - **Streams.** A pipe, tty or character device cannot be read at an offset (`ESPIPE`): such an operation goes on as
   a stream, waits for readiness and then uses `read` or `write`; the offset is ignored.
 - **Opening a FIFO** never holds the worker: the open is made with `O_NONBLOCK` and the flag is cleared on the

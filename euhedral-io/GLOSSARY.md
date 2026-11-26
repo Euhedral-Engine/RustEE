@@ -10,8 +10,10 @@ only starts operations and finds their ends; the public API, the buffers, the co
 `LatticeSource` behaviour are portable and live in `src/lib.rs`. io_uring on Linux and Android; IoRing and
 completion ports on Windows; none on macOS yet, where the crate is empty.
 
-**pieces**: a read is cut into pieces so that no single completion holds a worker for long. On Windows a
-write goes in pieces of at most 256 KiB, because a write that extends a file is synchronous on NTFS. A
+**pieces**: a read or a send is cut into pieces of at most the size the caller sets (`AsyncIoOptions::read_piece`,
+`send_piece`, or `ReadOptions::piece` for one read; 256 KiB by default), each piece's completion submitting the
+next. On the positional engine and on Windows a write goes in pieces of at most `AsyncIoOptions::write_piece`
+(256 KiB by default; a write that extends a file is synchronous on NTFS). A
 region read with `read_into` is cut internally too, each piece landing at its own offset.
 
 **IoMemory** ([`IoMemory`](src/lib.rs)): an `unsafe` trait for memory the caller owns, that

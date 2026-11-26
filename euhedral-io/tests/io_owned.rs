@@ -27,7 +27,7 @@ use euhedral_io::{AsyncIo, Create, IoDoneOwned, OpenSpec, OwnedFile, RawFile};
 #[cfg(target_os = "linux")]
 use euhedral_io::{IoMemory, MAX_PIECE, ReadOptions};
 
-/// The most bytes the engine moves in one piece is 256 KiB; a read of more is cut.
+/// The default piece (`DEFAULT_PIECE`): a read of more is cut.
 const PIECE: usize = 256 * 1024;
 const SENTINEL: u8 = 0xAA;
 
@@ -502,9 +502,7 @@ fn a_direct_read_with_the_largest_piece_lands_every_byte() {
         raw(&file),
         0,
         Aligned::new(data.len()),
-        ReadOptions {
-            piece: Some(MAX_PIECE),
-        },
+        ReadOptions::with_piece(MAX_PIECE),
         Box::new(move |done| {
             *landing.lock().unwrap() = Some(done);
             Ended::frame(2)

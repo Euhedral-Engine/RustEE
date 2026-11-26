@@ -6,7 +6,7 @@
 //! open, a rename or a length), and the operations that did not end go to the back of the line. The operations
 //! that wait for a descriptor (sockets, accept, pipes and the like) are asked about together: one `poll(2)` call
 //! with no timeout per visit over their descriptors, and only the ones it reports ready are attempted. A visit
-//! walks the line once and makes at most [`ATTEMPTS_PER_POLL`] attempts, so nothing waits and what is idle costs
+//! walks the line once and makes at most [`AsyncIoOptions::attempts_per_poll`] attempts, so nothing waits and what is idle costs
 //! one system call between all of it.
 //!
 //! Everything here is plain state of the one poll that is inside (`SourceCell`); only the queue of messages
@@ -27,21 +27,12 @@ use euhedral_data_structures::queues::{Consumer, MpscQueue, Multi, Producer, Sin
 
 use super::uring::{c_path, open_flags, socket_address};
 use super::{
-    Buf, Cancelled, Engine, LimitPassed, MAX_PIECE, OpId, Request, Then, WRITE_PIECE,
+    AsyncIoOptions, Buf, Cancelled, Engine, LimitPassed, MAX_PIECE, OpId, Request, Then,
     conclude as conclude_io,
 };
 
 /// Slots per chunk of the queue of messages.
 const INCOMING_CHUNK: usize = 256;
-/// The most attempts one poll makes, so that a reap is bounded work however much is queued. Every attempt counts,
-/// one that finds its descriptor not ready after all included; an operation that readiness says is not ready is
-/// not attempted and costs nothing.
-const ATTEMPTS_PER_POLL: usize = 64;
-/// The most pieces of one read or write a poll moves in a row before the next operation's turn, while other
-/// operations are also due (one that is cancelled or past its limit is due: it takes an attempt to end; one that
-/// waits for a descriptor that is not ready or backs off is not). An operation that is the only one due in a
-/// visit goes on until the visit's attempt budget is used.
-const PIECES_PER_TURN: usize = 4;
 /// The most visits an open that cannot proceed yet (a FIFO with no reader, a leased file) lets pass between two
 /// of its attempts. The wait doubles from one visit up to this.
 const OPEN_RETRY_VISITS_MAX: u32 = 64;
@@ -59,6 +50,13 @@ pub(super) struct Positional {
     state: SourceCell<State>,
     /// The most bytes one step of a read, write or send moves; a test lowers it to force short ones.
     max_piece: usize,
+    /// The most bytes one step of a write moves ([`AsyncIoOptions::write_piece`]).
+    write_piece: usize,
+    /// The most attempts one poll makes ([`AsyncIoOptions::attempts_per_poll`]).
+    attempts_per_poll: usize,
+    /// The most pieces of one read or write a poll moves in a row while other operations are also due
+    /// ([`AsyncIoOptions::pieces_per_turn`]).
+    pieces_per_turn: usize,
     /// How many `poll(2)` readiness calls the visits made (tests).
     #[cfg(test)]
     pub(super) readiness_calls: std::sync::atomic::AtomicUsize,
@@ -276,14 +274,14 @@ impl Op {
     }
 
     /// One step: ends early for a cancel or a passed limit, else does the operation's next piece or attempt.
-    fn step(&mut self, max_piece: usize) -> Step {
+    fn step(&mut self, max_piece: usize, write_piece: usize) -> Step {
         if self.cancelled {
             return Step::Done(Err(Cancelled::error(self.moved)));
         }
         if self.limit.is_some_and(|at| Instant::now() >= at) {
             return Step::Done(Err(LimitPassed::error(self.moved)));
         }
-        let piece = max_piece.min(WRITE_PIECE);
+        let piece = max_piece.min(write_piece);
         match &mut self.kind {
             Kind::Read {
                 fd,
@@ -671,12 +669,18 @@ fn kind(request: Request) -> io::Result<Kind> {
 }
 
 impl Positional {
-    pub(super) fn new() -> Self {
-        Self::with_piece(MAX_PIECE)
+    pub(super) fn new(options: &AsyncIoOptions) -> Self {
+        Self::with_settings(MAX_PIECE, options)
     }
 
     /// An engine whose read, write and send steps move at most `max_piece` bytes (tests force short ones).
+    #[cfg(test)]
     pub(super) fn with_piece(max_piece: usize) -> Self {
+        Self::with_settings(max_piece, &AsyncIoOptions::default())
+    }
+
+    /// An engine with `max_piece` and the settings of `options` (already checked).
+    fn with_settings(max_piece: usize, options: &AsyncIoOptions) -> Self {
         let queue: MpscQueue<Message> = MpscQueue::with_pool(INCOMING_CHUNK, 2);
         Self {
             id: ID_MARK | NEXT_ID.fetch_add(1, Ordering::Relaxed),
@@ -689,6 +693,9 @@ impl Positional {
                 slots: Vec::new(),
             }),
             max_piece: max_piece.clamp(1, MAX_PIECE),
+            write_piece: options.write_piece,
+            attempts_per_poll: options.attempts_per_poll,
+            pieces_per_turn: options.pieces_per_turn,
             #[cfg(test)]
             readiness_calls: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
@@ -824,11 +831,11 @@ impl Engine for Positional {
             }
         }
         let turns = if due == 1 {
-            ATTEMPTS_PER_POLL
+            self.attempts_per_poll
         } else {
-            PIECES_PER_TURN
+            self.pieces_per_turn
         };
-        let mut budget = ATTEMPTS_PER_POLL;
+        let mut budget = self.attempts_per_poll;
         for _ in 0..active.len() {
             let Some(mut op) = active.pop_front() else {
                 return;
@@ -847,7 +854,7 @@ impl Engine for Positional {
                 turn += 1;
                 #[cfg(test)]
                 self.attempts.fetch_add(1, Ordering::Relaxed);
-                match op.step(self.max_piece) {
+                match op.step(self.max_piece, self.write_piece) {
                     Step::Done(result) => {
                         op.release();
                         let fills = matches!(op.kind, Kind::Read { .. } | Kind::Recv { .. });

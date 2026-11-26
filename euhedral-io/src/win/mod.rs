@@ -60,7 +60,7 @@ use self::sys::{
 };
 use super::{
     AsyncIo, AsyncIoOptions, Buf, Cancelled, Engine as EngineTrait, LimitPassed, MAX_PIECE, OpId,
-    OpenSpec, Request, Then, WRITE_PIECE, conclude as conclude_io, invalid,
+    OpenSpec, Request, Then, conclude as conclude_io, invalid,
 };
 
 mod handles;
@@ -540,6 +540,8 @@ pub(super) struct Engine {
     rings: Box<[OnceLock<Arc<Ring>>]>,
     ring_count: AtomicUsize,
     max_piece: usize,
+    /// The most bytes of one piece of a write ([`AsyncIoOptions::write_piece`]).
+    write_piece: usize,
     /// The soonest deadline of the limits (`NO_DEADLINE` when there is none): `begin` lowers it, the
     /// poller sets it to the head of its set. A poll before it does nothing for limits.
     next_deadline: AtomicU64,
@@ -614,6 +616,7 @@ impl Engine {
             rings: (0..MAX_RINGS).map(|_| OnceLock::new()).collect(),
             ring_count: AtomicUsize::new(0),
             max_piece: max_piece.clamp(1, MAX_PIECE),
+            write_piece: options.write_piece,
             next_deadline: AtomicU64::new(NO_DEADLINE),
             strays: AtomicUsize::new(0),
         })
@@ -1408,11 +1411,11 @@ impl Engine {
             Kind::Write { file, offset } => {
                 let file = *file;
                 let at = offset + moved as u64;
-                // Pieces of at most WRITE_PIECE: a write that extends a file is synchronous on
+                // Pieces of at most the write piece: a write that extends a file is synchronous on
                 // NTFS (the call returns when the data is written), so its size is the worker's
                 // wait.
                 let rest = &op.buf.bytes()[moved..op.buf.filled()];
-                let len = self.piece(rest.len().min(WRITE_PIECE));
+                let len = self.piece(rest.len().min(self.write_piece));
                 let buf = rest.as_ptr();
                 if let Route::Ring(ring) = &op.route {
                     let entry = Entry {

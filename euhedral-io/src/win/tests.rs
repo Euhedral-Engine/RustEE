@@ -110,18 +110,17 @@ impl Harness {
     }
 
     fn with(probe: Option<RingProbe>, ioring: bool, max_piece: usize) -> Self {
+        let options = AsyncIoOptions {
+            windows_ioring: ioring,
+            ..AsyncIoOptions::default()
+        };
+        Self::with_options(probe, options, max_piece)
+    }
+
+    fn with_options(probe: Option<RingProbe>, options: AsyncIoOptions, max_piece: usize) -> Self {
         let sim = Arc::new(Sim::new());
         sim.set_probe(probe);
-        let engine = Engine::new(
-            sim.clone(),
-            AsyncIoOptions {
-                windows_ioring: ioring,
-                positional_io: false,
-                ..AsyncIoOptions::default()
-            },
-            max_piece,
-        )
-        .unwrap();
+        let engine = Engine::new(sim.clone(), options, max_piece).unwrap();
         Self {
             sim,
             engine: Arc::new(engine),
@@ -274,6 +273,91 @@ fn a_read_is_cut_into_pieces_and_ends_once_with_its_bytes() {
     let reads = h.sim.log().iter().filter(|l| l.starts_with("read")).count();
     assert_eq!(reads, 4, "pieces of at most 4096 bytes");
     assert_eq!(h.pending(), 0);
+}
+
+/// A read's own piece, below the engine's limit, sets what each call moves.
+#[test]
+fn a_read_goes_in_pieces_of_the_size_its_request_names() {
+    let h = Harness::new();
+    let data = content(3 * 10_000 + 5);
+    let file = h.sim.file(&data);
+    let buf = IoBuf {
+        bytes: vec![0; data.len()],
+        filled: 0,
+    };
+    let request = Request::Read {
+        file,
+        offset: 0,
+        piece: 10_000,
+    };
+    h.submit(request, buf, io_then(1)).unwrap();
+    let done = ended(h.one());
+    assert_eq!(done.result.unwrap(), data.len());
+    assert_eq!(done.buf.bytes, data);
+    let reads = h.sim.log().iter().filter(|l| l.starts_with("read")).count();
+    assert_eq!(reads, 4, "pieces of at most 10000 bytes");
+}
+
+/// A piece up to the limit reads whole what the default would cut in many.
+#[test]
+fn a_read_of_the_largest_piece_goes_in_one_call() {
+    let h = Harness::new();
+    let data = content(3 * DEFAULT_PIECE + 5);
+    let file = h.sim.file(&data);
+    let buf = IoBuf {
+        bytes: vec![0; data.len()],
+        filled: 0,
+    };
+    let request = Request::Read {
+        file,
+        offset: 0,
+        piece: MAX_PIECE,
+    };
+    h.submit(request, buf, io_then(1)).unwrap();
+    let done = ended(h.one());
+    assert_eq!(done.buf.bytes, data);
+    let reads = h.sim.log().iter().filter(|l| l.starts_with("read")).count();
+    assert_eq!(reads, 1);
+}
+
+/// A send's own piece sets what each call moves.
+#[test]
+fn a_send_goes_in_pieces_of_the_size_its_request_names() {
+    let h = Harness::new();
+    let sock = h.sim.sock();
+    let data = content(250);
+    let buf = IoBuf {
+        bytes: data.clone(),
+        filled: data.len(),
+    };
+    h.submit(Request::Send { sock, piece: 100 }, buf, io_then(1))
+        .unwrap();
+    assert_eq!(ended(h.one()).result.unwrap(), 250);
+    assert_eq!(h.sim.sent(sock), data);
+    let sends = h.sim.log().iter().filter(|l| l.starts_with("Send")).count();
+    assert_eq!(sends, 3, "pieces of at most 100 bytes");
+}
+
+/// The write piece of the options sets what each call of a write moves.
+#[test]
+fn a_write_goes_in_pieces_of_the_write_piece_of_the_options() {
+    let options = AsyncIoOptions {
+        write_piece: MAX_PIECE,
+        ..AsyncIoOptions::default()
+    };
+    let h = Harness::with_options(None, options, MAX_PIECE);
+    let file = h.sim.file(&[]);
+    let data = content(600 * 1024);
+    h.write(file, 0, &data, 1).unwrap();
+    assert_eq!(ended(h.one()).result.unwrap(), data.len());
+    let writes = h
+        .sim
+        .log()
+        .iter()
+        .filter(|l| l.starts_with("write"))
+        .count();
+    assert_eq!(writes, 1);
+    assert_eq!(h.sim.file_data(file), data);
 }
 
 #[test]
@@ -1368,7 +1452,7 @@ fn a_ring_completion_or_a_packet_ends_only_a_record_on_its_own_route() {
 }
 
 #[test]
-fn a_write_goes_in_pieces_of_at_most_a_read_piece() {
+fn a_write_goes_in_pieces_of_at_most_the_default_write_piece() {
     let h = Harness::new();
     let file = h.sim.file(&[]);
     let data = content(600 * 1024);

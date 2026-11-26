@@ -176,7 +176,9 @@ pub struct OpOptions {
 
 /// How one read of [`AsyncIo::read_with`] or [`AsyncIo::read_into_with`] differs from the
 /// `AsyncIo`'s defaults.
+/// Build it with [`ReadOptions::with_piece`] or from `ReadOptions::default()`: it may gain fields.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ReadOptions {
     /// The most bytes one piece of this read moves, in place of
     /// [`AsyncIoOptions::read_piece`]: `None` keeps that. Refused (the submission returns an
@@ -184,6 +186,16 @@ pub struct ReadOptions {
     /// direct I/O must keep it a multiple of the device's logical block size (4096 is safe), as
     /// the kernel requires of every piece.
     pub piece: Option<usize>,
+}
+
+impl ReadOptions {
+    /// Options with the piece of a read set to `piece` bytes.
+    pub fn with_piece(piece: usize) -> Self {
+        Self {
+            piece: Some(piece),
+            ..Self::default()
+        }
+    }
 }
 
 /// The error of an operation that [`AsyncIo::cancel`] ended before it finished: kind
@@ -387,12 +399,22 @@ pub struct AsyncIoOptions {
     /// choose its own through [`ReadOptions::piece`] (a system holding buffered and direct files
     /// sets the size per read).
     ///
-    /// Guidance: a read the page cache can serve is copied inside the submitting call, on the
-    /// submitting worker, at about 0.2 ms per MB, so a buffered read is best kept to small pieces
-    /// (the default), which bound how long one call holds a worker. A read of a file opened for
-    /// direct I/O copies nothing, and each piece is a round trip to the device: a large piece
-    /// (up to [`MAX_PIECE`]) lets the device work on the whole read at once. For a direct file the
-    /// piece must be a multiple of the device's logical block size (4096 is safe).
+    /// Guidance, by what a piece costs the worker, per engine:
+    /// - **io_uring:** a read the page cache can serve is copied inside the submitting call, on
+    ///   the submitting worker, at about 0.2 ms per MB, so a buffered read is best kept to small
+    ///   pieces (the default), which bound how long one call holds a worker. A read of a file
+    ///   opened for direct I/O copies nothing: the device works while no worker waits, and each
+    ///   piece is a round trip, so a large piece (up to [`MAX_PIECE`]) lets the device work on
+    ///   the whole read at once.
+    /// - **Positional engine** (`positional_io`, or where io_uring is refused): every piece is a
+    ///   synchronous `pread` made by the polling worker, buffered or direct, and the worker waits
+    ///   for it (the copy, or the device). A visit makes up to
+    ///   [`attempts_per_poll`](Self::attempts_per_poll) of them in a row for a lone read, so the
+    ///   worker is held for about that many pieces' time: size the piece with that in mind.
+    /// - **Windows:** as io_uring, where the call is the submitting worker's.
+    ///
+    /// For a direct file the piece must be a multiple of the device's logical block size (4096
+    /// is safe).
     ///
     /// The default is [`DEFAULT_PIECE`] (256 KiB), kept so that callers that set nothing behave as
     /// before; it is a default, not a policy.
@@ -400,6 +422,21 @@ pub struct AsyncIoOptions {
     /// As [`read_piece`](Self::read_piece), for the pieces of a send. A send is copied into the
     /// socket inside the submitting call, so the guidance for a buffered read holds for it.
     pub send_piece: usize,
+    /// The most bytes one piece of a write moves, from 1 to [`MAX_PIECE`], on the positional engine
+    /// and on Windows (a write that extends a file is synchronous on NTFS, so its size is the
+    /// worker's wait; on the positional engine every `pwrite` is a worker's wait). The io_uring
+    /// engine does not cut writes below [`MAX_PIECE`] and ignores it. Default [`DEFAULT_PIECE`].
+    pub write_piece: usize,
+    /// Positional engine only: the most attempts one visit of the poll makes (an attempt is one
+    /// piece of a read or write, one non-blocking socket call, or a whole open, rename or length),
+    /// at least 1. It bounds the work of a reap: a lone long read moves up to this many pieces in a
+    /// visit. Default 64.
+    pub attempts_per_poll: usize,
+    /// Positional engine only: the most pieces of one read or write a visit moves in a row before
+    /// the next operation's turn, while other operations are also due, at least 1. An operation
+    /// that is alone in a visit is held to [`attempts_per_poll`](Self::attempts_per_poll)
+    /// instead. Default 4.
+    pub pieces_per_turn: usize,
 }
 
 impl Default for AsyncIoOptions {
@@ -409,16 +446,33 @@ impl Default for AsyncIoOptions {
             positional_io: false,
             read_piece: DEFAULT_PIECE,
             send_piece: DEFAULT_PIECE,
+            write_piece: DEFAULT_PIECE,
+            attempts_per_poll: DEFAULT_ATTEMPTS_PER_POLL,
+            pieces_per_turn: DEFAULT_PIECES_PER_TURN,
         }
     }
 }
 
 impl AsyncIoOptions {
-    /// Refuses a piece size outside `1..=MAX_PIECE`.
+    /// Refuses a piece size outside `1..=MAX_PIECE` and a count of 0, naming the value.
     fn check(&self) -> io::Result<()> {
         check_piece("read_piece", self.read_piece)?;
-        check_piece("send_piece", self.send_piece)
+        check_piece("send_piece", self.send_piece)?;
+        check_piece("write_piece", self.write_piece)?;
+        check_count("attempts_per_poll", self.attempts_per_poll)?;
+        check_count("pieces_per_turn", self.pieces_per_turn)
     }
+}
+
+/// Refuses a count of 0, naming `what` and the value.
+fn check_count(what: &str, count: usize) -> io::Result<()> {
+    if count >= 1 {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("{what} is {count}: it is at least 1"),
+    ))
 }
 
 /// Refuses a piece size of 0 or above [`MAX_PIECE`], naming `what`, the value and the limit.
@@ -435,11 +489,13 @@ fn check_piece(what: &str, piece: usize) -> io::Result<()> {
 /// The piece size of a read or send that no option changes: 256 KiB.
 pub const DEFAULT_PIECE: usize = 256 * 1024;
 /// The longest piece of a read, write or send handed to the kernel at once (the limit of
-/// [`AsyncIoOptions::read_piece`], [`AsyncIoOptions::send_piece`] and [`ReadOptions::piece`]); the
+/// [`AsyncIoOptions::read_piece`], [`AsyncIoOptions::send_piece`], [`AsyncIoOptions::write_piece`] and [`ReadOptions::piece`]); the
 /// rest follows as a short one's would.
 pub const MAX_PIECE: usize = (i32::MAX as usize) & !4095;
-/// What writes use on the engines that cut them (the default piece).
-pub(crate) const WRITE_PIECE: usize = DEFAULT_PIECE;
+/// The default of [`AsyncIoOptions::attempts_per_poll`].
+pub const DEFAULT_ATTEMPTS_PER_POLL: usize = 64;
+/// The default of [`AsyncIoOptions::pieces_per_turn`].
+pub const DEFAULT_PIECES_PER_TURN: usize = 4;
 
 /// What an operation asks of an engine. Handles are the platform's raw values (a descriptor, a
 /// handle or a socket) as a `usize`.
