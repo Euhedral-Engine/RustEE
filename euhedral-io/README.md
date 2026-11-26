@@ -50,10 +50,10 @@ policy: all three default to `DEFAULT_PIECE` (256 KiB), a default the caller may
 worker depends on the engine:
 
 - **io_uring** (and Windows): a read the page cache can serve is copied inside the submitting call, on the
-  submitting worker, at about 0.2 ms per MB, so a buffered read is best kept in small pieces, which bound how long
+  submitting worker, so for a buffered file keep the default small piece, which bounds how long
   one call holds a worker. A read of a file opened for direct I/O copies nothing and no worker waits for the
-  device; each piece is a round trip, so a large piece (up to `MAX_PIECE`) keeps the device busy with the whole
-  read.
+  device; each piece is a round trip, so for a direct file a large piece (up to `MAX_PIECE`) is recommended: the
+  device works on the whole read.
 - **Positional engine:** every piece is a synchronous `pread` or `pwrite` made by the polling worker, buffered or
   direct, and the worker waits for it. A visit makes up to `attempts_per_poll` of them (64 by default) for a
   lone operation, and at most `pieces_per_turn` (4) in a row for each when several are due, so the worker is

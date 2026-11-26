@@ -401,11 +401,11 @@ pub struct AsyncIoOptions {
     ///
     /// Guidance, by what a piece costs the worker, per engine:
     /// - **io_uring:** a read the page cache can serve is copied inside the submitting call, on
-    ///   the submitting worker, at about 0.2 ms per MB, so a buffered read is best kept to small
-    ///   pieces (the default), which bound how long one call holds a worker. A read of a file
+    ///   the submitting worker, so for a buffered file keep the default small piece, which bounds
+    ///   how long one call holds a worker. A read of a file
     ///   opened for direct I/O copies nothing: the device works while no worker waits, and each
-    ///   piece is a round trip, so a large piece (up to [`MAX_PIECE`]) lets the device work on
-    ///   the whole read at once.
+    ///   piece is a round trip, so for a direct file a large piece (up to [`MAX_PIECE`]) is
+    ///   recommended: the device works on the whole read at once.
     /// - **Positional engine** (`positional_io`, or where io_uring is refused): every piece is a
     ///   synchronous `pread` made by the polling worker, buffered or direct, and the worker waits
     ///   for it (the copy, or the device). A visit makes up to
