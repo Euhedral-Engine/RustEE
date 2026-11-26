@@ -22,8 +22,8 @@ use euhedral_data_structures::queues::{Consumer, MpscQueue, Multi, Producer, Sin
 use io_uring::{IoUring, Submitter, opcode, squeue, types};
 
 use super::{
-    AsyncIo, Buf, Cancelled, Create, Engine, LimitPassed, MAX_PIECE, OpId, OpenSpec, READ_PIECE,
-    Request, Then, conclude as conclude_io, note_stray,
+    AsyncIo, Buf, Cancelled, Create, Engine, LimitPassed, MAX_PIECE, OpId, OpenSpec, Request, Then,
+    conclude as conclude_io, note_stray,
 };
 
 /// Entries of each ring's submission queue (its completion queue has twice as many).
@@ -202,6 +202,8 @@ enum Kind {
     Read {
         fd: RawFd,
         offset: u64,
+        /// The most bytes of one piece.
+        piece: usize,
     },
     Write {
         fd: RawFd,
@@ -209,6 +211,8 @@ enum Kind {
     },
     Send {
         fd: RawFd,
+        /// The most bytes of one piece.
+        piece: usize,
     },
     Recv {
         fd: RawFd,
@@ -322,14 +326,16 @@ impl Op {
     fn entry(&mut self, user_data: u64, max_piece: usize) -> squeue::Entry {
         let piece = |n: usize| u32::try_from(n.min(max_piece)).unwrap_or(u32::MAX);
         let entry = match &mut self.kind {
-            Kind::Read { fd, offset } => {
+            Kind::Read {
+                fd,
+                offset,
+                piece: whole,
+            } => {
                 let rest = &mut self.buf.bytes_mut()[self.moved..];
-                // A read the page cache can serve is copied inside `io_uring_enter`, on the
-                // submitting worker: about 0.2 ms per MB (a read of several MB copied in one
-                // completion held a worker for a millisecond). So a read goes in pieces of at most
-                // READ_PIECE, each piece's completion submitting the next (`IOSQE_ASYNC` instead
-                // made the submitting worker create an io worker thread now and then: worse).
-                let len = piece(rest.len().min(READ_PIECE));
+                // A read goes in pieces of at most the caller's size, each piece's completion
+                // submitting the next (`IOSQE_ASYNC` instead made the submitting worker create an
+                // io worker thread now and then: worse).
+                let len = piece(rest.len().min(*whole));
                 opcode::Read::new(types::Fd(*fd), rest.as_mut_ptr(), len)
                     .offset(*offset + self.moved as u64)
                     .build()
@@ -340,14 +346,13 @@ impl Op {
                     .offset(*offset + self.moved as u64)
                     .build()
             }
-            Kind::Send { fd } => {
-                // Copied into the socket inside `io_uring_enter` too: pieces of at most READ_PIECE,
-                // as reads.
+            Kind::Send { fd, piece: whole } => {
+                // Pieces of at most the caller's size, as reads.
                 let bytes = &self.buf.bytes()[self.moved..self.buf.filled()];
                 opcode::Send::new(
                     types::Fd(*fd),
                     bytes.as_ptr(),
-                    piece(bytes.len().min(READ_PIECE)),
+                    piece(bytes.len().min(*whole)),
                 )
                 .flags(libc::MSG_NOSIGNAL)
                 .build()
@@ -899,15 +904,23 @@ impl Uring {
 
     fn kind(request: Request) -> io::Result<Kind> {
         Ok(match request {
-            Request::Read { file, offset } => Kind::Read {
+            Request::Read {
+                file,
+                offset,
+                piece,
+            } => Kind::Read {
                 fd: file as RawFd,
                 offset,
+                piece,
             },
             Request::Write { file, offset } => Kind::Write {
                 fd: file as RawFd,
                 offset,
             },
-            Request::Send { sock } => Kind::Send { fd: sock as RawFd },
+            Request::Send { sock, piece } => Kind::Send {
+                fd: sock as RawFd,
+                piece,
+            },
             Request::Recv { sock } => Kind::Recv { fd: sock as RawFd },
             Request::Accept { listener } => Kind::Accept {
                 fd: listener as RawFd,
@@ -1131,7 +1144,8 @@ mod tests {
     use euhedral_core::generics::{LatticeReceiver, LatticeSource};
 
     use super::super::{
-        AsyncIoOptions, Continuation, IoBuf, IoDone, IoDoneOwned, IoMemory, IoThen, OpOptions,
+        AsyncIoOptions, Continuation, DEFAULT_PIECE, IoBuf, IoDone, IoDoneOwned, IoMemory, IoThen,
+        OpOptions, ReadOptions,
     };
     use super::*;
 
@@ -2178,6 +2192,7 @@ mod tests {
             .submit(
                 Request::Send {
                     sock: crate::raw_sock(ours.as_raw_fd()),
+                    piece: crate::DEFAULT_PIECE,
                 },
                 IoBuf {
                     bytes: vec![7; total],
@@ -2960,7 +2975,7 @@ mod tests {
     #[test]
     fn a_lone_long_read_moves_more_than_a_turn_in_one_reap_and_two_share() {
         let pieces = 12;
-        let data = content(pieces * crate::READ_PIECE, 5);
+        let data = content(pieces * crate::DEFAULT_PIECE, 5);
         let (_guard, file) = temp_file("long-read", &data);
         let io = positional();
         io.read(file.as_raw_fd(), 0, buf(data.len()), then(1))
@@ -2979,10 +2994,102 @@ mod tests {
         assert_eq!(io.reap(), 2);
     }
 
+    /// The read's own piece size sets what each step moves: 4 pieces of 64 KiB, not the default's one of 256 KiB.
+    #[test]
+    fn a_read_with_a_piece_issues_pieces_of_that_size() {
+        let data = content(DEFAULT_PIECE, 7);
+        let (_guard, file) = temp_file("piece-small", &data);
+        let io = positional();
+        let options = ReadOptions {
+            piece: Some(DEFAULT_PIECE / 4),
+        };
+        io.read_with(file.as_raw_fd(), 0, buf(data.len()), options, then(1))
+            .unwrap();
+        let done = poll(&io, 1).pop().unwrap().1.done.unwrap();
+        assert_eq!(done.result.unwrap(), data.len());
+        assert!(done.buf.bytes == data, "every piece landed at its offset");
+        assert_eq!(counts(&io).1, 4, "four pieces of a quarter each");
+    }
+
+    /// A piece up to the limit takes a read of several default pieces whole, and every byte lands.
+    #[test]
+    fn a_read_with_the_largest_piece_goes_whole() {
+        let data = content(12 * DEFAULT_PIECE + 5, 8);
+        let (_guard, file) = temp_file("piece-whole", &data);
+        let io = positional();
+        let options = ReadOptions {
+            piece: Some(MAX_PIECE),
+        };
+        io.read_with(file.as_raw_fd(), 0, buf(data.len()), options, then(1))
+            .unwrap();
+        let done = poll(&io, 1).pop().unwrap().1.done.unwrap();
+        assert_eq!(done.result.unwrap(), data.len());
+        assert!(done.buf.bytes == data, "every byte landed");
+        assert_eq!(counts(&io).1, 1, "one piece for all of it");
+    }
+
+    /// The `AsyncIo`'s own piece size is the default of a read that names none.
+    #[test]
+    fn the_options_of_the_io_set_the_piece_of_a_plain_read() {
+        let data = content(DEFAULT_PIECE, 9);
+        let (_guard, file) = temp_file("piece-io", &data);
+        let io = AsyncIo::open_with_options(AsyncIoOptions {
+            positional_io: true,
+            read_piece: DEFAULT_PIECE / 2,
+            ..AsyncIoOptions::default()
+        })
+        .unwrap();
+        io.read(file.as_raw_fd(), 0, buf(data.len()), then(1))
+            .unwrap();
+        let done = poll(&io, 1).pop().unwrap().1.done.unwrap();
+        assert!(done.buf.bytes == data);
+        assert_eq!(counts(&io).1, 2, "two pieces of a half each");
+    }
+
+    /// A piece of 0 or past the limit is refused where it is given, naming the value and the limit.
+    #[test]
+    fn a_bad_piece_is_refused_naming_the_value() {
+        let io = positional();
+        let (ours, _theirs) = socket_pair(4096);
+        for bad in [0, MAX_PIECE + 1] {
+            let options = ReadOptions { piece: Some(bad) };
+            let error = io
+                .read_with(ours.as_raw_fd(), 0, buf(8), options, then(1))
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            let said = error.to_string();
+            assert!(
+                said.contains(&format!("is {bad}:")) && said.contains(&MAX_PIECE.to_string()),
+                "the refusal names the value and the limit: {said}"
+            );
+            assert_eq!(io.pending(), 0, "nothing started");
+        }
+        for (name, options) in [
+            (
+                "read_piece",
+                AsyncIoOptions {
+                    read_piece: 0,
+                    ..AsyncIoOptions::default()
+                },
+            ),
+            (
+                "send_piece",
+                AsyncIoOptions {
+                    send_piece: MAX_PIECE + 1,
+                    ..AsyncIoOptions::default()
+                },
+            ),
+        ] {
+            let error = AsyncIo::open_with_options(options).err().unwrap();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(error.to_string().contains(name), "{error}");
+        }
+    }
+
     /// A cancelled operation due in the same visit is a rival: the live read moves four pieces, not all the budget.
     #[test]
     fn a_cancelled_operation_in_the_visit_is_a_rival_for_the_budget() {
-        let data = content(12 * crate::READ_PIECE, 6);
+        let data = content(12 * crate::DEFAULT_PIECE, 6);
         let (_guard, file) = temp_file("long-read-rival", &data);
         let io = positional();
         io.read(file.as_raw_fd(), 0, buf(data.len()), then(1))

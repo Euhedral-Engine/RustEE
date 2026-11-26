@@ -27,7 +27,7 @@ use euhedral_data_structures::queues::{Consumer, MpscQueue, Multi, Producer, Sin
 
 use super::uring::{c_path, open_flags, socket_address};
 use super::{
-    Buf, Cancelled, Engine, LimitPassed, MAX_PIECE, OpId, READ_PIECE, Request, Then,
+    Buf, Cancelled, Engine, LimitPassed, MAX_PIECE, OpId, Request, Then, WRITE_PIECE,
     conclude as conclude_io,
 };
 
@@ -91,6 +91,7 @@ enum Kind {
     Read {
         fd: RawFd,
         offset: u64,
+        piece: usize,
     },
     Write {
         fd: RawFd,
@@ -98,6 +99,7 @@ enum Kind {
     },
     Send {
         fd: RawFd,
+        piece: usize,
     },
     Recv {
         fd: RawFd,
@@ -263,7 +265,7 @@ impl Op {
             Kind::Read { fd, .. } if self.stream => Some((*fd, libc::POLLIN)),
             Kind::Write { fd, .. } if self.stream => Some((*fd, libc::POLLOUT)),
             Kind::Recv { fd } | Kind::Accept { fd } => Some((*fd, libc::POLLIN)),
-            Kind::Send { fd } | Kind::SendTo { fd, .. } => Some((*fd, libc::POLLOUT)),
+            Kind::Send { fd, .. } | Kind::SendTo { fd, .. } => Some((*fd, libc::POLLOUT)),
             Kind::Connect {
                 fd,
                 state: Connecting::Under(_),
@@ -281,11 +283,15 @@ impl Op {
         if self.limit.is_some_and(|at| Instant::now() >= at) {
             return Step::Done(Err(LimitPassed::error(self.moved)));
         }
-        let piece = max_piece.min(READ_PIECE);
+        let piece = max_piece.min(WRITE_PIECE);
         match &mut self.kind {
-            Kind::Read { fd, offset } => {
+            Kind::Read {
+                fd,
+                offset,
+                piece: whole,
+            } => {
                 let rest = &mut self.buf.bytes_mut()[self.moved..];
-                let len = rest.len().min(piece);
+                let len = rest.len().min(max_piece.min(*whole));
                 let ptr = rest.as_mut_ptr().cast();
                 let n = if self.stream {
                     // SAFETY: `rest` is a live, writable region of at least `len` bytes, and nothing else
@@ -362,12 +368,12 @@ impl Op {
                     }
                 }
             }
-            Kind::Send { fd } => {
+            Kind::Send { fd, piece: whole } => {
                 let rest = &self.buf.bytes()[self.moved..self.buf.filled()];
                 if rest.is_empty() {
                     return Step::Done(Ok(self.moved));
                 }
-                let len = rest.len().min(piece);
+                let len = rest.len().min(max_piece.min(*whole));
                 // SAFETY: `rest` is a live, readable region of at least `len` bytes.
                 let n = unsafe {
                     libc::send(
@@ -608,15 +614,23 @@ fn connect_check(fd: RawFd) -> Step {
 
 fn kind(request: Request) -> io::Result<Kind> {
     Ok(match request {
-        Request::Read { file, offset } => Kind::Read {
+        Request::Read {
+            file,
+            offset,
+            piece,
+        } => Kind::Read {
             fd: file as RawFd,
             offset,
+            piece,
         },
         Request::Write { file, offset } => Kind::Write {
             fd: file as RawFd,
             offset,
         },
-        Request::Send { sock } => Kind::Send { fd: sock as RawFd },
+        Request::Send { sock, piece } => Kind::Send {
+            fd: sock as RawFd,
+            piece,
+        },
         Request::Recv { sock } => Kind::Recv { fd: sock as RawFd },
         Request::Accept { listener } => Kind::Accept {
             fd: listener as RawFd,

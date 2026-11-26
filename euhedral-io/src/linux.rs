@@ -102,9 +102,9 @@ impl AsyncIo {
 
     /// As [`open`](Self::open), with options: [`AsyncIoOptions::positional_io`] forces the fallback.
     pub fn open_with_options(options: AsyncIoOptions) -> io::Result<Arc<Self>> {
-        Ok(Self::from_engine(Platform::choose(options, || {
-            Uring::native()
-        })?))
+        options.check()?;
+        let engine = Platform::choose(options, Uring::native)?;
+        Ok(Self::from_engine_with(engine, &options))
     }
 
     /// The engine this `AsyncIo` runs on.

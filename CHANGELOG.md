@@ -3,6 +3,18 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## The piece size of an `AsyncIo` read and send is the caller's setting (io) (2026-11-26)
+
+**What.** `AsyncIoOptions` gains `read_piece` and `send_piece`, and `ReadOptions { piece }` with `AsyncIo::read_with` and `read_into_with` sets the piece of one read. `DEFAULT_PIECE` (256 KiB, the value every read and send used) and `MAX_PIECE` are public. `read` and `read_into` use the `AsyncIo`'s `read_piece`.
+
+**Why.** Every read was cut to 256 KiB pieces issued one after another, so a large read of a file opened for direct I/O ran as a serial chain of round trips and reached about 3.4 GB/s on a disk that gives 5.7. The cut is there so that a read the page cache serves (copied inside the submitting call) does not hold a worker; that reason does not hold for a direct file. The size is the user system's to choose, not the crate's.
+
+**How to use.** `AsyncIo::open_with_options(AsyncIoOptions { read_piece: MAX_PIECE, ..Default::default() })` for an `AsyncIo` of direct files, or `io.read_into_with(file, offset, region, ReadOptions { piece: Some(MAX_PIECE) }, then)` for one read among buffered ones. For a direct file keep the piece a multiple of the device's logical block size (4096 is safe). Callers that set nothing behave as before.
+
+**Semantics.** A read or send goes in pieces of at most its size; one piece is one kernel read or send, and a short one is resubmitted for the rest as before. A size of 0 or above `MAX_PIECE` is refused where given (`open_with_options`, `read_with`, `read_into_with`), with an `InvalidInput` error naming the value and the limit, and nothing starts. All three engines (io_uring, positional, Windows) apply it; writes are unchanged. Code that builds `AsyncIoOptions` by naming every field needs `..AsyncIoOptions::default()` now.
+
+**Tests.** `euhedral-io` unit tests: a read with a piece issues pieces of that size, a read with `MAX_PIECE` goes whole and lands every byte, the `AsyncIo`'s option sets a plain read's piece, a bad size is refused naming it. `tests/io_owned.rs`: a direct read through the real ring with `MAX_PIECE` lands every byte.
+
 ## The Gitea repo check runs the pin alignment and the vendored-copy check (build) (2026-11-25)
 
 **What.** The Gitea `check-repo` job runs forge's checker with `--pins`, so C5 (pin alignment) and C13 (a vendored copy of a published module is byte for byte that version's archive) run on every pull request. The step fails unless the output has the C5 pass line and a C13 line that compared at least one copy. Every step of the job runs under an absolute shell.

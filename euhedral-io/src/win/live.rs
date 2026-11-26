@@ -83,6 +83,7 @@ fn both(body: impl Fn(&Arc<AsyncIo>)) {
         let io = AsyncIo::open_with_options(AsyncIoOptions {
             windows_ioring,
             positional_io: false,
+            ..AsyncIoOptions::default()
         })
         .unwrap();
         assert_eq!(io.engine.ring_use(), expected_ring_use(windows_ioring));

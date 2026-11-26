@@ -36,9 +36,22 @@ channels, `Condvar`, blocking `std::fs` or `std::net` calls.
 return at once, and the operation's `IoDone` (its buffer back, and the bytes moved or the error)
 reaches the `IoThen` continuation, which builds the frame the source emits. Handles are the
 platform's: descriptors on Linux and Android, `HANDLE`s and `SOCKET`s on Windows (the aliases
-`RawFile`, `RawSock`, `OwnedFile` and `OwnedSock`). A read is cut into pieces so that no single
-completion holds a worker for long. The `AsyncIo` type is the same everywhere; an engine under it
+`RawFile`, `RawSock`, `OwnedFile` and `OwnedSock`). A read is cut into pieces, one
+after another, each piece's completion submitting the next. The caller sets the size (see
+*Piece size*, below). The `AsyncIo` type is the same everywhere; an engine under it
 starts operations and finds their ends, and `src/lib.rs` does the rest.
+
+**Piece size.** `AsyncIoOptions::read_piece` and `send_piece` (each 1 to `MAX_PIECE`, 2 GiB less 4 KiB;
+`open_with_options` refuses anything else, naming the value) set how many bytes one piece of a read or a send
+moves, and `ReadOptions { piece: Some(n) }` on `read_with` and `read_into_with` sets it for one read, so one
+`AsyncIo` can hold buffered and direct files. The crate sets no policy: both default to `DEFAULT_PIECE`
+(256 KiB), a default the caller may change. Guidance: a read the page cache can serve is copied inside the
+submitting call, on the submitting worker, at about 0.2 ms per MB, so a buffered read is best kept in small
+pieces, which bound how long one call holds a worker. A read of a file opened for direct I/O copies nothing and
+each piece is a round trip to the device, so a large piece (up to `MAX_PIECE`) keeps the device busy with the
+whole read; for such a file the piece must be a multiple of the device's logical block size (a multiple of
+4096 is safe), which the crate cannot check and the kernel enforces. Writes keep their own piece (Windows: 256
+KiB, see below).
 
 `file_len(file, then)` finds the length of an open file without blocking the caller, so a reader can size its
 buffers or plan its reads from it: `statx(2)` of the descriptor through the ring on Linux and Android
@@ -154,7 +167,7 @@ assert_eq!(io.backend(), IoBackend::Positional);
   there still fails the open: it is not a permission refusal.
 - **Dropping** an `AsyncIo` with operations in flight frees their buffers and runs no continuation: nothing
   is in a kernel that could still write them (the io_uring engine leaks them instead).
-- `AsyncIoOptions::positional_io` forces the fallback where io_uring works; the other options do not apply to it.
+- `AsyncIoOptions::positional_io` forces the fallback where io_uring works; `windows_ioring` does not apply to it; the piece sizes do.
 
 ### Closing handles on Windows
 
