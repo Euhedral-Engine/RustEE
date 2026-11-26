@@ -24,8 +24,10 @@ use std::time::{Duration, Instant};
 use euhedral_core::frames::{Frame, FrameHeader};
 use euhedral_core::generics::LatticeSource;
 use euhedral_io::{AsyncIo, Create, IoDoneOwned, OpenSpec, OwnedFile, RawFile};
+#[cfg(target_os = "linux")]
+use euhedral_io::{IoMemory, MAX_PIECE, ReadOptions};
 
-/// The most bytes the engine moves in one piece is 256 KiB; a read of more is cut.
+/// The default piece (`DEFAULT_PIECE`): a read of more is cut.
 const PIECE: usize = 256 * 1024;
 const SENTINEL: u8 = 0xAA;
 
@@ -411,4 +413,104 @@ fn a_request_while_a_pull_holds_the_front_returns_at_once_and_is_served_after() 
     for open in common::engines() {
         a_request_while_a_pull_holds_the_front_returns_at_once_and_is_served_after_on(open);
     }
+}
+
+/// Memory aligned to 4096 bytes, as a direct read needs.
+#[cfg(target_os = "linux")]
+struct Aligned {
+    ptr: *mut u8,
+    len: usize,
+}
+
+#[cfg(target_os = "linux")]
+impl Aligned {
+    fn new(len: usize) -> Self {
+        let layout = std::alloc::Layout::from_size_align(len, 4096).unwrap();
+        // SAFETY: `layout` has a non-zero size.
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        assert!(!ptr.is_null());
+        Self { ptr, len }
+    }
+
+    fn bytes(&self) -> &[u8] {
+        // SAFETY: `ptr` addresses `len` initialised bytes that `self` owns.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for Aligned {
+    fn drop(&mut self) {
+        let layout = std::alloc::Layout::from_size_align(self.len, 4096).unwrap();
+        // SAFETY: allocated in `new` with this layout.
+        unsafe { std::alloc::dealloc(self.ptr, layout) };
+    }
+}
+
+// SAFETY: the block is owned by the value, stays where it is when the value moves, and `len` bytes
+// of it are valid for reads and writes.
+#[cfg(target_os = "linux")]
+unsafe impl Send for Aligned {}
+
+// SAFETY: as above.
+#[cfg(target_os = "linux")]
+unsafe impl IoMemory for Aligned {
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.ptr
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+}
+
+/// A read of a file opened for direct I/O, with the largest piece, lands every byte at its place
+/// (a read of this size is 16 default pieces; here it is one).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_direct_read_with_the_largest_piece_lands_every_byte() {
+    let io = common::open_default();
+    let data = content(4 << 20);
+    let path = common::scratch::test_scratch_dir(|| PathBuf::from(env!("CARGO_TARGET_TMPDIR")))
+        .join(format!("io-owned-direct-{}", std::process::id()));
+    std::fs::write(&path, &data).unwrap();
+    let _scratch = Scratch(path.clone());
+    let slot = Arc::new(Mutex::new(None));
+    let landing = slot.clone();
+    io.open_file(
+        &path,
+        libc::O_RDONLY | libc::O_DIRECT,
+        0,
+        Box::new(move |file| {
+            *landing.lock().unwrap() = Some(file);
+            Ended::frame(1)
+        }),
+    )
+    .unwrap();
+    drain(&io);
+    let file = match slot.lock().unwrap().take().expect("the open ended") {
+        Ok(file) => file,
+        Err(error) if error.raw_os_error() == Some(libc::EINVAL) => {
+            eprintln!("skipped: this file system does not take direct I/O");
+            return;
+        }
+        Err(error) => panic!("the open failed: {error}"),
+    };
+    let slot = Arc::new(Mutex::new(None));
+    let landing = slot.clone();
+    io.read_into_with(
+        raw(&file),
+        0,
+        Aligned::new(data.len()),
+        ReadOptions::with_piece(MAX_PIECE),
+        Box::new(move |done| {
+            *landing.lock().unwrap() = Some(done);
+            Ended::frame(2)
+        }),
+    )
+    .unwrap();
+    drain(&io);
+    let done = slot.lock().unwrap().take().expect("the read ended");
+    assert_eq!(done.result.unwrap(), data.len());
+    assert!(done.buf.unwrap().bytes() == data, "every byte landed");
 }

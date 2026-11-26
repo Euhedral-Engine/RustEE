@@ -3,6 +3,18 @@
 Changes to the lattice's execution model, newest first. Each entry says what changed, why, how to use it, its exact
 semantics and the tests that pin it.
 
+## The piece size of an `AsyncIo` read and send is the caller's setting (io) (2026-11-26)
+
+**What.** `AsyncIoOptions` gains `read_piece`, `send_piece`, `write_piece` (positional engine and Windows), `attempts_per_poll` and `pieces_per_turn` (positional engine), and `ReadOptions` (non-exhaustive, built with `ReadOptions::with_piece`) with `AsyncIo::read_with` and `read_into_with` sets the piece of one read. `DEFAULT_PIECE` (256 KiB, the value every read, send and cut write used), `DEFAULT_ATTEMPTS_PER_POLL` (64), `DEFAULT_PIECES_PER_TURN` (4) and `MAX_PIECE` are public. `read` and `read_into` use the `AsyncIo`'s `read_piece`.
+
+**Why.** Every read was cut to 256 KiB pieces issued one after another, so a large read of a file opened for direct I/O ran as a serial chain of round trips, each waiting for the one before. The cut is there so that a read the page cache serves (copied inside the submitting call) does not hold a worker; that reason does not hold for a direct file. The size is the user system's to choose, not the crate's.
+
+**How to use.** `AsyncIo::open_with_options(AsyncIoOptions { read_piece: MAX_PIECE, ..Default::default() })` for an `AsyncIo` of direct files, or `io.read_into_with(file, offset, region, ReadOptions::with_piece(MAX_PIECE), then)` for one read among buffered ones. For a direct file keep the piece a multiple of the device's logical block size (4096 is safe). Callers that set nothing behave as before.
+
+**Semantics.** A read or send goes in pieces of at most its size; one piece is one kernel read or send, and a short one is resubmitted for the rest as before. A size of 0 or above `MAX_PIECE`, or a count of 0, is refused where given (`open_with_options`, `read_with`, `read_into_with`), with an `InvalidInput` error naming the value and the limit, and nothing starts. The positional engine's per-visit budget of 64 attempts and its 4 pieces per turn were fixed; they are the defaults of the new settings. Their cost per piece differs by engine, and the option docs say how. All three engines (io_uring, positional, Windows) apply the read and send sizes; io_uring writes are unchanged (not cut below `MAX_PIECE`). Code that builds `AsyncIoOptions` by naming every field needs `..AsyncIoOptions::default()` now.
+
+**Tests.** `euhedral-io` unit tests: a read with a piece issues pieces of that size, a read with `MAX_PIECE` goes whole and lands every byte, the `AsyncIo`'s option sets a plain read's piece, a bad size or count is refused naming it; on the io_uring stand-in, the positional engine and the Windows simulation, a read, a send and (positional, Windows) a write go in pieces of the size given, and the positional per-visit attempts and pieces per turn follow the options. `tests/io_owned.rs`: a direct read through the real ring with `MAX_PIECE` lands every byte.
+
 ## The Gitea repo check runs the pin alignment and the vendored-copy check (build) (2026-11-25)
 
 **What.** The Gitea `check-repo` job runs forge's checker with `--pins`, so C5 (pin alignment) and C13 (a vendored copy of a published module is byte for byte that version's archive) run on every pull request. The step fails unless the output has the C5 pass line and a C13 line that compared at least one copy. Every step of the job runs under an absolute shell.

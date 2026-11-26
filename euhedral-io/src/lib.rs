@@ -174,6 +174,30 @@ pub struct OpOptions {
     pub limit: Option<Duration>,
 }
 
+/// How one read of [`AsyncIo::read_with`] or [`AsyncIo::read_into_with`] differs from the
+/// `AsyncIo`'s defaults.
+/// Build it with [`ReadOptions::with_piece`] or from `ReadOptions::default()`: it may gain fields.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ReadOptions {
+    /// The most bytes one piece of this read moves, in place of
+    /// [`AsyncIoOptions::read_piece`]: `None` keeps that. Refused (the submission returns an
+    /// error naming the value) if it is 0 or above [`MAX_PIECE`]. A read of a file opened for
+    /// direct I/O must keep it a multiple of the device's logical block size (4096 is safe), as
+    /// the kernel requires of every piece.
+    pub piece: Option<usize>,
+}
+
+impl ReadOptions {
+    /// Options with the piece of a read set to `piece` bytes.
+    pub fn with_piece(piece: usize) -> Self {
+        Self {
+            piece: Some(piece),
+            ..Self::default()
+        }
+    }
+}
+
 /// The error of an operation that [`AsyncIo::cancel`] ended before it finished: kind
 /// [`io::ErrorKind::Other`] (not `Interrupted`, which means "retry"), carrying this value. Test for
 /// it with [`Cancelled::is`]: it is none of the other ways an operation ends early, a passed limit
@@ -369,6 +393,51 @@ pub struct AsyncIoOptions {
     /// frame) even where io_uring works. Without it, the positional engine is used only where the system
     /// refuses io_uring. Ignored on other platforms.
     pub positional_io: bool,
+    /// The most bytes one piece of a read moves, from 1 to [`MAX_PIECE`]: a read longer than that
+    /// goes as several pieces, one after another, each piece's completion submitting the next.
+    /// [`AsyncIo::open_with_options`] refuses a value outside that range, naming it. A read can
+    /// choose its own through [`ReadOptions::piece`] (a system holding buffered and direct files
+    /// sets the size per read).
+    ///
+    /// Guidance, by what a piece costs the worker, per engine:
+    /// - **io_uring:** a read the page cache can serve is copied inside the submitting call, on
+    ///   the submitting worker, so for a buffered file keep the default small piece, which bounds
+    ///   how long one call holds a worker. A read of a file
+    ///   opened for direct I/O copies nothing: the device works while no worker waits, and each
+    ///   piece is a round trip, so for a direct file a large piece (up to [`MAX_PIECE`]) is
+    ///   recommended: the device works on the whole read at once.
+    /// - **Positional engine** (`positional_io`, or where io_uring is refused): every piece is a
+    ///   synchronous `pread` made by the polling worker, buffered or direct, and the worker waits
+    ///   for it (the copy, or the device). A visit makes up to
+    ///   [`attempts_per_poll`](Self::attempts_per_poll) of them in a row for a lone read, so the
+    ///   worker is held for about that many pieces' time: size the piece with that in mind.
+    /// - **Windows:** as io_uring, where the call is the submitting worker's.
+    ///
+    /// For a direct file the piece must be a multiple of the device's logical block size (4096
+    /// is safe).
+    ///
+    /// The default is [`DEFAULT_PIECE`] (256 KiB), kept so that callers that set nothing behave as
+    /// before; it is a default, not a policy.
+    pub read_piece: usize,
+    /// As [`read_piece`](Self::read_piece), for the pieces of a send. A send is copied into the
+    /// socket inside the submitting call, so the guidance for a buffered read holds for it.
+    pub send_piece: usize,
+    /// The most bytes one piece of a write moves, from 1 to [`MAX_PIECE`], on the positional engine
+    /// and on Windows (a write that extends a file is synchronous on NTFS, so its size is the
+    /// worker's wait; on the positional engine every `pwrite` is a worker's wait). The io_uring
+    /// engine does not cut writes below [`MAX_PIECE`] and ignores it. Default [`DEFAULT_PIECE`].
+    pub write_piece: usize,
+    /// Positional engine only: the most attempts one visit of the poll makes (an attempt is one
+    /// piece of a read or write, one non-blocking socket call, or a whole open, rename or length),
+    /// at least 1. It bounds the work of a reap: a lone long read moves up to this many pieces in a
+    /// visit. Default 64.
+    pub attempts_per_poll: usize,
+    /// Positional engine only: the most pieces of one read or write a visit moves in a row before
+    /// the next operation's turn, while other operations are also due, at least 1. An operation
+    /// that is alone in a visit is held to [`attempts_per_poll`](Self::attempts_per_poll)
+    /// instead. When a visit's attempts run out inside a turn, the operation goes behind the others
+    /// due, so none moves more pieces than this in a row while another waits. Default 4.
+    pub pieces_per_turn: usize,
 }
 
 impl Default for AsyncIoOptions {
@@ -376,15 +445,58 @@ impl Default for AsyncIoOptions {
         Self {
             windows_ioring: true,
             positional_io: false,
+            read_piece: DEFAULT_PIECE,
+            send_piece: DEFAULT_PIECE,
+            write_piece: DEFAULT_PIECE,
+            attempts_per_poll: DEFAULT_ATTEMPTS_PER_POLL,
+            pieces_per_turn: DEFAULT_PIECES_PER_TURN,
         }
     }
 }
 
-/// The most bytes one read, write or send piece moves (see the engines' read pieces).
-pub(crate) const READ_PIECE: usize = 256 * 1024;
-/// The longest piece of a read or write handed to the kernel at once; the rest follows as a short
-/// one's would.
-pub(crate) const MAX_PIECE: usize = (i32::MAX as usize) & !4095;
+impl AsyncIoOptions {
+    /// Refuses a piece size outside `1..=MAX_PIECE` and a count of 0, naming the value.
+    fn check(&self) -> io::Result<()> {
+        check_piece("read_piece", self.read_piece)?;
+        check_piece("send_piece", self.send_piece)?;
+        check_piece("write_piece", self.write_piece)?;
+        check_count("attempts_per_poll", self.attempts_per_poll)?;
+        check_count("pieces_per_turn", self.pieces_per_turn)
+    }
+}
+
+/// Refuses a count of 0, naming `what` and the value.
+fn check_count(what: &str, count: usize) -> io::Result<()> {
+    if count >= 1 {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("{what} is {count}: it is at least 1"),
+    ))
+}
+
+/// Refuses a piece size of 0 or above [`MAX_PIECE`], naming `what`, the value and the limit.
+fn check_piece(what: &str, piece: usize) -> io::Result<()> {
+    if (1..=MAX_PIECE).contains(&piece) {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("{what} is {piece}: a piece moves 1 to {MAX_PIECE} bytes"),
+    ))
+}
+
+/// The piece size of a read or send that no option changes: 256 KiB.
+pub const DEFAULT_PIECE: usize = 256 * 1024;
+/// The longest piece of a read, write or send handed to the kernel at once (the limit of
+/// [`AsyncIoOptions::read_piece`], [`AsyncIoOptions::send_piece`], [`AsyncIoOptions::write_piece`] and [`ReadOptions::piece`]); the
+/// rest follows as a short one's would.
+pub const MAX_PIECE: usize = (i32::MAX as usize) & !4095;
+/// The default of [`AsyncIoOptions::attempts_per_poll`].
+pub const DEFAULT_ATTEMPTS_PER_POLL: usize = 64;
+/// The default of [`AsyncIoOptions::pieces_per_turn`].
+pub const DEFAULT_PIECES_PER_TURN: usize = 4;
 
 /// What an operation asks of an engine. Handles are the platform's raw values (a descriptor, a
 /// handle or a socket) as a `usize`.
@@ -392,6 +504,8 @@ pub(crate) enum Request {
     Read {
         file: usize,
         offset: u64,
+        /// The most bytes of one piece (1 to [`MAX_PIECE`], checked where it was chosen).
+        piece: usize,
     },
     Write {
         file: usize,
@@ -399,6 +513,8 @@ pub(crate) enum Request {
     },
     Send {
         sock: usize,
+        /// The most bytes of one piece (1 to [`MAX_PIECE`], checked where it was chosen).
+        piece: usize,
     },
     Recv {
         sock: usize,
@@ -781,6 +897,9 @@ pub struct AsyncIo {
     events: AtomicU64,
     /// Operations whose continuation panicked (their frame is a [`Lost`] one, dropped by the reap).
     panicked: AtomicUsize,
+    /// The pieces of a read and of a send that no [`ReadOptions::piece`] changes (checked at open).
+    read_piece: usize,
+    send_piece: usize,
 }
 
 /// The counts of an operation the engine has not accepted: taken back when it drops, which is when the engine
@@ -1148,7 +1267,13 @@ fn owned_sock(raw: usize) -> OwnedSock {
 }
 
 impl AsyncIo {
+    #[cfg(all(test, unix))]
     fn from_engine(engine: Platform) -> Arc<Self> {
+        Self::from_engine_with(engine, &AsyncIoOptions::default())
+    }
+
+    /// As `from_engine`, with the piece sizes of `options` (already checked).
+    fn from_engine_with(engine: Platform, options: &AsyncIoOptions) -> Arc<Self> {
         Arc::new_cyclic(|me| Self {
             front: Front::new(),
             engine,
@@ -1157,6 +1282,15 @@ impl AsyncIo {
             pacing: KeyPacing::new(),
             events: AtomicU64::new(0),
             panicked: AtomicUsize::new(0),
+            read_piece: options.read_piece,
+            send_piece: options.send_piece,
+        })
+    }
+
+    /// The piece of a read: the operation's own, checked, or the `AsyncIo`'s.
+    fn read_piece_of(&self, options: ReadOptions) -> io::Result<usize> {
+        options.piece.map_or(Ok(self.read_piece), |piece| {
+            check_piece("ReadOptions::piece", piece).map(|()| piece)
         })
     }
 
@@ -1276,7 +1410,43 @@ impl AsyncIo {
             return Err(invalid("a read into an empty buffer"));
         }
         let file = raw_file(file);
-        self.submit(Request::Read { file, offset }, buf.into(), Then::Io(then))
+        let piece = self.read_piece;
+        self.submit(
+            Request::Read {
+                file,
+                offset,
+                piece,
+            },
+            buf.into(),
+            Then::Io(then),
+        )
+    }
+
+    /// As [`read`](Self::read), with `options`: [`ReadOptions::piece`] sets the size of this
+    /// read's pieces (a direct file can read whole up to [`MAX_PIECE`] while a buffered one
+    /// keeps small pieces); a bad one is refused, naming it, and nothing starts.
+    pub fn read_with(
+        &self,
+        file: RawFile,
+        offset: u64,
+        buf: IoBuf,
+        options: ReadOptions,
+        then: IoThen,
+    ) -> io::Result<()> {
+        if buf.bytes.is_empty() {
+            return Err(invalid("a read into an empty buffer"));
+        }
+        let piece = self.read_piece_of(options)?;
+        let file = raw_file(file);
+        self.submit(
+            Request::Read {
+                file,
+                offset,
+                piece,
+            },
+            buf.into(),
+            Then::Io(then),
+        )
     }
 
     /// Reads into memory the caller owns: up to `buf.len()` bytes at `offset` of `file`, straight
@@ -1296,12 +1466,27 @@ impl AsyncIo {
         &self,
         file: RawFile,
         offset: u64,
+        buf: B,
+        then: Continuation<IoDoneOwned<B>>,
+    ) -> io::Result<()> {
+        self.read_into_with(file, offset, buf, ReadOptions::default(), then)
+    }
+
+    /// As [`read_into`](Self::read_into), with `options`: [`ReadOptions::piece`] sets the size of
+    /// this read's pieces (a pinned region read from a direct file can go whole, up to
+    /// [`MAX_PIECE`] at a time); a bad one is refused, naming it, and nothing starts.
+    pub fn read_into_with<B: IoMemory>(
+        &self,
+        file: RawFile,
+        offset: u64,
         mut buf: B,
+        options: ReadOptions,
         then: Continuation<IoDoneOwned<B>>,
     ) -> io::Result<()> {
         if buf.is_empty() {
             return Err(invalid("a read into an empty region"));
         }
+        let piece = self.read_piece_of(options)?;
         let region = Region::of(&mut buf);
         let file = raw_file(file);
         // The closure keeps `buf` alive and in place until the operation ends.
@@ -1319,7 +1504,15 @@ impl AsyncIo {
                 filled,
             })
         }));
-        self.submit(Request::Read { file, offset }, Buf::Region(region), then)
+        self.submit(
+            Request::Read {
+                file,
+                offset,
+                piece,
+            },
+            Buf::Region(region),
+            then,
+        )
     }
 
     /// Writes `buf.bytes[..buf.filled]` at `offset` of `file`.
@@ -1337,7 +1530,8 @@ impl AsyncIo {
             return Err(invalid("filled is beyond the buffer"));
         }
         let sock = raw_sock(socket);
-        self.submit(Request::Send { sock }, buf.into(), Then::Io(then))
+        let piece = self.send_piece;
+        self.submit(Request::Send { sock, piece }, buf.into(), Then::Io(then))
     }
 
     /// Receives into `buf.bytes` from a connected socket; `Ok(0)` is the peer's end of stream.
@@ -1362,9 +1556,10 @@ impl AsyncIo {
         if buf.filled > buf.bytes.len() {
             return Err(invalid("filled is beyond the buffer"));
         }
+        let piece = self.send_piece;
         let sock = raw_sock(socket);
         self.submit_with(
-            Request::Send { sock },
+            Request::Send { sock, piece },
             buf.into(),
             Then::Io(then),
             options.limit,

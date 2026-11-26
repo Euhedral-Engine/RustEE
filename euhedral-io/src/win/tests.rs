@@ -18,6 +18,7 @@ use super::sys::{
     verbatim_path,
 };
 use super::{Engine, Join, MAX_PIECE};
+use crate::DEFAULT_PIECE;
 use crate::{
     AsyncIoOptions, Buf, Cancelled, Create, Engine as EngineTrait, Front, IoBuf, IoDone,
     IoDoneOwned, LimitPassed, OpId, OpenSpec, Region, Request, Then,
@@ -109,17 +110,17 @@ impl Harness {
     }
 
     fn with(probe: Option<RingProbe>, ioring: bool, max_piece: usize) -> Self {
+        let options = AsyncIoOptions {
+            windows_ioring: ioring,
+            ..AsyncIoOptions::default()
+        };
+        Self::with_options(probe, options, max_piece)
+    }
+
+    fn with_options(probe: Option<RingProbe>, options: AsyncIoOptions, max_piece: usize) -> Self {
         let sim = Arc::new(Sim::new());
         sim.set_probe(probe);
-        let engine = Engine::new(
-            sim.clone(),
-            AsyncIoOptions {
-                windows_ioring: ioring,
-                positional_io: false,
-            },
-            max_piece,
-        )
-        .unwrap();
+        let engine = Engine::new(sim.clone(), options, max_piece).unwrap();
         Self {
             sim,
             engine: Arc::new(engine),
@@ -153,14 +154,26 @@ impl Harness {
             bytes: vec![0; len],
             filled: 0,
         };
-        self.submit(Request::Read { file, offset }, buf, io_then(tag))
+        self.submit(
+            Request::Read {
+                file,
+                offset,
+                piece: DEFAULT_PIECE,
+            },
+            buf,
+            io_then(tag),
+        )
     }
 
     fn read_owned(&self, file: Handle, offset: u64, memory: Vec<u8>, tag: u64) -> io::Result<()> {
         let (buf, then) = owned_read(memory, tag);
         self.front.pending.fetch_add(1, Ordering::AcqRel);
         let started = self.engine.submit(
-            Request::Read { file, offset },
+            Request::Read {
+                file,
+                offset,
+                piece: DEFAULT_PIECE,
+            },
             buf,
             then,
             None,
@@ -260,6 +273,91 @@ fn a_read_is_cut_into_pieces_and_ends_once_with_its_bytes() {
     let reads = h.sim.log().iter().filter(|l| l.starts_with("read")).count();
     assert_eq!(reads, 4, "pieces of at most 4096 bytes");
     assert_eq!(h.pending(), 0);
+}
+
+/// A read's own piece, below the engine's limit, sets what each call moves.
+#[test]
+fn a_read_goes_in_pieces_of_the_size_its_request_names() {
+    let h = Harness::new();
+    let data = content(3 * 10_000 + 5);
+    let file = h.sim.file(&data);
+    let buf = IoBuf {
+        bytes: vec![0; data.len()],
+        filled: 0,
+    };
+    let request = Request::Read {
+        file,
+        offset: 0,
+        piece: 10_000,
+    };
+    h.submit(request, buf, io_then(1)).unwrap();
+    let done = ended(h.one());
+    assert_eq!(done.result.unwrap(), data.len());
+    assert_eq!(done.buf.bytes, data);
+    let reads = h.sim.log().iter().filter(|l| l.starts_with("read")).count();
+    assert_eq!(reads, 4, "pieces of at most 10000 bytes");
+}
+
+/// A piece up to the limit reads whole what the default would cut in many.
+#[test]
+fn a_read_of_the_largest_piece_goes_in_one_call() {
+    let h = Harness::new();
+    let data = content(3 * DEFAULT_PIECE + 5);
+    let file = h.sim.file(&data);
+    let buf = IoBuf {
+        bytes: vec![0; data.len()],
+        filled: 0,
+    };
+    let request = Request::Read {
+        file,
+        offset: 0,
+        piece: MAX_PIECE,
+    };
+    h.submit(request, buf, io_then(1)).unwrap();
+    let done = ended(h.one());
+    assert_eq!(done.buf.bytes, data);
+    let reads = h.sim.log().iter().filter(|l| l.starts_with("read")).count();
+    assert_eq!(reads, 1);
+}
+
+/// A send's own piece sets what each call moves.
+#[test]
+fn a_send_goes_in_pieces_of_the_size_its_request_names() {
+    let h = Harness::new();
+    let sock = h.sim.sock();
+    let data = content(250);
+    let buf = IoBuf {
+        bytes: data.clone(),
+        filled: data.len(),
+    };
+    h.submit(Request::Send { sock, piece: 100 }, buf, io_then(1))
+        .unwrap();
+    assert_eq!(ended(h.one()).result.unwrap(), 250);
+    assert_eq!(h.sim.sent(sock), data);
+    let sends = h.sim.log().iter().filter(|l| l.starts_with("Send")).count();
+    assert_eq!(sends, 3, "pieces of at most 100 bytes");
+}
+
+/// The write piece of the options sets what each call of a write moves.
+#[test]
+fn a_write_goes_in_pieces_of_the_write_piece_of_the_options() {
+    let options = AsyncIoOptions {
+        write_piece: MAX_PIECE,
+        ..AsyncIoOptions::default()
+    };
+    let h = Harness::with_options(None, options, MAX_PIECE);
+    let file = h.sim.file(&[]);
+    let data = content(600 * 1024);
+    h.write(file, 0, &data, 1).unwrap();
+    assert_eq!(ended(h.one()).result.unwrap(), data.len());
+    let writes = h
+        .sim
+        .log()
+        .iter()
+        .filter(|l| l.starts_with("write"))
+        .count();
+    assert_eq!(writes, 1);
+    assert_eq!(h.sim.file_data(file), data);
 }
 
 #[test]
@@ -366,7 +464,15 @@ fn sends_and_receives_move_bytes_in_pieces() {
         bytes: data.clone(),
         filled: data.len(),
     };
-    h.submit(Request::Send { sock }, buf, io_then(1)).unwrap();
+    h.submit(
+        Request::Send {
+            sock,
+            piece: DEFAULT_PIECE,
+        },
+        buf,
+        io_then(1),
+    )
+    .unwrap();
     let done = ended(h.one());
     assert_eq!(done.result.unwrap(), 250);
     assert_eq!(h.sim.sent(sock), data);
@@ -790,7 +896,11 @@ fn a_second_first_operation_during_a_join_is_held_until_it_ends_and_then_runs() 
             front.pending.fetch_add(1, Ordering::AcqRel);
             engine
                 .submit(
-                    Request::Read { file, offset: 10 },
+                    Request::Read {
+                        file,
+                        offset: 10,
+                        piece: DEFAULT_PIECE,
+                    },
                     IoBuf {
                         bytes: vec![0; 10],
                         filled: 0,
@@ -837,7 +947,11 @@ fn a_handle_on_another_port_is_refused_to_both_threads_and_leaves_no_claim() {
             front.pending.fetch_add(1, Ordering::AcqRel);
             engine
                 .submit(
-                    Request::Read { file, offset: 10 },
+                    Request::Read {
+                        file,
+                        offset: 10,
+                        piece: DEFAULT_PIECE,
+                    },
                     IoBuf {
                         bytes: vec![0; 10],
                         filled: 0,
@@ -912,7 +1026,11 @@ fn a_file_one_thread_joins_while_another_makes_its_ring_goes_to_the_port_for_bot
                 front.pending.fetch_add(1, Ordering::AcqRel);
                 engine
                     .submit(
-                        Request::Read { file, offset: 10 },
+                        Request::Read {
+                            file,
+                            offset: 10,
+                            piece: DEFAULT_PIECE,
+                        },
                         IoBuf {
                             bytes: vec![0; 10],
                             filled: 0,
@@ -974,7 +1092,10 @@ fn completions_of_the_ring_and_the_port_each_come_out_once() {
     h.sim.hold(true);
     h.read(file, 0, 10, 1).unwrap();
     h.submit(
-        Request::Send { sock },
+        Request::Send {
+            sock,
+            piece: DEFAULT_PIECE,
+        },
         IoBuf {
             bytes: vec![1; 8],
             filled: 8,
@@ -1311,7 +1432,10 @@ fn a_ring_completion_or_a_packet_ends_only_a_record_on_its_own_route() {
     let sock = h.sim.sock();
     h.sim.hold(true);
     h.submit(
-        Request::Send { sock },
+        Request::Send {
+            sock,
+            piece: DEFAULT_PIECE,
+        },
         IoBuf {
             bytes: vec![1; 4],
             filled: 4,
@@ -1328,7 +1452,7 @@ fn a_ring_completion_or_a_packet_ends_only_a_record_on_its_own_route() {
 }
 
 #[test]
-fn a_write_goes_in_pieces_of_at_most_a_read_piece() {
+fn a_write_goes_in_pieces_of_at_most_the_default_write_piece() {
     let h = Harness::new();
     let file = h.sim.file(&[]);
     let data = content(600 * 1024);
@@ -1444,7 +1568,11 @@ fn a_ring_that_breaks_while_an_issuer_is_mid_call_cannot_touch_its_record() {
     let bytes = vec![0u8; 10];
     let buf = IoBuf { bytes, filled: 0 };
     let op = Engine::op(
-        super::Kind::Read { file, offset: 0 },
+        super::Kind::Read {
+            file,
+            offset: 0,
+            piece: DEFAULT_PIECE,
+        },
         super::Route::Ring(ring.clone()),
         buf.into(),
         io_then(2),
@@ -1551,7 +1679,11 @@ fn an_operation_ended_by_the_issuers_recheck_of_a_broken_ring_leaks_its_buffer()
     h.drain(1);
     let ring = h.engine.ring().unwrap();
     let op = Engine::op(
-        super::Kind::Read { file, offset: 0 },
+        super::Kind::Read {
+            file,
+            offset: 0,
+            piece: DEFAULT_PIECE,
+        },
         super::Route::Ring(ring.clone()),
         IoBuf {
             bytes: vec![0u8; 10],
@@ -1687,7 +1819,11 @@ fn an_owned_read_whose_ring_broke_leaks_its_memory_and_its_continuation_says_so(
         })
     }));
     let op = Engine::op(
-        super::Kind::Read { file, offset: 0 },
+        super::Kind::Read {
+            file,
+            offset: 0,
+            piece: DEFAULT_PIECE,
+        },
         super::Route::Ring(ring.clone()),
         Buf::Region(region),
         then,
@@ -1793,8 +1929,16 @@ fn limited_operations_that_finish_in_time_end_once_and_leave_no_limit_behind() {
         bytes: vec![1; 250],
         filled: 250,
     };
-    h.submit_limited(Request::Send { sock }, buf, io_then(2), Some(LIMIT))
-        .unwrap();
+    h.submit_limited(
+        Request::Send {
+            sock,
+            piece: DEFAULT_PIECE,
+        },
+        buf,
+        io_then(2),
+        Some(LIMIT),
+    )
+    .unwrap();
     h.submit_limited(
         Request::Accept { listener },
         IoBuf::default(),
@@ -1871,7 +2015,15 @@ fn a_cancelled_send_that_is_still_pending_ends_once_with_its_buffer() {
         filled: 1000,
     };
     let id = h
-        .submit_limited(Request::Send { sock }, buf, io_then(1), None)
+        .submit_limited(
+            Request::Send {
+                sock,
+                piece: DEFAULT_PIECE,
+            },
+            buf,
+            io_then(1),
+            None,
+        )
         .unwrap();
     assert!(h.pull_with(&mut |_| false).is_empty());
     h.engine.cancel(id);
@@ -1933,7 +2085,10 @@ fn a_limit_or_cancel_that_comes_between_two_pieces_ends_the_operation_there() {
         // The first piece's packet is queued, not yet polled: the operation is in flight.
         let id = h
             .submit_limited(
-                Request::Send { sock },
+                Request::Send {
+                    sock,
+                    piece: DEFAULT_PIECE,
+                },
                 buf,
                 io_then(1),
                 timeout.then_some(LIMIT),
@@ -2065,7 +2220,15 @@ fn a_send_ended_between_pieces_says_how_many_bytes_went() {
         filled: 250,
     };
     let id = h
-        .submit_limited(Request::Send { sock }, buf, io_then(1), None)
+        .submit_limited(
+            Request::Send {
+                sock,
+                piece: DEFAULT_PIECE,
+            },
+            buf,
+            io_then(1),
+            None,
+        )
         .unwrap();
     h.engine.cancel(id);
     let error = ended(h.one()).result.unwrap_err();
@@ -2099,7 +2262,11 @@ fn failures_from_4_submitters_are_each_delivered_once() {
             scope.spawn(move || {
                 for i in 0..EACH {
                     let op = Engine::op(
-                        super::Kind::Read { file, offset: 0 },
+                        super::Kind::Read {
+                            file,
+                            offset: 0,
+                            piece: DEFAULT_PIECE,
+                        },
                         super::Route::Port,
                         IoBuf::default().into(),
                         io_then(thread * 100 + i),
@@ -2234,7 +2401,11 @@ fn limits_begun_on_8_threads_each_expire_once() {
                     (0..4u64)
                         .map(|i| {
                             let mut op = Engine::op(
-                                super::Kind::Read { file, offset: 0 },
+                                super::Kind::Read {
+                                    file,
+                                    offset: 0,
+                                    piece: DEFAULT_PIECE,
+                                },
                                 super::Route::Port,
                                 IoBuf::default().into(),
                                 io_then(thread * 10 + i),
@@ -2339,7 +2510,11 @@ fn a_rest_offered_while_the_owner_builds_is_submitted_once() {
     let ring = h.engine.ring().unwrap();
     // A second operation, in flight and with its entry built, but not yet offered.
     let op = Engine::op(
-        super::Kind::Read { file, offset: 10 },
+        super::Kind::Read {
+            file,
+            offset: 10,
+            piece: DEFAULT_PIECE,
+        },
         super::Route::Ring(ring.clone()),
         IoBuf {
             bytes: vec![0u8; 10],

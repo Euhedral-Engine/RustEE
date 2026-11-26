@@ -60,7 +60,7 @@ use self::sys::{
 };
 use super::{
     AsyncIo, AsyncIoOptions, Buf, Cancelled, Engine as EngineTrait, LimitPassed, MAX_PIECE, OpId,
-    OpenSpec, READ_PIECE, Request, Then, conclude as conclude_io, invalid,
+    OpenSpec, Request, Then, conclude as conclude_io, invalid,
 };
 
 mod handles;
@@ -119,16 +119,42 @@ impl Drop for Port {
 
 /// What an operation does, with the handles it uses.
 enum Kind {
-    Read { file: Handle, offset: u64 },
-    Write { file: Handle, offset: u64 },
-    Send { sock: Handle },
-    Recv { sock: Handle },
-    SendTo { sock: Handle },
-    Accept { listener: Handle },
-    Connect { sock: Handle },
-    Open { path: PathBuf, spec: OpenSpec },
-    Rename { from: PathBuf, to: PathBuf },
-    FileLen { file: Handle },
+    Read {
+        file: Handle,
+        offset: u64,
+        piece: usize,
+    },
+    Write {
+        file: Handle,
+        offset: u64,
+    },
+    Send {
+        sock: Handle,
+        piece: usize,
+    },
+    Recv {
+        sock: Handle,
+    },
+    SendTo {
+        sock: Handle,
+    },
+    Accept {
+        listener: Handle,
+    },
+    Connect {
+        sock: Handle,
+    },
+    Open {
+        path: PathBuf,
+        spec: OpenSpec,
+    },
+    Rename {
+        from: PathBuf,
+        to: PathBuf,
+    },
+    FileLen {
+        file: Handle,
+    },
 }
 
 /// How the operation reaches the kernel.
@@ -184,7 +210,7 @@ impl Op {
         match (&self.route, &self.kind) {
             (
                 Route::Port,
-                Kind::Send { sock: handle }
+                Kind::Send { sock: handle, .. }
                 | Kind::Recv { sock: handle }
                 | Kind::SendTo { sock: handle }
                 | Kind::Accept { listener: handle }
@@ -514,6 +540,8 @@ pub(super) struct Engine {
     rings: Box<[OnceLock<Arc<Ring>>]>,
     ring_count: AtomicUsize,
     max_piece: usize,
+    /// The most bytes of one piece of a write ([`AsyncIoOptions::write_piece`]).
+    write_piece: usize,
     /// The soonest deadline of the limits (`NO_DEADLINE` when there is none): `begin` lowers it, the
     /// poller sets it to the head of its set. A poll before it does nothing for limits.
     next_deadline: AtomicU64,
@@ -588,6 +616,7 @@ impl Engine {
             rings: (0..MAX_RINGS).map(|_| OnceLock::new()).collect(),
             ring_count: AtomicUsize::new(0),
             max_piece: max_piece.clamp(1, MAX_PIECE),
+            write_piece: options.write_piece,
             next_deadline: AtomicU64::new(NO_DEADLINE),
             strays: AtomicUsize::new(0),
         })
@@ -1353,14 +1382,17 @@ impl Engine {
         let moved = op.moved;
         let user_data = token(held.slot, held.generation);
         match &op.kind {
-            Kind::Read { file, offset } => {
+            Kind::Read {
+                file,
+                offset,
+                piece,
+            } => {
                 let file = *file;
                 let at = offset + moved as u64;
-                // A read the page cache can serve is copied inside the call, on the submitting
-                // worker: pieces of at most READ_PIECE, each piece's completion submitting the
+                // Pieces of at most the caller's size, each piece's completion submitting the
                 // next.
                 let rest = &mut op.buf.bytes_mut()[moved..];
-                let len = self.piece(rest.len().min(READ_PIECE));
+                let len = self.piece(rest.len().min(*piece));
                 let buf = rest.as_mut_ptr();
                 if let Route::Ring(ring) = &op.route {
                     let entry = Entry {
@@ -1379,11 +1411,11 @@ impl Engine {
             Kind::Write { file, offset } => {
                 let file = *file;
                 let at = offset + moved as u64;
-                // Pieces of at most READ_PIECE too: a write that extends a file is synchronous on
+                // Pieces of at most the write piece: a write that extends a file is synchronous on
                 // NTFS (the call returns when the data is written), so its size is the worker's
                 // wait.
                 let rest = &op.buf.bytes()[moved..op.buf.filled()];
-                let len = self.piece(rest.len().min(READ_PIECE));
+                let len = self.piece(rest.len().min(self.write_piece));
                 let buf = rest.as_ptr();
                 if let Route::Ring(ring) = &op.route {
                     let entry = Entry {
@@ -1399,10 +1431,10 @@ impl Engine {
                 reset(ov, at);
                 Call::Write { file, buf, len, ov }
             }
-            Kind::Send { sock } => {
+            Kind::Send { sock, piece } => {
                 let sock = *sock;
                 let bytes = &op.buf.bytes()[moved..op.buf.filled()];
-                let len = self.piece(bytes.len().min(READ_PIECE));
+                let len = self.piece(bytes.len().min(*piece));
                 let buf = bytes.as_ptr();
                 reset(ov, 0);
                 Call::Send { sock, buf, len, ov }
@@ -1810,20 +1842,34 @@ impl EngineTrait for Engine {
         taken: &Cell<bool>,
     ) -> io::Result<OpId> {
         let mut op = match request {
-            Request::Read { file, offset } => {
+            Request::Read {
+                file,
+                offset,
+                piece,
+            } => {
                 self.check_handle(file, false)?;
                 let (route, join) = self.file_route(file);
-                Self::op(Kind::Read { file, offset }, route, buf, then).after(join, file)
+                Self::op(
+                    Kind::Read {
+                        file,
+                        offset,
+                        piece,
+                    },
+                    route,
+                    buf,
+                    then,
+                )
+                .after(join, file)
             }
             Request::Write { file, offset } => {
                 self.check_handle(file, false)?;
                 let (route, join) = self.file_route(file);
                 Self::op(Kind::Write { file, offset }, route, buf, then).after(join, file)
             }
-            Request::Send { sock } => {
+            Request::Send { sock, piece } => {
                 self.check_handle(sock, true)?;
                 let join = self.join_port(sock, true);
-                Self::op(Kind::Send { sock }, Route::Port, buf, then).after(join, sock)
+                Self::op(Kind::Send { sock, piece }, Route::Port, buf, then).after(join, sock)
             }
             Request::Recv { sock } => {
                 self.check_handle(sock, true)?;
@@ -1965,7 +2011,11 @@ impl AsyncIo {
     /// As [`open`](Self::open), with options.
     #[cfg(windows)]
     pub fn open_with_options(options: AsyncIoOptions) -> io::Result<Arc<Self>> {
+        options.check()?;
         let sys: Arc<dyn Sys> = Arc::new(real::RealSys::new());
-        Ok(Self::from_engine(Engine::new(sys, options, MAX_PIECE)?))
+        Ok(Self::from_engine_with(
+            Engine::new(sys, options, MAX_PIECE)?,
+            &options,
+        ))
     }
 }

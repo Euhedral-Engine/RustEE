@@ -46,11 +46,11 @@ impl Platform {
         uring: impl FnOnce() -> io::Result<Uring>,
     ) -> io::Result<Self> {
         if options.positional_io {
-            return Ok(Self::Positional(Positional::new()));
+            return Ok(Self::Positional(Positional::new(&options)));
         }
         match uring() {
             Ok(uring) => Ok(Self::Uring(uring)),
-            Err(error) if refused(&error) => Ok(Self::Positional(Positional::new())),
+            Err(error) if refused(&error) => Ok(Self::Positional(Positional::new(&options))),
             Err(error) => Err(error),
         }
     }
@@ -102,9 +102,9 @@ impl AsyncIo {
 
     /// As [`open`](Self::open), with options: [`AsyncIoOptions::positional_io`] forces the fallback.
     pub fn open_with_options(options: AsyncIoOptions) -> io::Result<Arc<Self>> {
-        Ok(Self::from_engine(Platform::choose(options, || {
-            Uring::native()
-        })?))
+        options.check()?;
+        let engine = Platform::choose(options, Uring::native)?;
+        Ok(Self::from_engine_with(engine, &options))
     }
 
     /// The engine this `AsyncIo` runs on.
